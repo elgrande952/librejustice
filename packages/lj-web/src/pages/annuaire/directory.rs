@@ -1,10 +1,10 @@
-//! Page `/annuaire/{kind}` (ADR 0192) : listing paginé d'une catégorie, trié par
-//! contentieux décroissant (côté API). Filtre barreau pour les avocats. Gabarit
-//! rail + contenu commun (cf. `pages::annuaire`) : rail des catégories dans la
-//! gouttière gauche, chips de catégories en mobile. Rendu SSR crawlable
+//! Page `/annuaire/{kind}` : listing paginé d'une catégorie, trié par contentieux
+//! décroissant (côté API). Filtre barreau pour les avocats. Gabarit rail +
+//! contenu commun (cf. `pages::annuaire`) : rail des catégories dans la gouttière
+//! gauche, chips de catégories en mobile. Rendu SSR crawlable
 //! (`PartiallyBlocked`) : head (title / description / canonical, `noindex`
-//! au-delà de la page 1) + listing **bloquant** dans le HTML initial.
-//! Catégorie inconnue ⇒ 404 doux (noindex).
+//! au-delà de la page 1) + listing **bloquant** dans le HTML initial. Catégorie
+//! inconnue ⇒ 404 doux (noindex).
 
 use leptos::either::Either;
 use leptos::prelude::*;
@@ -13,6 +13,8 @@ use leptos_router::components::A;
 use leptos_router::hooks::{use_params_map, use_query_map};
 use lj_dtos::EntityDirectoryResponse;
 
+use crate::components::layout::{CONTENT_COL, GRID_2COL, SHELL};
+use crate::components::own_page_description;
 use crate::helpers::group_thousands;
 use crate::pages::annuaire::common::{
     category_chips, entity_row, fetch_directory, list_skeleton, max_decision_count, stats_resource,
@@ -54,6 +56,8 @@ fn barreau_param() -> Signal<Option<String>> {
 
 #[component]
 pub fn AnnuaireDirectoryPage() -> impl IntoView {
+    own_page_description();
+
     let slug = kind_slug();
     let page = page_param();
     let barreau = barreau_param();
@@ -91,14 +95,14 @@ fn DirectoryLoaded(
         <Link rel="canonical" href=canonical />
         {move || robots().map(|r| view! { <Meta name="robots" content=r /> })}
 
-        <div class="mx-auto w-full max-w-[92rem] flex-1 px-4 py-8 sm:px-6 lg:px-8">
-            // Gabarit commun /decisions · /textes · /texte : gouttière 240px,
-            // colonne contenu bornée 3xl.
-            <div class="grid gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12">
+        <div class=format!("{SHELL} flex-1")>
+            // Gabarit commun /decisions · /textes · /texte : gouttière 240px, colonne
+            // contenu bornée 3xl.
+            <div class=GRID_2COL>
                 <div class="hidden lg:block">
                     <AnnuaireRail current=kind stats=stats />
                 </div>
-                <div class="flex w-full min-w-0 max-w-3xl flex-col gap-6">
+                <div class=CONTENT_COL>
                     <header class="flex flex-col gap-2">
                         <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
                             <A
@@ -112,8 +116,6 @@ fn DirectoryLoaded(
                         <p class="max-w-prose text-[var(--color-ink-muted)]">{kind.tagline()}</p>
                     </header>
 
-                    // Sous `lg`, le rail est masqué : les chips donnent la
-                    // navigation entre catégories.
                     {category_chips(Some(kind))}
 
                     {kind.has_barreau_filter().then(|| view! { <BarreauFilter kind=kind barreau=barreau /> })}
@@ -207,13 +209,12 @@ fn directory_view(
     }
 
     let total = response.total;
-    // Pagination bornée au plafond de profondeur de l'API (ADR 0239).
+    // Pagination bornée au plafond de profondeur de l'API.
     let total_pages = ((total + PAGE_SIZE - 1) / PAGE_SIZE).clamp(1, MAX_PAGES);
     let count_label = match total {
         1 => "1 entité au registre".to_string(),
         n => format!("{} entités au registre", group_thousands(n)),
     };
-    // Sous-ensemble « en justice » en contexte (ADR 0233/0239).
     let contentieux_label = (response.contentieux > 0)
         .then(|| format!("dont {} en justice", group_thousands(response.contentieux)));
     let max = max_decision_count(&response.items);

@@ -1,9 +1,9 @@
-//! Liens de chronologie entre décisions (ADR 0161) : une ligne
-//! `decision_links` = (décision qui attaque, type, `canonical_ref` de la
-//! décision attaquée, cible résolue quand elle existe). Écrits par l'ingest
-//! (remplacement par décision, comme les citations), résolus à l'écriture
-//! puis en batch (`resolve_pending_decision_links`) — une décision qui arrive
-//! « attire » les liens pendants qui la visent.
+//! Liens de chronologie entre décisions : une ligne `decision_links` =
+//! (décision qui attaque, type, `canonical_ref` de la décision attaquée, cible
+//! résolue quand elle existe). Écrits par l'ingest (remplacement par décision,
+//! comme les citations), résolus à l'écriture puis en batch
+//! (`resolve_pending_decision_links`) — une décision qui arrive « attire » les
+//! liens pendants qui la visent.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,20 +22,24 @@ impl DecisionRepository<'_> {
         &self,
         decision_id: i64,
         links: Option<&[DecisionLinkRow]>,
-    ) -> Result<()> {
+    ) -> Result<Vec<i64>> {
         self.replace_decision_links_bulk(&[(decision_id, links.map(<[_]>::to_vec))])
             .await
     }
 
     /// Écrit les liens d'un lot de décisions : garde jamais-dégrader
     /// (version > `EXTRACT_VERSION` = révision manuelle, jamais remplacée),
-    /// skip des sets `(link_type, target_ref)` inchangés (la passe intégrale
-    /// hebdo ne doit pas churner), puis DELETE + INSERT et résolution des
-    /// cibles fraîchement écrites. Idempotent.
+    /// skip des sets `(link_type, target_ref)` inchangés, puis DELETE + INSERT
+    /// et résolution des cibles fraîchement écrites. Idempotent. Rend les
+    /// décisions RÉELLEMENT réécrites, pour que l'appelant date leur page du
+    /// jour.
     #[tracing::instrument(name = "db.replace_decision_links_bulk", skip(self, items), fields(db.system = "postgresql", items = items.len()))]
-    pub async fn replace_decision_links_bulk(&self, items: &[DecisionLinkWriteItem]) -> Result<()> {
+    pub async fn replace_decision_links_bulk(
+        &self,
+        items: &[DecisionLinkWriteItem],
+    ) -> Result<Vec<i64>> {
         if items.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
         let protected: HashSet<i64> = self
@@ -82,7 +86,7 @@ impl DecisionRepository<'_> {
             })
             .collect();
         if changed.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let changed_ids: Vec<i64> = changed.iter().map(|(id, _)| *id).collect();
@@ -122,7 +126,7 @@ impl DecisionRepository<'_> {
                 .execute(RESOLVE_SQL_FOR_DECISIONS, &[&changed_ids])
                 .await?;
         }
-        Ok(())
+        Ok(changed_ids)
     }
 
     /// Résout en batch tous les liens pendants dont la cible est arrivée en
@@ -134,6 +138,14 @@ impl DecisionRepository<'_> {
         let n = self.conn.execute(RESOLVE_SQL_ALL, &[]).await?;
         Ok(n)
     }
+
+    /// Jumeau par CLÉ (sonde inversée) : liens pendants dont le `target_ref`
+    /// est dans le lot — l'index partiel `decision_links_pending_target_idx`
+    /// sert la sonde. Même sémantique d'unicité que le sweep.
+    pub(super) async fn resolve_decision_links_by_key(&self, refs: &[String]) -> Result<u64> {
+        let n = self.conn.execute(RESOLVE_SQL_FOR_KEYS, &[&refs]).await?;
+        Ok(n)
+    }
 }
 
 const RESOLVE_SQL_FOR_DECISIONS: &str = "
@@ -143,6 +155,14 @@ const RESOLVE_SQL_FOR_DECISIONS: &str = "
         WHERE d.canonical_ref = dl.target_ref AND d.deleted_at IS NULL
         HAVING count(*) = 1)
     WHERE dl.decision_id = ANY($1) AND dl.target_decision_id IS NULL";
+
+const RESOLVE_SQL_FOR_KEYS: &str = "
+    UPDATE decision_links dl
+    SET target_decision_id = (
+        SELECT min(d.id) FROM decisions d
+        WHERE d.canonical_ref = dl.target_ref AND d.deleted_at IS NULL
+        HAVING count(*) = 1)
+    WHERE dl.target_ref = ANY($1) AND dl.target_decision_id IS NULL";
 
 const RESOLVE_SQL_ALL: &str = "
     UPDATE decision_links dl

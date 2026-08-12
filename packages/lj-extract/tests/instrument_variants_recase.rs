@@ -1,9 +1,3 @@
-//! Oracle de régression normalisation (ADR 0077) : 311 variantes d'instruments
-//! réellement vues en prod (≥10 refs), mal orthographiées / tronquées / à prose
-//! collée, classées par subagents puis auditées Opus. Chacune DOIT se recoller
-//! à son code canonique via `normalize_instrument` (règle squelette + table
-//! d'alias embarquée). Fige les ~96 k références prod ainsi récupérées.
-
 use serde::Deserialize;
 
 #[derive(Deserialize)]

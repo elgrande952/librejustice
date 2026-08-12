@@ -38,19 +38,19 @@ pub const REEXTRACTABLE_FIELDS: &[&str] = &[
 ];
 
 /// Champ ré-extractible routé vers `replace_citations` (pas une colonne JSONB sur
-/// `decisions`, cf. ADR 0033 / 0112 P5).
+/// `decisions`).
 pub(super) const LEGAL_REFS_FIELD: &str = "legal_references";
 
 /// Champ ré-extractible routé vers `replace_decision_links` (table
-/// `decision_links`, ADR 0161).
+/// `decision_links`).
 pub(super) const DECISION_LINKS_FIELD: &str = "decision_links";
 
 /// Champ ré-extractible routé vers `replace_case_citations` (table
-/// `case_citation`, ADR 0165).
+/// `case_citation`).
 pub(super) const CASE_CITATIONS_FIELD: &str = "case_citations";
 
 /// Champ ré-extractible routé vers `replace_decision_parties` (table
-/// `decision_party`, ADR 0182).
+/// `decision_party`).
 pub(super) const PARTIES_FIELD: &str = "parties";
 
 /// Types PG des colonnes ré-extractibles. Sert à caster la première ligne de
@@ -77,7 +77,7 @@ pub(super) fn extracted_column_type(field: &str) -> &'static str {
 }
 
 /// Valeur d'une colonne ré-extractible, boxée pour le binding tokio-postgres.
-/// Réplique `_extracted_field_values` : routage champ → valeur SQL.
+/// Routage champ → valeur SQL.
 pub(super) fn extracted_field_value(
     extracted: &ExtractedFields,
     field: &str,
@@ -97,8 +97,8 @@ pub(super) fn extracted_field_value(
         "legal_domain_uid" => Box::new(extracted.legal_domain_uid.clone()),
         "publication_uid" => Box::new(extracted.publication_uid.clone()),
         // Le code canonique exige la résolution `source_code` → `code` via
-        // `ensure_jurisdictions` (ADR 0201) : les appelants spécialisent ce
-        // champ avant d'arriver ici.
+        // `ensure_jurisdictions` : les appelants spécialisent ce champ avant d'arriver
+        // ici.
         "jurisdiction_code" => unreachable!("jurisdiction_code se résout via ensure_jurisdictions"),
         "applicant_counsel_names" => Box::new(extracted.applicant_counsel_names.clone()),
         "applicant_law_firms" => Box::new(extracted.applicant_law_firms.clone()),
@@ -113,8 +113,8 @@ pub(super) fn extracted_field_value(
 }
 
 /// Dérive le nom de source d'un `source_uid` à partir de son préfixe. Les fonds
-/// DILA (ADR 0093) encodent `<fond>/<ID DILA>` ; les autres provenances héritent
-/// du repli `opendata`.
+/// DILA encodent `<fond>/<ID DILA>` ; les autres provenances héritent du repli
+/// `opendata`.
 pub fn source_from_source_uid(source_uid: &str) -> &'static str {
     if source_uid.starts_with("judilibre/") {
         "judilibre"
@@ -134,6 +134,8 @@ pub fn source_from_source_uid(source_uid: &str) -> &'static str {
         "ariane-web"
     } else if source_uid.starts_with("adde/") {
         "adde"
+    } else if source_uid.starts_with("juricaf/") {
+        "juricaf"
     } else {
         "opendata"
     }
@@ -170,7 +172,7 @@ pub(super) fn legal_article_row_from_row(r: tokio_postgres::Row) -> super::types
     }
 }
 
-/// Timestamp courant UTC (réplique `_now()` Python : tz-aware UTC).
+/// Timestamp courant UTC (tz-aware).
 pub(super) fn now() -> DateTime<Utc> {
     Utc::now()
 }
@@ -198,7 +200,6 @@ mod tests {
             {
                 continue;
             }
-            // Ne panique pas → couverture complète.
             let _ = extracted_column_type(f);
         }
     }

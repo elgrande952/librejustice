@@ -1,6 +1,5 @@
-//! Endpoints `/me/*` — lecture, mise à jour et suppression du profil utilisateur
-//! (port de `me.py`). Cf. ADR 0036 (création/JIT), 0039 (suppression + RGPD),
-//! 0056 (toggle d'enregistrement d'activité).
+//! Endpoints `/me/*` — lecture, mise à jour et suppression du profil
+//! utilisateur.
 //!
 //! Les handlers axum vivent dans `routes.rs` ; ce module porte la logique
 //! d'accès aux données + Supabase, exposée comme fonctions de service prenant le
@@ -16,16 +15,16 @@ use crate::config::Settings;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Formate un timestamp Postgres `TIMESTAMPTZ` en RFC 3339 (parité avec la
-/// sérialisation JSON Pydantic d'un `datetime.datetime`).
+/// Formate un timestamp Postgres `TIMESTAMPTZ` en RFC 3339.
 pub(crate) fn ts_to_rfc3339(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// Lit le profil utilisateur (parité `_fetch_profile`).
+/// Lit le profil utilisateur.
 ///
 /// Renvoie [`ApiError::NotFound`] si la ligne est absente (théoriquement
-/// impossible : `required_user` vient de provisionner — `detail=profile_missing`).
+/// impossible : [`RequiredUser`] vient de provisionner —
+/// `detail=profile_missing`).
 pub async fn fetch_profile(pool: &Pool, sub: &str) -> Result<UserProfile, ApiError> {
     let conn = pool
         .get()
@@ -50,13 +49,12 @@ pub async fn fetch_profile(pool: &Pool, sub: &str) -> Result<UserProfile, ApiErr
     })
 }
 
-/// `GET /me` (parité `get_me`).
+/// `GET /me`.
 pub async fn get_me(state: &AppState, user_sub: &str) -> Result<UserProfile, ApiError> {
     fetch_profile(&state.pool, user_sub).await
 }
 
-/// `PATCH /me` — met à jour le `display_name` puis relit le profil (parité
-/// `patch_me`).
+/// `PATCH /me` — met à jour le `display_name` puis relit le profil.
 pub async fn patch_me(
     state: &AppState,
     user_sub: &str,
@@ -78,10 +76,9 @@ pub async fn patch_me(
     fetch_profile(&state.pool, user_sub).await
 }
 
-/// `PUT /me/activity-tracking` — active/désactive l'enregistrement d'activité
-/// (ADR 0056). Désactiver = mode ZDR : on coupe le tracking **et** on purge tout
-/// l'existant (recherches, lectures, signets) dans une seule transaction (parité
-/// `set_activity_tracking`).
+/// `PUT /me/activity-tracking` — active/désactive l'enregistrement d'activité.
+/// Désactiver = mode ZDR : on coupe le tracking **et** on purge tout l'existant
+/// (recherches, lectures, signets) dans une seule transaction.
 pub async fn set_activity_tracking(
     state: &AppState,
     user_sub: &str,
@@ -130,8 +127,7 @@ pub async fn set_activity_tracking(
     fetch_profile(&state.pool, user_sub).await
 }
 
-/// Supprime l'utilisateur dans Supabase Auth via l'Admin API (parité
-/// `_delete_supabase_user`).
+/// Supprime l'utilisateur dans Supabase Auth via l'Admin API.
 ///
 /// Requiert `supabase_url` + `supabase_secret_key`. Strictement côté serveur.
 /// 200/204 attendus ; 404 toléré (déjà supprimé → idempotence) ; tout autre code
@@ -143,7 +139,6 @@ async fn delete_supabase_user(cfg: &Settings, sub: &str) -> Result<(), ApiError>
     ) {
         (Some(u), Some(k)) => (u, k),
         _ => {
-            // 503 account_deletion_unavailable côté Python.
             return Err(ApiError::Internal("account_deletion_unavailable".into()));
         }
     };
@@ -177,7 +172,7 @@ async fn delete_supabase_user(cfg: &Settings, sub: &str) -> Result<(), ApiError>
     Ok(())
 }
 
-/// `DELETE /me` — suppression définitive du compte (parité `delete_me`).
+/// `DELETE /me` — suppression définitive du compte.
 ///
 /// Ordre : Supabase Auth d'abord (échec → DB locale intacte, l'utilisateur peut
 /// retenter). Puis `DELETE FROM users` qui cascade sur bookmarks / history /

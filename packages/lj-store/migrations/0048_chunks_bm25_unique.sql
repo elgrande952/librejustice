@@ -1,4 +1,4 @@
--- Migration 0048 — Index BM25 unique consolidé (ADR 0073).
+-- Migration 0048 — Index BM25 unique consolidé.
 --
 -- ``chunks_bm25`` devient le SEUL index BM25 : il absorbe le titre
 -- (``search_title`` dénormalisé sur le chunk 0 — un doc-titre par décision,
@@ -20,9 +20,9 @@
 -- et ``paradedb.parse`` analyse les phrases avec le tokenizer du champ → une
 -- phrase avec stopwords matche exactement comme avant ; en OR les stopwords
 -- sont ignorés (plus de pollution BM25) ; stopword seul → 0 résultat sans
--- erreur. Cf. ADR 0073.
+-- erreur.
 --
--- ⚠️ Fenêtre de maintenance : ``@@@`` est indisponible du DROP au CREATE
+-- Fenêtre de maintenance : ``@@@`` est indisponible du DROP au CREATE
 -- (lexical/hybrid en échec, ~30-60 min). Les DROP précèdent le backfill :
 -- l'UPDATE de ~3 M de lignes tourne sans maintenance BM25/GIN (leçon de 0047,
 -- où le GIN créé avant le backfill l'avait étiré à 75 min).

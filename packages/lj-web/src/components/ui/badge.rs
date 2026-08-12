@@ -1,10 +1,8 @@
-//! `Badge` (port de `ui/badge.tsx`). CVA -> `badge_classes`.
-
 use leptos::prelude::*;
 
 use crate::helpers::cn;
 
-/// Tonalite. Defaut : `Neutral` (= `defaultVariants.tone`).
+/// Tonalite. Defaut : `Neutral`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum BadgeTone {
     #[default]
@@ -34,7 +32,7 @@ fn tone_classes(tone: BadgeTone) -> &'static str {
     }
 }
 
-/// Classes completes d'un badge (port de `badgeVariants` + `cn(…, className)`).
+/// Classes completes d'un badge.
 pub fn badge_classes(tone: BadgeTone, extra: &str) -> String {
     cn([BASE, tone_classes(tone), extra])
 }

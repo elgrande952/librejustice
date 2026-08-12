@@ -1,4 +1,4 @@
-//! BOFiP-Impôts (ADR 0196) : doctrine fiscale DGFiP opposable (LPF, art. L. 80 A).
+//! BOFiP-Impôts : doctrine fiscale DGFiP opposable (LPF, art. L. 80 A).
 //!
 //! Source : dataset open data **`bofip-vigueur`** (data.economie.gouv.fr,
 //! licence ouverte) — un record par publication doctrinale **en vigueur**
@@ -40,7 +40,7 @@ const BOFIP_USER_AGENT: &str = "librejustice-ingest/1.0 (+https://librejustice.f
 /// Télécharge l'export JSONL `bofip-vigueur` sous `dir` (streamé, RAM
 /// ~constante). Toujours re-téléchargé : le dataset est un snapshot vivant
 /// (publications en vigueur), pas un fond incrémental — l'idempotence vit dans
-/// l'upsert par `content_checksum` (#7).
+/// l'upsert par `content_checksum`.
 pub fn fetch_bofip_vigueur(dir: &Path) -> Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let dst = dir.join("bofip-vigueur.jsonl");
@@ -66,7 +66,7 @@ pub fn fetch_bofip_vigueur(dir: &Path) -> Result<PathBuf> {
     Ok(dst)
 }
 
-/// Record brut du dataset (frontière serde, #12).
+/// Record brut du dataset (frontière serde).
 #[derive(Debug, Deserialize)]
 pub struct BofipRecord {
     #[serde(rename = "type")]
@@ -111,7 +111,7 @@ pub struct BofipDoc {
 }
 
 /// Parse une ligne JSONL de l'export. `Ok(None)` = record hors périmètre
-/// (`type=Actualité`). Champ d'identité manquant = erreur franche (#12).
+/// (`type=Actualité`). Champ d'identité manquant = erreur franche.
 pub fn parse_bofip_record(line: &str) -> Result<Option<BofipDoc>> {
     let rec: BofipRecord = serde_json::from_str(line)
         .map_err(|e| SourceError::Invalid(format!("record bofip illisible: {e}")))?;
@@ -255,8 +255,6 @@ mod tests {
             <p class=""paragraphe-western"">Contenu du § 10, phrase A.</p>
             <p class=""paragraphe-western"">Phrase B.</p>"#;
         let (pre, paras) = split_paragraphs(html);
-        // Le préambule = le texte avant le premier §, intertitres exclus
-        // (« I. Section » devient le chemin de section des §).
         assert_eq!(pre.as_deref(), Some("Intro du document."));
         assert_eq!(paras.len(), 2);
         assert_eq!(paras[0].num, "1");
@@ -270,8 +268,6 @@ mod tests {
 
     #[test]
     fn intertitres_hierarchie_et_hors_texte() {
-        // h2 entre le § 30 et le § 40 : il sort du texte du § 30 et entre dans
-        // le chemin du § 40 ; un h1 suivant vide la pile (dépile les niveaux ≥).
         let html = r#"<h1>I. Premier</h1>
             <p class=""numero-de-paragraphe-western"">30</p>
             <p>Fin du § 30.</p>
@@ -292,9 +288,6 @@ mod tests {
 
     #[test]
     fn paragraphe_porte_numero_conserve_et_rattache_a_sa_section() {
-        // Layout BOFiP fréquent : le marqueur de § précède l'intertitre qu'il
-        // étiquette (« 20 » devant « II. … »). Le § reste (ancre citable,
-        // texte vide) et adopte la section qu'il ouvre.
         let html = r#"<p class=""numero-de-paragraphe-western"">10</p>
             <p>Corps du § 10.</p>
             <p class=""numero-de-paragraphe-western"">20</p>

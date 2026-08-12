@@ -1,5 +1,5 @@
 -- Migration 0107 — DROP des colonnes facettes ancien-monde + mort de l'axe
--- instance (ADR 0148 §5, ADR 0151, #29).
+-- instance.
 --
 -- v12 : les scanners émettent les uids référentiels directement
 -- (solution_uid/voie_uid/office_uid/legal_domain_uid) — les colonnes TEXT
@@ -10,7 +10,7 @@
 -- uid (hors AUTRE mappé vers rien par design) — le DROP ne perd aucune donnée.
 -- `defendant_administration` sort aussi : hors matrice NER retenue
 -- ({applicant,defendant} × {counsel_names,law_firms,companies}) ; la donnée
--- gold reste dans les fichiers LFS par-décision (ADR 0152).
+-- gold reste dans les fichiers LFS par-décision.
 --
 -- `decisions_bm25` portait les 4 colonnes en fast fields littéraux → DROP +
 -- CREATE (même fenêtre que 0081 : lock AccessExclusive le temps du build,
@@ -78,7 +78,7 @@ ALTER TABLE decisions
     DROP COLUMN IF EXISTS instance_uid,
     DROP COLUMN IF EXISTS defendant_administration;
 
--- 5. Vocabulaire instance:* (l'axe disparaît, ADR 0151).
+-- 5. Vocabulaire instance:* (l'axe disparaît).
 DELETE FROM facet_value WHERE uid LIKE 'instance:%';
 
 CREATE INDEX decisions_bm25 ON decisions

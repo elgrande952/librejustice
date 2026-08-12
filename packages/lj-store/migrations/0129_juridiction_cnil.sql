@@ -1,4 +1,4 @@
--- Migration 0129 — CNIL comme juridiction de décision (ADR 0185).
+-- Migration 0129 — CNIL comme juridiction de décision.
 --
 -- Nouveau `juridiction_type = CNIL` (délibérations/décisions de la CNIL, fond
 -- bulk DILA `dila-cnil`). Deux effets :

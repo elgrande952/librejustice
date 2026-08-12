@@ -1,25 +1,31 @@
-//! Layout 3 colonnes de la page décision. Port de `decision-layout.tsx`.
+//! Layout 3 colonnes de la page décision (et de la page texte, `law_page`).
 use leptos::prelude::*;
 
-/// Grille `toc | main | similar`.
+use crate::components::layout::{GRID_3COL, SHELL};
+
+/// Grille `toc | main | similar`. La stickiness est l'affaire de chaque
+/// colonne : le sommaire est sticky, la colonne similaires défile avec la
+/// page.
 ///
-/// Sur mobile (colonnes empilées), le contenu principal passe AVANT le
-/// sommaire/contexte : le lecteur atterrit sur ce qu'il a cliqué, les rails
-/// (sommaire, chronologie, versions) suivent. Sur desktop l'ordre visuel
-/// redevient `toc | main | similar`.
+/// Sur mobile (colonnes empilées), les rails desktop disparaissent : le
+/// sommaire et les actions sont ré-injectés DANS le flux principal par la page
+/// (entre « Parties » et le texte), et les décisions similaires suivent le
+/// contenu — l'ordre de lecture mobile est linéaire.
+///
+/// La colonne centrale est bornée à `max-w-3xl` en grille 3 colonnes — la même
+/// mesure de lecture que `CONTENT_COL` des pages de recherche. Sous `lg`
+/// (colonne unique) et à l'impression, pleine largeur.
 ///
 /// `w-full` est nécessaire : la grille est enfant flex du `<main>` (colonne), et
 /// `mx-auto` y désactive l'étirement cross-axis (spec flexbox) → largeur
-/// fit-content. Le contenu réel (texte long) atteint quand même `max-w`, mais le
-/// skeleton (barres en largeurs %) s'effondrait sur ses seules largeurs fixes
-/// (~1018px, colonne centrale ~400px) au lieu de remplir les 92rem.
+/// fit-content.
 #[component]
 pub fn DecisionLayout(toc: AnyView, main: AnyView, similar: AnyView) -> impl IntoView {
     view! {
-        <div class="mx-auto grid w-full max-w-[92rem] gap-8 px-4 py-8 sm:px-6 lg:grid-cols-[240px_minmax(0,1fr)_280px] lg:gap-12 lg:px-8 print:block print:max-w-none print:p-0">
-            <div class="order-2 lg:order-1 print:hidden">{toc}</div>
-            <div class="order-1 min-w-0 lg:order-2">{main}</div>
-            <div class="order-3 print:hidden">{similar}</div>
+        <div class=format!("{SHELL} {GRID_3COL} print:block print:max-w-none print:p-0")>
+            <div class="hidden lg:block print:hidden">{toc}</div>
+            <div class="w-full min-w-0 lg:max-w-3xl print:max-w-none">{main}</div>
+            <div class="print:hidden">{similar}</div>
         </div>
     }
 }

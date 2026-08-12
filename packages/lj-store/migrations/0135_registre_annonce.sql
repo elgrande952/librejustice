@@ -1,7 +1,7 @@
--- ADR 0197 : annonces des registres (BODACC, JOAFE, comptes des associations).
+-- Annonces des registres (BODACC, JOAFE, comptes des associations).
 -- Couche *événements* du référentiel d'entités : une ligne par annonce
 -- publiée, liée aux entités par uid déterministe (siren:…, rna:…), sans FK
--- (les registres sont rechargés par remplacement de namespace, ADR 0179).
+-- (les registres sont rechargés par remplacement de namespace).
 
 CREATE TABLE registre_annonce (
     id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -30,7 +30,7 @@ CREATE INDEX registre_annonce_famille_idx ON registre_annonce (registre, famille
 CREATE INDEX registre_annonce_source_file_idx ON registre_annonce (source_file);
 
 -- Suivi d'ingest par membre bulk : un re-run saute les fichiers au checksum
--- inchangé (xxh3-64 du XML brut, règle #7).
+-- inchangé (xxh3-64 du XML brut).
 CREATE TABLE registre_annonce_file (
     file_name   TEXT PRIMARY KEY,
     checksum    BIGINT NOT NULL,

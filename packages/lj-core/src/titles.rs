@@ -1,12 +1,12 @@
-//! Composition canonique du titre de décision (ADR 0049 / 0170) — partagée
-//! par l'API (affichage à la lecture) et l'ingest (écriture de
-//! `search_title`) : une seule fonction, un seul format.
+//! Composition canonique du titre de décision — partagée par l'API (affichage à
+//! la lecture) et l'ingest (écriture de `search_title`) : une seule fonction, un
+//! seul format.
 //!
 //! Format : `<juridiction>[, <siège>], <date FR>, <premier numéro>` — p. ex.
 //! « Cour d'appel de Paris, pôle 5 — 3e chambre · formation à trois,
 //! 25 février 2026, 21/04532 ». Le siège est recomposé depuis les axes
-//! structurés (`chamber_position` + labels `formation:*` / `office:*`),
-//! jamais depuis une chaîne source.
+//! structurés (`chamber_position` + labels `formation:*` / `office:*`), jamais
+//! depuis une chaîne source.
 
 const FR_MONTHS: [&str; 12] = [
     "janvier",
@@ -42,8 +42,8 @@ pub fn format_fr_date(date_lecture: &str) -> String {
 }
 
 /// Labels des types de formation `formation:*` — miroir exact du seed
-/// `facet_value` (migration 0117) ; la table Rust sert l'écriture ingest
-/// (`search_title`) sans aller-retour DB.
+/// `facet_value` ; la table Rust sert l'écriture ingest (`search_title`) sans
+/// aller-retour DB.
 pub const FORMATION_LABELS: &[(&str, &str)] = &[
     ("formation:A_TROIS", "Formation à trois"),
     ("formation:A_CINQ", "Formation à cinq"),
@@ -59,7 +59,7 @@ pub const FORMATION_LABELS: &[(&str, &str)] = &[
     ("formation:SPECIALISEE", "Formation spécialisée"),
 ];
 
-/// Labels des offices `office:*` — miroir du référentiel (seeds 0107/0117).
+/// Labels des offices `office:*` — miroir du référentiel.
 pub const OFFICE_LABELS: &[(&str, &str)] = &[
     ("office:JLD", "Juge des libertés et de la détention"),
     ("office:JAF", "Juge aux affaires familiales"),
@@ -76,9 +76,9 @@ pub const OFFICE_LABELS: &[(&str, &str)] = &[
     ("office:JUGE_EXPROPRIATION", "Juge de l'expropriation"),
 ];
 
-/// Labels des types de juridiction — miroir du seed `facet_value`
-/// (migration 0102) ; repli du titre quand la décision ne porte pas de nom de
-/// juridiction extrait (CEDH, CJUE, CONSTIT, TC…).
+/// Labels des types de juridiction — miroir du seed `facet_value` ; repli du
+/// titre quand la décision ne porte pas de nom de juridiction extrait (CEDH,
+/// CJUE, CONSTIT, TC…).
 pub const JURISDICTION_TYPE_LABELS: &[(&str, &str)] = &[
     ("CE", "Conseil d'État"),
     ("CAA", "Cour administrative d'appel"),
@@ -162,16 +162,14 @@ fn formation_redundant(base: &str, formation: &str) -> bool {
         .all(|t| base_tokens.contains(&t))
 }
 
-/// Siège recomposé depuis les axes structurés (ADR 0170) :
-/// `chamber_position`, qualifié après un point médian par le type de formation
-/// ou à défaut l'office (« 7e chambre · juge des libertés et de la détention »)
-/// — le « · » (et non des parenthèses) évite les parenthèses imbriquées quand le
-/// titre est lui-même cité entre parenthèses ; sans position, formation puis
-/// office. Les redondances tombent par
-/// comparaison pliée — la chambre déjà portée par le label de juridiction
-/// (« Cour de cassation, deuxième chambre civile ») n'est pas répétée, une
-/// position « Sous-sections 2/6 réunies » n'est pas suffixée
-/// « (sous-sections réunies) ».
+/// Siège recomposé depuis les axes structurés : `chamber_position`, qualifié
+/// après un point médian par le type de formation ou à défaut l'office
+/// (« 7e chambre · juge des libertés et de la détention ») — le « · » évite les
+/// parenthèses imbriquées quand le titre est lui-même cité entre parenthèses ;
+/// sans position, formation puis office. Les redondances tombent par comparaison
+/// pliée : la chambre déjà portée par le label de juridiction (« Cour de
+/// cassation, deuxième chambre civile ») n'est pas répétée, une position
+/// « Sous-sections 2/6 réunies » n'est pas suffixée « (sous-sections réunies) ».
 pub fn seat_display(
     jurisdiction: &str,
     chamber_position: Option<&str>,
@@ -254,7 +252,6 @@ mod tests {
 
     #[test]
     fn seat_cc_chambre_deja_dans_la_juridiction() {
-        // Le label référentiel cass_civ2 porte déjà la chambre.
         let seat = seat_display(
             "Cour de cassation, deuxième chambre civile",
             Some("Deuxième chambre civile"),
@@ -323,8 +320,6 @@ mod tests {
 
     #[test]
     fn seat_office_prime_sans_position() {
-        // « Chamb. référés (sup 10 000) » : office juge des référés + régime
-        // juge unique — le rôle fait le siège.
         let seat = seat_display(
             "Tribunal judiciaire de Lyon",
             None,

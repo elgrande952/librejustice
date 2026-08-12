@@ -1,7 +1,7 @@
--- Migration 0054 — Drops post-cutover grain décision (ADR 0084 étape 4 + 0085).
+-- Migration 0054 — Drops post-cutover grain décision (étape 4).
 --
 -- Récupère l'espace des trois supports rendus redondants par la refonte « texte
--- au grain décision » (ADR 0084) et « payload reconstructible » (ADR 0085) :
+-- au grain décision » et « payload reconstructible » :
 --
 --   1. ``chunks_bm25`` (~11 GB) — la recherche BM25 passe par ``decisions_bm25``
 --      (0053, grain décision) ; plus aucune jambe n'interroge l'index chunk.
@@ -14,7 +14,7 @@
 --      (banc ``reextract-parity`` : 0 divergence / 2993, dont 1965 JSON).
 --      ``payload_format`` est conservé (choix du reconstructeur côté re-extract).
 --
--- ⚠️ PRÉREQUIS (sinon casse la prod) : déployer AVANT cette migration le code
+-- PRÉREQUIS (sinon casse la prod) : déployer AVANT cette migration le code
 -- qui (a) ne lit plus ``body``/``chunks_bm25`` (cutover recherche/render, jambes
 -- sur ``decisions_bm25``, lecteurs offline sur ``full_text``), (b) n'écrit plus
 -- ``body`` ni ``source_payload_gzip`` à l'ingest, et (c) reconstruit le download

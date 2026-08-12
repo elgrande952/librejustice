@@ -25,6 +25,39 @@ pub fn site_default() -> PageMeta {
     }
 }
 
+/// JSON-LD d'entité, posé sur l'accueil : une `Organization` et un `WebSite`
+/// liés par `@id`. Les `sameAs` listent les endroits où le nom LibreJustice est
+/// déjà porté ailleurs (dépôt, réutilisation data.gouv, annuaire MCP), ce qui
+/// rattache ces profils au domaine pour un moteur.
+pub const SITE_JSONLD: &str = r#"{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "@id": "https://librejustice.fr/#organization",
+      "name": "LibreJustice",
+      "alternateName": "Libre Justice",
+      "url": "https://librejustice.fr/",
+      "logo": "https://librejustice.fr/icon-192.png",
+      "sameAs": [
+        "https://github.com/librejustice",
+        "https://github.com/librejustice/librejustice",
+        "https://www.data.gouv.fr/reuses/librejustice-moteur-de-recherche-libre-sur-la-jurisprudence-et-les-textes-de-loi-francais",
+        "https://glama.ai/mcp/servers/fnxeb5mhsh"
+      ]
+    },
+    {
+      "@type": "WebSite",
+      "@id": "https://librejustice.fr/#website",
+      "name": "LibreJustice",
+      "alternateName": "Libre Justice",
+      "url": "https://librejustice.fr/",
+      "inLanguage": "fr-FR",
+      "publisher": { "@id": "https://librejustice.fr/#organization" }
+    }
+  ]
+}"#;
+
 /// Meta de la page 404 (noindex).
 pub fn not_found_meta() -> PageMeta {
     PageMeta {

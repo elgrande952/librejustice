@@ -1,7 +1,7 @@
-//! Rôles des textes publiés (ADR 0246) : backfill rejouable de
-//! `legal_text.role` (classification v1 conservatrice par motifs de titre +
-//! arêtes `legal_link`) et alignement de `legal_link.verb` sur le repli
-//! verbe/nom courant. Exposé en commande `backfill-text-roles`.
+//! Rôles des textes publiés : backfill rejouable de `legal_text.role`
+//! (classification conservatrice par motifs de titre + arêtes `legal_link`) et
+//! alignement de `legal_link.verb` sur le repli verbe/nom courant. Exposé en
+//! commande `backfill-text-roles`.
 
 use anyhow::{anyhow, Result};
 use lj_store::repository::DecisionRepository;
@@ -17,19 +17,24 @@ pub async fn backfill_text_roles() -> Result<()> {
     lj_store::migrator::apply_migrations(&conn)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
-    // Passes pleine-table sur 1,4 M de titres : au-delà du statement_timeout
-    // de 30 s du pool.
+    // Passes pleine-table sur l'ensemble des titres : au-delà du
+    // statement_timeout de 30 s du pool.
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
     let repo = DecisionRepository::new(&conn);
-    let (individuel, habilitation, vehicule) = repo.backfill_text_roles().await?;
+    let (individuel, habilitation, vehicule, modificatif) = repo.backfill_text_roles().await?;
     let verbs = repo.normalize_link_verbs().await?;
+    // `legal_article.searchable` dépend du rôle : un rôle reclassé doit
+    // re-dénormaliser les articles du texte.
+    let denorm = repo.refresh_article_denorm().await?;
     tracing::info!(
         individuel,
         habilitation,
         vehicule,
+        modificatif,
         verbs_alignes = verbs,
+        denorm,
         "rôles des textes backfillés"
     );
     Ok(())

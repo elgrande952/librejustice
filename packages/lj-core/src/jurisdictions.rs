@@ -1,11 +1,10 @@
-//! Détection des juridictions étrangères nommées dans une requête de
-//! recherche de textes. Le corpus normatif mélange droit applicable en France
-//! (FR, UE, INTL) et codes étrangers francophones ou traduits (~60 pays) dont
-//! la rédaction napoléonienne matche mot pour mot les requêtes françaises —
-//! sans prior, « responsabilité du fait des choses » sort le code civil belge
-//! avant l'article 1242. Le ranking déclasse donc l'étranger **sauf si la
-//! requête nomme le pays** : cette table pays/gentilé → code ISO (celle du
-//! champ `legal_text.jurisdiction`) porte la détection. Pur, sans I/O.
+//! Détection des juridictions étrangères nommées dans une requête de recherche
+//! de textes. Le corpus normatif mélange droit applicable en France (FR, UE,
+//! INTL) et codes étrangers francophones ou traduits dont la rédaction
+//! napoléonienne matche mot pour mot les requêtes françaises. Le ranking
+//! déclasse donc l'étranger **sauf si la requête nomme le pays** : cette table
+//! pays/gentilé → code ISO (celle du champ `legal_text.jurisdiction`) porte la
+//! détection. Pur, sans I/O.
 
 use crate::text::fold;
 
@@ -87,12 +86,11 @@ pub fn query_jurisdictions(query: &str) -> Vec<&'static str> {
 
 /// Comme [`query_jurisdictions`], mais renvoie aussi la requête **débarrassée
 /// des tokens pays/gentilé** (tokens d'origine, casse/accents préservés) —
-/// l'entrée de la jambe « pays nommé » du ranking (ADR 0238) : dans
-/// « conditions du divorce au sénégal », le token « sénégal » désigne le
-/// corpus, pas le contenu — les articles de fond du divorce sénégalais ne le
-/// contiennent pas et le BM25 favorise les docs qui le portent (conventions
-/// fiscales…). `None` si aucun pays nommé ; si rien ne subsiste après retrait
-/// (requête réduite au pays), la requête d'origine est renvoyée telle quelle.
+/// l'entrée de la jambe « pays nommé » du ranking : dans « conditions du divorce
+/// au sénégal », le token « sénégal » désigne le corpus, pas le contenu — les
+/// articles de fond du divorce sénégalais ne le contiennent pas. `None` si aucun
+/// pays nommé ; si rien ne subsiste après retrait (requête réduite au pays), la
+/// requête d'origine est renvoyée telle quelle.
 pub fn strip_query_jurisdictions(query: &str) -> Option<(Vec<&'static str>, String)> {
     let folded = fold(query);
     if folded.is_empty() {
@@ -192,7 +190,6 @@ mod tests {
 
     #[test]
     fn short_exact_forms_do_not_prefix_match() {
-        // « mali » exact matche, « malice » non ; « niger » ≠ « nigeria ».
         assert_eq!(query_jurisdictions("code minier du mali"), vec!["ML"]);
         assert!(query_jurisdictions("malice et intention de nuire").is_empty());
         assert_eq!(query_jurisdictions("constitution du niger"), vec!["NE"]);
@@ -221,12 +218,10 @@ mod tests {
             strip_query_jurisdictions("droit du travail belge"),
             Some((vec!["BE"], "droit du travail".to_string()))
         );
-        // Sous-chaîne multi-mots : les deux tokens tombent.
         assert_eq!(
             strip_query_jurisdictions("successions aux pays bas"),
             Some((vec!["NL"], "successions aux".to_string()))
         );
-        // Requête réduite au pays : renvoyée telle quelle.
         assert_eq!(
             strip_query_jurisdictions("sénégal"),
             Some((vec!["SN"], "sénégal".to_string()))
@@ -240,7 +235,6 @@ mod tests {
     #[test]
     fn bilateral_compound_is_not_a_country() {
         use super::strip_query_jurisdictions;
-        // « franco-algérien » nomme un traité, pas le droit interne algérien.
         assert_eq!(
             strip_query_jurisdictions("accord franco-algérien certificat de résidence"),
             None
@@ -249,7 +243,6 @@ mod tests {
             strip_query_jurisdictions("convention franco-sénégalaise d'exequatur"),
             None
         );
-        // Pays nommé nu À CÔTÉ d'un composé : le composé ne compte pas, le nom nu si.
         assert_eq!(
             strip_query_jurisdictions("accord franco-algérien et droit algérien"),
             Some((vec!["DZ"], "accord franco algérien et droit".to_string()))

@@ -1,15 +1,15 @@
 //! Tokenizer body — parité exacte avec le tokenizer de l'index `chunks_bm25`
 //! (ParadeDB `regex([\p{L}\p{N}-]+) + ascii_folding`, stopwords tantivy `French`
-//! + `a`/`à` ; ADR 0073, migration 0048).
+//! + `a`/`à`).
 //!
 //! Vit ici (PUR) parce qu'il est partagé par DEUX chemins qui doivent folder
 //! et segmenter à l'identique, sous peine de drift silencieux :
 //! - la jambe BM25 body de `lj-api` (génération de la query `paradedb.parse`),
-//! - le mineur de collocations de `lj-bench` (qui foldé le corpus pour produire
+//! - le mineur de collocations de `lj-bench` (qui folde le corpus pour produire
 //!   le lexique embarqué par [`crate::collocations`]).
 //!
 //! Si les deux foldent différemment, une entrée de lexique ne matche jamais la
-//! query correspondante. Une seule implémentation → pas de drift.
+//! query correspondante.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -51,9 +51,9 @@ pub fn tokenize(query: &str) -> Vec<String> {
     tokenize_with(query, fold)
 }
 
-/// Mêmes frontières de tokens que [`tokenize`], mais lowercase **sans** fold
-/// des accents : la forme d'affichage des suggestions (ADR 0216). Les deux
-/// sorties sont alignées index à index.
+/// Mêmes frontières de tokens que [`tokenize`], mais lowercase **sans** fold des
+/// accents : la forme d'affichage des suggestions. Les deux sorties sont alignées
+/// index à index.
 pub fn tokenize_lower(query: &str) -> Vec<String> {
     tokenize_with(query, |s| s.to_lowercase())
 }
@@ -141,7 +141,6 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        // « de » splitte ; run gauche < 2 (tribunal seul) drop, run droit ≥ 2 gardé.
         let chunks = content_chunks(&toks, 2);
         assert_eq!(
             chunks,
@@ -159,7 +158,7 @@ mod tests {
     fn stopwords_are_folded_forms() {
         assert!(is_stopword("de"));
         assert!(is_stopword("la"));
-        assert!(is_stopword("a")); // ajout maison (a/à)
+        assert!(is_stopword("a"));
         assert!(!is_stopword("commerce"));
     }
 }

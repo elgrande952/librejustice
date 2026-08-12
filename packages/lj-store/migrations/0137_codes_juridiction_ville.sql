@@ -1,4 +1,4 @@
--- ADR 0201 : codes juridiction lisibles par ville.
+-- Codes juridiction lisibles par ville.
 --
 -- Les codes TJ/TCOM étaient les identifiants `location` Judilibre repris
 -- verbatim (`tj75056` = code INSEE de Paris, `tcom7501` = numéro de greffe),

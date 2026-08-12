@@ -1,4 +1,4 @@
-//! `Pagination` (port de `pagination.tsx`). Fenêtre de pages avec ellipses ;
+//! `Pagination` : fenêtre de pages avec ellipses ;
 //! chaque page est un point d'historique (replace=false) ; scroll top au clic.
 
 use leptos::prelude::*;
@@ -15,7 +15,7 @@ enum PageItem {
     Ellipsis,
 }
 
-/// Fenêtre `[1] … [current±2] … [total]`. Port verbatim de `buildPageRange`.
+/// Fenêtre `[1] … [current±2] … [total]`.
 fn build_page_range(current: u32, total: u32) -> Vec<PageItem> {
     if total <= 7 {
         return (1..=total).map(PageItem::Page).collect();
@@ -86,15 +86,13 @@ pub fn Pagination(
     #[prop(into)] total_pages: Signal<u32>,
 ) -> impl IntoView {
     let query_map = use_query_map();
-    // `navigate` (Send+Sync) stocké en `StoredValue` (SyncStorage) : le *handle*
-    // est Copy, donc les `Callback::new` (qui exigent Send+Sync) peuvent le
-    // capturer. `query_map` (Memo) est déjà Copy. NB : `new_local` (LocalStorage)
-    // donnerait une valeur attachée à l'owner courant, introuvable depuis le
-    // contexte détaché d'un `Callback` → `with_value` no-op silencieux (la nav ne
-    // partait pas). SyncStorage rend la valeur lisible partout.
+    // `navigate` (Send+Sync) stocké en `StoredValue` (SyncStorage) : le *handle* est
+    // Copy, donc les `Callback::new` (qui exigent Send+Sync) peuvent le capturer.
+    // `query_map` (Memo) est déjà Copy. `new_local` (LocalStorage) donnerait une
+    // valeur attachée à l'owner courant, introuvable depuis le contexte détaché d'un
+    // `Callback` ; SyncStorage la rend lisible partout.
     let nav: StoredValue<NavFn> = StoredValue::new(Box::new(use_navigate()) as NavFn);
-    // Helper Copy (capture seulement `nav` + `query_map`, deux handles Copy) :
-    // reconstruit dans chaque `Callback::new` sans déplacer un état partagé.
+    // Helper Copy (capture seulement `nav` + `query_map`, deux handles Copy).
     let go_to = move |page: u32| navigate_to_page(nav, query_map, page);
 
     view! {
@@ -207,7 +205,6 @@ mod tests {
 
     #[test]
     fn windowed_with_leading_ellipsis() {
-        // current=8, total=10 ⇒ [1, …, 6,7,8,9,10] (end touche total-1).
         let r = build_page_range(8, 10);
         assert_eq!(r[0], PageItem::Page(1));
         assert_eq!(r[1], PageItem::Ellipsis);
@@ -217,7 +214,6 @@ mod tests {
 
     #[test]
     fn windowed_with_both_ellipses() {
-        // current=5, total=10 ⇒ [1, …, 3,4,5,6,7, …, 10].
         let r = build_page_range(5, 10);
         assert_eq!(r[0], PageItem::Page(1));
         assert_eq!(r[1], PageItem::Ellipsis);

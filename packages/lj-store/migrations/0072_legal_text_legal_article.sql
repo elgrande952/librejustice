@@ -1,6 +1,6 @@
--- Migration 0072 — Référentiel → legal_text / legal_article (ADR 0112, phase A).
+-- Migration 0072 — Référentiel → legal_text / legal_article (phase A).
 --
--- ADR 0112 sépare IDENTITÉ (text_uid) et PROVENANCE (source, portée par version).
+-- On sépare IDENTITÉ (text_uid) et PROVENANCE (source, portée par version).
 -- Renomme referential_texts→legal_text, referential_articles→legal_article ; sort
 -- `source` de l'identité (source_uid GLOBALEMENT unique, vérifié 2026-06-18 :
 -- 1 392 582 lignes = 1 392 582 source_uid distincts, 0 collision) ; ajoute

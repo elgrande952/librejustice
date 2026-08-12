@@ -1,4 +1,4 @@
--- Migration 0100 — référentiels de facettes en base (ADR 0146).
+-- Migration 0100 — référentiels de facettes en base.
 --
 -- Modèle « lien » intégral : une table unique `facet_value` à uid namespacé
 -- (`domaine:CIVIL_DROIT_LOCATIF`, `solution:REJET`, …) avec vraie FK Postgres,
@@ -7,10 +7,12 @@
 -- juridiction elle-même pour les uniques). Les labels FR vivent ICI, plus dans
 -- le code (les trois fichiers labels.rs sont supprimés par la suite du chantier).
 --
--- Vocabulaires seedés (arbitrés 2026-07-02/03, ADR 0146 §2) :
---   domaine     : arbre de référence verbatim — 9 racines + 36 feuilles.
---   solution    : 17 valeurs — 15 de référence + Satisfaction totale/partielle.
---   publication : les 6 valeurs de référence (mapping depuis nos 12 codes source).
+-- Vocabulaires seedés (arbitrés 2026-07-02/03) :
+--   domaine     : arbre du référentiel de place, repris tel quel — 9 racines
+--                 + 36 feuilles.
+--   solution    : 17 valeurs — les 15 du référentiel de place + Satisfaction
+--                 totale/partielle (second référentiel).
+--   publication : les 6 valeurs de place (mapping depuis nos 12 codes source).
 --   voie        : voie procédurale (badge requêtable, jamais une facette).
 --   office      : juge spécialisé (badge + promotion dans la facette juridiction).
 --   instance    : stade procédural (hors rail, dérivable, gardé en donnée).
@@ -57,7 +59,7 @@ ALTER TABLE decisions
     ADD COLUMN jurisdiction_code TEXT REFERENCES jurisdiction(code);
 
 -- ============================================================
--- domaine — arbre de référence verbatim (9 racines, 36 feuilles).
+-- domaine — arbre du référentiel de place, repris tel quel (9 racines, 36 feuilles).
 -- Clé annotée = la feuille ; racine annotée directement quand elle n'a pas de
 -- feuille (Fiscal, Européen, Criminel, Constitutionnel) ou quand aucune
 -- feuille ne convient.
@@ -113,7 +115,7 @@ INSERT INTO facet_value (uid, facet, label, parent_uid, sort) VALUES
     ('domaine:PROPRIETE_INTELLECTUELLE_LITTERAIRE_ARTISTIQUE','domaine','Propriété littéraire et artistique',                       'domaine:PROPRIETE_INTELLECTUELLE', 2);
 
 -- ============================================================
--- solution — 15 de référence + les 2 satisfactions supplémentaires (1ʳᵉ instance civile).
+-- solution — les 15 du référentiel de place + 2 satisfactions (1ʳᵉ instance civile).
 -- ============================================================
 
 INSERT INTO facet_value (uid, facet, label, sort) VALUES
@@ -136,7 +138,7 @@ INSERT INTO facet_value (uid, facet, label, sort) VALUES
     ('solution:AUTRE',                  'solution', 'Autre',                  17);
 
 -- ============================================================
--- publication — les 6 valeurs de référence (mapping depuis les codes source).
+-- publication — les 6 valeurs de place (mapping depuis les codes source).
 -- La portée (majeure/importante/limitée, lj-core/publication.rs) n'est pas
 -- une facette : affichage seulement.
 -- ============================================================
@@ -171,7 +173,7 @@ INSERT INTO facet_value (uid, facet, label, abbr, sort) VALUES
 
 -- ============================================================
 -- office — juge spécialisé (décomposition de special_procedure-25).
--- Badge + promotion en racine de la facette juridiction (UX de référence).
+-- Badge + promotion en racine de la facette juridiction (UX du secteur).
 -- Le sigle vit dans `abbr`, jamais dans un titre.
 -- ============================================================
 

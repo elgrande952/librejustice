@@ -1,0 +1,913 @@
+//! Vue « Annonces » de la page `/annonces` — le pot des événements juridiques en
+//! cours, **même gabarit que `/decisions` et `/textes`** : rail de synthèse à
+//! gauche, barre de dropdowns + chips actives au centre, colonne d'appoint à
+//! droite.
+//!
+//! Deux différences tiennent au pot, pas au gabarit :
+//!
+//! - **Pas d'invite de départ.** Les sœurs n'affichent rien sans requête ; ici
+//!   l'état vide *est* le produit — « ce qui est ouvert en ce moment », trié par
+//!   échéance. `q` n'est qu'un filtre de plus.
+//! - **La barre de filtres est déclarée par le serveur.** Les axes viennent de la
+//!   réponse (`axes`), parce qu'ils dépendent du fond interrogé : le CPV
+//!   n'existe que pour les marchés, la famille d'avis n'a pas le même
+//!   vocabulaire d'un fond à l'autre. Le front n'en connaît aucun par son nom,
+//!   il rend ce que le backend sait exécuter.
+
+use leptos::prelude::*;
+use leptos_router::components::A;
+use leptos_router::hooks::use_query_map;
+use leptos_router::params::ParamsMap;
+use lj_dtos::{
+    AnnonceFacetAxis, AnnonceFondGroup, AnnonceHit, AnnonceSearchRequest, AnnonceSearchResponse,
+    AnnonceSort, FacetChoice, ANNONCE_FOND_MARCHE,
+};
+
+use crate::api::ApiClient;
+use crate::components::layout::{CONTENT_COL, GRID_3COL, SIDE_RAIL};
+use crate::helpers::{format_results_count_exact, group_thousands, total_pages};
+use crate::pages::decision_page::data::sendable;
+
+use super::compact_search::query_state;
+use super::facet_widgets::{scroll_lock_ref, FilterSearchInput, Nav};
+use super::filter_dropdown::{FilterDropdown, OpenDropdown};
+use super::CompactSearch;
+
+/// Annonces ramenées par page et par fond.
+const LIMIT: u32 = 20;
+/// Plafond de pages affichées (le service borne l'offset à 5 000).
+const MAX_PAGES_DISPLAY: i64 = 40;
+/// Lignes par bloc de facettes du rail.
+const RAIL_ROWS: usize = 6;
+/// Au-delà de ce nombre de valeurs, un axe ne se lit plus par le poids : sa
+/// liste passe en ordre alphabétique et gagne un champ de filtre (départements,
+/// divisions CPV).
+const LISTE_LONGUE: usize = 12;
+
+/// Clés d'URL portées par les filtres. `fond` en fait partie : c'est un axe
+/// comme les autres, pas un mode.
+const FILTER_KEYS: [&str; 6] = [
+    "fond",
+    "departement",
+    "famille",
+    "cpv",
+    "echeanceJours",
+    "closes",
+];
+
+/// Axes multi-valeurs : cocher une seconde valeur l'ajoute au lieu de remplacer
+/// la première (un candidat suit deux départements).
+const MULTI_KEYS: [&str; 4] = ["fond", "departement", "famille", "cpv"];
+
+/// État de recherche lu depuis l'URL — la même mécanique que les pages sœurs :
+/// l'URL est l'état, rien ne vit en mémoire.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AnnoncesQuery {
+    pub q: String,
+    pub fond: Vec<String>,
+    pub departement: Vec<String>,
+    pub famille: Vec<String>,
+    pub cpv: Vec<String>,
+    pub echeance_jours: Option<u32>,
+    pub closes: bool,
+    pub sort: Option<String>,
+    pub page: u32,
+}
+
+impl AnnoncesQuery {
+    pub fn from_map(map: &ParamsMap) -> Self {
+        let liste = |key: &str| -> Vec<String> {
+            map.get_all(key)
+                .map(|v| {
+                    v.iter()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            q: map
+                .get("q")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            fond: liste("fond"),
+            departement: liste("departement"),
+            famille: liste("famille"),
+            cpv: liste("cpv"),
+            echeance_jours: map.get("echeanceJours").and_then(|j| j.parse().ok()),
+            closes: map.get("closes").is_some_and(|v| v == "true" || v == "1"),
+            sort: map.get("sort").filter(|s| !s.is_empty()),
+            page: map
+                .get("page")
+                .and_then(|p| p.parse::<u32>().ok())
+                .filter(|p| *p >= 1)
+                .unwrap_or(1),
+        }
+    }
+
+    /// Valeur active d'un axe, quelle que soit sa clé — le front ne connaît pas
+    /// les axes par leur nom, il les lit comme le serveur les déclare.
+    fn valeurs(&self, key: &str) -> Vec<String> {
+        match key {
+            "fond" => self.fond.clone(),
+            "departement" => self.departement.clone(),
+            "famille" => self.famille.clone(),
+            "cpv" => self.cpv.clone(),
+            "echeanceJours" => self
+                .echeance_jours
+                .map(|j| j.to_string())
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn to_request(&self) -> AnnonceSearchRequest {
+        AnnonceSearchRequest {
+            q: (!self.q.is_empty()).then(|| self.q.clone()),
+            fond: self.fond.clone(),
+            departement: self.departement.clone(),
+            famille: self.famille.clone(),
+            cpv: self.cpv.clone(),
+            echeance_jours: self.echeance_jours,
+            closes: self.closes,
+            sort: match self.sort.as_deref() {
+                Some("publication") => AnnonceSort::Publication,
+                Some("nouveautes") => AnnonceSort::Nouveautes,
+                _ => AnnonceSort::Echeance,
+            },
+            limit: LIMIT,
+            offset: self.page.max(1).saturating_sub(1) * LIMIT,
+        }
+    }
+}
+
+async fn fetch(state: AnnoncesQuery) -> Result<AnnonceSearchResponse, String> {
+    ApiClient::from_context()
+        .search_annonces(&state.to_request())
+        .await
+        .map_err(|e| e.message)
+}
+
+#[component]
+pub fn AnnoncesView() -> impl IntoView {
+    let query_map = use_query_map();
+    let state = Signal::derive(move || AnnoncesQuery::from_map(&query_map.get()));
+    let results = Resource::new(move || state.get(), |s| sendable(fetch(s)));
+    // Axes et volumétrie survivent au refetch : la barre reste cliquable pendant
+    // qu'une page charge.
+    let axes = RwSignal::new(Vec::<AnnonceFacetAxis>::new());
+    let volume = RwSignal::new(None::<i64>);
+    Effect::new(move |_| {
+        if let Some(Ok(resp)) = results.get() {
+            axes.set(resp.axes);
+            volume.set(Some(resp.total));
+        }
+    });
+
+    view! {
+        <div class=GRID_3COL>
+            <aside aria-label="Synthèse des résultats" class=SIDE_RAIL>
+                <AnnoncesRail axes=axes state=state />
+            </aside>
+            <div class=CONTENT_COL>
+                <div class="flex flex-col gap-2">
+                    <CompactSearch />
+                    <div class="flex items-baseline gap-3 lg:hidden">
+                        {move || {
+                            volume
+                                .get()
+                                .map(|total| {
+                                    view! {
+                                        <p class="text-sm text-[var(--color-ink-subtle)]">
+                                            <span class="font-medium text-[var(--color-ink)]">
+                                                {format_results_count_exact(total)}
+                                            </span>
+                                        </p>
+                                    }
+                                })
+                        }}
+                    </div>
+                </div>
+                <div class="flex min-w-0 flex-col gap-4">
+                    <AnnoncesFilterBar axes=axes state=state />
+                    <AnnoncesActiveChips axes=axes state=state />
+                    <Suspense fallback=move || {
+                        view! { <p class="text-sm text-[var(--color-ink-subtle)]">"Recherche…"</p> }
+                    }>
+                        {move || Suspend::new(async move {
+                            let st = state.get_untracked();
+                            match results.await {
+                                Ok(resp) => view! { <AnnoncesResults resp=resp state=st /> }.into_any(),
+                                Err(msg) => {
+                                    view! {
+                                        <p class="text-sm text-[var(--color-ink-subtle)]">
+                                            {format!("Recherche indisponible ({msg}).")}
+                                        </p>
+                                    }
+                                        .into_any()
+                                }
+                            }
+                        })}
+                    </Suspense>
+                </div>
+            </div>
+            <aside aria-label="Voir aussi" class=SIDE_RAIL>
+                <AnnoncesSummary volume=volume state=state />
+            </aside>
+        </div>
+    }
+}
+
+/// Volumétrie + tri + flux, en tête de la colonne droite.
+#[component]
+fn AnnoncesSummary(
+    #[prop(into)] volume: Signal<Option<i64>>,
+    #[prop(into)] state: Signal<AnnoncesQuery>,
+) -> impl IntoView {
+    let query_map = use_query_map();
+    let nav = Nav::new();
+    let tri_actif = move || state.get().sort.unwrap_or_else(|| "echeance".to_string());
+    let tris = [
+        ("echeance", "Échéance la plus proche"),
+        ("nouveautes", "Vues en dernier"),
+        ("publication", "Parution la plus récente"),
+    ];
+    view! {
+        <div class="flex flex-col gap-4">
+            <div class="flex flex-col gap-1">
+                <h2 class="font-sans text-xl text-[var(--color-ink)]">
+                    {move || {
+                        volume
+                            .get()
+                            .map(format_results_count_exact)
+                            .unwrap_or_else(|| "Recherche en cours…".to_string())
+                    }}
+                </h2>
+                <p class="text-xs text-[var(--color-ink-subtle)]">
+                    "Annonces publiées, encore ouvertes"
+                </p>
+            </div>
+            <div class="flex flex-col gap-1.5 border-t border-[var(--color-rule)] pt-4">
+                <p class="pb-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                    "Trier par"
+                </p>
+                {tris
+                    .into_iter()
+                    .map(|(value, label)| {
+                        let actif = move || tri_actif() == value;
+                        view! {
+                            <button
+                                type="button"
+                                class=move || {
+                                    if actif() {
+                                        "text-left text-[13px] font-medium text-[var(--color-bordeaux)]"
+                                    } else {
+                                        "text-left text-[13px] text-[var(--color-ink-muted)] hover:text-[var(--color-ink)]"
+                                    }
+                                }
+                                on:click=move |_| {
+                                    nav.go(
+                                        query_state::with_param(
+                                            &query_map.get_untracked(),
+                                            "sort",
+                                            (value != "echeance").then_some(value),
+                                            true,
+                                        ),
+                                    );
+                                }
+                            >
+                                {label}
+                            </button>
+                        }
+                    })
+                    .collect_view()}
+            </div>
+            <AnnoncesFlux state=state />
+        </div>
+    }
+}
+
+/// Les deux flux d'alerte de l'état de filtres courant : l'URL de la page, avec
+/// une autre extension.
+#[component]
+fn AnnoncesFlux(#[prop(into)] state: Signal<AnnoncesQuery>) -> impl IntoView {
+    let query_map = use_query_map();
+    let href = move |ext: &str| {
+        let qs = query_state::without_keys(&query_map.get(), &["page", "sort"]);
+        if qs.is_empty() {
+            format!("/annonces.{ext}")
+        } else {
+            format!("/annonces.{ext}?{qs}")
+        }
+    };
+    // L'agenda n'est offert que si un fond sélectionné porte des échéances : un
+    // fond qui constate des faits déjà survenus produirait un calendrier vide.
+    let agenda = move || {
+        let fonds = state.get().fond;
+        fonds.is_empty() || fonds.iter().any(|f| lj_dtos::annonce_fond_a_echeance(f))
+    };
+    view! {
+        <div class="flex flex-col gap-1.5 border-t border-[var(--color-rule)] pt-4">
+            <p class="pb-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                "S'abonner à ces filtres"
+            </p>
+            <a
+                href=move || href("rss")
+                class="text-[13px] text-[var(--color-ink-muted)] hover:text-[var(--color-accent)]"
+            >
+                "Flux RSS des nouveautés"
+            </a>
+            <Show when=agenda>
+                <a
+                    href=move || href("ics")
+                    class="text-[13px] text-[var(--color-ink-muted)] hover:text-[var(--color-accent)]"
+                >
+                    "Agenda des échéances (ICS)"
+                </a>
+            </Show>
+            <p class="pt-1 text-[11px] leading-snug text-[var(--color-ink-subtle)]">
+                "Sans compte : l'URL est l'abonnement."
+            </p>
+        </div>
+    }
+}
+
+/// Rail gauche : un bloc par axe déclaré, mêmes lignes `libellé … compte` que
+/// le rail des pages sœurs.
+#[component]
+fn AnnoncesRail(
+    #[prop(into)] axes: Signal<Vec<AnnonceFacetAxis>>,
+    #[prop(into)] state: Signal<AnnoncesQuery>,
+) -> impl IntoView {
+    view! {
+        <div class="flex flex-col gap-4 [&>div:first-child]:border-t-0 [&>div:first-child]:pt-0">
+            <For
+                each=move || axes.get()
+                key=|axe: &AnnonceFacetAxis| axe.key.clone()
+                children=move |axe: AnnonceFacetAxis| {
+                    // Les clés d'axe ne bougent pas d'une réponse à l'autre,
+                    // leurs comptes si : le bloc se relit dans le signal à
+                    // chaque réponse.
+                    let key = StoredValue::new(axe.key);
+                    move || {
+                        let (axe, actives) = key
+                            .with_value(|k| {
+                                (
+                                    axes.get().into_iter().find(|a| &a.key == k),
+                                    state.get().valeurs(k),
+                                )
+                            });
+                        axe.map(|axe| rail_block(axe, &actives))
+                    }
+                }
+            />
+        </div>
+    }
+}
+
+fn rail_block(axe: AnnonceFacetAxis, actives: &[String]) -> AnyView {
+    if axe.choices.is_empty() {
+        return ().into_any();
+    }
+    let query_map = use_query_map();
+    let nav = Nav::new();
+    let key = axe.key.clone();
+    let rows = axe
+        .choices
+        .into_iter()
+        .take(RAIL_ROWS)
+        .map(|c| {
+            let is_active = actives.iter().any(|a| a == &c.value);
+            let label_class = if is_active {
+                "truncate text-[13px] leading-snug font-medium text-[var(--color-bordeaux)]"
+            } else {
+                "truncate text-[13px] leading-snug text-[var(--color-ink-muted)] transition-colors group-hover:text-[var(--color-ink)]"
+            };
+            let key = key.clone();
+            let value = c.value.clone();
+            view! {
+                <button
+                    type="button"
+                    class="group flex w-full items-baseline justify-between gap-3 text-left"
+                    title=c.label.clone()
+                    on:click=move |_| {
+                        nav.go(basculer(&query_map.get_untracked(), &key, &value, is_active));
+                    }
+                >
+                    <span class=label_class>{c.label.clone()}</span>
+                    <span class="shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]">
+                        {group_thousands(c.count)}
+                    </span>
+                </button>
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="flex flex-col gap-1.5 border-t border-[var(--color-rule)] pt-4">
+            <p class="pb-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                {axe.label.clone()}
+            </p>
+            {rows}
+        </div>
+    }
+    .into_any()
+}
+
+/// Mutation d'URL d'un axe : multi-valeurs pour ceux qui l'acceptent, sinon
+/// mono-sélection qui se retire au re-clic. Toute mutation revient page 1.
+fn basculer(map: &ParamsMap, key: &str, value: &str, is_active: bool) -> String {
+    if MULTI_KEYS.contains(&key) {
+        return query_state::toggle_multi(map, key, value);
+    }
+    query_state::with_param(map, key, (!is_active).then_some(value), true)
+}
+
+/// Barre de filtres : un dropdown par axe déclaré, dans l'ordre du serveur.
+#[component]
+fn AnnoncesFilterBar(
+    #[prop(into)] axes: Signal<Vec<AnnonceFacetAxis>>,
+    #[prop(into)] state: Signal<AnnoncesQuery>,
+) -> impl IntoView {
+    provide_context(OpenDropdown(RwSignal::new(None)));
+    view! {
+        <div
+            role="toolbar"
+            aria-label="Filtres de recherche"
+            class="flex items-center gap-2 overflow-x-auto pb-1"
+        >
+            <For
+                each=move || axes.get()
+                key=|axe: &AnnonceFacetAxis| axe.key.clone()
+                children=move |axe: AnnonceFacetAxis| {
+                    let key = StoredValue::new(axe.key.clone());
+                    // Les choix se relisent dans le signal, jamais figés à la
+                    // première réponse : cocher un filtre remonte des comptes
+                    // neufs sur tous les autres axes.
+                    let choices = Signal::derive(move || {
+                        key.with_value(|k| {
+                            axes.get()
+                                .into_iter()
+                                .find(|a| &a.key == k)
+                                .map(|a| a.choices)
+                                .unwrap_or_default()
+                        })
+                    });
+                    view! {
+                        <FilterDropdown
+                            id=axe.key.clone()
+                            label=axe.label.clone()
+                            active_count=Signal::derive(move || {
+                                key.with_value(|k| state.get().valeurs(k).len())
+                            })
+                        >
+                            <FacetList
+                                url_key=key.get_value()
+                                choices=choices
+                                actives=Signal::derive(move || {
+                                    key.with_value(|k| state.get().valeurs(k))
+                                })
+                            />
+                        </FilterDropdown>
+                    }
+                }
+            />
+        </div>
+    }
+}
+
+/// Liste d'un dropdown : lignes valeur/compte, la valeur active se retire au
+/// re-clic. Une sélection orpheline (URL partagée, valeur absente de la
+/// facette) reste affichée en tête, compteur 0 — sinon on ne peut plus la
+/// retirer.
+///
+/// Au-delà de [`LISTE_LONGUE`] valeurs, l'axe se parcourt par le nom et non
+/// plus par le poids : les 100 départements se lisent dans l'ordre
+/// alphabétique, avec un champ pour filtrer. Le rail garde l'ordre du serveur
+/// (les six plus gros) — c'est lui qui dit où est la masse.
+#[component]
+fn FacetList(
+    url_key: String,
+    #[prop(into)] choices: Signal<Vec<FacetChoice>>,
+    #[prop(into)] actives: Signal<Vec<String>>,
+) -> impl IntoView {
+    let query_map = use_query_map();
+    let nav = Nav::new();
+    let saisie = RwSignal::new(String::new());
+    let rows = Memo::new(move |_| {
+        let choices = choices.get();
+        let mut out: Vec<FacetChoice> = actives
+            .get()
+            .into_iter()
+            .filter(|a| !choices.iter().any(|c| &c.value == a))
+            .map(|a| FacetChoice {
+                label: a.clone(),
+                value: a,
+                count: 0,
+                parent: None,
+            })
+            .collect();
+        out.extend(choices);
+        if out.len() > LISTE_LONGUE {
+            out.sort_by_key(|c| cle_alpha(&c.label));
+        }
+        out
+    });
+    let cherchable = Signal::derive(move || rows.with(|r| r.len()) > LISTE_LONGUE);
+    // Les lignes montrées ; le compteur et le libellé de chacune se relisent
+    // dans `rows`, qui suit les facettes de la dernière réponse.
+    let visible = Memo::new(move |_| {
+        let aiguille = cle_alpha(&saisie.get());
+        rows.get()
+            .into_iter()
+            .filter(|c| aiguille.is_empty() || cle_alpha(&c.label).contains(&aiguille))
+            .collect::<Vec<_>>()
+    });
+    view! {
+        <Show when=move || cherchable.get()>
+            <FilterSearchInput value=saisie placeholder="Filtrer (ex. Guyane…)" />
+        </Show>
+        <div
+            node_ref=scroll_lock_ref()
+            class="filter-scroll flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto"
+        >
+            <Show when=move || visible.with(|r| r.is_empty())>
+                <p class="px-2 py-1 text-xs text-[var(--color-ink-subtle)]">"Aucune valeur"</p>
+            </Show>
+            <For
+                each=move || visible.get()
+                key=|c: &FacetChoice| c.value.clone()
+                children=move |c: FacetChoice| {
+                    let key = url_key.clone();
+                    let value = c.value.clone();
+                    let pour_actif = c.value.clone();
+                    let is_active = Signal::derive(move || {
+                        actives.get().iter().any(|a| a == &pour_actif)
+                    });
+                    let lookup = c.value.clone();
+                    let row = Memo::new(move |_| {
+                        rows.with(|l| l.iter().find(|x| x.value == lookup).cloned())
+                    });
+                    let repli = c.value.clone();
+                    let label = Signal::derive(move || {
+                        row.get().map(|x| x.label).unwrap_or_else(|| repli.clone())
+                    });
+                    let count = Signal::derive(move || row.get().map(|x| x.count).unwrap_or(0));
+                    let row_class = move || {
+                        crate::helpers::cn([
+                            "flex w-full items-center gap-2.5 rounded px-2 py-1 text-left text-sm transition-colors",
+                            if is_active.get() {
+                                "bg-[var(--color-bordeaux-soft)] text-[var(--color-accent)]"
+                            } else {
+                                "text-[var(--color-ink-muted)] hover:text-[var(--color-ink)]"
+                            },
+                        ])
+                    };
+                    view! {
+                        <button
+                            type="button"
+                            aria-pressed=move || is_active.get().to_string()
+                            class=row_class
+                            on:click=move |_| {
+                                nav.go(
+                                    basculer(
+                                        &query_map.get_untracked(),
+                                        &key,
+                                        &value,
+                                        is_active.get_untracked(),
+                                    ),
+                                );
+                            }
+                        >
+                            <span class="flex-1 truncate leading-tight">{label}</span>
+                            <Show when=move || { count.get() > 0 }>
+                                <span class="tabular-nums text-xs text-[var(--color-ink-subtle)]">
+                                    {move || group_thousands(count.get())}
+                                </span>
+                            </Show>
+                        </button>
+                    }
+                }
+            />
+        </div>
+    }
+}
+
+/// Clé de tri et de recherche d'un libellé : minuscules, diacritiques rabattus.
+/// « Ardèche » se range alors entre « Ardennes » et « Ariège », et se trouve en
+/// tapant « ardeche ».
+fn cle_alpha(label: &str) -> String {
+    label
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| match c {
+            'à' | 'á' | 'â' | 'ä' => 'a',
+            'ç' => 'c',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'î' | 'ï' | 'í' => 'i',
+            'ô' | 'ö' | 'ó' => 'o',
+            'ù' | 'û' | 'ü' => 'u',
+            'ÿ' => 'y',
+            c => c,
+        })
+        .collect()
+}
+
+/// Chips des filtres actifs + « Tout effacer ». Le libellé se résout dans
+/// l'axe ; à défaut, la valeur brute.
+#[component]
+fn AnnoncesActiveChips(
+    #[prop(into)] axes: Signal<Vec<AnnonceFacetAxis>>,
+    #[prop(into)] state: Signal<AnnoncesQuery>,
+) -> impl IntoView {
+    let query_map = use_query_map();
+    let nav = Nav::new();
+    let chips = Memo::new(move |_| {
+        let state = state.get();
+        let axes = axes.get();
+        let mut out: Vec<(String, String, String)> = Vec::new();
+        for key in FILTER_KEYS {
+            if key == "closes" {
+                if state.closes {
+                    out.push((
+                        "closes".to_string(),
+                        "true".to_string(),
+                        "Consultations closes comprises".to_string(),
+                    ));
+                }
+                continue;
+            }
+            let axe = axes.iter().find(|a| a.key == key);
+            for value in state.valeurs(key) {
+                let label = axe
+                    .and_then(|a| a.choices.iter().find(|c| c.value == value))
+                    .map(|c| c.label.clone())
+                    .unwrap_or_else(|| value.clone());
+                out.push((key.to_string(), value, label));
+            }
+        }
+        out
+    });
+
+    view! {
+        <Show when=move || !chips.with(|c| c.is_empty())>
+            <div class="flex flex-wrap items-center gap-2">
+                <For
+                    each=move || chips.get()
+                    key=|(key, value, label): &(String, String, String)| {
+                        format!("{key}:{value}:{label}")
+                    }
+                    children=move |(key, value, label): (String, String, String)| {
+                        let on_remove = move |_| {
+                            let map = query_map.get_untracked();
+                            nav.go(if MULTI_KEYS.contains(&key.as_str()) {
+                                query_state::toggle_multi(&map, &key, &value)
+                            } else {
+                                query_state::with_param(&map, &key, None, true)
+                            });
+                        };
+                        view! {
+                            <span class="inline-flex h-7 items-center gap-1.5 rounded-full border border-[var(--color-rule)] bg-[var(--color-bordeaux-soft)] pl-3 pr-1.5 text-xs text-[var(--color-accent)]">
+                                <span class="max-w-56 truncate">{label}</span>
+                                <button
+                                    type="button"
+                                    aria-label="Retirer ce filtre"
+                                    on:click=on_remove
+                                    class="flex h-4 w-4 items-center justify-center rounded-full transition-colors hover:bg-[var(--color-accent)] hover:text-[var(--color-accent-foreground)]"
+                                >
+                                    <svg viewBox="0 0 12 12" class="h-2.5 w-2.5" aria-hidden="true">
+                                        <path
+                                            d="M3 3l6 6M9 3L3 9"
+                                            fill="none"
+                                            stroke="currentColor"
+                                            stroke-width="1.5"
+                                            stroke-linecap="round"
+                                        />
+                                    </svg>
+                                </button>
+                            </span>
+                        }
+                    }
+                />
+                <button
+                    type="button"
+                    on:click=move |_| {
+                        nav.go(query_state::without_keys(&query_map.get_untracked(), &FILTER_KEYS));
+                    }
+                    class="text-xs text-[var(--color-ink-subtle)] underline-offset-2 hover:text-[var(--color-accent)] hover:underline"
+                >
+                    "Tout effacer"
+                </button>
+            </div>
+        </Show>
+    }
+}
+
+/// Les groupes de la réponse. Un seul fond interrogé ⇒ une liste simple ; les
+/// deux ⇒ un intertitre par fond, jamais d'entrelacement.
+#[component]
+fn AnnoncesResults(resp: AnnonceSearchResponse, state: AnnoncesQuery) -> impl IntoView {
+    if resp.groupes.iter().all(|g| g.hits.is_empty()) {
+        return view! {
+            <div class="border-t border-[var(--color-rule)] py-16">
+                <p class="text-[var(--color-ink-muted)]">
+                    "Aucune annonce ouverte pour ces filtres."
+                </p>
+            </div>
+        }
+        .into_any();
+    }
+    let seul = resp.groupes.len() == 1;
+    let pages = if seul {
+        total_pages(resp.groupes[0].total, LIMIT as i64, MAX_PAGES_DISPLAY) as u32
+    } else {
+        0
+    };
+    let groupes = resp
+        .groupes
+        .into_iter()
+        .map(|g| view! { <Groupe groupe=g seul=seul /> })
+        .collect_view();
+    view! {
+        <section aria-label="Résultats" class="flex min-w-0 flex-col gap-6">
+            {groupes}
+            // La pagination n'a de sens que sur un fond : deux backends ont
+            // deux curseurs, et l'utilisateur choisit son fond avant de
+            // s'enfoncer dedans.
+            <Show when=move || { seul && pages > 1 }>
+                <AnnoncesPagination current_page=state.page total_pages=pages />
+            </Show>
+        </section>
+    }
+    .into_any()
+}
+
+#[component]
+fn Groupe(groupe: AnnonceFondGroup, seul: bool) -> impl IntoView {
+    let query_map = use_query_map();
+    let nav = Nav::new();
+    let fond = groupe.fond.clone();
+    let entete = (!seul).then(|| {
+        let label = groupe.label.clone();
+        let total = groupe.total;
+        view! {
+            <div class="flex items-baseline justify-between gap-3 border-t border-[var(--color-rule)] pt-3">
+                <h2 class="font-sans text-lg text-[var(--color-ink)]">{label}</h2>
+                <button
+                    type="button"
+                    class="shrink-0 text-xs text-[var(--color-ink-subtle)] underline-offset-2 hover:text-[var(--color-accent)] hover:underline"
+                    on:click=move |_| {
+                        nav.go(query_state::toggle_multi(&query_map.get_untracked(), "fond", &fond));
+                    }
+                >
+                    {format!("{} — tout voir", group_thousands(total))}
+                </button>
+            </div>
+        }
+    });
+    let lignes = groupe
+        .hits
+        .into_iter()
+        .map(|h| view! { <Ligne hit=h /> })
+        .collect_view();
+    view! {
+        <div class="flex flex-col gap-1">
+            {entete}
+            <ul class="flex flex-col">{lignes}</ul>
+        </div>
+    }
+}
+
+/// Une annonce en liste : ce qu'elle est, qui elle concerne, quand elle ferme.
+#[component]
+fn Ligne(hit: AnnonceHit) -> impl IntoView {
+    let interne = hit.fond == ANNONCE_FOND_MARCHE;
+    let href = if interne {
+        format!("/marche/{}", hit.uid)
+    } else {
+        hit.url_action.clone()
+    };
+    let titre = hit.titre.clone();
+    let acteur = Some(hit.acteur.trim().to_string()).filter(|a| !a.is_empty());
+    let meta = ligne_meta(&hit);
+    let lien = if interne {
+        view! {
+            <A href=href attr:class="text-base text-[var(--color-ink)] hover:text-[var(--color-accent)]">
+                {titre}
+            </A>
+        }
+        .into_any()
+    } else {
+        // Fond servi en proxy : la fiche est celle du publicateur officiel.
+        view! {
+            <a
+                href=href
+                rel="noopener"
+                class="text-base text-[var(--color-ink)] hover:text-[var(--color-accent)]"
+            >
+                {titre}
+            </a>
+        }
+        .into_any()
+    };
+    view! {
+        <li class="flex flex-col gap-1 border-t border-[var(--color-rule)] py-3">
+            {lien} {acteur.map(|a| view! { <p class="text-sm text-[var(--color-ink-muted)]">{a}</p> })}
+            <p class="text-xs text-[var(--color-ink-subtle)]">{meta}</p>
+        </li>
+    }
+}
+
+/// Ligne de métadonnées : échéance ou parution, lieu, nature, canaux.
+fn ligne_meta(hit: &AnnonceHit) -> String {
+    let mut bouts: Vec<String> = Vec::new();
+    match hit.echeance.as_deref().and_then(date_fr) {
+        Some(d) => bouts.push(format!("Remise avant le {d}")),
+        None => {
+            if let Some(d) = date_fr(&hit.date_publication) {
+                bouts.push(format!("Publié le {d}"));
+            }
+        }
+    }
+    if let Some(dep) = hit.departement_label.as_deref() {
+        bouts.push(dep.to_string());
+    }
+    if let Some(f) = hit.famille.as_ref() {
+        bouts.push(f.label.clone());
+    }
+    if hit.canaux.len() > 1 {
+        bouts.push(format!("{} canaux", hit.canaux.len()));
+    }
+    bouts.join(" · ")
+}
+
+/// `2026-08-12` ou RFC 3339 → `12/08/2026`. Entrée hors forme ⇒ `None`.
+pub fn date_fr(value: &str) -> Option<String> {
+    let date = value.get(..10)?;
+    let mut parts = date.split('-');
+    let (a, m, j) = (parts.next()?, parts.next()?, parts.next()?);
+    (a.len() == 4 && m.len() == 2 && j.len() == 2).then(|| format!("{j}/{m}/{a}"))
+}
+
+#[component]
+fn AnnoncesPagination(current_page: u32, total_pages: u32) -> impl IntoView {
+    let query_map = use_query_map();
+    let nav = Nav::new();
+    let lien = move |page: u32, label: &'static str, actif: bool| {
+        let cible = query_state::with_param(
+            &query_map.get_untracked(),
+            "page",
+            (page > 1).then(|| page.to_string()).as_deref(),
+            false,
+        );
+        view! {
+            <button
+                type="button"
+                disabled=!actif
+                class="rounded border border-[var(--color-rule)] px-3 py-1.5 text-sm text-[var(--color-ink-muted)] disabled:opacity-40 enabled:hover:text-[var(--color-accent)]"
+                on:click=move |_| nav.go(cible.clone())
+            >
+                {label}
+            </button>
+        }
+    };
+    view! {
+        <nav aria-label="Pagination" class="flex items-center justify-between gap-3">
+            {lien(current_page.saturating_sub(1).max(1), "Précédent", current_page > 1)}
+            <span class="text-xs text-[var(--color-ink-subtle)]">
+                {format!("Page {current_page} sur {total_pages}")}
+            </span>
+            {lien(current_page + 1, "Suivant", current_page < total_pages)}
+        </nav>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn la_date_iso_se_lit_en_francais() {
+        assert_eq!(date_fr("2026-08-12").as_deref(), Some("12/08/2026"));
+        assert_eq!(
+            date_fr("2026-09-01T15:00:00+00:00").as_deref(),
+            Some("01/09/2026")
+        );
+        assert_eq!(date_fr("hier"), None);
+    }
+
+    #[test]
+    fn le_fond_est_un_axe_multi_valeurs() {
+        assert!(MULTI_KEYS.contains(&"fond"));
+        assert!(!MULTI_KEYS.contains(&"echeanceJours"));
+        assert!(FILTER_KEYS.contains(&"fond"));
+    }
+
+    #[test]
+    fn l_etat_vide_demande_la_fenetre_ouverte() {
+        let req = AnnoncesQuery::default().to_request();
+        assert!(req.q.is_none() && req.fond.is_empty() && !req.closes);
+        assert_eq!(req.sort, AnnonceSort::Echeance);
+    }
+}

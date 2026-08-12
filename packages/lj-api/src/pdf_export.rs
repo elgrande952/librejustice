@@ -1,16 +1,15 @@
-//! Génération PDF à partir d'un [`DecisionDetail`] — port de `pdf_export.py`.
+//! Génération PDF à partir d'un [`DecisionDetail`].
 //!
-//! Le Python s'appuie sur ReportLab (`SimpleDocTemplate` + `Paragraph`). Côté
-//! Rust on porte la **logique de composition** (titre / sous-titre / méta /
-//! corps, échappement XML ReportLab, conversion `\n` → `<br/>`) dans
+//! La **logique de composition** (titre / sous-titre / méta / corps,
+//! échappement XML du markup, conversion `\n` → `<br/>`) vit dans
 //! [`build_decision_story`], puis on rend les octets PDF avec la crate `printpdf`
 //! en embarquant **Liberation Sans** (Regular + Bold), libre et métric-compatible
 //! Helvetica/Arial.
 //!
-//! Le word-wrap, le centrage et la pagination restent calculés ici (métriques AFM
-//! Helvetica — valables car Liberation Sans en est métric-compatible, positions en
-//! points) pour conserver le découpage en lignes ; `printpdf` ne sert qu'à émettre
-//! le flux d'opérations texte positionnées.
+//! Le word-wrap, le centrage et la pagination sont calculés ici (métriques AFM
+//! Helvetica, valables car Liberation Sans en est métric-compatible, positions en
+//! points) ; `printpdf` ne sert qu'à émettre le flux d'opérations texte
+//! positionnées.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,22 +21,18 @@ use printpdf::{
 
 use crate::titles::decision_jurisdiction;
 
-/// Style logique d'un bloc de contenu — calque des `ParagraphStyle` ReportLab.
-///
-/// Les valeurs numériques (police, taille, interligne, couleurs, alignement)
-/// sont reprises telles quelles de `pdf_export.py` pour que le rendu final soit
-/// pixel-fidèle une fois branché sur un moteur PDF.
+/// Style logique d'un bloc de contenu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdfBlockStyle {
-    /// Titre centré, Helvetica-Bold 18 / leading 22, `#1f2a44`.
+    /// Titre centré.
     Title,
-    /// Sous-titre centré (numéro de rôle), Helvetica-Bold 13 / leading 16.
+    /// Sous-titre centré (numéro de rôle).
     Subtitle,
-    /// Ligne de méta, Helvetica 9.5 / leading 12, `#4a5568`.
+    /// Ligne de méta.
     Meta,
-    /// Paragraphe de corps, Helvetica 10.5 / leading 15, `#1f2937`.
+    /// Paragraphe de corps.
     Body,
-    /// Espaceur vertical (hauteur en points ≈ `Spacer`).
+    /// Espaceur vertical (hauteur en points).
     Spacer,
 }
 
@@ -49,10 +44,7 @@ pub struct PdfBlock {
     pub content: String,
 }
 
-/// Échappe `&`, `<`, `>` façon `xml.sax.saxutils.escape` (ReportLab markup).
-///
-/// `escape` n'échappe par défaut **que** ces trois caractères (pas les
-/// guillemets) — parité stricte avec le Python.
+/// Échappe `&`, `<`, `>` — ces trois caractères seulement.
 fn xml_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -66,8 +58,7 @@ fn xml_escape(text: &str) -> String {
     out
 }
 
-/// Construit la story (séquence de blocs) d'un PDF de décision — port fidèle de
-/// `build_decision_pdf` (partie composition).
+/// Construit la story (séquence de blocs) d'un PDF de décision.
 ///
 /// Ordre : titre (juridiction) → sous-titre (1er numéro de rôle ou `id`) →
 /// lignes de méta (date de lecture, formation) → espaceur si méta → corps.
@@ -141,10 +132,9 @@ pub fn build_decision_story(detail: &DecisionDetail) -> Vec<PdfBlock> {
     story
 }
 
-/// Génère le PDF d'une décision (octets) — port de `build_decision_pdf`.
-///
-/// La composition (titre, méta, corps, échappement) est portée et figée par
-/// [`build_decision_story`] / les tests ; le rendu binaire passe par `printpdf`.
+/// Génère le PDF d'une décision (octets). La composition (titre, méta, corps,
+/// échappement) est portée par [`build_decision_story`] ; le rendu binaire passe
+/// par `printpdf`.
 pub fn build_decision_pdf(detail: &DecisionDetail) -> Vec<u8> {
     let story = build_decision_story(detail);
     render_pdf(&story)
@@ -152,9 +142,8 @@ pub fn build_decision_pdf(detail: &DecisionDetail) -> Vec<u8> {
 
 // --- Rendu PDF (printpdf, Liberation Sans embarquée) -----------------------
 
-/// Géométrie A4 (points PostScript, 1 mm = 72/25.4 pt) — marges de
-/// `SimpleDocTemplate` dans `pdf_export.py`. Les positions de texte sont
-/// calculées en points (origine bas-gauche) puis posées telles quelles.
+/// Géométrie A4 (points PostScript, 1 mm = 72/25.4 pt). Les positions de texte
+/// sont calculées en points (origine bas-gauche) puis posées telles quelles.
 const PAGE_W: f64 = 595.275_59; // 210 mm
 const PAGE_H: f64 = 841.889_76; // 297 mm
 const MARGIN_L: f64 = 56.692_91; // 20 mm
@@ -167,9 +156,9 @@ const MARGIN_B: f64 = 51.023_62; // 18 mm
 const PAGE_W_MM: f32 = 210.0;
 const PAGE_H_MM: f32 = 297.0;
 
-/// Attributs typographiques d'un style — calque 1-pour-1 des `ParagraphStyle`
-/// ReportLab (taille, interligne, alignement, couleur RGB 0-1). `font` est le code
-/// de graisse logique : `"F1"` = Regular, `"F2"` = Bold.
+/// Attributs typographiques d'un style (taille, interligne, alignement, couleur
+/// RGB 0-1). `font` est le code de graisse logique : `"F1"` = Regular,
+/// `"F2"` = Bold.
 struct StyleAttrs {
     font: &'static str,
     size: f64,
@@ -232,7 +221,7 @@ fn style_attrs(style: PdfBlockStyle) -> StyleAttrs {
             ),
             space_after: 8.0,
         },
-        // Spacer : pas de glyphe, hauteur fixe (ReportLab `Spacer(1, 6)`).
+        // Spacer : pas de glyphe, hauteur fixe.
         PdfBlockStyle::Spacer => StyleAttrs {
             font: "F1",
             size: 0.0,
@@ -284,8 +273,8 @@ fn render_pdf(story: &[PdfBlock]) -> Vec<u8> {
             continue;
         }
 
-        // Le contenu est en markup ReportLab (déjà XML-échappé + `<br/>`).
-        // ReportLab le *rend* : on rétablit les glyphes visibles avant de poser.
+        // Le contenu est en markup ReportLab (déjà XML-échappé + `<br/>`) :
+        // on rétablit les glyphes visibles avant de poser.
         let rendered = unescape_reportlab(&block.content);
 
         for logical_line in rendered.split('\n') {
@@ -365,7 +354,7 @@ fn text_width(text: &str, font: &str, size: f64) -> f64 {
 }
 
 /// Rétablit les glyphes visibles du markup ReportLab : `<br/>` → `\n`, puis
-/// dés-échappement XML (`&lt;`/`&gt;`/`&amp;`). C'est ce que ReportLab affiche.
+/// dés-échappement XML (`&lt;`/`&gt;`/`&amp;`).
 fn unescape_reportlab(markup: &str) -> String {
     let with_breaks = markup.replace("<br/>", "\n");
     with_breaks
@@ -404,13 +393,10 @@ fn winansi_code(ch: char) -> u8 {
 // --- Police embarquée (Liberation Sans, OFL) -------------------------------
 //
 // Liberation Sans est métric-compatible Helvetica/Arial : nos tables AFM
-// (`text_width`) restent valides pour le wrap/centrage. On l'embarque pour deux
-// raisons : les polices base-14 builtin de printpdf 0.9 + lopdf 0.38 écrivent les
-// octets **UTF-8 bruts** sous une police déclarée `/WinAnsiEncoding` (branche
-// `SimpleEncoding(_)` non gérée) → tout accent finit en mojibake (`è` → `Ã¨`).
-// Une police embarquée passe par l'encodage glyph-id (`Identity-H`), correct pour
-// tout l'Unicode. printpdf en `default-features=false` n'a pas de parseur de
-// police : on alimente ses maps glyphes (cmap + hmtx) via ttf-parser.
+// (`text_width`) restent valides pour le wrap/centrage. Une police embarquée
+// passe par l'encodage glyph-id (`Identity-H`), correct pour tout l'Unicode.
+// printpdf en `default-features=false` n'a pas de parseur de police : on
+// alimente ses maps glyphes (cmap + hmtx) via ttf-parser.
 
 static LIBERATION_SANS: &[u8] = include_bytes!("../data/fonts/LiberationSans-Regular.ttf");
 static LIBERATION_SANS_BOLD: &[u8] = include_bytes!("../data/fonts/LiberationSans-Bold.ttf");
@@ -446,9 +432,8 @@ fn load_font(ttf: &'static [u8], used: &BTreeSet<char>) -> ParsedFont {
 ///
 /// Chaque [`LineCmd`] porte une position absolue en points (origine bas-gauche,
 /// déjà calculée par [`render_pdf`]) : on émet un `Op::SetTextMatrix` (opérateur
-/// PDF `Tm`, **absolu**) par ligne — surtout pas `SetTextCursor` (`Td`, relatif :
-/// il cumulerait les positions et jetterait le texte hors-page). `printpdf`
-/// sérialise le document (catalog / pages / fonts embarquées / xref).
+/// PDF `Tm`, **absolu**) par ligne. `printpdf` sérialise le document (catalog /
+/// pages / fonts embarquées / xref).
 fn assemble_pdf(pages: &[Page]) -> Vec<u8> {
     let mut doc = PdfDocument::new("Decision");
 
@@ -535,7 +520,7 @@ fn jur_type_code(detail: &DecisionDetail) -> &'static str {
 //
 // Valeurs des fichiers AFM Adobe officiels (Helvetica.afm / Helvetica-Bold.afm),
 // réindexées par code WinAnsiEncoding. Servent au word-wrap et au centrage.
-// Les codes non assignés portent la largeur de l'espace (approximation neutre).
+// Les codes non assignés portent la largeur de l'espace.
 
 /// Largeurs Helvetica (regular).
 static HELVETICA_WIDTHS: [u16; 256] = build_helvetica_widths();
@@ -762,8 +747,8 @@ mod tests {
     #[test]
     fn story_structure_matches_python() {
         let story = build_decision_story(&detail());
-        // titre, sous-titre, 2 lignes méta, spacer, 2 paragraphes, spacer + pied
-        // de provenance (permalien seul : fixture sans source ni ECLI).
+        // titre, sous-titre, 2 lignes méta, spacer, 2 paragraphes, spacer, pied
+        // de provenance.
         assert_eq!(story.len(), 9);
         assert_eq!(story[0].style, PdfBlockStyle::Title);
         assert_eq!(story[0].content, "Cour de cassation");
@@ -797,21 +782,18 @@ mod tests {
         d.date_lecture = None;
         d.seat = None;
         let story = build_decision_story(&d);
-        // titre, sous-titre, puis directement le corps (pas de spacer).
+        // titre, sous-titre, puis directement le corps.
         assert_eq!(story[2].style, PdfBlockStyle::Body);
     }
 
     #[test]
     fn pdf_is_well_formed() {
         let bytes = build_decision_pdf(&detail());
-        // En-tête PDF (`%PDF-1.x`) + marqueur de fin produits par printpdf.
         assert!(bytes.starts_with(b"%PDF-"), "préfixe %PDF- manquant");
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("%%EOF"), "marqueur %%EOF manquant");
         assert!(text.contains("startxref"), "table xref manquante");
         assert!(text.contains("/Catalog"), "catalog racine manquant");
-        // Police Unicode embarquée (Type0/Identity-H + flux TrueType FontFile2),
-        // pas une base-14 builtin — c'est ce qui rend les accents corrects.
         assert!(text.contains("/Type0"), "police Type0 (composite) attendue");
         assert!(text.contains("Identity-H"), "encodage Identity-H attendu");
         assert!(text.contains("FontFile2"), "flux police TrueType embarqué");

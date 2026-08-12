@@ -12,7 +12,7 @@
 //! - participe `-é` homographe d'un présent/nom (« condamne »/« condamné »,
 //!   « arrête »/« arrêté »), y compris adjectival sans auxiliaire (« l'arrêt
 //!   attaqué ») : tranché par un modèle contextuel appris hors-ligne sur le corpus
-//!   (cf. `PARTICIPLE_CTX`, ADR 0072), avec repli sur la règle auxiliaire
+//!   (cf. `PARTICIPLE_CTX`), avec repli sur la règle auxiliaire
 //!   (`participle_fires`) pour les formes hors-modèle.
 //!
 //! Pas de noms de personnes.
@@ -29,8 +29,7 @@ const ACCENTS_TXT: &str = include_str!("../data/accents_fr.txt");
 /// Complément du lexique : formes accentuées sans ambiguïté (participes accordés
 /// `-ée/-és/-ées`, vocabulaire juridique/genré absent de Lexique383 —
 /// « greffière », « préfète », « requérante »…) dont l'orthographe sans accent
-/// est rare comme mot réel (même filtre de dominance). Fichier séparé pour rester
-/// sous le plafond de taille du hook (200 Ko/fichier).
+/// est rare comme mot réel (même filtre de dominance).
 const ACCENTS_SUPP_TXT: &str = include_str!("../data/accents_supplement_fr.txt");
 
 /// Noms propres de lieux/juridictions français (une forme cassée par ligne),
@@ -39,8 +38,8 @@ const PROPER_TXT: &str = include_str!("../data/proper_nouns_fr.txt");
 
 /// Mots repliés qui, juste **après** « a/à », trahissent l'auxiliaire/le verbe « a »
 /// (« a été », « a pas », « a lieu », « a condamné », « a donc statué »). Appris
-/// hors-ligne sur les décisions accentuées disjointes de la GT (pureté « a » ≥ 97 %,
-/// unis aux participes irréguliers connus). Un mot ici ⇒ on n'accentue pas.
+/// hors-ligne sur les décisions accentuées, unis aux participes irréguliers connus.
+/// Un mot ici ⇒ on n'accentue pas.
 const A_AUX_NEXT_TXT: &str = include_str!("../data/a_aux_next_fr.txt");
 
 /// Mots repliés qui, juste **avant** « a/à », trahissent l'auxiliaire (sujet élidé/
@@ -52,18 +51,17 @@ const A_AUX_PREV_TXT: &str = include_str!("../data/a_aux_prev_fr.txt");
 /// (« condamne »/« condamné », « attaque »/« attaqué ») — exclus du lexique
 /// principal par le filtre de dominance. Format `folded<TAB>accentué<TAB>tier`
 /// (`s` = lecture participe dominante, `w` = nom/présent dominant). Restaurés
-/// seulement quand un auxiliaire précède (cf. `participle_fires`), signal de
-/// précision ≥ 97 % mesuré sur la GT recasse.
+/// seulement quand un auxiliaire précède (cf. `participle_fires`).
 const PARTICIPLES_TXT: &str = include_str!("../data/participles_fr.txt");
 
 /// Désambiguïsation contextuelle du participe masculin singulier `-é` (présent/nom
 /// « condamne » vs participe « condamné » ; double homographe « arrête »/« arrêté »),
-/// apprise hors-ligne sur ~28 000 décisions accentuées **disjointes de la GT
-/// recasse** (cf. ADR 0072). Format `folded<TAB>forme_é<TAB>forme_alt<TAB>défaut(e|é)
-/// <TAB>flips` : `forme_é` = participe accentué, `forme_alt` = lecture alternative
-/// (vide ⇒ non accentuée), `défaut` = lecture majoritaire en jurisprudence, `flips`
-/// = voisins repliés qui l'inversent (`p<token>`/`n<token>` ; `^`/`$` = début/fin).
-/// Contextes ≥ 95 % décisifs uniquement. Consulté avant le lexique.
+/// apprise hors-ligne sur des décisions accentuées disjointes de la GT recasse.
+/// Format `folded<TAB>forme_é<TAB>forme_alt<TAB>défaut(e|é)<TAB>flips` :
+/// `forme_é` = participe accentué, `forme_alt` = lecture alternative (vide ⇒ non
+/// accentuée), `défaut` = lecture majoritaire en jurisprudence, `flips` = voisins
+/// repliés qui l'inversent (`p<token>`/`n<token>` ; `^`/`$` = début/fin).
+/// Consulté avant le lexique.
 const PARTICIPLE_CTX_TXT: &str = include_str!("../data/participle_context_fr.txt");
 
 static ACCENTS: LazyLock<HashMap<String, &'static str>> = LazyLock::new(|| {
@@ -163,7 +161,7 @@ const ACRONYMS: &[&str] = &[
 // Désambiguïsation de l'homographe « a » (auxiliaire avoir) / « à » (préposition),
 // tranchée sur les mots voisins repliés (cf. `disambiguate_a`, `A_AUX_PREV`,
 // `A_AUX_NEXT`) : défaut préposition, « a » seulement sur signal auxiliaire franc
-// (sujet/initiale avant, prédicteur appris après). Mesuré sur la GT : ~97 % des « à ».
+// (sujet/initiale avant, prédicteur appris après).
 
 /// Têtes nominales temporelles/locatives qui précèdent l'adverbe relatif « où »
 /// (« le jour où », « dans la mesure où », « au cas où ») ⇒ « où ». La
@@ -238,7 +236,7 @@ fn fold(s: &str) -> String {
 /// Vrai si le texte est majoritairement en capitales (≥ 85 % des lettres) sur un
 /// volume significatif — signature des vieilles décisions caps-lock. C'est le
 /// portillon : on ne recasse QUE ces documents, jamais un texte déjà en casse
-/// mixte (qu'on abîmerait).
+/// mixte.
 pub fn is_caps_lock(text: &str) -> bool {
     let mut upper = 0usize;
     let mut letters = 0usize;
@@ -267,8 +265,8 @@ fn is_word_char(c: char) -> bool {
 
 fn truecase_line(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
-    // Pré-passe : suite des mots repliés, pour donner à chaque mot le contexte de
-    // ses voisins (désambiguïsation a/à).
+    // pré-passe : suite des mots repliés, pour donner à chaque mot le contexte de ses
+    // voisins
     let folded = folded_word_seq(&chars);
     let mut out = String::with_capacity(line.len());
     let mut i = 0;
@@ -304,9 +302,8 @@ fn truecase_line(line: &str) -> String {
             }
             let run = &chars[start..i];
             out.extend(run.iter());
-            // Frontière de phrase sur « . ! ? » mais pas sur une ellipse (« ... »)
-            // ni un « ; » (les attendus/moyens s'enchaînent en minuscule). Sinon on
-            // conserve l'état (les ponctuations de tête gardent le début de ligne).
+            // frontière de phrase sur « . ! ? », pas sur une ellipse (« ... ») ni un « ; ».
+            // Sinon on conserve l'état.
             if is_sentence_boundary(run) {
                 sentence_start = true;
             }
@@ -395,9 +392,8 @@ fn case_word(
     } else if let Some(form) = disambiguate_closed(&key, prev, next) {
         form.to_string()
     } else if let Some(ctx) = PARTICIPLE_CTX.get(key.as_str()) {
-        // Tranche participe `-é` vs forme alternative (consulté avant le lexique :
-        // gère les doubles homographes « arrête »/« arrêté » que le lexique fixait
-        // à tort sur la lecture non-juridique).
+        // tranche participe `-é` vs forme alternative, consulté avant le lexique : gère
+        // les doubles homographes « arrête »/« arrêté »
         let flip = {
             let pk = format!("p{}", prev.unwrap_or("^"));
             let nk = format!("n{}", next.unwrap_or("$"));
@@ -426,12 +422,12 @@ fn case_word(
     } else {
         base
     };
-    // Invariant de longueur (offsets de spans de citation, lj-api decisions.rs) :
-    // la recasse ne change JAMAIS le nombre de codepoints. Les seules formes des
-    // lexiques qui le violent sont les ligatures œ/æ (clé foldée `oe`/`ae` → forme
-    // affichée d'1 codepoint plus courte) : on retombe alors sur la minuscule
-    // (recasée en début de phrase), de même longueur que l'entrée. La restauration
-    // d'accents (é, à, ô…) est 1:1 et passe sans repli.
+    // Invariant de longueur : la recasse ne change JAMAIS le nombre de codepoints —
+    // les offsets des spans de citation sont appliqués sur le texte recasé. Les
+    // seules formes des lexiques qui le violent sont les ligatures œ/æ (clé foldée
+    // `oe`/`ae` → forme affichée d'un codepoint plus courte) : on retombe alors sur
+    // la minuscule, de même longueur que l'entrée. La restauration d'accents est 1:1
+    // et passe sans repli.
     if cased.chars().count() == word.chars().count() {
         cased
     } else {
@@ -489,9 +485,8 @@ fn participle_fires(prev: Option<&str>, strong: bool) -> bool {
 }
 
 /// Homographes fermés `ou`/`où`, `des`/`dès`, `du`/`dû` tranchés sur les voisins
-/// repliés (signaux mesurés ≥ 95 % de pureté sur la GT recasse). Renvoie la forme
-/// accentuée quand un signal franc se déclenche, sinon `None` (on garde la forme
-/// non accentuée, par précision).
+/// repliés. Renvoie la forme accentuée quand un signal franc se déclenche, sinon
+/// `None` : on garde la forme non accentuée.
 fn disambiguate_closed(key: &str, prev: Option<&str>, next: Option<&str>) -> Option<&'static str> {
     match key {
         // « le jour où », « dans la mesure où » : nom temporel/locatif juste avant.
@@ -508,8 +503,7 @@ fn disambiguate_closed(key: &str, prev: Option<&str>, next: Option<&str>) -> Opt
             _ => None,
         },
         // « aurait dû », « restant dû », « a dû être » : participe « dû ». On reste
-        // étroit (l'article « du » précède aussi des noms en -er/-ir, « du premier
-        // ressort », « du pouvoir » : pas de test d'infinitif).
+        // étroit — l'article « du » précède aussi des noms en -er/-ir.
         "du" => {
             let aux_before = matches!(
                 prev,
@@ -548,13 +542,10 @@ mod tests {
 
     #[test]
     fn truecase_preserves_codepoint_length() {
-        // Invariant critique : les offsets de spans de citation (codepoints sur le
-        // texte original) sont appliqués sur le texte recasé (lj-api decisions.rs).
-        // La recasse ne doit JAMAIS changer le nombre de codepoints. Les ligatures
-        // œ/æ des lexiques (OEUVRE→œuvre, SCHOELCHER→Schœlcher) raccourciraient le
-        // texte de 1 codepoint par occurrence et décaleraient les liens en aval —
-        // repli sur la forme oe/ae pour tenir l'invariant. Restaurer les accents
-        // (é, à…) reste 1:1 et autorisé.
+        // Invariant : la recasse ne change jamais le nombre de codepoints. Les ligatures
+        // œ/æ des lexiques (OEUVRE→œuvre, SCHOELCHER→Schœlcher) raccourciraient le texte
+        // d'un codepoint par occurrence et décaleraient les liens en aval : repli sur la
+        // forme oe/ae. Restaurer les accents reste 1:1.
         for s in [
             "VU L'OEUVRE ET L'ARTICLE 700 DU CODE DE PROCEDURE CIVILE",
             "TRIBUNAL DE SCHOELCHER, ARTICLE L. 761-1 DU CODE",
@@ -582,12 +573,10 @@ mod tests {
 
     #[test]
     fn capitalizes_after_sentence_dot_not_after_semicolon_or_ellipsis() {
-        // « ; » n'ouvre pas une phrase ; « . » oui.
         assert_eq!(
             truecase("ATTENDU QUE ; QUE CECI."),
             "Attendu que ; que ceci."
         );
-        // Ellipse d'anonymisation : pas de capitale derrière.
         assert_eq!(
             truecase("LE SIEUR X... ETAIT LA."),
             "Le sieur X... était la."
@@ -604,9 +593,6 @@ mod tests {
 
     #[test]
     fn protects_ambiguous_unaccented_words() {
-        // « a » (sujet « il » avant), « sur », « du » : laissés intacts. « statué »
-        // tranché par le modèle contextuel (auxiliaire avant) ; « dès la » par la
-        // règle fermée (déterminant après « des ») ; « première » par le lexique.
         assert_eq!(
             truecase("IL A STATUE SUR LE FOND DU DROIT DES LA PREMIERE HEURE"),
             "Il a statué sur le fond du droit dès la première heure"
@@ -615,7 +601,6 @@ mod tests {
 
     #[test]
     fn disambiguates_a_preposition_vs_auxiliary() {
-        // Préposition « à » : devant déterminant, infinitif, marqueur.
         assert_eq!(
             truecase("CONDAMNE A PAYER LA SOMME"),
             "Condamne à payer la somme"
@@ -628,22 +613,16 @@ mod tests {
             truecase("FIXE A COMPTER DU JUGEMENT"),
             "Fixe à compter du jugement"
         );
-        // Auxiliaire « a » (laissé tel quel) ; « statué » accentué par le modèle
-        // contextuel (participe après auxiliaire).
         assert_eq!(
             truecase("LA COUR D'APPEL A STATUE"),
             "La cour d'appel a statué"
         );
-        // « a » auxiliaire (sujet « il » avant) ; « violé » accentué par la règle
-        // participe (auxiliaire avant, forme participe-dominante).
         assert_eq!(truecase("IL A VIOLE LE TEXTE"), "Il a violé le texte");
         assert_eq!(
             truecase("LA DEMANDE A ETE REJETEE"),
             "La demande a été rejetée"
         );
-        // Piège « il a la » : le sujet l'emporte sur le déterminant suivant.
         assert_eq!(truecase("IL A LA FACULTE"), "Il a la faculté");
-        // « à » devant bénéficiaire/quantité (jamais après l'auxiliaire « a »).
         assert_eq!(
             truecase("CONDAMNE A PAYER A M. DUPONT LA SOMME"),
             "Condamne à payer à M. Dupont la somme"
@@ -652,14 +631,11 @@ mod tests {
 
     #[test]
     fn restores_aux_participle_and_closed_homographs() {
-        // Participe en -é restauré derrière un auxiliaire (« a condamné »,
-        // « est fondé », « ont formé ») ; sans auxiliaire, on reste prudent.
         assert_eq!(
             truecase("LA COUR A CONDAMNE ET A PRONONCE LA RELAXE"),
             "La cour a condamné et a prononcé la relaxe"
         );
         assert_eq!(truecase("LE MOYEN EST FONDE"), "Le moyen est fondé");
-        // Homographes fermés : « dès lors/que », « le jour où », « aurait dû ».
         assert_eq!(
             truecase("DES LORS QUE LA DEMANDE"),
             "Dès lors que la demande"
@@ -672,7 +648,6 @@ mod tests {
             truecase("LE JUGE AURAIT DU STATUER"),
             "Le juge aurait dû statuer"
         );
-        // « du » article et « des » article restent intacts (pas de signal).
         assert_eq!(
             truecase("LE PRESIDENT DU TRIBUNAL ET DES PARTIES"),
             "Le président du tribunal et des parties"
@@ -681,17 +656,14 @@ mod tests {
 
     #[test]
     fn disambiguates_masc_participle_by_context() {
-        // Participe adjectival après un nom-tête (patient) ⇒ accentué.
         assert_eq!(
             truecase("L'ARRET ATTAQUE A REJETE LA DEMANDE"),
             "L'arrêt attaqué a rejeté la demande"
         );
-        // Verbe présent au dispositif (sujet-agent avant) ⇒ non accentué.
         assert_eq!(
             truecase("LE TRIBUNAL CONDAMNE LA SOCIETE"),
             "Le tribunal condamne la société"
         );
-        // Passif (« a été condamné ») ⇒ participe.
         assert_eq!(
             truecase("IL A ETE CONDAMNE PAR LE JUGEMENT"),
             "Il a été condamné par le jugement"

@@ -1,4 +1,4 @@
--- Migration 0120 — purge de l'ancien monde titres (ADR 0170 ét.7).
+-- Migration 0120 — purge de l'ancien monde titres (ét. 7).
 --
 -- `formation_or_chamber` (chaîne aplatie greffe) et `jurisdiction_name`
 -- (libellé texte libre) ne sont plus ni écrites ni lues : les axes

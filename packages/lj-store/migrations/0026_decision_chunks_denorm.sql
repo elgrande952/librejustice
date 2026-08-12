@@ -1,5 +1,5 @@
 -- Migration 0026 — Pre-filter BM25 via dénormalisation des métadonnées sur
--- ``decision_chunks`` (cf. ADR 0033).
+-- ``decision_chunks``.
 --
 -- Ce que cette migration fait :
 --
@@ -21,7 +21,7 @@
 -- une réécriture BM25 — pour finalement les jeter au rebuild. Premier essai
 -- (1 M chunks) : 2h13 ; ce pattern descend à ~50 min.
 --
--- ⚠️ Post-migration obligatoire : ``REINDEX INDEX CONCURRENTLY`` sur
+-- Post-migration obligatoire : ``REINDEX INDEX CONCURRENTLY`` sur
 -- ``chunks_bm25`` ET ``chunks_vec``. La migration laisse les segments
 -- Tantivy bloated (jusqu'à 2× la taille cible) car le bgmerger ParadeDB ne
 -- compacte pas spontanément les segments > 1 GB, et ``vchordrq`` accumule
@@ -273,7 +273,7 @@ CREATE TRIGGER dlr_sync_chunks_legal_instruments
 --
 -- chunks_vec — paramètres identiques à 0023 (``rabitq8_cosine_ops``).
 --
--- ⚠️ Build long. Pendant le rebuild :
+-- Build long. Pendant le rebuild :
 -- - writes sur ``decision_chunks`` bloquées (CREATE INDEX prend un SHARE
 --   lock — pas concurrent, sinon il faudrait sortir du transaction wrapper
 --   du migrator).

@@ -1,4 +1,4 @@
--- Sitemaps servis depuis Postgres (ADR 0064).
+-- Sitemaps servis depuis Postgres.
 --
 -- Remplace le stockage objet R2 + le Worker Cloudflare : le cron (`lj-ingest
 -- sitemap`) régénère l'ensemble et l'upsert ici, `lj-server` sert

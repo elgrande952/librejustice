@@ -1,15 +1,14 @@
-//! Autocomplétion des barres de recherche (ADR 0216) : contrôleur + panneau.
+//! Autocomplétion des barres de recherche : contrôleur + panneau.
 //!
-//! Le parent garde son `<input>` contrôlé ; il crée un [`SuggestController`]
-//! sur le même signal `query`, lui attache `on:keydown` / `on:blur`, pose
-//! `relative` sur le conteneur du champ et rend un [`SuggestPanel`] dedans.
-//! Le contrôleur observe `query` (debounce 150 ms), interroge `GET /suggest`
-//! et remplace les `matched_tokens` derniers mots à la sélection. Gestes
-//! (modèle Google) : les **flèches** recopient la suggestion surlignée dans
-//! le champ (liste figée, remonter au-delà restaure le texte tapé), donc
-//! **Enter** soumet le champ tel quel et la frappe continue naturellement
-//! après ; le **clic** valide la suggestion et lance la recherche aussitôt
-//! (soumission du formulaire englobant).
+//! Le parent garde son `<input>` contrôlé ; il crée un [`SuggestController`] sur
+//! le même signal `query`, lui attache `on:keydown` / `on:blur`, pose `relative`
+//! sur le conteneur du champ et rend un [`SuggestPanel`] dedans. Le contrôleur
+//! observe `query` (debounce 150 ms), interroge `GET /suggest` et remplace les
+//! `matched_tokens` derniers mots à la sélection. Gestes : les **flèches**
+//! recopient la suggestion surlignée dans le champ (liste figée, remonter au-delà
+//! restaure le texte tapé), donc **Enter** soumet le champ tel quel et la frappe
+//! continue naturellement après ; le **clic** valide la suggestion et lance la
+//! recherche aussitôt (soumission du formulaire englobant).
 
 use leptos::leptos_dom::helpers::{set_timeout_with_handle, TimeoutHandle};
 use leptos::prelude::*;
@@ -38,8 +37,7 @@ pub struct SuggestController {
     /// pas de refetch pour celle-là — aux flèches la liste reste figée, au
     /// clic la recherche part.
     silent_set: StoredValue<bool>,
-    /// Le champ a le focus : seule la frappe déclenche des suggestions — un
-    /// `query.set` programmatique (resync URL après soumission) ne rouvre rien.
+    /// Le champ a le focus : seule la frappe déclenche des suggestions.
     focused: RwSignal<bool>,
 }
 
@@ -70,7 +68,11 @@ impl SuggestController {
                 ctrl.silent_set.set_value(false);
                 return;
             }
-            if !ctrl.focused.get_untracked() || q.trim().chars().count() < MIN_QUERY {
+            // Corpus sans index de suggestions : rien à demander.
+            if ctrl.mode.get_untracked().is_empty()
+                || !ctrl.focused.get_untracked()
+                || q.trim().chars().count() < MIN_QUERY
+            {
                 ctrl.close();
                 return;
             }
@@ -124,9 +126,9 @@ impl SuggestController {
         })
     }
 
-    /// Valide la suggestion `i` (clic) : elle remplace les `matched` derniers
-    /// mots tapés et la recherche part aussitôt — soumission du formulaire
-    /// qui contient le champ, comme Google.
+    /// Valide la suggestion `i` (clic) : elle remplace les `matched` derniers mots
+    /// tapés et la recherche part aussitôt — soumission du formulaire qui contient le
+    /// champ.
     pub fn pick(self, i: usize, ev: &leptos::ev::MouseEvent) {
         let Some(next) = self.composed(i) else {
             return;
@@ -156,6 +158,13 @@ impl SuggestController {
         self.open.set(false);
         self.active.set(None);
         self.items.set(Vec::new());
+    }
+
+    /// Set programmatique de `query` par le parent (resync depuis l'URL) : pas de
+    /// refetch, le panneau ne se rouvre pas après une soumission.
+    pub fn sync(self, text: String) {
+        self.silent_set.set_value(true);
+        self.query.set(text);
     }
 
     /// Navigation clavier à attacher à l'`<input>` : flèches (appliquent la
@@ -215,11 +224,11 @@ impl SuggestController {
 #[component]
 pub fn SuggestPanel(ctrl: SuggestController) -> impl IntoView {
     view! {
-        <Show when=move || ctrl.open.get()>
             <ul
                 role="listbox"
                 aria-label="Suggestions"
-                class="absolute inset-x-0 top-full z-30 mt-1 overflow-hidden rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] py-1 shadow-lg"
+                data-open=move || ctrl.open.get().then_some("true")
+                class="lj-panel absolute inset-x-0 top-full z-30 mt-1 overflow-hidden rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] py-1 shadow-lg"
             >
                 <For
                     each=move || ctrl.items.get().into_iter().enumerate()
@@ -263,7 +272,6 @@ pub fn SuggestPanel(ctrl: SuggestController) -> impl IntoView {
                     }
                 />
             </ul>
-        </Show>
     }
 }
 

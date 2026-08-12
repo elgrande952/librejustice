@@ -1,4 +1,4 @@
--- Migration 0117 — formation structurée (ADR 0170).
+-- Migration 0117 — formation structurée.
 --
 -- `formation_or_chamber` (TEXT libre) est remplacée par trois axes : la
 -- position recomposée affichable (`chamber_position`), la spécialisation
@@ -7,7 +7,7 @@
 -- reprennent verbatim les tables du parseur (`lj-extract/src/formation.rs`,
 -- CHAMBRE_SEED / FORMATION_SEED / OFFICE_SEED_EXTRA). Le drop de l'ancienne
 -- colonne arrive en migration séparée, après backfill et bascule des
--- consommateurs (séquencement ADR 0170).
+-- consommateurs.
 
 ALTER TABLE decisions
   ADD COLUMN chamber_position TEXT,

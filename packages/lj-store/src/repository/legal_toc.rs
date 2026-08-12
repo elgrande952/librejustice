@@ -1,7 +1,7 @@
-//! Arêtes `legal_toc_edge` (arbre structurel daté des textes DILA, ADR 0207) :
-//! écriture par **remplacement par propriétaire** (même patron que
-//! `legal_link`), lecture par CTE récursive filtrée à une date (sommaire réel,
-//! vue-lecture d'une section), purge des orphelins après backfill.
+//! Arêtes `legal_toc_edge` (arbre structurel daté des textes DILA) : écriture
+//! par **remplacement par propriétaire** (même patron que `legal_link`), lecture
+//! par CTE récursive filtrée à une date (sommaire réel, vue-lecture d'une
+//! section), purge des orphelins après backfill.
 
 use chrono::NaiveDate;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -58,6 +58,26 @@ impl DecisionRepository<'_> {
             .execute(
                 "DELETE FROM legal_toc_edge WHERE owner_uid = ANY($1::text[])",
                 &[&owners],
+            )
+            .await?;
+        // L'ordre de lecture persisté dérive de cette structure : la réécrire
+        // salit le texte, le `NULL` étant le seul marqueur d'un rang périmé. **Un
+        // seul article par texte** suffit à le porter : le finisseur sélectionne
+        // les textes dont *au moins un* article est `NULL`, puis recalcule le
+        // texte entier.
+        let mut texts: Vec<&str> = items.iter().map(|(o, _)| o.text_uid.as_str()).collect();
+        texts.sort_unstable();
+        texts.dedup();
+        self.conn
+            .execute(
+                "UPDATE legal_article SET reading_rank = NULL
+                 WHERE id IN (
+                     SELECT s.id FROM unnest($1::text[]) AS t(uid)
+                     CROSS JOIN LATERAL (
+                         SELECT a.id FROM legal_article a
+                         WHERE a.text_uid = t.uid AND a.reading_rank IS NOT NULL
+                         LIMIT 1) s)",
+                &[&texts],
             )
             .await?;
 
@@ -154,10 +174,10 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Vue-lecture d'une section (ADR 0207) : résout le `cid` stable vers sa
-    /// version couvrant `at`, puis renvoie `(titre de section, sous-arbre en
-    /// ordre de lecture)` — corps des articles joints par `source_uid`.
-    /// `None` si le `cid` est inconnu du texte à cette date (404 côté API).
+    /// Vue-lecture d'une section : résout le `cid` stable vers sa version
+    /// couvrant `at`, puis renvoie `(titre de section, sous-arbre en ordre de
+    /// lecture)` — corps des articles joints par `source_uid`. `None` si le `cid`
+    /// est inconnu du texte à cette date (404 côté API).
     #[tracing::instrument(name = "db.toc_section_reading", skip(self), fields(db.system = "postgresql"))]
     pub async fn toc_section_reading(
         &self,
@@ -165,24 +185,75 @@ impl DecisionRepository<'_> {
         cid: &str,
         at: NaiveDate,
     ) -> Result<Option<(String, Vec<TocReadingRow>)>> {
-        let head_sql = concat!(
+        let Some((section_uid, section_label)) = self.section_head(text_uid, cid, at).await? else {
+            return Ok(None);
+        };
+        let items = self.reading_subtree(&section_uid, text_uid, at).await?;
+        Ok(Some((section_label, items)))
+    }
+
+    /// `(num_key, numéro affichable)` des articles du sous-arbre d'une section
+    /// **à une date** — l'ensemble de clés qu'agrège une division (citantes et
+    /// palmarès des plus cités). Même résolution du `cid` et même fenêtre datée
+    /// que [`Self::toc_section_reading`] ; `None` si le `cid` est inconnu du texte
+    /// à cette date (404 côté API). Le numéro affichable est le libellé de
+    /// l'arête, celui que rend la vue-lecture.
+    ///
+    /// Lecture **sans les corps**, là où `toc_section_reading` joint `texte` et
+    /// `nota` : la jointure détoasterait les corps pour n'en garder que les clés.
+    /// `DISTINCT ON` : une arête par version d'article, et une section LEGI
+    /// ré-écrite peut en présenter deux couvrantes — une clé sort une fois.
+    #[tracing::instrument(name = "db.toc_section_article_keys", skip(self), fields(db.system = "postgresql"))]
+    pub async fn toc_section_article_keys(
+        &self,
+        text_uid: &str,
+        cid: &str,
+        at: NaiveDate,
+    ) -> Result<Option<Vec<(String, String)>>> {
+        let Some((section_uid, _)) = self.section_head(text_uid, cid, at).await? else {
+            return Ok(None);
+        };
+        let sql = concat!(
+            "WITH RECURSIVE tree AS ( \
+                 SELECT e.child_kind, e.child_uid, e.child_num_key, e.label, \
+                        1 AS depth, ARRAY[e.seq] AS path \
+                 FROM legal_toc_edge e \
+                 WHERE e.owner_uid = $1 AND ",
+            window!("e", "$2"),
+            "    UNION ALL \
+                 SELECT c.child_kind, c.child_uid, c.child_num_key, c.label, \
+                        t.depth + 1, t.path || c.seq \
+                 FROM tree t \
+                 JOIN legal_toc_edge c ON c.owner_uid = t.child_uid \
+                 WHERE t.child_kind = 'section' AND t.depth < 32 AND ",
+            window!("c", "$2"),
+            ") SELECT DISTINCT ON (child_num_key) child_num_key, label FROM tree \
+              WHERE child_kind = 'article' AND child_num_key IS NOT NULL \
+              ORDER BY child_num_key, path",
+        );
+        let rows = self.conn.query(sql, &[&section_uid, &at]).await?;
+        Ok(Some(rows.iter().map(|r| (r.get(0), r.get(1))).collect()))
+    }
+
+    /// Résout le `cid` stable d'une section vers l'uid de sa version couvrant
+    /// `at`, et son libellé. `None` si le texte n'a pas cette section à cette date.
+    async fn section_head(
+        &self,
+        text_uid: &str,
+        cid: &str,
+        at: NaiveDate,
+    ) -> Result<Option<(String, String)>> {
+        let sql = concat!(
             "SELECT e.child_uid, e.label FROM legal_toc_edge e \
              WHERE e.text_uid = $1 AND e.child_cid = $2 AND e.child_kind = 'section' AND ",
             window!("e", "$3"),
             " LIMIT 1",
         );
-        let Some(head) = self
+        Ok(self
             .conn
-            .query_opt(head_sql, &[&text_uid, &cid, &at])
+            .query_opt(sql, &[&text_uid, &cid, &at])
             .await?
-        else {
-            return Ok(None);
-        };
-        let section_uid: String = head.get("child_uid");
-        let section_label: String = head.get("label");
-
-        let items = self.reading_subtree(&section_uid, text_uid, at).await?;
-        Ok(Some((section_label, items)))
+            .map(|r| (r.get("child_uid"), r.get("label"))))
     }
 
     /// Vue-lecture d'un texte entier : le sous-arbre ancré à la racine
@@ -260,9 +331,9 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Purge autoritaire des arêtes d'un texte curé avant réécriture
-    /// (ADR 0186) — le dataset est la source de vérité de sa structure,
-    /// y compris quand il n'en déclare plus.
+    /// Purge autoritaire des arêtes d'un texte curé avant réécriture — le
+    /// dataset est la source de vérité de sa structure, y compris quand il n'en
+    /// déclare plus.
     #[tracing::instrument(name = "db.delete_toc_edges_by_text", skip(self), fields(db.system = "postgresql"))]
     pub async fn delete_toc_edges_by_text(&self, text_uid: &str) -> Result<u64> {
         let n = self
@@ -275,9 +346,9 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Suppression `.dat` (ADR 0207) : purge les arêtes dont le propriétaire
-    /// figure dans une liste de suppression. `owners` = ids extraits des
-    /// chemins (`LEGISCTA` de version, cid de texte pour `texte/struct`).
+    /// Suppression `.dat` : purge les arêtes dont le propriétaire figure dans
+    /// une liste de suppression. `owners` = ids extraits des chemins
+    /// (`LEGISCTA` de version, cid de texte pour `texte/struct`).
     #[tracing::instrument(name = "db.delete_toc_edges_by_owners", skip_all, fields(db.system = "postgresql", owners = owners.len()))]
     pub async fn delete_toc_edges_by_owners(&self, owners: &[String]) -> Result<u64> {
         if owners.is_empty() {

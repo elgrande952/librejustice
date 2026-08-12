@@ -1,5 +1,5 @@
 -- Migration 0102 — labels des types de juridiction dans le référentiel
--- (ADR 0146, complète le seed 0100).
+-- (complète le seed 0100).
 --
 -- Le niveau 1 de l'arbre juridiction est `juridiction_type` ; ses libellés
 -- vivaient uniquement en code (triple copie labels.rs). On les porte dans

@@ -9,9 +9,10 @@ use regex::Regex;
 
 use lj_dtos::QueryMode;
 
-/// `\b(?:ET|OU|SAUF|AND|OR|NOT)\b|(?:PROCHE|NEAR)\d+|["*]` — détecteur de query booléenne.
+/// `\b(?:ET|OU|SAUF|AND|OR|NOT)\b|\b(?:PROCHE|NEAR)\d+\b|["*]` — détecteur de
+/// query booléenne.
 static BOOL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\b(?:ET|OU|SAUF|AND|OR|NOT)\b|(?:PROCHE|NEAR)\d+|[*"]"#).unwrap()
+    Regex::new(r#"\b(?:ET|OU|SAUF|AND|OR|NOT)\b|\b(?:PROCHE|NEAR)\d+\b|[*"]"#).unwrap()
 });
 
 // ── Détection de mode / traduction booléenne ─────────────────────────────────
@@ -29,36 +30,113 @@ pub(crate) fn is_boolean_query(query: &str) -> bool {
     BOOL_RE.is_match(query)
 }
 
-static PROCHE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#""([^"]*)"(?:PROCHE|NEAR)(\d+)"#).unwrap());
-/// Collapse les guillemets doublés `""x""` → `"x"` (parité `re.sub(r'""([^"]*?)""', …)`
-/// côté Python) : deux quotes de chaque côté, pas trois.
+/// Collapse les guillemets doublés `""x""` → `"x"` : deux quotes de chaque
+/// côté, pas trois.
 static DOUBLE_QUOTE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new("\"\"([^\"]*?)\"\"").unwrap());
 static ET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bET\b").unwrap());
 static OU_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bOU\b").unwrap());
 static SAUF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bSAUF\b").unwrap());
-static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""[^"]*"|\S+"#).unwrap());
+/// Un token = phrase quotée (slop `~N` collé compris), ou token nu.
+static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""[^"]*"(?:~\d+)?|\S+"#).unwrap());
+
+/// Découpage pour la passe de proximité : phrase quotée, opérateur
+/// `PROCHE`/`NEAR` suivi de son entier, ou token nu. L'opérateur passe avant
+/// `\S+` pour être reconnu même collé à une phrase (`"a b"PROCHE3`).
+static PROX_SCAN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""[^"]*"|\b(?:PROCHE|NEAR)\d+\b|\S+"#).unwrap());
+/// Token qui *est* l'opérateur de proximité, avec son slop en capture.
+static PROX_OP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:PROCHE|NEAR)(\d+)$").unwrap());
 
 pub(crate) fn translate_boolean(query: &str) -> String {
-    let q = PROCHE_RE.replace_all(query, r#""$1"~$2"#).into_owned();
-    let q = DOUBLE_QUOTE_RE.replace_all(&q, r#""$1""#).into_owned();
+    let q = DOUBLE_QUOTE_RE.replace_all(query, r#""$1""#).into_owned();
+    let q = rewrite_proximity(&q);
     let q = ET_RE.replace_all(&q, "AND").into_owned();
     let q = OU_RE.replace_all(&q, "OR").into_owned();
     let q = SAUF_RE.replace_all(&q, "NOT").into_owned();
     enforce_and_precedence(&q)
 }
 
+/// Slop d'un token opérateur (`PROCHE5` → 5), `None` si ce n'en est pas un.
+fn proximity_slop(tok: &str) -> Option<u32> {
+    PROX_OP_RE.captures(tok)?.get(1)?.as_str().parse().ok()
+}
+
+/// Un opérande de proximité : ni mot-clé booléen, ni opérateur de proximité.
+fn is_proximity_operand(tok: &str) -> bool {
+    !matches!(tok, "ET" | "OU" | "SAUF" | "AND" | "OR" | "NOT") && proximity_slop(tok).is_none()
+}
+
+/// Mots portés par un opérande : une phrase quotée est aplatie en ses mots, un
+/// token nu se rend lui-même. Les guillemets tombent — la phrase à slop les
+/// reposera autour de l'ensemble.
+fn operand_words(tok: &str) -> Vec<String> {
+    tok.replace('"', " ")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Réécrit les chaînes de proximité `A PROCHE5 B [PROCHE3 C…]` en phrase à slop
+/// tantivy `"A B C"~5` (slop = max des N de la chaîne), seule construction de la
+/// grammaire `paradedb.parse` qui exprime la proximité. Les opérandes sont des
+/// mots nus ou des phrases quotées, aplatis dans la phrase ; le slop tantivy
+/// tolère l'inversion (`"commercial bail"~5` matche « bail commercial »).
+///
+/// Un opérateur privé d'opérande à gauche ou à droite (`PROCHE5 bail`,
+/// `"bail commercial"PROCHE5`, `bail ET PROCHE5`) est droppé : rien à
+/// rapprocher.
+fn rewrite_proximity(query: &str) -> String {
+    if !PROX_SCAN_RE
+        .find_iter(query)
+        .any(|m| proximity_slop(m.as_str()).is_some())
+    {
+        return query.to_string();
+    }
+    let toks: Vec<&str> = PROX_SCAN_RE.find_iter(query).map(|m| m.as_str()).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let Some(mut slop) = proximity_slop(toks[i]) else {
+            out.push(toks[i].to_string());
+            i += 1;
+            continue;
+        };
+        let left = out.last().filter(|t| is_proximity_operand(t)).cloned();
+        let right = toks.get(i + 1).copied().filter(|t| is_proximity_operand(t));
+        let (Some(left), Some(right)) = (left, right) else {
+            i += 1;
+            continue;
+        };
+        out.pop();
+        let mut words = operand_words(&left);
+        words.extend(operand_words(right));
+        i += 2;
+        // Chaîne : `A PROCHE5 B PROCHE3 C` → une seule phrase, slop = max.
+        while let (Some(next_slop), Some(operand)) = (
+            toks.get(i).and_then(|t| proximity_slop(t)),
+            toks.get(i + 1).copied().filter(|t| is_proximity_operand(t)),
+        ) {
+            slop = slop.max(next_slop);
+            words.extend(operand_words(operand));
+            i += 2;
+        }
+        out.push(format!("\"{}\"~{slop}", words.join(" ")));
+    }
+    out.join(" ")
+}
+
 /// Caractères que la grammaire tantivy interprète hors guillemets : un token nu
-/// qui en porte un (`d'acte`, `acte(s`) fait rejeter la query **entière** par
+/// qui en porte un (`d'acte`, `acte(s`) fait rejeter la query entière par
 /// `paradedb.parse` — l'apostrophe ouvre une phrase single-quote jamais fermée.
-/// Vérifié sur l'index : `' ( ) [ { : ^` cassent tous le parse ; `~` (slop) et
-/// `*` (wildcard) parsent et restent porteurs de sens.
+/// `' ( ) [ { : ^` cassent tous le parse ; `~` (slop) et `*` (wildcard) parsent
+/// et restent porteurs de sens.
 const TANTIVY_SYNTAX: &[char] = &['\'', '(', ')', '[', ']', '{', '}', ':', '^', '\\'];
 
 /// Token composé uniquement d'étoiles : un wildcard sans préfixe n'est pas une
-/// prefix-query — `+*` fait rejeter la query entière par `paradedb.parse`
-/// (422 mesuré sur « 2 * 3 »). Droppé comme un stopword.
+/// prefix-query — `+*` fait rejeter la query entière par `paradedb.parse`.
+/// Droppé comme un stopword.
 fn is_bare_star(tok: &str) -> bool {
     !tok.is_empty() && tok.chars().all(|c| c == '*')
 }
@@ -80,8 +158,7 @@ fn quote_bare_syntax_token(tok: &str, syntax: &[char]) -> String {
 fn enforce_and_precedence(query: &str) -> String {
     if query.contains(" OR ") {
         // Chemin OR servi tel quel à tantivy : le grouping `(…)` y est de la
-        // syntaxe voulue — seule l'apostrophe (jamais intentionnelle en
-        // français) est neutralisée.
+        // syntaxe voulue, seule l'apostrophe est neutralisée.
         let toks = TOKEN_RE
             .find_iter(query)
             .filter(|m| !is_bare_star(m.as_str().trim_start_matches(['+', '-'])))
@@ -96,7 +173,7 @@ fn enforce_and_precedence(query: &str) -> String {
                 }
             });
         // Le drop d'une étoile nue peut rendre un opérateur pendant
-        // (« congés OR » / « OR congés ») — lui aussi un parse error tantivy.
+        // (« congés OR » / « OR congés ») — un parse error tantivy.
         let is_op = |t: &str| matches!(t, "AND" | "OR" | "NOT");
         let mut out: Vec<String> = Vec::new();
         for t in toks {
@@ -154,11 +231,10 @@ pub(crate) fn phrase_combo_parse(query: &str) -> String {
 
 /// Bras de construction de la jambe body BM25, pour l'A/B de ranking offline
 /// (`lj-bench rank-arms`). `Split` est le chemin prod : sac OR + phrase entière +
-/// runs de contenu découpés aux stopwords (le gazetteer reste hors chemin, jugé
-/// net-négatif — note 2026-06-12). `Bag` ne garde que le sac OR (aucune clause
-/// phrase). `Weighted(w)` part de `Split` et pondère chaque clause phrase par
-/// `^w` (`w < 1` ⇒ sous-pondération). Sert à trancher si la machinerie phrase
-/// apporte un gain de ranking ou se résume au sac de mots.
+/// runs de contenu découpés aux stopwords (le gazetteer reste hors chemin).
+/// `Bag` ne garde que le sac OR (aucune clause phrase). `Weighted(w)` part de
+/// `Split` et pondère chaque clause phrase par `^w` (`w < 1` ⇒
+/// sous-pondération).
 #[derive(Debug, Clone, Copy)]
 pub enum BodyArm {
     Bag,
@@ -190,17 +266,16 @@ pub fn body_query_for_arm(query: &str, arm: BodyArm) -> String {
 
 /// Construit les clauses (gazetteer injecté via `spans`, pour testabilité) :
 ///
-/// 1. **sac OR** : tous les tokens dédupés (rappel maximal) ;
-/// 2. **phrase entière** (si ≥ 2 tokens) : boost du verbatim ;
-/// 3. **clauses phrase**, en un balayage gauche→droite : à chaque span de
+/// 1. sac OR : tous les tokens dédupés (rappel maximal) ;
+/// 2. phrase entière (si ≥ 2 tokens) : boost du verbatim ;
+/// 3. clauses phrase, en un balayage gauche→droite : à chaque span de
 ///    collocation reconnue (peut contenir des stopwords internes — l'index
 ///    préserve les gaps de position, donc `"tribunal de commerce"` matche), on
 ///    émet la collocation ; entre/hors spans, on regroupe les runs de contenu
-///    ≥ 2 tokens (ancien `content_chunks`), **bornés aux tokens non couverts**.
+///    ≥ 2 tokens, bornés aux tokens non couverts.
 ///
-/// Effet : la collocation à stopword interne remplace le fragment-déchet que le
-/// split-au-stopword produisait (« tribunal · commerce paris » → la vraie
-/// « tribunal de commerce »). Cf. note 2026-06-12.
+/// La collocation à stopword interne remplace ainsi le fragment produit par le
+/// split-au-stopword (« tribunal · commerce paris » → « tribunal de commerce »).
 pub(crate) fn phrase_combo_clauses(toks: &[String], spans: &[(usize, usize)]) -> Vec<String> {
     // 1. Sac OR : dédup en préservant l'ordre.
     let mut seen = HashSet::new();
@@ -254,8 +329,7 @@ pub(crate) fn phrase_combo_clauses(toks: &[String], spans: &[(usize, usize)]) ->
 /// survivent à la tokenisation comme prefix-query (jamais term-vides), donc une
 /// requête à `*` n'est jamais court-circuitée. Sinon les jambes BM25 généreraient
 /// une query tantivy sans clause, que `paradedb.parse` rejette (`body:()` → parse
-/// error) — vérifié sur l'index : `+responsabilite +de` matche (le `+de` vide est
-/// droppé), mais `+de +la` / `""` lèvent l'erreur de parse.
+/// error).
 pub(crate) fn query_lacks_searchable_terms(query: &str) -> bool {
     let has_prefix_wildcard = query
         .split_whitespace()
@@ -267,8 +341,6 @@ pub(crate) fn query_lacks_searchable_terms(query: &str) -> bool {
 mod tests {
     use super::*;
 
-    // Utilisé par l'oracle de parité ; hors chemin de prod (phrase_combo_clauses
-    // inline désormais le regroupement des runs de contenu).
     use lj_core::body_tok::content_chunks;
 
     #[test]
@@ -288,42 +360,71 @@ mod tests {
 
     #[test]
     fn translate_boolean_et_ou_sauf() {
-        // ET → +AND-precedence ; pure-AND ⇒ chaque token forcé `+`.
         assert_eq!(translate_boolean("congés ET payés"), "+congés +payés");
-        // OU laisse tel quel (mixte).
         assert_eq!(translate_boolean("congés OU payés"), "congés OR payés");
-        // SAUF → NOT → préfixe `-`.
         assert_eq!(translate_boolean("congés SAUF maladie"), "+congés -maladie");
-        // NEAR = alias de PROCHE (slop `~N`), sortie identique.
+    }
+
+    #[test]
+    fn proximity_infix_becomes_slop_phrase() {
         assert_eq!(
-            translate_boolean(r#""travail dimanche"NEAR3"#),
-            translate_boolean(r#""travail dimanche"PROCHE3"#)
+            translate_boolean("licenciement PROCHE5 harcèlement"),
+            r#"+"licenciement harcèlement"~5"#
+        );
+        assert_eq!(
+            translate_boolean("bail NEAR5 commercial"),
+            translate_boolean("bail PROCHE5 commercial")
+        );
+        assert_eq!(
+            translate_boolean(r#""travail dominical" PROCHE3 rupture"#),
+            r#"+"travail dominical rupture"~3"#
+        );
+        assert_eq!(
+            translate_boolean("bail PROCHE5 commercial PROCHE3 résiliation"),
+            r#"+"bail commercial résiliation"~5"#
+        );
+        assert_eq!(
+            translate_boolean("bail PROCHE5 commercial ET résiliation"),
+            r#"+"bail commercial"~5 +résiliation"#
+        );
+        assert_eq!(
+            translate_boolean("bail PROCHE5 commercial SAUF habitation"),
+            r#"+"bail commercial"~5 -habitation"#
+        );
+        assert_eq!(
+            translate_boolean("bail PROCHE5 commercial OU habitation"),
+            r#""bail commercial"~5 OR habitation"#
         );
     }
 
     #[test]
+    fn dangling_proximity_operator_is_dropped() {
+        assert_eq!(
+            translate_boolean(r#""travail dimanche"PROCHE3"#),
+            r#"+"travail dimanche""#
+        );
+        assert_eq!(translate_boolean("PROCHE5 bail"), "+bail");
+        assert_eq!(translate_boolean("bail ET PROCHE5"), "+bail");
+        assert_eq!(translate_boolean("approche5 ET bail"), "+approche5 +bail");
+        assert_eq!(detect_query_mode("approche5 bail"), QueryMode::Hybrid);
+    }
+
+    #[test]
     fn enforce_and_strips_stopwords() {
-        // « de » est un stopword body : retiré, pas de `+de` (parse error PDB).
         assert_eq!(enforce_and_precedence("congés de payés"), "+congés +payés");
     }
 
     #[test]
     fn bare_syntax_tokens_are_quoted() {
-        // Bug prod 15/07/2026 : `+d'acte` fait rejeter la query entière par
-        // `paradedb.parse` (apostrophe = phrase single-quote jamais fermée).
-        // Le token nu porteur de syntaxe est re-servi en phrase double-quotée.
         assert_eq!(
             translate_boolean(r#"prise d'acte "produit les effets d'une démission""#),
             r#"+prise +"d'acte" +"produit les effets d'une démission""#
         );
-        // Parenthèse / crochet / deux-points nus : même neutralisation.
         assert_eq!(translate_boolean(r#"acte(s ET nul"#), r#"+"acte(s" +nul"#);
-        // Wildcard préservé, phrase déjà quotée intacte.
         assert_eq!(
             translate_boolean(r#"répar* ET "l'astreinte""#),
             r#"+répar* +"l'astreinte""#
         );
-        // Chemin OR (servi tel quel) : grouping préservé, apostrophe seule quotée.
         assert_eq!(
             translate_boolean("congés OU d'aménagement"),
             r#"congés OR "d'aménagement""#
@@ -332,40 +433,26 @@ mod tests {
 
     #[test]
     fn bare_star_token_is_dropped() {
-        // Bug prod 19/07/2026 : « 2 * 3 » → `+2 +* +3`, et `+*` (wildcard sans
-        // préfixe) fait rejeter la query entière par `paradedb.parse` (422).
         assert_eq!(translate_boolean("2 * 3"), "+2 +3");
         assert_eq!(translate_boolean("faute ** dommage"), "+faute +dommage");
         assert_eq!(translate_boolean("congés OU *"), "congés");
-        // Le wildcard À préfixe reste porteur de sens.
         assert_eq!(translate_boolean("répar* ET faute"), "+répar* +faute");
-        // Query réduite aux étoiles : court-circuitée (résultat vide), jamais
-        // servie à tantivy.
         assert!(query_lacks_searchable_terms("*"));
         assert!(query_lacks_searchable_terms("* **"));
     }
 
     #[test]
     fn stopword_only_query_lacks_searchable_terms() {
-        // 100 % stopwords (plain ou booléen) / vide → court-circuit sur résultat
-        // vide, jamais de query tantivy term-vide (parse error `paradedb.parse`).
         assert!(query_lacks_searchable_terms("de la"));
         assert!(query_lacks_searchable_terms("le la les des du"));
         assert!(query_lacks_searchable_terms("de ET la"));
         assert!(query_lacks_searchable_terms(""));
         assert!(query_lacks_searchable_terms("   "));
-        // Contenu réel → récupération normale.
         assert!(!query_lacks_searchable_terms("responsabilité"));
         assert!(!query_lacks_searchable_terms("code de la route"));
-        // Wildcard sur préfixe stopword : prefix-query valide, pas court-circuité.
         assert!(!query_lacks_searchable_terms("de*"));
     }
 
-    // GT de construction de requête ParadeDB, figée dans
-    // tests/fixtures/oracle/query_strings.json (cf. _provenance). Asservit le gros
-    // des comportements de query-string (slop `~N`, préfixes `+`/`-`, folding
-    // d'accents, dédup OR-leg et clauses, split/strip stopwords alignés index)
-    // sans DB.
     #[derive(serde::Deserialize)]
     struct QueryCase {
         query: String,
@@ -396,9 +483,6 @@ mod tests {
                 "translate_boolean({:?})",
                 c.query
             );
-            // Base lexicon-free (gazetteer vide) : la fixture pin la construction
-            // sac OR + phrase + runs de contenu, indépendamment du lexique
-            // embarqué (testé séparément). spans=[] ⇒ comportement pré-gazetteer.
             assert_eq!(
                 phrase_combo_clauses(&tokenize_body(&c.query), &[]).join(" "),
                 c.phrase_combo_parse,
@@ -423,28 +507,22 @@ mod tests {
     #[test]
     fn phrase_combo_dedups_or_leg() {
         let out = phrase_combo_parse("podologie podologie");
-        // OR-leg dédupliqué : un seul `podologie` en tête.
         assert!(out.starts_with("podologie "), "got: {out}");
     }
 
     #[test]
     fn phrase_combo_gazetteer_replaces_split_fragment() {
-        // Le gazetteer (lexique contrôlé) remplace le fragment-déchet du split.
         let toks = tokenize_body("tribunal de commerce de paris competence litige");
         let m = lj_core::collocations::Matcher::from_phrases(["tribunal de commerce"]);
         let clauses = phrase_combo_clauses(&toks, &m.spans(&toks));
-        // La vraie collocation est phrasée…
         assert!(
             clauses.iter().any(|c| c == "\"tribunal de commerce\""),
             "{clauses:?}"
         );
-        // …et le fragment-déchet « commerce paris » (split au stopword) ne l'est
-        // PLUS (couvert par la collocation).
         assert!(
             !clauses.iter().any(|c| c == "\"commerce paris\""),
             "{clauses:?}"
         );
-        // Sac OR (« de » dédupé) + phrase entière (verbatim, « de » conservé).
         assert_eq!(clauses[0], "tribunal de commerce paris competence litige");
         assert!(clauses
             .iter()
@@ -465,7 +543,6 @@ mod tests {
             clauses.iter().any(|c| c == "\"exces de vitesse\""),
             "{clauses:?}"
         );
-        // Le run-déchet « route exces » du split n'apparaît pas.
         assert!(
             !clauses.iter().any(|c| c == "\"route exces\""),
             "{clauses:?}"
@@ -474,7 +551,6 @@ mod tests {
 
     #[test]
     fn phrase_combo_uncovered_content_run_survives() {
-        // Un run de contenu hors collocation reste phrasé (ancien content_chunks).
         let toks = tokenize_body("tribunal de commerce detention provisoire");
         let m = lj_core::collocations::Matcher::from_phrases(["tribunal de commerce"]);
         let clauses = phrase_combo_clauses(&toks, &m.spans(&toks));

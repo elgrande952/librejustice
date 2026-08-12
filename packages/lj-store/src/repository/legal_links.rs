@@ -1,8 +1,7 @@
-//! Arêtes `legal_link` (graphe de liens DILA, ADR 0174) : écriture par
-//! **remplacement par propriétaire** (DELETE + COPY binaire, idempotent,
-//! rejouable — même patron que `write_citation_occurrences`), lecture résolue
-//! au read-time contre `legal_text`/`legal_article`, et purge des orphelins
-//! après backfill. Sentinelles owner texte-niveau : `num_key = ''`,
+//! Arêtes `legal_link` (graphe de liens DILA) : écriture par remplacement par
+//! propriétaire (DELETE + COPY binaire, idempotent, rejouable), lecture résolue
+//! au read-time contre `legal_text`/`legal_article`, et purge des orphelins après
+//! backfill. Sentinelles owner texte-niveau : `num_key = ''`,
 //! `date_debut = '0001-01-01'` (alignées sur `legal_article`).
 
 use chrono::NaiveDate;
@@ -19,13 +18,11 @@ fn owner_date(d: Option<NaiveDate>) -> NaiveDate {
 }
 
 impl DecisionRepository<'_> {
-    /// Remplace les arêtes de chaque propriétaire du batch : un DELETE par
-    /// clés (unnest) puis un COPY binaire de toutes les lignes, `seq` = ordre
-    /// du `Vec`. Un propriétaire avec un `Vec` vide voit ses arêtes purgées.
-    /// Un propriétaire présent plusieurs fois dans le batch (deux fichiers
-    /// DILA pour la même identité de version) suit la règle de l'upsert
-    /// article : **le dernier gagne** (sinon le COPY viole la PK).
-    /// Renvoie le nombre de lignes écrites.
+    /// Remplace les arêtes de chaque propriétaire du batch : un DELETE par clés
+    /// (unnest) puis un COPY binaire de toutes les lignes, `seq` = ordre du `Vec`.
+    /// Un propriétaire avec un `Vec` vide voit ses arêtes purgées. Un propriétaire
+    /// présent plusieurs fois dans le batch suit la règle de l'upsert article : le
+    /// dernier gagne. Renvoie le nombre de lignes écrites.
     #[tracing::instrument(name = "db.replace_legal_links", skip_all, fields(db.system = "postgresql", owners = items.len()))]
     pub async fn replace_legal_links(
         &self,
@@ -136,9 +133,13 @@ impl DecisionRepository<'_> {
         Ok(written)
     }
 
-    /// Arêtes d'une version d'article, cibles résolues : article par
-    /// `source_uid` (ID DILA exact) sinon par `(texte, num_key)` ; texte par
-    /// `target_text_uid`. Ordre du fichier source (`seq`).
+    /// Arêtes d'une version d'article, cibles résolues : article par `source_uid`
+    /// (ID DILA exact) sinon par `(texte, num_key)` ; texte par `target_text_uid`.
+    /// Ordre du fichier source (`seq`).
+    ///
+    /// Jumelage d'identité : les arêtes possédées par les versions `kind='edit'` de
+    /// la même clé sont servies avec celles du triplet exact. Les arêtes propres
+    /// d'abord, celles du jumeau ensuite, chacune dans l'ordre du fichier.
     #[tracing::instrument(name = "db.article_links", skip(self), fields(db.system = "postgresql"))]
     pub async fn article_links(
         &self,
@@ -174,8 +175,13 @@ impl DecisionRepository<'_> {
                      LIMIT 1 \
                  ) ts ON true \
                  WHERE l.owner_text_uid = $1 AND l.owner_num_key = $2 \
-                   AND l.owner_date_debut = $3 \
-                 ORDER BY l.seq",
+                   AND (l.owner_date_debut = $3 \
+                     OR EXISTS (SELECT 1 FROM legal_article e \
+                                WHERE e.text_uid = l.owner_text_uid \
+                                  AND e.num_key = l.owner_num_key \
+                                  AND e.date_debut = l.owner_date_debut \
+                                  AND e.kind = 'edit')) \
+                 ORDER BY (l.owner_date_debut <> $3), l.seq",
                 &[&text_uid, &num_key, &date],
             )
             .await?;
@@ -200,10 +206,8 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Purge les arêtes dont le propriétaire n'existe plus (article supprimé
-    /// par une liste `.dat` rejouée avant le backfill, texte collapsé…). Passe
-    /// de fin de backfill — anti-join pleine table, l'appelant lève le
-    /// `statement_timeout`.
+    /// Purge les arêtes dont le propriétaire n'existe plus. Passe de fin de
+    /// backfill — anti-join pleine table, l'appelant lève le `statement_timeout`.
     #[tracing::instrument(name = "db.prune_orphan_legal_links", skip(self), fields(db.system = "postgresql"))]
     pub async fn prune_orphan_legal_links(&self) -> Result<u64> {
         let n = self

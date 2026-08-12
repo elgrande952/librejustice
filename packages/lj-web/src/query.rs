@@ -1,23 +1,20 @@
-//! Cache de requetes (leptos-fetch). Port des conventions de
-//! `apps/web/src/lib/query-client.ts` :
-//!   - `stale_time` 1 h (aligne sur le TTL du cache recherche API) : tant que la donnee
-//!     est fresh, un remontage / une nav SPA de retour vers une recherche deja en
-//!     cache ne refetch pas (verifie : retour decision -> liste = 0 appel) -> pas
-//!     de flash. A l'hydratation initiale, la ressource streamee (non bloquante,
-//!     cf. `search_data`) declenche tout de meme UN fetch client dedupe : sa valeur
-//!     est ecrasee par le stream SSR (`SsrStreamedValueOverride` de leptos-fetch),
-//!     mais l'execution search cote serveur a bien lieu (cache hit ~6 ms). Cout
-//!     inherent au choix streaming (vs `resource_blocking` = page blanche ~3 s),
-//!     pas un flash.
-//!   - `gc_time` 2 h (> `stale_time`) : une entree inactive survit tout le temps
-//!     ou elle est fresh (1 h) PUIS une fenetre stale-while-revalidate (1 h de
-//!     plus) ou un retour de nav peint la version stale instantanement puis
-//!     revalide en arriere-plan, au lieu d'un fetch a froid.
+//! Cache de requetes (leptos-fetch).
+//!
+//! - `stale_time` 1 h (aligne sur le TTL du cache recherche API) : tant que la
+//!   donnee est fresh, un remontage ou une nav SPA de retour vers une recherche
+//!   deja en cache ne refetch pas.
+//! - `gc_time` 2 h (> `stale_time`) : une entree inactive survit tout le temps ou
+//!   elle est fresh (1 h) PUIS une fenetre stale-while-revalidate (1 h de plus) ou
+//!   un retour de nav peint la version stale instantanement puis revalide en
+//!   arriere-plan.
+//!
+//! Un chargement de `/decisions?q=…` n'execute aucune recherche cote serveur : le
+//! SSR peint le squelette (`search_is_loading` vrai, la ressource n'est jamais
+//! lue). Tout span `search` `context=user` vient donc du fetch CLIENT.
 //!
 //! leptos-fetch gere la dualite SSR/navigateur en interne (instance fournie au
-//! contexte ; dehydrate/rehydrate des ressources via le SharedContext leptos),
-//! la ou le React legacy distinguait manuellement `makeQueryClient` (SSR neuf)
-//! vs singleton navigateur. On fournit donc une seule fois au contexte racine.
+//! contexte ; dehydrate/rehydrate des ressources via le SharedContext leptos). On
+//! fournit donc une seule fois au contexte racine.
 
 use std::time::Duration;
 

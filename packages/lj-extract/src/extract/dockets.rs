@@ -1,4 +1,4 @@
-//! Jonctions de numéros de dossier lues dans le TEXTE (ADR 0157) : gabarits
+//! Jonctions de numéros de dossier lues dans le TEXTE : gabarits
 //! auto-détectés par le scan — pivot « joint les pourvois » (cassation) et
 //! clause « sous le(s) n° » de requête — regex sur petits spans positionnés
 //! par tokens, jamais le plein-texte.
@@ -92,8 +92,8 @@ fn same_court_docket_pattern(main_docket: &str) -> Option<Regex> {
     static RE_PA: OnceLock<Regex> = OnceLock::new();
     static RE_NUM: OnceLock<Regex> = OnceLock::new();
     // Motif dynamique mais espace minuscule (codes juridiction 2 lettres +
-    // 3 longueurs numériques) : memoïsé — la compilation regex par document
-    // pesait ~8 % du CPU d'extraction. `Regex` se clone par Arc.
+    // 3 longueurs numériques) : memoïsé, la compilation regex par document étant
+    // coûteuse. `Regex` se clone par Arc.
     static CACHE: OnceLock<std::sync::RwLock<std::collections::HashMap<String, Regex>>> =
         OnceLock::new();
     let re_pa = RE_PA.get_or_init(|| Regex::new(r"^\d{2}[A-Z]{2}\d{4,6}$").unwrap());
@@ -144,9 +144,8 @@ pub(super) fn joined_docket_numbers(
         caps_all.extend(re_docket_context_alt().captures_iter(w));
         for caps in caps_all {
             let m = caps.get(0).unwrap();
-            // Python : `text[max(0, start - 45) : start]` — 45 POINTS DE CODE
-            // avant le match (pas 45 octets : trancher en octets casse sur
-            // l'UTF-8 FR).
+            // 45 POINTS DE CODE avant le match (pas 45 octets : trancher en
+            // octets casse sur l'UTF-8 FR).
             let prefix_full = &w[..m.start()];
             let prefix = match prefix_full.char_indices().nth_back(44) {
                 Some((idx, _)) => &prefix_full[idx..],

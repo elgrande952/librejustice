@@ -1,4 +1,4 @@
-//! Génération des sitemaps (ADR 0064).
+//! Génération des sitemaps.
 //!
 //! Pipeline :
 //!
@@ -6,20 +6,20 @@
 //!    construit **en mémoire** un fichier `sitemap-{n}.xml.gz` par page + un
 //!    `sitemap-index.xml` qui les référence par leur URL publique finale.
 //! 2. Côté appelant (`cmd_sitemap`), l'ensemble est upserté dans la table
-//!    Postgres `sitemaps` ([`lj_store::repository::DecisionRepository::replace_sitemaps`]).
+//!    Postgres `sitemaps`
+//!    ([`lj_store::repository::DecisionRepository::replace_sitemaps`]).
 //!
-//! Coté serveur HTTP, `lj-server` sert `/sitemap.xml` (ligne `sitemap-index.xml`)
-//! et `/sitemaps/{file}` depuis cette table — plus de Worker Cloudflare ni de
-//! bucket R2.
+//! Côté serveur HTTP, `lj-server` sert `/sitemap.xml` (ligne
+//! `sitemap-index.xml`) et `/sitemaps/{file}` depuis cette table.
 
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::NaiveDate;
 use flate2::{Compression, GzBuilder};
 
 /// Limites W3C Sitemaps : 50 000 URLs OU 50 MiB décompressé par sitemap.
-/// On est dominés par la cardinalité, pas la taille. ~60 fichiers pour 3M.
 pub const MAX_URLS_PER_SITEMAP: usize = 50_000;
 
 /// Origine publique des URLs ; en dur — un site = une origine canonique.
@@ -31,8 +31,7 @@ pub const SITEMAP_INDEX_NAME: &str = "sitemap-index.xml";
 /// Un fichier sitemap construit en mémoire, prêt à upserter en base.
 ///
 /// `body` est servi tel quel : `.xml.gz` = **fichier gzip** (`application/gzip`
-/// sans `Content-Encoding`, surtout pas `application/xml` + `gzip` → double
-/// compression CDN), `.xml` = `application/xml`.
+/// sans `Content-Encoding`), `.xml` = `application/xml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SitemapFile {
     pub filename: String,
@@ -41,51 +40,63 @@ pub struct SitemapFile {
     pub lastmod: NaiveDate,
 }
 
-/// Source des décisions à inclure dans le sitemap.
-///
-/// Un trait laisse les tests fournir un fake sans tirer `lj-store`/Postgres dans
-/// le graphe.
+/// Date de dernière modification telle que la source la connaît : `None` quand
+/// elle l'ignore. La source **n'invente jamais** de date de remplacement — c'est
+/// [`plausible_lastmod`] qui tranche ce qui est publiable.
+pub type SourceLastmod = Option<NaiveDate>;
+
+/// Sortie de [`SitemapSource::iter_annonces_for_sitemap`] : fiches
+/// `(uid, lastmod)` et codes département de leurs pages de catalogue.
+pub type AnnoncesSitemap = (Vec<(String, SourceLastmod)>, Vec<String>);
+
 pub trait SitemapSource {
     /// Itère `(public_id, lastmod)` pour toutes les décisions à publier.
-    fn iter_decisions_for_sitemap(&self) -> Result<Vec<(String, NaiveDate)>>;
+    fn iter_decisions_for_sitemap(&self) -> Result<Vec<(String, SourceLastmod)>>;
 
     /// Itère `(slug, num, lastmod)` pour les articles de référentiel à publier
-    /// (pages `/texte/{slug}/{num}`, ADR 0097).
-    fn iter_referential_for_sitemap(&self) -> Result<Vec<(String, String, NaiveDate)>>;
+    /// (pages `/texte/{slug}/{num}`).
+    fn iter_referential_for_sitemap(&self) -> Result<Vec<(String, String, SourceLastmod)>>;
 
     /// Itère `(ns, id, lastmod)` pour les entités de l'annuaire à publier
-    /// (pages `/entite/{ns}/{id}`, ADR 0237). Les avocats (personnes physiques)
-    /// sont exclus côté SQL (RGPD).
-    fn iter_entities_for_sitemap(&self) -> Result<Vec<(String, String, NaiveDate)>>;
+    /// (pages `/entite/{ns}/{id}`). Les avocats (personnes physiques) sont exclus
+    /// côté SQL (RGPD).
+    fn iter_entities_for_sitemap(&self) -> Result<Vec<(String, String, SourceLastmod)>>;
 
     /// Itère `(slug, lastmod)` pour les codes navigables (pages TDM
-    /// `/texte/{slug}`, ADR 0237).
-    fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, NaiveDate)>>;
+    /// `/texte/{slug}`).
+    fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, SourceLastmod)>>;
 
     /// Itère `(code, années)` pour les hubs juridiction (pages
-    /// `/juridiction/{code}` + `/juridiction/{code}/{annee}`, ADR 0253).
+    /// `/juridiction/{code}` + `/juridiction/{code}/{annee}`).
     fn iter_jurisdiction_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<i32>)>>;
 
     /// Itère `(fond, tokens année)` pour les hubs du catalogue des normes
-    /// (pages `/normes/{fond}` + `/normes/{fond}/{annee}`, ADR 0255) —
-    /// `annee` = année ou `sans-date`.
+    /// (pages `/normes/{fond}` + `/normes/{fond}/{annee}`) — `annee` = année ou
+    /// `sans-date`.
     fn iter_norm_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<String>)>>;
+
+    /// Itère `(uid, lastmod)` pour les fiches de consultation (`/marche/{uid}`)
+    /// et `(code département)` pour leurs pages de catalogue
+    /// (`/annonces/departement/{code}`).
+    fn iter_annonces_for_sitemap(&self) -> Result<AnnoncesSitemap>;
 }
 
 /// Pages statiques indexables, servies en SSR mais absentes des tables (donc
 /// non énumérables en base) — landing, recherche, hubs d'annuaire, mentions
-/// légales… (ADR 0237). Chemins relatifs à [`BASE_URL`] ; leur `lastmod` est la
-/// date du run (pas de signal de fraîcheur par page). Le hub `/annuaire/avocats`
-/// est **volontairement absent** : il pagine les avocats (personnes physiques),
-/// même exclusion SEO que leurs fiches.
+/// légales… Chemins relatifs à [`BASE_URL`] ; leur `lastmod` est la date du run
+/// (pas de signal de fraîcheur par page). Le hub `/annuaire/avocats` est
+/// **volontairement absent** : il pagine les avocats (personnes physiques), même
+/// exclusion SEO que leurs fiches.
 const STATIC_PATHS: &[&str] = &[
     "/",
     "/decisions",
     "/textes",
     "/sources",
-    "/codes",
     "/juridictions",
+    "/annonces",
+    "/annonces/departement",
     "/normes",
+    "/normes/codes",
     "/annuaire",
     "/annuaire/entreprises",
     "/annuaire/personnes-publiques",
@@ -120,7 +131,7 @@ fn sitemap_url(filename: &str) -> String {
     format!("{BASE_URL}/sitemaps/{filename}")
 }
 
-/// Échappe `&`, `<`, `>` — équivalent `xml.sax.saxutils.escape` (défaut).
+/// Échappe `&`, `<`, `>`.
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -128,19 +139,218 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Bloc `<url>` minimal — pas de `priority`/`changefreq` (ignorés par Google
-/// depuis 2023). `loc` est échappé ici ; les appelants passent l'URL brute.
-fn format_url_entry(loc: &str, lastmod: NaiveDate) -> String {
-    format!(
-        "<url><loc>{}</loc><lastmod>{}</lastmod></url>",
-        xml_escape(loc),
-        lastmod.format("%Y-%m-%d"),
-    )
+/// Plus ancienne date de modification publiable : **l'epoch Unix**, plancher
+/// imposé par le parseur de Google. Search Console rejette en « Date non
+/// valide » tout `lastmod` antérieur.
+///
+/// Sous ce plancher tombent aussi les artefacts de source : DILA écrit
+/// `0001-01-01` quand un début de vigueur est inconnu, et le corpus porte des
+/// dates aberrantes (`0015-01-01`, `0025-12-01`).
+const LASTMOD_FLOOR: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
+    Some(d) => d,
+    None => unreachable!(),
+};
+
+/// **Seul** juge de ce qui part en `<lastmod>`. Une date hors de
+/// `[LASTMOD_FLOOR, today]` est une sentinelle ou une aberration de la source,
+/// pas un signal de fraîcheur : on l'écarte, sans la remplacer par une date
+/// inventée.
+///
+/// `<lastmod>` est optionnel au schéma sitemaps.org : l'absence est la seule
+/// réponse honnête quand la source ne sait pas.
+fn plausible_lastmod(lastmod: SourceLastmod, today: NaiveDate) -> Option<NaiveDate> {
+    lastmod.filter(|d| (LASTMOD_FLOOR..=today).contains(d))
 }
 
-/// gzip avec `mtime=0` pour des bytes reproductibles entre runs. `gzip.compress`
-/// par défaut écrit `time.time()` dans l'en-tête, ce qui casse le diff entre deux
-/// runs (et l'upsert idempotent en base).
+/// Bloc `<url>` minimal — pas de `priority`/`changefreq` (ignorés par Google
+/// depuis 2023). `loc` est échappé ici ; les appelants passent l'URL brute.
+/// `lastmod` absent → tag omis (cf. [`plausible_lastmod`]).
+fn format_url_entry(loc: &str, lastmod: Option<NaiveDate>) -> String {
+    match lastmod {
+        Some(d) => format!(
+            "<url><loc>{}</loc><lastmod>{}</lastmod></url>",
+            xml_escape(loc),
+            d.format("%Y-%m-%d"),
+        ),
+        None => format!("<url><loc>{}</loc></url>", xml_escape(loc)),
+    }
+}
+
+/// Taille maximale d'un sitemap **décompressé** (limite sitemaps.org).
+const MAX_UNCOMPRESSED_BYTES: usize = 50 * 1024 * 1024;
+
+/// Longueur maximale d'une URL dans un sitemap (limite Google).
+const MAX_LOC_LEN: usize = 2048;
+
+/// Vérifie que l'artefact produit respecte le contrat sitemaps.org + Google,
+/// **en relisant les octets qui seront servis** (gzip décompressé), et non les
+/// structures qui les ont produits.
+///
+/// Toute violation est une erreur franche : `cmd_sitemap` s'arrête avant
+/// `replace_sitemaps`, donc **les sitemaps valides du run précédent restent
+/// servis**.
+///
+/// Les problèmes sont accumulés puis rapportés ensemble.
+fn validate_sitemaps(files: &[SitemapFile], today: NaiveDate) -> Result<()> {
+    let mut problems: Vec<String> = Vec::new();
+    let mut locs_seen: HashMap<String, usize> = HashMap::new();
+    let produced: HashSet<&str> = files
+        .iter()
+        .filter(|f| f.content_type == "application/gzip")
+        .map(|f| f.filename.as_str())
+        .collect();
+
+    for f in files {
+        let xml = decoded_body(f)?;
+
+        if f.content_type == "application/xml" {
+            // Ligne d'index : doit référencer exactement les subs produits.
+            let listed: HashSet<&str> = tag_values(&xml, "loc")
+                .into_iter()
+                .filter_map(|l| l.rsplit('/').next())
+                .collect();
+            let missing: Vec<&&str> = produced.iter().filter(|p| !listed.contains(**p)).collect();
+            let extra: Vec<&&str> = listed.iter().filter(|l| !produced.contains(**l)).collect();
+            if !missing.is_empty() || !extra.is_empty() {
+                problems.push(format!(
+                    "index incohérent : {} sub(s) produit(s) non référencé(s) {:?}, \
+                     {} référence(s) sans fichier {:?}",
+                    missing.len(),
+                    missing.iter().take(3).collect::<Vec<_>>(),
+                    extra.len(),
+                    extra.iter().take(3).collect::<Vec<_>>(),
+                ));
+            }
+            continue;
+        }
+
+        if xml.len() > MAX_UNCOMPRESSED_BYTES {
+            problems.push(format!(
+                "{} : {} octets décompressés (max {})",
+                f.filename,
+                xml.len(),
+                MAX_UNCOMPRESSED_BYTES
+            ));
+        }
+        let url_count = xml.matches("<url>").count();
+        if url_count > MAX_URLS_PER_SITEMAP {
+            problems.push(format!(
+                "{} : {url_count} URLs (max {MAX_URLS_PER_SITEMAP})",
+                f.filename
+            ));
+        }
+
+        for loc in tag_values(&xml, "loc") {
+            *locs_seen.entry(loc.to_string()).or_default() += 1;
+            if !loc.starts_with(BASE_URL) {
+                problems.push(format!(
+                    "{} : loc hors origine canonique — {loc}",
+                    f.filename
+                ));
+            }
+            if loc.len() > MAX_LOC_LEN {
+                problems.push(format!(
+                    "{} : loc de {} caractères (max {MAX_LOC_LEN}) — {loc}",
+                    f.filename,
+                    loc.len()
+                ));
+            }
+            if loc.contains('<') || loc.contains('>') || unescaped_amp(loc) {
+                problems.push(format!("{} : loc mal échappée — {loc}", f.filename));
+            }
+        }
+
+        for lastmod in tag_values(&xml, "lastmod") {
+            match NaiveDate::parse_from_str(lastmod, "%Y-%m-%d") {
+                Ok(d) if plausible_lastmod(Some(d), today).is_some() => {}
+                Ok(d) => problems.push(format!(
+                    "{} : lastmod hors fenêtre publiable [{LASTMOD_FLOOR}, {today}] — {d}",
+                    f.filename
+                )),
+                Err(_) => problems.push(format!(
+                    "{} : lastmod non ISO YYYY-MM-DD — {lastmod}",
+                    f.filename
+                )),
+            }
+        }
+    }
+
+    let dups: Vec<(&String, &usize)> = locs_seen.iter().filter(|(_, n)| **n > 1).collect();
+    if !dups.is_empty() {
+        let repeated: usize = dups.iter().map(|(_, n)| **n - 1).sum();
+        problems.push(format!(
+            "{} URL(s) dupliquée(s) sur l'ensemble des sitemaps, {repeated} entrée(s) en trop \
+             — ex. {:?} : la source n'est pas au grain de l'URL",
+            dups.len(),
+            dups.iter().take(3).map(|(l, n)| (l, n)).collect::<Vec<_>>(),
+        ));
+    }
+
+    if !problems.is_empty() {
+        // Cap l'affichage du log ; le total reste donné.
+        let shown: Vec<&String> = problems.iter().take(10).collect();
+        bail!(
+            "sitemaps hors contrat, publication refusée — {} problème(s) :\n  {}{}",
+            problems.len(),
+            shown
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join("\n  "),
+            if problems.len() > shown.len() {
+                format!("\n  … et {} autre(s)", problems.len() - shown.len())
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Corps d'un sitemap en texte — gunzip pour les `.xml.gz`, tel quel sinon.
+fn decoded_body(f: &SitemapFile) -> Result<String> {
+    if f.content_type == "application/gzip" {
+        let mut out = String::new();
+        flate2::read::GzDecoder::new(&f.body[..])
+            .read_to_string(&mut out)
+            .with_context(|| format!("sitemap: gunzip {}", f.filename))?;
+        Ok(out)
+    } else {
+        String::from_utf8(f.body.clone())
+            .with_context(|| format!("sitemap: {} n'est pas de l'UTF-8", f.filename))
+    }
+}
+
+/// Valeurs de toutes les occurrences de `<tag>…</tag>`. Le format est celui
+/// qu'on écrit nous-mêmes (pas de retour à la ligne, pas d'attribut) : un scan
+/// suffit.
+fn tag_values<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        match after.find(&close) {
+            Some(end) => {
+                out.push(&after[..end]);
+                rest = &after[end + close.len()..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// `&` non suivi d'une entité — le signe d'un `xml_escape` oublié.
+fn unescaped_amp(value: &str) -> bool {
+    value.match_indices('&').any(|(i, _)| {
+        !["amp;", "lt;", "gt;", "quot;", "apos;"]
+            .iter()
+            .any(|e| value[i + 1..].starts_with(e))
+    })
+}
+
+/// gzip avec `mtime=0` pour des bytes reproductibles entre runs.
 fn gzip_bytes(payload: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzBuilder::new()
         .mtime(0)
@@ -152,46 +362,63 @@ fn gzip_bytes(payload: &[u8]) -> Result<Vec<u8>> {
 /// Construit `sitemap-{section}-{n}.xml.gz` + `sitemap-index.xml` en mémoire.
 ///
 /// Les fichiers sont nommés **par fond** (`pages`, `juridictions`, `textes`,
-/// `entites`, `decisions`, ADR 0253) : Search Console expose alors
-/// l'indexation par fond au lieu d'une numérotation opaque. Retourne la
-/// liste des fichiers (index en dernier). L'index réfère les sub-sitemaps
-/// via leur URL publique finale, comme l'exige sitemaps.org § sitemap index
-/// (URLs absolues).
+/// `entites`, `decisions`) : Search Console expose alors l'indexation par fond
+/// au lieu d'une numérotation opaque. Retourne la liste des fichiers (index en
+/// dernier). L'index réfère les sub-sitemaps via leur URL publique finale, comme
+/// l'exige sitemaps.org § sitemap index (URLs absolues).
 pub fn build_sitemaps<S: SitemapSource>(repo: &S, today: NaiveDate) -> Result<Vec<SitemapFile>> {
     let mut files: Vec<SitemapFile> = Vec::new();
 
     // Pages statiques indexables (landing, hubs annuaire…), `lastmod` = run.
-    let mut pages = SectionWriter::new("pages");
+    let mut pages = SectionWriter::new("pages", today);
     for path in STATIC_PATHS {
-        pages.push(&static_url(path), today)?;
+        pages.push(&static_url(path), Some(today))?;
     }
     files.extend(pages.finish()?);
 
-    // Hubs juridiction `/juridiction/{code}` + `/juridiction/{code}/{annee}`
-    // (ADR 0253) — `lastmod` = run : leurs listes bougent à l'ingest quotidien.
-    let mut hubs = SectionWriter::new("juridictions");
+    // Hubs juridiction `/juridiction/{code}` + `/juridiction/{code}/{annee}` —
+    // `lastmod` = run : leurs listes bougent à l'ingest quotidien.
+    let mut hubs = SectionWriter::new("juridictions", today);
     for (code, years) in repo.iter_jurisdiction_hubs_for_sitemap()? {
-        hubs.push(&format!("{BASE_URL}/juridiction/{code}"), today)?;
+        hubs.push(&format!("{BASE_URL}/juridiction/{code}"), Some(today))?;
         for year in years {
-            hubs.push(&format!("{BASE_URL}/juridiction/{code}/{year}"), today)?;
+            hubs.push(
+                &format!("{BASE_URL}/juridiction/{code}/{year}"),
+                Some(today),
+            )?;
         }
     }
     files.extend(hubs.finish()?);
 
     // Hubs du catalogue des normes `/normes/{fond}` + `/normes/{fond}/{annee}`
-    // (ADR 0255, `annee` = année ou `sans-date`) — même profil.
-    let mut normes = SectionWriter::new("normes");
+    // (`annee` = année ou `sans-date`) — même profil.
+    let mut normes = SectionWriter::new("normes", today);
     for (fond, tokens) in repo.iter_norm_hubs_for_sitemap()? {
-        normes.push(&format!("{BASE_URL}/normes/{fond}"), today)?;
+        normes.push(&format!("{BASE_URL}/normes/{fond}"), Some(today))?;
         for token in tokens {
-            normes.push(&format!("{BASE_URL}/normes/{fond}/{token}"), today)?;
+            normes.push(&format!("{BASE_URL}/normes/{fond}/{token}"), Some(today))?;
         }
     }
     files.extend(normes.finish()?);
 
-    // Textes : pages TDM `/texte/{slug}` (ADR 0237) + articles
-    // `/texte/{slug}/{num}` (ADR 0097).
-    let mut textes = SectionWriter::new("textes");
+    // Annonces : catalogue départemental + fiches de consultation. `lastmod` =
+    // date de PARUTION de l'avis, seule date stable de la ligne : la dernière vue
+    // d'un canal est réécrite à chaque moisson.
+    let (annonces, departements) = repo.iter_annonces_for_sitemap()?;
+    let mut section = SectionWriter::new("annonces", today);
+    for code in departements {
+        section.push(
+            &format!("{BASE_URL}/annonces/departement/{code}"),
+            Some(today),
+        )?;
+    }
+    for (uid, lastmod) in annonces {
+        section.push(&format!("{BASE_URL}/marche/{uid}"), lastmod)?;
+    }
+    files.extend(section.finish()?);
+
+    // Textes : pages TDM `/texte/{slug}` + articles `/texte/{slug}/{num}`.
+    let mut textes = SectionWriter::new("textes", today);
     for (slug, lastmod) in repo.iter_codes_for_sitemap()? {
         textes.push(&code_url(&slug), lastmod)?;
     }
@@ -200,15 +427,15 @@ pub fn build_sitemaps<S: SitemapSource>(repo: &S, today: NaiveDate) -> Result<Ve
     }
     files.extend(textes.finish()?);
 
-    // Fiches d'entités de l'annuaire `/entite/{ns}/{id}` (ADR 0237, avocats
-    // exclus côté SQL).
-    let mut entites = SectionWriter::new("entites");
+    // Fiches d'entités de l'annuaire `/entite/{ns}/{id}` (avocats exclus côté
+    // SQL).
+    let mut entites = SectionWriter::new("entites", today);
     for (ns, id, lastmod) in repo.iter_entities_for_sitemap()? {
         entites.push(&entity_url(&ns, &id), lastmod)?;
     }
     files.extend(entites.finish()?);
 
-    let mut decisions = SectionWriter::new("decisions");
+    let mut decisions = SectionWriter::new("decisions", today);
     for (public_id, lastmod) in repo.iter_decisions_for_sitemap()? {
         decisions.push(&decision_url(&public_id), lastmod)?;
     }
@@ -237,8 +464,11 @@ pub fn build_sitemaps<S: SitemapSource>(repo: &S, today: NaiveDate) -> Result<Ve
         content_type: "application/xml",
         body: index_body.into_bytes(),
         // Index vide (corpus vide) → date neutre ; sinon le max des subs.
-        lastmod: index_lastmod.unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+        lastmod: index_lastmod.unwrap_or(LASTMOD_FLOOR),
     });
+
+    // Personne ne publie sans passer par ici.
+    validate_sitemaps(&files, today)?;
     Ok(files)
 }
 
@@ -249,25 +479,30 @@ pub fn build_sitemaps<S: SitemapSource>(repo: &S, today: NaiveDate) -> Result<Ve
 /// re-crawler que les subs modifiés).
 struct SectionWriter {
     section: &'static str,
+    today: NaiveDate,
     files: Vec<SitemapFile>,
     entries: Vec<String>,
     max_lastmod: Option<NaiveDate>,
 }
 
 impl SectionWriter {
-    fn new(section: &'static str) -> Self {
+    fn new(section: &'static str, today: NaiveDate) -> Self {
         Self {
             section,
+            today,
             files: Vec::new(),
             entries: Vec::new(),
             max_lastmod: None,
         }
     }
 
-    fn push(&mut self, loc: &str, lastmod: NaiveDate) -> Result<()> {
+    fn push(&mut self, loc: &str, lastmod: SourceLastmod) -> Result<()> {
+        let lastmod = plausible_lastmod(lastmod, self.today);
         self.entries.push(format_url_entry(loc, lastmod));
-        if self.max_lastmod.is_none_or(|m| lastmod > m) {
-            self.max_lastmod = Some(lastmod);
+        if let Some(d) = lastmod {
+            if self.max_lastmod.is_none_or(|m| d > m) {
+                self.max_lastmod = Some(d);
+            }
         }
         if self.entries.len() >= MAX_URLS_PER_SITEMAP {
             self.flush()?;
@@ -279,7 +514,9 @@ impl SectionWriter {
         if self.entries.is_empty() {
             return Ok(());
         }
-        let max_lastmod = self.max_lastmod.take().expect("entrées sans lastmod");
+        // `lastmod` du fichier = max des dates publiables qu'il contient. Aucune
+        // (section entière à dates inconnues) → la date du run.
+        let max_lastmod = self.max_lastmod.take().unwrap_or(self.today);
         let filename = format!("sitemap-{}-{}.xml.gz", self.section, self.files.len() + 1);
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -311,24 +548,25 @@ mod tests {
 
     #[derive(Default)]
     struct FakeSource {
-        decisions: Vec<(String, NaiveDate)>,
-        referential: Vec<(String, String, NaiveDate)>,
-        entities: Vec<(String, String, NaiveDate)>,
-        codes: Vec<(String, NaiveDate)>,
+        decisions: Vec<(String, SourceLastmod)>,
+        referential: Vec<(String, String, SourceLastmod)>,
+        entities: Vec<(String, String, SourceLastmod)>,
+        codes: Vec<(String, SourceLastmod)>,
         jurisdiction_hubs: Vec<(String, Vec<i32>)>,
         norm_hubs: Vec<(String, Vec<String>)>,
+        annonces: (Vec<(String, SourceLastmod)>, Vec<String>),
     }
     impl SitemapSource for FakeSource {
-        fn iter_decisions_for_sitemap(&self) -> Result<Vec<(String, NaiveDate)>> {
+        fn iter_decisions_for_sitemap(&self) -> Result<Vec<(String, SourceLastmod)>> {
             Ok(self.decisions.clone())
         }
-        fn iter_referential_for_sitemap(&self) -> Result<Vec<(String, String, NaiveDate)>> {
+        fn iter_referential_for_sitemap(&self) -> Result<Vec<(String, String, SourceLastmod)>> {
             Ok(self.referential.clone())
         }
-        fn iter_entities_for_sitemap(&self) -> Result<Vec<(String, String, NaiveDate)>> {
+        fn iter_entities_for_sitemap(&self) -> Result<Vec<(String, String, SourceLastmod)>> {
             Ok(self.entities.clone())
         }
-        fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, NaiveDate)>> {
+        fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, SourceLastmod)>> {
             Ok(self.codes.clone())
         }
         fn iter_jurisdiction_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<i32>)>> {
@@ -337,23 +575,200 @@ mod tests {
         fn iter_norm_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<String>)>> {
             Ok(self.norm_hubs.clone())
         }
+        fn iter_annonces_for_sitemap(&self) -> Result<AnnoncesSitemap> {
+            Ok(self.annonces.clone())
+        }
     }
 
     fn d(s: &str) -> NaiveDate {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
     }
 
-    // Spec : bloc <url> = loc + lastmod ISO, sans priority/changefreq.
     #[test]
     fn url_entry_format() {
         assert_eq!(
-            format_url_entry(&decision_url("ce_42"), d("2026-05-29")),
+            format_url_entry(&decision_url("ce_42"), Some(d("2026-05-29"))),
             "<url><loc>https://librejustice.fr/decision/ce_42</loc>\
              <lastmod>2026-05-29</lastmod></url>"
         );
     }
 
-    // Spec : URL page loi = {BASE_URL}/texte/{code}/{num}.
+    #[test]
+    fn lastmod_hors_fenetre_est_ecarte() {
+        let today = d("2026-07-31");
+        assert_eq!(
+            plausible_lastmod(Some(d("1970-01-01")), today),
+            Some(d("1970-01-01"))
+        );
+        assert_eq!(
+            plausible_lastmod(Some(d("2026-07-29")), today),
+            Some(d("2026-07-29"))
+        );
+        assert_eq!(plausible_lastmod(Some(today), today), Some(today));
+        assert_eq!(plausible_lastmod(Some(d("1969-12-31")), today), None);
+        assert_eq!(plausible_lastmod(Some(d("1848-02-24")), today), None);
+        assert_eq!(plausible_lastmod(Some(d("0001-01-01")), today), None);
+        assert_eq!(plausible_lastmod(Some(d("0015-01-01")), today), None);
+        assert_eq!(plausible_lastmod(Some(d("2999-01-01")), today), None);
+        assert_eq!(plausible_lastmod(Some(d("5489-12-30")), today), None);
+        assert_eq!(plausible_lastmod(Some(d("2026-08-01")), today), None);
+        assert_eq!(plausible_lastmod(None, today), None);
+    }
+
+    #[test]
+    fn url_entry_sans_lastmod_omet_le_tag() {
+        assert_eq!(
+            format_url_entry(&decision_url("ce_42"), None),
+            "<url><loc>https://librejustice.fr/decision/ce_42</loc></url>"
+        );
+    }
+
+    #[test]
+    fn sentinelle_source_nexporte_aucun_lastmod() {
+        let source = FakeSource {
+            referential: vec![
+                ("code-civil".into(), "1240".into(), Some(d("0001-01-01"))),
+                ("code-civil".into(), "1241".into(), Some(d("2026-02-02"))),
+                ("code-civil".into(), "1242".into(), None),
+            ],
+            codes: vec![("code-penal".into(), Some(d("2999-01-01")))],
+            ..Default::default()
+        };
+        let files = build_sitemaps(&source, d("2026-07-31")).unwrap();
+        let body = decompress_subs(&files);
+
+        assert!(!body.contains("0001-01-01"));
+        assert!(!body.contains("2999-01-01"));
+        assert!(
+            body.contains("<url><loc>https://librejustice.fr/texte/code-civil/1240</loc></url>")
+        );
+        assert!(
+            body.contains("<url><loc>https://librejustice.fr/texte/code-civil/1242</loc></url>")
+        );
+        assert!(body.contains("<url><loc>https://librejustice.fr/texte/code-penal</loc></url>"));
+        assert!(body.contains(
+            "<url><loc>https://librejustice.fr/texte/code-civil/1241</loc>\
+             <lastmod>2026-02-02</lastmod></url>"
+        ));
+        let textes = files
+            .iter()
+            .find(|f| f.filename == "sitemap-textes-1.xml.gz")
+            .expect("section textes");
+        assert_eq!(textes.lastmod, d("2026-02-02"));
+    }
+
+    #[test]
+    fn section_sans_date_publiable_est_datee_du_run() {
+        let source = FakeSource {
+            decisions: vec![("a".into(), None), ("b".into(), Some(d("0001-01-01")))],
+            ..Default::default()
+        };
+        let files = build_sitemaps(&source, d("2026-07-31")).unwrap();
+        let decisions = files
+            .iter()
+            .find(|f| f.filename == "sitemap-decisions-1.xml.gz")
+            .expect("section decisions");
+        assert_eq!(decisions.lastmod, d("2026-07-31"));
+    }
+
+    /// Fabrique un sub-sitemap à partir de blocs `<url>` bruts — un artefact que
+    /// les writers ne produiraient pas.
+    fn forged_sub(entries: &str) -> SitemapFile {
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">{entries}</urlset>"
+        );
+        SitemapFile {
+            filename: "sitemap-decisions-1.xml.gz".to_string(),
+            content_type: "application/gzip",
+            body: gzip_bytes(body.as_bytes()).unwrap(),
+            lastmod: d("2026-08-01"),
+        }
+    }
+
+    #[test]
+    fn valide_un_artefact_conforme() {
+        let source = FakeSource {
+            decisions: vec![("a".into(), Some(d("2026-01-01")))],
+            referential: vec![("code-civil".into(), "1240".into(), None)],
+            ..Default::default()
+        };
+        let files = build_sitemaps(&source, d("2026-08-01")).unwrap();
+        validate_sitemaps(&files, d("2026-08-01")).unwrap();
+    }
+
+    #[test]
+    fn refuse_une_loc_dupliquee() {
+        let source = FakeSource {
+            decisions: vec![
+                ("a".into(), Some(d("2026-01-01"))),
+                ("a".into(), Some(d("2026-03-15"))),
+            ],
+            ..Default::default()
+        };
+        let err = build_sitemaps(&source, d("2026-08-01"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dupliquée"), "message inattendu : {err}");
+        assert!(err.contains("grain de l'URL"), "message inattendu : {err}");
+    }
+
+    #[test]
+    fn refuse_un_lastmod_hors_contrat() {
+        let pre_epoch = forged_sub(
+            "<url><loc>https://librejustice.fr/decision/a</loc>\
+             <lastmod>1969-12-31</lastmod></url>",
+        );
+        let err = validate_sitemaps(&[pre_epoch], d("2026-08-01"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hors fenêtre publiable"), "{err}");
+
+        let mal_forme = forged_sub(
+            "<url><loc>https://librejustice.fr/decision/a</loc>\
+             <lastmod>01/08/2026</lastmod></url>",
+        );
+        let err = validate_sitemaps(&[mal_forme], d("2026-08-01"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("non ISO"), "{err}");
+    }
+
+    #[test]
+    fn refuse_une_loc_invalide() {
+        let hors_origine = forged_sub("<url><loc>https://exemple.fr/decision/a</loc></url>");
+        let err = validate_sitemaps(&[hors_origine], d("2026-08-01"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hors origine canonique"), "{err}");
+
+        let mal_echappee = forged_sub("<url><loc>https://librejustice.fr/texte/a&b/1</loc></url>");
+        let err = validate_sitemaps(&[mal_echappee], d("2026-08-01"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mal échappée"), "{err}");
+    }
+
+    #[test]
+    fn refuse_un_index_incoherent() {
+        let sub = forged_sub("<url><loc>https://librejustice.fr/decision/a</loc></url>");
+        let index = SitemapFile {
+            filename: SITEMAP_INDEX_NAME.to_string(),
+            content_type: "application/xml",
+            body: format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><sitemapindex>\
+                 <sitemap><loc>{}</loc></sitemap></sitemapindex>",
+                sitemap_url("sitemap-decisions-99.xml.gz")
+            )
+            .into_bytes(),
+            lastmod: d("2026-08-01"),
+        };
+        let err = validate_sitemaps(&[sub, index], d("2026-08-01"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("index incohérent"), "{err}");
+    }
+
     #[test]
     fn law_url_format() {
         assert_eq!(
@@ -362,33 +777,29 @@ mod tests {
         );
     }
 
-    // Spec : xml_escape n'échappe que & < > (pas les quotes).
     #[test]
     fn escapes_only_xml_specials() {
         assert_eq!(xml_escape("a&b<c>d\"e"), "a&amp;b&lt;c&gt;d\"e");
     }
 
-    // Spec : gzip déterministe (mtime=0) → identique entre deux runs.
     #[test]
     fn gzip_reproducible() {
         let a = gzip_bytes(b"hello world").unwrap();
         let b = gzip_bytes(b"hello world").unwrap();
         assert_eq!(a, b);
-        // Octets mtime (offset 4..8 de l'en-tête gzip) à zéro.
         assert_eq!(&a[4..8], &[0, 0, 0, 0]);
     }
 
-    // Spec : build_sitemaps produit un sub PAR SECTION alimentée (nommé
-    // sitemap-{section}-{n}, ADR 0253) + index ; l'index référence les sub
-    // par URL absolue avec leur max lastmod ; les sub décompressent en urlset.
     #[test]
     fn builds_index_and_subs() {
         let source = FakeSource {
-            decisions: vec![("a".into(), d("2026-01-01")), ("b".into(), d("2026-03-15"))],
+            decisions: vec![
+                ("a".into(), Some(d("2026-01-01"))),
+                ("b".into(), Some(d("2026-03-15"))),
+            ],
             ..Default::default()
         };
-        let files = build_sitemaps(&source, d("2000-01-01")).unwrap();
-        // Sections alimentées : pages (statiques) + decisions, puis l'index.
+        let files = build_sitemaps(&source, d("2026-05-01")).unwrap();
         assert_eq!(files.len(), 3);
         assert_eq!(files[0].filename, "sitemap-pages-1.xml.gz");
         assert_eq!(files[1].filename, "sitemap-decisions-1.xml.gz");
@@ -399,11 +810,10 @@ mod tests {
         let index = String::from_utf8(files[2].body.clone()).unwrap();
         assert!(index
             .contains("<loc>https://librejustice.fr/sitemaps/sitemap-decisions-1.xml.gz</loc>"));
-        // Max lastmod du sub décisions (`today` ancien → celui des décisions).
         assert!(index.contains("<lastmod>2026-03-15</lastmod>"));
-        assert_eq!(files[2].lastmod, d("2026-03-15"));
+        assert_eq!(files[1].lastmod, d("2026-03-15"));
+        assert_eq!(files[2].lastmod, d("2026-05-01"));
 
-        // Le sub décisions décompresse en un urlset contenant les deux décisions.
         let mut decoder = flate2::read::GzDecoder::new(&files[1].body[..]);
         let mut body = String::new();
         decoder.read_to_string(&mut body).unwrap();
@@ -411,13 +821,11 @@ mod tests {
         assert!(body.contains("https://librejustice.fr/decision/b"));
     }
 
-    // Spec : un article de référentiel fourni par la source produit une <url>
-    // /texte/{slug}/{num} dans le sub-sitemap.
     #[test]
     fn includes_referential_law_urls() {
         let source = FakeSource {
-            decisions: vec![("a".into(), d("2026-01-01"))],
-            referential: vec![("code-civil".into(), "1240".into(), d("2026-02-02"))],
+            decisions: vec![("a".into(), Some(d("2026-01-01")))],
+            referential: vec![("code-civil".into(), "1240".into(), Some(d("2026-02-02")))],
             ..Default::default()
         };
         let files = build_sitemaps(&source, d("2026-01-01")).unwrap();
@@ -425,8 +833,6 @@ mod tests {
         assert!(body.contains("https://librejustice.fr/texte/code-civil/1240"));
     }
 
-    // Spec : les hubs juridiction (ADR 0253) produisent une section dédiée
-    // sitemap-juridictions-N avec le hub du code et une URL par année.
     #[test]
     fn includes_jurisdiction_hub_urls() {
         let source = FakeSource {
@@ -444,9 +850,6 @@ mod tests {
         assert!(body.contains("<loc>https://librejustice.fr/juridiction/ca_paris/2025</loc>"));
     }
 
-    // Spec : les hubs normes (ADR 0255) produisent une section dédiée
-    // sitemap-normes-N avec le hub du fond et une URL par token d'année
-    // (année ou sans-date).
     #[test]
     fn includes_norm_hub_urls() {
         let source = FakeSource {
@@ -464,6 +867,30 @@ mod tests {
         assert!(body.contains("<loc>https://librejustice.fr/normes/lois/sans-date</loc>"));
     }
 
+    #[test]
+    fn includes_annonce_urls() {
+        let source = FakeSource {
+            annonces: (
+                vec![
+                    ("boamp-25-1234".into(), Some(d("2026-07-20"))),
+                    ("boamp-25-1235".into(), None),
+                ],
+                vec!["44".into(), "2A".into()],
+            ),
+            ..Default::default()
+        };
+        let files = build_sitemaps(&source, d("2026-08-01")).unwrap();
+        assert!(files
+            .iter()
+            .any(|f| f.filename == "sitemap-annonces-1.xml.gz"));
+        let body = decompress_subs(&files);
+        assert!(body.contains("<loc>https://librejustice.fr/annonces/departement/44</loc>"));
+        assert!(body.contains("<loc>https://librejustice.fr/annonces/departement/2A</loc>"));
+        assert!(body.contains("<loc>https://librejustice.fr/marche/boamp-25-1234</loc>"));
+        assert!(body.contains("<lastmod>2026-07-20</lastmod>"));
+        assert!(body.contains("<loc>https://librejustice.fr/marche/boamp-25-1235</loc>"));
+    }
+
     /// Décompresse tous les sub-sitemaps `.xml.gz` en une seule chaîne.
     fn decompress_subs(files: &[SitemapFile]) -> String {
         let mut all = String::new();
@@ -477,7 +904,6 @@ mod tests {
         all
     }
 
-    // Spec : URL fiche entité = {BASE_URL}/entite/{ns}/{id} ; URL code = /texte/{slug}.
     #[test]
     fn entity_and_code_url_format() {
         assert_eq!(
@@ -490,13 +916,11 @@ mod tests {
         );
     }
 
-    // Spec : build_sitemaps émet les pages statiques (landing, hubs annuaire),
-    // les codes et les fiches d'entités ; le hub /annuaire/avocats est exclu.
     #[test]
     fn includes_static_codes_and_entities() {
         let source = FakeSource {
-            entities: vec![("siren".into(), "552081317".into(), d("2026-04-01"))],
-            codes: vec![("code-civil".into(), d("2026-02-02"))],
+            entities: vec![("siren".into(), "552081317".into(), Some(d("2026-04-01")))],
+            codes: vec![("code-civil".into(), Some(d("2026-02-02")))],
             ..Default::default()
         };
         let files = build_sitemaps(&source, d("2026-05-01")).unwrap();
@@ -507,7 +931,6 @@ mod tests {
         assert!(body.contains("https://librejustice.fr/mentions-legales"));
         assert!(body.contains("https://librejustice.fr/texte/code-civil<"));
         assert!(body.contains("https://librejustice.fr/entite/siren/552081317"));
-        // Avocats : ni le hub listing, ni une fiche (exclusion RGPD).
         assert!(!body.contains("/annuaire/avocats"));
     }
 }

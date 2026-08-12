@@ -1,5 +1,4 @@
-//! Downloaders (port de `sources/downloader.py` opendata ZIP +
-//! `sources/judilibre/downloader.py` sync incrémental).
+//! Downloaders : opendata ZIP + sync incrémental Judilibre.
 //!
 //! Persiste un [`Manifest`] JSON sur disque pour la reprise idempotente. Les
 //! deux sources ont des formats de manifeste distincts (opendata : `entries`
@@ -7,13 +6,9 @@
 //! `/transactionalhistory`). [`Manifest`] porte les deux formes ; `load`
 //! détecte le format présent sur disque et `save` réécrit la forme courante.
 //!
-//! Différences assumées vs Python (cf. `unresolved`) :
-//! - pas de barre de progression `tqdm` ;
-//! - opendata : I/O HTTP synchrone via `reqwest::blocking` (le Python utilise
-//!   `requests`), pas de parallélisme ;
-//! - judilibre : `sync_judilibre` est mono-thread (le Python parallélise le
-//!   bootstrap mensuel via `ThreadPoolExecutor`) — logique identique, ordre
-//!   séquentiel ; le verrou `fcntl.flock` n'est pas reporté.
+//! - opendata : I/O HTTP synchrone via `reqwest::blocking`, pas de
+//!   parallélisme ;
+//! - judilibre : `sync_judilibre` est mono-thread, ordre séquentiel.
 
 mod calendar;
 mod compact;

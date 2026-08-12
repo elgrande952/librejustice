@@ -3,10 +3,8 @@
 //! L'ADDE (Avocats pour la défense des droits des étrangers) publie des
 //! analyses de décisions dans la catégorie *jurisprudence* (id 48). Le titre
 //! du post est la citation de la décision commentée ; on n'en tire que des
-//! **liens sortants** (jamais le corps). Volume faible (dizaines de posts) :
-//! un seul appel REST paginé, pas de cache disque.
-//!
-//! User-Agent identifiable (`LibreJusticeBot`) et débit poli entre pages.
+//! **liens sortants**, jamais le corps. Volume faible : un seul appel REST
+//! paginé, pas de cache disque.
 
 use crate::error::{Result, SourceError};
 use std::time::Duration;

@@ -6,7 +6,7 @@ license.workspace = true
 
 # Contrats api ↔ web + taxonomie. serde rename camelCase = _CamelModel côté
 # Python. DTOs = source de vérité, importés directement par lj-api et lj-web.
-# Noyau léger serde-pur partagé backend ↔ front wasm (ADR 0060) : aucune dépendance
+# Noyau léger serde-pur partagé backend ↔ front wasm : aucune dépendance
 # lourde, compile en `wasm32-unknown-unknown`.
 [dependencies]
 serde = { workspace = true }

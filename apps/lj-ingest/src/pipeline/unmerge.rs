@@ -1,25 +1,24 @@
-//! Réparation rétroactive des faux merges **intra-source** judilibre (ADR 0104).
+//! Réparation rétroactive des faux merges **intra-source** judilibre.
 //!
-//! La dédup historique (axe `canonical_ref`, ADR 0100) a fusionné des décisions
+//! La dédup historique (axe `canonical_ref`) a fusionné des décisions
 //! **distinctes** d'une même source judilibre partageant `numbers`+cour+date (lot
 //! d'audience, RG réutilisé, arrêt sur déférée). Le `full_text` du **perdant** a
 //! été détruit (la ligne `decisions` n'en garde qu'un, l'autorité) → pour le
 //! re-créer il faut son corps de texte. On le relit du **cache local** judilibre
-//! (miroir complet, rangé `<jur>/<AAAAMM-du-decision_date>.jsonl.gz`) — **aucun
-//! appel API** (les anciens object_id supersédés n'y manquent pas ; le cache
-//! `compact` retire en revanche les tombstonés → une provenance supprimée n'y est
-//! plus, donc jamais re-matérialisée : RGPD respecté gratuitement).
+//! (miroir complet, rangé `<jur>/<AAAAMM-du-decision_date>.jsonl.gz`), sans appel
+//! API. Le cache `compact` retire les tombstonés : une provenance supprimée n'y
+//! est plus, donc jamais re-matérialisée.
 //!
-//! Passe (per perdante, ADR 0104 / inverse d'une fusion) :
+//! Passe, par perdante, inverse d'une fusion :
 //! 1. `create_split_decision([loser_uid])` : détache la provenance perdante vers
 //!    une **nouvelle** décision squelette (l'autorité `rn=1` reste sur l'origine,
-//!    son texte y est déjà — pas touchée) ;
+//!    son texte y est déjà) ;
 //! 2. relit le payload du perdant dans son fichier cache et `drain_batch_in_txn`
 //!    (`IngestMode::All`, re-chunk + re-embed **vLLM strict**) le matérialise sur
 //!    la décision scindée. Split + matérialisation **dans une seule transaction**.
 //!
-//! `--dry-run` (défaut CLI) : compte seulement (cache-hit/miss), **aucune
-//! écriture, aucun GPU**. `--limit N` : rollout borné.
+//! `--dry-run` (défaut CLI) : compte seulement (cache-hit/miss), aucune écriture,
+//! aucun GPU. `--limit N` : rollout borné.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -94,9 +93,8 @@ fn load_payloads(path: &Path, needed: &HashSet<&str>) -> Result<HashMap<String, 
     Ok(out)
 }
 
-/// Défait les faux merges intra-source judilibre (ADR 0104). `execute = false`
-/// (dry-run) : plan + comptage, aucune écriture. `limit` : borne le nombre de
-/// splits écrits (rollout prudent).
+/// Défait les faux merges intra-source judilibre. `execute = false` (dry-run) :
+/// plan + comptage, aucune écriture. `limit` : borne le nombre de splits écrits.
 pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =

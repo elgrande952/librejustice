@@ -1,5 +1,4 @@
-//! Mentions légales. Port de `mentions-legales-page.tsx`. `<Title>` propre,
-//! hérite de la description racine.
+//! Mentions légales. `<Title>` propre, hérite de la description racine.
 
 use leptos::prelude::*;
 use leptos_meta::Title;
@@ -27,9 +26,9 @@ pub fn MentionsLegales() -> impl IntoView {
                     "Courriel : "
                     <a
                         class="text-[var(--color-accent)] underline-offset-4 hover:underline"
-                        href="mailto:contact@librejustice.fr"
+                        href="mailto:support@librejustice.fr"
                     >
-                        "contact@librejustice.fr"
+                        "support@librejustice.fr"
                     </a>
                 </address>
             </Section>

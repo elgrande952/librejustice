@@ -1,10 +1,9 @@
-//! Client API Judilibre (port de `sources/judilibre/client.py`).
+//! Client API Judilibre.
 //!
-//! Client HTTP fin : pas de logique métier, pas de cache. Trois endpoints
-//! utiles à l'ingest (`/scan`, `/transactionalhistory`, `/decision`) avec auth
-//! par jeton Bearer OAuth2 PISTE (mêmes identifiants que Légifrance, cf.
-//! [`crate::piste`]). L'orchestration (pagination, watermark, dispatch fichier)
-//! vit dans [`crate::downloader`].
+//! Client HTTP fin. Trois endpoints utiles à l'ingest (`/scan`,
+//! `/transactionalhistory`, `/decision`) avec auth par jeton Bearer OAuth2 PISTE
+//! (mêmes identifiants que Légifrance, [`crate::piste`]). L'orchestration vit
+//! dans [`crate::downloader`].
 
 use crate::error::{Result, SourceError};
 use crate::piste::PisteOAuth;
@@ -14,10 +13,9 @@ use serde_json::Value;
 
 /// URL de base par défaut de l'API Judilibre (PISTE).
 pub const BASE_URL: &str = "https://api.piste.gouv.fr/cassation/judilibre/v1.0";
-/// User-Agent envoyé sur chaque requête (port de `client.USER_AGENT`).
+/// User-Agent envoyé sur chaque requête.
 pub const USER_AGENT: &str = "librejustice-judilibre/0.1 (+https://github.com/)";
 
-/// Client HTTP Judilibre (reqwest). Détient `base_url`, l'OAuth PISTE et le client.
 pub struct JudilibreClient {
     pub base_url: String,
     client: ClientWithMiddleware,
@@ -26,19 +24,14 @@ pub struct JudilibreClient {
 
 impl JudilibreClient {
     /// Construit un client. `base_url` est normalisée (trailing `/` retiré),
-    /// l'authentification se fait par jeton Bearer OAuth2 PISTE (client_credentials).
-    ///
-    /// Note : contrairement au Python (`base_url` par défaut), le contrat Rust
-    /// passe explicitement `base_url` en premier argument. Utiliser
-    /// [`BASE_URL`] pour la valeur de prod.
+    /// l'authentification se fait par jeton Bearer OAuth2 PISTE
+    /// (client_credentials). [`BASE_URL`] pour la valeur de prod.
     pub fn new(
         base_url: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        // Wrappé reqwest-middleware + TracingMiddleware : chaque requête émet un
-        // span HTTP client (http.client.request) exporté vers Tempo.
         let client = ClientBuilder::new(
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
@@ -56,11 +49,10 @@ impl JudilibreClient {
 
     /// `GET /scan` — pagination cursor via `searchAfter`.
     ///
-    /// Successeur officiel de `/export` (deprecated). Les `params` sont passés
-    /// tels quels en query-string ; l'orchestrateur fournit `jurisdiction`,
-    /// `date_type`, `date_start`/`date_end`, `searchAfter`, `batch_size`.
-    /// Réponse : `{results, total, next_batch, ...}` ; `next_batch` est une
-    /// querystring contenant `searchAfter` à extraire pour la page suivante.
+    /// Les `params` sont passés tels quels en query-string ; l'orchestrateur
+    /// fournit `jurisdiction`, `date_type`, `date_start`/`date_end`, `searchAfter`,
+    /// `batch_size`. Réponse : `{results, total, next_batch, ...}` ; `next_batch`
+    /// est une querystring contenant `searchAfter` à extraire pour la page suivante.
     pub async fn scan(&self, params: &[(&str, String)]) -> Result<Value> {
         self.get("/scan", params).await
     }
@@ -86,8 +78,7 @@ impl JudilibreClient {
     /// Cœur partagé : GET signé Bearer, JSON ou `JudilibreApi` sur statut ≠ 200.
     ///
     /// Sur **401**, le jeton caché est purgé et la requête rejouée **une fois**
-    /// avec un Bearer frais : le TTL réel PISTE peut être plus court que
-    /// l'`expires_in` annoncé, d'où un 401 en plein run long (cf. `piste.rs`).
+    /// avec un Bearer frais.
     async fn get(&self, path: &str, params: &[(&str, String)]) -> Result<Value> {
         match self.get_once(path, params).await {
             Err(SourceError::JudilibreApi { status: 401, .. }) => {
@@ -126,16 +117,13 @@ impl JudilibreClient {
 
 /// Extrait un paramètre d'une querystring (`?key=value` ou `key=value`).
 ///
-/// Port fidèle de `extract_query_param` (Python `urllib.parse.parse_qs`) :
-/// renvoie la **première** valeur du paramètre, `None` si la querystring est
+/// Renvoie la **première** valeur du paramètre, `None` si la querystring est
 /// vide/absente ou la clé absente. Décode le percent-encoding et les `+`.
 pub fn extract_query_param(querystring: Option<&str>, key: &str) -> Option<String> {
     let qs = querystring?;
     if qs.is_empty() {
         return None;
     }
-    // Tolère un éventuel `?` de tête (parse_qs ne le voit jamais, mais les
-    // valeurs Judilibre `next_batch`/`next_page` sont des querystrings nues).
     let qs = qs.strip_prefix('?').unwrap_or(qs);
     for pair in qs.split('&') {
         if pair.is_empty() {
@@ -152,8 +140,7 @@ pub fn extract_query_param(querystring: Option<&str>, key: &str) -> Option<Strin
     None
 }
 
-/// Décodage querystring minimal : `+` → espace, `%XX` → octet. Suffisant pour
-/// les curseurs opaques Judilibre (qui peuvent contenir des `%2C`, etc.).
+/// Décodage querystring minimal : `+` → espace, `%XX` → octet.
 fn decode_qs_component(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -213,7 +200,6 @@ mod tests {
 
     #[test]
     fn extract_query_param_first_value_wins() {
-        // parse_qs renvoie la première valeur (parsed.get(key, [None])[0]).
         assert_eq!(
             extract_query_param(Some("x=1&x=2"), "x").as_deref(),
             Some("1")

@@ -3,10 +3,11 @@
 #   GET /api/decision/{id}
 #   GET /api/decision/{id}/similar
 #   GET /api/decision/{id}/preview
-# All public (auth=none). {{base}} = host root. {{decision_id}} = a REAL
-# public_id discovered from a prior search (runner must substitute; placeholders
-# like "does-not-exist-xyz" stay literal). Assertions are STRUCTURAL only
-# (field presence / type / enum set / ordering), never live-data values.
+# All public (auth=none). {{base}} = host root — the ONLY variable this file
+# needs: {{decision_id}} is captured below from a live search, so the suite runs
+# as one command against any environment (placeholders like "does-not-exist-xyz"
+# stay literal). Assertions are STRUCTURAL only (field presence / type / enum
+# set / ordering), never live-data values.
 # ============================================================================
 
 # ---------------------------------------------------------------------------
@@ -17,6 +18,19 @@ HTTP 200
 [Asserts]
 jsonpath "$.status" == "ok"
 jsonpath "$.version" isString
+
+
+# ---------------------------------------------------------------------------
+# Discovery : un public_id RÉEL du corpus servi. Capturé plutôt que passé par
+# le runner — une variable externe non fournie fait échouer le fichier sur
+# « Undefined variable » au lieu de tester quoi que ce soit.
+# ---------------------------------------------------------------------------
+GET {{base}}/api/search?q=usufruit&limit=1
+HTTP 200
+[Captures]
+decision_id: jsonpath "$.hits[0].id"
+[Asserts]
+jsonpath "$.hits" count == 1
 
 
 # ===========================================================================
@@ -57,16 +71,19 @@ HTTP 404
 
 
 # ===========================================================================
-# GET /api/decision/{id}/similar — default limit (4)
+# GET /api/decision/{id}/similar — deux volets (principe / espece), default
+# limit (4) par volet
 # ===========================================================================
 GET {{base}}/api/decision/{{decision_id}}/similar
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
 jsonpath "$.decisionId" == "{{decision_id}}"
-jsonpath "$.hits" isCollection
-# default limit is 4 → at most 4 hits
-jsonpath "$.hits" count <= 4
+jsonpath "$.principe" isCollection
+jsonpath "$.espece" isCollection
+# default limit is 4 → at most 4 hits per volet
+jsonpath "$.principe" count <= 4
+jsonpath "$.espece" count <= 4
 
 
 # similar — explicit limit within bounds
@@ -74,13 +91,16 @@ GET {{base}}/api/decision/{{decision_id}}/similar?limit=12
 HTTP 200
 [Asserts]
 jsonpath "$.decisionId" == "{{decision_id}}"
-jsonpath "$.hits" isCollection
-jsonpath "$.hits" count <= 12
+jsonpath "$.principe" isCollection
+jsonpath "$.espece" isCollection
+jsonpath "$.principe" count <= 12
+jsonpath "$.espece" count <= 12
 
 GET {{base}}/api/decision/{{decision_id}}/similar?limit=1
 HTTP 200
 [Asserts]
-jsonpath "$.hits" count <= 1
+jsonpath "$.principe" count <= 1
+jsonpath "$.espece" count <= 1
 
 
 # similar — limit below bound (0) → 422 (parité FastAPI, cf. routes.rs SimilarQuery)
@@ -104,7 +124,7 @@ HTTP 404
 
 
 # ===========================================================================
-# GET /api/decision/{id}/preview — hover card (ADR 0168) : identité légère,
+# GET /api/decision/{id}/preview — hover card : identité légère,
 # jamais le corps (pas de paragraphs/sections).
 # ===========================================================================
 GET {{base}}/api/decision/{{decision_id}}/preview

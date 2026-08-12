@@ -1,7 +1,7 @@
 //! Front LibreJustice (Leptos 0.8 SSR + hydration).
 //!
-//! La cible serveur compile sous `ssr` (lib consommée par le binaire `lj-server`,
-//! ADR 0061) ; la cible wasm sous `hydrate`, pilotée EXCLUSIVEMENT par
+//! La cible serveur compile sous `ssr` (lib consommée par le binaire
+//! `lj-server`) ; la cible wasm sous `hydrate`, pilotée EXCLUSIVEMENT par
 //! cargo-leptos. Les deux features sont exclusives ; `default = ["ssr"]` garde le
 //! build host workspace vert.
 
@@ -28,4 +28,10 @@ pub mod seo;
 pub fn hydrate() {
     console_error_panic_hook::set_once();
     leptos::mount::hydrate_body(crate::app::App);
+    // Témoin lu par la sonde d'hydratation du shell.
+    let _ = js_sys::Reflect::set(
+        &js_sys::global(),
+        &wasm_bindgen::JsValue::from_str("__LJ_HYDRATED"),
+        &wasm_bindgen::JsValue::TRUE,
+    );
 }

@@ -1,28 +1,21 @@
-//! Guide MCP. Port de `mcp-page.tsx`. `<Title>` propre, hérite de la
-//! description racine.
+//! Guide MCP. `<Title>` propre, hérite de la description racine.
 
 use leptos::prelude::*;
 use leptos_meta::Title;
 
 use crate::seo::CANONICAL_BASE;
 
-/// Install plugin Claude Code : connecteur MCP + skills ensemble.
-const CLAUDE_CODE_INSTALL: &str =
-    "/plugin marketplace add librejustice/librejustice\n/plugin install librejustice@librejustice";
-
-/// Install plugin Codex CLI : connecteur MCP + skills ensemble.
-const CODEX_INSTALL: &str = "codex plugin marketplace add librejustice/librejustice\ncodex plugin add librejustice@librejustice";
-
-/// Skills seules, agents compatibles skills.sh.
-const SKILLS_ADD: &str = "npx skills add librejustice/librejustice";
-
-/// Prompt d'installation pour les agents à shell (Claude Code, Codex,
-/// Cursor…) : une ligne pointant vers le guide agent `llms-install.md`
-/// du dépôt public (convention popularisée par Cline, suivie par le
-/// catalogue MCP de Microsoft, Magic MCP, Firebase MCP…).
+/// Prompt d'installation pour les applications agentiques (ChatGPT
+/// Desktop, Claude Desktop…) : une ligne pointant vers le guide agent
+/// `llms-install.md` du dépôt public (convention popularisée par Cline,
+/// suivie par le catalogue MCP de Microsoft, Magic MCP, Firebase MCP…).
 const UNIVERSAL_PROMPT: &str = "Installe LibreJustice (MCP + skills) en suivant ce guide : https://github.com/librejustice/librejustice/blob/main/llms-install.md";
 
-/// Prompts d'exemple a copier dans un client IA (verbatim `TEST_PROMPTS`).
+/// Fiche du connecteur dans le répertoire officiel claude.ai : installation en
+/// un clic, sans saisie de l'URL de l'endpoint.
+const CLAUDE_DIRECTORY_URL: &str = "https://claude.ai/directory/connectors/librejustice";
+
+/// Prompts d'exemple a copier dans un client IA.
 const TEST_PROMPTS: [&str; 4] = [
     "Trouve 5 décisions sur l'annulation d'un permis de construire.",
     "Cherche en mode lexical : OQTF SAUF rétention.",
@@ -33,13 +26,9 @@ const TEST_PROMPTS: [&str; 4] = [
 #[component]
 pub fn McpGuide() -> impl IntoView {
     let mcp_url = format!("{CANONICAL_BASE}/mcp/");
-    let prompts = TEST_PROMPTS.iter().map(|prompt| {
-        view! {
-            <li class="border-l-2 border-[var(--color-accent)] py-1 pl-4 text-sm text-[var(--color-ink-muted)]">
-                {*prompt}
-            </li>
-        }
-    });
+    let prompts = TEST_PROMPTS
+        .iter()
+        .map(|prompt| view! { <CopyPrompt text=*prompt /> });
 
     view! {
         <Title text="MCP - LibreJustice" />
@@ -64,7 +53,14 @@ pub fn McpGuide() -> impl IntoView {
                 <p class="text-lg leading-relaxed text-[var(--color-ink-muted)]">
                     "Connectez Claude, ChatGPT ou votre propre agent au droit français (jurisprudence et textes) via le protocole MCP. La recherche sémantique et lexicale, directement dans le contexte de votre IA."
                 </p>
-                <CopyEndpoint url=mcp_url />
+                <a
+                    href=CLAUDE_DIRECTORY_URL
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="self-start rounded-md bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                >
+                    "Ajouter à Claude"
+                </a>
             </section>
 
             // Démo
@@ -87,37 +83,37 @@ pub fn McpGuide() -> impl IntoView {
             <section class="flex flex-col gap-8">
                 <SectionLabel>"Installation par client"</SectionLabel>
 
-                <ClientHowto title="Claude (claude.ai)">
+                <ClientHowto title="Claude">
                     <Step n=1>
-                        "Connectez-vous sur "
+                        "Ouvrez la fiche LibreJustice dans le répertoire des connecteurs (connexion à votre compte Claude requise) : "
                         <a
-                            href="https://claude.ai"
+                            href=CLAUDE_DIRECTORY_URL
                             target="_blank"
                             rel="noopener noreferrer"
                             class="underline underline-offset-2"
                         >
-                            "claude.ai"
+                            "claude.ai/directory/connectors/librejustice"
                         </a>
                         "."
                     </Step>
                     <Step n=2>
-                        "En bas à gauche, cliquez sur votre avatar puis "
-                        <strong>"Paramètres → Connecteurs"</strong>
-                        "."
+                        "Cliquez sur "
+                        <strong>"Connect"</strong>
+                        " : Claude vous redirige vers LibreJustice pour valider l'accès via OAuth."
                     </Step>
                     <Step n=3>
-                        "Cliquez sur "
-                        <strong>"Ajouter un connecteur personnalisé"</strong>
-                        ", donnez un nom (ex. "
-                        <em>"LibreJustice"</em>
-                        ") et collez l'URL de l'endpoint."
-                    </Step>
-                    <Step n=4>
-                        "Claude vous redirige vers LibreJustice pour valider la connexion via OAuth. Une fois autorisé, le connecteur est actif dans tous vos projets."
+                        "Une fois autorisé, le connecteur est actif dans vos conversations et vos projets."
                     </Step>
                 </ClientHowto>
 
-                <ClientHowto title="ChatGPT">
+                <div class="flex flex-col gap-3">
+                    <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
+                        "Les clients suivants n'ont pas encore de fiche LibreJustice dans leur répertoire : ils l'ajoutent comme connecteur personnalisé, à partir de l'URL de l'endpoint."
+                    </p>
+                    <CopyEndpoint url=mcp_url />
+                </div>
+
+                <ClientHowto title="ChatGPT Web">
                     <Step n=1>
                         "Connectez-vous sur "
                         <a
@@ -179,7 +175,7 @@ pub fn McpGuide() -> impl IntoView {
                     </Step>
                     <Step n=4>
                         <strong>"Créer"</strong>
-                        " — validez la connexion sur la page LibreJustice qui s'ouvre."
+                        ", puis validez la connexion sur la page LibreJustice qui s'ouvre."
                     </Step>
                 </ClientHowto>
 
@@ -229,28 +225,7 @@ pub fn McpGuide() -> impl IntoView {
                     ". Une skill est un mode d'emploi que votre agent lit avant de chercher : lire une décision en intégralité avant de la citer, viser la version d'un texte à la date du litige, éviter les pièges du corpus. Le connecteur fonctionne sans, mais les réponses sont nettement plus fiables avec."
                 </p>
 
-                <ClientHowto title="Claude Code">
-                    <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Le plugin installe le connecteur MCP et les deux skills d'un coup :"
-                    </p>
-                    <CopyBlock text=CLAUDE_CODE_INSTALL label="Dans Claude Code" />
-                </ClientHowto>
-
-                <ClientHowto title="Codex CLI">
-                    <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Même plugin, même contenu :"
-                    </p>
-                    <CopyBlock text=CODEX_INSTALL label="Dans un terminal" />
-                </ClientHowto>
-
-                <ClientHowto title="Autres agents (Cursor, Windsurf…)">
-                    <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Les skills seules, dans tout agent compatible skills — chaque skill embarque la marche à suivre pour connecter le MCP :"
-                    </p>
-                    <CopyBlock text=SKILLS_ADD label="Dans un terminal" />
-                </ClientHowto>
-
-                <ClientHowto title="claude.ai">
+                <ClientHowto title="Claude Web">
                     <Step n=1>
                         "Téléchargez la skill : "
                         <a
@@ -271,30 +246,47 @@ pub fn McpGuide() -> impl IntoView {
                         "."
                     </Step>
                     <Step n=2>
-                        "Sur claude.ai : avatar en bas à gauche → "
+                        "Sur Claude Web : avatar en bas à gauche → "
                         <strong>"Paramètres → Personnaliser → Skills"</strong>
                         " (tous les plans)."
                     </Step>
                     <Step n=3>
                         <strong>"Upload skill"</strong>
-                        " et sélectionnez le zip. La skill s'active dans vos conversations — avec le connecteur MCP ajouté ci-dessus."
+                        " et sélectionnez le zip. La skill s'active dans vos conversations (le connecteur MCP ajouté ci-dessus reste nécessaire)."
                     </Step>
                 </ClientHowto>
 
-                <ClientHowto title="Agents en ligne de commande, par prompt">
-                    <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Un agent qui a accès au shell (Claude Code, Codex, Cursor…) peut s'installer LibreJustice lui-même : collez-lui ce prompt, il suit le guide "
+                <ClientHowto title="ChatGPT Web">
+                    <Step n=1>
+                        "Téléchargez la skill : "
                         <a
-                            href="https://github.com/librejustice/librejustice/blob/main/llms-install.md"
-                            target="_blank"
-                            rel="noopener noreferrer"
+                            href="/skills/recherche-jurisprudence.zip"
+                            download
                             class="underline underline-offset-2"
                         >
-                            "llms-install.md"
+                            "recherche-jurisprudence.zip"
                         </a>
-                        " du dépôt. Dans les applications de chat (claude.ai, ChatGPT…), l'installation passe par les réglages, sections ci-dessus."
-                    </p>
-                    <CopyBlock text=UNIVERSAL_PROMPT label="Prompt d'installation" />
+                        " ou "
+                        <a
+                            href="/skills/recherche-normes.zip"
+                            download
+                            class="underline underline-offset-2"
+                        >
+                            "recherche-normes.zip"
+                        </a>
+                        "."
+                    </Step>
+                    <Step n=2>
+                        "Sur chatgpt.com, dans la barre latérale : "
+                        <strong>"Plugins"</strong>
+                        ", puis l'onglet "
+                        <strong>"Skills"</strong>
+                        " (plans Business, Enterprise ou Edu ; sur Enterprise et Edu, l'administrateur doit avoir activé les skills)."
+                    </Step>
+                    <Step n=3>
+                        <strong>"Create → Upload from your computer"</strong>
+                        " et sélectionnez le zip. ChatGPT scanne la skill puis l'active (le connecteur MCP ajouté ci-dessus reste nécessaire)."
+                    </Step>
                 </ClientHowto>
             </section>
 
@@ -306,13 +298,34 @@ pub fn McpGuide() -> impl IntoView {
                 </p>
                 <ul class="flex flex-col gap-2">{prompts.collect_view()}</ul>
             </section>
+
+            // Installation par prompt : le plugin complet (connecteur MCP + skills)
+            <section class="flex flex-col gap-8">
+                <SectionLabel>"Installation par prompt"</SectionLabel>
+
+                <ClientHowto title="ChatGPT Desktop, Claude Desktop…">
+                    <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
+                        "Ces applications peuvent installer LibreJustice elles-mêmes, connecteur MCP et skills d'un coup : collez ce prompt, l'assistant suit le guide "
+                        <a
+                            href="https://github.com/librejustice/librejustice/blob/main/llms-install.md"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            class="underline underline-offset-2"
+                        >
+                            "llms-install.md"
+                        </a>
+                        " du dépôt."
+                    </p>
+                    <CopyBlock text=UNIVERSAL_PROMPT label="Prompt d'installation" />
+                </ClientHowto>
+            </section>
         </div>
     }
 }
 
-/// Endpoint MCP + bouton copier. Port de `CopyEndpoint` : le SSR rend le fallback
+/// Endpoint MCP + bouton copier : le SSR rend le fallback
 /// canonique (`CANONICAL_BASE + "/mcp/"`) ; côté client, l'URL est ré-résolue
-/// depuis l'origine courante (port de `window.location.origin`) après hydratation
+/// depuis l'origine courante après hydratation
 /// — l'init identique au SSR évite tout décalage d'hydratation.
 #[component]
 fn CopyEndpoint(url: String) -> impl IntoView {
@@ -399,6 +412,44 @@ fn CopyBlock(text: &'static str, label: &'static str) -> impl IntoView {
             </div>
             <pre class="overflow-x-auto whitespace-pre-wrap px-4 py-3 font-mono text-sm leading-relaxed text-[var(--color-ink)]">{text}</pre>
         </div>
+    }
+}
+
+/// Prompt d'exemple sur une ligne + bouton copier (même pattern clipboard
+/// que `CopyBlock`).
+#[component]
+fn CopyPrompt(text: &'static str) -> impl IntoView {
+    let copied = RwSignal::new(false);
+
+    let on_copy = move |_| {
+        #[cfg(feature = "hydrate")]
+        {
+            leptos::task::spawn_local(async move {
+                if crate::dom::copy_text(text).await {
+                    copied.set(true);
+                    leptos::prelude::set_timeout(
+                        move || copied.set(false),
+                        std::time::Duration::from_millis(2000),
+                    );
+                }
+            });
+        }
+    };
+
+    view! {
+        <li class="flex items-center gap-2 border-l-2 border-[var(--color-accent)] py-1 pl-4">
+            <span class="min-w-0 flex-1 truncate text-sm text-[var(--color-ink-muted)]">
+                {text}
+            </span>
+            <button
+                type="button"
+                on:click=on_copy
+                aria-label="Copier le prompt"
+                class="shrink-0 rounded px-2 py-1 text-xs text-[var(--color-ink-subtle)] transition-colors hover:bg-[var(--color-rule)] hover:text-[var(--color-ink)]"
+            >
+                {move || if copied.get() { "Copié ✓" } else { "Copier" }}
+            </button>
+        </li>
     }
 }
 

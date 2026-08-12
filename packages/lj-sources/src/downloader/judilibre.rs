@@ -1,5 +1,4 @@
-//! Sync incrémental Judilibre (port de `sources/judilibre/downloader.py`, HTTP
-//! async, mono-thread).
+//! Sync incrémental Judilibre (HTTP async, mono-thread).
 
 use super::calendar::{list_target_months, month_bounds};
 use super::http::path_with_added_extension;
@@ -16,7 +15,7 @@ use std::io::Write;
 use std::path::Path;
 
 // ----------------------------------------------------------------------------
-// Constantes Judilibre (port de judilibre/downloader.py)
+// Constantes Judilibre
 // ----------------------------------------------------------------------------
 
 use crate::state_paths::JUDILIBRE_DIR;
@@ -25,7 +24,6 @@ const ARCHIVE_KEY: &str = "archive";
 const DEFAULT_BATCH_SIZE: i64 = 1000;
 const DEFAULT_JURISDICTIONS: &[&str] = &["cc", "ca", "tj", "tcom"];
 
-/// Coupure historique par juridiction (`ARCHIVE_CUTOFF`).
 fn archive_cutoff(jur: &str) -> Option<&'static str> {
     match jur {
         "cc" => Some("1986-10-31"),
@@ -34,7 +32,6 @@ fn archive_cutoff(jur: &str) -> Option<&'static str> {
     }
 }
 
-/// Mois de départ du bootstrap mensuel par juridiction (`MONTHLY_START`).
 fn monthly_start(jur: &str) -> Option<&'static str> {
     match jur {
         "cc" => Some("1986-11-01"),
@@ -45,7 +42,7 @@ fn monthly_start(jur: &str) -> Option<&'static str> {
     }
 }
 
-/// `YYYYMM` extrait de `decision_date` ISO, sinon `UNDATED_BUCKET` (port de `_yyyymm_of`).
+/// `YYYYMM` extrait de `decision_date` ISO, sinon `UNDATED_BUCKET`.
 fn yyyymm_of(decision: &Value) -> String {
     let raw = decision
         .get("decision_date")
@@ -60,7 +57,7 @@ fn yyyymm_of(decision: &Value) -> String {
 }
 
 // ----------------------------------------------------------------------------
-// sync_judilibre — port de judilibre/downloader.sync (HTTP async, mono-thread)
+// sync_judilibre (HTTP async, mono-thread)
 // ----------------------------------------------------------------------------
 
 /// Sync incrémental Judilibre depuis `date_start_iso` (`YYYY-MM-DD`).
@@ -68,9 +65,7 @@ fn yyyymm_of(decision: &Value) -> String {
 /// Pour chaque juridiction de [`DEFAULT_JURISDICTIONS`] : bootstrap archive (≤
 /// cutoff) + bootstrap mensuel (mois > cutoff) via `/scan`, puis incrémental
 /// global via `/transactionalhistory`. Append-only sur `.jsonl.gz`, reprise au
-/// cursor. Mono-thread (le Python parallélise le bootstrap mensuel ; logique et
-/// résultat identiques, ordre séquentiel). Le verrou `fcntl.flock` n'est pas
-/// porté (cf. `unresolved`).
+/// cursor. Mono-thread, ordre séquentiel.
 pub async fn sync_judilibre(
     client: &JudilibreClient,
     data_dir: &Path,
@@ -116,7 +111,6 @@ pub async fn sync_judilibre(
             None => jur_target_months,
         };
 
-        // Initialise les MonthState, collecte les mois à bootstrapper.
         let mut pending: Vec<String> = Vec::new();
         for yyyymm in &monthly_targets {
             let month = state.months.entry(yyyymm.clone()).or_default();
@@ -129,7 +123,6 @@ pub async fn sync_judilibre(
             bootstrap_started_at = Some(server_now(client).await?);
         }
 
-        // Bootstrap archive (séquentiel).
         if let Some(cutoff_date) = cutoff {
             let archive_done = state
                 .months
@@ -150,7 +143,6 @@ pub async fn sync_judilibre(
             }
         }
 
-        // Bootstrap mensuel (séquentiel).
         for yyyymm in &pending {
             if let Err(e) = bootstrap_month(
                 client,
@@ -171,7 +163,6 @@ pub async fn sync_judilibre(
         manifest.save(&manifest_path)?;
     }
 
-    // Seed du watermark global.
     if manifest.history_watermark.is_none() {
         if let Some(seed) = &bootstrap_started_at {
             manifest.history_watermark = Some(seed.clone());
@@ -179,14 +170,13 @@ pub async fn sync_judilibre(
         }
     }
 
-    // Incrémental global /transactionalhistory.
     incremental_global(client, &source_dir, &mut manifest, &manifest_path).await?;
 
     manifest.save(&manifest_path)?;
     Ok(manifest)
 }
 
-/// Heure UTC serveur via `query_date` de `/transactionalhistory` (port de `_server_now`).
+/// Heure UTC serveur via `query_date` de `/transactionalhistory`.
 async fn server_now(client: &JudilibreClient) -> Result<String> {
     let now = Manifest::now_iso_seconds();
     let probe = client.transactional_history(&now, None).await?;
@@ -197,7 +187,6 @@ async fn server_now(client: &JudilibreClient) -> Result<String> {
         .unwrap_or(now))
 }
 
-/// Met à jour `max_update_date` du mois (port de `_update_max_update_date`).
 fn update_max_update_date(month: &mut MonthState, decisions: &[Value]) {
     for d in decisions {
         if let Some(ud) = d.get("update_date").and_then(|v| v.as_str()) {
@@ -213,7 +202,7 @@ fn update_max_update_date(month: &mut MonthState, decisions: &[Value]) {
     }
 }
 
-/// Append des décisions dans `<jur>/<key>.jsonl.gz` (port de `_append_decisions`).
+/// Append des décisions dans `<jur>/<key>.jsonl.gz`.
 pub(super) fn append_decisions(path: &Path, decisions: &[Value]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -275,11 +264,9 @@ pub(super) fn append_tombstone(data_dir: &Path, decision_id: &str) -> Result<()>
     Ok(())
 }
 
-/// Annule la tombstone d'un id (corrige la résurrection, ADR 0087). Une décision
-/// supprimée puis re-créée côté Judilibre (`deleted` suivi d'un `created`/
-/// `updated`) doit redevenir vivante : sans ça, la tombstone périmée la ferait
-/// dropper par `compact_archives` et supprimer en base. Réécriture atomique sans
-/// l'id ; no-op (sans réécriture) s'il est absent.
+/// Annule la tombstone d'un id. Une décision supprimée puis re-créée côté
+/// Judilibre (`deleted` suivi d'un `created`/`updated`) doit redevenir vivante.
+/// Réécriture atomique sans l'id ; no-op (sans réécriture) s'il est absent.
 fn remove_tombstone(data_dir: &Path, decision_id: &str) -> Result<()> {
     let path = data_dir.join("tombstones.jsonl");
     if !path.exists() {
@@ -308,8 +295,7 @@ fn remove_tombstone(data_dir: &Path, decision_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Bootstrap archive : décisions ≤ `cutoff_date` dans `archive.jsonl.gz` (port
-/// de `_bootstrap_archive`).
+/// Bootstrap archive : décisions ≤ `cutoff_date` dans `archive.jsonl.gz`.
 async fn bootstrap_archive(
     client: &JudilibreClient,
     data_dir: &Path,
@@ -386,7 +372,7 @@ async fn bootstrap_archive(
     Ok(())
 }
 
-/// Bootstrap d'un mois via `/scan` (port de `_bootstrap_month`).
+/// Bootstrap d'un mois via `/scan`.
 async fn bootstrap_month(
     client: &JudilibreClient,
     data_dir: &Path,
@@ -467,9 +453,8 @@ async fn bootstrap_month(
     Ok(())
 }
 
-/// Process `/transactionalhistory` global multi-juridictions (port de
-/// `_incremental_global`). Mono-thread : les `client.decision(id)` sont séquen-
-/// tiels (le Python utilise un pool de 8 threads ; même résultat).
+/// Process `/transactionalhistory` global multi-juridictions. Mono-thread :
+/// les `client.decision(id)` sont séquentiels.
 async fn incremental_global(
     client: &JudilibreClient,
     data_dir: &Path,
@@ -482,8 +467,8 @@ async fn incremental_global(
 
     let mut cursor = manifest.history_cursor.clone();
     // `query_date` est calculée une fois (borne basse formelle quand un cursor
-    // pilote la pagination) et n'est plus réassignée dans la boucle — port
-    // fidèle de `_incremental_global` (le cursor `from_id` est primaire).
+    // pilote la pagination) et n'est plus réassignée dans la boucle (le cursor
+    // `from_id` est primaire).
     let query_date = if cursor.is_some() {
         manifest
             .history_watermark
@@ -533,7 +518,7 @@ async fn incremental_global(
                 .or_else(|| op.get("type"))
                 .or_else(|| op.get("operation"))
                 .and_then(|v| v.as_str());
-            // Tombstone last-action-wins (ADR 0087) : un `deleted` marque mort,
+            // Tombstone last-action-wins : un `deleted` marque mort,
             // tout autre événement (created/updated) ressuscite en annulant la
             // tombstone. L'effet s'applique à CHAQUE occurrence — hors du dédup
             // `seen_ids` — pour couvrir delete↔create dans une même fenêtre. Les
@@ -549,7 +534,6 @@ async fn incremental_global(
             }
         }
 
-        // Fetch séquentiel (le Python parallélise via ThreadPoolExecutor(8)).
         let mut groups: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
         for did in &to_fetch {
             match client.decision(did).await {
@@ -620,7 +604,7 @@ fn page_results(page: &Value) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// `dt - 1h` en ISO millisecondes (port de la marge horaire de `_incremental_global`).
+/// `dt - 1h` en ISO millisecondes.
 fn minus_one_hour_iso(wm: &str) -> String {
     let normalized = wm.replace('Z', "+00:00");
     match chrono::DateTime::parse_from_rfc3339(&normalized) {
@@ -631,7 +615,6 @@ fn minus_one_hour_iso(wm: &str) -> String {
     }
 }
 
-/// `true` si un `.jsonl.gz` est lisible sans erreur (port de `_is_valid_gzip`).
 fn is_valid_gzip(path: &Path) -> bool {
     use std::io::Read;
     let file = match fs::File::open(path) {
@@ -664,7 +647,6 @@ mod tests {
         assert_eq!(yyyymm_of(&weird), "undated");
     }
 
-    // Spec ADR 0087 : append idempotent (pas de doublon) + remove annule.
     #[test]
     fn tombstone_append_idempotent_and_remove() {
         let dir = tempfile::tempdir().unwrap();
@@ -683,8 +665,6 @@ mod tests {
         assert_eq!(read_tombstone_ids(&path).unwrap().len(), 1);
     }
 
-    // Spec ADR 0087 : deleted→created (résurrection) ⇒ la tombstone est annulée
-    // et la décision survit au compact (sans le fix, elle serait droppée).
     #[test]
     fn tombstone_revive_then_compact_keeps_record() {
         let dir = tempfile::tempdir().unwrap();

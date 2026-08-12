@@ -1,8 +1,7 @@
-//! Description des filtres d'une recherche passee (chips) — port de la logique
-//! `describeFilters` / `FILTER_LABELS` / `FILTER_VALUE_LABELS` d'`activity-page`.
+//! Description des filtres d'une recherche passee (chips).
 //!
 //! Les valeurs des filtres referentiels (solution, procedure, office,
-//! legalDomain, codes de juridiction, publication — ADR 0146) sont affichees brutes
+//! legalDomain, codes de juridiction, publication) sont affichees brutes
 //! (suffixes d'uid / codes) : l'historique serialise le `SearchRequest` et le
 //! front n'embarque aucune table de libelles referentiels. Seul le type de
 //! juridiction (enum porte par `lj-dtos`) garde une map locale.
@@ -10,7 +9,7 @@
 use serde_json::Value;
 
 /// Champs de requete serialises dans `filters` qui ne sont PAS des filtres
-/// affichables (port de `NON_FILTER_KEYS`).
+/// affichables.
 const NON_FILTER_KEYS: [&str; 3] = ["mode", "sort", "aiMode"];
 
 /// Libelle court par cle de filtre (camelCase via la serialisation serde du
@@ -30,12 +29,13 @@ fn filter_label(key: &str) -> Option<&'static str> {
         "publication" => "Publication",
         "dateFrom" => "Depuis le",
         "dateTo" => "Jusqu'au",
+        "page" => "Page",
         _ => return None,
     })
 }
 
-/// Map code -> libelle pour une cle de filtre donnee (port de
-/// `FILTER_VALUE_LABELS`). `None` si la cle n'a pas de map de valeurs.
+/// Map code -> libelle pour une cle de filtre donnee. `None` si la cle n'a pas
+/// de map de valeurs.
 fn value_label(key: &str, code: &str) -> Option<&'static str> {
     match key {
         "jurisdictionType" => jurisdiction_type_label(code),
@@ -66,7 +66,7 @@ pub(super) struct DescribedFilter {
 }
 
 /// Formate la valeur d'un filtre : array -> labels joints par `, ` ; sinon label
-/// unique (fallback `String(v)`). Port de `formatFilterValue`.
+/// unique (fallback `String(v)`).
 fn format_filter_value(key: &str, value: &Value) -> String {
     let one = |v: &Value| -> String {
         let code = json_scalar(v);
@@ -78,7 +78,7 @@ fn format_filter_value(key: &str, value: &Value) -> String {
     }
 }
 
-/// Representation scalaire d'une valeur JSON, parite `String(v)` JS.
+/// Representation scalaire d'une valeur JSON.
 fn json_scalar(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -89,8 +89,8 @@ fn json_scalar(v: &Value) -> String {
     }
 }
 
-/// Decrit les filtres affichables d'une entree d'historique. Port de
-/// `describeFilters` : exclut les cles non-filtre, mappe libelles + valeurs.
+/// Decrit les filtres affichables d'une entree d'historique : exclut les cles
+/// non-filtre, mappe libelles + valeurs.
 pub(super) fn describe_filters(filters: &Value) -> Vec<DescribedFilter> {
     let Some(map) = filters.as_object() else {
         return Vec::new();

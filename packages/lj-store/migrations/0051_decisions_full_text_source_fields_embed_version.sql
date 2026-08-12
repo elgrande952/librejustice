@@ -1,15 +1,15 @@
--- Migration 0051 — Modèle document quasi-bijectif (ADR 0085) : colonnes
+-- Migration 0051 — Modèle document quasi-bijectif : colonnes
 -- ``full_text`` / ``source_fields`` / ``embed_version`` sur ``decisions``.
 --
 -- ``source_payload ⟷ (full_text, source_fields)`` : le texte nettoyé vit dans
--- ``full_text`` (indexé BM25 au grain décision, ADR 0084) ; tout le reste du
+-- ``full_text`` (indexé BM25 au grain décision) ; tout le reste du
 -- payload source vit dans ``source_fields`` (JSONB, offsets rebasés sur
 -- ``full_text``). Le payload brut gzippé devient reconstructible par
 -- recombinaison et sera dropé (``decision_full_text``) une fois les gates banc
 -- passées — étape ultérieure, hors de cette migration.
 --
 -- ``embed_version`` versionne la génération (chunker + modèle) des embeddings
--- stockés, comme ``extract_version`` (ADR 0083) versionne l'extraction de
+-- stockés, comme ``extract_version`` versionne l'extraction de
 -- champs : un futur ``reembed`` ne retouche que les décisions dont la version
 -- diffère. NULL = embeddé avant le versionnage.
 --

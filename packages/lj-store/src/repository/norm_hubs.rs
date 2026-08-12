@@ -1,19 +1,19 @@
-//! Hubs du catalogue des normes (ADR 0255) : catalogue agrégé par fond,
-//! années couvertes par un fond, page de textes d'une année — les chemins de
-//! crawl SSR `/normes` → `/normes/{fond}` → `/normes/{fond}/{annee}`.
+//! Hubs du catalogue des normes : catalogue agrégé par fond, années couvertes
+//! par un fond, page de textes d'une année — les chemins de crawl SSR `/normes`
+//! → `/normes/{fond}` → `/normes/{fond}/{annee}`.
 //!
 //! La taxonomie nature → fond et la date de parcours vivent dans les deux
-//! fragments SQL ci-dessous, LES MÊMES expressions que l'index de la migration
-//! 0166 (le planner ne matche un index d'expression que sur l'arbre exact).
-//! Toute évolution = nouvelle migration qui ré-indexe. Les libellés et l'ordre
+//! fragments SQL ci-dessous, les mêmes expressions que l'index qui les sert (le
+//! planner ne matche un index d'expression que sur l'arbre exact). Toute
+//! évolution = nouvelle migration qui ré-indexe. Les libellés et l'ordre
 //! d'affichage des fonds vivent dans `lj_core::referential_labels`.
 
 use super::types::NormTextRow;
 use super::DecisionRepository;
 use crate::error::Result;
 
-/// Fond de parcours d'un texte — miroir exact de l'expression indexée (0166).
-const NORM_FOND_EXPR: &str = "CASE \
+/// Fond de parcours d'un texte — miroir exact de l'expression indexée.
+pub(super) const NORM_FOND_EXPR: &str = "CASE \
     WHEN nature ILIKE 'code%' OR upper(nature) IN ('CODE', 'CONSTITUTION', 'ETAT_CIVIL') THEN 'codes' \
     WHEN jurisdiction = 'UE' OR upper(nature) IN ('DIRECTIVE', 'DIRECTIVE_EURO', 'REGLEMENTEUROPEEN', 'REGLEMENT_EURO', 'DECISION_EURO', 'AVISEURO', 'ARRETEURO', 'ARRETEEURO', 'INSTRUCTIONEURO', 'DELIBERATIONEURO', 'DECLARATIONEURO', 'LETTREEURO') THEN 'textes-ue' \
     WHEN jurisdiction = 'INTL' OR upper(nature) IN ('TRAITE', 'TI', 'PROTOCOLE') THEN 'traites' \
@@ -28,16 +28,16 @@ const NORM_FOND_EXPR: &str = "CASE \
 
 /// Date de parcours : première date VALIDE entre `date_texte` et `date_publi`
 /// (la DILA pose la sentinelle 2999-01-01 dans `date_texte` de certains JORF).
-/// Miroir exact de l'expression indexée (0166).
+/// Miroir exact de l'expression indexée.
 const NORM_BROWSE_DATE_EXPR: &str = "CASE \
     WHEN date_texte >= DATE '1500-01-01' AND date_texte < DATE '2100-01-01' THEN date_texte \
     WHEN date_publi >= DATE '1500-01-01' AND date_publi < DATE '2100-01-01' THEN date_publi \
   END";
 
 /// Filtre commun : textes publiés (page `/texte/{slug}`) hors actes
-/// individuels (nominations JORF, ADR 0246 — pas des normes). Miroir du
-/// prédicat partiel de l'index 0166.
-const NORM_SCOPE: &str = "slug IS NOT NULL AND role <> 'individuel'";
+/// individuels (nominations JORF, pas des normes). Miroir du prédicat partiel
+/// de l'index.
+pub(super) const NORM_SCOPE: &str = "slug IS NOT NULL AND role <> 'individuel'";
 
 impl DecisionRepository<'_> {
     /// Volumes par fond (`/normes`). Servi derrière le cache 12 h de `lj-api` ;
@@ -107,8 +107,8 @@ impl DecisionRepository<'_> {
     }
 
     /// Fond et année de parcours d'un texte, pour le maillage retour de la
-    /// page `/texte/{slug}` (ADR 0255). `None` si le texte est hors catalogue
-    /// (pas de slug ou acte individuel).
+    /// page `/texte/{slug}`. `None` si le texte est hors catalogue (pas de slug ou
+    /// acte individuel).
     #[tracing::instrument(name = "db.norm_fond_of_text", skip(self), fields(db.system = "postgresql"))]
     pub async fn norm_fond_of_text(&self, text_uid: &str) -> Result<Option<(String, Option<i32>)>> {
         let sql = format!(
@@ -119,10 +119,11 @@ impl DecisionRepository<'_> {
         Ok(rows.first().map(|r| (r.get(0), r.get(1))))
     }
 
-    /// Couples `(fond, années)` pour la section `normes` des sitemaps
-    /// (ADR 0255) : un hub par fond + une URL par année (token `sans-date`
-    /// pour le bucket sans date de parcours), années récentes en tête. Le
-    /// fond `codes` est exclu — son catalogue est la page statique `/codes`.
+    /// Couples `(fond, années)` pour la section `normes` des sitemaps : un hub
+    /// par fond + une URL par année (token `sans-date` pour le bucket sans date de
+    /// parcours), années récentes en tête. Le fond `codes` est exclu — son
+    /// catalogue `/normes/codes` (pas de hubs année) est porté par la section
+    /// `pages`.
     #[tracing::instrument(name = "db.iter_norm_hubs_for_sitemap", skip(self), fields(db.system = "postgresql"))]
     pub async fn iter_norm_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<String>)>> {
         let sql = format!(

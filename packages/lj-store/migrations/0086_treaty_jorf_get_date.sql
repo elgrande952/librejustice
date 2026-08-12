@@ -1,4 +1,4 @@
--- ADR 0129 (corr) — `source_asof` effectif ne doit JAMAIS être inconnu : au pire la
+-- Correctif : `source_asof` effectif ne doit JAMAIS être inconnu — au pire la
 -- « date de get ». jorf/treaty viennent du bulk DILA (ingest manuel/périodique, PAS du
 -- sync quotidien comme legifrance/kali) → leur fraîcheur = la **date de get**, stable,
 -- stockée par ligne (et non dérivée du live qui avancerait à tort chaque jour).

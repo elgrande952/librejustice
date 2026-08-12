@@ -1,39 +1,39 @@
 //! Loader générique de corpus de loi curé → `legal_text` + `legal_article`.
 //!
-//! Source-agnostique (ADR 0108/0118) : la moitié **adaptative** (OCR, choix du
-//! document, juridiction/nature/statut, **segmentation**) vit en **Python jettable**
-//! (`scripts/segment_jafbase.py`, `scripts/curate_*.py`) qui produit un dataset JSON
-//! par texte sous `<state_dir>/ingest/corpus/`, **articles déjà découpés ET
-//! déjà nettoyés** (ADR 0118). Ce module n'est qu'un **pur inséreur** : il upsert le
-//! texte et insère les articles fournis, `texte` inséré **VERBATIM**. Les seules
-//! dérivations tolérées sont des CLÉS/colonnes calculées à partir des champs fournis
-//! (`num_key = normalize_article`, invariant partagé avec la résolution des citations ;
-//! `status`/`instrument_key`) — jamais une modification du contenu.
+//! Source-agnostique : la moitié **adaptative** (OCR, choix du document,
+//! juridiction/nature/statut, **segmentation**) vit dans les scripts Python
+//! jetables de curation, qui produisent un dataset JSON par texte sous
+//! `<state_dir>/ingest/corpus/`, articles déjà découpés ET déjà nettoyés. Ce
+//! module n'est qu'un **pur inséreur** : il upsert le texte et insère les articles
+//! fournis, `texte` inséré **VERBATIM**. Les seules dérivations tolérées sont des
+//! clés calculées à partir des champs fournis (`num_key`, `status`,
+//! `instrument_key`) — jamais une modification du contenu.
 //!
-//! ⛔ RÈGLE ABSOLUE — AUCUN NETTOYAGE / NORMALISATION DE TEXTE DANS CE FICHIER. Tout
-//! traitement du CORPS (glyphes PUA Symbol/Wingdings, césures, en-têtes/pieds de page,
-//! mojibake, cruft de navigation, reflux de paragraphes, `replace`/`sanitize`/`strip`/
-//! regex sur `texte`…) se fait EXCLUSIVEMENT dans les scripts **Python jettables**
-//! (`scripts/curate_*.py`, `scripts/segment_jafbase.py`, `scripts/lj_segment.py`,
-//! `scripts/clean_pua_cruft.py`), JAMAIS ici. Ce loader Rust d'ingest doit rester
-//! EXTRÊMEMENT LÉGER. Toute logique de cleaning ajoutée ici est un bug : la corriger
-//! côté producteur Python et recharger. De même, aucune commande de nettoyage in-place
-//! (SQL) ne vit dans ce binaire — c'est un script Python jettable.
+//! ⛔ RÈGLE ABSOLUE — AUCUN NETTOYAGE NI NORMALISATION DE TEXTE DANS CE FICHIER.
+//! Tout traitement du CORPS (glyphes PUA, césures, en-têtes et pieds de page,
+//! mojibake, cruft de navigation, reflux de paragraphes, `replace`/`strip`/regex
+//! sur `texte`…) se fait dans les scripts Python de curation. Toute logique de
+//! cleaning ajoutée ici est un bug, à corriger côté producteur puis recharger.
+//! Même chose pour une commande de nettoyage in-place en SQL.
 //!
-//! Chaque article du dataset est, exclusivement :
-//! - **mono-version** (`texte`) : forme consolidée, `effect_date` = `date_debut`
-//!   commun (law-at-date). Cas par défaut (jafbase, UE, traités non amendés).
-//! - **multi-versions** (`versions[]`) : historique par article (avenants des
-//!   traités), une ligne `legal_article` par version datée.
+//! La règle vise la curation **adaptative par texte**, celle qui grossit d'un cas
+//! à chaque source, pas le normaliseur caractères unique et invariant
+//! `lj_core::normalizer::normalize_chars`, appliqué à toutes les sources au point
+//! d'écriture unique du référentiel.
+//!
+//! Chaque article du dataset est **mono-version** (`texte` : forme consolidée,
+//! `effect_date` = `date_debut` commun) ou **multi-versions** (`versions[]` :
+//! historique par article, une ligne `legal_article` par version datée).
 //!
 //! Le dataset est **autoritaire** pour son texte : on purge ses articles avant
-//! rechargement (idempotence #7). DB uniquement via le repository `lj-store`
-//! (règle #2) — ce loader est la frontière d'écriture, pas le Python.
+//! rechargement. DB uniquement via le repository `lj-store`.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
-use lj_store::repository::{DecisionRepository, LegalArticleRow, LegalTextRow};
+use lj_store::repository::{
+    DecisionRepository, LegalArticleRow, LegalLinkOwner, LegalLinkRow, LegalTextRow,
+};
 
 use crate::config::Settings;
 
@@ -44,53 +44,88 @@ struct CorpusDoc {
     source: String,
     jurisdiction: String,
     title: String,
-    /// Clé de liaison des citations (fold du linker sur `title_key`, ADR 0145).
-    /// Si absente, dérivée du `title` par `normalize_instrument` (cas courant). Override
-    /// explicite quand la **forme citée** par les juridictions (gentilé « code civil guinéen »,
-    /// nom tronqué « loi fédérale suisse sur la poursuite ») diffère du `title` canonique
-    /// d'affichage — découple liaison et affichage (cf. working-note title_key).
+    /// Clé de liaison des citations (fold du linker sur `title_key`). Absente, elle
+    /// est dérivée du `title` par `normalize_instrument`. Override explicite quand la
+    /// forme citée par les juridictions (« code civil guinéen ») diffère du `title`
+    /// canonique d'affichage.
     #[serde(default)]
     title_key: Option<String>,
     nature: String,
-    /// Provenance structurée du `texte` (ADR 0116) : `officiel` / `non_officiel` /
-    /// `automatique`. Défaut `non_officiel` (cas jafbase courant).
+    /// Provenance structurée du `texte` : `officiel` / `non_officiel` /
+    /// `automatique`. Défaut `non_officiel`.
     #[serde(default = "default_translation")]
     translation: String,
     #[serde(default)]
     source_url: Option<String>,
-    /// Date « as-of » de fraîcheur (ADR 0129), ISO `YYYY-MM-DD` : dernière base crédible
-    /// que cette copie reflète le droit en vigueur. Absente ⇒ le loader pose la date du
-    /// run (date de chargement = proxy d'extraction pour le curé).
+    /// Date « as-of » de fraîcheur, ISO `YYYY-MM-DD` : dernière date à laquelle
+    /// cette copie reflète le droit en vigueur. Absente ⇒ le loader pose la date du
+    /// run.
     #[serde(default)]
     source_asof: Option<String>,
-    /// Source secondaire amont (ADR 0129) : site qu'un agrégateur (jafbase) pointe. Rare.
+    /// Source secondaire amont : site qu'un agrégateur pointe. Rare.
     #[serde(default)]
     source_upstream_url: Option<String>,
     /// Date du texte (signature/adoption) si connue, ISO `YYYY-MM-DD`.
     #[serde(default)]
     date_texte: Option<String>,
     /// Date d'effet de la forme consolidée (ISO `YYYY-MM-DD`) : `date_debut` des
-    /// articles **mono-version** (law-at-date). Absent (jafbase) ⇒ borne ouverte
-    /// (sentinelle). Ignoré pour les articles **multi-versions** (chaque version
-    /// porte sa propre `date_debut`).
+    /// articles **mono-version** (law-at-date). Absent ⇒ borne ouverte (sentinelle).
+    /// Ignoré pour les articles **multi-versions**, chaque version portant sa propre
+    /// `date_debut`.
     #[serde(default)]
     effect_date: Option<String>,
-    /// Si vrai, le `status` de chaque article est dérivé du corps (`(Abrogé…)`/vide ⇒
-    /// `ABROGE`, sinon `VIGUEUR`) au lieu d'être forcé `VIGUEUR` — pour les formes
-    /// consolidées qui annotent leurs articles abrogés (traités). Défaut: `false`.
+    /// Si vrai, le `status` de chaque article est dérivé du corps (`(Abrogé…)`/vide
+    /// ⇒ `ABROGE`, sinon `VIGUEUR`) au lieu d'être forcé `VIGUEUR` — pour les formes
+    /// consolidées qui annotent leurs articles abrogés. Défaut : `false`.
     #[serde(default)]
     detect_abrogation: bool,
-    /// Si vrai, la résolution d'article de ce texte est PRÉFIXE-AGNOSTIQUE (migration
-    /// 0087, §7.4) : une citation matche sur le cœur numérique quel que soit le préfixe
-    /// d'instrument (codes territoriaux PF/NC cités « L./D./A./nu » alors que l'officiel
-    /// est « A./LP. »). À poser SEULEMENT si le n° identifie l'article à lui seul dans
-    /// ce code (aucun n° sous deux préfixes — garanti par le curateur). Défaut: `false`.
+    /// Si vrai, la résolution d'article de ce texte est PRÉFIXE-AGNOSTIQUE : une
+    /// citation matche sur le cœur numérique quel que soit le préfixe d'instrument
+    /// (codes territoriaux PF/NC cités « L./D./A./nu » alors que l'officiel est
+    /// « A./LP. »). À poser SEULEMENT si le n° identifie l'article à lui seul dans ce
+    /// code. Défaut : `false`.
     #[serde(default)]
     num_prefix_agnostic: bool,
-    /// Articles déjà segmentés par la curation Python (ADR 0118 : le Python segmente,
-    /// le loader insère). Chaque article est **mono-version** (`texte`) ou
-    /// **multi-versions** (`versions[]`, historique daté des avenants de traités).
+    /// Articles déjà segmentés par la curation Python. Chaque article est
+    /// **mono-version** (`texte`) ou **multi-versions** (`versions[]`, historique daté).
     articles: Vec<CorpusArticle>,
+    /// Arêtes de graphe curées (`legal_link`) possédées par CE texte au niveau
+    /// texte, en remplacement-par-propriétaire comme les articles. Réservées aux uid
+    /// hors fonds DILA, où les arêtes texte-niveau appartiennent aux fonds.
+    #[serde(default)]
+    links: Vec<CorpusLink>,
+}
+
+/// Une arête curée. `direction` vue du texte propriétaire : `outgoing` = il
+/// agit (défaut), `incoming` = il subit — un instrument porte son arête `publie`
+/// en `incoming` (« publié par le véhicule »), les fonds ne connaissant jamais
+/// son uid.
+#[derive(Deserialize)]
+struct CorpusLink {
+    verb: String,
+    #[serde(default = "default_link_direction")]
+    direction: String,
+    target_text_uid: String,
+    /// Libellé affichable de la cible (repris tel quel par les consommateurs
+    /// quand la cible n'est pas résolue en base).
+    target_label: String,
+    /// Date de l'acte cible (ISO `YYYY-MM-DD`), si connue.
+    #[serde(default)]
+    date: Option<String>,
+}
+
+/// Défaut de `CorpusLink::direction` (le propriétaire agit).
+fn default_link_direction() -> String {
+    "outgoing".to_string()
+}
+
+/// Un uid appartenant aux fonds DILA : leurs arêtes texte-niveau sont
+/// re-livrées par les syncs (remplacement-par-propriétaire), un dataset curé ne
+/// doit jamais posséder d'arêtes sur ces uid.
+fn is_dila_uid(uid: &str) -> bool {
+    ["JORFTEXT", "LEGITEXT", "KALI", "BOI-"]
+        .iter()
+        .any(|p| uid.starts_with(p))
 }
 
 /// Un article fourni en ligne. Forme **mono-version** (`texte` seul) ou
@@ -101,35 +136,30 @@ struct CorpusArticle {
     /// Mono-version : corps consolidé (jafbase, UE, traités non amendés).
     #[serde(default)]
     texte: Option<String>,
-    /// Corps dans la langue d'origine (ADR 0116), si disponible — mono-version
-    /// uniquement (couche front/vérification, souvent absent).
+    /// Corps dans la langue d'origine, si disponible — mono-version uniquement.
     #[serde(default)]
     texte_original: Option<String>,
     /// Langue de `texte_original` (ISO-639-1, `ar`…).
     #[serde(default)]
     lang_original: Option<String>,
-    /// Override de `translation` (ADR 0116) pour CET article — la curation fusionne
-    /// des provenances de traduction hétérogènes dans un seul texte (ex. code civil
-    /// syrien : corps auto-traduit `automatique` + 130 articles à traduction humaine
-    /// publiée `non_officiel`). Absent ⇒ hérite de `doc.translation`. Le loader reste
-    /// pur inséreur (ADR 0118) : il pose la valeur fournie, il ne la fabrique pas.
+    /// Override de `translation` pour CET article : une curation fusionne parfois
+    /// des provenances de traduction hétérogènes dans un seul texte. Absent ⇒ hérite
+    /// de `doc.translation`.
     #[serde(default)]
     translation: Option<String>,
-    /// Apparat éditorial affiché (ADR 0135) construit par la curation : jurisprudence/
-    /// doctrine extraite du corps des éditions annotées, renvois « voir aussi » vers les
-    /// instruments insérés. Inséré tel quel dans `legal_article.nota` — le loader reste
-    /// un pur inséreur (ADR 0118), aucune fabrication de note côté Rust.
+    /// Apparat éditorial affiché construit par la curation : jurisprudence et
+    /// doctrine extraites du corps des éditions annotées, renvois « voir aussi » vers
+    /// les instruments insérés. Inséré tel quel dans `legal_article.nota`.
     #[serde(default)]
     nota: Option<String>,
     /// Multi-versions : historique daté (avenants des traités). Exclusif avec `texte`.
     #[serde(default)]
     versions: Option<Vec<CorpusVersion>>,
-    /// Fil d'Ariane des divisions englobantes (ADR 0186), segments joints par
-    /// ` > ` — même sérialisation que `legal_article.title_path` côté LEGI.
-    /// Produit par la curation ; le loader en dérive aussi les arêtes
-    /// `legal_toc_edge` (sommaire arborescent + vue-lecture par division).
-    /// Pour un article multi-versions (ADR 0187), le chemin est celui de la
-    /// structure COURANTE — chaque version reçoit une arête fenêtrée à sa place.
+    /// Fil d'Ariane des divisions englobantes, segments joints par ` > ` — même
+    /// sérialisation que `legal_article.title_path` côté LEGI. Le loader en dérive
+    /// aussi les arêtes `legal_toc_edge`. Pour un article multi-versions, le chemin est
+    /// celui de la structure COURANTE, chaque version recevant une arête fenêtrée à sa
+    /// place.
     #[serde(default)]
     title_path: Option<String>,
 }
@@ -141,15 +171,15 @@ fn default_translation() -> String {
 
 /// Une version datée d'un article. `date_fin = None` ⇒ version courante.
 ///
-/// Provenance **par version** (ADR 0131) : un traité et ses avenants combinent des
-/// sources/dates distinctes (chaque avenant = un décret JORF de publication). Chaque
-/// champ, absent, retombe sur la valeur doc-level. `source` reste un **libellé de
-/// diffuseur** (`legifrance`, `jorf`…), jamais une URL ni une catégorie.
+/// Provenance **par version** : un traité et ses avenants combinent des sources et
+/// des dates distinctes. Chaque champ, absent, retombe sur la valeur doc-level.
+/// `source` reste un **libellé de diffuseur** (`legifrance`, `jorf`…), jamais une
+/// URL ni une catégorie.
 #[derive(Deserialize)]
 struct CorpusVersion {
-    /// Absente ⇒ borne ouverte (version la plus ancienne dont le début n'est
-    /// pas connu — historique reconstitué d'instantanés, ADR 0187). Au plus
-    /// une par article (la PK `(text_uid, num_key, date_debut)` sentinelle).
+    /// Absente ⇒ borne ouverte (version la plus ancienne dont le début n'est pas
+    /// connu). Au plus une par article : la PK `(text_uid, num_key, date_debut)` porte
+    /// une sentinelle.
     #[serde(default)]
     date_debut: Option<String>,
     #[serde(default)]
@@ -167,21 +197,64 @@ struct CorpusVersion {
     source_upstream_url: Option<String>,
 }
 
+/// Le corps s'OUVRE-t-il sur une annonce d'abrogation ? (`(Abrogé par …)`,
+/// `Article abrogé`, `Abrogé`, `Implicitement abrogé …`.)
+///
+/// Le participe reste ACCENTUÉ à dessein — « abroge » nu est la forme verbale d'un
+/// article EN VIGUEUR qui en abroge un autre, et l'accepter retournerait le statut
+/// de son porteur.
+fn opens_on_abrogation(texte: &str) -> bool {
+    let low = texte.trim_start().to_lowercase();
+    let low = ["implicitement ", "tacitement "]
+        .iter()
+        .find_map(|adv| low.strip_prefix(adv))
+        .unwrap_or(&low);
+    low.starts_with("abrogé") || low.starts_with("article abrogé") || low.starts_with("(abrogé")
+}
+
+/// Retire UN préfixe éditorial de tête : une référence d'acte parenthésée que
+/// les formes consolidées posent avant le corps (« ( L. du 20 juillet 2018 ) »,
+/// « (ancien article 30bis) »). `None` si le corps n'en ouvre pas un.
+///
+/// Groupe non imbriqué et borné : au-delà, ce n'est plus une référence d'acte mais
+/// de la prose parenthésée, qu'on ne saute pas.
+fn strip_act_reference(texte: &str) -> Option<&str> {
+    const MAX_REF: usize = 80;
+    let rest = texte.strip_prefix('(')?;
+    let close = rest
+        .char_indices()
+        .take(MAX_REF)
+        .find_map(|(i, c)| match c {
+            ')' => Some(Some(i)),
+            '(' => Some(None),
+            _ => None,
+        })??;
+    Some(rest[close + 1..].trim_start())
+}
+
 /// Statut d'un article d'une forme consolidée : `ABROGE` si le corps n'est que
-/// l'annotation d'abrogation (`(Abrogé par …)`, `Article abrogé` Lexpol, `Abrogé`)
-/// ou vide ; `VIGUEUR` sinon.
+/// l'annonce de son abrogation, ou vide ; `VIGUEUR` sinon.
+///
+/// L'annonce est cherchée en tête, puis derrière chaque référence d'acte que la
+/// consolidation a posée devant elle. La reconnaissance ne peut qu'AJOUTER
+/// `ABROGE` : un corps déjà reconnu en tête n'est jamais rouvert, et un reliquat
+/// vide n'en fait pas un.
 fn article_status(texte: &str) -> &'static str {
-    let t = texte.trim_start();
-    let low = t.to_lowercase();
-    if t.is_empty()
-        || low.starts_with("(abrogé")
-        || low.starts_with("article abrogé")
-        || low.starts_with("abrogé")
-    {
-        "ABROGE"
-    } else {
-        "VIGUEUR"
+    const MAX_PREFIXES: usize = 4;
+    let mut t = texte.trim();
+    if t.is_empty() {
+        return "ABROGE";
     }
+    for _ in 0..MAX_PREFIXES {
+        if opens_on_abrogation(t) {
+            return "ABROGE";
+        }
+        match strip_act_reference(t) {
+            Some(rest) if !rest.is_empty() => t = rest,
+            _ => break,
+        }
+    }
+    "VIGUEUR"
 }
 
 fn parse_date(iso: &str) -> Result<chrono::NaiveDate> {
@@ -189,8 +262,8 @@ fn parse_date(iso: &str) -> Result<chrono::NaiveDate> {
         .map_err(|e| anyhow!("date {iso:?} invalide: {e}"))
 }
 
-/// Date de dernière modification d'un fichier dataset → `NaiveDate` UTC (proxy de
-/// fraîcheur « as-of » par défaut, ADR 0129).
+/// Date de dernière modification d'un fichier dataset → `NaiveDate` UTC, proxy
+/// de fraîcheur « as-of » par défaut.
 fn file_mtime_date(path: &std::path::Path) -> Result<chrono::NaiveDate> {
     let mtime = std::fs::metadata(path)
         .with_context(|| format!("metadata {}", path.display()))?
@@ -212,9 +285,9 @@ fn dataset_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
-/// Charge les datasets de `<state_dir>/ingest/corpus/*.json`. `only` (sous-chaîne
-/// du nom de fichier) restreint le chargement — chargement chirurgical d'un lot curé
-/// (ex. `eu-rproc`) sans réasserter les 3800 datasets déjà en base.
+/// Charge les datasets de `<state_dir>/ingest/corpus/*.json`. `only`
+/// (sous-chaîne du nom de fichier) restreint le chargement à un lot curé, sans
+/// réasserter tous les datasets déjà en base.
 pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
     let settings = Settings::from_env()?;
     let dir = settings.legal_corpus_dir();
@@ -239,7 +312,24 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
 
+    // Cibles des arêtes `publie` écrites par ce chargement : candidates au rôle
+    //     `vehicule`, classifiées en fin de load.
+    let mut publie_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
     for file in &files {
+        load_dataset_file(&repo, file, &mut publie_targets).await?;
+    }
+    run_corpus_finishers(&repo, publie_targets).await
+}
+
+/// Charge UN dataset (texte + articles + TOC + arêtes) — corps de boucle du
+/// loader, partagé avec `sync-eu-law` qui recharge les seuls datasets régénérés.
+/// Accumule les cibles `publie` pour les finisseurs.
+pub(crate) async fn load_dataset_file(
+    repo: &DecisionRepository<'_>,
+    file: &std::path::Path,
+    publie_targets: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    {
         let raw =
             std::fs::read_to_string(file).with_context(|| format!("lecture {}", file.display()))?;
         let doc: CorpusDoc = serde_json::from_str(&raw)
@@ -247,10 +337,9 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
 
         let date_texte = doc.date_texte.as_deref().map(parse_date).transpose()?;
         let effect_date = doc.effect_date.as_deref().map(parse_date).transpose()?;
-        // Fraîcheur « as-of » (ADR 0129) : valeur explicite du dataset, ou — à défaut — la
-        // date de modification du FICHIER dataset (= date de curation, proxy stable et plus
-        // honnête que la date de chargement : invariant au re-load). Posée par article (les
-        // avenants de traités peuvent porter des sources/dates distinctes — ici commune au doc).
+        // Fraîcheur « as-of » : valeur explicite du dataset, ou à défaut la date de
+        // modification du FICHIER dataset — la date de curation, invariante au re-load.
+        // Posée par article, ici commune au doc.
         let source_asof = match doc.source_asof.as_deref() {
             Some(s) => Some(parse_date(s)?),
             None => Some(file_mtime_date(file)?),
@@ -267,7 +356,6 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
             last_modified: None,
             date_texte,
             date_publi: None,
-            // Droit étranger curé : identité par `text_uid`, cascade ADR 0115 non peuplée.
             eli: None,
             nor: None,
             instrument_key: None,
@@ -277,8 +365,6 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
         repo.upsert_legal_text(&trow)
             .await
             .map_err(|e| anyhow!("upsert_legal_text {}: {e}", doc.text_uid))?;
-        // Résolution préfixe-agnostique du texte (migration 0087) : posée à part de
-        // l'upsert (qui n'élargit pas `LegalTextRow` à tous ses sites de construction).
         repo.set_legal_text_num_prefix_agnostic(&doc.text_uid, doc.num_prefix_agnostic)
             .await
             .map_err(|e| anyhow!("set num_prefix_agnostic {}: {e}", doc.text_uid))?;
@@ -289,13 +375,13 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
             .await
             .map_err(|e| anyhow!("purge {}: {e}", doc.text_uid))?;
 
-        // Articles déjà segmentés par la curation Python (ADR 0118). Une ligne par
-        // article (mono `texte`) ou par version datée (multi `versions[]`).
+        // Articles déjà segmentés par la curation Python. Une ligne par article
+        // (mono `texte`) ou par version datée (multi `versions[]`).
         let mut n = 0usize;
         let mut toc_articles: Vec<super::corpus_toc::TocArticle> = Vec::new();
         for (pos, art) in doc.articles.iter().enumerate() {
-            // Clé d'identité (ADR 0236) : sans perte, injective par texte — la
-            // dé-collision base « 164 » / sous-articles « 164/1 » est intrinsèque.
+            // Clé d'identité sans perte, injective par texte : la dé-collision base
+            // « 164 » / sous-articles « 164/1 » est intrinsèque.
             let num_key = lj_core::article_key::identity_key(&art.num);
             match (&art.texte, &art.versions) {
                 (Some(_), Some(_)) | (None, None) => bail!(
@@ -303,8 +389,7 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
                     doc.text_uid,
                     art.num
                 ),
-                // Multi-versions : une ligne par version datée (avenants des
-                // traités, historiques reconstitués ADR 0187).
+                // Multi-versions : une ligne par version datée.
                 (None, Some(versions)) => {
                     if versions.iter().filter(|v| v.date_debut.is_none()).count() > 1 {
                         bail!(
@@ -316,13 +401,13 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
                     }
                     let mut toc_versions = Vec::with_capacity(versions.len());
                     for v in versions {
-                        // Provenance par version (ADR 0131) : override de l'avenant, sinon doc-level.
+                        // Provenance par version : override de l'avenant, sinon doc-level.
                         let v_asof = match v.source_asof.as_deref() {
                             Some(s) => Some(parse_date(s)?),
                             None => source_asof,
                         };
-                        // Borne ouverte (pas de début connu) : identité mono-forme,
-                        // même `source_uid` que joindrait une arête TOC sans date.
+                        // Borne ouverte (pas de début connu) : identité mono-forme, même
+                        // `source_uid` que joindrait une arête TOC sans date.
                         let source_uid = match v.date_debut.as_deref() {
                             Some(d) => format!("{}#{}@{}", doc.text_uid, num_key, d),
                             None => format!("{}#{}", doc.text_uid, num_key),
@@ -345,7 +430,7 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
                             date_debut,
                             date_fin,
                             texte: Some(v.texte.clone()),
-                            // Original par version non géré (avenants traités) ; ADR 0116.
+                            // Original par version non géré.
                             texte_original: None,
                             lang_original: None,
                             translation: art.translation.clone().unwrap_or_else(|| doc.translation.clone()),
@@ -418,8 +503,8 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
                 }
             }
         }
-        // Structure (ADR 0186) : purge autoritaire des arêtes du texte, puis
-        // réécriture de l'arbre dérivé des `title_path` (vide = corpus à plat).
+        // Structure : purge autoritaire des arêtes du texte, puis réécriture de
+        // l'arbre dérivé des `title_path` (vide = corpus à plat).
         repo.delete_toc_edges_by_text(&doc.text_uid)
             .await
             .map_err(|e| anyhow!("delete_toc_edges_by_text {}: {e}", doc.text_uid))?;
@@ -428,6 +513,56 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
             .replace_toc_edges(&toc)
             .await
             .map_err(|e| anyhow!("replace_toc_edges {}: {e}", doc.text_uid))?;
+
+        // Arêtes curées : le dataset est autoritaire sur les arêtes texte-niveau de
+        // son uid — remplacement-par-propriétaire, un `links` vide purge. Uniquement hors
+        // uid DILA : là-bas les arêtes appartiennent aux fonds.
+        if is_dila_uid(&doc.text_uid) {
+            if !doc.links.is_empty() {
+                bail!(
+                    "dataset {} : `links[]` interdit sur un uid DILA — les arêtes \
+                     texte-niveau y appartiennent aux fonds (ancrer l'instrument \
+                     sur un uid propre)",
+                    doc.text_uid
+                );
+            }
+        } else {
+            let owner = LegalLinkOwner {
+                text_uid: doc.text_uid.clone(),
+                num_key: String::new(),
+                date_debut: None,
+            };
+            let rows: Vec<LegalLinkRow> = doc
+                .links
+                .iter()
+                .map(|l| {
+                    Ok(LegalLinkRow {
+                        typelien: l.verb.to_uppercase(),
+                        verb: l.verb.clone(),
+                        direction: l.direction.clone(),
+                        target_kind: "texte".to_string(),
+                        target_uid: Some(l.target_text_uid.clone()),
+                        target_text_uid: Some(l.target_text_uid.clone()),
+                        target_num: None,
+                        target_num_key: None,
+                        target_nature: None,
+                        target_label: l.target_label.clone(),
+                        target_date: l.date.as_deref().map(parse_date).transpose()?,
+                        target_nor: None,
+                    })
+                })
+                .collect::<Result<_>>()?;
+            for r in &rows {
+                if r.verb == "publie" && r.direction == "incoming" {
+                    if let Some(target) = &r.target_text_uid {
+                        publie_targets.insert(target.clone());
+                    }
+                }
+            }
+            repo.replace_legal_links(&[(owner, rows)])
+                .await
+                .map_err(|e| anyhow!("replace_legal_links {}: {e}", doc.text_uid))?;
+        }
 
         tracing::info!(
             text_uid = doc.text_uid,
@@ -439,20 +574,61 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
             "legal corpus loaded"
         );
     }
-    // Titre du texte dénormalisé → `search_title` (ADR 0114).
+    Ok(())
+}
+
+/// Finisseurs de fin de chargement, dans l'ordre des dépendances
+/// (`legal_article.searchable` dérive du slug ET du rôle) : slugs, rôles des
+/// véhicules déclarés par les datasets, dénorm, puis rangs de lecture. Partagés
+/// avec `sync-eu-law`.
+pub(crate) async fn run_corpus_finishers(
+    repo: &DecisionRepository<'_>,
+    publie_targets: std::collections::HashSet<String>,
+) -> Result<()> {
+    let slugged = super::slugs::assign_text_slugs(repo).await?;
+    let uids: Vec<String> = publie_targets.into_iter().collect();
+    let (_, _, vehicule, _) = repo
+        .classify_text_roles_scoped(&uids)
+        .await
+        .map_err(|e| anyhow!("classify_text_roles_scoped: {e}"))?;
     repo.refresh_article_denorm()
         .await
         .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
-    // Slugs des textes nouveaux (ADR 0162).
-    let slugged = super::slugs::assign_text_slugs(&repo).await?;
-    tracing::info!(slugged, "legal corpus slugs");
+    // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
+    //     rangs, ce finisseur les recalcule.
+    let (ranked_texts, ranked_rows) = repo
+        .refresh_reading_ranks()
+        .await
+        .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
+    tracing::info!(ranked_texts, ranked_rows, "reading ranks");
+    tracing::info!(slugged, vehicule, "legal corpus finishers");
+    Ok(())
+}
+
+/// Commande `reading-ranks` : recalcule l'ordre de lecture des textes sales.
+/// Même appel que le finisseur de fin de pipeline.
+pub async fn reading_ranks() -> Result<()> {
+    let settings = Settings::from_env()?;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    lj_store::migrator::apply_migrations(&conn)
+        .await
+        .map_err(|e| anyhow!("migrations: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+    let (texts, rows) = repo
+        .refresh_reading_ranks()
+        .await
+        .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
+    tracing::info!(texts, rows, "reading ranks");
+    println!("reading-ranks : {texts} textes recalculés, {rows} lignes écrites.");
     Ok(())
 }
 
 /// Re-confirme la fraîcheur « as-of » des sources *live* autoritaires
-/// (legifrance/kali/jorf) à la date du jour dans `ingest_freshness` (ADR 0129) : à
-/// lancer après chaque ingest LEGI/KALI/JORF. La fraîcheur effective d'un article live
-/// se dérive ensuite de `COALESCE(legal_article.source_asof, ingest_freshness[source])`.
+/// (legifrance/kali/jorf) à la date du jour dans `ingest_freshness` : à lancer
+/// après chaque ingest LEGI/KALI/JORF. La fraîcheur effective d'un article live se
+/// dérive ensuite de `COALESCE(legal_article.source_asof, ingest_freshness[source])`.
 pub async fn stamp_freshness() -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -463,8 +639,8 @@ pub async fn stamp_freshness() -> Result<()> {
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
     let today = chrono::Utc::now().date_naive();
-    // Seules legifrance/kali sont re-synchronisées quotidiennement (cron). jorf/treaty =
-    // bulk DILA → date de get stockée par ligne à l'ingest (pas ici). ADR 0129.
+    // Seules legifrance/kali sont re-synchronisées quotidiennement. jorf/treaty =
+    //     bulk DILA → date de get stockée par ligne à l'ingest, pas ici.
     for source in ["legifrance", "kali"] {
         repo.upsert_ingest_freshness(source, today)
             .await
@@ -474,16 +650,18 @@ pub async fn stamp_freshness() -> Result<()> {
     Ok(())
 }
 
-/// Retrofit ADR 0131 : reclasse en bloc les `source` **catégorie/méthode** hérités
-/// (`treaty`, `eu-law`, `official-fr`, `traduction-automatique`) en libellés de
-/// **diffuseur** réels. Stratégie :
+/// Reclasse en bloc les `source` **catégorie/méthode** hérités (`treaty`,
+/// `eu-law`, `official-fr`, `traduction-automatique`) en libellés de **diffuseur**
+/// réels :
 /// 1. lignes portant une URL → libellé dérivé de `source_url`
-///    ([`lj_core::source_authority::diffuseur_label_from_url`], source de vérité partagée) ;
-/// 2. traités du **bulk JORF** (sans URL, `source_uid=JORFARTI…`) → `jorf` (DILA) ;
-/// 3. reliquat sans URL hors bulk (chaînes curées de traités, vieux codes traduits) :
-///    laissé au reload de curation, **compté et logué** (jamais réécrit en aveugle).
+///    ([`lj_core::source_authority::diffuseur_label_from_url`], source de vérité
+///    partagée) ;
+/// 2. traités du **bulk JORF** (sans URL, `source_uid=JORFARTI…`) → `jorf` ;
+/// 3. reliquat sans URL hors bulk (chaînes curées de traités, vieux codes
+///    traduits) : laissé au reload de curation, **compté et logué**, jamais
+///    réécrit en aveugle.
 ///
-/// Idempotent (un re-run ne trouve plus de catégorie à reclasser).
+/// Idempotent : un re-run ne trouve plus de catégorie à reclasser.
 pub async fn relabel_sources() -> Result<()> {
     const CATEGORIES: &[&str] = &["treaty", "eu-law", "official-fr", "traduction-automatique"];
 
@@ -517,7 +695,15 @@ pub async fn relabel_sources() -> Result<()> {
         .map_err(|e| anyhow!("relabel_treaty_jorf_bulk: {e}"))?;
     tracing::info!(rows = jorf_bulk, "relabel treaty bulk JORF → jorf");
 
-    // 3. Reliquat (URL vide, hors bulk) : à corriger par reload de curation.
+    // Reclasse en bloc les `source` catégorie/méthode hérités en libellés de
+    // **diffuseur** réels :
+    // 1. lignes portant une URL → libellé dérivé de `source_url`
+    //    ([`lj_core::source_authority::diffuseur_label_from_url`]) ;
+    // 2. traités du bulk JORF (sans URL, `source_uid=JORFARTI…`) → `jorf` ;
+    // 3. reliquat sans URL hors bulk : laissé au reload de curation, compté et logué,
+    //    jamais réécrit en aveugle.
+    //
+    // Idempotent.
     let leftovers = repo
         .count_category_source_leftovers(CATEGORIES)
         .await
@@ -538,13 +724,13 @@ pub async fn relabel_sources() -> Result<()> {
     Ok(())
 }
 
-/// Canonicalise les **variantes d'hôte** d'un même diffuseur vers son libellé unique
-/// (ADR 0131 « un libellé par diffuseur ») — la dérivation canonique vit dans
-/// [`lj_core::source_authority::diffuseur_label_from_url`] (corrigée pour les futurs
-/// loads) ; cette commande rabat les lignes DÉJÀ stockées. Idempotent. One-shot
-/// post-déploiement. À étendre si d'autres variantes d'hôte apparaissent.
+/// Canonicalise les **variantes d'hôte** d'un même diffuseur vers son libellé
+/// unique — la dérivation canonique vit dans
+/// [`lj_core::source_authority::diffuseur_label_from_url`], cette commande rabat
+/// les lignes DÉJÀ stockées. Idempotent. À étendre si d'autres variantes d'hôte
+/// apparaissent.
 pub async fn canonicalize_source_labels() -> Result<()> {
-    // (variante d'hôte → libellé canonique). jafbase a deux hôtes (jafbase.fr).
+    // Variante d'hôte → libellé canonique.
     const CANON: &[(&str, &str)] = &[("jafbase.fr", "jafbase")];
 
     let settings = Settings::from_env()?;
@@ -572,7 +758,6 @@ mod tests {
 
     #[test]
     fn article_status_detecte_abrogation() {
-        // Forme Lexpol (codes PF/NC consolidés) + formes traités + vide.
         assert_eq!(article_status("Article abrogé"), "ABROGE");
         assert_eq!(article_status("  Article abrogé\n"), "ABROGE");
         assert_eq!(article_status("Abrogé"), "ABROGE");
@@ -581,7 +766,51 @@ mod tests {
             "ABROGE"
         );
         assert_eq!(article_status(""), "ABROGE");
-        // Texte réel en vigueur.
         assert_eq!(article_status("Le recouvrement des impôts…"), "VIGUEUR");
+    }
+
+    #[test]
+    fn article_status_saute_la_reference_d_acte_de_tete() {
+        assert_eq!(article_status("Abrogé ( L. du 27 juin 2018 )"), "ABROGE");
+        assert_eq!(
+            article_status("( L. du 20 juillet 2018 ) Article abrogé."),
+            "ABROGE"
+        );
+        assert_eq!(article_status("( L. du 27 juin 2018 )\nAbrogés"), "ABROGE");
+        assert_eq!(article_status("(ancien article 30bis) (Abrogé)"), "ABROGE");
+        assert_eq!(
+            article_status("Implicitement abrogé ( L. 13 juin 1994 )."),
+            "ABROGE"
+        );
+        assert_eq!(
+            article_status("Implicitement abrogé (C. pén., art. 387)"),
+            "ABROGE"
+        );
+    }
+
+    #[test]
+    fn article_status_ne_bascule_pas_sur_un_article_vivant() {
+        assert_eq!(
+            article_status("(supprimé par changement de numérotation)"),
+            "VIGUEUR"
+        );
+        assert_eq!(
+            article_status("Abroge l'article 5 de la loi du 3 juillet 1978."),
+            "VIGUEUR"
+        );
+        assert_eq!(
+            article_status(
+                "( L. 12 août 2003 ) Les dispositions abrogées par la loi \
+                            du 4 juillet 2014 restent applicables aux instances en cours."
+            ),
+            "VIGUEUR"
+        );
+        assert_eq!(
+            article_status(
+                "(Le présent article, dont la rédaction résulte d'une refonte complète \
+                 opérée en 2018, régit la matière) Abrogé"
+            ),
+            "VIGUEUR"
+        );
     }
 }

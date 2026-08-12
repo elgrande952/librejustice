@@ -15,7 +15,6 @@ use crate::error::{Result, SourceError};
 
 /// Endpoint OAuth2 PISTE (production).
 pub const OAUTH_TOKEN_URL: &str = "https://oauth.piste.gouv.fr/api/oauth/token";
-/// User-Agent des requêtes de jeton.
 const USER_AGENT: &str = "librejustice-piste/0.1 (+https://github.com/)";
 
 /// Détient les identifiants `client_credentials` et un jeton Bearer caché.
@@ -50,9 +49,9 @@ impl PisteOAuth {
 
     /// Renvoie un jeton Bearer valide, en le rafraîchissant si absent/expiré.
     ///
-    /// Le lock est tenu pendant tout le rafraîchissement : sous forte concurrence,
-    /// un seul appelant fait le `POST /token`, les autres attendent puis lisent le
-    /// jeton frais — pas de stampede sur l'endpoint OAuth.
+    /// Le lock est tenu pendant tout le rafraîchissement : sous forte concurrence, un
+    /// seul appelant fait le `POST /token`, les autres attendent puis lisent le jeton
+    /// frais.
     pub async fn bearer(&self) -> Result<String> {
         let mut guard = self.token.lock().await;
         if let Some((tok, expiry)) = guard.as_ref() {
@@ -60,9 +59,9 @@ impl PisteOAuth {
                 return Ok(tok.clone());
             }
         }
-        // client_credentials, scope openid (cf. FAQ API PISTE). On encode le corps
-        // `x-www-form-urlencoded` à la main : `reqwest_middleware` n'expose pas
-        // `.form()`, et le secret peut contenir des caractères réservés.
+        // `client_credentials`, scope openid. Le corps `x-www-form-urlencoded` est
+        // encodé à la main : `reqwest_middleware` n'expose pas `.form()`, et le secret
+        // peut contenir des caractères réservés.
         let form = format!(
             "grant_type=client_credentials&client_id={}&client_secret={}&scope=openid",
             urlencode(&self.client_id),
@@ -90,17 +89,16 @@ impl PisteOAuth {
             .as_str()
             .ok_or_else(|| SourceError::Invalid("oauth piste: access_token absent".into()))?
             .to_string();
-        // expires_in en secondes (souvent 3600) ; marge de 60 s avant péremption.
+        // `expires_in` en secondes (souvent 3600) ; marge de 60 s avant péremption.
         let ttl = v["expires_in"].as_u64().unwrap_or(3600).saturating_sub(60);
         let expiry = Instant::now() + Duration::from_secs(ttl);
         *guard = Some((tok.clone(), expiry));
         Ok(tok)
     }
 
-    /// Purge le jeton caché : le prochain [`bearer`](Self::bearer) en re-POSTera
-    /// un frais. Appelé quand l'API renvoie 401 alors qu'on croyait le jeton
-    /// valide — le TTL réel côté PISTE peut être plus court que `expires_in`
-    /// annoncé (ou skew d'horloge), d'où une expiration anticipée. Auto-réparation.
+    /// Purge le jeton caché : le prochain [`bearer`](Self::bearer) en re-POSTera un
+    /// frais. Appelé quand l'API renvoie 401 alors qu'on croyait le jeton valide — le
+    /// TTL réel côté PISTE peut être plus court que l'`expires_in` annoncé.
     pub async fn invalidate(&self) {
         *self.token.lock().await = None;
     }

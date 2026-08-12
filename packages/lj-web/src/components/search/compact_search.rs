@@ -1,16 +1,16 @@
-//! `CompactSearch` (port de `compact-search.tsx`) + point d'ancrage des modules
+//! `CompactSearch` + point d'ancrage des modules
 //! privés de la tranche recherche.
 //!
-//! Le `mod.rs` de `search/` est figé par la substrate et n'expose que les
-//! composants publics. Les helpers internes de la tranche (état URL, parsing,
-//! highlight, mode IA, fetch) sont donc rattachés ici via `#[path]` : ils
-//! deviennent des sous-modules de `compact_search`, accessibles depuis les
-//! autres composants via `super::compact_search::…`.
+//! Le `mod.rs` de `search/` n'expose que les composants publics. Les helpers
+//! internes de la tranche (état URL, parsing, highlight, mode IA, fetch) sont
+//! donc rattachés ici via `#[path]` : ils deviennent des sous-modules de
+//! `compact_search`, accessibles depuis les autres composants via
+//! `super::compact_search::…`.
 //!
 //! L'`<input>` est rendu inline (mêmes classes que `ui::Input`) plutôt que via
 //! le composant `Input` : ce dernier ne propage ni la valeur ni `on:input` au
 //! champ interne (slots `ViewFn` `Send + Sync` seulement), or on a besoin d'un
-//! champ contrôlé. Le DOM/les classes restent ceux d'`Input` (parité visuelle).
+//! champ contrôlé. Le DOM et les classes restent ceux d'`Input`.
 
 #[path = "ai_mode.rs"]
 pub mod ai_mode;
@@ -33,7 +33,7 @@ use super::suggest_box::{SuggestController, SuggestPanel};
 /// Texte courant de la barre de recherche, partagé via contexte avec le rail de
 /// filtres. Cocher un filtre applique CE texte comme `q` (même non soumis), pour
 /// ajuster requête + filtres d'un seul geste. Fourni par `SearchPage` ; lu par
-/// `CompactSearch` (qui l'édite) et `FilterRail` (qui le lit à la mutation).
+/// `CompactSearch` (qui l'édite).
 #[derive(Clone, Copy)]
 pub struct DraftQuery(pub RwSignal<String>);
 
@@ -52,40 +52,39 @@ pub fn CompactSearch() -> impl IntoView {
         .unwrap_or_else(|| RwSignal::new(initial));
     let (ai_mode, set_ai_mode) = use_ai_mode();
     // Corpus actif par la route (`/textes` vs `/decisions`) : le mode IA
-    // (rerank + résumés) n'existe que pour les décisions — toggle masqué et
+    // (reclassement LLM) n'existe que pour les décisions — toggle masqué et
     // jamais soumis côté textes ; le placeholder suit.
-    let is_textes = Signal::derive(query_state::on_textes_path);
-    let show_ai = Signal::derive(move || !is_textes.get());
-    // Autocomplétion (ADR 0216) : le mode suit le corpus de la route.
-    let suggest_mode = Signal::derive(move || {
-        if is_textes.get() {
-            "textes"
-        } else {
-            "jurisprudence"
-        }
-    });
+    let corpus = Signal::derive(query_state::corpus);
+    let show_ai = Signal::derive(move || corpus.get() == query_state::Corpus::Decisions);
+    // Autocomplétion : le mode suit le corpus de la route, vide pour celui qui n'a
+    // pas d'index de suggestions.
+    let suggest_mode = Signal::derive(move || corpus.get().suggest_mode());
     let suggest = SuggestController::new(query, suggest_mode);
 
     // Re-sync `q` (back/forward). `Memo` sur le SEUL param `q` : ne notifie qu'au
     // changement effectif de `q`. Une mutation de filtre (le rail navigue en
     // replace=true en conservant `q`) ne re-déclenche donc pas le set — sinon
     // cocher un filtre réécrirait le champ avec l'ancien `q` de l'URL, écrasant
-    // le texte saisi mais pas encore soumis.
+    // le texte saisi mais pas encore soumis. Set via `sync` (silencieux) : la
+    // resync qui suit une soumission ne rouvre pas le panneau de suggestions.
     let url_q = Memo::new(move |_| query_map.get().get("q").unwrap_or_default());
     Effect::new(move |_| {
-        query.set(url_q.get());
+        suggest.sync(url_q.get());
     });
 
     let submit_nav = navigate.clone();
     let submit = move || {
         let trimmed = query.get_untracked().trim().to_string();
-        if trimmed.is_empty() {
+        // Vider la barre est une soumission valable là où l'état sans requête
+        // est un résultat (le pot d'annonces) : c'est le seul geste qui retire
+        // `q` quand la croix a déjà disparu avec le dernier caractère.
+        if trimmed.is_empty() && !corpus.get_untracked().accepts_empty_query() {
             return;
         }
         let qs = query_state::with_query(
             &query_map.get_untracked(),
             &trimmed,
-            ai_mode.get_untracked() && show_ai.get_untracked(),
+            show_ai.get_untracked().then(|| ai_mode.get_untracked()),
         );
         submit_nav(&query_state::search_href(&qs), Default::default());
     };
@@ -120,13 +119,7 @@ pub fn CompactSearch() -> impl IntoView {
                     name="q"
                     size="1"
                     autocomplete="off"
-                    placeholder=move || {
-                        if is_textes.get() {
-                            "Rechercher dans les codes et lois…"
-                        } else {
-                            "Rechercher dans la jurisprudence…"
-                        }
-                    }
+                    placeholder=move || corpus.get().placeholder()
                     prop:value=move || query.get()
                     on:input=move |ev| query.set(event_target_value(&ev))
                     on:keydown=suggest.on_keydown()

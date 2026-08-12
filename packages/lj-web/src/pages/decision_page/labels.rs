@@ -1,11 +1,9 @@
 //! Libellés des codes de publication bruts (`publication_codes`) et de la
-//! portée dérivée (groupes au rang le plus fort — facette depuis l'ADR 0167,
-//! qui supersède le « affichage seulement » de l'ADR 0146 §2). Les autres
-//! libellés métier (solution, voie, office, domaine, juridictions) arrivent
-//! résolus par l'API en `FacetTag` (ADR 0146).
+//! portée dérivée (groupes au rang le plus fort). Les autres libellés métier
+//! (solution, voie, office, domaine, juridictions) arrivent résolus par l'API
+//! en `FacetTag`.
 
-/// Table `code → libellé` des publications. Port de `PUBLICATION_LABELS`
-/// (= `publication.py` / `labels_by_code`).
+/// Table `code → libellé` des publications.
 const PUBLICATION_LABELS: &[(&str, &str)] = &[
     ("b", "Publié au bulletin"),
     ("r", "Publié au rapport"),
@@ -29,7 +27,7 @@ fn publication_code_label(code: &str) -> Option<&'static str> {
 }
 
 /// Libellé joint depuis les codes (« Publié au bulletin · Rapport »), dédupliqué,
-/// ordre préservé, codes inconnus ignorés. Port de `publicationLabel`. `None` si
+/// ordre préservé, codes inconnus ignorés. `None` si
 /// vide / aucun code connu.
 pub fn publication_label(codes: &[String]) -> Option<String> {
     if codes.is_empty() {
@@ -50,9 +48,9 @@ pub fn publication_label(codes: &[String]) -> Option<String> {
     }
 }
 
-/// Libellé des seules publications notables (exclut les « Inédit… »). Port de
-/// `publicationBadge` : filtre les codes dont le label commence par `"Inédit"`,
-/// puis applique `publication_label`.
+/// Libellé des seules publications notables (exclut les « Inédit… ») : filtre
+/// les codes dont le label commence par `"Inédit"`, puis applique
+/// `publication_label`.
 pub fn publication_badge(codes: &[String]) -> Option<String> {
     let notable: Vec<String> = codes
         .iter()
@@ -67,8 +65,7 @@ pub fn publication_badge(codes: &[String]) -> Option<String> {
 }
 
 /// Groupes de portée, du rang le plus fort au plus faible — miroir de
-/// `significance_codes` de lj-core (ADR 0167), même servitude de duplication que
-/// `PUBLICATION_LABELS` (lj-web ne dépend pas de lj-core).
+/// `significance_codes` de lj-core, que lj-web ne peut pas importer.
 const PORTEE_GROUPS: &[(&str, &[&str])] = &[
     ("Majeure", &["r", "A"]),
     ("Importante", &["b", "l", "c", "B", "C+", "R"]),
@@ -86,9 +83,8 @@ pub fn significance_label(codes: &[String]) -> Option<&'static str> {
     })
 }
 
-/// Badge de portée des cartes résultat : majeure/importante seulement (la
-/// portée limitée, 85 % du corpus classé, serait du bruit) — remplace l'ancien
-/// badge publication brut, dont il est la lecture normalisée inter-ordres.
+/// Badge de portée des cartes résultat : majeure/importante seulement, la
+/// portée limitée serait du bruit.
 pub fn significance_badge(codes: &[String]) -> Option<String> {
     significance_label(codes)
         .filter(|l| *l != "Limitée")

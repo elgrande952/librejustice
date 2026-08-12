@@ -12,37 +12,63 @@ pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
     /// Échec de validation d'une requête (paramètres query/path/corps hors
-    /// contraintes) → 422, parité avec la `RequestValidationError` de FastAPI
-    /// (Pydantic/Query). `BadRequest`/400 reste réservé au JSON malformé.
+    /// contraintes) → 422. `BadRequest`/400 reste réservé au JSON malformé.
     ///
-    /// Porte l'objet d'erreur Pydantic déjà construit (`{type, loc, msg, input,
-    /// ctx?}`) : le corps `{"detail": [<obj>]}` est byte-identique à
-    /// `jsonable_encoder(exc.errors())` après canonicalisation A/B (`jq -S`,
-    /// strip des clés nulles). Cf. [`validation`].
+    /// Porte l'objet d'erreur déjà construit (`{type, loc, msg, input, ctx?}`) ;
+    /// le corps rendu est `{"detail": [<obj>]}`. Cf. [`validation`].
     #[error("unprocessable")]
     Unprocessable(Value),
     #[error("not found")]
     NotFound,
     #[error("unauthorized")]
     Unauthorized,
-    /// Service indisponible (ex. client résumé non instancié) → 503, parité
-    /// `HTTPException(503, "summary_unavailable")`.
+    /// Service indisponible (ex. client résumé non instancié) → 503.
     #[error("unavailable: {0}")]
     Unavailable(String),
-    /// Erreur d'un service amont (ex. génération résumé Mistral) → 502, parité
-    /// `HTTPException(502, "summary_error")`.
+    /// Erreur d'un service amont (ex. génération résumé Mistral) → 502.
     #[error("bad gateway: {0}")]
     BadGateway(String),
+    /// Base momentanément saturée : checkout du pool en timeout, toutes les
+    /// connexions retenues → 503 + `Retry-After`. Les requêtes annulées par
+    /// `statement_timeout`/`lock_timeout` sont reclassées pareillement via
+    /// [`Self::is_db_busy`].
+    #[error("db busy: {0}")]
+    DbBusy(String),
+    /// Budget de coût de l'appelant épuisé ([`crate::ratelimit`]) → 429 +
+    /// `Retry-After`.
+    #[error("rate limited")]
+    TooManyRequests,
     #[error("internal: {0}")]
     Internal(String),
 }
 
+/// `Retry-After` (secondes) des 503 « base occupée ».
+const DB_BUSY_RETRY_AFTER_SECS: &str = "3600";
+
+/// `Retry-After` (secondes) des 429. Le seau se recharge en continu : une minute
+/// rend au demandeur un plein débit-minute de jetons.
+const RATE_LIMIT_RETRY_AFTER_SECS: &str = "60";
+
+impl From<deadpool_postgres::PoolError> for ApiError {
+    fn from(e: deadpool_postgres::PoolError) -> Self {
+        // Un `PoolError` ne naît que du checkout (`pool.get()`). Le timeout
+        // d'attente = saturation transitoire → 503 ; le reste (backend, pool
+        // fermé…) est une erreur serveur 500.
+        let detail = lj_store::error::pool_detail(&e);
+        match e {
+            deadpool_postgres::PoolError::Timeout(_) => {
+                ApiError::DbBusy(format!("checkout connexion: {detail}"))
+            }
+            _ => ApiError::Internal(format!("checkout connexion: {detail}")),
+        }
+    }
+}
+
 impl From<tokio_postgres::Error> for ApiError {
     fn from(e: tokio_postgres::Error) -> Self {
-        // Conserve l'erreur PG structurée (SQLSTATE) au lieu de la stringifier :
-        // la frontière HTTP ([`crate::routes::pg_error_boundary`]) la classe
-        // (class 22 → 422 invalid_request_bytes, parse ParadeDB → 422
-        // invalid_query_syntax), parité des `@app.exception_handler` de `main.py`.
+        // Conserve l'erreur PG structurée (SQLSTATE) au lieu de la stringifier : la
+        // frontière HTTP ([`crate::routes::pg_error_boundary`]) la classe (class 22 →
+        // 422 invalid_request_bytes, parse ParadeDB → 422 invalid_query_syntax).
         ApiError::Store(lj_store::error::StoreError::Postgres(e))
     }
 }
@@ -51,24 +77,23 @@ impl From<tokio_postgres::Error> for ApiError {
 /// (porté dans une extension de réponse, lue par [`crate::routes::pg_error_boundary`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgErrKind {
-    /// Syntaxe `paradedb.parse` invalide (`InternalError_` + `_PARADEDB_PARSE_ERR_RE`).
+    /// Syntaxe `paradedb.parse` invalide (message ParadeDB).
     ParseSyntax,
-    /// Donnée invalide au niveau bytes/cast (NUL `\x00`, date hors plage…), SQLSTATE
-    /// class 22 — `psycopg.DataError` côté oracle.
+    /// Donnée invalide au niveau bytes/cast (NUL `\x00`, date hors plage…),
+    /// SQLSTATE class 22.
     DataException,
 }
 
 impl ApiError {
     /// Classe une erreur PG sous-jacente pour la reclasser en 422 à la frontière
-    /// HTTP. `None` = erreur serveur opaque (reste 500). Parité avec l'ordre des
-    /// handlers `main.py` : la syntaxe `paradedb.parse` (regex sur le message)
-    /// avant la class 22 (NUL/cast).
+    /// HTTP. `None` = erreur serveur opaque (reste 500). Ordre : la syntaxe
+    /// `paradedb.parse` (regex sur le message) avant la class 22 (NUL/cast).
     pub fn pg_err_kind(&self) -> Option<PgErrKind> {
         let ApiError::Store(lj_store::error::StoreError::Postgres(e)) = self else {
             return None;
         };
-        // On lit le `DbError` structuré (message brut + SQLSTATE) plutôt que le
-        // `Display` de l'erreur, dont le formatage masque le message ParadeDB.
+        // On lit le `DbError` structuré (message brut + SQLSTATE) : le `Display` de
+        // l'erreur masque le message ParadeDB.
         let db = e.as_db_error()?;
         let msg = db.message();
         if msg.contains("could not parse query string")
@@ -81,20 +106,42 @@ impl ApiError {
         }
         None
     }
+
+    /// Vrai si l'erreur signale une base momentanément indisponible : checkout
+    /// du pool en timeout ([`ApiError::DbBusy`]) ou requête annulée par
+    /// `statement_timeout` (SQLSTATE 57014) / lock non obtenu (55P03) — le cas
+    /// d'une fenêtre de maintenance type `VACUUM FULL`. La réponse passe en
+    /// 503 + `Retry-After` au lieu d'un 500.
+    fn is_db_busy(&self) -> bool {
+        match self {
+            ApiError::DbBusy(_) => true,
+            ApiError::Store(lj_store::error::StoreError::Postgres(e)) => e
+                .as_db_error()
+                .is_some_and(|db| matches!(db.code().code(), "57014" | "55P03")),
+            _ => false,
+        }
+    }
 }
 
 impl ApiError {
     /// Code HTTP de la variante — source unique partagée par [`Self::status`] et
-    /// l'impl [`IntoResponse`], pour qu'ils ne divergent pas.
+    /// l'impl [`IntoResponse`].
     fn status_code(&self) -> StatusCode {
         match self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
-            ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::Unavailable(_) | ApiError::DbBusy(_) => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
-            ApiError::Store(_) | ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::Store(_) | ApiError::Internal(_) => {
+                if self.is_db_busy() {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
         }
     }
 
@@ -106,12 +153,11 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        // Corps JSON : `{"detail": …}`, parité FastAPI. Pour les 4xx « détail
-        // texte » (`HTTPException(detail="…")`), `detail` est la chaîne ; pour la
-        // validation 422 (`RequestValidationError`), `detail` est la liste
-        // d'objets Pydantic ; pour 5xx, on conserve la chaîne `detail` mais on
-        // log la chaîne d'erreur complète côté serveur.
+        // Corps JSON : `{"detail": …}`. Pour les 4xx « détail texte », `detail`
+        // est la chaîne ; pour la validation 422, `detail` est la liste d'objets
+        // d'erreur ; pour 5xx, la chaîne d'erreur complète est loguée côté serveur.
         let status = self.status_code();
+        let busy = self.is_db_busy();
         let detail: Value = match &self {
             ApiError::BadRequest(msg) => json!(msg),
             ApiError::Unprocessable(obj) => json!([obj.clone()]),
@@ -119,13 +165,19 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => json!("auth_required"),
             ApiError::Unavailable(msg) => json!(msg),
             ApiError::BadGateway(msg) => json!(msg),
-            ApiError::Store(_) | ApiError::Internal(_) => json!("internal_error"),
+            ApiError::DbBusy(_) => json!("database_busy"),
+            ApiError::TooManyRequests => json!("rate_limited"),
+            ApiError::Store(_) | ApiError::Internal(_) => {
+                json!(if busy {
+                    "database_busy"
+                } else {
+                    "internal_error"
+                })
+            }
         };
         // Famille PG reclassable (parse syntax / data exception) : portée en
-        // extension de réponse. [`crate::routes::pg_error_boundary`] la relit pour
-        // émettre le 422 ciblé (avec le `path`/`query` de la requête, qu'on n'a pas
-        // ici). Capturé AVANT le log 5xx — une donnée invalide n'est pas une erreur
-        // serveur.
+        // extension de réponse, relue par [`crate::routes::pg_error_boundary`] qui émet
+        // le 422 ciblé avec le `path`/`query` de la requête. Capturé AVANT le log 5xx.
         let pg_kind = self.pg_err_kind();
         if pg_kind.is_none() && status.is_server_error() {
             let mut chain = self.to_string();
@@ -134,9 +186,26 @@ impl IntoResponse for ApiError {
                 chain.push_str(&format!(" -> {e}"));
                 src = e.source();
             }
-            tracing::error!(error = %chain, "5xx");
+            // Base occupée = fenêtre de maintenance attendue, pas un bug : warn.
+            if busy {
+                tracing::warn!(error = %chain, "503 database_busy");
+            } else {
+                tracing::error!(error = %chain, "5xx");
+            }
         }
         let mut resp = (status, Json(json!({ "detail": detail }))).into_response();
+        if busy {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(DB_BUSY_RETRY_AFTER_SECS),
+            );
+        }
+        if matches!(self, ApiError::TooManyRequests) {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(RATE_LIMIT_RETRY_AFTER_SECS),
+            );
+        }
         if let Some(kind) = pg_kind {
             resp.extensions_mut().insert(kind);
         }
@@ -144,14 +213,11 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Constructeurs d'objets d'erreur Pydantic (`{type, loc, msg, input, ctx?}`)
-/// pour la parité byte-à-byte avec `RequestValidationError` de FastAPI.
+/// Constructeurs d'objets d'erreur de validation (`{type, loc, msg, input,
+/// ctx?}`) — le corps 422 de l'API.
 ///
-/// Chaque fonction reproduit la sortie de `jsonable_encoder(exc.errors())` pour
-/// un cas de validation que le port Rust détecte à la main (Pydantic valide en
-/// désérialisant, axum/serde non). `loc` porte le préfixe Pydantic
-/// (`"query"`/`"body"`), les messages et `ctx` sont copiés mot pour mot des
-/// versions installées (FastAPI 0.136 / Pydantic 2.13).
+/// Chaque fonction couvre un cas de validation détecté à la main (axum/serde ne
+/// valide pas en désérialisant). `loc` porte le préfixe `"query"`/`"body"`.
 pub mod validation {
     use serde_json::{json, Value};
 
@@ -221,11 +287,9 @@ pub mod validation {
         })
     }
 
-    /// `date_from_datetime_parsing` — chaîne date non parsable (type émis par
-    /// Pydantic en mode smart pour un champ `date` recevant une string : il tente
-    /// d'abord le parse datetime). `error` est le détail speedate (« invalid
-    /// character in year », « month value is outside expected range of 1-12 »…),
-    /// repris verbatim dans `msg` et `ctx.error`.
+    /// `date_from_datetime_parsing` — chaîne date non parsable. `error` est le
+    /// détail (« invalid character in year », « month value is outside expected
+    /// range of 1-12 »…), repris verbatim dans `msg` et `ctx.error`.
     pub fn date_parsing(loc: &[&str], input: &str, error: &str) -> Value {
         json!({
             "type": "date_from_datetime_parsing",
@@ -259,8 +323,8 @@ pub mod validation {
         })
     }
 
-    /// `enum` — valeur hors des variantes d'un `StrEnum`. `expected` est la
-    /// liste Pydantic : `'a', 'b' or 'c'` (virgules + `or` final, sans Oxford).
+    /// `enum` — valeur hors des variantes. `expected` est la liste `'a', 'b' or
+    /// 'c'` (virgules + `or` final, sans Oxford).
     pub fn enum_error(loc: &[&str], input: &str, variants: &[&str]) -> Value {
         let expected = expected_list(variants);
         json!({
@@ -312,8 +376,8 @@ pub mod validation {
         })
     }
 
-    /// Joint les variantes au format Pydantic : `'a'`, `'a' or 'b'`,
-    /// `'a', 'b' or 'c'` (virgule entre tous sauf le dernier, lié par ` or `).
+    /// Joint les variantes : `'a'`, `'a' or 'b'`, `'a', 'b' or 'c'` (virgule
+    /// entre tous sauf le dernier, lié par ` or `).
     fn expected_list(variants: &[&str]) -> String {
         let quoted: Vec<String> = variants.iter().map(|v| format!("'{v}'")).collect();
         match quoted.split_last() {
@@ -329,13 +393,31 @@ pub type Result<T> = std::result::Result<T, ApiError>;
 #[cfg(test)]
 mod tests {
     use super::validation::*;
+    use super::ApiError;
+    use axum::response::IntoResponse;
     use serde_json::{json, Value};
 
-    // Chaque attendu est copié de la sortie réelle de FastAPI 0.136 / Pydantic
-    // 2.13 (`jsonable_encoder(exc.errors())`) pour figer la parité byte-à-byte.
+    #[test]
+    fn pool_wait_timeout_maps_to_503_with_retry_after() {
+        let err: ApiError =
+            deadpool_postgres::PoolError::Timeout(deadpool_postgres::TimeoutType::Wait).into();
+        assert_eq!(err.status(), 503);
+        let resp = err.into_response();
+        assert_eq!(resp.status(), 503);
+        assert_eq!(
+            resp.headers().get(axum::http::header::RETRY_AFTER).unwrap(),
+            "3600"
+        );
+    }
 
     #[test]
-    fn int_parsing_matches_pydantic() {
+    fn pool_closed_stays_500() {
+        let err: ApiError = deadpool_postgres::PoolError::Closed.into();
+        assert_eq!(err.status(), 500);
+    }
+
+    #[test]
+    fn int_parsing_error_shape() {
         assert_eq!(
             int_parsing(&["query", "limit"], "abc"),
             json!({
@@ -348,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_matches_pydantic() {
+    fn missing_error_shape() {
         assert_eq!(
             missing(&["query", "code_challenge"]),
             json!({
@@ -389,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn bound_errors_match_pydantic() {
+    fn bound_errors_shape() {
         assert_eq!(
             greater_than_equal(&["query", "limit"], "0", 1),
             json!({
@@ -413,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn enum_error_matches_pydantic() {
+    fn enum_error_shape() {
         assert_eq!(
             enum_error(
                 &["query", "mode"],
@@ -428,7 +510,6 @@ mod tests {
                 "ctx": { "expected": "'auto', 'lexical' or 'semantic'" }
             })
         );
-        // Variante à deux items : `'a' or 'b'` (pas de virgule).
         assert_eq!(
             enum_error(&["query", "m"], "z", &["lexical", "hybrid"]),
             json!({
@@ -442,9 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn date_errors_match_pydantic() {
-        // Sorties figées depuis Pydantic 2.13 sur le champ `date` du schéma
-        // `SearchRequest` (type smart-mode `date_from_datetime_parsing`).
+    fn date_errors_shape() {
         assert_eq!(
             date_parsing(
                 &["query", "dateFrom"],
@@ -482,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn list_length_errors_match_pydantic() {
+    fn list_length_errors_shape() {
         assert_eq!(
             too_short(&["body", "redirect_uris"], json!([]), "List", 1),
             json!({

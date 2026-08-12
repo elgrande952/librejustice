@@ -1,19 +1,16 @@
-//! Chunker mathématique avec DP sur DAG (port de `chunking/chunker.py`).
+//! Chunker mathématique avec DP sur DAG.
 //!
 //! Deux entrées : [`chunk_char`] (mode caractères, chemin nominal rapide) et
 //! [`chunk_bpe`] (mode BPE exact via tokenizer HF, repli déclenché sur overflow
 //! de l'embedder). La DP layer-par-layer et l'assemblage sont communs
 //! ([`solve_and_assemble`]) ; seule la préparation des candidats diffère.
-//! Cf. `docs/working-notes/chunking_dag.md`.
 //!
-//! Parité octet : tout est indexé en **unités char** (positions de string Python),
-//! jamais en octets. Les offsets BPE sont récupérés via `encode_char_offsets`
-//! (le binding Python `Tokenizer.encode` renvoie des offsets char).
+//! Tout est indexé en **unités char**, jamais en octets. Les offsets BPE sont
+//! récupérés via `encode_char_offsets`.
 //!
 //! Vit dans `lj-ingest` (seul consommateur) : le mode BPE charge le tokenizer
 //! Qwen3 (~11 Mo, `include_bytes!`), une I/O qui n'a pas sa place dans `lj-core`
-//! pur. Le calibrage chars↔tokens partagé reste, lui, dans `lj_core::tokens`
-//! (ADR 0081).
+//! pur. Le calibrage chars↔tokens partagé reste, lui, dans `lj_core::tokens`.
 
 use anyhow::{anyhow, Result};
 use lj_core::tokens::{CHARS_PER_TOKEN_MEDIAN, CHARS_PER_TOKEN_SAFE};
@@ -23,10 +20,10 @@ pub const DEFAULT_CHUNK_TOKENS: usize = 8192;
 pub const DEFAULT_OVERLAP_MIN: usize = 125;
 pub const DEFAULT_OVERLAP_MAX: usize = 250;
 
-/// Version de génération chunk + embed (ADR 0085), miroir d'`EXTRACT_VERSION`
-/// (ADR 0083). Persistée dans `decisions.embed_version` quand des embeddings
-/// sont écrits ; un futur `reembed` ne retouche que les décisions dont la
-/// version diffère. À incrémenter à tout changement du chunker ou du modèle.
+/// Version de génération chunk + embed, miroir d'`EXTRACT_VERSION`. Persistée
+/// dans `decisions.embed_version` quand des embeddings sont écrits ; un futur
+/// `reembed` ne retouche que les décisions dont la version diffère. À
+/// incrémenter à tout changement du chunker ou du modèle.
 pub const EMBED_VERSION: i16 = 1;
 
 /// Séparateur visuel inséré entre `visa_trim` et `ctx` dans `E_i` (i ≥ 1).
@@ -116,7 +113,7 @@ impl Chunk {
 
 /// Char-mode : positions juste après chaque séparateur, plus 0 et len(text).
 ///
-/// `chars` est `text` décomposé en chars (positions = indices Python).
+/// `chars` est `text` décomposé en chars (positions = indices de char).
 fn build_candidates_chars(
     chars: &[char],
     sep_penalties: &[(String, f64)],
@@ -132,8 +129,6 @@ fn build_candidates_chars(
         if sep_len == 0 {
             continue;
         }
-        // Reproduit `text.find(sep, start)` avec start avançant de 1 à chaque hit
-        // (boucle Python : start = i + 1).
         let mut start = 0usize;
         loop {
             let i = find_char(chars, &sep_chars, start);
@@ -192,8 +187,8 @@ fn build_candidates_bpe(
 
     for t in 0..n_tok.saturating_sub(1) {
         // Le post-processor Qwen ajoute `<|endoftext|>` en fin (offset (0,0)) →
-        // `char_starts` n'est pas monotone sur ce token. Python slice `text[a:b]`
-        // renvoie `""` quand `a >= b` ; on réplique (span vide, aucun candidat).
+        // `char_starts` n'est pas monotone sur ce token : `a >= b` ⇒ span vide,
+        // aucun candidat.
         let (a, b) = (char_starts[t], char_starts[t + 1]);
         let span: &[char] = if a < b { &chars[a..b] } else { &[] };
         for (sep, rho) in sep_penalties {
@@ -376,15 +371,13 @@ fn dp_for_n(
                     if e > k as i64 {
                         edge = inf;
                     }
-                    // argmin : premier minimum strict (np.argmin renvoie le 1er min).
+                    // argmin : premier minimum strict.
                     if edge < best_edge {
                         best_edge = edge;
                         best_c_idx = Some(jc);
                     }
                 }
-                // np.argmin sur une ligne tout-INF renvoie 0 ; mais edge_grid[E>K]=INF
-                // puis best_edge ajouté à f_i : reste INF, improved=False. On reproduit
-                // en ne mettant à jour que si fini.
+                // Ligne tout-INF : on ne met à jour que si le coût est fini.
                 let (best_edge, best_c_jc) = match best_c_idx {
                     Some(jc) => (best_edge, jc),
                     None => (inf, jc_lo),
@@ -546,7 +539,7 @@ pub fn chunk_bpe(
     let chars: Vec<char> = text.chars().collect();
     let char_len = chars.len();
 
-    // Le binding Python `encode` => offsets char + add_special_tokens=True.
+    // `encode_char_offsets` => offsets char + add_special_tokens=True.
     let encoding = tokenizer
         .encode_char_offsets(text, true)
         .map_err(|e| anyhow!("tokenizer encode: {e}"))?;
@@ -711,7 +704,6 @@ mod tests {
 
     #[test]
     fn short_text_single_chunk_char_mode() {
-        // T tout petit << K = 8192*3.20 → un seul chunk, body == text intégral.
         let text = "Le tribunal administratif rejette la requête.\n\nFin.";
         let out = chunk_char(text, "", "", DEFAULT_CHUNK_TOKENS, 125, 250, None).unwrap();
         assert_eq!(out.len(), 1);
@@ -765,7 +757,6 @@ mod tests {
             metadata_header: "HDR".to_string(),
             visa_trim: "VISA".to_string(),
         };
-        // HDR + "\n\n" + VISA + marker + CTX + BODY
         let expected = format!("HDR\n\nVISA{TRUNCATION_MARKER}CTXBODY");
         assert_eq!(c.embedding_text(), expected);
     }
@@ -788,20 +779,16 @@ mod tests {
 
     #[test]
     fn candidates_chars_marks_after_each_separator() {
-        // "a\n\nbb. c" (8 codepoints) → séparateurs : "\n\n", ". ", ".", "\n"
         let chars: Vec<char> = "a\n\nbb. c".chars().collect();
-        let n = chars.len(); // 8
+        let n = chars.len();
         let pen: Vec<(String, f64)> = DEFAULT_SEP_PENALTIES
             .iter()
             .map(|(s, p)| (s.to_string(), *p))
             .collect();
         let (pos, rho) = build_candidates_chars(&chars, &pen);
-        // 0 et n toujours présents.
         assert_eq!(pos[0], 0);
         assert_eq!(*pos.last().unwrap(), n);
-        // toutes les positions entre 0 et n.
         assert!(pos.iter().all(|&p| p <= n));
-        // rho aligné.
         assert_eq!(pos.len(), rho.len());
     }
 
@@ -817,24 +804,17 @@ mod tests {
 
     #[test]
     fn n_min_trivial_and_general() {
-        // K - pi_0 >= T → 1
         assert_eq!(n_min(100, 1000, 10, 5, 5), 1);
-        // général : T=1000, K=300, pi_0=10, pi=20, o_min=30
-        // denom = 300-20-30 = 250 ; numer = 1000 - (300-10) = 710
-        // ceil(710/250)+1 = 3+1 = 4
         assert_eq!(n_min(1000, 300, 10, 20, 30), 4);
     }
 
     #[test]
     fn multi_chunk_char_mode_covers_full_text_without_gaps() {
-        // Texte long forçant plusieurs chunks avec un petit budget.
         let mut text = String::new();
         for i in 0..400 {
             text.push_str(&format!("Phrase numero {i} du corps de la decision.\n\n"));
         }
-        // budget volontairement petit : chunk_tokens tel que K ~ petit.
-        // K = chunk_tokens * 3.20 ; on veut K << len(text).
-        let chunk_tokens = 200; // K = 640
+        let chunk_tokens = 200;
         let out = chunk_char(
             &text,
             "",
@@ -851,58 +831,46 @@ mod tests {
             out.len()
         );
         let total_chars = text.chars().count();
-        // Premier body commence à 0, dernier finit à T.
         assert_eq!(out[0].char_start, 0);
         assert_eq!(out.last().unwrap().char_end, total_chars);
-        // Les bodies sont contigus (own_i = x[q_i:q_{i+1}], couverture sans trou).
         for w in out.windows(2) {
             assert_eq!(w[0].char_end, w[1].char_start);
         }
-        // chunk_index monotone.
         for (i, c) in out.iter().enumerate() {
             assert_eq!(c.chunk_index, i);
         }
-        // Chaque body est bien le slice char correspondant.
         let chars: Vec<char> = text.chars().collect();
         for c in &out {
             let slice: String = chars[c.char_start..c.char_end].iter().collect();
             assert_eq!(c.body, slice);
         }
-        // ctx présent pour i >= 1 (overlap gauche), absent pour i == 0.
         assert_eq!(out[0].ctx, "");
         assert!(!out[1].ctx.is_empty());
     }
 
     #[test]
     fn candidates_bpe_tolerates_non_monotonic_char_starts() {
-        // Le post-processor Qwen ajoute `<|endoftext|>` en fin, d'offset (0,0) :
-        // `char_starts` n'est donc pas monotone (un 0 après le dernier token réel).
-        // Le span de ce token doit être traité comme vide (slicing Python `a:b`,
-        // a >= b → ""), sans paniquer. Régression du mode BPE.
-        let chars: Vec<char> = "a\n\nbb".chars().collect(); // 5 chars
+        let chars: Vec<char> = "a\n\nbb".chars().collect();
         let pen: Vec<(String, f64)> = DEFAULT_SEP_PENALTIES
             .iter()
             .map(|(s, p)| (s.to_string(), *p))
             .collect();
-        // 4 tokens : [a][\n\n][bb][EOS], EOS d'offset 0 → starts non monotone.
-        // char_starts a n_tok+1 entrées (offsets + len poussée).
         let n_tok = 4;
         let char_starts = vec![0usize, 1, 3, 0, 5];
         let (pos, rho) = build_candidates_bpe(&chars, n_tok, &char_starts, &pen);
-        // Pas de panic ; 0 et n_tok toujours présents, alignés.
         assert_eq!(pos[0], 0);
         assert_eq!(*pos.last().unwrap(), n_tok);
         assert_eq!(pos.len(), rho.len());
     }
 
-    // Golden char-mode gelé (ex-`lj-core/tests/chunking_regression.rs`).
+    // Golden char-mode gelé.
     //
     // La DP de découpe (`chunk_char`) est de la logique profonde où une dérive de
     // frontière est invisible à l'œil. On fige sa sortie char-mode sur une entrée
     // déterministe (séparateurs variés, accents → offsets en codepoints, header +
     // visa → préfixe non trivial) : index, `char_start`/`char_end`/`ctx_start`
-    // (codepoints), `body`, `ctx`. Golden non éditable à la main ; régénérer
-    // depuis `chunk_char` si le comportement change volontairement.
+    // (codepoints), `body`, `ctx`. Golden non éditable à la main ; régénérer depuis
+    // `chunk_char` si le comportement change volontairement.
     #[derive(Deserialize)]
     struct Fixture {
         input: GoldenInput,

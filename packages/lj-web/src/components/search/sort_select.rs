@@ -1,4 +1,4 @@
-//! `SortSelect` (port de `sort-select.tsx`). Tri des résultats via `DropdownSelect`.
+//! `SortSelect` : tri des résultats via `DropdownSelect`.
 
 use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_query_map};

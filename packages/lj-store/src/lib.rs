@@ -1,9 +1,7 @@
-//! `lj-store` — accès Postgres (port de `packages/py/librejustice-store`).
+//! `lj-store` — accès Postgres.
 //!
-//! Driver : tokio-postgres + deadpool-postgres (PAS sqlx). pgvector via crate
-//! `pgvector` (feature postgres). Pas de SQL dispersé (règle #2) : toute
-//! écriture passe par [`repository::DecisionRepository`]. Le runner de
-//! migrations embarque les 45 `.sql` sous `migrations/` (inchangées).
+//! Driver : tokio-postgres + deadpool-postgres. Toute écriture passe par
+//! [`repository::DecisionRepository`].
 
 pub mod db;
 pub mod error;

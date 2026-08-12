@@ -1,8 +1,7 @@
-//! Briques partagées des filtres décisions (extraites de l'ex-`filter_rail.rs`,
-//! rail vertical remplacé par la barre horizontale gabarit de référence) :
-//! navigation (`Nav`), clés de filtre, arbre 2 niveaux, lignes checkbox
-//! (`CheckboxOption`, `TreeRow`), recherche intra-facette, checklist plate
-//! plafonnée (`FacetChecklist`) et anti scroll-chaining (`scroll_lock_ref`).
+//! Briques partagées des filtres décisions : navigation (`Nav`), clés de filtre,
+//! arbre 2 niveaux, lignes checkbox (`CheckboxOption`, `TreeRow`), recherche
+//! intra-facette, checklist plate plafonnée (`FacetChecklist`) et anti
+//! scroll-chaining (`scroll_lock_ref`).
 //!
 //! Les options viennent des facettes servies (`FacetChoice` : valeur + libellé +
 //! `parent`) — aucune table de libellés compilée. Une valeur sélectionnée absente
@@ -50,7 +49,7 @@ pub fn scroll_lock_ref() -> NodeRef<leptos::html::Div> {
     node_ref
 }
 
-/// Clés de filtre décisions (parité `FILTER_KEYS`).
+/// Clés de filtre décisions.
 pub fn filter_keys() -> Vec<&'static str> {
     vec![
         "jurisdictionType",
@@ -68,9 +67,9 @@ pub fn filter_keys() -> Vec<&'static str> {
     ]
 }
 
-/// Regroupe une facette plate en arbre 2 niveaux : racines (`parent = None`)
-/// puis enfants rattachés par `parent` == `value` racine (contrat ADR 0146 :
-/// le `parent` d'un enfant reprend la `value` de sa racine verbatim).
+/// Regroupe une facette plate en arbre 2 niveaux : racines (`parent = None`) puis
+/// enfants rattachés par `parent` == `value` racine — le `parent` d'un enfant
+/// reprend la `value` de sa racine verbatim.
 pub fn build_tree(choices: &[FacetChoice]) -> Vec<(FacetChoice, Vec<FacetChoice>)> {
     let mut roots: Vec<(FacetChoice, Vec<FacetChoice>)> = choices
         .iter()
@@ -94,11 +93,9 @@ type NavFn = Box<dyn Fn(&str, NavigateOptions) + Send + Sync>;
 ///
 /// `navigate` (Send+Sync) est stocké en `StoredValue` (SyncStorage) : le handle
 /// est Copy, donc `Nav` est Copy et peut être capturé par les `Callback::new`
-/// (qui exigent Send+Sync) des sous-composants. NB : `new_local` (LocalStorage)
+/// (qui exigent Send+Sync) des sous-composants. `new_local` (LocalStorage)
 /// attacherait la valeur à l'owner courant, introuvable depuis le contexte
-/// détaché d'un `Callback` → `with_value` no-op silencieux (la nav ne partait
-/// pas : filtres, dates et pagination restaient sans effet). SyncStorage rend la
-/// valeur lisible partout.
+/// détaché d'un `Callback` ; SyncStorage la rend lisible partout.
 #[derive(Clone, Copy)]
 pub struct Nav {
     navigate: StoredValue<NavFn>,
@@ -119,9 +116,8 @@ impl Nav {
                 NavigateOptions {
                     replace: true,
                     // `scroll` défaut `true` : le router remonterait en haut à
-                    // chaque mutation de facette. Les filtres affinent la
-                    // recherche courante (replace=true), ils ne naviguent pas —
-                    // on conserve la position de scroll.
+                    // chaque mutation de facette. Les filtres affinent la recherche
+                    // courante (replace=true), ils ne naviguent pas.
                     scroll: false,
                     ..Default::default()
                 },
@@ -145,7 +141,7 @@ pub fn CheckboxOption(
     // passent un `String` (converti via `into`).
     #[prop(into)] label: Signal<String>,
     // `count` réactif : sur arrivée des facettes (nouvelle recherche) les compteurs
-    // changent en place sans reconstruire la ligne — parité React (re-render keyé).
+    // changent en place sans reconstruire la ligne.
     #[prop(into)] count: Signal<i64>,
     #[prop(into)] selected: Signal<bool>,
     #[prop(into)] on_toggle: Callback<()>,
@@ -402,8 +398,8 @@ pub fn TreeRow(
 
 /// Liste plate à cocher pilotée par les facettes servies (Publication,
 /// Dispositif — sections du modal « Plus de filtres »). Lignes = sélection
-/// orpheline (libellé = valeur brute, compteur 0) ∪ facette. Plafonnée à 6
-/// lignes + « Voir plus » (gabarit de référence A5).
+/// orpheline (libellé = valeur brute, compteur 0) ∪ facette. Plafonnée à 6 lignes
+/// + « Voir plus ».
 #[component]
 pub fn FacetChecklist(
     #[prop(into)] choices: Signal<Vec<FacetChoice>>,

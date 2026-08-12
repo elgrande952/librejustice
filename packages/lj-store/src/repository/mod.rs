@@ -1,15 +1,16 @@
 //! Repository de décisions chunk-aware (Postgres + pgvector).
-//! Port de `repository.py`. Aucun SQL ailleurs (règle #2).
+//! Aucun SQL ailleurs.
 //!
 //! Méthodes clés : [`DecisionRepository::upsert`] (INSERT/UPDATE métadonnées),
 //! `replace_chunks` (DELETE + bulk INSERT chunks), `replace_citations`
-//! (`legal_citation` à plat, module `citations`), `replace_source_payload`,
-//! `delete`. Le pipeline appelle ces méthodes dans une transaction unique.
+//! (`legal_citation` à plat, module `citations`), `delete`. Le pipeline appelle
+//! ces méthodes dans une transaction unique.
 //!
 //! Découpé par domaine en sous-modules (blocs `impl DecisionRepository`
 //! répartis) ; ce `mod.rs` détient le struct, le constructeur et les
 //! réexports publics.
 
+mod annonces;
 mod bench;
 mod cases;
 mod chunks;
@@ -17,6 +18,7 @@ mod citations;
 mod decisions;
 mod entities;
 mod identity;
+mod instrument_move;
 mod jurisdiction_hubs;
 mod legal_links;
 mod legal_toc;
@@ -26,6 +28,7 @@ mod norm_hubs;
 mod parties;
 mod referential;
 mod rekey;
+mod scopes;
 mod suggest;
 mod support;
 mod types;
@@ -33,12 +36,22 @@ mod usage_terms;
 
 use crate::db::Connection;
 
-pub use bench::ManualFields;
+pub use annonces::{
+    AnnonceAEnrichir, AnnonceAJumeler, AnnonceAxe, AnnonceCanalOuvert, AnnonceCanalRow,
+    AnnonceChamps, AnnonceEntiteRow, AnnonceFiltre, AnnonceOrdre, AnnonceOrpheline, AnnonceRow,
+    AnnonceSourceWriteItem, AnnonceWriteItem, AnnonceWriteStats, DetailPose, EntityAnnonceRow,
+    ResultatPose, TableSize,
+};
+pub use bench::{ManualFields, ManualUpsert};
 pub use cases::CaseCitationWriteItem;
 pub use citations::CitationWriteItem;
-pub use entities::{EntityHistoryWriteItem, EntityWriteItem};
+pub use entities::{
+    AffiliationEdge, CnbEntityState, CnbEntityUpdate, EntityHistoryWriteItem, EntityWriteItem,
+};
+pub use instrument_move::TextRenameCounts;
 pub use links::DecisionLinkWriteItem;
 pub use parties::DecisionPartyWriteItem;
+pub use scopes::{ArticleScopeRow, CompteurArticleRow};
 pub use suggest::SUGGEST_FST_KEY;
 pub use support::source_from_source_uid;
 pub use types::{
@@ -57,8 +70,8 @@ pub use types::{
 
 pub use support::REEXTRACTABLE_FIELDS;
 
-/// Accès CRUD typé aux tables chunk-aware (cf. ADR 0014). Détient une connexion
-/// checkout du pool ; le pipeline wrappe ses appels dans une transaction.
+/// Accès CRUD typé aux tables chunk-aware. Détient une connexion checkout du
+/// pool ; le pipeline wrappe ses appels dans une transaction.
 pub struct DecisionRepository<'a> {
     pub conn: &'a Connection,
 }

@@ -1,4 +1,4 @@
--- ADR 0202 : réparations du référentiel juridiction après le rename 0137.
+-- Réparations du référentiel juridiction après le rename 0137.
 --
 -- 1. Fusion des lignes fantômes nées de noms de greffe corrompus — l'extraction
 --    les refuse désormais (apostrophe perdue TA réécrite, nomenclature CAA

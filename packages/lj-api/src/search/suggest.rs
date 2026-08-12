@@ -1,6 +1,6 @@
-//! Probe du FST d'autocomplétion (ADR 0216) : vocabulaire n-grammes 1-5
-//! partagé jurisprudence/textes (valeur `u64 = df_juris << 32 | df_textes`),
-//! sondé par préfixe du contexte le plus long au plus court.
+//! Probe du FST d'autocomplétion : vocabulaire n-grammes 1-5 partagé
+//! jurisprudence/textes (valeur `u64 = df_juris << 32 | df_textes`), sondé par
+//! préfixe du contexte le plus long au plus court.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -51,18 +51,14 @@ pub async fn suggest(state: &AppState, q: &str, mode: &str) -> Result<lj_dtos::S
     })
 }
 
-/// FST d'autocomplétion, chargé du blob `suggest_index` au premier appel
-/// (cache mono-entrée, TTL 24 h). Blob absent = index vide + warn : état
-/// documenté d'avant premier `build-suggest` (ADR 0216), jamais une 500.
+/// FST d'autocomplétion, chargé du blob `suggest_index` au premier appel (cache
+/// mono-entrée, TTL 24 h). Blob absent = index vide + warn : état d'avant
+/// premier `build-suggest`, jamais une 500.
 async fn suggest_index(state: &AppState) -> Result<Arc<SuggestIndex>> {
     state
         .suggest_cache
         .try_get_with((), async {
-            let conn = state
-                .pool
-                .get()
-                .await
-                .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+            let conn = state.pool.get().await?;
             let repo = DecisionRepository::new(&conn);
             match repo
                 .fetch_suggest_fst(lj_store::repository::SUGGEST_FST_KEY)
@@ -99,16 +95,14 @@ impl SuggestDomain {
 }
 
 /// Garde-fou d'énumération : un préfixe de 2 chars balaye un gros sous-arbre ;
-/// au-delà de ce budget le top-k courant suffit (le vocabulaire est ≤ 3 M clés,
-/// l'énumération complète reste en ms — c'est une borne franche, pas un tuning).
+/// au-delà de ce budget le top-k courant suffit.
 const SCAN_CAP: usize = 500_000;
 
-/// Sur-échantillonnage du top-k avant dédup : un candidat dont une extension
-/// du pool porte au moins la moitié du df est redondant (« code de
-/// procédure » quand « code de procédure civile » domine) — l'extension, plus
-/// informative, prend sa place (biais Google vers les complétions longues).
-/// Un candidat aux extensions toutes faibles reste (« bail » face à un
-/// « bail commercial statut » marginal).
+/// Sur-échantillonnage du top-k avant dédup : un candidat dont une extension du
+/// pool porte au moins la moitié du df est redondant (« code de procédure »
+/// quand « code de procédure civile » domine) — l'extension, plus informative,
+/// prend sa place. Un candidat aux extensions toutes faibles reste (« bail »
+/// face à un « bail commercial statut » marginal).
 const DEDUP_POOL: usize = 4;
 
 /// FST d'autocomplétion chargé en mémoire (blob `suggest_index`).
@@ -148,9 +142,9 @@ impl SuggestIndex {
             _ => (&toks[..], ""),
         };
 
-        // Contexte sondé jusqu'à MAX_KEY_TOKENS-1 mots : au-delà des trigrammes,
-        // seuls les titres injectés entiers peuvent matcher — un palier raté
-        // coûte O(len(préfixe)), les paliers longs sont gratuits.
+        // Contexte sondé jusqu'à MAX_KEY_TOKENS-1 mots : au-delà des trigrammes, seuls
+        // les titres injectés entiers peuvent matcher — un palier raté coûte
+        // O(len(préfixe)).
         for ctx in (0..=completed.len().min(MAX_KEY_TOKENS - 1)).rev() {
             let context = &completed[completed.len() - ctx..];
             if context.is_empty() && partial.is_empty() {
@@ -197,11 +191,10 @@ impl SuggestIndex {
         let mut pool: Vec<(u32, Vec<u8>)> = heap.into_iter().map(|Reverse(e)| e).collect();
         pool.sort_unstable_by_key(|(df, _)| Reverse(*df));
         let dominated = |df: u32, folded: &[u8]| {
-            // Une référence chiffrée est une citation complète : ses
-            // extensions (« article 700 du code ») sont du remplissage,
-            // jamais un remplacement. Un token d'1-2 chiffres nus est un
-            // fragment de date (« 78-17 du 6 »), pas une référence — il ne
-            // protège pas.
+            // Une référence chiffrée est une citation complète : ses extensions
+            // (« article 700 du code ») sont du remplissage, jamais un remplacement. Un
+            // token d'1-2 chiffres nus est un fragment de date (« 78-17 du 6 »), pas une
+            // référence — il ne protège pas.
             let ends_in_ref = folded.rsplit(|b| *b == b' ').next().is_some_and(|last| {
                 last.iter().any(u8::is_ascii_digit)
                     && (last.len() >= 3 || last.iter().any(|b| !b.is_ascii_digit()))
@@ -253,7 +246,6 @@ mod tests {
 
     #[test]
     fn forme_affichee_accentuee_rendue_et_matchee_pliee() {
-        // La clé porte `folded\x00display` : on matche plié, on rend accentué.
         let idx = index(&[
             ("conges payes\u{0}congés payés", 800, 10),
             ("congestion", 100, 5),
@@ -261,7 +253,6 @@ mod tests {
         let (matched, out) = idx.suggest("congés pa", SuggestDomain::Jurisprudence, 5);
         assert_eq!(out, vec!["congés payés".to_string()]);
         assert_eq!(matched, 2);
-        // L'exclusion du préfixe exactement saisi compare la part PLIÉE.
         let (_, out) = idx.suggest("conges payes", SuggestDomain::Jurisprudence, 5);
         assert!(out.is_empty(), "{out:?}");
     }
@@ -273,11 +264,8 @@ mod tests {
             ("commerce", 900, 50),
             ("tribunal de commerce", 300, 5),
         ]);
-        // Mi-mot avec contexte : le trigramme « tribunal de commerce » sort au
-        // palier ctx=2, avant les unigrammes en "com".
         let (matched, out) = idx.suggest("tribunal de com", SuggestDomain::Jurisprudence, 5);
         assert_eq!(out, vec!["tribunal de commerce".to_string()]);
-        // Remplace « de com » ? Non : ctx=2 (« tribunal de ») + mot en cours = 3.
         assert_eq!(matched, 3);
     }
 
@@ -285,7 +273,6 @@ mod tests {
     fn repli_sur_unigramme_et_tri_par_df() {
         let idx = index(&[("commercant", 500, 10), ("commerce", 900, 50)]);
         let (matched, out) = idx.suggest("bail com", SuggestDomain::Jurisprudence, 5);
-        // « bail com » n'existe pas en bigramme → repli unigramme, df décroissant.
         assert_eq!(matched, 1);
         assert_eq!(out, vec!["commerce".to_string(), "commercant".to_string()]);
     }
@@ -302,8 +289,6 @@ mod tests {
     #[test]
     fn fin_sur_espace_complete_la_suite() {
         let idx = index(&[("tribunal de commerce", 300, 5), ("tribunal", 800, 20)]);
-        // Query close par un espace : le dernier mot est complet, on suggère la
-        // suite du contexte (et la clé égale au préfixe seul est exclue).
         let (matched, out) = idx.suggest("tribunal ", SuggestDomain::Jurisprudence, 5);
         assert_eq!(out, vec!["tribunal de commerce".to_string()]);
         assert_eq!(matched, 1);
@@ -311,8 +296,6 @@ mod tests {
 
     #[test]
     fn titre_plus_long_que_le_trigramme_matche_en_contexte() {
-        // Un titre injecté entier (4 tokens > MAX_N) doit rester atteignable
-        // en tapant son début : le contexte sondé dépasse les trigrammes.
         let idx = index(&[("code de la route", 0, 12_000), ("route", 0, 900)]);
         let (matched, out) = idx.suggest("code de la ro", SuggestDomain::Textes, 5);
         assert_eq!(out, vec!["code de la route".to_string()]);
@@ -321,9 +304,6 @@ mod tests {
 
     #[test]
     fn prefixe_domine_par_son_extension_deduplique() {
-        // « code » et « code de procedure » sont dominés par une extension
-        // (df ≥ la moitié du leur) : l'extension, plus informative, les
-        // remplace. « code civil », sans extension, reste.
         let idx = index(&[
             ("code", 300, 0),
             ("code civil", 150, 0),
@@ -342,8 +322,6 @@ mod tests {
 
     #[test]
     fn reference_chiffree_jamais_evincee_par_ses_extensions() {
-        // « article 700 » est une citation complète : son extension dominante
-        // ne l'évince pas — les deux sortent, par df décroissant.
         let idx = index(&[("article 700", 300, 0), ("article 700 du code", 250, 0)]);
         let (_, out) = idx.suggest("article 70", SuggestDomain::Jurisprudence, 5);
         assert_eq!(
@@ -354,8 +332,6 @@ mod tests {
 
     #[test]
     fn fragment_de_date_non_protege() {
-        // « loi du 29 » finit par 2 chiffres nus : fragment de date, dominé
-        // par la citation complète comme n'importe quel préfixe.
         let idx = index(&[("loi du 29", 100, 0), ("loi du 29 juillet 1881", 90, 0)]);
         let (_, out) = idx.suggest("loi du 2", SuggestDomain::Jurisprudence, 5);
         assert_eq!(out, vec!["loi du 29 juillet 1881".to_string()]);
@@ -363,7 +339,6 @@ mod tests {
 
     #[test]
     fn prefixe_aux_extensions_faibles_conserve() {
-        // L'extension marginale (df < la moitié) ne chasse pas son préfixe.
         let idx = index(&[("bail", 500, 0), ("bail commercial statut", 100, 0)]);
         let (_, out) = idx.suggest("ba", SuggestDomain::Jurisprudence, 5);
         assert_eq!(

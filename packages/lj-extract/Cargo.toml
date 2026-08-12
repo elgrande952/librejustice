@@ -4,10 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
-# Étage INGEST (ADR 0123) : recognizer de citations, normaliseurs, parsers de
+# Étage d'ingest : recognizer de citations, normaliseurs, parsers de
 # sources Légifrance/JORF/KALI, identité. PUR (aucune I/O, aucun client réseau) —
 # mais lourd (DFA de citation, parsers XML). Tiré uniquement par lj-ingest et
-# lj-bench, JAMAIS par lj-server/lj-api/lj-web (cf. ADR 0123 : sort du chemin serve).
+# lj-bench, jamais par lj-server/lj-api/lj-web : il sort du chemin de service.
 # Données embarquées (legifrance_codes.json, instrument_aliases.json, registres
 # garble) via include_str! sous packages/lj-extract/data/.
 [dependencies]

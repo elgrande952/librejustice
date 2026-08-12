@@ -1,4 +1,4 @@
--- ADR 0245 — entités mono-table : dénominations en jsonb sur entity, folded
+-- Entités mono-table : dénominations en jsonb sur entity, folded
 -- nulle part en heap (index d'expression seulement). lj_fold est la
 -- transcription SQL de canon() (lj-core fold_stable + collapse d'espaces) ;
 -- sa conformité est vérifiée ci-dessous sur TOUTES les paires
@@ -31,7 +31,7 @@ SELECT coalesce(array_agg(public.lj_fold(e->>'d')), '{}')
 FROM jsonb_array_elements($1) AS e
 $fn$;
 
--- Garde de conformité (règle #12 : violation d'hypothèse = erreur franche) :
+-- Garde de conformité (violation d'hypothèse = erreur franche) :
 -- lj_fold doit reproduire canon() byte à byte sur tout l'existant.
 DO $$
 DECLARE bad bigint;
@@ -50,7 +50,7 @@ END $$;
 
 -- Dénominations agrégées sur entity : [{d, du, au}, …], dédupliquées
 -- (l'historique SIRENE porte des périodes dupliquées — leçon « actis actis »
--- de l'ADR 0243), dates gardées dans les objets (l'ordre du tableau n'est
+-- déjà vue), dates gardées dans les objets (l'ordre du tableau n'est
 -- pas porteur).
 ALTER TABLE entity ADD COLUMN denominations jsonb;
 

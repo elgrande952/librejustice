@@ -1,11 +1,10 @@
-//! Fiche entité (ADR 0189) : identité registre + agrégats contentieux dérivés
-//! de `decision_party`, décisions citantes paginées, et encart « Parties » d'une
+//! Fiche entité : identité registre + agrégats contentieux dérivés de
+//! `decision_party`, décisions citantes paginées, et encart « Parties » d'une
 //! décision.
 //!
-//! Fonctions pures `(&AppState, …) -> Result<Dto>` (même patron que
-//! [`crate::decisions`]) ; les adaptateurs axum (path/query, headers de cache)
-//! vivent dans [`crate::routes`]. Tout le SQL vit dans `lj-store`
-//! (`repository::entities`, règle #2) ; ce module ne fait que résoudre les
+//! Fonctions pures `(&AppState, …) -> Result<Dto>` ; les adaptateurs axum
+//! (path/query, headers de cache) vivent dans [`crate::routes`]. Tout le SQL vit
+//! dans `lj-store` (`repository::entities`) ; ce module ne fait que résoudre les
 //! libellés référentiels et assembler les DTOs.
 
 use lj_dtos::{
@@ -74,11 +73,7 @@ const TOP_COUNSEL_LIMIT: i64 = 10;
 pub async fn entity_page(state: &AppState, ns: &str, id: &str) -> Result<EntityPageResponse> {
     let uid = build_uid(ns, id);
     let refs = referential(state).await?;
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
     let header = repo.entity_header(&uid).await?.ok_or(ApiError::NotFound)?;
@@ -149,7 +144,7 @@ pub async fn entity_page(state: &AppState, ns: &str, id: &str) -> Result<EntityP
 
 /// Décisions citant l'entité (`GET /entity/{ns}/{id}/decisions`), plus récentes
 /// d'abord, paginées. `page` est 1-basé. Une entité inconnue renvoie une page
-/// vide (total 0) — pas de 404 (la ressource paginée existe, elle est vide).
+/// vide (total 0), pas de 404.
 #[instrument(skip(state), fields(db.system = "postgresql", uid = %build_uid(ns, id)))]
 pub async fn entity_decisions(
     state: &AppState,
@@ -160,18 +155,14 @@ pub async fn entity_decisions(
 ) -> Result<EntityDecisionsResponse> {
     let uid = build_uid(ns, id);
     let refs = referential(state).await?;
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
     let offset = (page - 1) * page_size;
     let (total, rows) = repo.entity_decisions(&uid, page_size, offset).await?;
 
-    // Hydratation `SearchHit` par le chemin de la recherche (rendu unifié
-    // `ResultCard`) : mêmes titres/tags/snippets que les pages de résultats.
+    // Hydratation `SearchHit` par le chemin de la recherche : mêmes titres, tags et
+    // snippets que les pages de résultats.
     let ids: Vec<i64> = rows.iter().map(|r| r.decision_id).collect();
     let mut roles: HashMap<i64, (String, Option<String>)> = rows
         .into_iter()
@@ -203,11 +194,7 @@ pub async fn decision_parties(
     state: &AppState,
     public_id: &str,
 ) -> Result<DecisionPartiesResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
     let rows = repo
@@ -229,14 +216,13 @@ pub async fn decision_parties(
     Ok(DecisionPartiesResponse { parties })
 }
 
-// ── Annuaire des entités (ADR 0192) ──────────────────────────────────────────
+// ── Annuaire des entités ─────────────────────────────────────────────────────
 
 /// Nombre max de résultats de recherche d'entités (borne dure de l'endpoint).
 pub const ENTITY_SEARCH_MAX_LIMIT: i64 = 50;
 /// Longueur minimale d'une requête de recherche d'entités (codepoints).
 pub const ENTITY_SEARCH_MIN_QUERY: usize = 2;
-/// Profondeur max du listing (`page × page_size`, ADR 0239) — au-delà, 422 ;
-/// la recherche par préfixe couvre l'accès à la traîne du registre.
+/// Profondeur max du listing (`page × page_size`) — au-delà, 422.
 pub const ENTITY_DIRECTORY_MAX_DEPTH: i64 = 10_000;
 
 /// Mappe le slug de catégorie de l'API (kebab, aligné sur la route web
@@ -253,9 +239,9 @@ pub fn kind_to_category(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// Plie une requête de recherche du MÊME fold que `entity_contentieux
-/// .denomination_folded` (fold_stable + blancs réduits, cf. chargeur de
-/// registres), neutralise les wildcards LIKE et suffixe `%` : préfixe prêt pour
+/// Plie une requête de recherche du MÊME fold que
+/// `entity_contentieux.denomination_folded` (fold_stable + blancs réduits),
+/// neutralise les wildcards LIKE et suffixe `%` : préfixe prêt pour
 /// `LIKE $1 ESCAPE '\'`.
 fn fold_search_prefix(q: &str) -> String {
     let folded = lj_core::text::fold_stable(q)
@@ -273,7 +259,6 @@ fn fold_search_prefix(q: &str) -> String {
     escaped
 }
 
-/// Convertit une ligne d'annuaire en item DTO.
 fn directory_item(row: EntityDirectoryRow) -> EntityDirectoryItemDto {
     EntityDirectoryItemDto {
         uid: row.uid,
@@ -288,9 +273,9 @@ fn directory_item(row: EntityDirectoryRow) -> EntityDirectoryItemDto {
 }
 
 /// Recherche d'entités (`GET /entities/search`) : préfixe de dénomination sur
-/// le registre complet (ADR 0239), filtre `kind` optionnel (déjà mappé en
-/// catégorie), tri contentieux décroissant. `q` est déjà validé
-/// (≥ 2 codepoints), `limit` borné par la route.
+/// le registre complet, filtre `kind` optionnel (déjà mappé en catégorie), tri
+/// contentieux décroissant. `q` est déjà validé (≥ 2 codepoints), `limit` borné
+/// par la route.
 #[instrument(skip(state), fields(db.system = "postgresql"))]
 pub async fn entity_search(
     state: &AppState,
@@ -298,11 +283,7 @@ pub async fn entity_search(
     category: Option<&str>,
     limit: i64,
 ) -> Result<EntitySearchResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
     let folded_like = fold_search_prefix(q);
@@ -323,11 +304,7 @@ pub async fn entity_directory(
     page: i64,
     page_size: i64,
 ) -> Result<EntityDirectoryResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
     let offset = (page - 1) * page_size;
@@ -344,14 +321,10 @@ pub async fn entity_directory(
 }
 
 /// Compteurs de l'annuaire par catégorie (`GET /entities/stats`) : total du
-/// registre chargé + entités avec contentieux (ADR 0233).
+/// registre chargé + entités avec contentieux.
 #[instrument(skip(state), fields(db.system = "postgresql"))]
 pub async fn annuaire_stats(state: &AppState) -> Result<AnnuaireStatsResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
     let mut resp = AnnuaireStatsResponse::default();

@@ -1,4 +1,4 @@
-//! `DropdownSelect` (port de `ui/dropdown-select.tsx`). Bouton + panneau
+//! `DropdownSelect` : bouton + panneau
 //! flottant custom, fermeture au clic exterieur.
 
 use leptos::prelude::*;
@@ -9,9 +9,8 @@ use super::SelectOption;
 /// `options` la liste, `aria_label` le libelle accessible du bouton.
 ///
 /// Panneau positionne en `position: fixed` (coordonnees mesurees a l'ouverture)
-/// plutot qu'en `absolute` : il echappe ainsi a tout ancetre `overflow-hidden`
-/// (ex. l'accordeon `FilterGroup` du rail, qui rognait sinon la liste au bas du
-/// calendrier). En contrepartie un panneau fixe ne suit pas le scroll de page :
+/// plutot qu'en `absolute` : il echappe ainsi a tout ancetre `overflow-hidden`.
+/// En contrepartie un panneau fixe ne suit pas le scroll de page :
 /// on le ferme au scroll (le scroll interne du panneau, cape + `overscroll-contain`,
 /// ne remonte pas a la fenetre, donc ne le ferme pas).
 #[component]
@@ -25,13 +24,13 @@ pub fn DropdownSelect(
     let open = RwSignal::new(false);
     let container_ref = NodeRef::<leptos::html::Div>::new();
     let button_ref = NodeRef::<leptos::html::Button>::new();
-    // Coordonnees viewport du panneau `(top, right, min_width, max_height)`
+    // Coordonnees viewport du panneau `(top, right_offset, min_width, max_height)`
     // mesurees a l'ouverture. `None` au SSR / avant mesure (masque tant que ferme).
     let coords = RwSignal::new(None::<(f64, f64, f64, f64)>);
 
-    // Fermeture au clic exterieur (port du listener `mousedown` document) +
-    // fermeture au scroll (le panneau fixe se detacherait du bouton sinon).
-    // `window_event_listener` est inerte cote SSR (pas de window) — ilot client.
+    // Fermeture au clic exterieur + fermeture au scroll (le panneau fixe se
+    // detacherait du bouton sinon). `window_event_listener` est inerte cote SSR
+    // (pas de window) — ilot client.
     #[cfg(feature = "hydrate")]
     {
         use wasm_bindgen::JsCast;
@@ -72,7 +71,7 @@ pub fn DropdownSelect(
     };
 
     // Bascule l'ouverture ; a l'ouverture, mesure le bouton pour ancrer le panneau
-    // (bord droit du bouton — parite visuelle avec l'ancien `right-0`). Auto-flip :
+    // (bord droit du bouton). Auto-flip :
     // ouvre vers le bas si la place suffit, sinon vers le haut (bouton bas de rail) ;
     // la hauteur est capee a l'espace dispo (240px max) pour ne jamais sortir du
     // viewport.
@@ -87,6 +86,11 @@ pub fn DropdownSelect(
                     .ok()
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
+                let win_w = window()
+                    .inner_width()
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
                 let cap = 240.0;
                 let space_below = win_h - rect.bottom() - 8.0;
                 let space_above = rect.top() - 8.0;
@@ -98,7 +102,7 @@ pub fn DropdownSelect(
                 } else {
                     (rect.bottom() + 4.0, space_below.max(0.0).min(cap))
                 };
-                coords.set(Some((top, rect.right(), rect.width(), max_h)));
+                coords.set(Some((top, win_w - rect.right(), rect.width(), max_h)));
             }
         }
         open.set(next);
@@ -108,15 +112,21 @@ pub fn DropdownSelect(
         coords
             .get()
             .map(|(top, right, width, max_h)| {
-                // `width:max-content` : sans largeur explicite, un panneau `fixed`
-                // (containing block = viewport) ne shrink-wrap pas comme l'`absolute`
-                // d'origine — les options `w-full` l'étiraient à toute la largeur.
-                // On le borne au contenu, plancher = largeur du bouton.
+                // `width:max-content` : un panneau `fixed` (containing block = viewport) ne
+                // shrink-wrap pas comme un `absolute`. On le borne au contenu, plancher =
+                // largeur du bouton.
+                //
+                // Ancrage par `right` (et non `left` + `translateX(-100%)`) : le panneau
+                // reste calé sur le bord droit du bouton, et `transform` reste libre pour
+                // le fondu de `.lj-panel`, qu'un translate inline écraserait.
                 format!(
-                    "position:fixed; top:{top}px; left:{right}px; transform:translateX(-100%); width:max-content; min-width:{width}px; max-height:{max_h}px;"
+                    "position:fixed; top:{top}px; right:{right}px; width:max-content; min-width:{width}px; max-height:{max_h}px;"
                 )
             })
-            .unwrap_or_default()
+            // Avant toute mesure (SSR, premiere frame) le panneau est monté mais
+            // invisible : on le sort du flux pour qu'il n'élargisse pas le
+            // conteneur `inline-flex`.
+            .unwrap_or_else(|| "position:fixed; top:0; left:0;".to_string())
     };
 
     let wrapper = format!("relative inline-flex {class}");
@@ -152,17 +162,17 @@ pub fn DropdownSelect(
                     />
                 </svg>
             </button>
-            <Show when=move || open.get()>
-                <div
-                    style=panel_style
-                    class="z-50 max-h-60 overflow-y-auto overscroll-contain rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] py-1 shadow-lg"
+            <div
+                style=panel_style
+                data-open=move || open.get().then_some("true")
+                class="lj-panel z-50 max-h-60 overflow-y-auto overscroll-contain rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] py-1 shadow-lg"
+            >
+                <For
+                    each=move || options.get()
+                    key=|opt| opt.value.clone()
+                    let:opt
                 >
-                    <For
-                        each=move || options.get()
-                        key=|opt| opt.value.clone()
-                        let:opt
-                    >
-                        {
+                    {
                             let opt_value = opt.value.clone();
                             let selected = move || value.get() == opt_value;
                             let opt_value_click = opt.value.clone();
@@ -175,9 +185,9 @@ pub fn DropdownSelect(
                                     }
                                     class=move || {
                                         // `block` (pas l'`inline-block` par défaut du
-                                        // `<button>`) : empile verticalement, sinon
-                                        // sous `width:max-content` les options se
-                                        // mettent côte à côte (largeur = leur somme).
+                                        // `<button>`) : empile verticalement, sinon sous
+                                        // `width:max-content` les options se mettent côte
+                                        // à côte.
                                         format!(
                                             "block w-full whitespace-nowrap px-3 py-1.5 text-left text-xs transition-colors {}",
                                             if selected() {
@@ -192,9 +202,8 @@ pub fn DropdownSelect(
                                 </button>
                             }
                         }
-                    </For>
-                </div>
-            </Show>
+                </For>
+            </div>
         </div>
     }
 }

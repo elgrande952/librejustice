@@ -90,9 +90,8 @@ pub(super) fn read_jsonl_gz_lines(path: &Path) -> Result<Vec<Vec<u8>>> {
 }
 
 /// Découpe un contenu JSONL en lignes trimées, **sans la pseudo-ligne vide**
-/// induite par le `\n` final. Compter les lignes comme Python (`enumerate(fh)`)
-/// est requis pour que `ingested_lines` reste un offset de resume stable sur
-/// un fichier append-only.
+/// induite par le `\n` final : `ingested_lines` reste ainsi un offset de resume
+/// stable sur un fichier append-only.
 fn split_jsonl_lines(content: &[u8]) -> Vec<Vec<u8>> {
     let content = content.strip_suffix(b"\n").unwrap_or(content);
     if content.is_empty() {
@@ -101,7 +100,6 @@ fn split_jsonl_lines(content: &[u8]) -> Vec<Vec<u8>> {
     content
         .split(|&b| b == b'\n')
         .map(|line| {
-            // strip() Python : trim whitespace ASCII des deux côtés.
             let start = line.iter().position(|b| !b.is_ascii_whitespace());
             match start {
                 None => Vec::new(),
@@ -118,19 +116,14 @@ fn split_jsonl_lines(content: &[u8]) -> Vec<Vec<u8>> {
 mod tests {
     use super::*;
 
-    // Spec resume incrémental Judilibre : le compte de lignes doit être stable
-    // sur un fichier append-only (pas de pseudo-ligne vide après le \n final),
-    // sinon l'offset `ingested_lines` saute une vraie ligne au run suivant.
     #[test]
     fn split_jsonl_lines_count_is_append_stable() {
         assert_eq!(split_jsonl_lines(b"").len(), 0);
         assert_eq!(split_jsonl_lines(b"a\nb\n").len(), 2);
         assert_eq!(split_jsonl_lines(b"a\nb").len(), 2);
-        // Append d'une ligne : les 2 premières inchangées, la 3e est la nouvelle.
         let after_append = split_jsonl_lines(b"a\nb\nc\n");
         assert_eq!(after_append.len(), 3);
         assert_eq!(after_append[2], b"c");
-        // Ligne blanche intermédiaire : comptée (comme enumerate(fh) Python).
         assert_eq!(split_jsonl_lines(b"a\n  \nb\n").len(), 3);
         assert_eq!(split_jsonl_lines(b"a\n  \nb\n")[1], b"");
     }

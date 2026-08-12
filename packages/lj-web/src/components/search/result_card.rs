@@ -1,12 +1,10 @@
-//! `ResultCard` (port de `result-card.tsx`). Numéral + titre lié + toggle
-//! Extrait/Résumé + badges. Extrait et résumé arrivent tous deux dans le payload
-//! de recherche (résumé garanti en base, joint au hot path — ADR 0051) : les deux
-//! vues sont instantanées, sans aucun fetch.
+//! `ResultCard` : numéral + titre lié + toggle Extrait/Résumé + badges. Extrait
+//! et résumé arrivent tous deux dans le payload de recherche (résumé garanti en
+//! base, joint au hot path) : les deux vues sont instantanées, sans aucun fetch.
 //!
 //! Navigation : lien `/decision/{id}`. Au clic, on pose la graine de navigation
 //! (`ResultNavSeed` : `hit_ids`/position/total + origine recherche) consommée par
-//! la barre décision de la page cible (port de `buildState`/`resultNav`/`fromSearch`,
-//! cf. `components::decision_bar`).
+//! la barre décision de la page cible (cf. `components::decision_bar`).
 
 use std::sync::Arc;
 
@@ -124,11 +122,11 @@ pub fn ResultCard(
         hit.title_html.clone()
     };
 
-    // Siège (chambre · formation/office) hors du titre (ADR 0170) — rendu à gauche
-    // de la ligne méta, en regard des badges référentiels alignés à droite.
+    // Siège (chambre · formation/office) hors du titre — rendu à gauche de la
+    // ligne méta, en regard des badges référentiels alignés à droite.
     let seat = hit.seat.clone().filter(|s| !s.trim().is_empty());
 
-    // Extrait et résumé sont tous deux dans le payload (ADR 0051) : rendu direct.
+    // Extrait et résumé sont tous deux dans le payload : rendu direct.
     let embedded_summary = hit.summary.clone();
     let snippet = hit.best_chunk.snippet.clone();
 
@@ -261,10 +259,9 @@ pub fn ResultCard(
     }
 }
 
-/// Badges depuis les tags référentiels servis (ADR 0146) : solution (sauf
-/// AUTRE), voie, portée notable (majeure/importante, ADR 0167 — lecture
-/// normalisée inter-ordres qui remplace le badge publication brut ; le détail
-/// « Publié au bulletin » reste dans la Synthèse de la décision).
+/// Badges depuis les tags référentiels servis : solution (sauf AUTRE), voie,
+/// portée notable (majeure/importante) — lecture normalisée inter-ordres ; le
+/// détail « Publié au bulletin » reste dans la Synthèse de la décision.
 #[component]
 fn ResultMetaBadges(
     solution: Option<FacetTag>,

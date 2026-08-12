@@ -1,7 +1,7 @@
-//! Hubs juridiction (ADR 0253) : catalogue `/api/juridictions`, hub
+//! Hubs juridiction : catalogue `/api/juridictions`, hub
 //! `/api/juridictions/{code}`, page année `/api/juridictions/{code}/{annee}`.
-//! Chemins de crawl SSR vers les décisions — réponses stables (le corpus
-//! bouge à l'ingest quotidien), cache CDN long côté routes.
+//! Chemins de crawl SSR vers les décisions — réponses stables (le corpus bouge à
+//! l'ingest quotidien), cache CDN long côté routes.
 
 use crate::error::{ApiError, Result};
 use crate::referential;
@@ -25,8 +25,7 @@ const TYPE_ORDER: &[&str] = &[
 ];
 
 /// Catalogue des juridictions groupé par famille. Une seule entrée de cache
-/// (clé `()`), TTL 12 h — l'agrégat sur 3,7 M de lignes ne se recalcule
-/// jamais par requête.
+/// (clé `()`), TTL 12 h : l'agrégat pleine table ne se recalcule pas par requête.
 pub async fn catalogue(state: &AppState) -> Result<Arc<JurisdictionCatalogueResponse>> {
     state
         .jurisdiction_catalogue_cache
@@ -37,11 +36,7 @@ pub async fn catalogue(state: &AppState) -> Result<Arc<JurisdictionCatalogueResp
 
 async fn load_catalogue(state: &AppState) -> Result<Arc<JurisdictionCatalogueResponse>> {
     let referential = referential::referential(state).await?;
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
     let rows = repo.jurisdiction_catalogue().await?;
 
@@ -92,11 +87,7 @@ pub async fn hub(state: &AppState, code: &str) -> Result<JurisdictionHubResponse
         .unwrap_or(&jurisdiction_type)
         .to_string();
 
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
     let years = repo.jurisdiction_years(code).await?;
     if years.is_empty() {
@@ -127,11 +118,7 @@ pub async fn year_page(
     let entry = referential.jurisdiction(code).ok_or(ApiError::NotFound)?;
     let label = entry.label.clone();
 
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
     let total = repo
         .jurisdiction_years(code)

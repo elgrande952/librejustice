@@ -1,0 +1,67 @@
+# Front résident devant `lj-server`.
+#
+# Tient `:443` pendant que le conteneur `app` est recréé : la socket est sinon
+# liée par un `rootlessport` PAR CONTENEUR, qui meurt avec lui, et l'origine
+# disparaît le temps du remplacement. Donc ce conteneur ne se recrée jamais au
+# déploiement ; sa configuration change par `caddy reload`.
+{
+	# Aucun ACME : l'origine présente un certificat statique, l'edge étant en
+	# « Full (strict) ».
+	auto_https off
+
+	# API d'administration sur la loopback du conteneur, celle qu'utilise
+	# `caddy reload`. Les conteneurs ne partagent pas de namespace réseau, donc
+	# cette adresse n'est joignable ni depuis l'hôte ni depuis un voisin :
+	# seulement par `podman exec librejustice-caddy caddy reload`.
+	admin localhost:2019
+
+	# Métriques agrégées poussées en OTLP direct, sans collecteur. Les labels
+	# sont {code, method, handler, server} — aucun label de chemin, donc une
+	# cardinalité bornée par code × méthode. La directive `tracing` reste
+	# éteinte : elle ajouterait un span par requête et ne saurait pas reproduire
+	# le filtre de crawl, qui vit côté Rust.
+	metrics {
+		otlp
+	}
+}
+
+:443 {
+	tls /etc/librejustice/origin/cert.pem /etc/librejustice/origin/key.pem {
+		# Authenticated Origin Pulls de zone : l'edge présente un certificat
+		# client signé par notre CA. Le certificat AOP « global » est partagé
+		# par tous les comptes Cloudflare et ne prouverait pas l'origine.
+		client_auth {
+			mode require_and_verify
+			trust_pool file /etc/librejustice/origin/aop-ca.pem
+		}
+	}
+
+	# L'amont se joint par son nom de service sur le réseau `infra_default` ;
+	# `app` n'a aucun port publié sur l'hôte, donc il n'est joignable que d'ici.
+	# Une bascule blue/green ne demande alors que de démarrer la couleur neuve,
+	# d'attendre son `/api/health`, puis de recharger.
+	reverse_proxy {$LIBREJUSTICE_CADDY_UPSTREAM:app:8300} {
+		# 10 s couvre le pire trou d'amont avec de la marge, et le plafond est
+		# dur : au-delà, l'expiration rend 502. 250 ms borne les rejeux à 40 sur
+		# la fenêtre.
+		lb_try_duration 10s
+		lb_try_interval 250ms
+
+		# Un échec au dial est repris quelle que soit la méthode ; ces deux jeux
+		# ne couvrent que l'échec après connexion établie, pendant la seconde de
+		# drainage où l'amont accepte encore puis coupe. Ils sont en OU :
+		# `method POST path /mcp*` sur une seule ligne passe `caddy validate` en
+		# comptant `path` comme une méthode HTTP, donc ne matche jamais, et
+		# `@nom` n'est pas résolu ici.
+		lb_retry_match method GET
+		lb_retry_match {
+			method POST
+			path /mcp*
+		}
+
+		# Sans tampon, le corps d'un POST n'est pas rejouable : le rejeu part à
+		# corps vide et le client finit sur un 502. 128 Ko couvrent toute la
+		# surface POST.
+		request_buffers 128KB
+	}
+}

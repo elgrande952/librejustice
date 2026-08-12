@@ -1,5 +1,5 @@
--- Migration 0118 — spécialisations révélées par le gate de titres (ADR 0170
--- étape 4) : chambre des terres (Polynésie / Nouvelle-Calédonie, aussi
+-- Migration 0118 — spécialisations révélées par le gate de titres
+-- (étape 4) : chambre des terres (Polynésie / Nouvelle-Calédonie, aussi
 -- « tribunal foncier ») et commission d'indemnisation des victimes (CIVI).
 -- Seeds miroir de CHAMBRE_SEED (lj-extract/src/formation.rs).
 

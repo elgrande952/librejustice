@@ -1,4 +1,4 @@
--- Migration 0047 — Clé d'article composite ``instrument|article`` (ADR 0071).
+-- Migration 0047 — Clé d'article composite ``instrument|article``.
 -- Variante ZÉRO DOWNTIME (pas de rebuild ``chunks_bm25``).
 --
 -- Contexte : le filtre ``legalArticle`` portait des libellés d'articles NUS

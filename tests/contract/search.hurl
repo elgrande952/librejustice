@@ -6,7 +6,7 @@
 # Variable: {{base}} = host root (e.g. http://localhost:8300).
 # The route is auth-OPTIONAL: public callers get results; a JWT only triggers
 # search-history recording (no response-shape change).
-# Facettes = référentiel ADR 0146 (jurisdiction/legalDomain/solution/publication/
+# Facettes = référentiel (jurisdiction/legalDomain/solution/publication/
 # dateLectureYear/legalInstrument).
 # ============================================================================
 
@@ -34,7 +34,7 @@ jsonpath "$.queryMode" matches /^(lexical|hybrid)$/
 jsonpath "$.queryMode" == "hybrid"
 jsonpath "$.allHitIds" isCollection
 jsonpath "$.facets" exists
-# facets struct (ADR 0146): every dimension present as an array
+# facets struct: every dimension present as an array
 jsonpath "$.facets.jurisdiction" isCollection
 jsonpath "$.facets.legalDomain" isCollection
 jsonpath "$.facets.solution" isCollection
@@ -154,7 +154,7 @@ jsonpath "$.hits" isCollection
 jsonpath "$.facets.jurisdiction" isCollection
 
 
-# ── 15. Single filter: solution (référentiel solution:*, ADR 0146) ───────────
+# ── 15. Single filter: solution (référentiel solution:*) ────────────────────
 GET {{base}}/api/search?q=rejet&solution=REJET
 HTTP 200
 [Asserts]
@@ -189,7 +189,7 @@ HTTP 200
 jsonpath "$.hits" isCollection
 
 
-# ── 20. Single filter: legalInstrument (token = ref_text_uid, ADR 0145 M4) ───
+# ── 20. Single filter: legalInstrument (token = ref_text_uid) ───────────────
 GET {{base}}/api/search?q=responsabilite&legalInstrument=LEGITEXT000006070721
 HTTP 200
 [Asserts]
@@ -204,10 +204,21 @@ jsonpath "$.hits" isCollection
 
 
 # ── 22. Single filter: publication codes ─────────────────────────────────────
-GET {{base}}/api/search?q=arret&publication=B
+# Valeur canonique de facette (`facet_value.uid` sans le préfixe `publication:`),
+# pas le code court de source (« B ») : un token inconnu est rejeté en 422
+# correctif, jamais ignoré en silence.
+GET {{base}}/api/search?q=arret&publication=PUBLIE_BULLETIN
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
+
+
+# ── 22b. Token de filtre inconnu → 422 correctif (jamais 200 silencieux) ─────
+GET {{base}}/api/search?q=arret&publication=B
+HTTP 422
+[Asserts]
+jsonpath "$.detail[0].loc[1]" == "publication"
+jsonpath "$.detail[0].type" == "enum"
 
 
 # ── 23. Date range filters ───────────────────────────────────────────────────
@@ -218,7 +229,7 @@ jsonpath "$.hits" isCollection
 
 
 # ── 24. Combined filters (many dimensions at once + date range) ──────────────
-GET {{base}}/api/search?q=expulsion&jurisdictionType=CA&solution=CONFIRMATION&legalDomain=CIVIL_DROIT_LOCATIF&dateFrom=2018-01-01&dateTo=2024-12-31&publication=B
+GET {{base}}/api/search?q=expulsion&jurisdictionType=CA&solution=CONFIRMATION&legalDomain=CIVIL_DROIT_LOCATIF&dateFrom=2018-01-01&dateTo=2024-12-31&publication=PUBLIE_BULLETIN
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
@@ -253,7 +264,7 @@ jsonpath "$.facets.jurisdiction" isCollection
 jsonpath "$.facets.jurisdiction[0].value" isString
 jsonpath "$.facets.jurisdiction[0].label" isString
 jsonpath "$.facets.jurisdiction[0].count" isInteger
-# racines = tokens jurisdiction_type (TA, CC, …), sans préfixe d'uid (ADR 0213)
+# racines = tokens jurisdiction_type (TA, CC, …), sans préfixe d'uid
 jsonpath "$.facets.jurisdiction[0].value" matches /^[A-Z]{2,6}$/
 jsonpath "$.facets.jurisdiction[0].parent" not exists
 

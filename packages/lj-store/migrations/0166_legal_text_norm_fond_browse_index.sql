@@ -1,4 +1,4 @@
--- ADR 0255 : arborescence navigable des normes (/normes → fond → année).
+-- Arborescence navigable des normes (/normes → fond → année).
 -- Index d'expression portant (fond de parcours, date de parcours, id) pour les
 -- hubs par fond×année. Les deux expressions sont LES MÊMES que celles des
 -- requêtes de lj-store::norm_hubs (le planner ne matche un index d'expression

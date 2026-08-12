@@ -1,9 +1,9 @@
-//! Accordéon « Commentaires » (ADR 0204/0212) : analyses officielles,
-//! conclusions du rapporteur public, notes de doctrine — en fin de page
-//! décision comme article de norme, **fermé par défaut**. Style uniforme :
-//! une analyse (body porté localement) se déplie sur place ; les conclusions
-//! du rapporteur public (droits réservés, jamais stockées) sont une
-//! ligne-lien externe vers ArianeWeb, composée côté API.
+//! Accordéon « Commentaires » : analyses officielles, conclusions du rapporteur
+//! public, notes de doctrine — en fin de page décision comme article de norme,
+//! **fermé par défaut**. Style uniforme : une analyse (body porté localement) se
+//! déplie sur place ; les conclusions du rapporteur public (droits réservés,
+//! jamais stockées) sont une ligne-lien externe vers ArianeWeb, composée côté
+//! API.
 use leptos::prelude::*;
 use lj_dtos::Commentaire;
 

@@ -1,4 +1,4 @@
--- Migration 0089 — couche override de résolution de citations (ADR 0125 §3).
+-- Migration 0089 — couche override de résolution de citations.
 --
 -- ADDITIVE : la résolution automatique (`resolve_citations`, const-arrays alias +
 -- remap) NE CHANGE PAS. Cette table porte des CORRECTIONS de résolution curables et
@@ -6,7 +6,7 @@
 -- vide, le comportement est strictement préservé.
 --
 -- Généralise `TREATY_ALIASES`/`KALI_ALIASES`/`EU_PRIMARY_ARTICLE_REMAP` (déjà des
--- corrections de résolution en const compilées, ADR 0112 Addendum #2) vers des
+-- corrections de résolution en const compilées) vers des
 -- données DB. L'override CORRIGE la résolution, il ne RECONNAÎT pas : il agit sur une
 -- clé DÉJÀ canonique (`text_key`, même clé que `cited_reference`).
 --

@@ -1,21 +1,20 @@
-//! Ingestion catalogue EUR-Lex (droit dérivé UE) — ADR 0138.
+//! Ingestion catalogue EUR-Lex (droit dérivé UE).
 //!
-//! Peuple `legal_text` avec les règlements/directives UE **cités mais absents** du
-//! catalogue, en **entrées catalogue-seul** (métadonnées, `articles: []`) — la règle
-//! UE slashnum du linker (ADR 0145) les ré-apparie à la passe intégrale suivante.
-//! Piloté PAR LA DEMANDE : on n'ingère que les slashnums réellement cités (spans
-//! non liés de `legal_citation`, retranchés de `full_text`), pas tout EUR-Lex.
+//! Peuple `legal_text` avec les règlements/directives UE **cités mais absents**
+//! du catalogue, en **entrées catalogue-seul** (métadonnées, `articles: []`).
+//! Piloté PAR LA DEMANDE : on n'ingère que les slashnums réellement cités
+//! (spans non liés de `legal_citation`, retranchés de `full_text`).
 //!
 //! Ce module est un GÉNÉRATEUR de datasets : il écrit un JSON par acte sous
-//! `<state_dir>/ingest/corpus/` (règle #17), consommé ensuite par le loader
-//! `load_legal_corpus` (frontière d'écriture DB unique, règle #2). Idempotent : un
-//! dataset déjà présent n'est pas re-fetché (reprise après interruption).
+//! `<state_dir>/ingest/corpus/`, consommé ensuite par le loader
+//! `load_legal_corpus`. Idempotent : un dataset déjà présent n'est pas
+//! re-fetché.
 //!
-//! Robustesse : le CELEX est reconstruit du couple (nature, slashnum) — la numérotation
-//! UE est incohérente (règlements pré-2015 = `seq/année`, directives = `année/seq`,
-//! unifiée `année/seq` post-2015). On teste les interprétations plausibles et on
-//! **AUTO-VALIDE** : l'entrée n'est écrite que si le titre FR récupéré porte EXACTEMENT
-//! le slashnum cité (un CELEX mal deviné rend un autre numéro → rejeté, zéro mislink).
+//! Le CELEX est reconstruit du couple (nature, slashnum) — la numérotation UE
+//! est incohérente (règlements pré-2015 = `seq/année`, directives =
+//! `année/seq`, unifiée `année/seq` post-2015). On teste les interprétations
+//! plausibles et l'entrée n'est écrite que si le titre FR récupéré porte
+//! EXACTEMENT le slashnum cité.
 
 use anyhow::{anyhow, Result};
 
@@ -24,9 +23,8 @@ use lj_store::repository::DecisionRepository;
 
 use crate::config::Settings;
 
-/// Premier numéro année/séquence `a/b` (a,b ≤ 4 chiffres) d'un libellé — MÊME extraction
-/// que le test d'absence catalogue (`regexp_match(title, '(\d{1,4}/\d{1,4})')`).
-/// Sert à l'auto-validation.
+/// Premier numéro année/séquence `a/b` (a, b ≤ 4 chiffres) d'un libellé. Sert à
+/// l'auto-validation.
 fn first_slashnum(s: &str) -> Option<String> {
     let ch: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -50,15 +48,14 @@ fn first_slashnum(s: &str) -> Option<String> {
                 return Some(ch[l0..j].iter().collect());
             }
         }
-        // sinon : la run de gauche n'ouvre pas un slashnum, on reprend après elle.
     }
     None
 }
 
-/// CELEX candidats pour `(nature, slashnum)`. `nature ∈ {reglement, directive}`.
-/// Rend 1-2 CELEX (interprétations année/séquence), le plus probable d'abord selon la
-/// convention historique (règlement = `seq/année`, directive = `année/seq`), l'autre en
-/// repli. L'auto-validation aval tranche définitivement.
+/// CELEX candidats pour `(nature, slashnum)`. `nature ∈ {reglement,
+/// directive}`. Rend 1-2 CELEX (interprétations année/séquence), le plus
+/// probable d'abord selon la convention historique (règlement = `seq/année`,
+/// directive = `année/seq`), l'autre en repli.
 fn celex_candidates(nature: &str, slashnum: &str) -> Vec<String> {
     let (a, b) = match slashnum.split_once('/') {
         Some((a, b)) => (a, b),
@@ -120,8 +117,8 @@ fn text_uid_from_celex(celex: &str) -> Option<String> {
     Some(format!("EU/{kind}/{seq_trim}-{year}"))
 }
 
-/// Génère les datasets EUR-Lex pour les slashnums cités-absents (ADR 0138).
-/// `limit` borne le nombre de slashnums traités (les plus cités d'abord) ; `None` = tous.
+/// Génère les datasets EUR-Lex pour les slashnums cités-absents. `limit`
+/// borne le nombre de slashnums traités (les plus cités d'abord) ; `None` = tous.
 pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
     let settings = Settings::from_env()?;
     let dir = settings.legal_corpus_dir();
@@ -130,7 +127,6 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    // Scan lourd (retranche les spans non liés de `full_text`) : pas de timeout.
     conn.batch_execute("SET statement_timeout = 0").await?;
     let repo = DecisionRepository::new(&conn);
 
@@ -170,7 +166,6 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
             let Some((title, date)) = meta else {
                 continue; // CELEX inexistant / sans titre FR → interprétation suivante
             };
-            // AUTO-VALIDATION : le titre récupéré porte-t-il EXACTEMENT le slashnum cité ?
             if first_slashnum(&title).as_deref() != Some(slashnum.as_str()) {
                 continue;
             }
@@ -235,7 +230,6 @@ mod tests {
             first_slashnum("Règlement (CE) n° 44/2001 du Conseil"),
             Some("44/2001".to_string())
         );
-        // Directive : le premier slashnum est le numéro, pas le suffixe /CEE.
         assert_eq!(
             first_slashnum("Sixième directive 77/388/CEE du Conseil"),
             Some("77/388".to_string())
@@ -245,16 +239,12 @@ mod tests {
 
     #[test]
     fn celex_candidates_covers_conventions() {
-        // Règlement moderne année/seq.
         assert_eq!(
             celex_candidates("reglement", "2016/679"),
             vec!["32016R0679"]
         );
-        // Règlement classique seq/année (4-chiffres année épingle).
         assert_eq!(celex_candidates("reglement", "44/2001"), vec!["32001R0044"]);
-        // Directive classique année-2chiffres/seq (année d'abord).
         assert_eq!(celex_candidates("directive", "77/388"), vec!["31977L0388"]);
-        // Directive moderne année/seq.
         assert_eq!(celex_candidates("directive", "2003/86"), vec!["32003L0086"]);
     }
 

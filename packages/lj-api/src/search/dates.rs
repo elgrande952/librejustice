@@ -1,12 +1,11 @@
 //! Validation des dates de recherche (frontière HTTP + MCP).
 
-/// Échec de validation d'une date `dateFrom`/`dateTo`. Parité oracle : côté
-/// FastAPI le champ est typé `date` borné `ge=1678-01-01, le=2262-01-01`
-/// (search.py) — Pydantic valide donc le format ET la plage AVANT le SQL.
+/// Échec de validation d'une date `dateFrom`/`dateTo` : format ET plage
+/// (`1678-01-01` … `2262-01-01`) validés AVANT le SQL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DateError {
-    /// Format non parsable — `error` est le détail speedate verbatim (Pydantic le
-    /// recopie dans `msg`/`ctx.error`).
+    /// Format non parsable — `error` est le détail verbatim, recopié dans
+    /// `msg`/`ctx.error`.
     Parse(&'static str),
     /// Antérieure à la borne basse représentable par Tantivy (1678-01-01).
     TooEarly,
@@ -14,15 +13,13 @@ pub(crate) enum DateError {
     TooLate,
 }
 
-/// Bornes basse/haute des dates (parité `ge`/`le` du schéma) : la fenêtre que
-/// Tantivy indexe en i64 nanosecondes.
+/// Bornes basse/haute des dates : la fenêtre que Tantivy indexe en i64
+/// nanosecondes.
 pub(crate) const DATE_GE: &str = "1678-01-01";
 pub(crate) const DATE_LE: &str = "2262-01-01";
 
-/// Parse une date `dateFrom`/`dateTo` à parité de l'oracle : strict `YYYY-MM-DD`
-/// puis plage [1678-01-01, 2262-01-01]. Les messages d'erreur de parse reprennent
-/// ceux de speedate (le parseur de Pydantic), de sorte que la 422 émise en amont
-/// est byte-identique à la `RequestValidationError` FastAPI sur les cas usuels.
+/// Parse une date `dateFrom`/`dateTo` : strict `YYYY-MM-DD` puis plage
+/// [1678-01-01, 2262-01-01].
 pub(crate) fn parse_search_date(s: &str) -> std::result::Result<chrono::NaiveDate, DateError> {
     let d = parse_iso_strict(s).map_err(DateError::Parse)?;
     // `ge`/`le` sont des constantes valides → `unwrap` sûr.
@@ -37,8 +34,8 @@ pub(crate) fn parse_search_date(s: &str) -> std::result::Result<chrono::NaiveDat
     }
 }
 
-/// `YYYY-MM-DD` strict, en mimant l'ordre de détection d'erreur de speedate
-/// (année 4 chiffres, `-`, mois 2 chiffres, `-`, jour 2 chiffres, longueur exacte).
+/// `YYYY-MM-DD` strict : année 4 chiffres, `-`, mois 2 chiffres, `-`, jour
+/// 2 chiffres, longueur exacte.
 fn parse_iso_strict(s: &str) -> std::result::Result<chrono::NaiveDate, &'static str> {
     let b = s.as_bytes();
     if b.len() < 4 {
@@ -75,8 +72,6 @@ fn parse_iso_strict(s: &str) -> std::result::Result<chrono::NaiveDate, &'static 
 mod tests {
     use super::*;
 
-    // Dates : messages de parse alignés sur speedate (parseur Pydantic), figés
-    // depuis la sortie réelle de FastAPI/Pydantic 2.13 sur le schéma `SearchRequest`.
     #[test]
     fn parse_search_date_parse_errors_match_speedate() {
         use DateError::Parse;
@@ -114,7 +109,6 @@ mod tests {
     fn parse_search_date_range_and_valid() {
         assert_eq!(parse_search_date("1600-01-01"), Err(DateError::TooEarly));
         assert_eq!(parse_search_date("2300-01-01"), Err(DateError::TooLate));
-        // Dates valides, dont les deux bornes incluses.
         assert!(parse_search_date("2024-01-01").is_ok());
         assert!(parse_search_date("1678-01-01").is_ok());
         assert!(parse_search_date("2262-01-01").is_ok());

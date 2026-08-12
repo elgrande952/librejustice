@@ -1,5 +1,4 @@
-//! Page `/texte/{code}/{num}[/{date}]` (LawArticlePage, SEO-critique). Calquée sur
-//! [`crate::pages::decision_page`] :
+//! Page `/texte/{code}/{num}[/{date}]` (LawArticlePage, SEO-critique).
 //!
 //! - Article (en-tête, méta, corps, timeline) : `Resource::new_blocking` ⇒ le SSR
 //!   attend la résolution avant d'émettre le HTML (`<Title>`/`<Meta>`/JSON-LD
@@ -7,20 +6,27 @@
 //! - Décisions citantes : `Resource` non bloquante + `<Suspense>` ⇒ streamées
 //!   après le shell.
 //! - `Cache-Control` (SSR) posé selon le statut (200 → 7 j CDN, 404/400/422 →
-//!   5 min, 5xx → no-store), comme la page décision.
+//!   5 min, 5xx → no-store).
 
+mod actions;
+pub(crate) mod cited_by;
 pub mod data;
+pub(crate) mod top_cited;
 
 use leptos::either::Either;
 use leptos::prelude::*;
 use leptos_meta::{Link, Meta, Script, Title};
 use leptos_router::components::A;
 use lj_dtos::{
-    ArticleModification, ArticleNeighbor, CitingDecisionHit, CoCitedArticle, LawArticleResponse,
-    LawArticleVersion, LinkedTextRef, ModificationItem,
+    ArticleModification, ArticleNeighbor, CoCitedArticle, LawArticleResponse, LawArticleVersion,
+    LinkedTextRef, ModificationItem,
 };
 
+use actions::ArticleActions;
+use cited_by::CitedBySection;
+
 use crate::components::decision::DecisionLayout;
+use crate::components::own_page_description;
 use crate::components::search::compact_search::highlight::CitedBlock;
 use crate::helpers::{format_article_num, format_iso_date};
 use crate::seo::law::{article_canonical_url, article_meta_description, build_article_json_ld};
@@ -31,14 +37,17 @@ use data::{
     RelatedResult,
 };
 
+const RELATED_LIMIT: usize = 5;
+
 #[component]
 pub fn LawArticlePage() -> impl IntoView {
+    own_page_description();
+
     let key = article_key();
 
-    // Article bloquant (SEO dans le document initial).
     let article = Resource::new_blocking(move || key.get(), |key| sendable(fetch_article(key)));
-    // Décisions citantes non bloquantes (streamées via <Suspense>), bornées à la
-    // fenêtre de validité de la version servie (clé = code + num + date).
+    // Décisions citantes bornées à la fenêtre de validité de la version servie
+    // (clé = code + num + date).
     let citing = Resource::new(
         move || {
             let k = key.get();
@@ -46,8 +55,8 @@ pub fn LawArticlePage() -> impl IntoView {
         },
         |(code, num, date)| sendable(fetch_citing(code, num, date)),
     );
-    // Articles co-cités (« souvent cité avec », Phase D) — indépendants de la
-    // version servie (co-citation au grain `num_key`).
+    // Articles co-cités (« souvent cité avec ») — indépendants de la version
+    // servie (co-citation au grain `num_key`).
     let related = Resource::new(
         move || {
             let k = key.get();
@@ -77,8 +86,7 @@ pub fn LawArticlePage() -> impl IntoView {
 }
 
 /// Pose le statut HTTP et le `Cache-Control` de la réponse document SSR. No-op
-/// côté hydrate. Aligné sur `decision_page::set_cache_control` (200 → 7 j ;
-/// erreurs client → 5 min ; 5xx → no-store).
+/// côté hydrate (200 → 7 j ; erreurs client → 5 min ; 5xx → no-store).
 #[cfg(feature = "ssr")]
 pub(crate) fn set_cache_control(status: u16) {
     use axum::http::{header::CACHE_CONTROL, HeaderValue, StatusCode};
@@ -143,7 +151,7 @@ fn LawSkeleton() -> impl IntoView {
 }
 
 /// Titre humain d'un article (« Article 1240 du Code civil », « Article 2 de
-/// l'Ordonnance n° 2016-131… »). Partagé avec la hover card d'article (ADR 0168).
+/// l'Ordonnance n° 2016-131… »).
 pub(crate) fn article_title(article: &LawArticleResponse) -> String {
     format!(
         "Article {} {}",
@@ -152,9 +160,9 @@ pub(crate) fn article_title(article: &LawArticleResponse) -> String {
     )
 }
 
-/// Nom affichable du code : le titre humain (`code_title`, ex. « Code de la famille
-/// sénégalais ») quand l'API le fournit ; à défaut, un libellé dérivé du slug `code`
-/// (tirets → espaces), forcément approximatif.
+/// Nom affichable du code : le titre humain (`code_title`, ex. « Code de la
+/// famille sénégalais ») quand l'API le fournit ; à défaut, un libellé dérivé du
+/// slug `code` (tirets → espaces), forcément approximatif.
 fn code_display_name(article: &LawArticleResponse) -> String {
     article
         .code_title
@@ -172,16 +180,14 @@ fn LawArticleLoaded(
 ) -> impl IntoView {
     let title = article_title(&article);
     let description = article_meta_description(&article, &title);
-    // URL canonique sur la clé `numKey` (forme résolue en lookup exact, ADR 0123 §2).
     let url = article_canonical_url(&article.code, &article.num_key);
     let jsonld = serde_json::to_string(&build_article_json_ld(&article, &title, &description))
         .unwrap_or_else(|_| "{}".to_string());
     let page_title = format!("{title} - LibreJustice");
 
-    // Date de début affichée seulement si connue : l'API vide `dateDebut` pour les
-    // articles modificatifs (sentinelle LEGI 2999) — pas de « en vigueur depuis le … ».
-    // Version servie future (ADR 0178) : le bandeau « entrera en vigueur » la
-    // porte, pas de « En vigueur depuis » à une date à venir.
+    // L'API vide `dateDebut` pour les articles modificatifs (sentinelle LEGI
+    // 2999) : pas de « en vigueur depuis le … ». Version servie future : le bandeau
+    // « entrera en vigueur » la porte.
     let served_is_upcoming = !article.date_debut.is_empty()
         && article.upcoming_version_date.as_deref() == Some(article.date_debut.as_str());
     let in_force = (!article.date_debut.is_empty() && !served_is_upcoming).then(|| {
@@ -194,9 +200,9 @@ fn LawArticleLoaded(
     });
     let code_href = format!("/texte/{}", article.code);
     let code_name = code_display_name(&article);
-    // Bandeau temporel (ADR 0178) : une version future de l'article existe.
-    // Si la version SERVIE est cette version future (article pas encore en
-    // vigueur), le bandeau dit l'entrée en vigueur, pas une modification.
+    // Bandeau temporel : une version future de l'article existe. Si la version
+    // SERVIE est cette version future, le bandeau dit l'entrée en vigueur, pas une
+    // modification.
     let upcoming = article.upcoming_version_date.as_deref().map(|d| {
         let subject = if article.date_debut == d {
             "Cet article entrera en vigueur"
@@ -208,6 +214,17 @@ fn LawArticleLoaded(
 
     let nav_view = view! { <ArticleSideNav article=article.clone() /> }.into_any();
     let neighbor_nav = neighbor_nav(&article);
+    // « Cité par » : décisions citantes streamées, textes citants portés par la
+    // réponse bloquante.
+    let cited_by_view = view! {
+        <CitedBySection
+            texts=article.cited_by.clone()
+            citing=citing
+            search_query=title.clone()
+            code=article.code.clone()
+            num_key=article.num_key.clone()
+        />
+    };
     let main_view = view! {
         <article class="flex flex-col gap-10">
             <header class="flex flex-col gap-2">
@@ -224,8 +241,7 @@ fn LawArticleLoaded(
             </header>
             <ArticleBody article=article.clone() />
             {travaux_section(article.travaux_parlementaires.clone())}
-            // Commentaires de norme (ADR 0212) : même accordéon fermé que côté
-            // décision (ADR 0204), DTO et rendu partagés.
+            {cited_by_view}
             <crate::components::decision::DecisionCommentaires commentaires=article
                 .commentaires
                 .clone() />
@@ -233,15 +249,8 @@ fn LawArticleLoaded(
         </article>
     }
     .into_any();
-    let citing_view = view! {
-        <CitingSection
-            article=article.clone()
-            citing=citing
-            related=related
-            search_query=title.clone()
-        />
-    }
-    .into_any();
+    let neighbors_view =
+        view! { <ArticleNeighbors article=article.clone() related=related /> }.into_any();
 
     view! {
         <Title text=page_title />
@@ -256,14 +265,13 @@ fn LawArticleLoaded(
         <Meta name="twitter:card" content="summary_large_image" />
         <Link rel="canonical" href=url />
         <Script type_="application/ld+json">{jsonld}</Script>
-        <DecisionLayout toc=nav_view main=main_view similar=citing_view />
+        <DecisionLayout toc=nav_view main=main_view similar=neighbors_view />
     }
 }
 
 /// Article précédent / suivant (voisins immédiats du contexte de chapitre),
 /// mobile uniquement — sur desktop la colonne « Dans le même chapitre » porte
-/// déjà cette navigation, mais sur mobile elle passe SOUS l'article
-/// (contenu d'abord) et le lecteur perdait les voisins.
+/// déjà cette navigation.
 fn neighbor_nav(article: &LawArticleResponse) -> Option<impl IntoView> {
     let ctx = &article.context;
     let idx = ctx.iter().position(|n| n.current)?;
@@ -300,34 +308,33 @@ fn neighbor_nav(article: &LawArticleResponse) -> Option<impl IntoView> {
     })
 }
 
-/// Colonne gauche : la dimension temporelle de l'article — sélecteur
-/// Chronolégi puis versions en points sur rail fin (le point plein accent
-/// marque la version courante). Scrollable indépendamment quand l'historique
-/// dépasse la fenêtre (codes anciens : des dizaines de versions).
+/// Colonne gauche : agir sur l'article (copier sa référence) puis sa
+/// dimension temporelle — sélecteur Chronolégi et versions en points sur rail
+/// fin (le point plein accent marque la version courante). Scrollable
+/// indépendamment quand l'historique dépasse la fenêtre.
 #[component]
 fn ArticleSideNav(article: LawArticleResponse) -> impl IntoView {
-    // Chronolégi (ADR 0193 §5) : la date demandée vient de la route
+    // Chronolégi : la date demandée vient de la route
     // (`/texte/{code}/{num}/{date}`), le picker navigue en segment de path.
     let base = format!("/texte/{}/{}", article.code, article.num_key);
-    let requested_date = {
-        let key = article_key();
-        Signal::derive(move || key.get().date)
-    };
+    let key = article_key();
+    let reference = article_title(&article);
+    let requested_date = Signal::derive(move || key.get().date);
     view! {
-        <nav
-            aria-label="Versions de l'article"
-            class="flex flex-col gap-8 lg:sticky lg:top-20 lg:max-h-[calc(100vh-6rem)] lg:self-start lg:overflow-y-auto"
-        >
-            <ChronoDatePicker base=base date=requested_date path_segment=true />
-            <Timeline article=article />
-        </nav>
+        <div class="flex flex-col gap-6 lg:sticky lg:top-20 lg:max-h-[calc(100vh-6rem)] lg:self-start lg:overflow-y-auto">
+            <ArticleActions reference=reference />
+            <nav aria-label="Versions de l'article" class="flex flex-col gap-8">
+                <ChronoDatePicker base=base date=requested_date path_segment=true />
+                <Timeline article=article />
+            </nav>
+        </div>
     }
 }
 
-/// Sélecteur Chronolégi « À la date du … » (ADR 0193 §5) : navigue vers la
-/// même ressource à la date choisie — segment de path pour l'article
-/// (`{base}/{date}`), query `?date=` pour sommaire et section. Vider le champ
-/// (ou « version en vigueur ») revient à `base`.
+/// Sélecteur Chronolégi « À la date du … » : navigue vers la même ressource à
+/// la date choisie — segment de path pour l'article (`{base}/{date}`), query
+/// `?date=` pour sommaire et section. Vider le champ (ou « version en vigueur »)
+/// revient à `base`.
 #[component]
 pub(crate) fn ChronoDatePicker(
     base: String,
@@ -417,8 +424,8 @@ pub(crate) fn rail_item(current: bool, body: AnyView) -> AnyView {
     .into_any()
 }
 
-/// (href, libellé) de la section descriptive de la source sur `/sources`
-/// (ADR 0114). Ancre par provenance ; fallback page `/sources` sans ancre.
+/// (href, libellé) de la section descriptive de la source sur `/sources`.
+/// Ancre par provenance ; fallback page `/sources` sans ancre.
 fn source_descriptor(source: &str) -> (String, &'static str) {
     let (anchor, label) = match source {
         "legifrance" => ("dila", "Base LEGI · DILA"),
@@ -443,8 +450,6 @@ fn ArticleMeta(article: LawArticleResponse) -> impl IntoView {
         .map(|d| format_iso_date(Some(d)))
         .unwrap_or_else(|| "en vigueur".to_string());
     let (source_href, source_label) = source_descriptor(&article.source);
-    // Fraîcheur / autorité du diffuseur (ADR 0129). `source_asof` jamais inconnue en
-    // pratique (au pire date de get). `source_authority` = axe distinct de `translation`.
     let freshness = article
         .source_asof
         .as_deref()
@@ -515,9 +520,9 @@ fn ArticleMeta(article: LawArticleResponse) -> impl IntoView {
     }
 }
 
-/// Lecture en contexte (ADR 0114) : voisins de l'article dans sa division (ou
-/// fenêtre), l'article courant au point plein. Masqué si pas de contexte (≤ 1
-/// entrée = seulement l'article lui-même).
+/// Lecture en contexte : voisins de l'article dans sa division (ou fenêtre),
+/// l'article courant au point plein. Masqué si pas de contexte (≤ 1 entrée =
+/// seulement l'article lui-même).
 #[component]
 fn ArticleContext(article: LawArticleResponse) -> impl IntoView {
     let context = article.context;
@@ -544,7 +549,6 @@ fn context_item(neighbor: ArticleNeighbor, code: &str) -> AnyView {
         .into_any();
         return rail_item(true, body);
     }
-    // Lien sur la clé canonique (`numKey`), résolue en lookup exact (ADR 0123 §2).
     let href = format!("/texte/{code}/{}", neighbor.num_key);
     let cls = if abrogated {
         "block text-sm leading-snug text-[var(--color-ink-subtle)] line-through no-underline hover:text-[var(--color-accent)]"
@@ -572,8 +576,8 @@ fn MetaField(label: &'static str, value: String, mono: bool) -> impl IntoView {
     }
 }
 
-/// Corps de l'article : texte principal (+ texte original en accordéon si trad.) et,
-/// sous le texte, le `nota` = apparat éditorial (ADR 0135) : « Nota » officielle
+/// Corps de l'article : texte principal (+ texte original en accordéon si
+/// trad.) et, sous le texte, le `nota` = apparat éditorial : « Nota » officielle
 /// Légifrance (entrée en vigueur, QPC) ou jurisprudence/doctrine + renvois « voir
 /// aussi » des éditions annotées. Rendu dans un encart distinct, non normatif.
 #[component]
@@ -582,8 +586,8 @@ fn ArticleBody(article: LawArticleResponse) -> impl IntoView {
         .texte
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| "Texte indisponible.".to_string());
-    // Badge de provenance (ADR 0116) : on signale une traduction non officielle ou
-    // automatique ; le texte officiel (cas par défaut) ne porte pas de badge.
+    // Badge de provenance : on signale une traduction non officielle ou
+    // automatique ; le texte officiel ne porte pas de badge.
     let badge = match article.translation.as_str() {
         "non_officiel" => Some(("Traduction non officielle", false)),
         "automatique" => Some(("Traduction automatique — non vérifiée", true)),
@@ -601,7 +605,6 @@ fn ArticleBody(article: LawArticleResponse) -> impl IntoView {
             )>{label}</span>
         }
     });
-    // Texte original (ADR 0116) : couche vérification/vérité, en accordéon.
     let lang_orig = article.lang_original.clone();
     let original = article
         .texte_original
@@ -627,8 +630,8 @@ fn ArticleBody(article: LawArticleResponse) -> impl IntoView {
                 </details>
             }
         });
-    // Fil d'Ariane : segments TOC cliquables vers la vue-lecture de section
-    // (ADR 0207) quand la structure est ingérée ; sinon le `titre_text` plat.
+    // Fil d'Ariane : segments TOC cliquables vers la vue-lecture de section quand
+    // la structure est ingérée ; sinon le `titre_text` plat.
     let fil = if article.breadcrumb.is_empty() {
         article
             .titre_text
@@ -679,8 +682,6 @@ fn ArticleBody(article: LawArticleResponse) -> impl IntoView {
             .into_any(),
         )
     };
-    // Apparat éditorial (ADR 0135) : encart distinct sous le texte, ton secondaire pour
-    // marquer le caractère non normatif (Nota officielle / jurisprudence / renvois).
     let nota = article
         .nota
         .filter(|t| !t.trim().is_empty())
@@ -698,9 +699,8 @@ fn ArticleBody(article: LawArticleResponse) -> impl IntoView {
         });
 
     // Article modificatif (ordonnance/loi de réforme) : l'API a parsé le résumé de
-    // liens LEGI en groupes liés (`modifications`). On rend cette liste — comme
-    //  / de référence — au lieu du corps brut, illisible (ADR 0173).
-    // Corps normal : les renvois du texte sont cliquables (ADR 0217).
+    // liens LEGI en groupes liés (`modifications`), rendus au lieu du corps brut.
+    // Corps normal : les renvois du texte sont cliquables.
     let body = if article.modifications.is_empty() {
         view! {
             <CitedBlock
@@ -725,9 +725,9 @@ fn ArticleBody(article: LawArticleResponse) -> impl IntoView {
     }
 }
 
-/// Liste des dispositions d'un article modificatif : un bloc par `(action, code)`,
+/// Liste des dispositions d'un article modificatif : un bloc par (action, code),
 /// en-tête action + code lié, puis les cibles — articles en chips cliquables vers
-/// `/texte/{code}/{num}`, sections en libellés (pas d'ancre de section sur `/texte`).
+/// `/texte/{code}/{num}`, sections en libellés.
 #[component]
 fn ModificationsList(groups: Vec<ArticleModification>) -> impl IntoView {
     let blocks = groups
@@ -809,10 +809,10 @@ fn modification_item(item: ModificationItem) -> AnyView {
     }
 }
 
-/// Accordéon « Travaux parlementaires » (ADR 0215, zéro ingest) : une ligne
-/// par loi modificatrice de l'article, lien externe composé vers la page
-/// Légifrance de la loi au JO (bloc « Travaux préparatoires » + dossiers
-/// législatifs). Rien si aucune loi modificatrice.
+/// Accordéon « Travaux parlementaires » : une ligne par loi modificatrice de
+/// l'article, lien externe composé vers la page Légifrance de la loi au JO
+/// (bloc « Travaux préparatoires » + dossiers législatifs). Rien si aucune loi
+/// modificatrice.
 fn travaux_section(refs: Vec<LinkedTextRef>) -> Option<AnyView> {
     if refs.is_empty() {
         return None;
@@ -852,48 +852,7 @@ fn travaux_section(refs: Vec<LinkedTextRef>) -> Option<AnyView> {
     )
 }
 
-/// Un accordéon de références liées (compte dans l'en-tête, liste dedans).
-fn link_ref_section(title: &'static str, refs: Vec<LinkedTextRef>, open: bool) -> Option<AnyView> {
-    if refs.is_empty() {
-        return None;
-    }
-    let count = refs.len();
-    let items = refs.into_iter().map(link_ref_item).collect_view();
-    Some(
-        view! {
-            <details
-                open=open
-                class="rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] px-4 py-3"
-            >
-                <summary class="cursor-pointer text-xs uppercase tracking-[0.16em] text-[var(--color-ink-subtle)]">
-                    {title}" · "{count}
-                </summary>
-                <ul class="mt-2 flex flex-col gap-1.5">{items}</ul>
-            </details>
-        }
-        .into_any(),
-    )
-}
-
-/// Une référence liée : libellé verbatim DILA, cliquable quand la cible est en
-/// base (article résolu ou sommaire du texte).
-fn link_ref_item(r: LinkedTextRef) -> AnyView {
-    let inner = match r.href {
-        Some(href) => view! {
-            <A
-                href=href
-                attr:class="text-[var(--color-accent)] no-underline hover:underline"
-            >
-                {r.label}
-            </A>
-        }
-        .into_any(),
-        None => view! { <span class="text-[var(--color-ink)]">{r.label}</span> }.into_any(),
-    };
-    view! { <li class="text-sm leading-relaxed">{inner}</li> }.into_any()
-}
-
-/// Bandeau temporel (ADR 0178) : « {sujet} sera modifié le … » — la sentinelle
+/// Bandeau temporel : « {sujet} sera modifié le … » — la sentinelle
 /// `2222-02-22` (date inconnue DILA) devient « à une date à déterminer ».
 pub(crate) fn upcoming_banner(subject: &str, date: &str) -> AnyView {
     let when = if date == "2222-02-22" {
@@ -910,7 +869,7 @@ pub(crate) fn upcoming_banner(subject: &str, date: &str) -> AnyView {
     .into_any()
 }
 
-/// Libellé FR d'un état DILA (ADR 0178) ; état inconnu rendu brut.
+/// Libellé FR d'un état DILA ; état inconnu rendu brut.
 pub(crate) fn status_label(etat: &str) -> String {
     lj_dtos::article_status_label(etat)
         .map(str::to_string)
@@ -925,11 +884,10 @@ fn Timeline(article: LawArticleResponse) -> impl IntoView {
         return ().into_any();
     }
     let code = article.code.clone();
-    // Lien sur la clé canonique (`numKey`), résolue en lookup exact (ADR 0123 §2).
     let num = article.num_key.clone();
     let current = article.legiarti.clone();
-    // Comparateur (ADR 0193) : version courante vs sa précédente (ou la
-    // suivante si la courante ouvre la timeline), dès 2 versions.
+    // Comparateur : version courante vs sa précédente (ou la suivante si la
+    // courante ouvre la timeline), dès 2 versions.
     let compare = compare_href(&article.versions, &code, &num, &current).map(|href| {
         view! {
             <A
@@ -991,7 +949,7 @@ fn timeline_item(
 ) -> AnyView {
     let is_current = version.legiarti == current;
     // `date_debut` vide = sentinelle absorbée (article modificatif) : pas de
-    // « depuis le … » bidon.
+    // « depuis le … ».
     let span = match (version.date_debut.is_empty(), version.date_fin.as_deref()) {
         (true, _) => "Version initiale".to_string(),
         (false, Some(fin)) => format!(
@@ -1001,8 +959,8 @@ fn timeline_item(
         ),
         (false, None) => format!("depuis le {}", format_iso_date(Some(&version.date_debut))),
     };
-    // « à venir » (ADR 0178) : version pas encore entrée en vigueur, calculé
-    // côté API (l'horloge vit côté serveur).
+    // « à venir » : version pas encore entrée en vigueur, calculé côté API
+    // (l'horloge vit côté serveur).
     let a_venir = version.upcoming.then(|| {
         view! {
             <span class="ml-1.5 rounded-sm border border-[var(--color-rule)] px-1 py-px text-[10px] uppercase tracking-wide text-[var(--color-ink-muted)]">
@@ -1017,9 +975,8 @@ fn timeline_item(
         </span>
     };
     if is_current {
-        // Textes à l'origine de la version servie (liens entrants du graphe,
-        // ADR 0174) — portés par l'entrée de frise, l'accordéon « Modifié
-        // par » séparé était redondant avec les versions.
+        // Textes à l'origine de la version servie (liens entrants du graphe), portés
+        // par l'entrée de frise.
         let sources = modified_by
             .iter()
             .map(|r| {
@@ -1069,40 +1026,20 @@ fn timeline_item(
     rail_item(false, body)
 }
 
-/// Colonne droite : « Cité par (textes) » (renvois entrants du graphe,
-/// replié), les voisins du chapitre, puis les décisions citantes (streamées,
-/// même gabarit cartes que « Décisions similaires » de la page décision —
-/// erreur ⇒ message discret) et les articles co-cités.
+/// Colonne droite : rebondir vers un autre article du corpus — les voisins du
+/// chapitre puis les articles co-cités (streamés). Aucun contenu porteur : ce qui
+/// cite l'article vit au centre.
 #[component]
-fn CitingSection(
+fn ArticleNeighbors(
     article: LawArticleResponse,
-    citing: Resource<CitingResult>,
     related: Resource<RelatedResult>,
-    search_query: String,
 ) -> impl IntoView {
-    let cited_by = link_ref_section("Cité par (textes)", article.cited_by.clone(), false);
     view! {
         <aside
-            aria-label="Jurisprudence et croisements"
+            aria-label="Articles liés"
             class="flex flex-col gap-4 lg:sticky lg:top-20 lg:self-start"
         >
-            {cited_by}
             <ArticleContext article=article />
-            <Suspense fallback=move || {
-                view! {
-                    <p class="text-sm text-[var(--color-ink-subtle)]">
-                        "Chargement des décisions…"
-                    </p>
-                }
-            }>
-                {move || {
-                    let query = search_query.clone();
-                    Suspend::new(async move {
-                        let resolved = citing.await;
-                        citing_view(resolved, &query)
-                    })
-                }}
-            </Suspense>
             <Suspense fallback=|| ()>
                 {move || Suspend::new(async move { related_view(related.await) })}
             </Suspense>
@@ -1110,58 +1047,19 @@ fn CitingSection(
     }
 }
 
-fn citing_view(resolved: CitingResult, search_query: &str) -> AnyView {
-    if let Some(err) = resolved.error {
-        return view! {
-            <p class="text-sm text-[var(--color-ink-subtle)]">
-                {format!("Décisions citantes indisponibles ({err}).")}
-            </p>
-        }
-        .into_any();
-    }
-    if resolved.hits.is_empty() {
-        // État vide : les backlinks `legal_citation` n'ont rien identifié —
-        // CTA vers la recherche plein-texte, qui attrape les mentions non
-        // extraites (plan graphe Phase D).
-        let mut qs = leptos_router::params::ParamsMap::new();
-        qs.insert("q".to_string(), search_query.to_string());
-        let href = format!("/decisions{}", qs.to_query_string());
-        return view! {
-            <h2 class="font-sans text-base text-[var(--color-ink)]">
-                "Décisions citant cet article"
-            </h2>
-            <p class="text-sm text-[var(--color-ink-subtle)]">
-                "Aucune décision citant cet article n'a encore été identifiée."
-            </p>
-            <A
-                href=href
-                attr:class="text-sm text-[var(--color-accent)] underline-offset-4 hover:underline"
-            >
-                "Rechercher dans les décisions"
-            </A>
-        }
-        .into_any();
-    }
-    let cards = resolved
-        .hits
-        .into_iter()
-        .map(|hit| view! { <CitingCard hit=hit /> })
-        .collect_view();
-    view! {
-        <h2 class="font-sans text-base text-[var(--color-ink)]">"Décisions citant cet article"</h2>
-        <ul class="flex flex-col gap-3">{cards}</ul>
-    }
-    .into_any()
-}
-
-/// Bloc « Souvent cité avec » (plan graphe Phase D) : articles co-cités dans
-/// les décisions citantes, boilerplate procédural exclu côté repo. Rien à
-/// afficher = pas de bloc (enrichissement, pas de contenu porteur).
+/// Bloc « Souvent cité avec » : articles co-cités dans les décisions citantes,
+/// boilerplate procédural exclu côté repo, plafonné à `RELATED_LIMIT`. Rien à
+/// afficher = pas de bloc.
 fn related_view(resolved: RelatedResult) -> AnyView {
     if resolved.items.is_empty() {
         return ().into_any();
     }
-    let items = resolved.items.into_iter().map(related_item).collect_view();
+    let items = resolved
+        .items
+        .into_iter()
+        .take(RELATED_LIMIT)
+        .map(related_item)
+        .collect_view();
     view! {
         <h2 class="font-sans text-base text-[var(--color-ink)]">"Souvent cité avec"</h2>
         <ul class="flex flex-col gap-2">{items}</ul>
@@ -1191,8 +1089,6 @@ fn related_item(item: CoCitedArticle) -> AnyView {
         }
         .into_any();
     };
-    // Le href co-cité est toujours un article (`/texte/{slug}/{numKey}`) : hover
-    // card d'article (ADR 0168) sur le lien.
     let kind = PreviewKind::Article {
         code: href
             .trim_start_matches("/texte/")
@@ -1218,61 +1114,4 @@ fn related_item(item: CoCitedArticle) -> AnyView {
         </li>
     }
     .into_any()
-}
-
-#[component]
-fn CitingCard(hit: CitingDecisionHit) -> impl IntoView {
-    use crate::components::hover_preview::{HoverPreview, PreviewKind};
-    use lj_dtos::Significance;
-    let kind = PreviewKind::Decision { id: hit.id.clone() };
-    let href = format!("/decision/{}", hit.id);
-    // Badge de portée (ADR 0167) : seules majeure/importante méritent l'appel —
-    // la liste arrive déjà triée par autorité.
-    let badge = match hit.significance {
-        Significance::Majeure => Some((
-            "Portée majeure",
-            "border-[var(--color-accent)] text-[var(--color-accent)]",
-        )),
-        Significance::Importante => Some((
-            "Portée importante",
-            "border-[var(--color-rule)] text-[var(--color-ink-muted)]",
-        )),
-        _ => None,
-    }
-    .map(|(label, tone)| {
-        view! {
-            <span class=format!(
-                "inline-flex w-fit items-center rounded-full border px-2 py-0.5 text-[11px] {tone}",
-            )>{label}</span>
-        }
-    });
-    // Résumé en première phrase, même gabarit que les cartes « Décisions
-    // similaires » de la page décision.
-    let summary = hit.summary.as_deref().map(|s| {
-        let snippet = crate::seo::decision::first_sentence(s);
-        view! {
-            <p class="line-clamp-3 text-sm leading-snug text-[var(--color-ink-muted)]">{snippet}</p>
-        }
-    });
-    view! {
-        <li class="rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] p-3">
-            // Le titre machine porte déjà juridiction, date et numéro — pas de
-            // sous-titre. Hover card de décision sur le lien (ADR 0168) : le hit
-            // citant est léger, la carte apporte solution/portée/résumé.
-            <div class="flex flex-col gap-1.5">
-                <h3 class="font-sans text-sm leading-snug text-[var(--color-ink)]">
-                    <HoverPreview kind=kind>
-                        <A
-                            href=href
-                            attr:class="no-underline transition-colors hover:text-[var(--color-accent)]"
-                        >
-                            {hit.title}
-                        </A>
-                    </HoverPreview>
-                </h3>
-                {summary}
-                {badge}
-            </div>
-        </li>
-    }
 }

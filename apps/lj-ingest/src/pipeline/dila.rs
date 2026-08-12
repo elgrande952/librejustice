@@ -1,4 +1,4 @@
-//! DILA bulk (JADE / CONSTIT / CNIL, ADR 0093/0185) : ingest tarball streamé + sync.
+//! DILA bulk (JADE / CONSTIT / CNIL) : ingest tarball streamé + sync.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -19,23 +19,23 @@ use super::{
     content_checksum, generate_public_id, Candidate, IngestCounts, IngestMode, BATCH_SIZE,
 };
 
-/// Fond bulk DILA, vue côté ingest : porte les deux représentations du fond — le
-/// `DilaFond` du parser pur (`lj-core`) et celui du bord I/O (`lj-sources`,
-/// downloader + `repair_dila`) — disjointes par construction (AGENTS.md #1). La
-/// clap `Command::IngestDila { fond }` construit cette valeur.
+/// Fond bulk DILA, vue côté ingest : porte les deux représentations du fond —
+/// le `DilaFond` du parser pur (`lj-core`) et celui du bord I/O (`lj-sources`,
+/// downloader + `repair_dila`), disjointes par construction. La clap
+/// `Command::IngestDila { fond }` construit cette valeur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Fond {
     Jade,
     Constit,
-    /// Délibérations/décisions de la CNIL (ADR 0185).
+    /// Délibérations/décisions de la CNIL.
     Cnil,
 }
 
 impl Fond {
     /// Préfixe `source_uid` du fond (`dila-jade`/`dila-constit`/`dila-cnil`).
-    /// `parse_dila_xml` forme `source_uid = "{member_path}/{ID}"` → on lui passe
-    /// ce préfixe comme `member_path` pour obtenir `dila-<fond>/<ID DILA>`
-    /// (clé pivot stable, ADR 0093 ; mappée par `source_from_source_uid`).
+    /// `parse_dila_xml` forme `source_uid = "{member_path}/{ID}"` → on lui passe ce
+    /// préfixe comme `member_path` pour obtenir `dila-<fond>/<ID DILA>` (clé pivot
+    /// stable, mappée par `source_from_source_uid`).
     fn source_prefix(self) -> &'static str {
         match self {
             Fond::Jade => "dila-jade",
@@ -72,17 +72,16 @@ pub(super) fn dila_member_id(name: &str) -> Option<&str> {
         .or_else(|| file.strip_suffix(".XML"))
 }
 
-/// Doublon publie/inedit à skipper (#36) : un membre sous `/inedit/` dont l'ID
-/// existe aussi sous `/publie/` du même tarball. Winner déterministe = `publie/`
-/// (texte « publié » = version de référence) ; sans cette garde le même
-/// `source_uid` reçoit deux checksums et ping-ponge à chaque ingest (40 doublons
-/// mesurés sur le stock JADE global, note 2026-06-15) → re-chunk/re-embed inutile.
+/// Doublon publie/inedit à skipper : un membre sous `/inedit/` dont l'ID existe
+/// aussi sous `/publie/` du même tarball. Winner déterministe = `publie/`
+/// (texte « publié » = version de référence) ; sinon le même `source_uid`
+/// reçoit deux checksums et ping-ponge à chaque ingest.
 fn is_inedit_dup(name: &str, publie_ids: &HashSet<String>) -> bool {
     name.contains("/inedit/") && dila_member_id(name).is_some_and(|id| publie_ids.contains(id))
 }
 
-/// Pré-passe noms-seuls : IDs présents sous `/publie/` dans un tarball DILA — la
-/// matière du winner publie/inedit ([`is_inedit_dup`], #36). O(noms), pas de
+/// Pré-passe noms-seuls : IDs présents sous `/publie/` dans un tarball DILA —
+/// la matière du winner publie/inedit ([`is_inedit_dup`]). O(noms), pas de
 /// lecture du contenu.
 fn collect_publie_ids(path: &Path) -> Result<HashSet<String>> {
     let mut set = HashSet::new();
@@ -98,9 +97,9 @@ fn collect_publie_ids(path: &Path) -> Result<HashSet<String>> {
 }
 
 /// Issue du classement d'un membre DILA : décision à **texte intégral** (chemin
-/// d'ingest normal) ou enregistrement **analyse-seule** (#33, ADR 0105) routé à
-/// part — enrichissement `source_fields` d'une décision existante OU orpheline
-/// créée, jamais d'écrasement d'un texte/chunks réels.
+/// d'ingest normal) ou enregistrement **analyse-seule** routé à part —
+/// enrichissement `source_fields` d'une décision existante OU orpheline créée,
+/// jamais d'écrasement d'un texte/chunks réels.
 pub(super) enum ClassifiedDila {
     Full(Candidate),
     Analysis(Candidate),
@@ -109,10 +108,10 @@ pub(super) enum ClassifiedDila {
 /// Parse + classe un membre XML bulk DILA réparé (miroir de [`classify_xml`]).
 ///
 /// `raw_repaired` = octets déjà passés par `repair_dila` (bord lj-sources) ;
-/// `content_checksum` est calculé sur `raw_brut` (pré-repair, idempotence #7).
-/// `None` ⇒ skip non fatal : juridiction JADE non routée. `Some(Full)` = texte
-/// intégral ; `Some(Analysis)` = analyse-seule (CONTENU absent, SOMMAIRE ANA/SCT
-/// comme contenu).
+/// `content_checksum` est calculé sur `raw_brut` (pré-repair). `None` ⇒ skip
+/// non fatal : juridiction JADE non routée. `Some(Full)` = texte intégral ;
+/// `Some(Analysis)` = analyse-seule (CONTENU absent, SOMMAIRE ANA/SCT comme
+/// contenu).
 ///
 /// [`classify_xml`]: super::prepare::classify_xml
 pub(super) fn classify_dila(
@@ -124,7 +123,7 @@ pub(super) fn classify_dila(
         .map_err(|e| anyhow!("parse_dila_doc ({}): {e}", fond.source_prefix()))?;
 
     // Membre sans corps (ni CONTENU ni SOMMAIRE) → skip non fatal : nominal pour
-    // CNIL (fiches de registre sans texte, ADR 0185), pas une erreur de parsing.
+    // CNIL (fiches de registre sans texte), pas une erreur de parsing.
     let (decision, is_analysis) = match doc {
         Some(DilaDoc::Full(d)) => (d, false),
         Some(DilaDoc::Analysis(d)) => (d, true),
@@ -155,23 +154,19 @@ pub(super) fn classify_dila(
     }))
 }
 
-/// Rattache les enregistrements DILA **analyse-seule** (#33, ADR 0105). Chemin
-/// **séparé** du drain normal, sous garde anti-écrasement (comme judilibre) : on ne
-/// re-chunke, ne ré-embedde et ne réécrit JAMAIS le texte d'une décision existante.
-/// Par enregistrement (dédup intra-lot par `source_uid`, last-wins) :
+/// Rattache les enregistrements DILA **analyse-seule**. Chemin séparé du drain
+/// normal, sous garde anti-écrasement : on ne re-chunke, ne ré-embedde et ne
+/// réécrit jamais le texte d'une décision existante. Par enregistrement (dédup
+/// intra-lot par `source_uid`, last-wins) :
 ///
-/// - `source_uid` déjà connu + checksum inchangé → skip (idempotent #7) ;
-/// - `source_uid` connu (changé/tombstoné) → on rafraîchit **seulement**
-///   `source_fields` (ANA/SCT à jour) via `upsert_decision_source` ;
-/// - identité (`ecli`/`canonical_ref`) trouvée → **case a** : enrichissement
-///   `source_fields` de la décision existante (texte réel d'une source de rang
-///   supérieur — opendata 55 / judilibre 60 > dila-jade 50, jamais autorité ⇒ jamais
-///   d'overwrite du texte canonique, ADR 0098 §3) ;
-/// - sinon → **case b** : décision **orpheline** créée + chunkée (+ embeddée si
-///   `require_embeddings`) via le drain normal, où l'analyse EST le contenu cherchable.
-///   Si un texte réel arrive plus tard (même `canonical_ref`), le merge cross-source
-///   le promeut autorité et écrase proprement l'analyse — l'abstrat reste en
-///   `source_fields` dila-jade.
+/// - `source_uid` connu + checksum inchangé → skip ; changé ou tombstoné → on
+///   rafraîchit **seulement** `source_fields` via `upsert_decision_source` ;
+/// - identité (`ecli`/`canonical_ref`) trouvée → enrichissement `source_fields`
+///   de la décision existante (le texte réel vient d'une source de rang
+///   supérieur, jamais écrasé) ;
+/// - sinon → décision **orpheline** créée + chunkée via le drain normal, où
+///   l'analyse EST le contenu cherchable. Un texte réel arrivé plus tard
+///   (même `canonical_ref`) est promu autorité par le merge cross-source.
 async fn apply_dila_analyses(
     conn: &Connection,
     embedder: Option<&AnyEmbedder>,
@@ -256,19 +251,17 @@ async fn apply_dila_analyses(
     Ok(())
 }
 
-/// Ingère un fond bulk DILA (`tar.gz` locaux sous `<cache>/dila/<fond>/tarballs/`,
-/// ADR 0093). Calqué sur [`ingest_legi_tarball`] (lecture tar STREAMÉE via canal
-/// borné, RAM ~constante) + [`ingest_opendata`] (triage idempotent par batch,
-/// upsert ECLI-first déjà actif côté repository).
+/// Ingère un fond bulk DILA (`tar.gz` locaux sous
+/// `<cache>/dila/<fond>/tarballs/`), lecture tar streamée via canal borné et
+/// triage idempotent par batch.
 ///
-/// Par archive : un thread lecteur (`for_each_member`) fait `repair_dila` (bord
-/// I/O) → `classify_dila` (`parse_dila_xml` + filtre CONSTIT AN/SEN) et pousse les
-/// `Candidate` sur un canal borné ; le consumer async batch → `drain_batch`
-/// (`payload_format = "dila-xml"`). Les `.dat` (suppressions) sont accumulés puis
-/// appliqués APRÈS les upserts via `repo.delete(source_uid)` (provenance-aware,
-/// ADR 0080/0087). Idempotent (`content_checksum` brut #7). Sans embeddings
-/// (backfill séparé). `sync_dila` auto-switch dépose stock global + incréments
-/// dans le même dossier (ingérés par ordre de nom).
+/// Par archive : un thread lecteur (`for_each_member`) fait `repair_dila` →
+/// `classify_dila` et pousse les `Candidate` sur un canal borné ; le consumer
+/// async batch → `drain_batch` (`payload_format = "dila-xml"`). Les `.dat`
+/// (suppressions) sont appliqués APRÈS les upserts via
+/// `repo.delete(source_uid)`. Sans embeddings (backfill séparé). `sync_dila`
+/// dépose stock global et incréments dans le même dossier, ingérés par ordre de
+/// nom.
 ///
 /// [`ingest_legi_tarball`]: super::legi
 /// [`ingest_opendata`]: super::opendata::ingest_opendata
@@ -300,12 +293,10 @@ pub async fn ingest_dila(fond: Fond) -> Result<()> {
     .await
 }
 
-/// Ingère une liste d'archives DILA (stock et/ou incréments) dans l'ordre fourni,
-/// puis logge le total. Partagé par [`ingest_dila`] (toutes les archives sur disque)
-/// et [`sync_dila`] (uniquement les archives fraîchement téléchargées, comme
-/// [`sync_legi`] — pas de re-stream de l'historique à chaque run).
-///
-/// [`sync_legi`]: super::legi::sync_legi
+/// Ingère une liste d'archives DILA (stock et/ou incréments) dans l'ordre
+/// fourni, puis logge le total. Partagé par [`ingest_dila`] (toutes les
+/// archives sur disque) et [`sync_dila`] (uniquement les archives fraîchement
+/// téléchargées).
 async fn ingest_dila_paths(
     conn: &Connection,
     fond: Fond,
@@ -339,12 +330,10 @@ async fn ingest_dila_paths(
 /// Ingère UNE archive DILA (stock ou incrément) en streaming, renvoie
 /// `(counts, deleted)`.
 ///
-/// Lecture+repair+parse (gzip+tar+XML = CPU sync) en thread bloquant, BORNÉE par
-/// un canal : RAM ~constante (stocks globaux jade/constit = centaines de k
-/// membres → JAMAIS tout en mémoire, cf. `tar_reader::for_each_member`). Le DB
-/// reste côté async (la connexion n'est pas déplaçable dans `spawn_blocking`).
-/// Backpressure : canal plein (flush DB en cours) ⇒ le lecteur attend. Les `.dat`
-/// (suppressions) sont accumulés puis appliqués APRÈS les upserts.
+/// Lecture+repair+parse (gzip+tar+XML = CPU sync) en thread bloquant, bornée
+/// par un canal : RAM ~constante sur des stocks de centaines de milliers de
+/// membres. Le DB reste côté async. Backpressure : canal plein ⇒ le lecteur
+/// attend. Les `.dat` sont appliqués APRÈS les upserts.
 async fn ingest_dila_tarball(
     conn: &Connection,
     fond: Fond,
@@ -353,24 +342,24 @@ async fn ingest_dila_tarball(
     require_embeddings: bool,
 ) -> Result<(IngestCounts, u64)> {
     // Messages remontés par le thread lecteur (membres parsés). `Candidate` boxé
-    // (gros : `Decision` + payload). `Delete` = IDs DILA d'un `.dat` de suppression.
+    // (gros : `Decision` + payload). `Delete` = IDs DILA d'un `.dat` de
+    // suppression.
     enum DilaMsg {
         Candidate(Box<Candidate>),
-        /// Enregistrement analyse-seule (CONTENU absent, #33) — traité à part.
+        /// Enregistrement analyse-seule (CONTENU absent) — traité à part.
         Analysis(Box<Candidate>),
         /// Membre écarté non fatal (juridiction JADE non routée).
         Skip,
-        /// Doublon publie/inedit écarté (winner = publie, #36).
+        /// Doublon publie/inedit écarté (winner = publie).
         DupSkip,
         Empty,
         ParseErr,
         Delete(Vec<String>),
     }
 
-    // Pré-passe : IDs sous `/publie/` (winner publie/inedit #36). Faite avant le
-    // stream principal pour être churn-free quel que soit l'ordre des membres
-    // (l'inedit/ précède publie/ alphabétiquement → sans pré-passe, l'inedit
-    // déclencherait un UPDATE transitoire à chaque re-run).
+    // Pré-passe : IDs sous `/publie/` (winner publie/inedit). Faite avant le
+    // stream principal pour être churn-free quel que soit l'ordre des membres —
+    // `inedit/` précède `publie/` alphabétiquement.
     let publie_ids = {
         let p = path.to_path_buf();
         tokio::task::spawn_blocking(move || collect_publie_ids(&p))
@@ -383,14 +372,14 @@ async fn ingest_dila_tarball(
     let reader = tokio::task::spawn_blocking(move || -> Result<()> {
         lj_sources::tar_reader::for_each_member(&tar_path, |name, raw| {
             let lower = name.to_lowercase();
-            // Doublon publie/inedit : on ne garde que la version publie/ (#36).
+            // Doublon publie/inedit : on ne garde que la version publie/.
             if lower.ends_with(".xml") && is_inedit_dup(&name, &publie_ids) {
                 return tx
                     .blocking_send(DilaMsg::DupSkip)
                     .map_err(|_| anyhow!("canal DILA fermé (consumer arrêté)"));
             }
-            // Suppressions : `.dat` (lignes = chemin tar ou ID DILA nu) ; on
-            // retient le dernier segment (= ID `CETATEXT…`/`CONSTEXT…`/`JURITEXT…`).
+            // Suppressions : `.dat` (lignes = chemin tar ou ID DILA nu) ; on retient le
+            // dernier segment (= ID `CETATEXT…`/`CONSTEXT…`/`JURITEXT…`).
             if lower.ends_with(".dat") {
                 let ids: Vec<String> = String::from_utf8_lossy(&raw)
                     .lines()
@@ -436,16 +425,15 @@ async fn ingest_dila_tarball(
 
     while let Some(msg) = rx.recv().await {
         match msg {
-            // Analyses-seules accumulées à part : traitées après les textes intégraux
-            // (#33), pour qu'un éventuel texte du même lot crée la décision d'abord.
+            // Analyses-seules accumulées à part : traitées après les textes intégraux,
+            // pour qu'un éventuel texte du même lot crée la décision d'abord.
             DilaMsg::Analysis(cand) => analysis.push(*cand),
             DilaMsg::Candidate(cand) => {
                 candidates.push(*cand);
                 if candidates.len() >= BATCH_SIZE {
                     let batch = std::mem::take(&mut candidates);
-                    // Embeddings selon `with_embeddings` (None = ingest rapide
-                    // sans vecteurs ; backfill via re-run --with-embeddings, chemin
-                    // re-embed de drain_batch). Mode MissingHash (idempotent #7).
+                    // Embeddings selon `with_embeddings` (None = ingest rapide sans vecteurs ;
+                    // backfill via re-run --with-embeddings). Mode MissingHash.
                     drain_batch(
                         conn,
                         embedder,
@@ -489,8 +477,8 @@ async fn ingest_dila_tarball(
         .await?;
     }
 
-    // Analyses-seules (#33) : APRÈS les textes intégraux du lot (rattachement à une
-    // décision existante OU création orpheline), AVANT les suppressions.
+    // Analyses-seules : APRÈS les textes intégraux du lot (rattachement à une
+    // décision existante ou création orpheline), AVANT les suppressions.
     apply_dila_analyses(
         conn,
         embedder,
@@ -501,9 +489,9 @@ async fn ingest_dila_tarball(
     )
     .await?;
 
-    // Suppressions appliquées APRÈS les upserts (un incrément ajoute ET retire,
-    // #7) via `delete` provenance-aware (ADR 0080/0087) sur le `source_uid`
-    // reconstruit `dila-<fond>/<ID>`.
+    // Suppressions appliquées APRÈS les upserts (un incrément ajoute ET retire)
+    // via `delete` provenance-aware sur le `source_uid` reconstruit
+    // `dila-<fond>/<ID>`.
     let repo = DecisionRepository::new(conn);
     let mut deleted_total: u64 = 0;
     for dila_id in dat_ids {
@@ -531,19 +519,18 @@ async fn ingest_dila_tarball(
 }
 
 /// Sync d'un fond DILA, **auto-switch cold ↔ warm** en un seul point d'entrée
-/// (mirroir de [`sync_legi`]) : [`lj_sources::dila::sync_dila`] télécharge le stock
-/// global au 1er run puis les incréments postérieurs au watermark sous
-/// `<cache>/dila/<fond>/tarballs/`, PUIS [`ingest_dila_paths`] ingère UNIQUEMENT
-/// les archives fraîchement téléchargées (pas de re-stream de l'historique). Le
-/// watermark avance à chaque téléchargement → idempotent et reprenable.
+/// (miroir de [`sync_legi`]) : [`lj_sources::dila::sync_dila`] télécharge le
+/// stock global au 1er run puis les incréments postérieurs au watermark sous
+/// `<cache>/dila/<fond>/tarballs/`, PUIS [`ingest_dila_paths`] ingère
+/// uniquement les archives fraîchement téléchargées. Le watermark avance à
+/// chaque téléchargement → idempotent et reprenable.
 ///
 /// [`sync_legi`]: super::legi::sync_legi
 pub async fn sync_dila(fond: Fond) -> Result<()> {
     let settings = Settings::from_env()?;
-    // `lj_sources::dila::sync_dila` s'appuie sur un client reqwest **bloquant** : le
-    // Drop de son runtime interne panique s'il tombe dans le contexte async d'un
-    // worker tokio (« Cannot drop a runtime… »). Il DOIT donc tourner sur un thread
-    // bloquant dédié.
+    // `lj_sources::dila::sync_dila` s'appuie sur un client reqwest **bloquant** :
+    // le Drop de son runtime interne panique s'il tombe dans le contexte async
+    // d'un worker tokio. Il doit donc tourner sur un thread bloquant dédié.
     let (cache_dir, src) = (settings.cache_dir(), fond.source());
     let downloaded =
         tokio::task::spawn_blocking(move || lj_sources::dila::sync_dila(&cache_dir, src))
@@ -584,27 +571,20 @@ mod tests {
             dila_member_id("jade/global/inedit/2007/sub/CETATEXT000007612345.xml"),
             Some("CETATEXT000007612345")
         );
-        // Pas un .xml → pas d'ID (PDF de présentation, .dat…).
         assert_eq!(dila_member_id("jade/global/publie/foo.pdf"), None);
     }
 
-    // Spec #36 : winner publie/inedit. Un membre inedit/ dont l'ID est aussi en
-    // publie/ est écarté ; un inedit/ unique (ID absent de publie/) est gardé ;
-    // un publie/ n'est jamais écarté.
     #[test]
     fn inedit_dup_skipped_only_when_publie_twin_exists() {
         let publie: HashSet<String> = ["CETATEXT000000000001".to_string()].into_iter().collect();
-        // inedit/ avec jumeau publie/ → skip.
         assert!(is_inedit_dup(
             "jade/global/inedit/2007/CETATEXT000000000001.xml",
             &publie
         ));
-        // inedit/ sans jumeau publie/ → gardé.
         assert!(!is_inedit_dup(
             "jade/global/inedit/2007/CETATEXT000000000099.xml",
             &publie
         ));
-        // publie/ → jamais écarté (même ID présent dans le set).
         assert!(!is_inedit_dup(
             "jade/global/publie/2007/CETATEXT000000000001.xml",
             &publie

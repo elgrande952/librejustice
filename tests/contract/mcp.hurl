@@ -274,7 +274,7 @@ jsonpath "$.result.content[0].text" contains "\"hint\""
 
 # -----------------------------------------------------------------------------
 # resources/list — liste vide assumée (primitive application-controlled sans
-# consommateur réel côté clients ; cf. ADR 0244).
+# consommateur réel côté clients).
 # -----------------------------------------------------------------------------
 POST {{base}}/mcp/
 Accept: application/json, text/event-stream

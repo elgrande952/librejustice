@@ -1,4 +1,4 @@
--- Migration 0104 — suppression définitive de `gold_annotation` (ADR 0148 §3
+-- Migration 0104 — suppression définitive de `gold_annotation` (choix
 -- ré-amendé) : la 0103 est annulée. Les révisions gold vivent dans les MÊMES
 -- colonnes de `decisions` que l'extraction déterministe, à une
 -- `extract_version` spécifique (1000, constante du banc) — aucune table

@@ -1,4 +1,4 @@
-//! Selecteur de theme (Systeme / Clair / Sombre) — port de `theme-settings.tsx`.
+//! Selecteur de theme (Systeme / Clair / Sombre).
 //!
 //! Pont localStorage `lj-theme` + `matchMedia` via le shim JS `theme.js`
 //! (web-sys indisponible sans feature dans le crate fige). L'anti-FOUC inline
@@ -7,7 +7,7 @@
 
 use leptos::prelude::*;
 
-/// Theme choisi (port du type `Theme`).
+/// Theme choisi.
 #[derive(Clone, Copy, PartialEq)]
 enum Theme {
     System,
@@ -105,11 +105,9 @@ pub fn ThemeSettings() -> impl IntoView {
             bridge::persist_theme(t.as_str());
             bridge::apply_theme(t.as_str());
         });
-        // En mode Systeme : suivre `prefers-color-scheme`. L'abonnement vit dans
-        // un `StoredValue` local (non-`Send`, normal cote wasm) : chaque passage
-        // remplace l'abonnement precedent — le `Drop` de l'ancien desabonne
-        // (port du `removeEventListener` du cleanup React). `on_cleanup` est
-        // inutilisable ici (l'abonnement tient un `Closure` JS, pas `Send`).
+        // En mode Systeme : suivre `prefers-color-scheme`. L'abonnement vit dans un
+        // `StoredValue` local (non-`Send`, normal cote wasm) : chaque passage remplace
+        // l'abonnement precedent — le `Drop` de l'ancien desabonne.
         let sub_slot: StoredValue<
             Option<bridge::PrefersDarkSubscription>,
             leptos::reactive::owner::LocalStorage,
@@ -170,7 +168,7 @@ pub fn ThemeSettings() -> impl IntoView {
     }
 }
 
-/// Icone SVG inline d'une option de theme (paths verbatim du React).
+/// Icone SVG inline d'une option de theme.
 #[component]
 fn ThemeIcon(theme: Theme) -> impl IntoView {
     match theme {

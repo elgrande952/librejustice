@@ -1,12 +1,12 @@
-//! Liens de chronologie entre décisions (ADR 0161) : depuis une décision
-//! d'appel / de cassation / de renvoi, la référence canonique de la décision
-//! ATTAQUÉE. Deux sources : la métadonnée Judilibre `contested`
-//! ([`Decision::attacked`]) et le texte (« Par un jugement n° X du D, le
-//! tribunal administratif de V… », « Décision déférée à la Cour : … »).
+//! Liens de chronologie entre décisions : depuis une décision d'appel / de
+//! cassation / de renvoi, la référence canonique de la décision ATTAQUÉE. Deux
+//! sources : la métadonnée Judilibre `contested` ([`Decision::attacked`]) et le
+//! texte (« Par un jugement n° X du D, le tribunal administratif de V… »,
+//! « Décision déférée à la Cour : … »).
 //!
-//! La cible sort en **clé pendante** dans la grammaire `canonical_ref` exacte
-//! de [`crate::identity`] (mêmes formes par juridiction, même normalisation) :
-//! elle se résout côté base dès qu'une décision unique et active la porte.
+//! La cible sort en clé pendante dans la grammaire `canonical_ref` exacte de
+//! [`crate::identity`] (mêmes formes par juridiction, même normalisation) : elle
+//! se résout côté base dès qu'une décision unique et active la porte.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -28,7 +28,7 @@ pub enum LinkType {
 }
 
 impl LinkType {
-    /// Valeur `decision_links.link_type` (CHECK de la migration 0110).
+    /// Valeur `decision_links.link_type`.
     pub fn as_str(self) -> &'static str {
         match self {
             LinkType::AppelDe => "APPEL_DE",
@@ -46,10 +46,9 @@ pub struct PriorRef {
 }
 
 /// Mapping (type de juridiction, ville pliée) → code de localisation
-/// Judilibre, dérivé du référentiel `jurisdiction` en base au début du run
-/// (comme le `LinkSnapshot` citations). Les clés `canonical_ref` CA/TJ/TCOM
-/// exigent ce code ; une ville ambiguë (deux codes pour le même couple) ne
-/// mappe pas (règle #12 : pas de clé bancale).
+/// Judilibre, dérivé du référentiel `jurisdiction` en base au début du run. Les
+/// clés `canonical_ref` CA/TJ/TCOM exigent ce code ; une ville ambiguë (deux
+/// codes pour le même couple) ne mappe pas.
 pub struct ChronoSnapshot {
     by_type_city: HashMap<(String, String), Option<String>>,
 }
@@ -58,9 +57,8 @@ impl ChronoSnapshot {
     /// `rows` = lignes `(code, jurisdiction_type, city)` du référentiel
     /// `jurisdiction`. Le code TCOM référentiel est préfixé (`tcom0603`) alors
     /// que la localisation Judilibre est nue (`0603`) : on déprefixe. TA/CAA
-    /// servent la chaîne du fond administratif (ADR 0165) ; CPH est vide
-    /// aujourd'hui et se remplit à l'ingest des premières décisions
-    /// prud'homales (référentiel ouvert, nourri par la donnée).
+    /// servent la chaîne du fond administratif ; CPH est vide aujourd'hui et se
+    /// remplit à l'ingest des premières décisions prud'homales.
     pub fn new(rows: impl IntoIterator<Item = (String, String, String)>) -> Self {
         let mut by_type_city: HashMap<(String, String), Option<String>> = HashMap::new();
         for (code, jt, city) in rows {
@@ -93,8 +91,8 @@ impl ChronoSnapshot {
         }
     }
 
-    /// Consommé aussi par le lexer de citations RG (`compiled::lex_case`,
-    /// ADR 0165) — même mapping ville → code que les liens de chronologie.
+    /// Consommé aussi par le lexer de citations RG (`compiled::lex_case`) — même
+    /// mapping ville → code que les liens de chronologie.
     pub(crate) fn location(&self, jt: &str, city_folded: &str) -> Option<&str> {
         self.by_type_city
             .get(&(jt.to_string(), city_folded.to_string()))?
@@ -209,11 +207,10 @@ fn jurisdiction_from_label(folded: &str) -> Option<(&'static str, String)> {
 /// les surfaces standard du corps qui la répètent — « l'arrêt attaqué (Paris,
 /// 22 août 2024) », « l'arrêt rendu le 22 août 2024 par la cour d'appel de
 /// Paris » — deviennent des citations de jurisprudence (`case_citation`)
-/// portant le MÊME `target_ref` que le lien de chronologie, résolues côté
-/// base par le pont depuis `decision_links` (même décision, même clé). Ces
-/// mentions n'ont pas de docket en texte : seule la métadonnée identifie la
-/// cible, et ville ET date doivent la matcher — zéro mislink. Offsets en
-/// CHARS (grain `case_citation`).
+/// portant le même `target_ref` que le lien de chronologie, résolues côté
+/// base par le pont depuis `decision_links`. Ces mentions n'ont pas de docket
+/// en texte : seule la métadonnée identifie la cible, et ville et date doivent
+/// la matcher. Offsets en chars (grain `case_citation`).
 pub fn attacked_text_spans(d: &Decision, snap: &ChronoSnapshot) -> Vec<(usize, usize, String)> {
     let Some(r) = from_attacked_meta(d, snap) else {
         return Vec::new();
@@ -363,8 +360,7 @@ fn header_has_pourvoi(header: &str) -> bool {
 /// Tribunal judiciaire de PARIS - RG n° 15/02585 » et les variantes « jugement
 /// du <date> - Juge de l'exécution de SAINT-ETIENNE … RG : 18/00064 » et
 /// « jugement du <date> rendu par le tribunal judiciaire de PARIS - RG
-/// n° 21/00000 » — en-têtes CA Judilibre quand `contested` manque
-/// (97 % des CA).
+/// n° 21/00000 » — en-têtes CA Judilibre quand `contested` manque.
 static RE_DEFEREE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)d[ée]cision\s+d[ée]f[ée]r[ée]e[^:]{0,60}:\s*(?:jugements?|ordonnances?|arr[êe]ts?)[^:;]{0,80}?(?:rendue?\s+le|du)\s+(\d{1,2}|1er)\s+([a-zà-ÿ]+)\s+(\d{4})\s*(?:(?:rendue?\s+)?par\s+l[ea]\s*|[-–]\s*)?((?:tribunal\s+judiciaire|tribunal\s+de\s+grande\s+instance|tribunal\s+d[’']instance|juge\s+de\s+l[’']ex[ée]cution|tribunal\s+de\s+commerce|tribunal\s+mixte\s+de\s+commerce)\s+(?:de\s+la\s+|de\s+|d[’']|du\s+)?[\p{L}][\p{L}'’ \-]{1,40}?)\s*[-–,(].{0,120}?RG\s*(?:n[°ºo]\s*)?:?\s*([0-9][0-9A-Za-z/.\-]{3,15})",
@@ -458,9 +454,6 @@ mod tests {
         assert_eq!(refs[0].target_ref, "ca|ca nancy|19 00207|2020-12-08");
     }
 
-    /// Villes à article : le référentiel porte « Le Havre » / « La Rochelle »
-    /// quand la citation contracte (« du Havre ») ou strippe (« de La
-    /// Rochelle » → « rochelle ») l'article — les deux formes doivent mapper.
     #[test]
     fn article_city_resolves_contracted_citation() {
         let snap = ChronoSnapshot::new(vec![

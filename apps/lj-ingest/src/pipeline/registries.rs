@@ -1,11 +1,11 @@
-//! Chargement des registres d'entités (ADR 0179) : SIRENE (unités légales
-//! Insee), RNA (associations), annuaire des avocats (CNB, open data).
+//! Chargement des registres d'entités : SIRENE (unités légales Insee), RNA
+//! (associations), annuaire des avocats (CNB, open data).
 //!
-//! Découverte + download via `lj_sources::registries` (API dataset
-//! data.gouv, URLs de ressources datées) ; chargement par remplacement de
-//! namespace + COPY binaire (`lj_store` — idempotent, règle #7). Le pliage
-//! des dénominations est `fold_stable` (le MÊME que l'extraction NER — la
-//! résolution comparera plié à plié) avec blancs réduits à un.
+//! Découverte + download via `lj_sources::registries` (API dataset data.gouv,
+//! URLs de ressources datées) ; chargement par remplacement de namespace + COPY
+//! binaire (`lj_store`, idempotent). Le pliage des dénominations est
+//! `fold_stable` (le MÊME que l'extraction NER — la résolution comparera plié à
+//! plié) avec blancs réduits à un.
 
 use crate::config::Settings;
 use anyhow::{anyhow, Result};
@@ -15,23 +15,26 @@ use lj_sources::registries::{
     datagouv_latest_resource, decode_field, download_resource, for_each_csv_record,
     RegistryResource,
 };
-use lj_store::repository::{DecisionRepository, EntityHistoryWriteItem, EntityWriteItem};
-use std::collections::HashSet;
+use lj_store::repository::{
+    AffiliationEdge, CnbEntityState, CnbEntityUpdate, DecisionRepository, EntityHistoryWriteItem,
+    EntityWriteItem,
+};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Sources de registres (clap `value_enum`).
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum RegistrySource {
     /// Unités légales Insee (namespace `siren:`) : personnes morales + EI
-    /// diffusibles (ADR 0249).
+    /// diffusibles.
     Sirene,
     /// Répertoire national des associations (namespace `rna:`).
     Rna,
     /// Annuaire des avocats de France, CNB (namespace `cnb:`).
     Avocats,
     /// Annuaire des avocats aux Conseils (Ordre au CE + Cass., namespace
-    /// `oacc:`) — snapshot curé sous `ingest/corpus/registries/oacc.json`
-    /// (ADR 0190), pas de bulk data.gouv.
+    /// `oacc:`) — snapshot curé sous `ingest/corpus/registries/oacc.json`, pas de
+    /// bulk data.gouv.
     AvocatsConseils,
 }
 
@@ -46,13 +49,13 @@ fn canon(s: &str) -> String {
 }
 
 /// Slug d'uid : pliage canonique, blancs et apostrophes en tirets.
-fn slug(s: &str) -> String {
+pub(super) fn slug(s: &str) -> String {
     canon(s).replace([' ', '\''], "-")
 }
 
-/// Clé patronyme composé (ADR 0195) : nom-seul plié, tirets normalisés en
-/// espaces — `None` si mono-token (le nom-seul simple reste irrésoluble).
-fn surname_key(nom: &str) -> Option<String> {
+/// Clé patronyme composé : nom-seul plié, tirets normalisés en espaces —
+/// `None` si mono-token (le nom-seul simple reste irrésoluble).
+pub(super) fn surname_key(nom: &str) -> Option<String> {
     let k = canon(nom)
         .replace('-', " ")
         .split_whitespace()
@@ -86,23 +89,42 @@ pub async fn load_registries(source: RegistrySource, with_history: bool) -> Resu
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
 
-    let (namespace, loaded) = match source {
-        RegistrySource::Sirene => (
-            "siren",
-            load_sirene(&repo, &conn, &dir, with_history).await?,
-        ),
-        RegistrySource::Rna => ("rna", load_rna(&repo, &conn, &dir).await?),
-        RegistrySource::Avocats => ("cnb", load_avocats(&repo, &conn, &dir).await?),
+    // Toggle GIN encadrant : le régime établi tient `entity_folded_all_idx` à
+    // `fastupdate = off` (les probes at-write de la résolution des parties ne
+    // rescannent pas de pending list) ; le reload bulk repasse en `on` le temps du
+    // COPY, puis restaure `off` ET vide la pending list — le retour à `off` ne la
+    // vide pas. Restauration sur les deux chemins.
+    conn.batch_execute("ALTER INDEX entity_folded_all_idx SET (fastupdate = on)")
+        .await?;
+    let result = match source {
+        RegistrySource::Sirene => load_sirene(&repo, &conn, &dir, with_history)
+            .await
+            .map(|n| ("siren", n)),
+        RegistrySource::Rna => load_rna(&repo, &conn, &dir).await.map(|n| ("rna", n)),
+        RegistrySource::Avocats => load_avocats(&repo, &conn, &dir).await.map(|n| ("cnb", n)),
         RegistrySource::AvocatsConseils => {
-            // Snapshot curé (règle #17) : `ingest/corpus/registries/oacc.json`,
-            // pas de download data.gouv (annuaire sans bulk, ADR 0190).
+            // Snapshot curé : `ingest/corpus/registries/oacc.json`, pas de download
+            // data.gouv (annuaire sans bulk).
             let path = settings
                 .legal_corpus_dir()
                 .join("registries")
                 .join("oacc.json");
-            ("oacc", load_avocats_conseils(&repo, &conn, &path).await?)
+            load_avocats_conseils(&repo, &conn, &path)
+                .await
+                .map(|n| ("oacc", n))
         }
     };
+    // Un échec laisse la connexion dans sa transaction avortée : la purger, sinon
+    // la restauration ci-dessous échoue et masque l'erreur du loader.
+    if result.is_err() {
+        conn.batch_execute("ROLLBACK").await.ok();
+    }
+    conn.batch_execute(
+        "ALTER INDEX entity_folded_all_idx SET (fastupdate = off); \
+         SELECT gin_clean_pending_list('entity_folded_all_idx')",
+    )
+    .await?;
+    let (namespace, loaded) = result?;
     let count = repo.entity_count(namespace).await?;
     tracing::info!(namespace, loaded, count, "registre chargé");
     println!("registries {namespace} : {loaded} entités chargées ({count} en base).");
@@ -158,7 +180,7 @@ impl Cols {
     }
 }
 
-fn field(rec: &csv::ByteRecord, i: usize) -> String {
+pub(super) fn field(rec: &csv::ByteRecord, i: usize) -> String {
     decode_field(rec.get(i).unwrap_or(b"")).trim().to_string()
 }
 
@@ -225,14 +247,13 @@ impl<'a, 'b> Loader<'a, 'b> {
 }
 
 // ---------------------------------------------------------------------------
-// Catégorie d'annuaire (ADR 0239) — dérivation UNIQUE, un seul écrivain
+// Catégorie d'annuaire — dérivation UNIQUE, un seul écrivain
 // ---------------------------------------------------------------------------
 
 /// Tokens (pliés) qui excluent une unité APE 69.10Z de la catégorie
 /// `cabinets` : les autres professions du droit partagent le code —
 /// études notariales, huissiers/commissaires de justice, AJ-MJ, greffiers
-/// des tribunaux de commerce. Règle calibrée sur le stock (working-note
-/// du plan ADR 0239).
+/// des tribunaux de commerce.
 const NON_CABINET_TOKENS: &[&str] = &[
     "notair",
     "notari",
@@ -263,8 +284,8 @@ fn sirene_category(nature: &'static str, ape: Option<&str>, folded: &str) -> &'s
 // ---------------------------------------------------------------------------
 
 /// Nature depuis la catégorie juridique Insee : `1xxx` = entrepreneur
-/// individuel (personne physique, chargée si diffusible — ADR 0249) ;
-/// niveaux 4/7 = droit public.
+/// individuel (personne physique, chargée si diffusible) ; niveaux 4/7 =
+/// droit public.
 fn sirene_nature(cat: &str) -> Option<&'static str> {
     match cat.as_bytes().first()? {
         b'1' => Some("physique"),
@@ -334,9 +355,9 @@ async fn load_sirene(
             let Some(nature) = sirene_nature(&cat) else {
                 return Ok(());
             };
-            // EI (ADR 0249) : personnes physiques diffusibles seulement,
-            // nom = PRENOM NOM (usuels d'abord) ; alternatives = ordre
-            // inverse + nom commercial. Morales : dénomination telle quelle.
+            // EI : personnes physiques diffusibles seulement, nom = PRENOM NOM
+            // (usuels d'abord) ; alternatives = ordre inverse + nom commercial.
+            // Morales : dénomination telle quelle.
             let (denom, alt_denominations) = if nature == "physique" {
                 if field(rec, statut) != "O" {
                     return Ok(());
@@ -385,6 +406,7 @@ async fn load_sirene(
                 ape,
                 barreau: None,
                 alt_denominations,
+                activity: None,
             })
         })?;
         loader.flush()?;
@@ -392,7 +414,7 @@ async fn load_sirene(
     })?;
 
     // Historique : périodes CLOSES de dénomination (la courante est déjà là) —
-    // stagées puis fusionnées d'un bloc dans `entity.denominations` (ADR 0245).
+    // stagées puis fusionnées d'un bloc dans `entity.denominations`.
     let mut hist_rows = 0u64;
     if let Some(hist) = history {
         repo.entity_history_stage_init().await?;
@@ -481,6 +503,7 @@ async fn load_rna(
                 ape: None,
                 barreau: None,
                 alt_denominations: Vec::new(),
+                activity: None,
                 denomination: titre,
             })
         })?;
@@ -492,74 +515,403 @@ async fn load_rna(
 }
 
 // ---------------------------------------------------------------------------
-// Avocats — annuaire CNB (open data, Licence Ouverte 2.0)
+// Avocats — annuaire CNB (open data, Licence Ouverte 2.0) : identité par code
+// CNBF, upsert vivant (on ne supprime plus, on observe), spans d'activité,
+// affiliations à la structure d'exercice (siren déclaré).
 // ---------------------------------------------------------------------------
 
-async fn load_avocats(
-    repo: &DecisionRepository<'_>,
-    conn: &lj_store::db::Connection,
-    dir: &Path,
-) -> Result<u64> {
-    let (_, path) = fetch(
+/// Ligne avocat du CSV riche (schéma data.gouv de juillet 2026).
+#[derive(Debug)]
+pub(super) struct AvocatRow {
+    pub(super) cnbf: String,
+    /// Nom de barreau brut (pour `forme`).
+    pub(super) barreau: String,
+    pub(super) barreau_slug: String,
+    pub(super) nom: String,
+    pub(super) prenom: String,
+    /// `avBarEntree` — entrée au barreau, déclarée.
+    pub(super) bar_entree: Option<chrono::NaiveDate>,
+    /// `cbSiretSiren` — siren de la structure d'exercice (EI de l'avocat pour
+    /// les CABI, société sinon).
+    pub(super) siren: Option<String>,
+    /// `acDateEntree` — entrée dans la structure courante.
+    pub(super) date_entree: Option<chrono::NaiveDate>,
+}
+
+impl AvocatRow {
+    /// Slug `nom-prenom` — le 3ᵉ segment des uids legacy
+    /// `cnb:{barreau}:{nom}-{prenom}`.
+    pub(super) fn nomprenom_slug(&self) -> String {
+        format!("{}-{}", slug(&self.nom), slug(&self.prenom))
+    }
+}
+
+/// Date `YYYYMMDD` stricte du CSV CNB.
+pub(super) fn parse_yyyymmdd(s: &str) -> Option<chrono::NaiveDate> {
+    if s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit()) {
+        chrono::NaiveDate::parse_from_str(s, "%Y%m%d").ok()
+    } else {
+        None
+    }
+}
+
+/// Un code CNBF valide est numérique — les lignes de pied de fichier du CSV
+/// portent le marqueur `V1.8` dans cette colonne.
+fn is_cnbf(code: &str) -> bool {
+    !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Date du snapshot depuis le titre de la ressource
+/// (`annuaire-avocats-20260717.CSV`) : dernière fenêtre de 8 chiffres.
+pub(super) fn snapshot_date_from_title(title: &str) -> Option<chrono::NaiveDate> {
+    let digits: Vec<(usize, char)> = title.char_indices().collect();
+    let bytes = title.as_bytes();
+    let mut best = None;
+    let mut run = 0usize;
+    for (i, _) in digits {
+        if bytes[i].is_ascii_digit() {
+            run += 1;
+            if run >= 8 {
+                best = parse_yyyymmdd(&title[i + 1 - 8..=i]).or(best);
+            }
+        } else {
+            run = 0;
+        }
+    }
+    best
+}
+
+/// Résultat du diff d'upsert CNB (pure, testé) — ce qu'il faut écrire, et
+/// les identités nouvelles/réactivées pour la sonde du delta.
+struct CnbDiff {
+    inserts: Vec<EntityWriteItem>,
+    updates: Vec<CnbEntityUpdate>,
+    deactivated: u64,
+    reactivated: u64,
+    /// Uids apparus ou réactivés à ce snapshot — surfaces à sonder contre
+    /// les clés pendantes.
+    added_uids: Vec<String>,
+}
+
+/// Ouvre un span d'activité `cnb` (`du` optionnel).
+fn cnb_span(du: Option<chrono::NaiveDate>) -> serde_json::Value {
+    match du {
+        Some(d) => serde_json::json!({"du": d.to_string(), "src": "cnb"}),
+        None => serde_json::json!({"src": "cnb"}),
+    }
+}
+
+/// Ferme les spans `cnb` ouverts (`au` absent) d'un tableau d'activité.
+fn close_open_spans(activity: &mut serde_json::Value, au: chrono::NaiveDate) {
+    if let Some(spans) = activity.as_array_mut() {
+        for s in spans {
+            if s.get("src").and_then(|v| v.as_str()) == Some("cnb") && s.get("au").is_none() {
+                s["au"] = serde_json::Value::String(au.to_string());
+            }
+        }
+    }
+}
+
+/// Diff d'upsert : CSV du snapshot × état `cnb:` en base → écritures.
+/// Présent = actif (réapparition rouvre un span à la date du snapshot) ;
+/// absent = inactif, spans clos, la ligne reste ; un changement de barreau est
+/// une mutation d'attribut, pas d'identité. `activity` absent en base (stock du
+/// re-key) est semé depuis `avBarEntree`.
+fn cnb_diff(
+    rows: &[AvocatRow],
+    existing: &[CnbEntityState],
+    snapshot: chrono::NaiveDate,
+) -> CnbDiff {
+    let by_uid: std::collections::HashMap<&str, &CnbEntityState> =
+        existing.iter().map(|s| (s.uid.as_str(), s)).collect();
+    let mut diff = CnbDiff {
+        inserts: Vec::new(),
+        updates: Vec::new(),
+        deactivated: 0,
+        reactivated: 0,
+        added_uids: Vec::new(),
+    };
+    let mut seen: HashSet<&str> = HashSet::with_capacity(rows.len());
+    for r in rows {
+        let uid = format!("cnb:{}", r.cnbf);
+        if !seen.insert(&r.cnbf) {
+            continue;
+        }
+        let denomination = format!("{} {}", r.prenom, r.nom).trim().to_string();
+        let surname = surname_key(&r.nom);
+        let forme = Some(format!("avocat ({})", r.barreau));
+        match by_uid.get(uid.as_str()) {
+            None => {
+                diff.added_uids.push(uid.clone());
+                diff.inserts.push(EntityWriteItem {
+                    uid,
+                    nature: "physique",
+                    denomination,
+                    sigle: None,
+                    forme,
+                    active: true,
+                    surname_key: surname,
+                    category: "avocats",
+                    ape: None,
+                    barreau: Some(r.barreau_slug.clone()),
+                    alt_denominations: Vec::new(),
+                    activity: Some(serde_json::json!([cnb_span(r.bar_entree)])),
+                });
+            }
+            Some(state) => {
+                let mut activity = state.activity.clone();
+                match activity.as_mut() {
+                    // Stock du re-key sans évidence : semé depuis la date
+                    // déclarée d'entrée au barreau.
+                    None => activity = Some(serde_json::json!([cnb_span(r.bar_entree)])),
+                    Some(act) => {
+                        if !state.active {
+                            // Réapparition (come and go) : nouveau span
+                            // observé au snapshot.
+                            if let Some(spans) = act.as_array_mut() {
+                                spans.push(cnb_span(Some(snapshot)));
+                            }
+                        } else if let Some(spans) = act.as_array_mut() {
+                            // Baseline mono-span sans du : la source déclare
+                            // l'entrée au barreau, on l'adopte.
+                            if let (1, Some(d)) = (spans.len(), r.bar_entree) {
+                                let s = &mut spans[0];
+                                if s.get("du").is_none() && s.get("au").is_none() {
+                                    s["du"] = serde_json::Value::String(d.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                if !state.active {
+                    diff.reactivated += 1;
+                    diff.added_uids.push(uid.clone());
+                }
+                let changed = !state.active
+                    || state.barreau.as_deref() != Some(r.barreau_slug.as_str())
+                    || state.denomination != denomination
+                    || state.surname_key != surname
+                    || state.activity != activity;
+                if changed {
+                    diff.updates.push(CnbEntityUpdate {
+                        uid,
+                        active: true,
+                        activity,
+                        barreau: Some(r.barreau_slug.clone()),
+                        denomination,
+                        forme,
+                        surname_key: surname,
+                    });
+                }
+            }
+        }
+    }
+    let present: HashSet<String> = rows.iter().map(|r| format!("cnb:{}", r.cnbf)).collect();
+    for state in existing {
+        if state.active && !present.contains(&state.uid) {
+            diff.deactivated += 1;
+            let mut activity = state
+                .activity
+                .clone()
+                .unwrap_or_else(|| serde_json::json!([cnb_span(None)]));
+            close_open_spans(&mut activity, snapshot);
+            diff.updates.push(CnbEntityUpdate {
+                uid: state.uid.clone(),
+                active: false,
+                activity: Some(activity),
+                barreau: state.barreau.clone(),
+                denomination: state.denomination.clone(),
+                forme: state.forme.clone(),
+                surname_key: state.surname_key.clone(),
+            });
+        }
+    }
+    diff
+}
+
+/// Télécharge le snapshot CNB courant et le parse (filtres pieds de fichier
+/// + identité). Partagé entre le reload upsert et le re-key one-shot.
+pub(super) async fn fetch_avocat_rows(dir: &Path) -> Result<(Vec<AvocatRow>, chrono::NaiveDate)> {
+    let (res, path) = fetch(
         "annuaire-des-avocats-de-france",
         dir,
         |_| true,
         |f| f.eq_ignore_ascii_case("csv"),
     )
     .await?;
-    conn.batch_execute("BEGIN").await?;
-    let cleared = repo.entity_namespace_clear("cnb").await?;
-    tracing::info!(cleared, "namespace cnb vidé");
-    let loaded = tokio::task::block_in_place(|| -> Result<u64, SourceError> {
-        let mut loader = Loader::new(repo);
+    let snapshot =
+        snapshot_date_from_title(&res.title).unwrap_or_else(|| chrono::Utc::now().date_naive());
+
+    // Parse complet en mémoire : le diff a besoin du snapshot entier face à
+    // l'état en base.
+    let rows = tokio::task::block_in_place(|| -> Result<Vec<AvocatRow>, SourceError> {
+        let mut rows = Vec::new();
         let mut cols = Cols::new();
-        let mut seen: HashSet<String> = HashSet::new();
         for_each_csv_record(&path, b';', |headers, rec| {
-            let &[barreau, nom, prenom] =
-                cols.resolve(headers, &["Barreau", "avNom", "avPrenom"])?
+            let &[cnbf, barreau, nom, prenom, bar_entree, siren, date_entree] = cols.resolve(
+                headers,
+                &[
+                    "avCnbfCode",
+                    "Barreau",
+                    "avNom",
+                    "avPrenom",
+                    "avBarEntree",
+                    "cbSiretSiren",
+                    "acDateEntree",
+                ],
+            )?
             else {
-                unreachable!("3 colonnes demandées")
+                unreachable!("7 colonnes demandées")
             };
+            let cnbf = field(rec, cnbf);
             let nom = field(rec, nom);
-            let prenom = field(rec, prenom);
+            // Pieds de fichier (V1.8) + lignes sans identité.
+            if !is_cnbf(&cnbf) || nom.is_empty() {
+                return Ok(());
+            }
             let barreau = field(rec, barreau);
-            if nom.is_empty() {
-                return Ok(());
-            }
-            // Pas d'id source : la clé naturelle est (barreau, nom, prénom).
-            let barreau_slug = slug(&barreau);
-            let uid = format!("cnb:{barreau_slug}:{}-{}", slug(&nom), slug(&prenom));
-            if !seen.insert(uid.clone()) {
-                return Ok(());
-            }
-            let denomination = format!("{prenom} {nom}").trim().to_string();
-            loader.push(EntityWriteItem {
-                uid,
-                nature: "physique",
-                denomination,
-                sigle: None,
-                forme: Some(format!("avocat ({barreau})")),
-                active: true,
-                surname_key: surname_key(&nom),
-                category: "avocats",
-                ape: None,
-                barreau: Some(barreau_slug),
-                alt_denominations: Vec::new(),
-            })
+            let siren = Some(field(rec, siren))
+                .filter(|s| s.len() == 9 && s.bytes().all(|b| b.is_ascii_digit()));
+            rows.push(AvocatRow {
+                cnbf,
+                barreau_slug: slug(&barreau),
+                barreau,
+                prenom: field(rec, prenom),
+                bar_entree: parse_yyyymmdd(&field(rec, bar_entree)),
+                siren,
+                date_entree: parse_yyyymmdd(&field(rec, date_entree)),
+                nom,
+            });
+            Ok(())
         })?;
-        loader.flush()?;
-        Ok(loader.loaded)
+        Ok(rows)
     })?;
+    Ok((rows, snapshot))
+}
+
+async fn load_avocats(
+    repo: &DecisionRepository<'_>,
+    conn: &lj_store::db::Connection,
+    dir: &Path,
+) -> Result<u64> {
+    let (rows, snapshot) = fetch_avocat_rows(dir).await?;
+    // L'UPDATE en masse du registre (index GIN d'entity) dépasse le
+    // `statement_timeout` du pool.
+    conn.batch_execute("BEGIN; SET LOCAL statement_timeout = 0")
+        .await?;
+    let existing = repo.entity_cnb_states().await?;
+    // L'upsert est clé sur le code CNBF : un stock legacy encore ACTIF
+    // signifie que le re-key n'a pas tourné — chaque reload dédoublerait le
+    // registre. Les legacy inactifs (réhydratés, sortis avant l'apparition du
+    // code) sont légitimes.
+    let legacy_active = existing
+        .iter()
+        .filter(|s| s.active && !s.uid[4..].bytes().all(|b| b.is_ascii_digit()))
+        .count();
+    if legacy_active > 0 {
+        anyhow::bail!(
+            "{legacy_active} uids cnb legacy actifs — lancer `lj-ingest rekey-cnb` \
+             avant le premier reload upsert"
+        );
+    }
+
+    let diff = cnb_diff(&rows, &existing, snapshot);
+    for batch in diff.inserts.chunks(BATCH) {
+        repo.entity_copy(batch).await?;
+    }
+    let updated = repo.entity_cnb_update_bulk(&diff.updates).await?;
+
+    // Affiliations déclarées (source `cnb`) : diff des arêtes ouvertes contre le
+    // siren de structure du snapshot.
+    let open = repo.affiliation_open_edges("cnb").await?;
+    let open_by_uid: std::collections::HashMap<&str, (&str, Option<chrono::NaiveDate>)> = open
+        .iter()
+        .map(|(e, s, du)| (e.as_str(), (s.as_str(), *du)))
+        .collect();
+    let mut desired: std::collections::HashMap<String, (String, Option<chrono::NaiveDate>)> =
+        std::collections::HashMap::new();
+    for r in &rows {
+        if let Some(siren) = &r.siren {
+            desired.insert(
+                format!("cnb:{}", r.cnbf),
+                (format!("siren:{siren}"), r.date_entree),
+            );
+        }
+    }
+    let mut to_close: Vec<String> = Vec::new();
+    let mut to_insert: Vec<AffiliationEdge> = Vec::new();
+    let mut to_backfill: Vec<(String, chrono::NaiveDate)> = Vec::new();
+    for (uid, (structure, du)) in &desired {
+        match open_by_uid.get(uid.as_str()) {
+            None => to_insert.push(AffiliationEdge {
+                entity_uid: uid.clone(),
+                structure_uid: structure.clone(),
+                du: *du,
+                au: None,
+            }),
+            Some((open_structure, _)) if *open_structure != structure.as_str() => {
+                // Mobilité observée : l'ancienne arête se clôt au snapshot,
+                // la nouvelle s'ouvre à la date déclarée (sinon au snapshot).
+                to_close.push(uid.clone());
+                to_insert.push(AffiliationEdge {
+                    entity_uid: uid.clone(),
+                    structure_uid: structure.clone(),
+                    du: du.or(Some(snapshot)),
+                    au: None,
+                });
+            }
+            Some((_, open_du)) => {
+                if let (None, Some(d)) = (open_du, du) {
+                    to_backfill.push((uid.clone(), *d));
+                }
+            }
+        }
+    }
+    for (uid, _, _) in &open {
+        if !desired.contains_key(uid) {
+            to_close.push(uid.clone());
+        }
+    }
+    let closed = repo
+        .affiliation_close_bulk("cnb", &to_close, snapshot)
+        .await?;
+    let opened = repo.affiliation_insert_bulk("cnb", &to_insert).await?;
+    let backfilled = repo.affiliation_backfill_du("cnb", &to_backfill).await?;
+
+    // Delta at-write : les identités nouvelles/réactivées dé-lient d'abord ce que
+    // leur arrivée rend ambigu à date (patronyme, nom complet), puis attirent les
+    // clés pendantes qui les visaient.
+    let delta_unlinked = repo.cnb_delta_unlink(&diff.added_uids).await?;
+    let delta_linked = repo
+        .resolve_pending_counsel_for_added(&diff.added_uids)
+        .await?;
     conn.batch_execute("COMMIT").await?;
-    Ok(loaded)
+
+    tracing::info!(
+        rows = rows.len(),
+        inserted = diff.inserts.len(),
+        updated,
+        deactivated = diff.deactivated,
+        reactivated = diff.reactivated,
+        edges_closed = closed,
+        edges_opened = opened,
+        edges_backfilled = backfilled,
+        delta_unlinked,
+        delta_linked,
+        %snapshot,
+        "cnb upsert"
+    );
+    Ok(rows.len() as u64)
 }
 
 // ---------------------------------------------------------------------------
-// Avocats aux Conseils — annuaire OACC (snapshot curé, ADR 0190)
+// Avocats aux Conseils — annuaire OACC (snapshot curé)
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
 struct OaccData {
+    /// Date de capture du snapshot curé — `au` des arêtes que ce reload ferme.
+    captured_at: chrono::NaiveDate,
     avocats: Vec<OaccAvocat>,
     societes: Vec<OaccSociete>,
 }
@@ -570,21 +922,30 @@ struct OaccAvocat {
     prenom: String,
     /// Nom d'affichage « Prénom NOM » — dénomination de résolution.
     full_name: String,
+    /// Courriel de contact — celui du CABINET, d'où l'affiliation.
+    email: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct OaccSociete {
     /// Raison sociale officielle (SCP/SARL/Cabinet…, tous les associés).
     nom: String,
+    email: Option<String>,
+}
+
+/// Courriel comparable : casse et blancs de bord neutralisés.
+fn mail_key(email: Option<&String>) -> Option<String> {
+    let e = email?.trim().to_ascii_lowercase();
+    (!e.is_empty()).then_some(e)
 }
 
 /// Charge le registre des avocats aux Conseils depuis le snapshot curé JSON
-/// (même racine `ingest/corpus` que `load-legal-corpus`). Dataset minuscule
-/// (~140 lignes) : deux COPY directs dans la transaction, pas de streaming.
+/// (même racine `ingest/corpus` que `load-legal-corpus`). Dataset minuscule :
+/// deux COPY directs dans la transaction, pas de streaming.
 ///
 /// Uid : `oacc:<nom>-<prenom>` (avocats, comme cnb sans segment barreau) et
 /// `oacc:firm-<raison-pliée>` (sociétés). Dénomination « Prénom NOM » /
-/// raison sociale, pliée `fold_stable` (la résolution comparera plié à plié).
+/// raison sociale, pliée `fold_stable`.
 async fn load_avocats_conseils(
     repo: &DecisionRepository<'_>,
     conn: &lj_store::db::Connection,
@@ -600,6 +961,10 @@ async fn load_avocats_conseils(
 
     let mut ents: Vec<EntityWriteItem> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
+    // Courriel de cabinet → uid de société, quand il en désigne UNE seule
+    // (un courriel partagé par deux raisons sociales ne tranche rien).
+    let mut firm_by_mail: HashMap<String, Option<String>> = HashMap::new();
+    let mut avocat_mail: Vec<(String, String)> = Vec::new();
 
     for av in &data.avocats {
         if av.nom.is_empty() {
@@ -608,6 +973,9 @@ async fn load_avocats_conseils(
         let uid = format!("oacc:{}-{}", slug(&av.nom), slug(&av.prenom));
         if !seen.insert(uid.clone()) {
             continue;
+        }
+        if let Some(m) = mail_key(av.email.as_ref()) {
+            avocat_mail.push((uid.clone(), m));
         }
         ents.push(EntityWriteItem {
             uid,
@@ -621,6 +989,7 @@ async fn load_avocats_conseils(
             ape: None,
             barreau: None,
             alt_denominations: Vec::new(),
+            activity: None,
         });
     }
 
@@ -632,6 +1001,12 @@ async fn load_avocats_conseils(
         let uid = format!("oacc:firm-{}", firm_slug(&nom));
         if !seen.insert(uid.clone()) {
             continue;
+        }
+        if let Some(m) = mail_key(sc.email.as_ref()) {
+            firm_by_mail
+                .entry(m)
+                .and_modify(|v| *v = None)
+                .or_insert(Some(uid.clone()));
         }
         ents.push(EntityWriteItem {
             uid,
@@ -645,17 +1020,67 @@ async fn load_avocats_conseils(
             ape: None,
             barreau: None,
             alt_denominations: Vec::new(),
+            activity: None,
         });
     }
+
+    // Affiliations (source `oacc`) : l'avocat aux Conseils porte le courriel de
+    // son cabinet, qui le désigne. Snapshot sans dates — les arêtes s'ouvrent sans
+    // `du` (début inconnu), le diff clôt les départs.
+    let desired: Vec<(String, String)> = avocat_mail
+        .iter()
+        .filter_map(|(uid, mail)| match firm_by_mail.get(mail) {
+            Some(Some(firm)) => Some((uid.clone(), firm.clone())),
+            _ => None,
+        })
+        .collect();
 
     conn.batch_execute("BEGIN").await?;
     let cleared = repo.entity_namespace_clear("oacc").await?;
     tracing::info!(cleared, "namespace oacc vidé");
     repo.entity_copy(&ents).await?;
+
+    let open = repo.affiliation_open_edges("oacc").await?;
+    let open_by_uid: HashMap<&str, &str> = open
+        .iter()
+        .map(|(e, s, _)| (e.as_str(), s.as_str()))
+        .collect();
+    let desired_uids: HashSet<&str> = desired.iter().map(|(u, _)| u.as_str()).collect();
+    let mut to_close: Vec<String> = Vec::new();
+    let mut to_insert: Vec<AffiliationEdge> = Vec::new();
+    for (uid, firm) in &desired {
+        let edge = |du| AffiliationEdge {
+            entity_uid: uid.clone(),
+            structure_uid: firm.clone(),
+            du,
+            au: None,
+        };
+        match open_by_uid.get(uid.as_str()) {
+            Some(open_firm) if *open_firm == firm.as_str() => {}
+            Some(_) => {
+                to_close.push(uid.clone());
+                to_insert.push(edge(Some(data.captured_at)));
+            }
+            None => to_insert.push(edge(None)),
+        }
+    }
+    for (uid, _, _) in &open {
+        if !desired_uids.contains(uid.as_str()) {
+            to_close.push(uid.clone());
+        }
+    }
+    let edges_closed = repo
+        .affiliation_close_bulk("oacc", &to_close, data.captured_at)
+        .await?;
+    let edges_opened = repo.affiliation_insert_bulk("oacc", &to_insert).await?;
     conn.batch_execute("COMMIT").await?;
+
     tracing::info!(
         avocats = data.avocats.len(),
         societes = data.societes.len(),
+        edges = desired.len(),
+        edges_closed,
+        edges_opened,
         "oacc chargé"
     );
     Ok(ents.len() as u64)
@@ -665,8 +1090,6 @@ async fn load_avocats_conseils(
 mod tests {
     use super::*;
 
-    // Spec ADR 0239 : cabinets = APE 69.10Z sans token d'une autre profession
-    // du droit ; le droit public prime ; hors 69.10Z → entreprises.
     #[test]
     fn sirene_category_cabinets_apres_exclusions() {
         assert_eq!(
@@ -695,5 +1118,129 @@ mod tests {
             sirene_category("morale_publique", Some("69.10Z"), "chambre des notaires"),
             "personnes_publiques"
         );
+    }
+
+    // ── Upsert CNB ──────────────────────────────────────────────────────────
+
+    fn d(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn row(cnbf: &str, barreau: &str, nom: &str, prenom: &str) -> AvocatRow {
+        AvocatRow {
+            cnbf: cnbf.to_string(),
+            barreau: barreau.to_string(),
+            barreau_slug: slug(barreau),
+            nom: nom.to_string(),
+            prenom: prenom.to_string(),
+            bar_entree: Some(d("2019-01-01")),
+            siren: None,
+            date_entree: None,
+        }
+    }
+
+    fn state(uid: &str, active: bool, activity: Option<serde_json::Value>) -> CnbEntityState {
+        CnbEntityState {
+            uid: uid.to_string(),
+            active,
+            activity,
+            barreau: Some("agen".to_string()),
+            denomination: "Dahab Azzouz".to_string(),
+            surname_key: None,
+            forme: Some("avocat (AGEN)".to_string()),
+        }
+    }
+
+    #[test]
+    fn cnb_diff_upsert_spec() {
+        let snapshot = d("2026-07-17");
+
+        let diff = cnb_diff(&[row("300730", "AGEN", "AZZOUZ", "Dahab")], &[], snapshot);
+        assert_eq!(diff.inserts.len(), 1);
+        assert_eq!(diff.inserts[0].uid, "cnb:300730");
+        assert_eq!(
+            diff.inserts[0].activity,
+            Some(serde_json::json!([{"du": "2019-01-01", "src": "cnb"}]))
+        );
+        assert_eq!(diff.added_uids, vec!["cnb:300730"]);
+
+        let cur = state(
+            "cnb:300730",
+            true,
+            Some(serde_json::json!([{"du": "2019-01-01", "src": "cnb"}])),
+        );
+        let mut cur = cur;
+        cur.denomination = "Dahab AZZOUZ".to_string();
+        let rows = [row("300730", "AGEN", "AZZOUZ", "Dahab")];
+        let diff = cnb_diff(&rows, std::slice::from_ref(&cur), snapshot);
+        assert!(diff.inserts.is_empty() && diff.updates.is_empty());
+
+        let diff = cnb_diff(&[], std::slice::from_ref(&cur), snapshot);
+        assert_eq!(diff.deactivated, 1);
+        assert_eq!(diff.updates.len(), 1);
+        assert!(!diff.updates[0].active);
+        assert_eq!(
+            diff.updates[0].activity,
+            Some(serde_json::json!([{"du": "2019-01-01", "au": "2026-07-17", "src": "cnb"}]))
+        );
+
+        let gone = state(
+            "cnb:300730",
+            false,
+            Some(serde_json::json!([{"du": "2019-01-01", "au": "2024-01-01", "src": "cnb"}])),
+        );
+        let diff = cnb_diff(&rows, std::slice::from_ref(&gone), snapshot);
+        assert_eq!(diff.reactivated, 1);
+        assert_eq!(diff.added_uids, vec!["cnb:300730"]);
+        assert_eq!(
+            diff.updates[0].activity,
+            Some(serde_json::json!([
+                {"du": "2019-01-01", "au": "2024-01-01", "src": "cnb"},
+                {"du": "2026-07-17", "src": "cnb"}
+            ]))
+        );
+
+        let diff = cnb_diff(
+            &[row("300730", "LYON", "AZZOUZ", "Dahab")],
+            std::slice::from_ref(&cur),
+            snapshot,
+        );
+        assert!(diff.inserts.is_empty());
+        assert_eq!(diff.updates.len(), 1);
+        assert_eq!(diff.updates[0].barreau.as_deref(), Some("lyon"));
+        assert!(diff.updates[0].active);
+
+        let bare = state("cnb:300730", true, None);
+        let diff = cnb_diff(&rows, std::slice::from_ref(&bare), snapshot);
+        assert_eq!(
+            diff.updates[0].activity,
+            Some(serde_json::json!([{"du": "2019-01-01", "src": "cnb"}]))
+        );
+
+        let diff = cnb_diff(
+            &[
+                row("300730", "AGEN", "AZZOUZ", "Dahab"),
+                row("300730", "LYON", "AZZOUZ", "Dahab"),
+            ],
+            &[],
+            snapshot,
+        );
+        assert_eq!(diff.inserts.len(), 1);
+        assert_eq!(diff.inserts[0].barreau.as_deref(), Some("agen"));
+    }
+
+    #[test]
+    fn cnb_csv_guards() {
+        assert!(!is_cnbf("V1.8"));
+        assert!(!is_cnbf(""));
+        assert!(is_cnbf("300730"));
+        assert_eq!(parse_yyyymmdd("20190101"), Some(d("2019-01-01")));
+        assert_eq!(parse_yyyymmdd("1"), None);
+        assert_eq!(parse_yyyymmdd("20191301"), None);
+        assert_eq!(
+            snapshot_date_from_title("annuaire-avocats-20260717.CSV"),
+            Some(d("2026-07-17"))
+        );
+        assert_eq!(snapshot_date_from_title("annuaire-avocats.csv"), None);
     }
 }

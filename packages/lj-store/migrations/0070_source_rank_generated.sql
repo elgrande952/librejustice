@@ -1,11 +1,11 @@
 -- `decision_sources.source_rank` devient une colonne GÉNÉRÉE depuis `source`
--- (ADR 0113, révise ADR 0098 §3).
+-- au lieu d'être écrite à l'ingest.
 --
 -- Le rang d'autorité (gagnant = max) est une fonction pure de `source` : le
 -- stocker en colonne libre écrite à l'ingest a dérivé (1 033 490 provenances
 -- opendata figées à 40 — leur rang au moment de l'ingest — alors que le barème
 -- code valait 55, faisant gagner jade(50) sur l'overlap admin contre l'intention
--- ADR 0098). Une colonne `GENERATED ALWAYS … STORED` recalcule le rang depuis
+-- du barème). Une colonne `GENERATED ALWAYS … STORED` recalcule le rang depuis
 -- `source` à chaque écriture : barème unique dans la DDL, drift structurellement
 -- impossible, `ORDER BY source_rank DESC` inchangé (les index/tris la lisent
 -- comme une colonne normale).

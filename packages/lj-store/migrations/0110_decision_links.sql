@@ -1,5 +1,5 @@
--- Liens de chronologie entre décisions (ADR 0161) : de la décision qui
--- attaque vers la décision attaquée. `target_ref` = canonical_ref (ADR 0100)
+-- Liens de chronologie entre décisions : de la décision qui
+-- attaque vers la décision attaquée. `target_ref` = canonical_ref
 -- de la cible, clé PENDANTE tant qu'aucune décision unique et active ne la
 -- porte ; `target_decision_id` posé à l'écriture ou par le relink.
 

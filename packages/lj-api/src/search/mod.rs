@@ -1,30 +1,15 @@
-//! Recherche hybride (BM25 ParadeDB `@@@` + ANN `<=>`) — port de `search.py`.
+//! Recherche hybride (BM25 ParadeDB `@@@` + ANN `<=>`).
 //!
 //! 1. `embed_query` produit le vecteur requête (chemin hybride).
-//! 2. En parallèle :
-//!    - **BM25 body** : `decisions_bm25` (`full_text`) au grain décision
-//!      (ADR 0084) — phrase-combo S5 (phrase entière + runs content ≥2 + tokens
-//!      OR) ou la traduction booléenne ; `LIMIT leg_limit` direct, plus de
-//!      sur-récupération ni de pooling (supersede la jambe chunk de l'ADR 0080).
-//!    - **BM25 titre** : `decisions_bm25` (`search_title`) au grain décision,
-//!      mêmes filtres que la jambe body.
-//!    - **ANN** VectorChord : `ORDER BY embedding <=> quantize_to_rabitq8(...)`
-//!      sur `decision_chunks` — la SEULE jambe encore au grain chunk
-//!      (max-pool ×1,1 par décision, ADR 0080 conservé : on ne somme jamais des
-//!      embeddings).
-//! 3. Fusion RRF au grain décision pondérée adaptative (signals), cap + seuil
-//!    relatif.
-//! 4. Hydratation métadonnées + facettes + snippets (`<mark>` depuis
-//!    `full_text` ; fenêtre ancrée au chunk gagnant pour un hit ANN).
+//! 2. En parallèle : BM25 body (`decisions_bm25` sur `full_text`, phrase-combo ou
+//!    traduction booléenne), BM25 titre (`search_title`), et ANN VectorChord sur
+//!    `decision_chunks` — la seule jambe encore au grain chunk (max-pool par
+//!    décision).
+//! 3. Fusion RRF au grain décision, pondération adaptative, cap et seuil relatif.
+//! 4. Hydratation métadonnées + facettes + snippets.
 //!
-//! Le tri stable tie-break par `source_uid`/id est assuré par l'ordre déterministe
-//! des `ORDER BY` SQL et le tri final sur le score puis l'id.
-//!
-//! NB scope : ce port couvre le retrieval + fusion + facettes + hydratation +
-//! snippets + rerank LLM (ai_mode, top-50 avant tri par date). Le résultat ranké
-//! (post-rerank) est mis en cache moka in-process par requête (cf.
-//! [`RankedResults`]), donc le rerank n'est pas rejoué par page ni sur requête
-//! répétée tant que l'entrée est chaude (TTL 1 h).
+//! Le tri stable tie-break par `source_uid`/id vient de l'ordre déterministe des
+//! `ORDER BY` SQL et du tri final sur le score puis l'id.
 
 mod adaptive;
 mod dates;
@@ -38,12 +23,13 @@ use std::collections::HashMap;
 
 use deadpool_postgres::Client;
 use lj_llm::backend::Embedder;
-use lj_llm::mistral::{key_fingerprint, MistralClient};
 use lj_store::repository::DecisionRepository;
 
 use crate::error::{ApiError, Result};
 use crate::referential::referential;
-use crate::rerank::{rerank_shortlist, RerankItem, RERANK_K};
+use crate::rerank::{
+    cached_order, rerank_shortlist, DocScores, RerankItem, RERANK_BUDGET, RERANK_K,
+};
 use crate::signals;
 use crate::state::AppState;
 
@@ -67,13 +53,10 @@ pub use query::{body_query_for_arm, BodyArm};
 
 // ── API bancs offline (lj-bench rank-arms / arm-latency / rank-bsweep) ────────
 
-/// Récupération LEXICALE pure pour l'A/B de ranking offline (`lj-bench
+/// Récupération lexicale pure pour l'A/B de ranking offline (`lj-bench
 /// rank-arms`) : jambe BM25 body (corps construit selon `arm`) + jambe titre,
-/// fusion RRF aux poids de base, troncature relative — exactement le chemin
-/// [`retrieve_boolean`] non-booléen du prod, le corps mis à part. Les deux jambes
-/// tournent en séquence sur la même connexion (le résultat est déterministe ;
-/// seule la latence diffère du `try_join` prod à deux connexions). Renvoie les
-/// `decision_id` en ordre de pertinence (= `all_hit_ids` lexical).
+/// fusion RRF aux poids de base, troncature relative. Renvoie les `decision_id` en
+/// ordre de pertinence.
 pub async fn lexical_rank_for_arm(
     conn: &Client,
     query: &str,
@@ -96,14 +79,10 @@ pub async fn lexical_rank_for_arm(
     Ok(fused.into_iter().map(|(d, _, _)| d).collect())
 }
 
-/// Récupération HYBRIDE pour l'A/B de ranking offline (`lj-bench rank-arms
-/// --mode hybrid`) : embedding requête + jambes BM25 body (corps selon `arm`) /
-/// ANN / titre, poids RRF adaptatifs (signals), troncature relative — exactement
-/// le chemin [`retrieve_hybrid`] du prod (mode `auto`, défaut utilisateur), le
-/// corps mis à part. Les jambes ANN et titre sont identiques pour tous les bras
-/// (le corps ne les touche pas) ; seules la jambe BM25 et, par ricochet, les
-/// poids adaptatifs varient. Renvoie les `decision_id` en ordre de pertinence RRF
-/// (pré-rerank ; le rerank LLM ne s'applique pas hors mode IA).
+/// Récupération hybride pour l'A/B de ranking offline (`lj-bench rank-arms --mode
+/// hybrid`) : embedding requête + jambes body / ANN / titre, poids RRF adaptatifs,
+/// troncature relative. Seule la jambe BM25 varie entre bras. Renvoie les
+/// `decision_id` en ordre de pertinence RRF.
 pub async fn hybrid_rank_for_arm(
     state: &AppState,
     query: &str,
@@ -113,7 +92,6 @@ pub async fn hybrid_rank_for_arm(
     let leg_limit = state.settings.leg_limit as i64;
     let vchord_probes = state.settings.vchord_probes;
 
-    // Les 3 bras d'une même requête partagent l'embedding (cache in-process).
     let query_vec = embed_query_cached(state, &req.query).await?;
 
     let body_query = body_query_for_arm(query, arm);
@@ -138,15 +116,10 @@ pub async fn hybrid_rank_for_arm(
     Ok(fused.into_iter().map(|(d, _, _)| d).collect())
 }
 
-/// Recherche complète SANS le cache résultats moka (banc de charge `lj-bench
-/// load`) : exécute TOUJOURS récupération + RRF + facettes + hydratation +
-/// assemblage de page, mais conserve le permit d'admission (`search_permits`) et
-/// le cache embeddings. Mesure la capacité DB « tous-miss » sans cache-buster la
-/// requête — la cache-buster invaliderait aussi le cache embeddings (→ un appel
-/// réseau d'embedding par requête, qui masquerait le coût DB). Le permit est tenu
-/// exactement comme en prod : sur récupération + ranking, relâché avant le
-/// highlight de page ([`search`] via [`ranked_results_cached`]). `ai_mode` ignoré
-/// (ordre RRF) — le rerank LLM est hors périmètre charge.
+/// Recherche complète SANS le cache résultats moka (banc `lj-bench load`) :
+/// exécute toujours récupération + RRF + facettes + hydratation + assemblage de
+/// page, en conservant le permit d'admission et le cache embeddings. `ai_mode`
+/// ignoré.
 pub async fn search_nocache(state: &AppState, req: &SearchRequest) -> Result<SearchResponse> {
     let leg_limit = state.settings.leg_limit as i64;
     let vchord_probes = state.settings.vchord_probes;
@@ -176,9 +149,6 @@ pub async fn search_nocache(state: &AppState, req: &SearchRequest) -> Result<Sea
     let hydrate_ms = t0.elapsed().as_secs_f64() * 1000.0 - retrieval_ms;
     let t1 = std::time::Instant::now();
     let resp = paginate(state, req, &ranked, None).await?;
-    // Décompose le coût d'une requête réelle pour le banc (`lj-bench load`) :
-    // récupération (3 jambes) / hydratation DB (facettes + metadata) / page
-    // (snippet : TOAST + highlight CPU). Cible `lj_bench_timing` (off par défaut).
     tracing::info!(
         target: "lj_bench_timing",
         retrieval_ms,
@@ -189,8 +159,8 @@ pub async fn search_nocache(state: &AppState, req: &SearchRequest) -> Result<Sea
     Ok(resp)
 }
 
-/// Embedding requête via le cache in-process (parité prod : un texte → un
-/// vecteur stable, partagé entre les bras et les jambes d'une même requête).
+/// Embedding requête via le cache in-process : un texte → un vecteur stable,
+/// partagé entre les bras et les jambes d'une même requête.
 async fn embed_query_cached(state: &AppState, text: &str) -> anyhow::Result<Vec<f32>> {
     let arr = match state.embedding_cache.get(text).await {
         Some(vec) => vec,
@@ -213,10 +183,8 @@ async fn embed_query_cached(state: &AppState, text: &str) -> anyhow::Result<Vec<
 }
 
 /// Latence isolée de la jambe BM25 body pour un bras (banc `lj-bench
-/// arm-latency`). La jambe body est la SEULE qui varie entre bras : la
-/// chronométrer seule donne le coût propre de la machinerie phrase, hors jambes
-/// titre/ANN (identiques d'un bras à l'autre) et hors fusion. Renvoie
-/// `(nb_hits, durée d'UN appel)` ; l'appelant boucle pour la statistique.
+/// arm-latency`) — la seule jambe qui varie entre bras. Renvoie `(nb_hits, durée
+/// d'UN appel)` ; l'appelant boucle pour la statistique.
 pub async fn time_body_leg_for_arm(
     conn: &Client,
     query: &str,
@@ -230,12 +198,9 @@ pub async fn time_body_leg_for_arm(
     Ok((hits.len(), t.elapsed()))
 }
 
-/// Ranking de la SEULE jambe body BM25 (sans jambe titre ni fusion RRF), pour un
-/// bras de construction de requête. Oracle de fidélité du re-scorer BM25 offline
-/// (`lj-bench rank-bsweep`) : la réimplémentation pure de BM25 doit reproduire ce
-/// classement de l'index `decisions_bm25` au `b` par défaut avant qu'on ne balaye
-/// `b`. Renvoie `(decision_id, score)` trié score décroissant puis id croissant
-/// (même tie-break que les jambes).
+/// Ranking de la seule jambe body BM25, sans jambe titre ni fusion RRF, pour un
+/// bras de construction de requête. Renvoie `(decision_id, score)` trié score
+/// décroissant puis id croissant.
 pub async fn body_leg_ranks(
     conn: &Client,
     query: &str,
@@ -254,8 +219,8 @@ pub async fn body_leg_ranks(
     Ok(ranked)
 }
 
-/// Latence isolée de la jambe titre (banc `arm-latency`) : identique d'un bras à
-/// l'autre, sert de point de comparaison au coût body. Renvoie (nb_hits, durée).
+/// Latence isolée de la jambe titre (banc `arm-latency`). Renvoie (nb_hits,
+/// durée).
 pub async fn time_title_leg(
     conn: &Client,
     query: &str,
@@ -267,11 +232,8 @@ pub async fn time_title_leg(
     Ok((scores.len(), t.elapsed()))
 }
 
-/// Latence isolée de la jambe ANN (banc `arm-latency`) : embedding HORS chrono
-/// (cache in-process, parité prod), on ne chronomètre que la requête VectorChord.
-/// Souvent la jambe la plus lente du `try_join` prod — la situer face au coût
-/// body dit si le surcoût `split` est sur le chemin critique ou masqué derrière
-/// elle. Renvoie (nb_hits, durée de la requête ANN seule).
+/// Latence isolée de la jambe ANN (banc `arm-latency`), embedding hors chrono.
+/// Renvoie (nb_hits, durée de la requête ANN seule).
 pub async fn time_ann_leg(
     state: &AppState,
     conn: &mut Client,
@@ -288,10 +250,9 @@ pub async fn time_ann_leg(
 
 // ── Orchestration ──────────────────────────────────────────────────────────
 
-/// Hydratation DB de TOUS les hits rankés (≤100) : metadata seule. **Aucun
-/// highlight** — c'est le Tier 1 du cache (cf. [`RankedResults`]) : la partie
-/// partagée par toutes les pages/tris, calculée une fois. Le highlight (depuis
-/// `full_text`) est par-page ([`assemble_page`]).
+/// Hydratation DB de tous les hits rankés (≤100) : metadata seule, aucun
+/// highlight. C'est le Tier 1 du cache (cf. [`RankedResults`]) ; le highlight est
+/// par-page ([`assemble_page`]).
 async fn hydrate_all(
     state: &AppState,
     fused: &[(i64, f64, LegHit)],
@@ -311,12 +272,10 @@ async fn client(state: &AppState) -> Result<Client> {
         .map_err(|e| ApiError::Internal(format!("pool: {e}")))
 }
 
-/// Hydrate des `SearchHit` complets pour une liste **ordonnée** d'ids de
-/// décisions, SANS requête de recherche (score 0, snippet = tête du texte) —
-/// chemin partagé des listes de décisions hors recherche (fiche entité ADR
-/// 0189…), même assemblage que les pages de résultats ([`assemble_page`]).
-/// Renvoie `(decision_id, hit)` dans l'ordre d'entrée ; les ids sans metadata
-/// affichable (public_id absent) sont silencieusement omis.
+/// Hydrate des `SearchHit` complets pour une liste ordonnée d'ids de décisions,
+/// sans requête de recherche (score 0, snippet = tête du texte). Renvoie
+/// `(decision_id, hit)` dans l'ordre d'entrée ; les ids sans metadata affichable
+/// sont silencieusement omis.
 pub(crate) async fn hits_for_decision_ids(
     conn: &Client,
     decision_ids: &[i64],
@@ -331,16 +290,12 @@ pub(crate) async fn hits_for_decision_ids(
         .map(|id| (*id, 0.0, LegHit::synthetic_title_only(*id)))
         .collect();
     let hits = assemble_page(conn, &page, &meta, "", refs).await?;
-    // `assemble_page` préserve l'ordre de `page` (déjà filtrée sur la metadata
-    // présente) : le zip id ↔ hit est positionnel.
     Ok(page.iter().map(|(id, _, _)| *id).zip(hits).collect())
 }
 
 /// Ordre relevance → ordre d'affichage : trie une vue de la liste fused par date
-/// (date_desc/asc) via la metadata hydratée, sans tie-break. `sort_by` stable +
-/// `order` déjà en pertinence ⇒ égalité de date = ordre de pertinence préservé
-/// (parité du `sorted(..., reverse=...)` stable de Python). Date nulle → ""
-/// (comme le `else ""` Python ; même format "YYYY-MM-DD" que `date_lecture`).
+/// via la metadata hydratée, sans tie-break. `sort_by` stable + `order` déjà en
+/// pertinence ⇒ égalité de date = ordre de pertinence préservé.
 fn sort_fused(
     order: &mut [&(i64, f64, LegHit)],
     meta: &HashMap<i64, DecisionMeta>,
@@ -377,8 +332,6 @@ async fn retrieve_boolean(
             title_leg(&title_conn, req, leg_limit),
         )
     } else {
-        // Détecté lexical via un autre signal (rare) : on retombe sur le
-        // phrase-combo standard de la jambe body.
         tokio::try_join!(
             bm25_leg(&bm25_conn, req, leg_limit),
             title_leg(&title_conn, req, leg_limit),
@@ -405,12 +358,6 @@ async fn retrieve_hybrid(
     leg_limit: i64,
     vchord_probes: u32,
 ) -> Result<Vec<(i64, f64, LegHit)>> {
-    // Embedder partagé (state) + cache in-process des vecteurs (moka, TTL 7 j) :
-    // un texte donné → un vecteur stable, on évite l'aller-retour backend
-    // d'embedding sur une requête répétée (parité du cache embeddings Redis
-    // Python). `embed_query` applique l'instruction (format_query) en interne —
-    // passer la requête brute (pré-formater ici doublait le préfixe
-    // « Instruct…Query: Instruct…Query: q » et changeait le vecteur).
     let query_arr = match state.embedding_cache.get(&req.query).await {
         Some(vec) => vec,
         None => {
@@ -429,9 +376,9 @@ async fn retrieve_hybrid(
     };
     let query_vec: Vec<f32> = query_arr.iter().copied().collect();
 
-    // Bloc dédié : les 3 conns des jambes sont relâchées dès le `try_join` fini
-    // (les résultats sont possédés), AVANT `compute_adaptive_weights` qui en
-    // reprend 2 en parallèle. Sans ce drop, le pic serait 3 + 2 = 5 > PEAK_CONNS.
+    // Les 3 connexions des jambes sont relâchées dès le `try_join` fini, AVANT
+    // `compute_adaptive_weights` qui en reprend 2 : le pic reste à
+    // `PEAK_CONNS_PER_SEARCH`.
     let (bm25_scores, ann_hits, title_scores) = {
         let bm25_conn = client(state).await?;
         let mut ann_conn = client(state).await?;
@@ -457,11 +404,9 @@ async fn retrieve_hybrid(
     Ok(fused)
 }
 
-/// Clé du cache rerank : `(query, ensemble TRIÉ du top-[`RERANK_K`])`. Trié car
-/// la sortie du rerank ne dépend que du SET de docs + de la query (le reranker
-/// shuffle son entrée en interne) — deux récupérations donnant le même top-50,
-/// même dans un ordre RRF différent, partagent ainsi l'ordre LLM. Indépendant de
-/// `sort`/`offset`/`limit` (le rerank ne s'applique qu'au tri relevance).
+/// Clé du cache rerank : `(query, ensemble TRIÉ du top-[`RERANK_K`])`. Trié parce
+/// que la sortie du rerank ne dépend que du set de documents et de la query — deux
+/// récupérations au même top-50 partagent l'ordre LLM.
 fn rerank_cache_key(query: &str, top_ids: &[i64]) -> String {
     let mut ids = top_ids.to_vec();
     ids.sort_unstable();
@@ -473,12 +418,10 @@ fn rerank_cache_key(query: &str, top_ids: &[i64]) -> String {
     format!("{query}|{joined}")
 }
 
-/// Applique l'ordre LLM `new_ids` sur le head (top-[`RERANK_K`]) de `base` (ordre
-/// RRF) et renvoie la séquence COMPLÈTE d'ids en ordre relevance reranké : head
-/// réordonné par `new_ids`, ids du head non couverts (hors `new_ids`, ex. sans
-/// résumé) remis en queue de head dans l'ordre RRF, puis la tail intacte.
-/// Conserve TOUS les ids de `base` — sinon `all_hit_ids` perdrait des entrées et
-/// `total` divergerait.
+/// Applique l'ordre LLM `new_ids` sur le head (top-[`RERANK_K`]) de `base` et
+/// renvoie la séquence complète d'ids en ordre relevance reranké : head réordonné,
+/// ids du head non couverts remis en queue de head dans l'ordre RRF, puis la tail
+/// intacte. Conserve tous les ids de `base`.
 fn rerank_id_order(base: &[(i64, f64, LegHit)], new_ids: &[i64]) -> Vec<i64> {
     let head_len = RERANK_K.min(base.len());
     let head_ids: Vec<i64> = base[..head_len].iter().map(|(d, _, _)| *d).collect();
@@ -498,58 +441,27 @@ fn rerank_id_order(base: &[(i64, f64, LegHit)], new_ids: &[i64]) -> Vec<i64> {
     out
 }
 
-/// Ordre LLM du top-[`RERANK_K`] si le mode IA s'applique, sinon `None` (ordre
-/// RRF naturel). No-op silencieux (→ `None`) si : `ai_mode` désactivé, retrieval
-/// lexical, sort ≠ relevance, clé Mistral absente, shortlist < 3, ou échec du
-/// rerank (fallback retrieval).
+/// Ordre LLM du top-[`RERANK_K`] si le mode IA s'applique, sinon `None` (ordre RRF
+/// naturel). No-op silencieux si : `ai_mode` désactivé, retrieval lexical, sort ≠
+/// relevance, clé Mistral absente, shortlist < 3, budget de rerank épuisé, ou échec
+/// du rerank.
 ///
-/// L'ordre LLM est mis en cache par `(query, top-ids)` (cf. [`rerank_cache_key`]) :
-/// le quota Mistral n'est consommé qu'UNE fois par shortlist — un toggle
-/// IA on↔off, ou une reconstruction du bundle au même top-50, sert le cache sans
-/// rappeler le LLM. Body-source = `bundle.meta` (title + summary déjà hydratés au
-/// retrieval) : ZÉRO requête DB ici. Renvoie l'`Arc<Vec<i64>>` cachable tel quel
-/// ([`rerank_id_order`] le déplie par-page en ordre complet).
+/// Deux caches en série : l'ordre complet, keyé `(query, top-ids)` ; puis les
+/// notes, keyées `(query, document)`, indépendantes de la shortlist. Seuls les
+/// documents sous [`TARGET_SCORES`] repartent au LLM.
+///
+/// Body-source = `bundle.meta`, donc zéro requête DB ici.
 async fn reranked_order(
     state: &AppState,
     req: &SearchRequest,
     bundle: &RankedResults,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
 ) -> Result<Option<std::sync::Arc<Vec<i64>>>> {
     if !req.ai_mode
         || bundle.query_mode == QueryMode::Lexical
         || req.sort != SortOrder::Relevance
         || bundle.fused.len() < 3
     {
-        return Ok(None);
-    }
-    let mistral_api_keys = &state.settings.mistral_api_keys;
-    if mistral_api_keys.is_empty() {
-        tracing::warn!(
-            "ai_mode requested but LIBREJUSTICE_MISTRAL_API_KEYS missing — skipping rerank"
-        );
-        return Ok(None);
-    }
-    // Écarte les clés désactivées (`mistral_key_status`). Connexion courte,
-    // relâchée avant les appels LLM.
-    let live_keys: Vec<String> = {
-        let conn = state
-            .pool
-            .get()
-            .await
-            .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
-        let disabled = DecisionRepository::new(&conn)
-            .disabled_mistral_key_fingerprints()
-            .await
-            .map_err(ApiError::Store)?;
-        mistral_api_keys
-            .iter()
-            .filter(|k| !disabled.contains(&key_fingerprint(k)))
-            .cloned()
-            .collect()
-    };
-    if live_keys.is_empty() {
-        tracing::warn!(
-            "toutes les clés Mistral sont désactivées (mistral_key_status) — skipping rerank"
-        );
         return Ok(None);
     }
 
@@ -559,14 +471,6 @@ async fn reranked_order(
         .map(|(d, _, _)| *d)
         .collect();
 
-    let key = rerank_cache_key(&req.query, &top_ids);
-    if let Some(cached) = state.rerank_cache.get(&key).await {
-        return Ok(Some(cached));
-    }
-
-    // Body-source depuis la metadata déjà hydratée — pas de DB. Un id sans résumé
-    // est non couvert : il restera en queue de head ([`rerank_id_order`]), parité
-    // de l'ex-`fetch_rerank_payloads` qui ne gardait que les ids à résumé.
     let refs = referential(state).await?;
     let items: Vec<RerankItem> = top_ids
         .iter()
@@ -584,16 +488,111 @@ async fn reranked_order(
         return Ok(None);
     }
 
-    // Client par requête ; un span HTTP par appel (TracingMiddleware) pour Tempo.
-    let client = std::sync::Arc::new(
-        MistralClient::new(live_keys, state.settings.mistral_model.clone())
-            .map_err(|e| ApiError::Internal(format!("rerank mistral client: {e}")))?,
-    );
-    let result = rerank_shortlist(items, &req.query, std::sync::Arc::clone(&client)).await;
+    // Single-flight : `optionally_get_with` ne laisse qu'un appelant exécuter le
+    // rerank pour une clé donnée. Le `None` — mode IA renoncé, échec, budget épuisé —
+    // n'est pas mis en cache.
+    let key = rerank_cache_key(&req.query, &top_ids);
+    let order = state
+        .rerank_cache
+        .optionally_get_with(key, llm_order(state, req, items, budget_key))
+        .await;
+    Ok(order)
+}
 
-    // Persiste les clés mortes découvertes — best-effort, un échec de marquage
-    // ne casse pas la recherche.
-    let spent = client.spent_fingerprints();
+/// Ordre LLM pour une shortlist qui n'est pas déjà dans le cache d'ordre : notes
+/// en cache d'abord, appels Mistral pour le reste. `None` = renoncement, et
+/// l'appelant sert l'ordre RRF.
+async fn llm_order(
+    state: &AppState,
+    req: &SearchRequest,
+    items: Vec<RerankItem>,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
+) -> Option<std::sync::Arc<Vec<i64>>> {
+    let qkey: std::sync::Arc<str> = std::sync::Arc::from(req.query.as_str());
+    let mut scores: HashMap<i64, DocScores> = HashMap::new();
+    for it in &items {
+        if let Some(v) = state
+            .rerank_scores_cache
+            .get(&(std::sync::Arc::clone(&qkey), it.decision_id))
+            .await
+        {
+            scores.insert(it.decision_id, v);
+        }
+    }
+    if let Some(order) = cached_order(&items, &scores) {
+        return Some(std::sync::Arc::new(order));
+    }
+
+    let Some(client) = state.mistral.as_ref() else {
+        tracing::warn!(
+            "ai_mode requested but LIBREJUSTICE_MISTRAL_API_KEYS missing — skipping rerank"
+        );
+        return None;
+    };
+    {
+        let conn = match state.pool.get().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(error = %err, "checkout connexion pour les clés Mistral — skipping rerank");
+                return None;
+            }
+        };
+        let disabled = match DecisionRepository::new(&conn)
+            .disabled_mistral_key_fingerprints()
+            .await
+        {
+            Ok(disabled) => disabled,
+            Err(err) => {
+                tracing::warn!(error = %err, "lecture de mistral_key_status — skipping rerank");
+                return None;
+            }
+        };
+        client.set_dead_fingerprints(&disabled);
+        if client.live_key_count() == 0 {
+            tracing::warn!(
+                "toutes les clés Mistral sont désactivées (mistral_key_status) — skipping rerank"
+            );
+            return None;
+        }
+    }
+
+    // Un jeton = un rerank, quel que soit le nombre d'appels qu'il déclenche : le
+    // cache de notes le fait varier de ~4 à 15. Le jeton est calé sur le pire cas.
+    if state.rerank_budget.take(budget_key).await == crate::ratelimit::Verdict::Exhausted {
+        return None;
+    }
+
+    let sink: crate::rerank::ScoreSink = {
+        let cache = state.rerank_scores_cache.clone();
+        let qkey = std::sync::Arc::clone(&qkey);
+        std::sync::Arc::new(move |batch: HashMap<i64, f64>| {
+            let cache = cache.clone();
+            let qkey = std::sync::Arc::clone(&qkey);
+            tokio::spawn(async move {
+                let now = tokio::time::Instant::now();
+                for (decision_id, score) in batch {
+                    cache
+                        .entry((std::sync::Arc::clone(&qkey), decision_id))
+                        .and_upsert_with(|old| async move {
+                            DocScores::merged(old.map(|e| e.into_value()), &[score], now)
+                        })
+                        .await;
+                }
+            });
+        })
+    };
+
+    let result = rerank_shortlist(
+        items,
+        &req.query,
+        std::sync::Arc::clone(client),
+        Some(tokio::time::Instant::now() + RERANK_BUDGET),
+        &scores,
+        sink,
+    )
+    .await;
+
+    let spent = client.drain_spent_fingerprints();
     if !spent.is_empty() {
         match state.pool.get().await {
             Ok(conn) => {
@@ -610,62 +609,42 @@ async fn reranked_order(
         }
     }
 
-    let new_ids = match result {
-        Ok(ids) => ids,
+    match result {
+        Ok(new_ids) => Some(std::sync::Arc::new(new_ids)),
         Err(err) => {
             tracing::warn!(error = %err, "rerank_shortlist failed — falling back to retrieval order");
-            return Ok(None);
+            None
         }
-    };
-
-    let order = std::sync::Arc::new(new_ids);
-    state.rerank_cache.insert(key, order.clone()).await;
-    Ok(Some(order))
+    }
 }
 
-/// Bundle de recherche mis en cache : récupération (BM25/ANN, **RRF**), facettes
-/// et **hydratation COMPLÈTE des hits** (metadata + summary), AVANT rerank, tri
-/// par date et pagination. Partagé via `Arc` dans le cache moka de l'[`AppState`] :
-/// une même `(query, filtres, mode)` — **ai_mode EXCLU** — réutilise ce calcul
-/// coûteux pour les deux modes, toutes les pages et les requêtes répétées. Le
-/// rerank LLM (ai_mode) ne touche PLUS ce bundle : il vit hors-cache dans
-/// [`reranked_order`] (cache rerank dédié) et n'est qu'un réordonnancement
-/// appliqué par-page. La pagination ne fait que trier puis slicer en mémoire ;
-/// le `full_text` n'est PAS caché — il est fetché par-page par
-/// [`assemble_page`] (≤`limit` lectures TOAST sur miss `page_memo`).
+/// Bundle de recherche mis en cache : récupération (BM25/ANN, RRF), facettes et
+/// hydratation complète des hits (metadata + summary), AVANT rerank, tri par date
+/// et pagination. Partagé via `Arc` dans le cache moka de l'[`AppState`], clé
+/// ai_mode-indépendante. Le `full_text` n'est pas caché : il est fetché par-page
+/// par [`assemble_page`].
 pub struct RankedResults {
     query_mode: QueryMode,
-    /// Liste fused en ordre RRF (PRÉ-rerank, PRÉ-tri). Porte le `chunk_id` du
-    /// chunk gagnant ANN (fenêtre snippet) + les scores ; le `full_text` est
-    /// fetché par-page ([`assemble_page`]).
+    /// Liste fused en ordre RRF (pré-rerank, pré-tri). Porte le `chunk_id` du chunk
+    /// gagnant ANN et les scores.
     fused: Vec<(i64, f64, LegHit)>,
-    /// Metadata hydratée de TOUS les hits (≤100), `summary` inclus. Sert au tri
-    /// par date ([`sort_fused`]), à l'assemblage de page ([`assemble_page`]) ET
-    /// de texte-source au rerank ([`reranked_order`] lit le `summary`, zéro DB).
-    /// PAS de highlight ici.
+    /// Metadata hydratée de tous les hits (≤100), `summary` inclus. Sert au tri par
+    /// date, à l'assemblage de page et de texte-source au rerank. Pas de highlight.
     meta: HashMap<i64, DecisionMeta>,
     facets: SearchFacets,
-    /// `decision_id → public_id` de tous les hits. [`paginate`] compose
-    /// `all_hit_ids` de la réponse dans l'ordre relevance EFFECTIF (reranké ou
-    /// non) — l'ordre n'est plus figé ici puisque le rerank est hors-bundle.
+    /// `decision_id → public_id` de tous les hits.
     pub_ids: HashMap<i64, String>,
     total: i64,
     /// Tier 2 — pages déjà highlightées, mémoïsées par `(ai_mode, sort, offset,
-    /// limit)`. Le highlight tantivy (~0,2 s/page) ne tourne qu'une fois par page
-    /// et par mode ; une page répétée (re-render, pagination retour, retour au
-    /// même mode) est servie instantanément. `ai_mode` est dans la clé car le
-    /// rerank change l'ordre, donc le contenu de la page. `std::sync::Mutex` :
-    /// verrou jamais tenu à travers un `await`.
+    /// limit)`. `ai_mode` est dans la clé car le rerank change l'ordre, donc le contenu
+    /// de la page. `std::sync::Mutex` : verrou jamais tenu à travers un `await`.
     page_memo: std::sync::Mutex<HashMap<String, std::sync::Arc<Vec<SearchHit>>>>,
 }
 
 impl RankedResults {
-    /// Poids approximatif de l'entrée en octets, pour le `weigher` du cache moka
-    /// (plafond mémoire, pas par nombre d'entrées). Dominé par la metadata
-    /// hydratée (`meta`, summary inclus) ; `fused` ne porte plus les bodies (fetch
-    /// par-page), donc son poids est négligeable. Borné à `u32`. Le `page_memo`
-    /// (rempli paresseusement, borné aux pages réellement demandées) n'est pas
-    /// pesé — moka ne ré-évalue pas le poids après insertion de toute façon.
+    /// Poids approximatif de l'entrée en octets, pour le `weigher` du cache moka.
+    /// Dominé par la metadata hydratée. Le `page_memo` n'est pas pesé — moka ne
+    /// ré-évalue pas le poids après insertion.
     pub fn approx_weight(&self) -> u32 {
         let fused: usize = self
             .fused
@@ -737,12 +716,9 @@ fn facets_weight(f: &SearchFacets) -> usize {
             .sum::<usize>()
 }
 
-/// Clé de cache du bundle retrieval : query, filtres, mode — tout ce qui
-/// détermine la récupération + RRF + hydratation. EXCLUT `offset`/`limit`
-/// (pagination), `sort` (ré-appliqué par page dans [`paginate`]) ET `ai_mode` :
-/// retrieval/RRF/facettes/hydratation sont identiques dans les deux modes (le
-/// rerank n'est qu'un réordonnancement, mis en cache à part). Une seule entrée
-/// sert donc les deux modes, toutes les pages et tous les tris.
+/// Clé de cache du bundle retrieval : query, filtres, mode. Exclut
+/// `offset`/`limit`, `sort` et `ai_mode` — une seule entrée sert les deux modes,
+/// toutes les pages et tous les tris.
 fn ranked_cache_key(req: &SearchRequest, query_mode: QueryMode) -> String {
     let mut norm = req.clone();
     norm.offset = 0;
@@ -755,9 +731,8 @@ fn ranked_cache_key(req: &SearchRequest, query_mode: QueryMode) -> String {
     )
 }
 
-/// Récupération (RRF) + facettes + hydratation → bundle [`RankedResults`] (la
-/// partie coûteuse, mise en cache, **ai_mode-indépendante**). Le rerank LLM n'est
-/// PLUS fait ici : il est appliqué hors-bundle par [`reranked_order`] / [`paginate`].
+/// Récupération (RRF) + facettes + hydratation → bundle [`RankedResults`], la
+/// partie coûteuse mise en cache et ai_mode-indépendante.
 async fn rank_results(
     state: &AppState,
     fused: Vec<(i64, f64, LegHit)>,
@@ -766,15 +741,8 @@ async fn rank_results(
     let all_ids: Vec<i64> = fused.iter().map(|(d, _, _)| *d).collect();
     let total = fused.len() as i64;
 
-    // `fetch_pub_ids_and_facets` (public_ids + facettes) et `hydrate_all`
-    // (metadata des ≤100 hits, SANS highlight) sont indépendants — `hydrate_all`
-    // n'utilise ni `pub_ids` ni `facets`. On les lance en parallèle pour épargner
-    // un aller-retour DB sur le chemin froid (gain p95 sur DB distante). Pics de
-    // connexions : 1 (facettes) + 1 (meta de hydrate_all) = 2 ≤
-    // PEAK_CONNS_PER_SEARCH (3) → le sémaphore couvre, pas de hold-and-wait.
-    // Le highlight n'est PLUS fait ici (tier 1) : il est par-page dans
-    // `assemble_page`/`paginate` (tier 2, mémoïsé). C'est le levier p95 froid :
-    // ~20 docs highlightés au lieu de 100.
+    // `fetch_pub_ids_and_facets` et `hydrate_all` sont indépendants : lancés en
+    // parallèle. Pic de connexions 1 + 1 = 2 ≤ `PEAK_CONNS_PER_SEARCH`.
     let refs = referential(state).await?;
     let facets_conn = client(state).await?;
     let ((pub_ids, facets), meta) = tokio::try_join!(
@@ -797,45 +765,34 @@ async fn rank_results(
     })
 }
 
-/// Tier 2 : applique l'ordre relevance EFFECTIF (reranké `rerank_ids` si mode IA,
-/// sinon RRF du bundle), puis tri + slice de la page (zéro DB) et highlight des
-/// ≤ `limit` hits de cette page, mémoïsés par `(ai_mode, sort, offset, limit)`.
-/// Première vue d'une page → highlight (~0,2 s) ; vue répétée (même mode) → mémo
-/// instantané. Le réseau ne porte que la page. `all_hit_ids` est recomposé dans
-/// l'ordre relevance effectif (le rerank n'étant plus figé dans le bundle).
+/// Tier 2 : applique l'ordre relevance effectif (reranké si mode IA, sinon RRF du
+/// bundle), puis tri + slice de la page (zéro DB) et highlight des ≤ `limit` hits,
+/// mémoïsés par `(ai_mode, sort, offset, limit)`. `all_hit_ids` est recomposé dans
+/// l'ordre relevance effectif.
 async fn paginate(
     state: &AppState,
     req: &SearchRequest,
     ranked: &RankedResults,
     rerank_ids: Option<&[i64]>,
 ) -> Result<SearchResponse> {
-    // Ordre relevance effectif (ids seuls — pas de clone de bodies). `rerank_ids`
-    // n'est `Some` que sous tri relevance (cf. `reranked_order`).
     let relevance_ids: Vec<i64> = match rerank_ids {
         Some(ids) => rerank_id_order(&ranked.fused, ids),
         None => ranked.fused.iter().map(|(d, _, _)| *d).collect(),
     };
-    // Posé sur la réponse dans l'ordre relevance (avant re-tri par date), comme
-    // l'ex-`_serve_from_cache`. Indépendant de la page → recalculé à chaque appel.
     let all_hit_ids: Vec<String> = relevance_ids
         .iter()
         .filter_map(|d| ranked.pub_ids.get(d).cloned())
         .collect();
 
-    // `ai_mode` dans la clé : l'ordre (donc le contenu de page) diffère entre modes.
     let page_key = format!(
         "{}|{:?}|{}|{}",
         req.ai_mode, req.sort, req.offset, req.limit
     );
 
-    // Verrou court, jamais tenu à travers l'`await` du highlight ci-dessous.
     let cached_page = ranked.page_memo.lock().unwrap().get(&page_key).cloned();
     let page = if let Some(hits) = cached_page {
         (*hits).clone()
     } else {
-        // Vue de la liste dans l'ordre relevance effectif, filtrée des ids sans
-        // meta (absents du référentiel — jamais en pratique) AVANT pagination :
-        // aligne le comptage de page sur l'ex-`build_page_hits`.
         let by_id: HashMap<i64, &(i64, f64, LegHit)> =
             ranked.fused.iter().map(|row| (row.0, row)).collect();
         let mut order: Vec<&(i64, f64, LegHit)> = relevance_ids
@@ -843,7 +800,6 @@ async fn paginate(
             .filter_map(|d| by_id.get(d).copied())
             .filter(|(d, _, _)| ranked.meta.contains_key(d))
             .collect();
-        // No-op sous relevance (l'ordre reranké est déjà posé) ; re-trie par date.
         sort_fused(&mut order, &ranked.meta, req.sort);
 
         let offset = req.offset as usize;
@@ -889,35 +845,65 @@ fn effective_query_mode(req: &SearchRequest) -> QueryMode {
 }
 
 /// Bundle retrieval depuis le cache moka, sinon calculé (récupération + RRF +
-/// facettes + hydratation, **sans rerank**) puis caché (TTL 1 h, aligné sur le
-/// cache CDN `/search`). Clé ai_mode-indépendante : les deux modes partagent ce
-/// calcul. Pas de single-flight (`ApiError` n'est pas `Clone`) : deux misses
-/// concurrents identiques recalculent — acceptable en mono-serveur.
+/// facettes + hydratation, sans rerank) puis caché. Clé ai_mode-indépendante.
+///
+/// Single-flight sur le chemin qui réussit : `optionally_get_with` ne laisse qu'un
+/// appelant calculer. L'échec n'est pas partagé — un suiveur tombé sur un échec
+/// recalcule pour obtenir son erreur typée.
 async fn ranked_results_cached(
     state: &AppState,
     req: &SearchRequest,
     query_mode: QueryMode,
     leg_limit: i64,
     vchord_probes: u32,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
 ) -> Result<std::sync::Arc<RankedResults>> {
     let key = ranked_cache_key(req, query_mode);
-    if let Some(cached) = state.search_cache.get(&key).await {
-        return Ok(cached);
+    let mut own_err: Option<ApiError> = None;
+    let hit = state
+        .search_cache
+        .optionally_get_with(key, async {
+            match rank_uncached(state, req, query_mode, leg_limit, vchord_probes, budget_key).await
+            {
+                Ok(ranked) => Some(ranked),
+                Err(err) => {
+                    own_err = Some(err);
+                    None
+                }
+            }
+        })
+        .await;
+    match (hit, own_err) {
+        (Some(ranked), _) => Ok(ranked),
+        (None, Some(err)) => Err(err),
+        (None, None) => {
+            rank_uncached(state, req, query_mode, leg_limit, vchord_probes, budget_key).await
+        }
     }
-    // Permit DB tenu pendant toute la phase récupération + ranking (cf.
-    // `AppState.search_permits`) : borne les recherches concurrentes pour que
-    // chacune puisse acquérir son pic de connexions sans hold-and-wait → pas de
-    // deadlock du pool, parallélisme intra-recherche (`try_join`) préservé.
+}
+
+/// Le calcul du bundle lui-même — budget, permit DB, récupération, ranking.
+/// Séparé de [`ranked_results_cached`] pour que le single-flight ne porte que sur
+/// le cache.
+async fn rank_uncached(
+    state: &AppState,
+    req: &SearchRequest,
+    query_mode: QueryMode,
+    leg_limit: i64,
+    vchord_probes: u32,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
+) -> Result<std::sync::Arc<RankedResults>> {
+    if state.search_budget.take(budget_key).await == crate::ratelimit::Verdict::Exhausted
+        && state.settings.search_budget_enforce
+    {
+        return Err(ApiError::TooManyRequests);
+    }
     let _db_permit = state
         .search_permits
         .clone()
         .acquire_owned()
         .await
         .map_err(|e| ApiError::Internal(format!("search semaphore: {e}")))?;
-    // Requête sans token indexable (vide / 100 % stopwords) : les jambes BM25
-    // produiraient une query tantivy sans clause → parse error `paradedb.parse`.
-    // Court-circuit sur un bundle vide (`fused` vide ⇒ facettes vides, total 0),
-    // caché comme les autres ; aucune jambe (ni embedding ANN) n'est exécutée.
     let fused = if query_lacks_searchable_terms(&req.query) {
         Vec::new()
     } else {
@@ -926,66 +912,57 @@ async fn ranked_results_cached(
             QueryMode::Hybrid => retrieve_hybrid(state, req, leg_limit, vchord_probes).await?,
         }
     };
-    let ranked = std::sync::Arc::new(rank_results(state, fused, query_mode).await?);
-    state.search_cache.insert(key, ranked.clone()).await;
-    Ok(ranked)
+    Ok(std::sync::Arc::new(
+        rank_results(state, fused, query_mode).await?,
+    ))
 }
 
-/// Exécute une recherche (lexicale ou hybride selon `mode`) et assemble les
-/// hits + facettes. Opérateurs `@@@` (BM25) / `<=>` (cosine) en SQL brut. Le
-/// bundle retrieval (récupération + RRF + facettes + metadata hydratée, sans
-/// rerank ni highlight) passe par le cache moka, ai_mode-indépendant ; le rerank
-/// LLM ([`reranked_order`], cache dédié) n'est qu'un réordonnancement appliqué
-/// par-dessus. Chaque appel ne fait plus que trier + slicer puis highlighter la
-/// page (≤ `limit` docs, mémoïsée) — zéro DB sur hit, zéro Mistral sur hit rerank.
+/// Exécute une recherche (lexicale ou hybride selon `mode`) et assemble les hits +
+/// facettes. Opérateurs `@@@` (BM25) / `<=>` (cosine) en SQL brut. Le bundle
+/// retrieval passe par le cache moka ; le rerank LLM ([`reranked_order`], cache
+/// dédié) n'est qu'un réordonnancement appliqué par-dessus.
 ///
-/// Pose `librejustice.search.{source,authenticated,query,mode,context}` sur le
-/// span courant AVANT l'exécution, puis `.results_count` APRÈS. `source`
-/// (web/mcp) et `authenticated` viennent du handler appelant : on ne met
-/// **jamais** l'identité de l'utilisateur dans les traces (RGPD / ADR 0039),
-/// seulement un booléen connecté/anonyme — assez pour séparer l'anonyme du
-/// connecté côté Tempo. `context` (`user`/`teaser`) distingue les recherches
-/// posées par l'utilisateur des fetchs machine des ponts croisés (ADR 0251) —
-/// exclure `teaser` de tout comptage d'usage. Ces noms littéraux
-/// `librejustice.search.*` survivent au scrub des attributs.
-#[tracing::instrument(skip(state, req), fields(
+/// Émet le signal d'usage du moteur `decisions` (cf. [`crate::usage`]). La
+/// provenance vient du handler appelant ; l'identité de l'utilisateur ne va jamais
+/// dans les traces, seulement `identity` = `authenticated` | `anonymous`.
+///
+/// `budget_key` est dans le `skip` pour cette raison : `instrument` enregistre par
+/// défaut tout paramètre non skippé via son `Debug`, et celui de
+/// [`crate::ratelimit::CallerKey`] porte le `sub` du compte ou l'IP du client.
+#[tracing::instrument(skip(state, req, caller, budget_key), fields(
+    librejustice.search.engine = tracing::field::Empty,
     librejustice.search.source = tracing::field::Empty,
     librejustice.search.query = tracing::field::Empty,
     librejustice.search.mode = tracing::field::Empty,
-    librejustice.search.authenticated = tracing::field::Empty,
+    librejustice.search.identity = tracing::field::Empty,
+    librejustice.search.session = tracing::field::Empty,
     librejustice.search.context = tracing::field::Empty,
+    librejustice.search.page = tracing::field::Empty,
+    librejustice.search.filters = tracing::field::Empty,
     librejustice.search.results_count = tracing::field::Empty,
 ))]
 pub async fn search(
     state: &AppState,
     req: &SearchRequest,
-    source: lj_dtos::ActivitySource,
-    authenticated: bool,
-    context: lj_dtos::SearchContext,
+    caller: crate::usage::Caller,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
 ) -> Result<SearchResponse> {
-    let span = tracing::Span::current();
-    span.record(
-        "librejustice.search.source",
-        crate::search_history::source_value(source),
-    );
-    span.record("librejustice.search.authenticated", authenticated);
-    span.record("librejustice.search.query", req.query.as_str());
-    span.record("librejustice.search.mode", tracing::field::debug(req.mode));
-    span.record(
-        "librejustice.search.context",
-        match context {
-            lj_dtos::SearchContext::User => "user",
-            lj_dtos::SearchContext::Teaser => "teaser",
-        },
-    );
+    const ENGINE: lj_dtos::SearchEngine = lj_dtos::SearchEngine::Decisions;
+    let filters = crate::search_history::facet_filters(req).to_string();
+    let shape = crate::usage::Shape {
+        page: crate::search_history::page_number(i64::from(req.offset), i64::from(req.limit))
+            .unwrap_or(1),
+        filters: &filters,
+    };
+    caller.record_span(ENGINE, req.query.as_str(), shape);
+    tracing::Span::current().record("librejustice.search.mode", tracing::field::debug(req.mode));
 
     let leg_limit = state.settings.leg_limit as i64;
     let vchord_probes = state.settings.vchord_probes;
     let query_mode = effective_query_mode(req);
-    let ranked = ranked_results_cached(state, req, query_mode, leg_limit, vchord_probes).await?;
-    // Rerank LLM hors-bundle (cache dédié, lit la meta hydratée) : 0 DB, 0 Mistral
-    // sur hit. `None` (mode IA off / no-op / échec) ⇒ ordre RRF naturel.
-    let rerank_ids = reranked_order(state, req, &ranked).await?;
+    let ranked =
+        ranked_results_cached(state, req, query_mode, leg_limit, vchord_probes, budget_key).await?;
+    let rerank_ids = reranked_order(state, req, &ranked, budget_key).await?;
     let resp = paginate(
         state,
         req,
@@ -994,6 +971,6 @@ pub async fn search(
     )
     .await?;
 
-    span.record("librejustice.search.results_count", resp.total);
+    caller.record_outcome(ENGINE, req.query.as_str(), shape, resp.total);
     Ok(resp)
 }

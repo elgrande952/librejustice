@@ -1,10 +1,9 @@
-//! Vue « Lois et règlements » de la page `/textes` (ADR 0114 pour le corpus ;
-//! gabarit de référence pour la page) : barre de filtres horizontale
-//! `Juridiction ▾ · Nature ▾ · Source ▾` + chips actives + liste paginée de
-//! hits avec total exact. État (requête, filtres, page) dans les query params —
-//! la clé URL du filtre provenance est `origine` (`source` est un nom hérité) ;
-//! le param API `/api/search-textes` reste `source`. Données via
-//! `ApiClient::search_textes`.
+//! Vue « Lois et règlements » de la page `/textes` : barre de filtres
+//! horizontale `Juridiction ▾ · Nature ▾ · Source ▾` + chips actives + liste
+//! paginée de hits avec total exact. État (requête, filtres, page) dans les
+//! query params — la clé URL du filtre provenance est `origine` (`source` est
+//! un nom hérité) ; le param API `/api/search-textes` reste `source`. Données
+//! via `ApiClient::search_textes`.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -13,6 +12,7 @@ use leptos_router::params::ParamsMap;
 use lj_dtos::{ArticleSearchFacets, ArticleSearchHit, ArticleSearchResponse, FacetChoice};
 
 use crate::api::{ApiClient, PageParams, TextesFilters};
+use crate::components::layout::{CONTENT_COL, GRID_3COL, SIDE_RAIL};
 use crate::helpers::{
     format_article_num, format_results_count_exact, group_thousands, total_pages,
 };
@@ -20,6 +20,10 @@ use crate::pages::decision_page::data::sendable;
 
 use super::compact_search::highlight::Highlighted;
 use super::compact_search::query_state;
+use super::corpus_intro::{
+    corpus_stats, DecisionsCorpusTeaser, NormesRail, TextesCorpusLine, TextesCorpusSummary,
+    TextesExamples,
+};
 use super::cross_teaser::DecisionsTeaser;
 use super::facet_widgets::Nav;
 use super::filter_dropdown::{FilterDropdown, OpenDropdown};
@@ -29,8 +33,8 @@ use super::CompactSearch;
 /// Articles ramenés par page.
 const TEXTES_LIMIT: u32 = 20;
 
-/// Plafond de pages affichées (cohérent avec `helpers::total_pages` ; le service
-/// borne déjà le total à 400).
+/// Plafond de pages affichées (cohérent avec `helpers::total_pages` ; le
+/// service borne déjà le total à 400).
 const MAX_PAGES_DISPLAY: i64 = 40;
 
 /// Clés de filtre portées par l'URL (corpus articles). `code` borne le moteur à
@@ -104,15 +108,15 @@ async fn fetch_textes(state: TextesQuery) -> Result<Option<ArticleSearchResponse
         .map_err(|e| e.message)
 }
 
-/// Corps « Lois et règlements », anatomie `/decisions` : rail de synthèse à
-/// gauche (volumétrie + facettes cliquables), colonne contenu au centre (barre,
-/// filtres, chips, liste), colonne DROITE (pont croisé « Dans les décisions » +
-/// aide à la recherche) — premier bloc sacrifié : visible seulement à partir de
-/// 88rem, largeur où tout tient à pleine mesure, jamais de compression du
-/// contenu pour la loger. Les facettes et la volumétrie alimentent rail et
-/// barre par `Effect` (mises à jour sur réponse seulement — pendant un refetch
-/// ils gardent les précédentes, interactifs). Sans requête, ni filtres ni
-/// résultats — juste l'invite.
+/// Corps « Lois et règlements » : grille `240px | minmax(0,1fr) | 280px` dès
+/// `lg` — rail de synthèse à gauche (volumétrie + facettes cliquables), colonne
+/// contenu au centre (barre, filtres, chips, liste), colonne droite (pont croisé
+/// « Dans les décisions » + aide à la recherche).
+///
+/// Les facettes et la volumétrie alimentent rail et barre par `Effect`, mis à
+/// jour sur réponse seulement : pendant un refetch ils gardent les précédentes
+/// et restent interactifs. Sans requête, ni filtres ni résultats — juste
+/// l'invite.
 #[component]
 pub fn TextesView() -> impl IntoView {
     let query_map = use_query_map();
@@ -127,31 +131,42 @@ pub fn TextesView() -> impl IntoView {
             volume.set(Some(resp.total));
         }
     });
+    let has_query = Signal::derive(move || !query.get().is_empty());
+    let stats = corpus_stats();
 
     view! {
-        <div class="grid grid-cols-1 gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12 min-[88rem]:grid-cols-[240px_minmax(0,1fr)_240px]">
-            <aside
-                aria-label="Synthèse des résultats"
-                class="hidden min-w-0 lg:sticky lg:top-20 lg:block lg:max-h-[calc(100dvh-6rem)] lg:self-start lg:overflow-y-auto"
-            >
-                <TextesRail query=query volume=volume facets=facets state=state />
+        <div class=GRID_3COL>
+            <aside aria-label="Synthèse des résultats" class=SIDE_RAIL>
+                <Show when=move || has_query.get() fallback=move || view! { <NormesRail /> }>
+                    <TextesRail facets=facets state=state />
+                </Show>
             </aside>
-            <div class="flex w-full min-w-0 max-w-3xl flex-col gap-6">
+            <div class=CONTENT_COL>
                 <div class="flex flex-col gap-2">
                     <CompactSearch />
-                    // Intro didactique : dire le périmètre du moteur (l'h1 est
-                    // sr-only, rien d'autre ne le dit) — les conventions
-                    // collectives notamment, que les utilisateurs cherchent à
-                    // tort côté décisions.
-                    <div class="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                        <p class="text-xs leading-snug text-[var(--color-ink-subtle)]">
-                            "Codes, lois et règlements, conventions collectives, doctrine administrative (BOFiP, circulaires)."
-                        </p>
-                        // Sauf quand la colonne droite — qui porte alors
-                        // l'aide — est affichée (requête non vide, ≥ 88rem).
-                        <span class=("min-[88rem]:hidden", move || !query.get().is_empty())>
-                            <SyntaxHint corpus=HelpCorpus::Textes />
-                        </span>
+                    // Ligne compacte mobile, rendue dans les DEUX états au même endroit (sur
+                    // desktop volumétrie et aide vivent dans la colonne droite) : volume des
+                    // résultats ou volume du corpus, et l'aide calée à droite.
+                    <div class="flex items-baseline gap-3 lg:hidden">
+                        <Show
+                            when=move || has_query.get()
+                            fallback=move || view! { <TextesCorpusLine stats=stats /> }
+                        >
+                            {move || {
+                                volume
+                                    .get()
+                                    .map(|total| {
+                                        view! {
+                                            <p class="text-sm text-[var(--color-ink-subtle)]">
+                                                <span class="font-medium text-[var(--color-ink)]">
+                                                    {format_results_count_exact(total)}
+                                                </span>
+                                            </p>
+                                        }
+                                    })
+                            }}
+                        </Show>
+                        <SyntaxHint corpus=HelpCorpus::Textes class="ml-auto shrink-0" />
                     </div>
                 </div>
                 <Show
@@ -161,21 +176,6 @@ pub fn TextesView() -> impl IntoView {
                     <div class="flex min-w-0 flex-col gap-4">
                         <TextesFilterBar facets=facets state=state />
                         <TextesActiveChips facets=facets state=state />
-                        // Volumétrie compacte, mobile uniquement (sur desktop
-                        // elle vit dans le rail).
-                        {move || {
-                            volume
-                                .get()
-                                .map(|total| {
-                                    view! {
-                                        <p class="text-sm text-[var(--color-ink-subtle)] lg:hidden">
-                                            <span class="font-medium text-[var(--color-ink)]">
-                                                {format_results_count_exact(total)}
-                                            </span>
-                                        </p>
-                                    }
-                                })
-                        }}
                         <Suspense fallback=move || {
                             view! {
                                 <p class="text-sm text-[var(--color-ink-subtle)]">"Recherche…"</p>
@@ -188,9 +188,8 @@ pub fn TextesView() -> impl IntoView {
                                         view! { <TextResultsLayout resp=resp state=st /> }
                                             .into_any()
                                     }
-                                    // Requête vide arrivée jusqu'au resource (le `<Show>`
-                                    // amont ne rend ce `<Suspense>` que requête non vide :
-                                    // ce bras couvre la frame où l'URL vient de se vider).
+                                    // Requête vide arrivée jusqu'au resource : ce bras couvre la frame où l'URL
+                                    // vient de se vider.
                                     Ok(None) => view! { <TextSearchPrompt /> }.into_any(),
                                     Err(msg) => {
                                         view! {
@@ -206,62 +205,40 @@ pub fn TextesView() -> impl IntoView {
                     </div>
                 </Show>
             </div>
-            // Colonne droite : pont croisé vers le moteur décisions + aide à la
-            // recherche. Sous 88rem elle disparaît (le contenu garde sa pleine
-            // mesure) ; l'aide retombe alors sur la ligne de périmètre.
-            <aside
-                aria-label="Voir aussi"
-                class="hidden min-w-0 min-[88rem]:sticky min-[88rem]:top-20 min-[88rem]:block min-[88rem]:max-h-[calc(100dvh-6rem)] min-[88rem]:self-start min-[88rem]:overflow-y-auto"
-            >
-                <Show when=move || !query.get().is_empty()>
-                    <div class="flex flex-col gap-4">
-                        <div class="border-t border-[var(--color-rule)] pt-4">
-                            <SyntaxHint corpus=HelpCorpus::Textes />
-                        </div>
-                        // Pont croisé : la même requête posée au moteur
-                        // décisions.
-                        <DecisionsTeaser query=query />
+            // Colonne droite : volumétrie, aide à la recherche, puis pont croisé vers le
+            // moteur décisions. Requête vide, les trois emplacements sont remplis par leur
+            // pendant corpus, dans le même gabarit. Sous lg la colonne disparaît.
+            <aside aria-label="Voir aussi" class=SIDE_RAIL>
+                <div class="flex flex-col gap-4">
+                    <Show
+                        when=move || has_query.get()
+                        fallback=move || view! { <TextesCorpusSummary stats=stats /> }
+                    >
+                        <TextesSummary query=query volume=volume />
+                    </Show>
+                    <div class="flex self-start">
+                        <SyntaxHint corpus=HelpCorpus::Textes />
                     </div>
-                </Show>
+                    <Show
+                        when=move || has_query.get()
+                        fallback=move || view! { <DecisionsCorpusTeaser stats=stats /> }
+                    >
+                        <DecisionsTeaser query=query />
+                    </Show>
+                </div>
             </aside>
         </div>
     }
 }
 
-/// Layout chargé : liste + pagination (la volumétrie vit dans le rail, et en
-/// ligne compacte mobile dans la colonne).
+/// Volumétrie desktop, en tête de la colonne droite : « N résultats / pour
+/// « q » », ou l'état d'attente tant que la réponse n'est pas arrivée.
 #[component]
-fn TextResultsLayout(resp: ArticleSearchResponse, state: TextesQuery) -> impl IntoView {
-    let total = resp.total;
-    let pages = total_pages(total, TEXTES_LIMIT as i64, MAX_PAGES_DISPLAY) as u32;
-    let page = state.page;
-    let query = state.q.clone();
-    let hits = resp.hits;
-
-    view! {
-        <section aria-label="Résultats" class="flex min-w-0 flex-col gap-6">
-            <TextResults hits=hits query=query page=page />
-            <TextPagination current_page=page total_pages=pages />
-        </section>
-    }
-}
-
-/// Lignes par bloc de facettes du rail.
-const RAIL_ROWS: usize = 5;
-
-/// Rail gauche de `/textes` (même gabarit que le rail `/decisions`) :
-/// volumétrie + blocs de facettes cliquables (Nature, Juridictions, Sources) +
-/// lien vers le catalogue des codes. Chaque clic passe par la MÊME mutation
-/// d'URL mono-sélection que les dropdowns de la barre (valeur active ⇒
-/// re-clic la retire, retour page 1).
-#[component]
-fn TextesRail(
+fn TextesSummary(
     #[prop(into)] query: Signal<String>,
     #[prop(into)] volume: Signal<Option<i64>>,
-    #[prop(into)] facets: Signal<Option<ArticleSearchFacets>>,
-    #[prop(into)] state: Signal<TextesQuery>,
 ) -> impl IntoView {
-    let header = move || {
+    move || {
         let Some(total) = volume.get() else {
             return view! {
                 <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">
@@ -285,8 +262,39 @@ fn TextesRail(
             </div>
         }
         .into_any()
-    };
+    }
+}
 
+/// Layout chargé : liste + pagination (la volumétrie vit dans la colonne
+/// droite, et en ligne compacte mobile dans la colonne de contenu).
+#[component]
+fn TextResultsLayout(resp: ArticleSearchResponse, state: TextesQuery) -> impl IntoView {
+    let total = resp.total;
+    let pages = total_pages(total, TEXTES_LIMIT as i64, MAX_PAGES_DISPLAY) as u32;
+    let page = state.page;
+    let query = state.q.clone();
+    let hits = resp.hits;
+
+    view! {
+        <section aria-label="Résultats" class="flex min-w-0 flex-col gap-6">
+            <TextResults hits=hits query=query page=page />
+            <TextPagination current_page=page total_pages=pages />
+        </section>
+    }
+}
+
+/// Lignes par bloc de facettes du rail.
+const RAIL_ROWS: usize = 5;
+
+/// Rail gauche de `/textes` : blocs de facettes cliquables (Portée, Nature,
+/// Juridictions, Sources). Chaque clic passe par la même mutation d'URL
+/// mono-sélection que les dropdowns de la barre (valeur active ⇒ re-clic la
+/// retire, retour page 1).
+#[component]
+fn TextesRail(
+    #[prop(into)] facets: Signal<Option<ArticleSearchFacets>>,
+    #[prop(into)] state: Signal<TextesQuery>,
+) -> impl IntoView {
     let scopes = move || {
         rail_facet_block(
             "Portée",
@@ -320,24 +328,15 @@ fn TextesRail(
         )
     };
 
+    // Le premier bloc rendu perd son filet haut (pas de séparateur au-dessus
+    // du premier bloc d'une colonne) ; les suivants gardent le leur.
     view! {
-        <Show when=move || !query.get().is_empty()>
-            <div class="flex flex-col gap-4">
-                {header}
-                {scopes}
-                {natures}
-                {jurisdictions}
-                {sources}
-                <div class="border-t border-[var(--color-rule)] pt-4">
-                    <A
-                        href="/normes"
-                        attr:class="text-[13px] text-[var(--color-ink-muted)] underline-offset-2 transition-colors hover:text-[var(--color-accent)] hover:underline"
-                    >
-                        "Parcourir le catalogue des normes"
-                    </A>
-                </div>
-            </div>
-        </Show>
+        <div class="flex flex-col gap-4 [&>div:first-child]:border-t-0 [&>div:first-child]:pt-0">
+            {scopes}
+            {natures}
+            {jurisdictions}
+            {sources}
+        </div>
     }
 }
 
@@ -403,7 +402,7 @@ fn rail_facet_block(
     .into_any()
 }
 
-/// Barre de filtres textes (gabarit de référence « Lois et règlements ») :
+/// Barre de filtres textes (gabarit du secteur « Lois et règlements ») :
 /// `Juridiction ▾ · Nature ▾ · Source ▾`. Chaque facette est mono-sélection :
 /// cliquer une valeur l'active (`?<clé>=<valeur>`), recliquer la retire. Toute
 /// mutation supprime `page` (retour page 1).
@@ -592,8 +591,8 @@ fn TextesActiveChips(
         };
         let mut out: Vec<(&'static str, String, String)> = Vec::new();
         if let Some(v) = state.code {
-            // Le slug est lisible une fois humanisé (« code-de-justice-… » →
-            // « Code de justice… ») — pas de facette pour porter le titre.
+            // Le slug est lisible une fois humanisé (« code-de-justice-… » → « Code de
+            // justice… ») — pas de facette pour porter le titre.
             let label = format!("Dans\u{00A0}: {}", humanize_slug(&v));
             out.push(("code", v, label));
         }
@@ -619,8 +618,7 @@ fn TextesActiveChips(
     view! {
         <Show when=move || !chips.with(|c| c.is_empty())>
             <div class="flex flex-wrap items-center gap-2">
-                // Libellé dans la clé : il arrive avec les facettes, après la chip
-                // (même règle que les chips décisions).
+                // Libellé dans la clé : il arrive avec les facettes, après la chip.
                 <For
                     each=move || chips.get()
                     key=|(key, value, label): &(&'static str, String, String)| {
@@ -699,9 +697,9 @@ fn TextResults(hits: Vec<ArticleSearchHit>, query: String, page: u32) -> impl In
 
 #[component]
 fn TextHit(hit: ArticleSearchHit, index: usize, page: u32) -> impl IntoView {
-    // Lien sur la clé canonique (`numKey`) — le serve résout en lookup exact, plus
-    // de normalisation au runtime (ADR 0123 §2). `num` reste l'affichage.
-    // `num` vide = hit « texte entier » (texte à corps, ADR 0196) → page du texte.
+    // Lien sur la clé canonique (`numKey`) — le serve résout en lookup exact.
+    // `num` reste l'affichage ; `num` vide = hit « texte entier » (texte à corps)
+    // → page du texte.
     let is_whole_text = hit.num_key.is_empty();
     let href = if is_whole_text {
         format!("/texte/{}", hit.code)
@@ -719,6 +717,36 @@ fn TextHit(hit: ArticleSearchHit, index: usize, page: u32) -> impl IntoView {
             .filter(|s| !s.is_empty())
             .collect();
         segs[segs.len().saturating_sub(2)..].join(" › ")
+    });
+    // Badge d'état : « JO du <date> » pour une publication (`source = "jorf"`,
+    // jamais d'état DILA), libellé d'état pour une version quand il porte un
+    // signal — `VIGUEUR` est l'état par défaut du droit servi dans la fenêtre.
+    let badge = if hit.source == "jorf" {
+        hit.date_debut
+            .as_deref()
+            .and_then(super::annonce_results::date_fr)
+            .map(|d| format!("JO du {d}"))
+    } else {
+        hit.status
+            .as_deref()
+            .filter(|s| *s != "VIGUEUR")
+            .and_then(lj_dtos::article_status_label)
+            .map(str::to_string)
+    };
+    let meta_line = (badge.is_some() || crumb.is_some()).then(|| {
+        view! {
+            <p class="flex min-w-0 items-baseline gap-2 text-xs text-[var(--color-ink-subtle)]">
+                {badge
+                    .map(|b| {
+                        view! {
+                            <span class="shrink-0 rounded border border-[var(--color-rule)] px-1.5 py-0.5">
+                                {b}
+                            </span>
+                        }
+                    })}
+                {crumb.map(|c| view! { <span class="truncate">{c}</span> })}
+            </p>
+        }
     });
     view! {
         <li class="group grid grid-cols-[auto_1fr] gap-x-6 border-t border-[var(--color-rule)] py-7">
@@ -739,12 +767,7 @@ fn TextHit(hit: ArticleSearchHit, index: usize, page: u32) -> impl IntoView {
                         .into_any()
                     }}
                 </h3>
-                {crumb
-                    .map(|c| {
-                        view! {
-                            <p class="truncate text-xs text-[var(--color-ink-subtle)]">{c}</p>
-                        }
-                    })}
+                {meta_line}
                 <p class="text-[0.95rem] leading-relaxed text-[var(--color-ink-muted)]">
                     <Highlighted text=hit.snippet />
                 </p>
@@ -915,26 +938,17 @@ fn humanize_slug(slug: &str) -> String {
 #[component]
 fn TextSearchPrompt() -> impl IntoView {
     view! {
-        <div class="flex flex-col items-start gap-3 border-t border-[var(--color-rule)] py-16">
-            <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
-                "Textes & codes"
-            </p>
+        <div class="flex flex-col items-start gap-3">
             <h2 class="font-sans text-2xl text-[var(--color-ink)]">
                 "Cherchez dans le texte des normes."
             </h2>
             <p class="max-w-prose text-[var(--color-ink-muted)]">
                 "Codes, lois et règlements, conventions collectives, doctrine "
-                "administrative (BOFiP, circulaires). Saisissez une notion "
-                "(« responsabilité du fait des choses », « congés trimestriels "
-                "convention collective de 1966 ») ; les articles en vigueur les "
-                "plus pertinents s'affichent, avec un lien vers leur page versionnée."
+                "administrative (BOFiP, circulaires). Saisissez une notion ou un "
+                "numéro d'article ; les articles en vigueur les plus pertinents "
+                "s'affichent, avec un lien vers leur page versionnée."
             </p>
-            <A
-                href="/normes"
-                attr:class="text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
-            >
-                "Parcourir le catalogue des normes"
-            </A>
+            <TextesExamples />
         </div>
     }
 }

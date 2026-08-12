@@ -6,7 +6,7 @@ license.workspace = true
 
 # Init telemetrie partagee par les binaires (lj-api, lj-ingest) : subscriber
 # tracing + export OTLP/HTTP direct vers Grafana Cloud (traces + logs +
-# metriques), scrub PII in-app, guard de flush. Voir ADR 0062.
+# metriques), scrub PII in-app, guard de flush.
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }

@@ -1,5 +1,5 @@
 //! Nettoyage des dockets, dates ISO, et extraction de la date d'audience
-//! depuis le corps. Port de la partie « Dockets & dates » de `extract/common.py`.
+//! depuis le corps.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -15,7 +15,6 @@ const DOCKET_MIN_LEN: usize = 4;
 const DATE_MIN_YEAR: i32 = 1800;
 const DATE_MAX_YEAR: i32 = 2200;
 
-/// `_clean_date_iso`.
 pub(crate) fn clean_date_iso(value: Option<&str>) -> Option<String> {
     let value = value?;
     if value.is_empty() {
@@ -36,7 +35,6 @@ pub(crate) fn clean_date_iso(value: Option<&str>) -> Option<String> {
     Some(value.to_string())
 }
 
-/// `_clean_docket_numbers`.
 pub(crate) fn clean_docket_numbers(values: Option<&[Option<String>]>) -> Option<Vec<String>> {
     let values = values?;
     if values.is_empty() {
@@ -65,7 +63,6 @@ pub(crate) fn clean_docket_numbers(values: Option<&[Option<String>]>) -> Option<
     }
 }
 
-/// `_FRENCH_MONTHS`.
 fn french_month(name: &str) -> Option<i8> {
     Some(match name {
         "janvier" => 1,
@@ -84,7 +81,6 @@ fn french_month(name: &str) -> Option<i8> {
     })
 }
 
-/// `_parse_french_date`.
 pub(crate) fn parse_french_date(day: &str, month: &str, year: &str) -> Option<String> {
     let month_num = french_month(&month.to_lowercase())?;
     let day_num: i8 = if day.to_lowercase() == "1er" {
@@ -175,7 +171,6 @@ fn parse_spelled_french_date(day: &str, month: &str, year: &str) -> Option<Strin
         .map(|d| d.to_string())
 }
 
-/// `_parse_numeric_date`.
 fn parse_numeric_date(day: &str, month: &str, year: &str) -> Option<String> {
     let d: i8 = day.parse().ok()?;
     let m: i8 = month.parse().ok()?;
@@ -184,8 +179,8 @@ fn parse_numeric_date(day: &str, month: &str, year: &str) -> Option<String> {
 }
 
 // Regex d'audience (toutes IGNORECASE) — petits spans positionnés par tokens :
-// elles ne lisent que les fenêtres `DocScan::audience_windows`, jamais le
-// texte intégral (ADR 0157).
+// elles ne lisent que les fenêtres `DocScan::audience_windows`, jamais le texte
+// intégral.
 static RE_AUDIENCE_COMPOSITION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)audience\s+(?:publique\s+)?du\s+(\d{1,2}|1er)\s+([a-zéûîôàèùç]+)\s+(\d{4})[\s,]*(?:où\s+étaient\s+présent|où\s+siégeaient|en\s+présence\s+de)",
@@ -198,7 +193,7 @@ static RE_AUDIENCE_LABELED: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-// `_RE_AUDIENCE_DEBATS` sans le lookbehind `(?<!délibéré\s)` (porté ci-dessous).
+// `RE_AUDIENCE_DEBATS` sans le lookbehind `(?<!délibéré\s)` (rejoué ci-dessous).
 static RE_AUDIENCE_DEBATS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)\b(?:d[ée]bat[s]?\s+en\s+l['\x{2019}]audience\s+publique|au\s+cours\s+de\s+l['\x{2019}]audience\s+publique|lors\s+des\s+d[ée]bat[s]?|(?:à|a)\s+l['\x{2019}]audience(?:\s+publique)?(?:\s+tenue)?|lors\s+de\s+l['\x{2019}]audience(?:\s+publique)?(?:\s+tenue)?|audience\s+(?:collégiale|des\s+référés|sur\s+incident)|délibéré\s+après\s+l['\x{2019}]audience|l['\x{2019}]affaire\s+a\s+été\s+appelée|l['\x{2019}]affaire\s+(?:a\s+été\s+)?plaidée|(?:l['\x{2019}]affaire\s+a\s+été\s+)?débattue?)\s+(?:du|le|en\s+date\s+du)\s+(\d{1,2}|1er)\s+([a-zéûîôàèùç]+)\s+(\d{4})",
@@ -269,8 +264,7 @@ fn audience_candidates(text: &str, re: &Regex) -> Vec<String> {
 }
 
 /// Comme [`audience_candidates`] mais écarte les matches précédés de
-/// « délibéré » (port du lookbehind `(?<!délibéré\s)`, qui ne porte que sur la
-/// branche `(?:à|a) l'audience`).
+/// « délibéré » (l'écart ne porte que sur la branche `(?:à|a) l'audience`).
 fn audience_candidates_debats(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for m in RE_AUDIENCE_DEBATS.captures_iter(text) {
@@ -299,11 +293,10 @@ fn audience_candidates_num(text: &str, re: &Regex) -> Vec<String> {
         .collect()
 }
 
-/// `_extract_textual_audience_date` — les regex de date ne tournent plus sur
-/// le texte intégral : le scan (ADR 0156/0157) positionne les ancres
-/// (« audience », « débats », « plaidoiries », « débattue », « appelée ») et
-/// chaque regex ne voit que les petites fenêtres verbatim autour de ces
-/// tokens. Priorité inchangée : premier producteur non vide, dans l'ordre.
+/// Les regex de date ne tournent pas sur le texte intégral : le scan positionne
+/// les ancres (« audience », « débats », « plaidoiries », « débattue »,
+/// « appelée ») et chaque regex ne voit que les petites fenêtres verbatim autour
+/// de ces tokens. Premier producteur non vide, dans l'ordre.
 pub(crate) fn extract_textual_audience_date(
     decision: &Decision,
     scan: Option<&crate::scan::DocScan>,
@@ -475,12 +468,6 @@ mod tests {
 
     #[test]
     fn textual_audience_date_priority_and_selection() {
-        // Spec figée + garde-fou du refacto paresseux de
-        // `extract_textual_audience_date` (l'ordre des producteurs et le « premier
-        // non vide » doivent rester identiques quelle que soit l'évaluation).
-
-        // Producteur 0 (RE_AUDIENCE_COMPOSITION) : « audience publique du … où
-        // étaient présents ». Date d'audience <= lecture et proche (< 120 j).
         let d = audience_decision(
             "Vu la procédure. À l'audience publique du 12 mars 2024 où étaient présents \
              les magistrats. Par ces motifs.",
@@ -491,7 +478,6 @@ mod tests {
             Some("2024-03-12")
         );
 
-        // Aucun motif d'audience → None (le cas fréquent qui doit court-circuiter).
         let none = audience_decision(
             "Vu la requête. Par ces motifs, rejette.",
             Some("2024-03-20"),
@@ -501,8 +487,6 @@ mod tests {
             None
         );
 
-        // Forme « débats … à l'audience publique du … » (producteur 2, via
-        // RE_AUDIENCE_DEBATS) : doit être captée et sélectionnée.
         let debats = audience_decision(
             "Les débats se sont tenus à l'audience publique du 3 octobre 2023.",
             Some("2023-11-10"),

@@ -1,13 +1,12 @@
-//! Facette domaine juridique dérivée du PROFIL DES CODES CITÉS (ADR 0156 :
-//! sur-exploitation du flux de citations liées). Vote pondéré : chaque
-//! citation résolue vers un texte SUBSTANTIEL vote pour un domaine — les
-//! codes procéduraux/génériques (CPC, CJA, COJ, CRPA) et les textes
-//! transverses (CEDH, Constitution, loi aide juridique) ne votent pas. Les
-//! codes multi-domaines (code civil, code de commerce, CPI) votent par plage
+//! Facette domaine juridique dérivée du PROFIL DES CODES CITÉS. Vote pondéré :
+//! chaque citation résolue vers un texte SUBSTANTIEL vote pour un domaine — les
+//! codes procéduraux/génériques (CPC, CJA, COJ, CRPA) et les textes transverses
+//! (CEDH, Constitution, loi aide juridique) ne votent pas. Les codes
+//! multi-domaines (code civil, code de commerce, CPI) votent par plage
 //! d'articles.
 //!
 //! Vocabulaire de sortie : suffixes d'uids `legal_domain:*` du référentiel
-//! `facet_value` (taxonomie gold, ADR 0146/0148).
+//! `facet_value`.
 
 use std::collections::HashMap;
 
@@ -22,21 +21,17 @@ pub struct DomainContext {
     pub commercial: bool,
     pub criminal: bool,
     /// Chambre civile CC (`civ1`/`civ2`/`civ3`/`ordo`/`mi`) : plancher CIVIL
-    /// quand rien ne vote — les désistements/stubs CC n'ont aucune matière
-    /// au texte, la chambre est le seul signal (gold : +37/0).
+    /// quand rien ne vote.
     pub civil_chamber: bool,
     /// Raffinement TEXTE pour l'ordre admin ([`crate::extract::ProcedureUids::
-    /// domain_hint`]) : ne s'applique que si aucun code substantiel ne vote —
-    /// les contentieux FP/aide sociale/urbanisme ne citent souvent que le CJA.
+    /// domain_hint`]) : ne s'applique que si aucun code substantiel ne vote.
     pub hint: Option<&'static str>,
 }
 
 /// Contexte dérivé de la décision : ordre + coloration de chambre, lue sur
 /// le code Judilibre ([`Decision::chamber`] — `soc`, `comm`, `cr` à la CC),
-/// les champs greffe bruts et les axes de formation structurés (ADR 0170 —
-/// la chambre bandeau y entre via `chamber_uid`/`chamber_position`). Un
-/// tribunal de commerce colore commercial par nature (gold : 103/112 TCOM
-/// en parent COMMERCIAL).
+/// les champs greffe bruts et les axes de formation structurés. Un tribunal
+/// de commerce colore commercial par nature.
 ///
 /// [`Decision::chamber`]: lj_core::decision::Decision::chamber
 pub fn context_for(
@@ -59,9 +54,8 @@ pub fn context_for(
         commercial: code == "comm"
             || d.jurisdiction_type.as_deref() == Some("TCOM")
             || blob.contains("commer"),
-        // Coloration JUDICIAIRE seulement : CRIMINEL n'existe pas dans
-        // l'ordre admin (extraditions CE : « correctionnel » au texte,
-        // gold étrangers/PUBLIC — 25 erreurs, 0 correcte).
+        // Coloration JUDICIAIRE seulement : CRIMINEL n'existe pas dans l'ordre
+        // admin.
         criminal: judiciaire
             && (code == "cr" || blob.contains("criminel") || blob.contains("correctionnel")),
         civil_chamber: matches!(code, "civ1" | "civ2" | "civ3" | "ordo" | "mi"),
@@ -81,7 +75,6 @@ const GENERIC_ADMIN: &[&str] = &["LEGITEXT000006070933", "LEGITEXT000031366350"]
 /// sur-classe à seuil RENFORCÉ (≥ 5 occurrences, ≥ 3× le second, parent
 /// CIVIL ou COMMERCIAL) : un prêt qui cite 1103/1343 reste du bancaire.
 /// Les autres sous-domaines posés par les codes cités sont intouchables.
-/// Simulations gold 2026-07-08 : +75/−4 (parents nus), +24/−8 (RC_CONTRATS).
 pub fn refine_with_terms(current: Option<String>, votes: &[(&'static str, u32)]) -> Option<String> {
     const PARENTS: &[&str] = &["PUBLIC", "CIVIL", "SOCIAL", "COMMERCIAL"];
     const SOFT_DEFAULT: &str = "CIVIL_DROIT_RESPONSABILITE_CONTRATS";
@@ -119,11 +112,8 @@ pub fn refine_with_terms(current: Option<String>, votes: &[(&'static str, u32)])
 /// Domaine porté par le code NAC (nomenclature des affaires civiles, posée
 /// par le greffe à l'enregistrement — [`Decision::nac`]). Table curée depuis
 /// la nomenclature officielle DACS (data.gouv.fr, familles 2 chars +
-/// exceptions 3 chars), validée contre le gold : 73 % exact, 89 % parent.
-/// L'école gold guide les familles mixtes : bail commercial (30) → LOCATIF,
-/// JLD rétention des étrangers (14G/H/N/Q/R) → ETRANGERS, saisie immobilière
-/// (78A/B/E) hors PCE, recouvrement de cotisations (88B) → SOCIAL nu.
-/// `None` : famille inconnue (codes historiques hors 51) ou hors nomenclature.
+/// exceptions 3 chars). `None` : famille inconnue (codes historiques hors 51)
+/// ou hors nomenclature.
 ///
 /// [`Decision::nac`]: lj_core::decision::Decision::nac
 pub fn nac_domain(nac: &str) -> Option<&'static str> {
@@ -136,7 +126,7 @@ pub fn nac_domain(nac: &str) -> Option<&'static str> {
         // Vente immobilière forcée et incidents de saisie immobilière.
         "78A" | "78B" | "78E" => Some("CIVIL_DROIT_SAISIE_IMMOBILIERE"),
         // Recouvrement de cotisations (mise en demeure, contrainte) : ni
-        // prestation ni travail — parent nu.
+        // prestation ni travail.
         "88B" => Some("SOCIAL"),
         // Faute inexcusable de l'employeur : contentieux du travail.
         "89B" => Some("SOCIAL_DROIT_TRAVAIL"),
@@ -153,8 +143,8 @@ pub fn nac_domain(nac: &str) -> Option<&'static str> {
         | "2A" => "CIVIL_DROIT_PERSONNES_FAMILLE",
         "20" | "21" | "22" => "CIVIL_DIVORCE_SEPARATION_CORPS",
         "28" | "29" => "CIVIL_DROIT_SUCCESSIONS",
-        // Bail commercial : école gold LOCATIF (9/9). 51 = baux d'habitation
-        // de la nomenclature historique, encore massif dans les stocks.
+        // Bail commercial. 51 = baux d'habitation de la nomenclature
+        // historique, encore massif dans les stocks.
         "30" | "51" | "5A" | "5B" => "CIVIL_DROIT_LOCATIF",
         "31" | "32" | "33" => "COMMERCIAL_DROIT_CONTRATS",
         "34" | "35" | "36" => "COMMERCIAL_DROIT_SOCIETES",
@@ -194,8 +184,7 @@ fn parent(d: &str) -> &str {
 /// citations trompeuses) — mais ne conteste jamais un sous-domaine du même
 /// parent posé par les codes cités, plus fins que la famille NAC (plages
 /// d'articles ; l'axe civil↔commercial des contrats dépend des parties, que
-/// la NAC ne voit pas). Simulation gold 2026-07-08 : +42/−8 ; l'override
-/// total faisait +61/−22.
+/// la NAC ne voit pas).
 pub fn refine_with_nac(current: Option<String>, nac: Option<&str>) -> Option<String> {
     let Some(dom) = nac.and_then(nac_domain) else {
         return current;
@@ -279,7 +268,7 @@ pub fn theme_domain(themes: &[String]) -> Option<&'static str> {
         | "relations du travail et protection sociale"
         | "securite sociale, accident du travail" => Some("SOCIAL_DROIT_TRAVAIL"),
         // sécurité sociale : prestations → aide, recouvrement/contentieux
-        // technique → SOCIAL nu (école gold)
+        // technique → SOCIAL nu
         "securite sociale, prestations familiales"
         | "securite sociale, assurances sociales"
         | "securite sociale, allocations diverses" => Some("SOCIAL_DROIT_AIDE_ACTION_SOCIALE"),
@@ -390,10 +379,9 @@ pub fn theme_domain(themes: &[String]) -> Option<&'static str> {
 }
 
 /// Raffine par les thèmes : COMBLE un domaine absent ou parent nu et TRANCHE
-/// un désaccord de parent, comme le NAC (ADR 0177) — sans contester un
-/// sous-domaine du même parent, ni JAMAIS le CRIMINEL (la chambre criminelle
-/// prime tout, fraude fiscale titrée « impots et taxes » comprise).
-/// Simulation gold 2026-07-12 : +25/−1 ; sans la garde CRIMINEL, +25/−5.
+/// un désaccord de parent, comme le NAC — sans contester un sous-domaine du
+/// même parent, ni JAMAIS le CRIMINEL (la chambre criminelle prime tout,
+/// fraude fiscale titrée « impots et taxes » comprise).
 pub fn refine_with_themes(current: Option<String>, themes: &[String]) -> Option<String> {
     let Some(dom) = theme_domain(themes) else {
         return current;
@@ -418,7 +406,7 @@ pub fn refine_with_themes(current: Option<String>, themes: &[String]) -> Option<
 /// companies extraits des deux côtés) : le code civil cité ne dit pas la
 /// qualité des parties, l'acte entre commerçants est commercial (C. com.
 /// L. 110-1). Ne touche que ce défaut — jamais un sous-domaine spécifique ni
-/// un CIVIL nu (gold : +10/−2 sur le défaut, −5 de plus sur CIVIL nu).
+/// un CIVIL nu.
 pub fn recolor_commercial_parties(
     current: Option<String>,
     both_sides_companies: bool,
@@ -454,11 +442,8 @@ pub fn legal_domain_uid<'a>(
     // La chambre colore les votes génériques du code civil : les obligations
     // devant la chambre commerciale sont du contentieux commercial, devant
     // la chambre sociale du contrat de travail ; l'action civile devant la
-    // chambre criminelle reste du contentieux pénal (gold : `cr` → CRIMINEL
-    // 98 %, intérêts civils compris).
+    // chambre criminelle reste du contentieux pénal.
     let winner = match winner {
-        // La chambre criminelle prime TOUT vote (gold : `cr` → CRIMINEL
-        // 98 % — action civile, fraude fiscale au pénal compris).
         Some(_) if ctx.criminal => Some("CRIMINEL"),
         Some("CIVIL_DROIT_RESPONSABILITE_CONTRATS" | "CIVIL") if ctx.commercial => {
             Some("COMMERCIAL_DROIT_CONTRATS")
@@ -490,9 +475,7 @@ fn domain_vote(uid: &str, num_key: Option<&str>, admin: bool) -> Option<(&'stati
         // massivement le CPP sans cesser d'être du droit des étrangers.
         "LEGITEXT000006070158" => Some(("PUBLIC_DROIT_ETRANGERS_NATIONALITE", 2.0)),
         "LEGITEXT000006069577" | "LEGITEXT000006069583" => strong("FISCAL"), // CGI, LPF
-        // CPP, CP : CRIMINEL n'existe pas dans l'ordre admin — les
-        // extraditions CE citent massivement le CPP en restant du droit des
-        // étrangers (gold : 25 sorties CRIMINEL admin, 0 correcte).
+        // CPP, CP : CRIMINEL n'existe pas dans l'ordre admin.
         "LEGITEXT000006071154" | "LEGITEXT000006070719" => (!admin).then_some(("CRIMINEL", 1.0)),
         "LEGITEXT000006072050" => strong(if admin {
             "PUBLIC_DROIT_TRAVAIL"
@@ -501,8 +484,8 @@ fn domain_vote(uid: &str, num_key: Option<&str>, admin: bool) -> Option<(&'stati
         }), // code du travail
         "LEGITEXT000044416551" => strong("PUBLIC_DROIT_TRAVAIL"), // CGFP
         "LEGITEXT000006074075" => strong("PUBLIC_DROIT_URBANISME_IMMOBILIER_PUBLIC"), // urbanisme
-        // CG3P (domaine public), voirie routière : l'immobilier/patrimoine
-        // public au sens de l'école gold.
+        // CG3P (domaine public), voirie routière : l'immobilier et le
+        // patrimoine publics.
         "LEGITEXT000006070299" | "LEGITEXT000006070667" => {
             admin.then_some(("PUBLIC_DROIT_URBANISME_IMMOBILIER_PUBLIC", 1.0))
         }
@@ -528,11 +511,9 @@ fn domain_vote(uid: &str, num_key: Option<&str>, admin: bool) -> Option<(&'stati
         // L. 434, maladies professionnelles L. 461, faute inexcusable
         // L. 452) et prévoyance collective d'entreprise (L. 911-914) =
         // contentieux du travail ; cotisations & recouvrement URSSAF
-        // (L. 133/136, livre 2, régimes des indépendants 6xx) = SOCIAL nu
-        // (école gold) ; le reste (prestations, livre 8) = aide/action
-        // sociale — SOCIAL même devant l'ordre admin (école gold : le
-        // contentieux technique de la sécu reste SOCIAL, contrairement au
-        // CASF).
+        // (L. 133/136, livre 2, régimes des indépendants 6xx) = SOCIAL nu ;
+        // le reste (prestations, livre 8) = aide/action sociale, SOCIAL même
+        // devant l'ordre admin.
         "LEGITEXT000006073189" => match head_num(num_key) {
             Some(411..=482 | 911..=914) => strong(if admin {
                 "PUBLIC_DROIT_TRAVAIL"
@@ -633,7 +614,7 @@ fn code_civil_vote(num_key: Option<&str>, admin: bool) -> (&'static str, f64) {
         711..=1099 => ("CIVIL_DROIT_SUCCESSIONS", 1.0),
         // responsabilité extracontractuelle (1240-1252 + anciens 1382-1386)
         // et quasi-contrats anciens (1371-1381 : gestion d'affaires,
-        // répétition de l'indu — école thèmes « resp. et quasi-contrats »)
+        // répétition de l'indu)
         1240..=1252 | 1371..=1386 => ("CIVIL_DROIT_RESPONSABILITE", 1.0),
         // preuve (anciens 1315-1316) : transverse, ne signe pas la matière
         1315 | 1316 => ("CIVIL", 0.5),
@@ -680,28 +661,23 @@ mod tests {
             ("CIVIL_DROIT_LOCATIF", 5u32),
             ("CIVIL_DROIT_SUCCESSIONS", 1),
         ];
-        // parent nu cohérent : raffiné
         assert_eq!(
             refine_with_terms(Some("legal_domain:CIVIL".into()), &votes).as_deref(),
             Some("legal_domain:CIVIL_DROIT_LOCATIF")
         );
-        // domaine absent : posé
         assert_eq!(
             refine_with_terms(None, &votes).as_deref(),
             Some("legal_domain:CIVIL_DROIT_LOCATIF")
         );
-        // sous-domaine posé par les codes : intouchable
         assert_eq!(
             refine_with_terms(Some("legal_domain:CIVIL_DROIT_ASSURANCES".into()), &votes)
                 .as_deref(),
             Some("legal_domain:CIVIL_DROIT_ASSURANCES")
         );
-        // parent incohérent : refus
         assert_eq!(
             refine_with_terms(Some("legal_domain:COMMERCIAL".into()), &votes).as_deref(),
             Some("legal_domain:COMMERCIAL")
         );
-        // sous les seuils (1 occurrence, ou gagnant < 2× le second) : refus
         assert_eq!(refine_with_terms(None, &[("CIVIL_DROIT_LOCATIF", 1)]), None);
         assert_eq!(
             refine_with_terms(
@@ -714,8 +690,6 @@ mod tests {
 
     #[test]
     fn chamber_criminelle_recolore_l_action_civile() {
-        // Pourvoi `cr` ne citant que le code civil (intérêts civils) :
-        // la coloration criminelle prime le vote responsabilité.
         let cites = || vec![("LEGITEXT000006070721", Some("1240"))];
         let cr = DomainContext {
             criminal: true,
@@ -729,7 +703,6 @@ mod tests {
             legal_domain_uid(cites(), DomainContext::default()).as_deref(),
             Some("legal_domain:CIVIL_DROIT_RESPONSABILITE")
         );
-        // Vote muet : plancher CRIMINEL.
         assert_eq!(
             legal_domain_uid(vec![], cr).as_deref(),
             Some("legal_domain:CRIMINEL")
@@ -738,7 +711,6 @@ mod tests {
 
     #[test]
     fn tcom_colore_les_obligations_en_commercial() {
-        // Obligations du code civil devant le tribunal de commerce.
         let cites = vec![("LEGITEXT000006070721", Some("1103"))];
         let ctx = DomainContext {
             commercial: true,
@@ -752,7 +724,6 @@ mod tests {
 
     #[test]
     fn nac_comble_et_tranche_le_parent_sans_contester_le_sous_domaine() {
-        // Comble un domaine absent ou parent nu.
         assert_eq!(
             refine_with_nac(None, Some("20A")).as_deref(),
             Some("legal_domain:CIVIL_DIVORCE_SEPARATION_CORPS")
@@ -761,7 +732,6 @@ mod tests {
             refine_with_nac(Some("legal_domain:CIVIL".into()), Some("5A1")).as_deref(),
             Some("legal_domain:CIVIL_DROIT_LOCATIF")
         );
-        // Tranche un désaccord de PARENT (citations trompeuses).
         assert_eq!(
             refine_with_nac(
                 Some("legal_domain:CIVIL_DROIT_PERSONNES_FAMILLE".into()),
@@ -770,7 +740,6 @@ mod tests {
             .as_deref(),
             Some("legal_domain:PUBLIC_DROIT_ETRANGERS_NATIONALITE")
         );
-        // Ne conteste jamais un sous-domaine du même parent (codes plus fins).
         assert_eq!(
             refine_with_nac(
                 Some("legal_domain:CIVIL_DROIT_BANCAIRE_BOURSIER".into()),
@@ -779,24 +748,20 @@ mod tests {
             .as_deref(),
             Some("legal_domain:CIVIL_DROIT_BANCAIRE_BOURSIER")
         );
-        // NAC inconnue : inerte.
         assert_eq!(refine_with_nac(None, Some("99Z")), None);
     }
 
     #[test]
     fn themes_comblent_et_tranchent_sauf_criminel() {
         let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // Matière pénale du titrage : comble un domaine absent.
         assert_eq!(
             refine_with_themes(None, &t(&["instruction", "perquisition"])).as_deref(),
             Some("legal_domain:CRIMINEL")
         );
-        // Préfixe de moyen raboté avant la table.
         assert_eq!(
             theme_domain(&t(&["(sur le 2e moyen) conventions collectives"])),
             Some("SOCIAL_DROIT_TRAVAIL")
         );
-        // Rétention d'un étranger : mots-clés à toute profondeur du titrage.
         assert_eq!(
             theme_domain(&t(&[
                 "droit des personnes",
@@ -805,8 +770,6 @@ mod tests {
             ])),
             Some("PUBLIC_DROIT_ETRANGERS_NATIONALITE")
         );
-        // Tranche un désaccord de PARENT, jamais un sous-domaine du même
-        // parent, jamais le CRIMINEL (fraude fiscale chambre criminelle).
         assert_eq!(
             refine_with_themes(Some("legal_domain:CIVIL".into()), &t(&["divorce"])).as_deref(),
             Some("legal_domain:CIVIL_DIVORCE_SEPARATION_CORPS")
@@ -827,13 +790,11 @@ mod tests {
             .as_deref(),
             Some("legal_domain:CRIMINEL")
         );
-        // Intitulé procédural : ne vote pas.
         assert_eq!(theme_domain(&t(&["cassation", "pouvoir"])), None);
     }
 
     #[test]
     fn ceseda_wins_over_procedural_codes() {
-        // CJA/CPC ne votent pas : une seule citation CESEDA suffit.
         let cites = vec![
             ("LEGITEXT000006070933", Some("L. 761-1")),
             ("LEGITEXT000006070158", Some("L. 611-1")),
@@ -867,7 +828,6 @@ mod tests {
 
     #[test]
     fn code_civil_ranges_vote_and_strong_beats_default() {
-        // 1240 (responsabilité) + deux plages par défaut : le fort gagne.
         let cites = vec![
             ("LEGITEXT000006070721", Some("2224")),
             ("LEGITEXT000006070721", Some("1240")),
@@ -880,8 +840,6 @@ mod tests {
 
     #[test]
     fn generic_admin_only_falls_back_to_public() {
-        // CJA seul : pas de domaine substantiel — fallback PUBLIC en admin,
-        // rien en judiciaire.
         let cites = || vec![("LEGITEXT000006070933", Some("R. 222-1"))];
         let ctx = DomainContext {
             admin: true,

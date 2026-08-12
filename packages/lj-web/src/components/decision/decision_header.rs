@@ -1,9 +1,8 @@
-//! En-tête décision + barre d'actions. Port de `decision-header.tsx`.
+//! En-tête décision + barre d'actions.
 //!
 //! `DecisionHeader` alimente la barre sticky (`components::decision_bar`) côté
 //! client, en consommant la graine de navigation posée par la carte résultat /
-//! la voisine (origine recherche + prev/next ; SSR : aucune barre, parité
-//! `useLayoutEffect`).
+//! la voisine (origine recherche + prev/next ; SSR : aucune barre).
 
 use leptos::prelude::*;
 use lj_dtos::DecisionDetail;
@@ -15,10 +14,10 @@ use crate::pages::decision_page::reference::build_decision_references;
 use crate::api::ApiClient;
 #[cfg(feature = "hydrate")]
 use crate::components::decision_bar::{
-    use_decision_bar, use_result_nav, use_seed_memory, DecisionBarState,
+    persist_seed, restore_seed, use_decision_bar, use_result_nav, use_seed_memory, DecisionBarState,
 };
 
-/// Pousse les métadonnées dans la barre sticky (port de `setBar`/cleanup).
+/// Pousse les métadonnées dans la barre sticky.
 #[component]
 pub fn DecisionHeader(detail: DecisionDetail) -> impl IntoView {
     #[cfg(feature = "hydrate")]
@@ -29,20 +28,23 @@ pub fn DecisionHeader(detail: DecisionDetail) -> impl IntoView {
         let seed = use_result_nav();
         let memory = use_seed_memory();
         Effect::new(move |_| {
-            // Consomme la graine (one-shot) en la mémorisant par id ; sans
-            // graine (back navigateur depuis un article de loi, lien direct,
-            // activité), on restaure le dernier contexte DE CETTE décision —
-            // jamais celui d'une autre. Aucun contexte connu → barre sans nav
-            // (titre + retour « Recherche »).
+            // Consomme la graine (one-shot) en la mémorisant par id ; sans graine (back
+            // navigateur depuis un article de loi, lien direct, activité), on restaure le
+            // dernier contexte DE CETTE décision — jamais celui d'une autre. Aucun
+            // contexte connu → barre sans nav (titre + retour « Recherche »).
             let consumed = match seed.get_untracked() {
                 Some(s) => {
                     memory.update_value(|m| {
                         m.insert(id.clone(), s.clone());
                     });
+                    persist_seed(&id, &s);
                     s
                 }
+                // Mémoire vive d'abord, puis l'onglet : la RAM ne survit pas au rechargement,
+                // `sessionStorage` si.
                 None => memory
                     .with_value(|m| m.get(&id).cloned())
+                    .or_else(|| restore_seed(&id))
                     .unwrap_or_default(),
             };
             seed.set(None);
@@ -60,7 +62,7 @@ pub fn DecisionHeader(detail: DecisionDetail) -> impl IntoView {
 }
 
 /// Barre d'actions (référence, signet, impression, PDF). Rendue dans
-/// `DecisionSimilar`. Port de `DecisionActions`.
+/// `DecisionSimilar`.
 #[component]
 pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
     let references = build_decision_references(&detail);
@@ -89,8 +91,11 @@ pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
                 >
                     <PrintIcon />
                 </button>
+                // `rel="nofollow"` : la cible est sous `/api/`, que le `robots.txt` refuse à
+                // tous les crawlers et que le WAF bloque.
                 <a
                     href=pdf_href
+                    rel="nofollow"
                     download=pdf_filename
                     class="inline-flex shrink-0 items-center gap-2 rounded-sm border border-[var(--color-rule)] px-2.5 py-1.5 text-xs text-[var(--color-ink-muted)] no-underline transition-colors hover:border-[var(--color-ink)] hover:text-[var(--color-ink)]"
                     aria-label="PDF"
@@ -104,14 +109,13 @@ pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
     .into_any()
 }
 
-/// Bouton « signet », gated par l'auth. Port de `BookmarkButton` : le bouton est
-/// masqué tant que la session n'est pas résolue (token absent au SSR), et masqué
-/// si l'enregistrement d'activité est coupé (mode ZDR, ADR 0056). Bascule
-/// optimiste add/remove avec rollback en erreur.
+/// Bouton « signet », gated par l'auth : masqué tant que la session n'est pas
+/// résolue (token absent au SSR), et masqué si l'enregistrement d'activité est
+/// coupé (mode ZDR). Bascule optimiste add/remove avec rollback en erreur.
 #[component]
 fn BookmarkButton(decision_id: String) -> impl IntoView {
     let has_token = RwSignal::new(None::<bool>);
-    // `None` = profil non chargé (affiché, comme React `profile === undefined`).
+    // `None` = profil non chargé (affiché).
     let track_activity = RwSignal::new(None::<bool>);
     let is_on = RwSignal::new(false);
     let busy = RwSignal::new(false);
@@ -193,7 +197,7 @@ fn BookmarkButton(decision_id: String) -> impl IntoView {
 }
 
 /// Bouton « Référence » + menu déroulant (copier complète / abrégée).
-/// Port de `CopyReferenceButton` : copie via `dom::copy_text`, retour « Copié »
+/// Copie via `dom::copy_text`, retour « Copié »
 /// 1,8 s, fermeture au clic extérieur (`pointerdown` document).
 #[component]
 fn CopyReferenceButton(full: String, short: String) -> impl IntoView {
@@ -202,7 +206,7 @@ fn CopyReferenceButton(full: String, short: String) -> impl IntoView {
     let copied = RwSignal::new(None::<&'static str>);
     let container_ref = NodeRef::<leptos::html::Div>::new();
 
-    // Fermeture au clic extérieur (port du listener `pointerdown` document).
+    // Fermeture au clic extérieur.
     #[cfg(feature = "hydrate")]
     {
         use wasm_bindgen::JsCast;
@@ -287,9 +291,11 @@ fn CopyReferenceButton(full: String, short: String) -> impl IntoView {
                     }
                 }}
             </button>
-            <Show when=move || open.get()>
-                <div class="absolute left-0 top-full z-30 mt-2 min-w-72 rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] p-2 shadow-lg">
-                    <CopyMenuButton
+            <div
+                data-open=move || open.get().then_some("true")
+                class="lj-panel absolute left-0 top-full z-30 mt-2 min-w-72 rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] p-2 shadow-lg"
+            >
+                <CopyMenuButton
                         label="Copier la référence complète"
                         value=full.clone()
                         copied=Signal::derive(move || copied.get() == Some("full"))
@@ -307,8 +313,7 @@ fn CopyReferenceButton(full: String, short: String) -> impl IntoView {
                             move |_| copy(short_copy.clone(), "short")
                         })
                     />
-                </div>
-            </Show>
+            </div>
         </div>
     }
     .into_any()

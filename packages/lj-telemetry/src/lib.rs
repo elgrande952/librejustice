@@ -2,28 +2,28 @@
 //! OTLP Grafana Cloud (traces + logs + metriques), HTTP/protobuf + Basic Auth.
 //!
 //! Crate consommee par les binaires `lj-api` (serveur axum, long-vivant) et
-//! `lj-ingest` (cron, court-vivant). Plus de collector local : c'etait lui qui
-//! scrubait la PII et faisait le fan-out vers les backends. Les deux roles sont
-//! rapatries cote app :
+//! `lj-ingest` (cron, court-vivant). Trois roles :
 //!
 //! - export OTLP/HTTP des 3 signaux vers un endpoint unique (`/otlp`), avec
 //!   l'en-tete `Authorization: Basic base64(<otlp_user>:<api_key>)` ;
-//! - scrub PII des spans avant export via un [`ScrubbingSpanProcessor`]
-//!   (RGPD / ADR 0039) : suppression IP / `db.statement`, troncature des
-//!   query-strings d'URL ; `librejustice.search.query` est conserve.
+//! - scrub PII des spans avant export via un [`ScrubbingSpanProcessor`] :
+//!   suppression IP / `db.statement`, troncature des query-strings d'URL ;
+//!   `librejustice.search.query` est conserve ;
+//! - echantillonnage par tete : `ParentBased` sur [`UnattendedRootSampler`],
+//!   qui abandonne la trace d'un crawl non surveille des son span racine
+//!   ([`unattended_request_span`]).
 //!
 //! L'activation OTel = presence des credentials Grafana ([`InitOpts::otlp`]).
 //! Sans eux, on reste sur un simple subscriber fmt (dev local).
 //!
 //! Court-vivant (cron) : [`init`] renvoie un [`TelemetryGuard`] dont le `Drop`
-//! flush les batch processors. Sans ce flush avant exit, les spans/logs
-//! bufferises ne partiraient jamais.
+//! flush les batch processors.
 
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::{global, KeyValue, Value};
+use opentelemetry::trace::{Link, SpanKind, TraceId, TraceState, TracerProvider as _};
+use opentelemetry::{global, Context, KeyValue, Value};
 use opentelemetry_otlp::{
     LogExporter, MetricExporter, SpanExporter, WithExportConfig, WithHttpConfig,
 };
@@ -31,12 +31,13 @@ use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::{
-    BatchSpanProcessor, SdkTracerProvider, Span, SpanData, SpanProcessor,
+    BatchSpanProcessor, Sampler, SamplingDecision, SamplingResult, SdkTracerProvider, ShouldSample,
+    Span, SpanData, SpanProcessor,
 };
 use opentelemetry_sdk::Resource;
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -49,9 +50,8 @@ const SCOPE: &str = "librejustice";
 pub struct OtlpCreds {
     /// Base URL de la gateway (ex. `https://otlp-gateway-...grafana.net/otlp`).
     /// On y ajoute soi-même `/v1/{traces,logs,metrics}` par signal (cf.
-    /// [`OtlpExport::signal_endpoint`]) : `with_endpoint` sur un builder
-    /// par-signal prend l'URL telle quelle (seule la variable *générale*
-    /// `OTEL_EXPORTER_OTLP_ENDPOINT` déclenche l'append automatique du SDK).
+    /// [`OtlpExport::signal_endpoint`]) : `with_endpoint` sur un builder par-signal
+    /// prend l'URL telle quelle.
     pub endpoint: String,
     /// Utilisateur OTLP (numero d'instance Grafana Cloud).
     pub user: String,
@@ -70,19 +70,17 @@ pub struct InitOpts {
     pub service_name: String,
     /// `deployment.environment` du `Resource` (ex. `prod`), si pose.
     pub deployment_environment: Option<String>,
-    /// Niveau plancher du bridge logs -> LogRecords OTLP (Loki). L'API reste
-    /// sur `WARN` (volume), l'ingest passe a `INFO` pour exporter les
-    /// breadcrumbs de cycle de vie (debut/fin de phase) : un « phase debut »
-    /// sans « phase fin » localise un hang invisible autrement.
-    pub otlp_log_level: LevelFilter,
+    /// Plancher du bridge logs -> LogRecords OTLP (Loki), par cible. L'API reste
+    /// sur `WARN` par defaut et n'ouvre `INFO` que sur sa cible d'usage ; l'ingest
+    /// passe tout a `INFO` pour exporter les breadcrumbs de cycle de vie
+    /// (debut/fin de phase).
+    pub otlp_log_filter: Targets,
     /// Credentials OTLP. `None` = subscriber fmt seul (pas d'export).
     pub otlp: Option<OtlpCreds>,
 }
 
-/// Garde de vie de la telemetrie : flush des batch processors a la destruction.
-///
-/// Indispensable pour les process courts (cron `lj-ingest`) : sans flush avant
-/// exit, les spans/logs bufferises ne sont jamais exportes. A lier dans `main`
+/// Garde de vie de la telemetrie : flush des batch processors a la
+/// destruction. A lier dans `main`
 /// (`let _guard = lj_telemetry::init(...)?;`).
 #[must_use = "garder le guard vivant jusqu'a la fin du process, sinon les signaux bufferises ne partent pas"]
 #[derive(Default)]
@@ -136,8 +134,8 @@ impl OtlpExport {
     }
 
     /// URL complète d'un signal : `<endpoint>/v1/<signal>` (ex.
-    /// `.../otlp/v1/traces`). Indispensable car `with_endpoint` par-signal est
-    /// utilisé verbatim — sans ce suffixe la gateway répond 404.
+    /// `.../otlp/v1/traces`). `with_endpoint` par-signal est utilisé verbatim, le
+    /// suffixe doit donc être ajouté ici.
     fn signal_endpoint(&self, signal: &str) -> String {
         format!("{}/v1/{signal}", self.endpoint)
     }
@@ -175,11 +173,11 @@ pub fn init(opts: InitOpts) -> Result<TelemetryGuard> {
     let logger_provider = build_logger_provider(&export)?;
 
     let traces_layer = tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer(SCOPE));
-    // Bridge logs : `otlp_log_level`+ partent en LogRecords OTLP (les events
-    // sous ce plancher restent visibles via le layer fmt et les spans dans Tempo).
+    // Bridge logs : ce que `otlp_log_filter` laisse passer part en LogRecords
+    // OTLP.
     let logs_layer =
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider)
-            .with_filter(opts.otlp_log_level);
+            .with_filter(opts.otlp_log_filter);
 
     tracing_subscriber::registry()
         .with(opts.filter)
@@ -208,6 +206,65 @@ pub fn meter() -> opentelemetry::metrics::Meter {
     global::meter(SCOPE)
 }
 
+/// Attribut qui marque le span racine d'une requete servie a un crawl non
+/// surveille. Ecrit par [`unattended_request_span`], lu par
+/// [`UnattendedRootSampler`] — les deux doivent nommer la meme cle.
+const UNATTENDED_KEY: &str = "librejustice.unattended";
+
+/// Span racine d'une requete servie a un crawl non surveille.
+///
+/// C'est ici, et une seule fois par requete, que se prend la decision de ne pas
+/// tracer : [`UnattendedRootSampler`] y lit [`UNATTENDED_KEY`] et repond `Drop`.
+/// Le `SpanContext` non echantillonne qui en resulte porte la decision a toute
+/// la descendance via `ParentBased` — les `db.*` du rendu SSR compris.
+///
+/// Ce que l'appelant doit garantir : que les spans a couper naissent bien
+/// **sous** ce span. Le lien parent-enfant passe par le contexte de tache de
+/// `tracing`, donc chaque frontiere de tache doit le reporter explicitement
+/// (`Instrument` sur le handler, sur le corps de reponse et sur les taches de
+/// l'executeur Leptos, cote `lj-server`).
+pub fn unattended_request_span() -> tracing::Span {
+    tracing::info_span!("http.request", librejustice.unattended = true)
+}
+
+/// Delegue racine du `ParentBased` : abandonne une trace dont le span racine
+/// porte [`UNATTENDED_KEY`], echantillonne toutes les autres.
+///
+/// Un span qui a deja un parent ne passe pas ici — `ParentBased` suit alors le
+/// bit `sampled` du parent.
+#[derive(Debug, Clone)]
+struct UnattendedRootSampler;
+
+impl ShouldSample for UnattendedRootSampler {
+    fn should_sample(
+        &self,
+        _parent_context: Option<&Context>,
+        _trace_id: TraceId,
+        _name: &str,
+        _span_kind: &SpanKind,
+        attributes: &[KeyValue],
+        _links: &[Link],
+    ) -> SamplingResult {
+        let unattended = attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == UNATTENDED_KEY && kv.value == Value::Bool(true));
+        SamplingResult {
+            decision: if unattended {
+                SamplingDecision::Drop
+            } else {
+                SamplingDecision::RecordAndSample
+            },
+            attributes: Vec::new(),
+            trace_state: TraceState::default(),
+        }
+    }
+}
+
+/// Sampler du provider de traces.
+fn sampler() -> Sampler {
+    Sampler::ParentBased(Box::new(UnattendedRootSampler))
+}
+
 /// Construit le `TracerProvider` OTLP/HTTP et le pose en global. Le
 /// [`ScrubbingSpanProcessor`] nettoie la PII avant de deleguer au
 /// `BatchSpanProcessor` (serialisation + transmission sur thread dedie).
@@ -224,6 +281,7 @@ fn build_tracer_provider(export: &OtlpExport) -> Result<SdkTracerProvider> {
 
     let provider = SdkTracerProvider::builder()
         .with_span_processor(processor)
+        .with_sampler(sampler())
         .with_resource(export.resource.clone())
         .build();
 
@@ -282,9 +340,9 @@ const URL_TRUNCATE_KEYS: &[&str] = &["url.full", "http.url", "http.target"];
 
 /// `SpanProcessor` qui scrub la PII puis delegue au `BatchSpanProcessor`.
 ///
-/// Sans collector, c'est le seul endroit ou la PII est retiree avant qu'elle ne
-/// quitte le process (RGPD / ADR 0039). `librejustice.search.query` n'est pas
-/// dans les listes : il part intact (attendu par le span de recherche).
+/// C'est le seul endroit ou la PII est retiree avant qu'elle ne quitte le
+/// process. `librejustice.search.query` n'est pas dans les listes : il part
+/// intact.
 #[derive(Debug)]
 struct ScrubbingSpanProcessor {
     inner: BatchSpanProcessor,
@@ -324,7 +382,70 @@ impl SpanProcessor for ScrubbingSpanProcessor {
     }
 }
 
-/// Nom d'hote (equivalent `socket.gethostname()`), best-effort.
+/// Nom d'hote, best-effort.
 fn hostname() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// `SpanProcessor` qui note le nom de chaque span parvenu jusqu'a l'export.
+    /// Un span abandonne par le sampler n'atteint jamais `on_end`.
+    #[derive(Debug, Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<String>>>);
+
+    impl SpanProcessor for Recorder {
+        fn on_start(&self, _span: &mut Span, _cx: &Context) {}
+
+        fn on_end(&self, span: SpanData) {
+            self.0.lock().unwrap().push(span.name.into_owned());
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn set_resource(&mut self, _resource: &Resource) {}
+    }
+
+    /// Joue `f` sous un subscriber branche sur [`sampler`] et rend les noms des
+    /// spans effectivement exportes, dans l'ordre de fermeture.
+    fn exported_spans(f: impl FnOnce()) -> Vec<String> {
+        let recorder = Recorder::default();
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(recorder.clone())
+            .with_sampler(sampler())
+            .build();
+        let layer = tracing_opentelemetry::layer().with_tracer(provider.tracer(SCOPE));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        let names = recorder.0.lock().unwrap().clone();
+        names
+    }
+
+    #[test]
+    fn un_crawl_non_surveille_n_exporte_ni_sa_racine_ni_ses_enfants() {
+        let spans = exported_spans(|| {
+            unattended_request_span().in_scope(|| {
+                tracing::info_span!("db.exemple").in_scope(|| {});
+            });
+        });
+        assert!(spans.is_empty(), "spans exportes : {spans:?}");
+    }
+
+    #[test]
+    fn une_requete_ordinaire_exporte_sa_racine_et_ses_enfants() {
+        let spans = exported_spans(|| {
+            tracing::info_span!("http.request").in_scope(|| {
+                tracing::info_span!("db.exemple").in_scope(|| {});
+            });
+        });
+        assert_eq!(spans, ["db.exemple", "http.request"]);
+    }
 }

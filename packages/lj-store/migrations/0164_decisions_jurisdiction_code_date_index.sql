@@ -1,4 +1,4 @@
--- ADR 0253 : hubs juridiction (/juridictions, /juridiction/{code}/{annee}).
+-- Hubs juridiction (/juridictions, /juridiction/{code}/{annee}).
 -- Les trois requêtes hub (catalogue agrégé, années d'un code, page d'une
 -- année) filtrent et trient par (jurisdiction_code, date_lecture) ; seul
 -- jurisdiction_type était indexé.

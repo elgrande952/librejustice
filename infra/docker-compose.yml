@@ -1,6 +1,7 @@
-# LibreJustice — infra + staging/prod
-# Démarrage  : docker compose up -d
-# Run manuel lj-ingest : binaire hôte, jamais exec dans `cron` (règle #21).
+# LibreJustice — infra + staging/prod. Démarrage : docker compose up -d
+#
+# Un `lj-ingest` manuel passe par le binaire hôte : le deploy recrée `cron` et
+# tuerait le run.
 
 services:
   postgres:
@@ -11,21 +12,24 @@ services:
     container_name: librejustice-postgres
     restart: unless-stopped
     shm_size: 3g
+    stop_grace_period: 300s
     environment:
       POSTGRES_DB: librejustice
       POSTGRES_USER: librejustice
       POSTGRES_PASSWORD: ${LIBREJUSTICE_PG_PASSWORD}
       POSTGRES_HOST_AUTH_METHOD: scram-sha-256
     ports:
-      # Deux ports loopback → le même Postgres. 5432 = accès local sur la VM
-      # (psql, outils). 5433 = cible locale du proxy qui expose la base aux
-      # machines de dev (posé hors compose — ADR 0200).
+      # Deux ports loopback vers le même Postgres : 5432 pour l'accès local sur
+      # la machine, 5433 comme cible du proxy qui l'expose aux machines de dev.
       - "127.0.0.1:5432:5432"
       - "127.0.0.1:5433:5432"
     volumes:
       - ${LIBREJUSTICE_STATE_DIR}/pgdata:/var/lib/postgresql
-      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
-      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      # Un répertoire, jamais deux montages de fichiers : un bind mount de
+      # fichier est lié à l'inode de la source, donc une réécriture depuis
+      # l'hôte (rename-over) laisse le conteneur sur l'ancien contenu, en
+      # silence. Le dossier est rempli par `mise run ensure-pg`.
+      - ${LIBREJUSTICE_STATE_DIR}/pg-conf:/etc/postgresql:ro
     command: postgres -c config_file=/etc/postgresql/postgresql.conf
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U librejustice -d librejustice"]
@@ -33,10 +37,51 @@ services:
       timeout: 3s
       retries: 10
 
-  # Container applicatif unique (ADR 0061) : un seul binaire axum `lj-server`
-  # sert l'API REST (/api/*), OAuth/MCP (/oauth/*, /mcp, /mcp/*, /.well-known/*),
-  # le SSR Leptos + ses assets statiques, ET termine le TLS d'origine in-process
-  # (cert Cloudflare Origin CA). Remplace les anciens services api + ssr + caddy.
+  # Front résident : il tient `:443` et le certificat d'origine pendant que le
+  # deploy recrée `app`. La socket est sinon liée par un `rootlessport` par
+  # conteneur, qui meurt avec lui.
+  #
+  # Ne jamais le recréer au deploy, qui ne touche que `cron` et `app`. Un
+  # changement de sa configuration passe par
+  # `podman exec librejustice-caddy caddy reload --config /etc/caddy/Caddyfile`,
+  # qui ne lâche pas la socket.
+  caddy:
+    image: docker.io/library/caddy:2.11.4-alpine
+    container_name: librejustice-caddy
+    profiles: ["staging", "prod"]
+    restart: unless-stopped
+    # `:443` seulement : l'edge en « Full (strict) » ne compose jamais
+    # l'origine en clair.
+    ports:
+      - "443:443"
+    environment:
+      # Métriques agrégées poussées en OTLP direct vers Grafana Cloud, sans
+      # collecteur. Les noms standards OTel sont posés ici, dans l'env du
+      # conteneur, jamais dans `.env` : le shell de développement n'en hérite
+      # pas.
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT}
+      OTEL_SERVICE_NAME: librejustice-caddy
+      LIBREJUSTICE_GRAFANA_OTLP_USER: ${LIBREJUSTICE_GRAFANA_OTLP_USER}
+      LIBREJUSTICE_GRAFANA_CLOUD_API_KEY: ${LIBREJUSTICE_GRAFANA_CLOUD_API_KEY}
+    # L'auth de Grafana Cloud est un Basic `instanceID:apiKey` déjà encodé, que
+    # `OTEL_EXPORTER_OTLP_HEADERS` ne sait pas composer. `tr -d` et non
+    # `base64 -w0` : busybox n'a pas l'option.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic $$(printf '%s:%s' "$$LIBREJUSTICE_GRAFANA_OTLP_USER" "$$LIBREJUSTICE_GRAFANA_CLOUD_API_KEY" | base64 | tr -d '\n')"
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    volumes:
+      # Un répertoire et non un fichier, même piège d'inode que pg-conf.
+      - ./caddy:/etc/caddy:ro
+      # Certificat d'origine de librejustice.fr, terminé ici.
+      - ${LIBREJUSTICE_STATE_DIR}/tls/origin:/etc/librejustice/origin:ro
+      - ${LIBREJUSTICE_STATE_DIR}/caddy:/data
+
+  # Conteneur applicatif unique : le binaire `lj-server` sert l'API REST
+  # (/api/*), OAuth/MCP (/oauth/*, /mcp, /.well-known/*), le SSR Leptos et ses
+  # assets. Le TLS d'origine est terminé par le front `caddy`.
   app:
     build:
       context: ..
@@ -44,20 +89,18 @@ services:
     container_name: librejustice-app
     profiles: ["staging", "prod"]
     restart: unless-stopped
+    # Non-root : `lj-server` n'écrit rien sur disque, n'a qu'un mount read-only
+    # et écoute au-dessus de 1024. Ici et pas dans `Dockerfile.app`, que `cron`
+    # partage — lui écrit dans son mount `ingest`, possédé par l'UID conteneur 0.
+    user: "1000:1000"
     env_file: ../.env
     environment:
       LIBREJUSTICE_DB_URL: postgresql://librejustice:${LIBREJUSTICE_PG_PASSWORD}@postgres:5432/librejustice
-      LIBREJUSTICE_API_BIND_HOST: "0.0.0.0"
-      # lj-server termine le TLS in-process (ADR 0061) et remplace Caddy : il bind
-      # directement 443 (le défaut 8300 est pour le dev derrière rien). Mappé 443:443.
-      LIBREJUSTICE_API_BIND_PORT: "443"
-      # TLS d'origine in-process (ADR 0061 §3) : le binaire bind :443 en TLS via
-      # axum-server/rustls avec le cert Cloudflare Origin CA — mêmes fichiers que
-      # Caddy hier (state dir, montés ci-dessous en lecture seule).
-      LIBREJUSTICE_API_TLS_CERT_PATH: /etc/librejustice/origin/cert.pem
-      LIBREJUSTICE_API_TLS_KEY_PATH: /etc/librejustice/origin/key.pem
-      # Export OTLP direct vers Grafana Cloud (traces + logs + metriques),
-      # plus de collector voisin. Auth Basic instanceID:apiKey cote app.
+      # Adresse d'écoute du binaire : HTTP en clair derrière `caddy`. Les
+      # conteneurs ne partagent pas de netns, donc `0.0.0.0` et non la
+      # loopback. Aucun `ports:` ici : c'est ce qui rend `CF-Connecting-IP`
+      # non forgeable, donc le rate-limit anonyme incontournable.
+      LEPTOS_SITE_ADDR: "0.0.0.0:8300"
       LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT: ${LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT}
       LIBREJUSTICE_GRAFANA_OTLP_USER: ${LIBREJUSTICE_GRAFANA_OTLP_USER}
       LIBREJUSTICE_GRAFANA_CLOUD_API_KEY: ${LIBREJUSTICE_GRAFANA_CLOUD_API_KEY}
@@ -65,36 +108,26 @@ services:
       LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT: ${LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT}
       LIBREJUSTICE_API_DB_APPLICATION_NAME: ${LIBREJUSTICE_API_DB_APPLICATION_NAME}
       LIBREJUSTICE_API_WEB_BASE_URL: ${LIBREJUSTICE_API_WEB_BASE_URL:-https://librejustice.fr}
-      # ⚠️ Override explicite : .env contient l'URL dev (localhost). On force la
-      # valeur prod ici pour que les metadata OAuth/MCP pointent vers le bon host.
-      # Mono-domaine (ADR 0042) : MCP + OAuth servis sous librejustice.fr.
+      # Override explicite : `.env` porte l'URL de dev, et les metadata
+      # OAuth/MCP doivent annoncer le host public.
       LIBREJUSTICE_API_PUBLIC_BASE_URL: https://librejustice.fr
       LIBREJUSTICE_API_MCP_REQUIRE_AUTH: "true"
-      # Runtime Leptos : localise les assets SSR copiés depuis target/site.
       LEPTOS_OUTPUT_NAME: lj-web
       LEPTOS_SITE_ROOT: /app/site
       LEPTOS_SITE_PKG_DIR: pkg
-      # Noms de bundle content-hashés (ADR 0155) : le SSR lit `hash.txt` (copié
-      # à côté du binaire) pour référencer lj-web.<sha256>.{js,wasm,css}.
+      # Noms de bundle content-hashés : le SSR lit `hash.txt`, posé à côté du
+      # binaire, pour référencer lj-web.<sha256>.{js,wasm,css}.
       LEPTOS_HASH_FILES: "true"
       LOG_FORMAT: json
-      # Stopgap aarch64 : AWS-LC (backend rustls via aws-lc-rs) abort() dans son
-      # RNG matériel ARMv8 `RNDR` pendant le handshake TLS (RAND_bytes →
-      # rand_bytes_impl → abort), ce qui tue tout le process (TLS accept tourne
-      # sur le runtime mono-thread → 1 handshake KO = crash-loop, Cloudflare 525).
-      # `OPENSSL_armcap=0` masque les features CPU ARM optionnelles (dont RNDR) →
-      # AWS-LC retombe sur l'entropie OS (getrandom). Var ARM-only : ignorée sur
-      # x86 (qui lit OPENSSL_ia32cap), donc inerte après bascule x86 — à retirer
-      # alors. Hors préfixe LIBREJUSTICE_ (#5) car lue par la lib C au init ;
-      # posée ici (env conteneur), pas dans .env → ne pollue pas le shell mise.
+      # Sur aarch64, AWS-LC abort() dans le RNG matériel ARMv8 `RNDR` et tue le
+      # process ; à 0 il retombe sur l'entropie de l'OS. Lue par la lib C à
+      # l'init, donc posée dans l'env du conteneur et pas dans `.env`.
       OPENSSL_armcap: "0"
-    ports:
-      - "80:80"
-      - "443:443"
     volumes:
-      # Cert Cloudflare Origin CA pour librejustice.fr (proxied → TLS origin),
-      # terminé in-process par lj-server (rustls, ADR 0061). cert.pem + key.pem.
-      - ${LIBREJUSTICE_STATE_DIR}/tls/origin:/etc/librejustice/origin:ro
+      # Bundles /pkg des déploiements précédents : `ServeDir` y retombe quand un
+      # HTML antérieur demande un asset hashé absent du build courant, et
+      # s'hydrate avec son propre bundle.
+      - ${LIBREJUSTICE_STATE_DIR}/pkg-keep:/app/site-keep/pkg:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -110,8 +143,6 @@ services:
       LIBREJUSTICE_DB_URL: postgresql://librejustice:${LIBREJUSTICE_PG_PASSWORD}@postgres:5432/librejustice
       LIBREJUSTICE_STATE_DIR: /var/lib/librejustice
       LOG_FORMAT: json
-      # Jobs cron observables dans Grafana (cf. ADR 0045) : export OTLP direct
-      # vers Grafana Cloud, plus de collector voisin.
       LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT: ${LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT}
       LIBREJUSTICE_GRAFANA_OTLP_USER: ${LIBREJUSTICE_GRAFANA_OTLP_USER}
       LIBREJUSTICE_GRAFANA_CLOUD_API_KEY: ${LIBREJUSTICE_GRAFANA_CLOUD_API_KEY}

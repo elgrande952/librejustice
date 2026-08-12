@@ -1,4 +1,4 @@
--- Commentaires de norme (ADR 0212) : table sœur de `decision_sources` pour les
+-- Commentaires de norme : table sœur de `decision_sources` pour les
 -- articles de loi/traité. Un commentaire s'ancre sur (text_uid, num_key) ;
 -- `num_key` NULL = commentaire du texte entier (ex. débats parlementaires d'une
 -- loi, propagés aux articles codifiés via `legal_link` au rendu). Même

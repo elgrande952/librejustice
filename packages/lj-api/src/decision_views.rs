@@ -1,5 +1,4 @@
-//! Endpoints `/me/decision-views` + hook d'enregistrement des consultations
-//! (port de `decision_views.py`). Cf. ADR 0053.
+//! Endpoints `/me/decision-views` + hook d'enregistrement des consultations.
 //!
 //! Modèle dédupliqué : une ligne par `(user, décision)`. Chaque ouverture bump
 //! `last_viewed_at` + `view_count` et met à jour `last_source` (`web` | `mcp`)
@@ -31,7 +30,7 @@ fn parse_source(raw: &str) -> Result<ActivitySource, ApiError> {
     }
 }
 
-/// Upsert d'une consultation (parité `_upsert_view`).
+/// Upsert d'une consultation.
 ///
 /// `ON CONFLICT` : bump `view_count`, `last_viewed_at = now()`, et `last_source`
 /// avec priorité `web` (si l'EXCLUDED ou l'existant est `web`, on reste `web`).
@@ -67,8 +66,7 @@ async fn upsert_view(
     Ok(())
 }
 
-/// Enregistre une consultation. Échec silencieux (best-effort, parité
-/// `record_decision_view`).
+/// Enregistre une consultation. Échec silencieux (best-effort).
 ///
 /// Utilisé par le hook MCP `get_decision` : ne doit jamais faire échouer la
 /// lecture. La résolution `public_id` → `id` interne sert d'existence-check.
@@ -91,9 +89,9 @@ pub async fn record_decision_view(
     }
 }
 
-/// Page de lectures (plus récentes d'abord) + total complet (parité
-/// `fetch_views`). `total` via `COUNT(*) OVER()`. Solution et nom de
-/// juridiction résolus depuis le référentiel (ADR 0146).
+/// Page de lectures (plus récentes d'abord) + total complet. `total` via
+/// `COUNT(*) OVER()`. Solution et nom de juridiction résolus depuis le
+/// référentiel.
 pub async fn fetch_views(
     pool: &Pool,
     refs: &Referential,
@@ -144,8 +142,7 @@ pub async fn fetch_views(
             .as_deref()
             .and_then(|c| refs.jurisdiction(c))
             .map(|j| j.label.clone());
-        // Titre canonique (ADR 0146 §4 / 0170) : siège recomposé depuis les
-        // axes structurés.
+        // Titre canonique : siège recomposé depuis les axes structurés.
         let jur_display = crate::titles::decision_jurisdiction(
             refs.jurisdiction_type_label(jur_type_raw)
                 .unwrap_or(jur_type_raw),
@@ -184,7 +181,7 @@ pub async fn fetch_views(
     Ok((items, total))
 }
 
-/// `GET /me/decision-views` (parité `list_views`). `limit` borné `[1, 100]` à la
+/// `GET /me/decision-views`. `limit` borné `[1, 100]` à la
 /// frontière HTTP.
 pub async fn list_views(
     state: &AppState,
@@ -197,7 +194,7 @@ pub async fn list_views(
 }
 
 /// `POST /me/decision-views/{decision_id}` — enregistre une consultation web
-/// (parité `record_view`). 404 si la décision n'existe pas.
+/// 404 si la décision n'existe pas.
 pub async fn record_view(
     state: &AppState,
     user_sub: &str,
@@ -205,11 +202,11 @@ pub async fn record_view(
 ) -> Result<(), ApiError> {
     let db_id = resolve_decision_pk(&state.pool, public_id)
         .await?
-        .ok_or(ApiError::NotFound)?; // detail=decision_not_found
+        .ok_or(ApiError::NotFound)?;
     upsert_view(&state.pool, user_sub, db_id, ActivitySource::Web).await
 }
 
-/// `DELETE /me/decision-views/{decision_id}` (parité `delete_view`).
+/// `DELETE /me/decision-views/{decision_id}`.
 /// 404 si la décision n'existe pas (`decision_not_found`) ou si aucune ligne de
 /// consultation (`view_not_found`).
 pub async fn delete_view(
@@ -219,7 +216,7 @@ pub async fn delete_view(
 ) -> Result<(), ApiError> {
     let db_id = resolve_decision_pk(&state.pool, public_id)
         .await?
-        .ok_or(ApiError::NotFound)?; // detail=decision_not_found
+        .ok_or(ApiError::NotFound)?;
     let conn = state
         .pool
         .get()
@@ -233,12 +230,12 @@ pub async fn delete_view(
         .await
         .map_err(|e| ApiError::Internal(format!("delete_view: {e}")))?;
     if affected == 0 {
-        return Err(ApiError::NotFound); // detail=view_not_found
+        return Err(ApiError::NotFound);
     }
     Ok(())
 }
 
-/// `DELETE /me/decision-views` — purge complète (parité `clear_views`).
+/// `DELETE /me/decision-views` — purge complète.
 pub async fn clear_views(state: &AppState, user_sub: &str) -> Result<(), ApiError> {
     let conn = state
         .pool

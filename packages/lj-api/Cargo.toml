@@ -24,6 +24,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 jsonwebtoken = { workspace = true }
 getrandom = { workspace = true }
 rmcp = { workspace = true }
@@ -46,7 +47,6 @@ deadpool-postgres = { workspace = true }
 tokio-postgres = { workspace = true }
 pgvector = { workspace = true }
 flate2 = { workspace = true }
-docx-rs = { workspace = true }
 printpdf = { workspace = true }
 ttf-parser = { workspace = true }
 

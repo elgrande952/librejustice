@@ -1,7 +1,4 @@
-//! Composants de la page decision (STUBS). A remplir par l'agent de la tranche
-//! Decision : port de `apps/web/src/components/decision/*`. Les stubs compilent
-//! et rendent un placeholder minimal ; la signature des `#[component]` peut etre
-//! ajustee a l'implementation (les noms de fichiers/modules, eux, sont figes).
+//! Composants de la page decision.
 
 pub mod decision_body;
 pub mod decision_commentaires;
@@ -16,7 +13,7 @@ pub mod decision_toc;
 
 pub use decision_body::DecisionBody;
 pub use decision_commentaires::DecisionCommentaires;
-pub use decision_header::DecisionHeader;
+pub use decision_header::{DecisionActions, DecisionHeader};
 pub use decision_layout::DecisionLayout;
 pub use decision_meta::DecisionMeta;
 pub use decision_parties::DecisionParties;

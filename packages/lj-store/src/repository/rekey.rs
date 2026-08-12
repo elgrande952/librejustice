@@ -1,4 +1,4 @@
-//! Rebasage one-shot des clés d'article vers la clé publique slug (ADR 0209) :
+//! Rebasage one-shot des clés d'article vers la clé publique slug :
 //! `legal_article.num_key`, `legal_citation.ref_num_key`,
 //! `legal_toc_edge.child_num_key`, `legal_link.owner/target_num_key`,
 //! `text_case_citation.owner_num_key`. Le mapping vieille clé → clé publique
@@ -128,9 +128,8 @@ impl<'a> DecisionRepository<'a> {
             .await?)
     }
 
-    /// Rebase les `ref_num_key` portés par les blobs `legal_citation.spans`
-    /// (ADR 0247) via le mapping de session. Renvoie le nombre de décisions
-    /// réécrites.
+    /// Rebase les `ref_num_key` portés par les blobs `legal_citation.spans` via le
+    /// mapping de session. Renvoie le nombre de décisions réécrites.
     pub async fn rekey_citation_spans(&self) -> Result<u64> {
         Ok(self
             .conn
@@ -152,7 +151,7 @@ impl<'a> DecisionRepository<'a> {
             .await?)
     }
 
-    /// Page keyset de `legal_article` pour le rebasage **identité** (ADR 0236) :
+    /// Page keyset de `legal_article` pour le rebasage **identité** :
     /// `(id, text_uid, num, num_key, date_debut::text)`, ordonnée par `id`.
     pub async fn article_identity_page(
         &self,
@@ -173,13 +172,12 @@ impl<'a> DecisionRepository<'a> {
             .collect())
     }
 
-    /// Applique un lot de clés d'identité (ADR 0236) : réécrit
-    /// `legal_article.num_key` par `id`, puis suit les `legal_link` possédés
-    /// (le triplet `(text_uid, ancienne clé, date_debut)` identifie l'article
-    /// pré-rebasage — c'est sa PK). Une ligne dont la cible PK est déjà
-    /// occupée (variante typographique du même article) est sautée — comptée
-    /// dans le deuxième champ du retour. Renvoie (articles réécrits, sautés,
-    /// liens suivis).
+    /// Applique un lot de clés d'identité : réécrit `legal_article.num_key` par
+    /// `id`, puis suit les `legal_link` possédés (le triplet `(text_uid, ancienne
+    /// clé, date_debut)` identifie l'article pré-rebasage — c'est sa PK). Une ligne
+    /// dont la cible PK est déjà occupée (variante typographique du même article)
+    /// est sautée — comptée dans le deuxième champ du retour. Renvoie (articles
+    /// réécrits, sautés, liens suivis).
     pub async fn apply_article_identity_keys(
         &self,
         rows: &[(i64, String, String, String, String)],
@@ -189,7 +187,9 @@ impl<'a> DecisionRepository<'a> {
         let updated_ids: std::collections::HashSet<i64> = self
             .conn
             .query(
-                "UPDATE legal_article a SET num_key = m.new_key
+                // `reading_rank = NULL` : le `num_key` porte l'ordre de lecture, le réécrire
+                // salit le texte.
+                "UPDATE legal_article a SET num_key = m.new_key, reading_rank = NULL
                  FROM unnest($1::bigint[], $2::text[]) AS m(id, new_key)
                  WHERE a.id = m.id
                    AND NOT EXISTS (

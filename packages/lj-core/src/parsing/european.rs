@@ -1,15 +1,13 @@
-//! Sous-module de `parsing` (#26, découpe ADR 0066). Aucune logique changée :
-//! déplacement depuis `parsing.rs`, accès aux helpers partagés via `super`.
-
 use super::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sources européennes : CEDH (HUDOC) et CJUE (EUR-Lex) — ADR 0094.
+// Sources européennes : CEDH (HUDOC) et CJUE (EUR-Lex).
 //
 // Parsers PURS : reçoivent le corps déjà strippé (HTML→texte au bord lj-sources)
 // + les métadonnées désérialisées (`columns` HUDOC / `predicates` CDM). Le texte
-// vit dans `texte_integral_*` ; les métadonnées partent verbatim en `source_fields`
-// (construites par le pipeline depuis le même `Value`, hors de `Decision`).
+// vit dans `texte_integral_*` ; les métadonnées partent verbatim en
+// `source_fields` (construites par le pipeline depuis le même `Value`, hors de
+// `Decision`).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Lit une chaîne non-vide d'une clé d'un objet JSON (`columns`/`predicates`).
@@ -21,7 +19,7 @@ fn json_str_nonempty<'a>(obj: &'a Value, key: &str) -> Option<&'a str> {
 
 /// `kpdate` HUDOC (`1960-11-14T00:00:00`, ISO horodaté) → `YYYY-MM-DD`. On retient
 /// les 10 premiers caractères ssi ce sont une date ISO valide (`%Y-%m-%d`) — pas
-/// de troncature aveugle (#12). `None` sinon.
+/// de troncature aveugle. `None` sinon.
 fn cedh_kpdate_to_iso(kpdate: &str) -> Option<String> {
     let head = kpdate.get(..10)?;
     jiff::civil::Date::strptime("%Y-%m-%d", head)
@@ -37,19 +35,18 @@ fn cedh_judgementdate_to_iso(judgementdate: &str) -> Option<String> {
     Some(d.strftime("%Y-%m-%d").to_string())
 }
 
-/// Parse un arrêt CEDH (HUDOC) en [`Decision`] (ADR 0094). `body_text` est le
-/// corps déjà converti HTML→texte au bord (`lj-sources`) ; `columns` est le bloc
+/// Parse un arrêt CEDH (HUDOC) en [`Decision`]. `body_text` est le corps déjà
+/// converti HTML→texte au bord (`lj-sources`) ; `columns` est le bloc
 /// `results[].columns` désérialisé ; `itemid` est la PK HUDOC (`001-…`).
 ///
 /// `jurisdiction_type` = `"CEDH"` (posé explicitement). `ecli` lu verbatim de
 /// `columns["ecli"]` (arrêts seulement, `None` sinon) — jamais dérivé.
 /// `numero_dossiers` = `columns["appno"]` (`;`-séparé → liste). `date_lecture` =
-/// `columns["kpdate"]` normalisé ISO `YYYY-MM-DD` (repli `judgementdate` `DD/MM/YYYY`),
-/// car la frontière store ne parse que `%Y-%m-%d`. Le titre (`docname`) et toutes
-/// les autres colonnes restent en `source_fields` (verbatim, hors `Decision`).
+/// `columns["kpdate"]` normalisé ISO `YYYY-MM-DD` (repli `judgementdate`
+/// `DD/MM/YYYY`), car la frontière store ne parse que `%Y-%m-%d`. Le titre
+/// (`docname`) et toutes les autres colonnes restent en `source_fields`.
 ///
-/// Erreur franche [`CoreError::Xml`] si `itemid` ou `body_text` est vide
-/// (frontière de validation source unique, AGENTS.md #12).
+/// Erreur franche [`CoreError::Xml`] si `itemid` ou `body_text` est vide.
 pub fn parse_cedh(
     body_text: &str,
     columns: &Value,
@@ -76,11 +73,9 @@ pub fn parse_cedh(
     });
     let numero_dossier = numero_dossiers.as_ref().and_then(|v| v.first().cloned());
 
-    // `date_lecture` doit sortir en ISO `YYYY-MM-DD` : la frontière store ne parse
-    // QUE `%Y-%m-%d` (types.rs, #12) et jette silencieusement tout autre format en
-    // NULL. HUDOC livre `kpdate` en ISO horodaté (`1960-11-14T00:00:00`) et
-    // `judgementdate` en `DD/MM/YYYY HH:MM:SS` : on les normalise ici, au bord source.
-    // kpdate prioritaire (déjà ISO, jour identique au judgementdate sur les arrêts).
+    // `date_lecture` sort en ISO `YYYY-MM-DD` : la frontière store ne parse QUE
+    // `%Y-%m-%d`. HUDOC livre `kpdate` en ISO horodaté (`1960-11-14T00:00:00`) et
+    // `judgementdate` en `DD/MM/YYYY HH:MM:SS` — kpdate prioritaire.
     let date_lecture = json_str_nonempty(columns, "kpdate")
         .and_then(cedh_kpdate_to_iso)
         .or_else(|| {
@@ -124,7 +119,7 @@ pub fn parse_cedh(
 /// secteur 6 encode : secteur `6`, année d'affaire (4 chiffres), type
 /// (`CJ`/`TJ`/`CO`/`TO`/`CC`…), numéro (chiffres, zéros de tête à retirer). La
 /// lettre de la juridiction est l'initiale du type (`C`/`T`/`F`). Repli sur le
-/// CELEX brut si la forme n'est pas reconnue (grounding §Parsers purs).
+/// CELEX brut si la forme n'est pas reconnue.
 fn celex_to_case_number(celex: &str) -> String {
     let bytes = celex.as_bytes();
     // `6` + 4 chiffres année + ≥1 lettre type + ≥1 chiffre numéro.
@@ -147,20 +142,18 @@ fn celex_to_case_number(celex: &str) -> String {
     format!("{court}-{number}/{yy}")
 }
 
-/// Parse un arrêt CJUE (EUR-Lex) en [`Decision`] (ADR 0094). `body_text` est le
-/// texte FR déjà converti (xhtml/html→texte) au bord (`lj-sources`) ;
-/// `predicates` est le bloc de prédicats CDM désérialisé ; `celex` est la PK.
+/// Parse un arrêt CJUE (EUR-Lex) en [`Decision`]. `body_text` est le texte FR
+/// déjà converti (xhtml/html→texte) au bord (`lj-sources`) ; `predicates` est le
+/// bloc de prédicats CDM désérialisé ; `celex` est la PK.
 ///
 /// `jurisdiction_type` = `"CJUE"` (posé explicitement). `ecli` lu verbatim de
 /// `predicates["case-law_ecli"]` (100 % présent, `None` si vide) — **jamais
-/// dérivé du CELEX** (l'ECLI dérivé serait faux, audit `cjue.md`). `numero_dossiers`
-/// = numéro d'affaire dérivé du CELEX (`C-560/20`), repli sur le CELEX brut.
+/// dérivé du CELEX** (l'ECLI dérivé serait faux). `numero_dossiers` = numéro
+/// d'affaire dérivé du CELEX (`C-560/20`), repli sur le CELEX brut.
 /// `date_lecture` = `predicates["work_date_document"]`. La bannière « objet » de
-/// l'en-tête (titre) et les autres prédicats restent en `source_fields` (verbatim,
-/// hors `Decision`).
+/// l'en-tête (titre) et les autres prédicats restent en `source_fields`.
 ///
-/// Erreur franche [`CoreError::Xml`] si `celex` ou `body_text` est vide
-/// (frontière de validation source unique, AGENTS.md #12).
+/// Erreur franche [`CoreError::Xml`] si `celex` ou `body_text` est vide.
 pub fn parse_cjue(
     body_text: &str,
     predicates: &Value,
@@ -213,33 +206,32 @@ pub fn parse_cjue(
     })
 }
 
-/// `true` si `source_uid` provient d'une source HTML européenne (ADR 0094) :
-/// préfixe `cedh/` (HUDOC) ou `cjue/` (EUR-Lex), posé par [`parse_cedh`] /
+/// `true` si `source_uid` provient d'une source HTML européenne : préfixe
+/// `cedh/` (HUDOC) ou `cjue/` (EUR-Lex), posé par [`parse_cedh`] /
 /// [`parse_cjue`]. Discriminant de famille du dispatch
-/// [`Decision::from_source_fields`] — sûr car ces préfixes sont stables en DB et
-/// jamais portés par les autres fonds (XML opendata, JSON Judilibre, DILA, CNDA).
+/// [`Decision::from_source_fields`] — ces préfixes sont stables en DB et jamais
+/// portés par les autres fonds (XML opendata, JSON Judilibre, DILA, CNDA).
 pub(crate) fn source_uid_is_html_europe(source_uid: &str) -> bool {
     source_uid.starts_with("cedh/") || source_uid.starts_with("cjue/")
 }
 
 impl Decision {
-    /// Branche HTML européenne (CEDH/CJUE) de [`Decision::from_source_fields`]
-    /// (ADR 0094/0085) : reconstruit une `Decision` **identique** à
-    /// [`parse_cedh`]/[`parse_cjue`] depuis `(full_text, source_fields)`. Pendant
-    /// exact de [`build_source_fields`] côté HTML : `source_fields` = les
-    /// métadonnées (colonnes HUDOC / prédicats CDM) verbatim + la clé `sections`
-    /// (que les parsers ignorent — ils relisent les sections de `full_text`).
+    /// Branche HTML européenne (CEDH/CJUE) de [`Decision::from_source_fields`] :
+    /// reconstruit une `Decision` **identique** à [`parse_cedh`]/[`parse_cjue`]
+    /// depuis `(full_text, source_fields)`. Pendant exact de [`build_source_fields`]
+    /// côté HTML : `source_fields` = les métadonnées (colonnes HUDOC / prédicats CDM)
+    /// verbatim + la clé `sections` (que les parsers ignorent — ils relisent les
+    /// sections de `full_text`).
     ///
-    /// L'inverse est **structurellement** à 0 écart car ces parsers posent
-    /// `texte_integral_clean = texte_integral_raw = body_text` (aucun nettoyage),
-    /// `metadata_header = visa_trim = ""` : le chunk ne dépend donc que de
-    /// `full_text` (stocké verbatim). On réinvoque le parser dédié sur
-    /// `(full_text, source_fields, pk)` — `pk` (`itemid`/`celex`) est dérivé du
-    /// `source_uid` (`cedh/<itemid>` / `cjue/<celex>`).
+    /// La parité est structurelle : ces parsers posent `texte_integral_clean =
+    /// texte_integral_raw = body_text` (aucun nettoyage) et `metadata_header =
+    /// visa_trim = ""`, le chunk ne dépend donc que de `full_text` (stocké verbatim).
+    /// On réinvoque le parser dédié sur `(full_text, source_fields, pk)` — `pk`
+    /// (`itemid`/`celex`) est dérivé du `source_uid` (`cedh/<itemid>` /
+    /// `cjue/<celex>`).
     ///
-    /// Panique si le parser échoue : à l'aval, `(full_text, source_fields)`
-    /// provient d'une décision déjà ingérée (donc valide) — un échec ici signale
-    /// une corruption DB ou un mauvais dispatch, pas une donnée externe (#12).
+    /// Panique si le parser échoue : à l'aval, `(full_text, source_fields)` provient
+    /// d'une décision déjà ingérée, donc valide.
     pub(crate) fn from_source_fields_html_europe(
         full_text: &str,
         source_fields: &Value,
@@ -262,12 +254,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── CEDH / CJUE (ADR 0094) ─────────────────────────────────────────────
+    // ── CEDH / CJUE ────────────────────────────────────────────────────────
 
     #[test]
     fn cedh_maps_fields_ecli_appno_list_and_type() {
-        // Fixture HUDOC (audit cedh.md §Champs) : corps déjà strippé + `columns`.
-        // appno `;`-séparé → liste ; ECLI pris verbatim (arrêt) ; type explicite.
         let columns = json!({
             "itemid": "001-250438",
             "docname": "AFFAIRE TAMAKULOVA ET AUTRES c. UKRAINE",
@@ -288,12 +278,10 @@ mod tests {
             d.jurisdiction_name.as_deref(),
             Some("Cour européenne des droits de l'homme")
         );
-        // ECLI verbatim, jamais dérivé.
         assert_eq!(
             d.ecli.as_deref(),
             Some("ECLI:CE:ECHR:2026:0611JUD002089016")
         );
-        // appno → liste ; numero_dossier = premier.
         assert_eq!(
             d.numero_dossiers.as_deref(),
             Some(
@@ -305,13 +293,9 @@ mod tests {
             )
         );
         assert_eq!(d.numero_dossier.as_deref(), Some("20890/16"));
-        // date normalisée ISO `YYYY-MM-DD` au bord source (la frontière store ne
-        // parse que `%Y-%m-%d` ; un `…T00:00:00` verbatim finissait NULL).
         assert_eq!(d.date_lecture.as_deref(), Some("2026-06-11"));
-        // full_text = body_text tel quel.
         assert_eq!(d.texte_integral_clean, body);
         assert_eq!(d.texte_integral_raw, body);
-        // Sections re-détectées sur le texte.
         let kinds: Vec<&str> = d.sections.iter().map(|s| s.kind.as_str()).collect();
         assert!(kinds.contains(&"visa"));
         assert!(kinds.contains(&"motivations"));
@@ -319,7 +303,6 @@ mod tests {
 
     #[test]
     fn cedh_ecli_none_when_absent_and_kpdate_fallback() {
-        // Note d'info (CLINF) : pas d'ECLI ; date_lecture replie sur kpdate.
         let columns = json!({
             "appno": "10000/20",
             "ecli": "",
@@ -337,8 +320,6 @@ mod tests {
 
     #[test]
     fn cedh_date_falls_back_to_judgementdate_ddmmyyyy_normalized_iso() {
-        // kpdate absent → repli sur judgementdate `DD/MM/YYYY HH:MM:SS`, normalisé
-        // ISO. Sans normalisation, ce format finissait NULL en base (store #12).
         let columns = json!({
             "appno": "332/57",
             "ecli": "ECLI:CE:ECHR:1960:1114JUD000033257",
@@ -357,8 +338,6 @@ mod tests {
 
     #[test]
     fn cjue_maps_fields_ecli_verbatim_and_case_number_from_celex() {
-        // Fixture EUR-Lex (audit cjue.md §Champs) : ECLI ≠ ECLI dérivable du CELEX.
-        // CELEX 62020CJ0560 → affaire C-560/20 ; ECLI réel 2024:96 (jamais dérivé).
         let predicates = json!({
             "case-law_ecli": "ECLI:EU:C:2024:96",
             "work_date_document": "2024-01-30",
@@ -372,10 +351,8 @@ mod tests {
         assert_eq!(d.source_uid, "cjue/62020CJ0560");
         assert_eq!(d.member_name, "62020CJ0560");
         assert_eq!(d.jurisdiction_type.as_deref(), Some("CJUE"));
-        // ECLI verbatim — surtout PAS dérivé du CELEX (qui donnerait …2020:560).
         assert_eq!(d.ecli.as_deref(), Some("ECLI:EU:C:2024:96"));
         assert_ne!(d.ecli.as_deref(), Some("ECLI:EU:C:2020:560"));
-        // Numéro d'affaire dérivé du CELEX (forme usuelle).
         assert_eq!(d.numero_dossier.as_deref(), Some("C-560/20"));
         assert_eq!(
             d.numero_dossiers.as_deref(),
@@ -387,12 +364,10 @@ mod tests {
 
     #[test]
     fn cjue_celex_to_case_number_variants() {
-        // Tribunal (T), ordonnance (CO/TO), CELEX non reconnu → repli brut.
         assert_eq!(celex_to_case_number("62020CJ0560"), "C-560/20");
         assert_eq!(celex_to_case_number("62023CO0614"), "C-614/23");
         assert_eq!(celex_to_case_number("62023TJ0188"), "T-188/23");
         assert_eq!(celex_to_case_number("62016CJ0550"), "C-550/16");
-        // Forme inattendue → repli sur le CELEX brut (pas de dérivation hasardeuse).
         assert_eq!(celex_to_case_number("NOTACELEX"), "NOTACELEX");
         assert_eq!(celex_to_case_number("32020R0560"), "32020R0560");
     }
@@ -444,13 +419,7 @@ mod tests {
         assert_eq!(vocab::jurisdiction_type(Some("tc")).as_deref(), Some("TC"));
     }
 
-    // ── Round-trip `from_source_fields` ⟷ parse direct (ADR 0085/0094, #37) ──
-    //
-    // Spec gate : reconstruire une `Decision` depuis `(full_text, source_fields)`
-    // reproduit EXACTEMENT le parse direct du corps HTML. La parité est
-    // structurelle (clean=raw=body_text, header/visa vides) — le chunk ne dépend
-    // que de `full_text`, stocké verbatim. `source_fields` = métadonnées verbatim
-    // + `sections` (via `build_source_fields`, calque exact de l'ingest html).
+    // ── Round-trip `from_source_fields` ⟷ parse direct ───────────────────────
 
     #[test]
     fn cedh_round_trips_via_source_fields() {
@@ -465,7 +434,6 @@ mod tests {
         let body = "Vu : la procédure suivie devant la Cour. \
                     Considérant ce qui suit : motifs. PAR CES MOTIFS, la Cour décide.";
         let orig = parse_cedh(body, &columns, "001-250438").expect("parse CEDH");
-        // `source_fields` calqué sur l'ingest html (métadonnées + sections rebasées).
         let sf = build_source_fields(&columns, &orig.sections);
         let rebuilt =
             Decision::from_source_fields(&orig.texte_integral_clean, &sf, &orig.source_uid);

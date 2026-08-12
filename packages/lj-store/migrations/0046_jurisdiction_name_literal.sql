@@ -1,4 +1,4 @@
--- Migration 0046 — jurisdiction_name en fast field ``pdb.literal`` exact (ADR 0070).
+-- Migration 0046 — jurisdiction_name en fast field ``pdb.literal`` exact.
 --
 -- Depuis la migration 0026, ``jurisdiction_name`` est le SEUL champ de
 -- ``chunks_bm25`` indexé en ``pdb.literal_normalized`` (lowercase implicite). Le
@@ -8,7 +8,7 @@
 -- lowercasé ≠ valeur heap). Conséquence mesurée sur pg_search 0.23.5 : le facet
 -- juridiction tombe en ``heap_filter`` (≈ 9,6 s cold sur la jambe BM25 body,
 -- ~460k buffers heap lus), tandis que tous les autres facets (``literal``)
--- poussent dans l'index (term/term_set, < 1 s). Cf. ADR 0070.
+-- poussent dans l'index (term/term_set, < 1 s).
 --
 -- La normalisation n'apportait rien : l'extraction produit déjà une forme
 -- canonique (mesuré : 175 valeurs distinctes brutes == 175 en lowercase, zéro
@@ -18,7 +18,7 @@
 -- ParadeDB ne permet pas d'altérer les fast fields d'un index BM25 existant :
 -- rebuild complet. ``chunks_vec`` n'est pas concerné.
 --
--- ⚠️ Fenêtre de maintenance OBLIGATOIRE : DROP + CREATE ``chunks_bm25`` (15 Go,
+-- Fenêtre de maintenance OBLIGATOIRE : DROP + CREATE ``chunks_bm25`` (15 Go,
 -- ≈ plusieurs minutes). Pendant le build, /search en mode lexical/hybrid échoue
 -- (l'opérateur ``@@@`` requiert l'index). À programmer off-peak. Rollback :
 -- recréer avec ``(jurisdiction_name::pdb.literal_normalized)`` (état 0041).

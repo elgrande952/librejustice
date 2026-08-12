@@ -1,4 +1,4 @@
--- ADR 0248 : champ usage_terms (signal d'usage des citations) sur
+-- Champ usage_terms (signal d'usage des citations) sur
 -- legal_article, indexé BM25. Colonne remplie par `lj-ingest usage-terms` ;
 -- recréation one-shot de legal_article_bm25 pour embarquer le champ
 -- (tokenizer avec `_` : les bigrammes des sacs sont des tokens joints).

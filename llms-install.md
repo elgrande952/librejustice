@@ -1,7 +1,9 @@
 # LibreJustice — agent install guide
 
-This guide is written for AI agents (Cline, Claude Code, Codex, Cursor,
-Windsurf…) installing LibreJustice: a remote MCP server for searching
+This guide is written for an AI agent installing LibreJustice on
+behalf of its user — typically inside a desktop app (ChatGPT Desktop,
+Claude Desktop…) or any agent able to edit its own configuration or
+run commands. LibreJustice is a remote MCP server for searching
 French and European case law and statutes, plus two method skills.
 
 ## 1. Connect the MCP server
@@ -11,31 +13,23 @@ French and European case law and statutes, plus two method skills.
 - Auth: OAuth 2.1, auto-discovered by the client. The browser flow
   creates a free account if the user does not have one.
 
-Claude Code — prefer the plugin, it installs the connector and the
-skills together (then skip step 2):
+Any client that reads a JSON MCP config — add to `mcpServers`:
+
+```json
+{"librejustice": {"type": "http", "url": "https://librejustice.fr/mcp"}}
+```
+
+Agents with a plugin system (Claude Code, Codex) — the plugin installs
+the connector and the skills together (then skip step 2):
 
 ```
 /plugin marketplace add librejustice/librejustice
 /plugin install librejustice@librejustice
 ```
 
-or connector only:
-
-```
-claude mcp add --transport http librejustice https://librejustice.fr/mcp
-```
-
-Codex CLI:
-
 ```
 codex plugin marketplace add librejustice/librejustice
 codex plugin add librejustice@librejustice
-```
-
-Any client that reads a JSON MCP config — add to `mcpServers`:
-
-```json
-{"librejustice": {"type": "http", "url": "https://librejustice.fr/mcp"}}
 ```
 
 ## 2. Install the skills
@@ -63,5 +57,5 @@ authorization, open the flow and wait for the user to approve it.
 
 If you can neither run commands nor edit your own configuration, say
 so and point the user to <https://librejustice.fr/mcp-guide> — it has
-step-by-step instructions per client (claude.ai, ChatGPT, Le Chat,
-Perplexity, agent CLIs).
+step-by-step instructions per client (Claude Web, ChatGPT Web, Le Chat,
+Perplexity).

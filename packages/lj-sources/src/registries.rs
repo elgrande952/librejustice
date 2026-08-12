@@ -1,5 +1,5 @@
-//! Registres d'entités (ADR 0179) : découverte data.gouv, download streamé,
-//! itération CSV depuis les stocks (SIRENE, RNA, annuaire des avocats).
+//! Registres d'entités : découverte data.gouv, download streamé, itération CSV
+//! depuis les stocks (SIRENE, RNA, annuaire des avocats).
 //!
 //! Les ressources data.gouv ont des URLs datées (une par publication) ; seul
 //! l'id de dataset est stable. La découverte interroge l'API dataset et prend
@@ -34,13 +34,14 @@ fn client() -> reqwest::blocking::Client {
         .expect("reqwest client build")
 }
 
-/// Ressource la plus récente (par `created_at`) du dataset dont le titre
-/// passe `title_ok` et le format `format_ok`.
-pub fn datagouv_latest_resource(
+/// Toutes les ressources du dataset dont le titre passe `title_ok` et le
+/// format `format_ok`, par `created_at` croissant — l'ordre de publication,
+/// qui est celui du rejeu chronologique.
+pub fn datagouv_resources(
     dataset: &str,
     title_ok: impl Fn(&str) -> bool,
     format_ok: impl Fn(&str) -> bool,
-) -> Result<RegistryResource> {
+) -> Result<Vec<RegistryResource>> {
     let url = format!("{DATAGOUV_API}/{dataset}/");
     let c = client();
     let (status, _, body) = get_with_body_retrying(&url, || c.get(&url).send())?;
@@ -52,7 +53,7 @@ pub fn datagouv_latest_resource(
     let v: sonic_rs::Value = sonic_rs::from_slice(&body)?;
     use sonic_rs::JsonValueTrait;
     let resources = &v["resources"];
-    let mut best: Option<(String, RegistryResource)> = None;
+    let mut out: Vec<(String, RegistryResource)> = Vec::new();
     let mut idx = 0usize;
     loop {
         let r = &resources[idx];
@@ -68,13 +69,9 @@ pub fn datagouv_latest_resource(
         if !title_ok(title) || !format_ok(format) {
             continue;
         }
-        let created = r["created_at"].as_str().unwrap_or_default().to_string();
-        if best.as_ref().is_some_and(|(c0, _)| *c0 >= created) {
-            continue;
-        }
         let filename = url.rsplit('/').next().unwrap_or(title).to_string();
-        best = Some((
-            created,
+        out.push((
+            r["created_at"].as_str().unwrap_or_default().to_string(),
             RegistryResource {
                 title: title.to_string(),
                 url: url.to_string(),
@@ -83,11 +80,24 @@ pub fn datagouv_latest_resource(
             },
         ));
     }
-    best.map(|(_, r)| r).ok_or_else(|| {
-        SourceError::Invalid(format!(
-            "data.gouv dataset {dataset}: aucune ressource ne matche"
-        ))
-    })
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out.into_iter().map(|(_, r)| r).collect())
+}
+
+/// Ressource la plus récente (par `created_at`) du dataset dont le titre
+/// passe `title_ok` et le format `format_ok`.
+pub fn datagouv_latest_resource(
+    dataset: &str,
+    title_ok: impl Fn(&str) -> bool,
+    format_ok: impl Fn(&str) -> bool,
+) -> Result<RegistryResource> {
+    datagouv_resources(dataset, title_ok, format_ok)?
+        .pop()
+        .ok_or_else(|| {
+            SourceError::Invalid(format!(
+                "data.gouv dataset {dataset}: aucune ressource ne matche"
+            ))
+        })
 }
 
 /// Télécharge la ressource sous `dir` (streamé). Manifeste minimal : un
@@ -126,7 +136,8 @@ pub fn decode_field(bytes: &[u8]) -> Cow<'_, str> {
 
 /// Itère les enregistrements CSV de `path` — un `.zip` (tous ses membres
 /// `.csv`, streamés sans extraction) ou un `.csv` nu. `f(headers, record)`
-/// reçoit les en-têtes du membre courant (BOM retiré) et chaque ligne.
+/// reçoit les en-têtes du membre courant (BOM et blancs de bord retirés —
+/// les millésimes de l'annuaire des avocats en sèment) et chaque ligne.
 pub fn for_each_csv_record(
     path: &Path,
     delimiter: u8,
@@ -164,7 +175,12 @@ fn read_csv(
         .byte_headers()
         .map_err(|e| SourceError::Invalid(format!("csv headers: {e}")))?
         .iter()
-        .map(|h| decode_field(h).trim_start_matches('\u{feff}').to_string())
+        .map(|h| {
+            decode_field(h)
+                .trim_start_matches('\u{feff}')
+                .trim()
+                .to_string()
+        })
         .collect();
     let mut record = csv::ByteRecord::new();
     loop {

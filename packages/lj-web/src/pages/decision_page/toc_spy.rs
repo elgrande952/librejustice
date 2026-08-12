@@ -1,16 +1,14 @@
-//! Logique pure du scroll-spy du sommaire décision. Port de
-//! `apps/web/src/lib/decision-toc-spy.ts`. Testable hors DOM.
+//! Logique pure du scroll-spy du sommaire décision.
 
-/// `scroll-margin-top` des ancres de section (= `scroll-mt-20`, 80px). Ligne
+/// `scroll-margin-top` des ancres de section (= `scroll-mt-20`). Ligne
 /// d'atterrissage après clic / jump `#hash`.
 pub const ANCHOR_SCROLL_MARGIN_PX: f64 = 80.0;
 
-/// Biais d'activation : la ligne de lecture du spy est posée quelques px sous la
-/// ligne d'atterrissage.
+/// Biais d'activation : la ligne de lecture est posée sous la ligne
+/// d'atterrissage.
 const ACTIVATION_BIAS_PX: f64 = 12.0;
 
-/// Décalage entre le haut du viewport et la ligne de lecture (atterrissage +
-/// biais).
+/// Décalage entre le haut du viewport et la ligne de lecture.
 pub const SCROLL_SPY_OFFSET_PX: f64 = ANCHOR_SCROLL_MARGIN_PX + ACTIVATION_BIAS_PX;
 
 /// Métrique d'une section : ancre absolue + centre de l'item dans la liste.
@@ -29,7 +27,7 @@ pub struct SpyResult {
 }
 
 /// Section active + position de la barre pour une ligne de marqueur donnée.
-/// Port de `resolveScrollSpy`. `metrics` triés par `anchor_top`.
+/// `metrics` triés par `anchor_top`.
 pub fn resolve_scroll_spy(
     metrics: &[SpyMetric],
     marker_y: f64,
@@ -95,7 +93,6 @@ mod tests {
             metric("b", 100.0, 30.0),
             metric("c", 300.0, 50.0),
         ];
-        // marker between a and b → active a, blend 0.5.
         let res = resolve_scroll_spy(&m, 50.0, false).unwrap();
         assert_eq!(res.id, "a");
         assert!((res.progress - 20.0).abs() < 1e-9);

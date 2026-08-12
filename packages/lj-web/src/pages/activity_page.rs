@@ -1,4 +1,4 @@
-//! Pages `/activite/{recherches,lectures,signets}` — port de `activity-page.tsx`.
+//! Pages `/activite/{recherches,lectures,signets}`.
 //!
 //! Un seul composant `ActivityPage`, le panneau actif est choisi via le path
 //! (`ActivePanel`). Tout est client-side (token Supabase en localStorage, absent
@@ -25,7 +25,7 @@ use crate::components::activity::activity_ui::{
     ErrorLine, FilterChip, InfiniteSentinel, PanelToolbar, Sep, SourceBadge, Switch,
 };
 
-/// Taille de page des listes (port de `ACTIVITY_PAGE_SIZE`).
+/// Taille de page des listes.
 const PAGE_SIZE: u32 = 50;
 
 #[component]
@@ -66,7 +66,7 @@ fn profile_signal() -> RwSignal<Option<UserProfile>> {
     profile
 }
 
-/// Toggle d'enregistrement d'activite (aside). Couper purge tout (ADR 0056).
+/// Toggle d'enregistrement d'activite (aside). Couper purge tout.
 #[component]
 fn ActivityTrackingToggle() -> impl IntoView {
     let profile = profile_signal();
@@ -115,7 +115,7 @@ fn ActivityTrackingToggle() -> impl IntoView {
     }
 }
 
-/// Selecteur de panneau selon le path (port de `ActivePanel`).
+/// Selecteur de panneau selon le path.
 #[component]
 fn ActivePanel() -> impl IntoView {
     let pathname = current_pathname();
@@ -174,10 +174,11 @@ fn HistoryPanel() -> impl IntoView {
         let id = entry.id;
         let described = filters::describe_filters(&entry.filters);
         let created = entry.created_at.clone();
-        // Relance vers le moteur d'origine (ADR 0251).
+        // Relance vers le moteur d'origine.
         let engine_path = match entry.engine {
             lj_dtos::SearchEngine::Decisions => "/decisions",
             lj_dtos::SearchEngine::Textes => "/textes",
+            lj_dtos::SearchEngine::Annonces => "/annonces",
         };
         let to = format!("{engine_path}?q={}", filters::encode_query(&entry.query));
         let meta = view! {
@@ -425,18 +426,15 @@ where
     }
 }
 
-// ── Etat de scroll infini (port de pagination.ts + onMutate optimistes) ────────
+// ── Etat de scroll infini ─────────────────────────────────────────────────────
 
 type PageFut<T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<T>, i64), String>>>>;
 type Fetcher<T> = std::rc::Rc<dyn Fn(PageParams) -> PageFut<T>>;
 
 /// Etat d'une liste infinie : items accumules, total, offset suivant, drapeaux.
-/// leptos-fetch 0.4.10 n'expose pas de query infinie ; on compose ici un
-/// equivalent fidele de `useInfiniteQuery` (signal de pages + fetch manuel),
-/// suffisant car ces listes sont purement client-side. Les items et le fetcher
-/// sont en `LocalStorage` (non-`Send`, normal cote wasm mono-thread) ; les
-/// drapeaux scalaires restent en stockage par defaut.
+/// Les items et le fetcher sont en `LocalStorage` (non-`Send`, normal cote wasm
+/// mono-thread) ; les drapeaux scalaires restent en stockage par defaut.
 struct InfiniteState<T: Clone + 'static> {
     items: RwSignal<Vec<T>, LocalStorage>,
     total: RwSignal<i64>,
@@ -531,7 +529,7 @@ impl<T: Clone + 'static> InfiniteState<T> {
     }
 
     /// Retrait optimiste : conserve les items pour lesquels `keep` est vrai,
-    /// decremente total + compteur charge (port de `dropFromPages`).
+    /// decremente total + compteur charge.
     fn remove_by(self, keep: impl Fn(&T) -> bool) {
         let before = self.items.with_untracked(Vec::len);
         self.items.update(|list| list.retain(&keep));

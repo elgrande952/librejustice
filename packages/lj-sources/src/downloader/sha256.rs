@@ -1,13 +1,11 @@
-//! SHA-256 (implémentation locale, FIPS 180-4).
-//!
-//! Implémentation autonome (pas de dép `sha2`) : suffisante pour figer le
-//! checksum opendata du manifeste.
+//! SHA-256 (implémentation locale, FIPS 180-4), pour figer le checksum opendata
+//! du manifeste.
 
 use crate::error::Result;
 use std::fs;
 use std::path::Path;
 
-/// SHA-256 hex d'un fichier, par chunks de 1 MiB (port de `_sha256_of`).
+/// SHA-256 hex d'un fichier, par chunks de 1 MiB.
 pub(super) fn sha256_of(path: &Path) -> Result<String> {
     let data = fs::read(path)?;
     Ok(sha256_hex(&data))
@@ -102,7 +100,6 @@ mod tests {
 
     #[test]
     fn sha256_known_vector() {
-        // "" et "abc" — vecteurs FIPS 180-4.
         assert_eq!(
             sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

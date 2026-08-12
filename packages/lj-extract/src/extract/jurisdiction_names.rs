@@ -1,7 +1,7 @@
 //! Nom de juridiction : table `location` Judilibre (+ renommage TAE lu dans
-//! l'EN-TÊTE, zone par tokens du scan — ADR 0157) et réécriture canonique des
-//! noms de greffe administratifs (TA/CAA/CE), dont les conventions nourrissent
-//! l'identité de dédoublonnage ([`crate::identity`]) et la facette juridiction
+//! l'en-tête) et réécriture canonique des noms de greffe administratifs
+//! (TA/CAA/CE). Ces conventions nourrissent l'identité de dédoublonnage
+//! ([`crate::identity`]) et la facette juridiction
 //! ([`crate::facets::city_from_name`]).
 
 use lj_core::decision::Decision;
@@ -21,12 +21,10 @@ fn location_to_name(loc: &str) -> Option<&'static str> {
 
 /// Nom depuis la métadonnée `location` Judilibre ; un tribunal de commerce
 /// dont l'en-tête annonce le « tribunal des activités économiques » est
-/// renommé (expérimentation TAE). Repli : nom de greffe verbatim.
+/// renommé. Repli : nom de greffe verbatim.
 pub(super) fn from_location(decision: &Decision, header: Option<&str>) -> Option<String> {
     if let Some(loc) = &decision.jurisdiction_location {
         if let Some(name) = location_to_name(loc) {
-            // sigle TAE dans l'EN-TÊTE (zone par tokens, plié — remplace le
-            // `head(800)` + regex ; le titre suit les mentions de greffe)
             let tae = header.is_some_and(|b| {
                 crate::compiled::fold_stable(b).contains("tribunal des activites economiques")
             });
@@ -56,7 +54,6 @@ fn lower_particles() -> &'static std::collections::HashSet<&'static str> {
     })
 }
 
-/// `_title_place`.
 fn title_place(place: &str) -> String {
     if place.is_empty()
         || !place.chars().any(|c| c.is_uppercase())
@@ -66,7 +63,6 @@ fn title_place(place: &str) -> String {
     }
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"([ \-])").unwrap());
-    // split en gardant les séparateurs (comme Python re.split avec groupe).
     let mut parts: Vec<String> = Vec::new();
     let mut last = 0;
     for m in re.find_iter(place) {
@@ -94,7 +90,6 @@ fn title_place(place: &str) -> String {
     result
 }
 
-/// Python `str.capitalize` : 1ère lettre maj, reste min.
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {

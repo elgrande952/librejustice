@@ -1,13 +1,13 @@
 //! Primitives de chaînes pures partagées (folding, recasse, collapse d'espaces,
 //! lookahead manuel). Noyau `lj-core` : consommé côté serve par `aliases` (fold
-//! des requêtes) et côté ingest par le recognizer de `lj-extract` — d'où leur
-//! résidence dans l'ancêtre commun (ADR 0123).
+//! des requêtes) et côté ingest par le recognizer de `lj-extract`, d'où leur
+//! résidence dans l'ancêtre commun.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
 
-/// `_fold` : minuscule, accents supprimés (NFD + drop Mn), apostrophes typo
+/// Minuscule, accents supprimés (NFD + drop Mn), apostrophes typo
 /// normalisées, espaces collapsés. Clé de comparaison uniquement.
 pub fn fold(text: &str) -> String {
     let lower = text.to_lowercase();
@@ -21,13 +21,30 @@ pub fn fold(text: &str) -> String {
     RE_WS.replace_all(&stripped, " ").trim().to_string()
 }
 
+/// Slug de comparaison : `fold` puis toute séquence non-alphanumérique
+/// réduite à un `-`, sans tiret de bord. Rend comparables les graphies d'un
+/// même lieu à travers les conventions de séparateur — code de juridiction
+/// (`ca_basse_terre`), libellé (« Cour d'appel de Basse-Terre »), slug de
+/// barreau (`bergerac-sarlat`).
+pub fn slug(s: &str) -> String {
+    let mut out = String::new();
+    for c in fold(s).chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 // ── pliage longueur-stable ──────────────────────────────────────────────────
 //
 // 1 char → 1 char, offsets préservés — le pliage général (`fold` ci-dessus)
 // normalise l'espace et casse les positions. Couvre le français des titres et
-// décisions ; tout char inconnu passe en minuscule simple. C'est LE fold
+// décisions ; tout char inconnu passe en minuscule simple. C'est le fold
 // canonique des dénominations : recognizer `lj-extract`, chargeur de
-// registres (`denomination_folded`), recherche annuaire (ADR 0192).
+// registres (`denomination_folded`), recherche annuaire.
 
 /// Pliage 1:1 d'un char (voie ASCII rapide — l'écrasante majorité des chars
 /// d'une décision : la casse ASCII évite la table Unicode de `to_lowercase`).
@@ -80,9 +97,9 @@ pub fn capitalize_only(s: &str) -> String {
 /// d'articles côté opendata, cabinets chaînés des observations côté judilibre)
 /// consomment la borne droite, ce qui avancerait le curseur trop loin et
 /// perdrait le match suivant. On rejoue donc `finditer` à la main en avançant à
-/// la fin du groupe *borne* renvoyée par `advance` (== `match.end()` côté
-/// Python), pas à la fin du match consommé ; garde-fou anti-boucle si la borne
-/// est zéro-largeur. Partagé : opendata passe `group(2)`, judilibre `group(name)`.
+/// la fin du groupe *borne* renvoyée par `advance`, pas à la fin du match
+/// consommé ; garde-fou anti-boucle si la borne est zéro-largeur. Partagé :
+/// opendata passe `group(2)`, judilibre `group(name)`.
 pub fn captures_iter_lookahead<'t>(
     re: &Regex,
     text: &'t str,
@@ -111,7 +128,6 @@ pub fn captures_iter_lookahead<'t>(
 
 static RE_WS_GLOBAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
-/// `_normalize_spaces`.
 pub fn normalize_spaces(value: &str) -> String {
     RE_WS_GLOBAL
         .replace_all(value.trim(), " ")
@@ -120,7 +136,7 @@ pub fn normalize_spaces(value: &str) -> String {
 }
 
 /// Mini-décomposition NFD ciblée (le crate `unicode-normalization` n'est pas
-/// au manifest de `lj-core`). Suffisant pour `_fold` sur le corpus juridique
+/// au manifest de `lj-core`). Suffisant pour `fold` sur le corpus juridique
 /// FR : retire les diacritiques latins courants.
 mod nfd {
     pub fn decompose(s: &str) -> String {

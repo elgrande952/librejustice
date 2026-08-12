@@ -1,10 +1,7 @@
-//! `Separator` (port de `ui/separator.tsx`). `role=separator` + orientation.
-
 use leptos::prelude::*;
 
 use crate::helpers::cn;
 
-/// Orientation. Defaut : `Horizontal`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SeparatorOrientation {
     #[default]
@@ -28,7 +25,6 @@ impl SeparatorOrientation {
     }
 }
 
-/// Separateur (regle visuelle). `role` defaut `separator`.
 #[component]
 pub fn Separator(
     #[prop(optional, into)] orientation: Signal<SeparatorOrientation>,

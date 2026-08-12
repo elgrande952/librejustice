@@ -1,5 +1,5 @@
-//! Page `/sources` — Données & sources (ADR 0114). Décrit chaque source du
-//! corpus (décisions + référentiel de droit), avec lien officiel et descriptif.
+//! Page `/sources` — Données & sources. Décrit chaque source du corpus
+//! (décisions + référentiel de droit), avec lien officiel et descriptif.
 //! Chaque section porte une ancre (`id`) ciblée par les pages d'article
 //! (`/sources#dila`…) et par la homepage. Page statique SSR (SEO), `<Title>`
 //! propre, hérite de la description racine.

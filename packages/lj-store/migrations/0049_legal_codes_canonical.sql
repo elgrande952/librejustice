@@ -1,9 +1,9 @@
--- Migration 0049 — Couche canonique du vocabulaire d'instruments (ADR 0079).
+-- Migration 0049 — Couche canonique du vocabulaire d'instruments.
 --
 -- ``legal_codes.canonical_id`` : auto-référence vers la ligne canonique
 -- (NULL = la forme EST canonique, jamais self). Posée par la passe de
 -- consolidation batch (``lj-ingest consolidate-legal-refs`` : squelette +
--- alias ADR 0077 puis snap fuzzy ancré sur la fréquence, ``lj_core::canon``),
+-- alias puis snap fuzzy ancré sur la fréquence, ``lj_core::canon``),
 -- recomputable — re-tuner les seuils = recompute du mapping + re-sync chunks,
 -- sans ré-ingérer. Les 5,5 M ``decision_legal_references`` continuent de
 -- pointer la ligne brute ; seule la dénormalisation chunks résout
@@ -27,7 +27,7 @@ CREATE INDEX IF NOT EXISTS idx_legal_codes_canonical
 -- Reprise du helper de 0048 : ``COALESCE(canon.name, lc.name)`` remplace
 -- ``lc.name`` dans ``instruments_arr`` et ``composite_arr``. ``la.label``
 -- est inchangé — les labels/numéros d'articles ne sont JAMAIS fuzzés
--- (garde ADR 0079 §4).
+-- (garde du snap fuzzy).
 
 CREATE OR REPLACE FUNCTION _sync_chunks_legal_instruments_for(p_ids bigint[])
 RETURNS void AS $$

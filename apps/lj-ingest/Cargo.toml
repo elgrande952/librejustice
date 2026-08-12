@@ -11,6 +11,7 @@ path = "src/main.rs"
 # CLI ingest (clap). Settings prefix LIBREJUSTICE_. Pipelines offline.
 [dependencies]
 lj-core = { workspace = true }
+lj-dtos = { workspace = true }
 lj-extract = { workspace = true }
 lj-store = { workspace = true }
 lj-sources = { workspace = true }
@@ -33,6 +34,8 @@ flate2 = { workspace = true }
 csv = { workspace = true }
 xxhash-rust = { workspace = true }
 chrono = { workspace = true }
+# Jour courant en Europe/Paris pour la moisson d'annonces.
+jiff = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

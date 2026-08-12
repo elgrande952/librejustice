@@ -1,9 +1,9 @@
-//! Endpoints `/me/bookmarks` — signets de décisions (port de `bookmarks.py`).
+//! Endpoints `/me/bookmarks` — signets de décisions.
 //!
-//! Cf. ADR 0036. La ligne `users` parente est garantie par le JIT provisioning ;
-//! les FK `user_bookmarks.user_sub` / `decision_id` (ON DELETE CASCADE)
-//! maintiennent l'intégrité. La création est gatée par `track_activity`
-//! directement dans l'INSERT (`WHERE EXISTS`, ADR 0056).
+//! La ligne `users` parente est garantie par le JIT provisioning ; les FK
+//! `user_bookmarks.user_sub` / `decision_id` (ON DELETE CASCADE) maintiennent
+//! l'intégrité. La création est gatée par `track_activity` directement dans
+//! l'INSERT (`WHERE EXISTS`).
 
 use deadpool_postgres::Pool;
 use lj_dtos::{BookmarkItem, JurisdictionType};
@@ -14,8 +14,8 @@ use crate::referential::{referential, Referential};
 use crate::state::AppState;
 use crate::titles::decision_title;
 
-/// Résout un `public_id` opaque en id interne `decisions.id` (parité
-/// `decisions.resolve_decision_pk`). Renvoie `None` si la décision n'existe pas.
+/// Résout un `public_id` opaque en id interne `decisions.id`. Renvoie `None` si
+/// la décision n'existe pas.
 pub(crate) async fn resolve_decision_pk(
     pool: &Pool,
     public_id: &str,
@@ -34,11 +34,11 @@ pub(crate) async fn resolve_decision_pk(
     Ok(row.map(|r| r.get::<_, i64>(0)))
 }
 
-/// Résout un `public_id` ou renvoie 404 (parité `_resolve_decision_id`).
+/// Résout un `public_id` ou renvoie 404.
 async fn resolve_decision_id(pool: &Pool, public_id: &str) -> Result<i64, ApiError> {
     resolve_decision_pk(pool, public_id)
         .await?
-        .ok_or(ApiError::NotFound) // detail=decision_not_found côté Python
+        .ok_or(ApiError::NotFound)
 }
 
 /// Désérialise une valeur TEXT de juridiction (`"TA"`, `"CE"`, …) vers l'enum.
@@ -47,11 +47,10 @@ fn parse_jurisdiction_type(raw: &str) -> Result<JurisdictionType, ApiError> {
         .map_err(|e| ApiError::Internal(format!("jurisdiction_type invalide {raw:?}: {e}")))
 }
 
-/// Page de signets (plus récents d'abord) + total complet (parité
-/// `fetch_bookmarks`).
+/// Page de signets (plus récents d'abord) + total complet.
 ///
 /// `total` via `COUNT(*) OVER()` (une seule requête). `limit` `None` → tout.
-/// Solution et nom de juridiction résolus depuis le référentiel (ADR 0146).
+/// Solution et nom de juridiction résolus depuis le référentiel.
 pub async fn fetch_bookmarks(
     pool: &Pool,
     refs: &Referential,
@@ -97,8 +96,8 @@ pub async fn fetch_bookmarks(
             .as_deref()
             .and_then(|c| refs.jurisdiction(c))
             .map(|j| j.label.clone());
-        // Titre court composé depuis les référentiels (ADR 0146 §4), sans
-        // siège — la liste des signets n'a pas besoin de la chambre.
+        // Titre court composé depuis les référentiels, sans siège — la liste des
+        // signets n'a pas besoin de la chambre.
         let title = decision_title(
             refs.jurisdiction_type_label(jur_type_raw)
                 .unwrap_or(jur_type_raw),
@@ -123,7 +122,7 @@ pub async fn fetch_bookmarks(
 }
 
 /// `GET /me/bookmarks` — liste complète (pas de pagination) : les signets sont
-/// curés manuellement donc bornés (parité `list_bookmarks`).
+/// curés manuellement donc bornés.
 pub async fn list_bookmarks(
     state: &AppState,
     user_sub: &str,
@@ -133,7 +132,7 @@ pub async fn list_bookmarks(
 }
 
 /// `PUT /me/bookmarks/{decision_id}` — ajoute un signet (idempotent via
-/// `ON CONFLICT DO NOTHING`), gaté par `track_activity` (parité `add_bookmark`).
+/// `ON CONFLICT DO NOTHING`), gaté par `track_activity`.
 pub async fn add_bookmark(
     state: &AppState,
     user_sub: &str,
@@ -157,8 +156,7 @@ pub async fn add_bookmark(
     Ok(())
 }
 
-/// `DELETE /me/bookmarks/{decision_id}` — retire un signet (parité
-/// `remove_bookmark`).
+/// `DELETE /me/bookmarks/{decision_id}` — retire un signet.
 pub async fn remove_bookmark(
     state: &AppState,
     user_sub: &str,

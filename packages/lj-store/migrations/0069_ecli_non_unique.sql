@@ -1,4 +1,4 @@
--- ECLI n'est PAS unique (ADR 0107, révise ADR 0080).
+-- ECLI n'est PAS unique.
 --
 -- Judilibre réutilise un même ECLI sur des décisions distinctes (vieux arrêts :
 -- ex. ECLI:FR:CCASS:1960:SO560 sur 3 arrêts de dates différentes — 128 ECLI

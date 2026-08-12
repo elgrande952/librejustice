@@ -1,8 +1,8 @@
-//! Configuration runtime du serveur API (port de `apps/api/.../config.py`).
+//! Configuration runtime du serveur API.
 //!
 //! Settings centralisé, prefix `LIBREJUSTICE_API_` (+ secrets/DB partagés sous
-//! `LIBREJUSTICE_`). Pas de `std::env::var` dispersé : tout est lu ici dans
-//! [`Settings::from_env`] et injecté dans l'état axum.
+//! `LIBREJUSTICE_`) : tout est lu ici dans [`Settings::from_env`] et injecté
+//! dans l'état axum.
 
 use anyhow::{Context, Result};
 use std::env;
@@ -35,20 +35,23 @@ pub struct Settings {
     pub mcp_allowed_hosts: Vec<String>,
     /// Token de vérification de propriété du domaine pour le catalogue d'apps
     /// ChatGPT (servi en `text/plain` sur `/.well-known/openai-apps-challenge`).
-    /// Valeur publique (non secrète) mais propre au déploiement. Absent → 404.
+    /// Valeur publique. Absent → 404.
     pub openai_apps_challenge_token: Option<String>,
     /// Mainteneur déclaré pour le claim du connecteur sur Glama (servi en JSON
     /// sur `/.well-known/glama.json` : `{"maintainers": [<valeur>]}` — email du
     /// compte Glama ou login GitHub). Valeur publique. Absent → 404.
     pub glama_maintainer: Option<String>,
-    /// Clé IndexNow (ADR 0044), partagée avec le cron `lj-ingest indexnow` :
-    /// le protocole exige qu'elle soit servie à `https://<host>/<clé>.txt`,
-    /// sinon les soumissions sont rejetées. Publique par protocole. Absent →
-    /// pas de route.
+    /// Clé IndexNow, partagée avec le cron `lj-ingest indexnow` : le protocole
+    /// exige qu'elle soit servie à `https://<host>/<clé>.txt`. Publique par
+    /// protocole. Absent → pas de route.
     pub indexnow_key: Option<String>,
+    /// Jeton de la sonde profonde `/api/health/deep`, présenté en
+    /// `Authorization: Bearer`. **Secret** : la route force un aller-retour DB
+    /// complet non cacheable. Absent → 404.
+    pub deep_probe_token: Option<String>,
     pub gunicorn_workers: usize,
     pub version: String,
-    // Export OTel direct vers la gateway Grafana Cloud (plus de collector local).
+    // Export OTel vers la gateway Grafana Cloud.
     pub grafana_otlp_endpoint: Option<String>,
     pub grafana_otlp_user: Option<String>,
     pub grafana_cloud_api_key: Option<String>,
@@ -60,16 +63,19 @@ pub struct Settings {
     pub public_base_url: String,
     pub mistral_api_keys: Vec<String>,
     pub mistral_model: String,
-    /// Chemin du certificat Cloudflare Origin CA pour le TLS rustls in-process
-    /// (ADR 0061). `None` → HTTP en clair.
-    pub tls_cert_path: Option<String>,
-    /// Chemin de la clé privée associée au certificat Origin CA. `None` → HTTP
-    /// en clair.
-    pub tls_key_path: Option<String>,
+    /// Dépenses de recherche par appelant et par minute (embedding + récupération
+    /// hybride), comptées sur MISS du `search_cache` uniquement.
+    pub search_budget_per_min: u32,
+    /// Le budget de recherche refuse-t-il, ou se contente-t-il de compter ?
+    pub search_budget_enforce: bool,
+    /// Reranks Mistral par appelant et par minute, comptés sur MISS du
+    /// `rerank_cache`. Le dépassement n'est jamais un refus : la recherche rend
+    /// l'ordre RRF (`crate::search::reranked_order`).
+    pub rerank_budget_per_min: u32,
 }
 
-/// Lit `var`, renvoie `None` si absent ou chaîne vide (parité avec Pydantic qui
-/// traite l'env vide comme « non fourni » pour les champs `Option`).
+/// Lit `var`, renvoie `None` si absent ou chaîne vide (env vide = « non
+/// fourni »).
 fn opt(var: &str) -> Option<String> {
     match env::var(var) {
         Ok(v) if !v.is_empty() => Some(v),
@@ -82,8 +88,7 @@ fn or_default(var: &str, default: &str) -> String {
     opt(var).unwrap_or_else(|| default.to_string())
 }
 
-/// Parse un entier avec borne `[lo, hi]`. Erreur franche si hors borne (parité
-/// avec les contraintes Pydantic `ge`/`le`).
+/// Parse un entier avec borne `[lo, hi]`. Erreur franche si hors borne.
 fn parse_ranged<T>(var: &str, default: T, lo: T, hi: T) -> Result<T>
 where
     T: std::str::FromStr + PartialOrd + std::fmt::Display + Copy,
@@ -103,7 +108,7 @@ where
     }
 }
 
-/// Parse un booléen façon Pydantic (`true/1/yes/on` insensible à la casse).
+/// Parse un booléen (`true/1/yes/on` insensible à la casse).
 fn parse_bool(var: &str, default: bool) -> bool {
     match opt(var) {
         None => default,
@@ -114,8 +119,7 @@ fn parse_bool(var: &str, default: bool) -> bool {
     }
 }
 
-/// Parse une liste séparée par des virgules, items vides éliminés (parité avec
-/// `_split_mistral_keys`).
+/// Parse une liste séparée par des virgules, items vides éliminés.
 fn parse_csv(var: &str) -> Vec<String> {
     match opt(var) {
         None => Vec::new(),
@@ -141,12 +145,10 @@ impl Settings {
         let bind_host = or_default("LIBREJUSTICE_API_BIND_HOST", "127.0.0.1");
         let bind_port = parse_ranged::<u16>("LIBREJUSTICE_API_BIND_PORT", 8300, 1, 65535)?;
         let pool_min = parse_ranged::<usize>("LIBREJUSTICE_API_POOL_MIN", 2, 1, 64)?;
-        // Défaut 32 : le sémaphore de recherche (cf. `AppState.search_permits`)
-        // borne les recherches concurrentes à `pool_max / PEAK_CONNS_PER_SEARCH`,
-        // soit ~10 ici (chacune tenant jusqu'à 3 connexions en `try_join`). C'est le
-        // sémaphore — pas la taille du pool — qui rend le pool deadlock-safe (toute
-        // recherche admise peut acquérir son pic de conns) ; `pool_max` ne règle
-        // donc que le plafond de concurrence DB.
+        // Le sémaphore de recherche (`AppState.search_permits`) borne les recherches
+        // concurrentes à `pool_max / PEAK_CONNS_PER_SEARCH`, chacune tenant jusqu'à
+        // 3 connexions en `try_join` ; `pool_max` ne règle que le plafond de
+        // concurrence DB.
         let pool_max = parse_ranged::<usize>("LIBREJUSTICE_API_POOL_MAX", 32, 1, 128)?;
         let vchord_probes = parse_ranged::<u32>("LIBREJUSTICE_API_VCHORD_PROBES", 20, 1, 512)?;
 
@@ -160,7 +162,7 @@ impl Settings {
 
         let leg_limit = parse_ranged::<u32>("LIBREJUSTICE_API_LEG_LIMIT", 200, 10, 1000)?;
 
-        // CORS : liste explicite, sinon dérivée de web_base_url (cf. validator Python).
+        // CORS : liste explicite, sinon dérivée de web_base_url.
         let cors_origins = parse_csv("LIBREJUSTICE_API_CORS_ORIGINS");
 
         let supabase_url = opt("LIBREJUSTICE_VITE_SUPABASE_URL");
@@ -182,13 +184,14 @@ impl Settings {
         let openai_apps_challenge_token = opt("LIBREJUSTICE_API_OPENAI_APPS_CHALLENGE_TOKEN");
         let glama_maintainer = opt("LIBREJUSTICE_API_GLAMA_MAINTAINER");
         let indexnow_key = opt("LIBREJUSTICE_INDEXNOW_KEY");
+        let deep_probe_token = opt("LIBREJUSTICE_API_DEEP_PROBE_TOKEN");
 
         let gunicorn_workers =
             parse_ranged::<usize>("LIBREJUSTICE_API_GUNICORN_WORKERS", 4, 1, 32)?;
         let version = or_default("LIBREJUSTICE_API_VERSION", "dev");
 
-        // Credentials gateway OTLP Grafana Cloud (regle #5 : via Settings,
-        // prefixe LIBREJUSTICE_). L'export OTel s'active si les trois sont la.
+        // Credentials gateway OTLP Grafana Cloud. L'export OTel s'active si les
+        // trois sont là.
         let grafana_otlp_endpoint = opt("LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT");
         let grafana_otlp_user = opt("LIBREJUSTICE_GRAFANA_OTLP_USER");
         let grafana_cloud_api_key = opt("LIBREJUSTICE_GRAFANA_CLOUD_API_KEY");
@@ -216,8 +219,11 @@ impl Settings {
         let mistral_api_keys = parse_csv("LIBREJUSTICE_MISTRAL_API_KEYS");
         let mistral_model = or_default("LIBREJUSTICE_MISTRAL_MODEL", "mistral-small-2603");
 
-        let tls_cert_path = opt("LIBREJUSTICE_API_TLS_CERT_PATH");
-        let tls_key_path = opt("LIBREJUSTICE_API_TLS_KEY_PATH");
+        let search_budget_per_min =
+            parse_ranged("LIBREJUSTICE_API_SEARCH_BUDGET_PER_MIN", 60, 1, 10_000)?;
+        let search_budget_enforce = parse_bool("LIBREJUSTICE_API_SEARCH_BUDGET_ENFORCE", true);
+        let rerank_budget_per_min =
+            parse_ranged("LIBREJUSTICE_API_RERANK_BUDGET_PER_MIN", 20, 1, 10_000)?;
 
         let mut settings = Settings {
             pg_password,
@@ -242,6 +248,7 @@ impl Settings {
             openai_apps_challenge_token,
             glama_maintainer,
             indexnow_key,
+            deep_probe_token,
             gunicorn_workers,
             version,
             grafana_otlp_endpoint,
@@ -255,8 +262,9 @@ impl Settings {
             public_base_url,
             mistral_api_keys,
             mistral_model,
-            tls_cert_path,
-            tls_key_path,
+            search_budget_per_min,
+            search_budget_enforce,
+            rerank_budget_per_min,
         };
 
         settings.inject_pg_password();
@@ -264,8 +272,7 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Injecte `pg_password` dans `db_url` si l'URL n'a pas déjà de mot de passe
-    /// (parité avec `_inject_pg_password`).
+    /// Injecte `pg_password` dans `db_url` si l'URL n'a pas déjà de mot de passe.
     fn inject_pg_password(&mut self) {
         if let Some(pw) = self.pg_password.as_deref() {
             if let Some(injected) = inject_password(&self.db_url, pw) {
@@ -274,8 +281,7 @@ impl Settings {
         }
     }
 
-    /// `cors_origins` vide → dérivé de `web_base_url` + dev local (parité avec
-    /// `_default_cors_origins`).
+    /// `cors_origins` vide → dérivé de `web_base_url` + dev local.
     fn default_cors_origins(&mut self) {
         if self.cors_origins.is_empty() {
             self.cors_origins = vec![
@@ -290,14 +296,12 @@ impl Settings {
 /// Injecte un mot de passe dans le composant `netloc` d'une URL `scheme://user@host[:port]/...`.
 ///
 /// Retourne `None` si l'URL a déjà un mot de passe (présence d'un `:` dans la
-/// section userinfo avant le `@`) — parité avec `if not parsed.password`. Le mot
-/// de passe est inséré tel quel (pas d'URL-encoding ; identique à `urlunparse`
-/// côté Python qui ne ré-encode pas un password déjà fourni en clair).
+/// section userinfo avant le `@`). Le mot de passe est inséré tel quel (pas
+/// d'URL-encoding).
 fn inject_password(url: &str, password: &str) -> Option<String> {
     let scheme_end = url.find("://")?;
     let (scheme, rest) = url.split_at(scheme_end + 3);
-    // `rest` = `[userinfo@]host[:port][/path...]`. On isole netloc = avant le
-    // premier `/`, `?` ou `#`.
+    // `rest` = `[userinfo@]host[:port][/path...]`.
     let netloc_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (netloc, tail) = rest.split_at(netloc_end);
 
@@ -306,12 +310,11 @@ fn inject_password(url: &str, password: &str) -> Option<String> {
         None => ("", netloc),
     };
 
-    // Déjà un password ? userinfo contient un `:`.
     if userinfo.contains(':') {
         return None;
     }
 
-    // username peut être vide (cas redis sans user) → `:password@host`.
+    // username peut être vide → `:password@host`.
     let new_netloc = if userinfo.is_empty() {
         format!(":{password}@{hostport}")
     } else {
@@ -338,7 +341,6 @@ mod tests {
 
     #[test]
     fn inject_pg_password_skips_when_present() {
-        // L'URL a déjà un password → on ne touche pas.
         assert_eq!(
             inject_password(
                 "postgresql://librejustice:already@127.0.0.1:5432/librejustice",

@@ -1,14 +1,13 @@
 //! Référentiel de droit positif — law-at-date, timeline, citations, sommaire de
-//! code (ADR 0097, généralise ADR 0092).
+//! code.
 //!
 //! Handlers purs `(&AppState, …) -> Result<DTO>` (même forme que
 //! [`crate::decisions`]) ; l'adaptation axum (path/query, headers de cache) vit
 //! dans [`crate::routes`]. Le `code` d'URL est résolu en `text_uid` par lookup
-//! **exact** sur le slug ([`DecisionRepository::resolve_referential_code`]) ; rien
+//! **exact** sur le slug ([`DecisionRepository::referential_ref`], caché in-process) ; rien
 //! ne matche ⇒ 404 ([`ApiError::NotFound`]). Le `num` d'URL **est déjà** la clé
-//! canonique (`num_key`) : nos liens internes la portent (DTO `numKey`, ADR 0123
-//! §2), aucune normalisation au runtime serve — c'est ce qui sort la pile
-//! `lj-extract` du chemin serve.
+//! canonique (`num_key`) : nos liens internes la portent (DTO `numKey`), aucune
+//! normalisation au runtime serve.
 
 use chrono::{Datelike, NaiveDate};
 use lj_core::source_authority::{is_live_authoritative, source_authority};
@@ -18,28 +17,28 @@ use lj_dtos::{
     CodeCatalogueEntry, CodeCatalogueResponse, CodeTocResponse, Commentaire, FacetChoice,
     JurisdictionType, LawArticleResponse, LawArticleVersion, LawCodeSummary, LawCompareOp,
     LawCompareResponse, LawCompareSegment, LawSectionItem, LawSectionRef, LawSectionResponse,
-    LinkedTextRef, ModificationItem, Significance, TocEntry, TocNode,
+    LinkedTextRef, ModificationItem, SectionCitingText, Significance, TocEntry, TocNode,
+    TopCitedArticle,
 };
 use lj_store::repository::{
     ArticleNeighborRow, ArticleSearchRow, ArticleSearchStats, CitingDecisionRow,
     DecisionRepository, FacetCount, LawVersionRow, LegalArticleRow, LegalTextCatalogRow,
     ResolvedLegalLink, TocArticleRow, TocReadingRow, TocTreeRow,
 };
+use std::sync::Arc;
 use tracing::instrument;
 
 use crate::error::{ApiError, Result};
 use crate::state::AppState;
 use crate::titles::decision_title;
 
-/// URL Légifrance versionnée d'un article (ADR 0092) :
-/// `/codes/article_lc/{LEGIARTI}/{date}`. `date` ISO `YYYY-MM-DD` est la date de
-/// consultation (date demandée pour la version-à-date, sinon `date_debut` de la
-/// version servie).
 /// URL Légifrance absolue et versionnée d'un article **natif** Légifrance
-/// (`source_uid` = LEGIARTI…). `None` pour une source curée (droit étranger, traités :
-/// `source_uid` synthétique `text_uid#…`) qui porte déjà sa propre `source_url`
-/// (ADR 0131). Sert à *remplir* `source_url` quand elle est absente — pas de champ
-/// `legifrance_url` dédié (lien « source » unique et générique).
+/// (`source_uid` = LEGIARTI…) : `/codes/article_lc/{LEGIARTI}/{date}`, `date` ISO
+/// `YYYY-MM-DD` étant la date de consultation (date demandée pour la
+/// version-à-date, sinon `date_debut` de la version servie). `None` pour une
+/// source curée (droit étranger, traités : `source_uid` synthétique
+/// `text_uid#…`) qui porte déjà sa propre `source_url`. Sert à *remplir*
+/// `source_url` quand elle est absente.
 fn legifrance_source_url(source_uid: &str, date: &str) -> Option<String> {
     if source_uid.contains('#') {
         return None;
@@ -49,11 +48,10 @@ fn legifrance_source_url(source_uid: &str, date: &str) -> Option<String> {
     ))
 }
 
-/// Rend une `date_debut` en ISO `YYYY-MM-DD`, en mappant la sentinelle borne
-/// ouverte (`0001-01-01`, posée par l'upsert pour les versions sans début connu —
-/// la colonne est NOT NULL depuis ADR 0112) vers la chaîne vide, comme une borne
-/// ouverte l'était avant (DTO `dateDebut` vide = pas de début). Un `None` (qui ne
-/// devrait plus survenir, la colonne étant NOT NULL) est traité de même.
+/// Rend une `date_debut` en ISO `YYYY-MM-DD`, en mappant la sentinelle de borne
+/// ouverte (`0001-01-01`, posée par l'upsert pour les versions sans début connu)
+/// vers la chaîne vide (DTO `dateDebut` vide = pas de début). Un `None` est traité
+/// de même.
 fn date_debut_display(date_debut: Option<NaiveDate>) -> String {
     match date_debut {
         Some(d) if d.year() != 1 => d.to_string(),
@@ -63,9 +61,8 @@ fn date_debut_display(date_debut: Option<NaiveDate>) -> String {
 
 /// Date de début pour l'AFFICHAGE (DTO `dateDebut`) : comme [`date_debut_display`]
 /// mais absorbe aussi la sentinelle LEGI `2999-01-01`, posée sur `date_debut` des
-/// articles **modificatifs** sans date propre (sinon « en vigueur depuis le 1
-/// janvier 2999 »). L'URL Légifrance garde 2999 (elle la résout) via la
-/// `consult_date`, calculée à part par [`date_debut_display`].
+/// articles **modificatifs** sans date propre. L'URL Légifrance garde 2999 (elle
+/// la résout) via la `consult_date`, calculée à part par [`date_debut_display`].
 fn display_start_date(date_debut: Option<NaiveDate>) -> String {
     match date_debut {
         Some(d) if d.year() != 1 && d.year() < 2999 => d.to_string(),
@@ -89,8 +86,8 @@ fn label_suffix(label: &str) -> &str {
 }
 
 /// Une arête du graphe en référence liée : lien article garanti quand la cible
-/// est résolue, ancre de section au sommaire (`#{cid}`, ADR 0207) pour une
-/// cible section, sinon sommaire du texte porteur, sinon libellé nu.
+/// est résolue, ancre de section au sommaire (`#{cid}`) pour une cible section,
+/// sinon sommaire du texte porteur, sinon libellé nu.
 fn linked_text_ref(l: ResolvedLegalLink) -> LinkedTextRef {
     let href = match (l.resolved_slug, l.resolved_num_key) {
         (Some(slug), Some(num_key)) => Some(format!("/texte/{slug}/{num_key}")),
@@ -106,18 +103,17 @@ fn linked_text_ref(l: ResolvedLegalLink) -> LinkedTextRef {
     }
 }
 
-/// Dérive les blocs de la page article depuis ses arêtes `legal_link`
-/// (ADR 0174) : dispositions modifiées (sortant modifie/crée/abroge, groupé
-/// **globalement** par action × texte cible dans l'ordre de première
-/// apparition — le XML entrelace les actions section par section, un
-/// regroupement seulement consécutif émietterait le rendu ADR 0173 §3),
-/// « Modifié par » (entrant modificatoire, trié par date), « Cite » / « Cité
-/// par » (CITATION, dédupliqués — la réciprocité DILA peut répéter une cible).
+/// Dérive les blocs de la page article depuis ses arêtes `legal_link` :
+/// dispositions modifiées (sortant modifie/crée/abroge, groupé **globalement**
+/// par action × texte cible dans l'ordre de première apparition — le XML
+/// entrelace les actions section par section), « Modifié par » (entrant
+/// modificatoire, trié par date), « Cité par » (CITATION entrant, dédupliqué —
+/// la réciprocité DILA peut répéter une cible). Le sortant CITATION n'est pas
+/// rendu : la citation se lit dans le texte, sur son span.
 fn link_blocks(
     links: Vec<ResolvedLegalLink>,
 ) -> (
     Vec<ArticleModification>,
-    Vec<LinkedTextRef>,
     Vec<LinkedTextRef>,
     Vec<LinkedTextRef>,
 ) {
@@ -125,7 +121,6 @@ fn link_blocks(
     let mut group_index: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
     let mut modified_by: Vec<LinkedTextRef> = Vec::new();
-    let mut cites: Vec<LinkedTextRef> = Vec::new();
     let mut cited_by: Vec<LinkedTextRef> = Vec::new();
     for l in links {
         if l.target_label.is_empty() {
@@ -152,7 +147,7 @@ fn link_blocks(
                             .unwrap_or_else(|| label_suffix(&l.target_label).to_string()),
                     },
                     // Cible section : ancre au sommaire du texte porteur quand
-                    // le cid est résolu via l'arbre structurel (ADR 0207).
+                    // le cid est résolu via l'arbre structurel.
                     "section" => ModificationItem {
                         kind: "section".to_string(),
                         label: label_suffix(&l.target_label).to_string(),
@@ -181,10 +176,9 @@ fn link_blocks(
                 }
             }
             "modifie" | "cree" | "abroge" => modified_by.push(linked_text_ref(l)),
-            "cite" if !incoming => cites.push(linked_text_ref(l)),
+            "cite" if !incoming => {}
             "cite" => cited_by.push(linked_text_ref(l)),
-            // codification, concordance, transfert… : stockés, exposés quand un
-            // usage produit les réclamera (frises Phase C/D).
+            // codification, concordance, transfert… : stockés, non exposés.
             _ => {}
         }
     }
@@ -195,18 +189,18 @@ fn link_blocks(
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     });
-    for list in [&mut modified_by, &mut cites, &mut cited_by] {
+    for list in [&mut modified_by, &mut cited_by] {
         let mut seen = std::collections::HashSet::new();
         list.retain(|r| seen.insert((r.label.clone(), r.href.clone())));
     }
-    (modifications, modified_by, cites, cited_by)
+    (modifications, modified_by, cited_by)
 }
 
 /// Convertit une ligne de timeline du repo en DTO version (dates ISO telles
-/// quelles, `dateDebut` borne ouverte ⇒ chaîne vide, `dateFin` absente ⇒ pas de
-/// fin). `dateDebut` du DTO est requise : une borne ouverte (sentinelle
+/// quelles). `dateDebut` du DTO est requise : une borne ouverte (sentinelle
 /// `0001-01-01` posée par l'upsert, ou source non versionnée) est rendue en
-/// chaîne vide. `source_uid` = identifiant natif de la version (LEGIARTI…).
+/// chaîne vide ; `dateFin` absente ⇒ pas de fin. `source_uid` = identifiant natif
+/// de la version (LEGIARTI…).
 fn version_dto(row: LawVersionRow) -> LawArticleVersion {
     // Sentinelles LEGI de borne ouverte / date absente : `0001-01-01` (borne
     // ouverte upsert) et `2999-01-01` (article modificatif sans date propre).
@@ -214,9 +208,9 @@ fn version_dto(row: LawVersionRow) -> LawArticleVersion {
         Some(d) if d != "0001-01-01" && d != "2999-01-01" => d,
         _ => String::new(),
     };
-    // Version future = pas encore entrée en vigueur (ADR 0178). Comparaison
-    // lexicale ISO ; la sentinelle 2999 est déjà absorbée ci-dessus, 2222
-    // (date inconnue) reste marquée « à venir ».
+    // Version future = pas encore entrée en vigueur. Comparaison lexicale ISO ;
+    // la sentinelle 2999 est déjà absorbée ci-dessus, 2222 (date inconnue) reste
+    // marquée « à venir ».
     let upcoming =
         !date_debut.is_empty() && date_debut > chrono::Utc::now().date_naive().to_string();
     LawArticleVersion {
@@ -234,9 +228,12 @@ fn version_dto(row: LawVersionRow) -> LawArticleVersion {
 /// chaîne vide pour une borne ouverte). `legiarti` = identifiant natif de la
 /// version (`source_uid`, LEGIARTI…) ; `legitext` = identité du texte
 /// (`text_uid`).
+#[allow(clippy::too_many_arguments)]
 async fn article_response(
+    state: &AppState,
     repo: &DecisionRepository<'_>,
     code: &str,
+    text: &TextRef,
     article: LegalArticleRow,
     consult_date: &str,
     href_date: Option<NaiveDate>,
@@ -246,12 +243,10 @@ async fn article_response(
     let links = repo
         .article_links(&article.text_uid, &article.num_key, article.date_debut)
         .await?;
-    // Renvois du corps (ADR 0217) : spans de la version servie, hrefs internes
-    // — datés quand la lecture l'est (`href_date` = date demandée de la route),
-    // pour que le renvoi navigue dans le même temps que la lecture. Même
-    // doctrine que les décisions : article ciblé → `/texte/{slug}/{numKey}`,
-    // mention nue → sommaire seulement si le texte a des articles, sinon pas
-    // de span du tout (mort du pointillé).
+    // Renvois du corps : spans de la version servie, hrefs internes — datés quand
+    // la lecture l'est (`href_date` = date demandée de la route). Article ciblé →
+    // `/texte/{slug}/{numKey}`, mention nue → sommaire seulement si le texte a des
+    // articles, sinon pas de span du tout.
     let texte_spans: Vec<CitationSpan> = repo
         .article_citation_spans(
             &article.text_uid,
@@ -271,7 +266,7 @@ async fn article_response(
                     Some(d) => format!("/texte/{slug}/{k}/{d}"),
                     None => format!("/texte/{slug}/{k}"),
                 },
-                None if s.ref_has_articles => match href_date {
+                None if s.ref_readable => match href_date {
                     Some(d) => format!("/texte/{slug}?date={d}"),
                     None => format!("/texte/{slug}"),
                 },
@@ -288,42 +283,42 @@ async fn article_response(
         })
         .collect();
     let travaux_parlementaires = travaux_refs(&links);
-    let (modifications, modified_by, cites, cited_by) = link_blocks(links);
-    // Commentaires de norme (ADR 0212) : bundles ancrés sur (texte, article)
-    // et sur le texte entier, forme `commentaires[]` partagée avec la décision.
-    let commentaires = match repo
-        .article_commentaires(&article.text_uid, &article.num_key)
-        .await?
-    {
+    let (modifications, modified_by, cited_by) = link_blocks(links);
+    // Commentaires de norme : bundles ancrés sur (texte, article) et sur le texte
+    // entier, forme `commentaires[]` partagée avec la décision. Ancre = le `code`
+    // d'URL (slug) : la clé que la page porte, pas l'identité physique du texte —
+    // celle-ci bouge en source.
+    let commentaires = match repo.article_commentaires(code, &article.num_key).await? {
         Some(v) => serde_json::from_value::<Vec<Commentaire>>(v)
             .map_err(|e| ApiError::Internal(format!("commentaires invalides: {e}")))?,
         None => Vec::new(),
     };
     let date_debut = display_start_date(article.date_debut);
     let date_fin = article.date_fin.map(|d| d.to_string());
-    // Lien « source » unique (ADR 0131) : l'URL curée si présente (droit étranger,
-    // traités), sinon — pour un article natif Légifrance — la page Légifrance versionnée.
+    // Lien « source » unique : l'URL curée si présente (droit étranger, traités),
+    // sinon — pour un article natif Légifrance — la page Légifrance versionnée.
     let source_url = article
         .source_url
         .clone()
         .or_else(|| legifrance_source_url(&article.source_uid, consult_date));
-    // Fraîcheur effective (ADR 0129) : `source_asof` par ligne (curé / bulk / jafbase),
-    // sinon — pour les sources live re-synchronisées (legifrance/kali) — la date du
+    // Fraîcheur effective : `source_asof` par ligne (curé / bulk / jafbase), sinon
+    // — pour les sources live re-synchronisées (legifrance/kali) — la date du
     // dernier sync (`ingest_freshness`). Axe distinct de `translation`.
     let source_asof = match article.source_asof {
         Some(d) => Some(d.to_string()),
-        None if is_live_authoritative(&article.source) => repo
-            .get_ingest_freshness(&article.source)
-            .await?
-            .map(|d| d.to_string()),
+        None if is_live_authoritative(&article.source) => {
+            ingest_freshness(state, repo, &article.source)
+                .await?
+                .map(|d| d.to_string())
+        }
         None => None,
     };
     let source_authority = source_authority(&article.source).label().to_string();
     // Titre humain du texte pour l'en-tête « Article N du … » : le `code` d'URL est un
-    // slug (le front l'humaniserait laidement, ex. « code de la famille senegal sn »).
-    let code_title = repo.referential_title(code).await?;
-    // Frise + bandeau « sera modifié le … » (ADR 0178) : versions convertie une
-    // fois, première date future extraite.
+    // slug. Porté par la résolution du slug — même ligne `legal_text`, déjà lue.
+    let code_title = text.title.clone();
+    // Frise + bandeau « sera modifié le … » : versions converties une fois,
+    // première date future extraite.
     let versions: Vec<LawArticleVersion> = versions.into_iter().map(version_dto).collect();
     let upcoming_version_date = versions
         .iter()
@@ -331,8 +326,8 @@ async fn article_response(
         .map(|v| v.date_debut.clone())
         .min();
     // Fil d'Ariane TOC cliquable : divisions enclosantes de la version servie,
-    // hrefs vers la vue-lecture de section (ADR 0207). Vide hors TOC (JORF,
-    // étranger) — le front retombe sur `titre_text`.
+    // hrefs vers la vue-lecture de section. Vide hors TOC (JORF, étranger) — le
+    // front retombe sur `titre_text`.
     let breadcrumb = repo
         .article_toc_breadcrumb(&article.text_uid, &article.source_uid)
         .await?
@@ -371,18 +366,17 @@ async fn article_response(
         context: context.into_iter().map(neighbor_dto).collect(),
         modifications,
         modified_by,
-        cites,
         cited_by,
         commentaires,
         travaux_parlementaires,
     })
 }
 
-/// Travaux parlementaires (ADR 0215, zéro ingest) : une ligne par **loi**
-/// modificatrice de l'article (arêtes entrantes modifie/crée/abroge, nature
-/// LOI, texte JORFTEXT), dédupliquée par texte, triée par date décroissante.
-/// `href` composé vers la page Légifrance de la loi au JO, qui porte le bloc
-/// « Travaux préparatoires » et les liens de dossiers législatifs.
+/// Travaux parlementaires : une ligne par **loi** modificatrice de l'article
+/// (arêtes entrantes modifie/crée/abroge, nature LOI, texte JORFTEXT),
+/// dédupliquée par texte, triée par date décroissante. `href` composé vers la
+/// page Légifrance de la loi au JO, qui porte le bloc « Travaux préparatoires »
+/// et les liens de dossiers législatifs.
 fn travaux_refs(links: &[ResolvedLegalLink]) -> Vec<LinkedTextRef> {
     let mut seen = std::collections::HashSet::new();
     let mut refs: Vec<LinkedTextRef> = links
@@ -410,7 +404,6 @@ fn travaux_refs(links: &[ResolvedLegalLink]) -> Vec<LinkedTextRef> {
     refs
 }
 
-/// Mappe un voisin du repo vers le DTO (numéro + état + flag courant, ADR 0114).
 fn neighbor_dto(row: ArticleNeighborRow) -> ArticleNeighbor {
     ArticleNeighbor {
         num: row.num,
@@ -420,14 +413,56 @@ fn neighbor_dto(row: ArticleNeighborRow) -> ArticleNeighbor {
     }
 }
 
-/// Résout le `code` d'URL en `text_uid` du texte de référentiel par lookup
-/// **exact** du slug (ADR 0112 §6 / ADR 0123 §2). 404 si le slug est inconnu :
-/// nos liens internes portent le slug canonique (DTO), une forme legacy/tapée-main
-/// ne bénéficie plus du rattrapage flou (assumé, ADR 0123).
-async fn resolve_text(repo: &DecisionRepository<'_>, code: &str) -> Result<String> {
-    repo.resolve_referential_code(code)
+/// Identité d'un texte de référentiel résolue depuis son slug d'URL : le
+/// `text_uid` qui clé toutes les requêtes en aval, et le titre humain de
+/// l'en-tête. Valeur du cache [`AppState::text_ref_cache`], partagée par `Arc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextRef {
+    pub text_uid: String,
+    pub title: Option<String>,
+}
+
+/// Résout le `code` d'URL en identité de texte de référentiel par lookup
+/// **exact** du slug. 404 si le slug est inconnu : nos liens internes portent le
+/// slug canonique (DTO).
+///
+/// Servi depuis le cache in-process (TTL 1 h) : le référentiel ne bouge qu'à
+/// l'ingest.
+async fn resolve_text(
+    state: &AppState,
+    repo: &DecisionRepository<'_>,
+    code: &str,
+) -> Result<Arc<TextRef>> {
+    if let Some(hit) = state.text_ref_cache.get(code).await {
+        return hit.ok_or(ApiError::NotFound);
+    }
+    let found = repo
+        .referential_ref(code)
         .await?
-        .ok_or(ApiError::NotFound)
+        .map(|(text_uid, title)| Arc::new(TextRef { text_uid, title }));
+    state
+        .text_ref_cache
+        .insert(code.to_string(), found.clone())
+        .await;
+    found.ok_or(ApiError::NotFound)
+}
+
+/// Fraîcheur « as-of » d'une source live, servie depuis le cache in-process
+/// (TTL 1 h).
+async fn ingest_freshness(
+    state: &AppState,
+    repo: &DecisionRepository<'_>,
+    source: &str,
+) -> Result<Option<NaiveDate>> {
+    if let Some(hit) = state.ingest_freshness_cache.get(source).await {
+        return Ok(hit);
+    }
+    let asof = repo.get_ingest_freshness(source).await?;
+    state
+        .ingest_freshness_cache
+        .insert(source.to_string(), asof)
+        .await;
+    Ok(asof)
 }
 
 /// Version en vigueur d'un article (`GET /api/texte/{code}/{num}`), avec sa
@@ -438,27 +473,32 @@ pub async fn article_in_force(
     code: &str,
     num: &str,
 ) -> Result<LawArticleResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
-    let text_uid = resolve_text(&repo, code).await?;
-    // `num` d'URL replié en clé d'identité (ADR 0236) : nos liens portent
-    // `numKey`, mais l'HTML caché/externe porte encore des formes citables
-    // (« L. 761-1 », « 1er ») — même clé, même page.
+    let text = resolve_text(state, &repo, code).await?;
+    let text_uid = &text.text_uid;
     let num_key = &lj_core::article_key::identity_key(num);
 
     let article = repo
-        .law_article_at_date(&text_uid, num_key, None)
+        .law_article_at_date(text_uid, num_key, None)
         .await?
         .ok_or(ApiError::NotFound)?;
     let consult_date = date_debut_display(article.date_debut);
-    let versions = repo.law_article_versions(&text_uid, num_key).await?;
-    let context = repo.article_context(&text_uid, num_key, None).await?;
-    article_response(&repo, code, article, &consult_date, None, versions, context).await
+    let versions = repo.law_article_versions(text_uid, num_key).await?;
+    let context = repo.article_context(text_uid, num_key, None).await?;
+    article_response(
+        state,
+        &repo,
+        code,
+        &text,
+        article,
+        &consult_date,
+        None,
+        versions,
+        context,
+    )
+    .await
 }
 
 /// Version d'un article à une date (`GET /api/texte/{code}/{num}/{date}`), avec sa
@@ -470,29 +510,25 @@ pub async fn article_at_date(
     num: &str,
     date: NaiveDate,
 ) -> Result<LawArticleResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
-    let text_uid = resolve_text(&repo, code).await?;
-    // `num` d'URL replié en clé d'identité (ADR 0236) : nos liens portent
-    // `numKey`, mais l'HTML caché/externe porte encore des formes citables
-    // (« L. 761-1 », « 1er ») — même clé, même page.
+    let text = resolve_text(state, &repo, code).await?;
+    let text_uid = &text.text_uid;
     let num_key = &lj_core::article_key::identity_key(num);
 
     let article = repo
-        .law_article_at_date(&text_uid, num_key, Some(date))
+        .law_article_at_date(text_uid, num_key, Some(date))
         .await?
         .ok_or(ApiError::NotFound)?;
     let consult_date = date.to_string();
-    let versions = repo.law_article_versions(&text_uid, num_key).await?;
-    let context = repo.article_context(&text_uid, num_key, Some(date)).await?;
+    let versions = repo.law_article_versions(text_uid, num_key).await?;
+    let context = repo.article_context(text_uid, num_key, Some(date)).await?;
     article_response(
+        state,
         &repo,
         code,
+        &text,
         article,
         &consult_date,
         Some(date),
@@ -505,8 +541,7 @@ pub async fn article_at_date(
 /// Variante de [`article_at_date`] acceptant une date ISO `YYYY-MM-DD` en
 /// chaîne, pour les appelants in-process (client SSR `lj-web`) qui ne
 /// manipulent pas `chrono`. Format invalide ⇒ 422
-/// ([`ApiError::Unprocessable`]) — même frontière de validation que la route
-/// HTTP (#12).
+/// ([`ApiError::Unprocessable`]).
 pub async fn article_at_date_str(
     state: &AppState,
     code: &str,
@@ -524,8 +559,7 @@ pub async fn article_at_date_str(
 }
 
 /// Parse la date Chronolégi optionnelle des appelants in-process (client SSR,
-/// qui ne manipule pas `chrono`). Format invalide ⇒ 422, même frontière que la
-/// route HTTP (#12).
+/// qui ne manipule pas `chrono`). Format invalide ⇒ 422.
 fn parse_opt_date(date: Option<&str>) -> Result<Option<NaiveDate>> {
     date.map(|d| {
         NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| {
@@ -558,10 +592,9 @@ pub async fn law_section_str(
     law_section(state, code, cid, parse_opt_date(date)?).await
 }
 
-/// Borne du comparateur de versions (ADR 0193) : date ISO tombant dans la
-/// fenêtre de la version visée, ou `initiale` pour la version à borne ouverte
-/// (sentinelle `0001-01-01`). Format invalide ⇒ 422, même frontière que la
-/// route à date (#12).
+/// Borne du comparateur de versions : date ISO tombant dans la fenêtre de la
+/// version visée, ou `initiale` pour la version à borne ouverte (sentinelle
+/// `0001-01-01`). Format invalide ⇒ 422.
 fn parse_compare_bound(raw: &str, segment: &'static str) -> Result<NaiveDate> {
     if raw == "initiale" {
         return Ok(NaiveDate::from_ymd_opt(1, 1, 1).expect("date sentinelle"));
@@ -586,7 +619,7 @@ fn row_version_dto(row: &LegalArticleRow) -> LawArticleVersion {
     })
 }
 
-/// Comparaison de deux rédactions d'un article (ADR 0193) :
+/// Comparaison de deux rédactions d'un article :
 /// `GET /api/texte/{code}/{num}/compare/{de}/{a}`. Chaque borne résout sa version
 /// par la fenêtre de dates (law-at-date) ; 404 si le code est inconnu ou si une
 /// borne ne couvre aucune version. Le diff est calculé côté serveur
@@ -601,25 +634,19 @@ pub async fn article_compare(
 ) -> Result<LawCompareResponse> {
     let from_date = parse_compare_bound(de, "de")?;
     let to_date = parse_compare_bound(a, "a")?;
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
-    let text_uid = resolve_text(&repo, code).await?;
-    // `num` d'URL replié en clé d'identité (ADR 0236) : nos liens portent
-    // `numKey`, mais l'HTML caché/externe porte encore des formes citables
-    // (« L. 761-1 », « 1er ») — même clé, même page.
+    let text = resolve_text(state, &repo, code).await?;
+    let text_uid = &text.text_uid;
     let num_key = &lj_core::article_key::identity_key(num);
 
     let from_row = repo
-        .law_article_at_date(&text_uid, num_key, Some(from_date))
+        .law_article_at_date(text_uid, num_key, Some(from_date))
         .await?
         .ok_or(ApiError::NotFound)?;
     let to_row = repo
-        .law_article_at_date(&text_uid, num_key, Some(to_date))
+        .law_article_at_date(text_uid, num_key, Some(to_date))
         .await?
         .ok_or(ApiError::NotFound)?;
 
@@ -638,11 +665,10 @@ pub async fn article_compare(
     })
     .collect();
 
-    let versions = repo.law_article_versions(&text_uid, num_key).await?;
-    let code_title = repo.referential_title(code).await?;
+    let versions = repo.law_article_versions(text_uid, num_key).await?;
     Ok(LawCompareResponse {
         code: code.to_string(),
-        code_title,
+        code_title: text.title.clone(),
         num: to_row.num.clone(),
         num_key: to_row.num_key.clone(),
         from: row_version_dto(&from_row),
@@ -654,8 +680,8 @@ pub async fn article_compare(
 
 /// Convertit une ligne `law_decisions_citing` en DTO citant : le `title`
 /// machine est dérivé des métadonnées (même source que le détail/MCP), le
-/// libellé de repli du type venant du référentiel (ADR 0146), la portée du
-/// groupe de `publication_codes` (ADR 0167).
+/// libellé de repli du type venant du référentiel, la portée du groupe de
+/// `publication_codes`.
 fn citing_dto(row: CitingDecisionRow, refs: &crate::referential::Referential) -> CitingDecisionHit {
     let dockets = row.docket_numbers.filter(|d| !d.is_empty());
     let title = decision_title(
@@ -681,6 +707,7 @@ fn citing_dto(row: CitingDecisionRow, refs: &crate::referential::Referential) ->
         date_lecture: row.date_lecture,
         significance,
         summary: row.summary,
+        cited_articles: row.cited_num_keys,
     }
 }
 
@@ -716,23 +743,17 @@ pub async fn article_citing(
         })
         .transpose()?;
 
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
-    let text_uid = resolve_text(&repo, code).await?;
-    // `num` d'URL replié en clé d'identité (ADR 0236) : nos liens portent
-    // `numKey`, mais l'HTML caché/externe porte encore des formes citables
-    // (« L. 761-1 », « 1er ») — même clé, même page.
+    let text = resolve_text(state, &repo, code).await?;
+    let text_uid = &text.text_uid;
     let num_key = &lj_core::article_key::identity_key(num);
 
     // Version servie (même résolution que l'en-tête d'article) → sa fenêtre de
-    // validité borne les citantes. `date_debut` NOT NULL en base (#12).
+    // validité borne les citantes. `date_debut` NOT NULL en base.
     let article = repo
-        .law_article_at_date(&text_uid, num_key, date)
+        .law_article_at_date(text_uid, num_key, date)
         .await?
         .ok_or(ApiError::NotFound)?;
     let date_debut = article
@@ -741,7 +762,7 @@ pub async fn article_citing(
 
     let rows = repo
         .law_decisions_citing(
-            &text_uid,
+            text_uid,
             num_key,
             date_debut,
             article.date_fin,
@@ -753,28 +774,94 @@ pub async fn article_citing(
     Ok(rows.into_iter().map(|r| citing_dto(r, &refs)).collect())
 }
 
+/// Articles interrogés pour les citantes d'une division. La liste des `num_key`
+/// d'un Livre en compte des milliers, et le coût d'une union de citantes croît
+/// avec le nombre de termes : on classe d'abord le sous-arbre par
+/// `citing_decision_counts`, puis on ne lit les décisions que pour les articles
+/// de tête. Même borne que le « voir tout » du front, qui compose une facette à
+/// une valeur par article.
+const SECTION_CITING_ARTICLES: usize = 20;
+
+/// Articles du palmarès « les plus cités » d'une division ou d'un code (colonne
+/// de rebond).
+const SECTION_TOP_CITED: usize = 5;
+
+/// Vivier du palmarès d'un texte entier : les termes les plus cités ne sont pas
+/// tous des articles encore présents dans le texte (renumérotations, transferts).
+/// On en tire quatre fois le plafond avant de joindre le catalogue.
+const TOP_CITED_CANDIDATES: usize = SECTION_TOP_CITED * 4;
+
+/// Textes citants d'une division : même plafond que les décisions du bloc.
+const SECTION_CITING_TEXTS: usize = 5;
+
+/// Seuil de débruitage des textes citants d'une division : un texte qui ne vise
+/// qu'un seul de ses articles n'est pas un texte de la division. Deux articles
+/// visés = une application de la division.
+const SECTION_CITING_TEXT_MIN_ARTICLES: i64 = 2;
+
+/// Décisions citant une DIVISION (`GET /api/texte/{code}/section/{cid}/citing`),
+/// paginées : union des citantes de **tout le sous-arbre** de la division à la
+/// date demandée, dédupliquée par décision et triée comme les citantes d'un
+/// article. `date` (ISO `YYYY-MM-DD`, `None` = en vigueur) choisit la composition
+/// du sous-arbre. 404 si le code ou le `cid` est inconnu ; 422 si `date` est mal
+/// formée.
+///
+/// Coût borné par [`SECTION_CITING_ARTICLES`] : seuls les articles les plus
+/// cités de la division sont interrogés, le classement venant de la table de
+/// compteurs.
+#[instrument(skip(state), fields(db.system = "postgresql", code = %code, cid = %cid, date, limit, offset))]
+pub async fn section_citing(
+    state: &AppState,
+    code: &str,
+    cid: &str,
+    date: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<CitingDecisionHit>> {
+    let date = parse_opt_date(date)?;
+    let conn = state.pool.get().await?;
+    let repo = DecisionRepository::new(&conn);
+
+    let text = resolve_text(state, &repo, code).await?;
+    let at = date.unwrap_or_else(|| chrono::Utc::now().date_naive());
+    let keys: Vec<String> = repo
+        .toc_section_article_keys(&text.text_uid, cid, at)
+        .await?
+        .ok_or(ApiError::NotFound)?
+        .into_iter()
+        .map(|(num_key, _)| num_key)
+        .collect();
+    let top: Vec<String> = repo
+        .citing_counts_for_articles(&text.text_uid, &keys)
+        .await?
+        .into_iter()
+        .take(SECTION_CITING_ARTICLES)
+        .map(|(num_key, _)| num_key)
+        .collect();
+    let rows = repo
+        .law_decisions_citing_any(&text.text_uid, &top, limit, offset)
+        .await?;
+    let refs = crate::referential::referential(state).await?;
+    Ok(rows.into_iter().map(|r| citing_dto(r, &refs)).collect())
+}
+
 /// Articles co-cités (`GET /api/texte/{code}/{num}/related`) : croisement
-/// `legal_citation` (« souvent cité avec », plan graphe Phase D), pondéré IDF
-/// côté repo (ADR 0250 — le boilerplate procédural coule de lui-même). 404 si
-/// le code est inconnu ; liste vide si l'article n'a pas de co-citations.
+/// `legal_citation` (« souvent cité avec »), pondéré IDF côté repo. 404 si le
+/// code est inconnu ; liste vide si l'article n'a pas de co-citations.
 #[instrument(skip(state), fields(db.system = "postgresql", code = %code, num = %num))]
 pub async fn article_co_cited(
     state: &AppState,
     code: &str,
     num: &str,
 ) -> Result<Vec<CoCitedArticle>> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
-    let text_uid = resolve_text(&repo, code).await?;
-    // `num` d'URL replié en clé d'identité (ADR 0236), comme tous les autres
-    // endpoints article — « L761-1 » externe et « l761-1 » interne = même page.
+    let text = resolve_text(state, &repo, code).await?;
     let num_key = &lj_core::article_key::identity_key(num);
-    let rows = repo.law_co_cited_articles(&text_uid, num_key, 8).await?;
+    let rows = repo
+        .law_co_cited_articles(&text.text_uid, num_key, 8)
+        .await?;
     Ok(rows
         .into_iter()
         .map(|r| CoCitedArticle {
@@ -793,11 +880,7 @@ pub async fn article_co_cited(
 /// en vigueur. 404 si le slug est inconnu.
 #[instrument(skip(state), fields(db.system = "postgresql", code = %code))]
 pub async fn code_summary(state: &AppState, code: &str) -> Result<LawCodeSummary> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
     let row = repo
@@ -813,16 +896,16 @@ pub async fn code_summary(state: &AppState, code: &str) -> Result<LawCodeSummary
         .map(|d| d.to_string())
         .collect();
     upcoming_versions.sort();
-    // Sur-facette portée (ADR 0196) : libellé exposé seulement pour la
-    // doctrine administrative — les normes n'ont pas de badge.
+    // Sur-facette portée : libellé exposé seulement pour la doctrine
+    // administrative — les normes n'ont pas de badge.
     let scope = lj_core::referential_labels::nature_scope(&row.nature);
     let scope = (scope != "norme").then(|| {
         lj_core::referential_labels::scope_label(scope)
             .unwrap_or(scope)
             .to_string()
     });
-    // Maillage retour vers le hub fond×année du catalogue des normes
-    // (ADR 0255) ; `None` pour un acte individuel.
+    // Maillage retour vers le hub fond×année du catalogue des normes ; `None`
+    // pour un acte individuel.
     let fond_link = repo.norm_fond_of_text(&row.text_uid).await?;
     let (fond, fond_label, fond_year) = match fond_link {
         Some((fond, year)) => {
@@ -833,6 +916,10 @@ pub async fn code_summary(state: &AppState, code: &str) -> Result<LawCodeSummary
         }
         None => (None, None, None),
     };
+    // Palmarès du texte entier : la colonne droite de la page code ouvre sur ses
+    // articles les plus jugés. Lecture de la table de compteurs, constante en taille
+    // de code.
+    let top_cited = top_cited_articles(&repo, &row.text_uid, &slug).await?;
     Ok(LawCodeSummary {
         legitext: row.text_uid,
         code: slug,
@@ -849,24 +936,45 @@ pub async fn code_summary(state: &AppState, code: &str) -> Result<LawCodeSummary
         fond,
         fond_label,
         fond_year,
+        top_cited,
     })
 }
 
 /// Longueur cible d'un extrait d'article dans les résultats `/recherche-textes`.
 const ARTICLE_SNIPPET_MAX: usize = 280;
 
-/// Recherche plein-texte d'articles (`GET /api/search-textes`, ADR 0114),
+/// Recherche plein-texte d'articles (`GET /api/search-textes`),
 /// **titre-primaire** : jambe titre (`search_title` formé, boostée + expansions
 /// d'alias) > jambe corps. `code` optionnel borne la recherche à un texte (résolu
 /// comme les pages `/texte`) ; absent ⇒ tout le référentiel navigable. Les facettes
 /// `jurisdiction`/`nature`/`source` et le `total` sont comptés sous le même
 /// prédicat BM25 + mêmes filtres que la page de hits, en une requête `GROUPING
 /// SETS` lancée **en parallèle** des hits sur sa propre connexion — le prédicat
-/// BM25 (~1 s plein corpus, ~430 k articles scorés sur une requête à tokens
-/// fréquents) est le poste dominant, on ne le paie qu'une fois
-/// par jambe. Chaque hit reçoit un extrait surligné via
-/// [`crate::snippets::highlight`] (fallback corps tronqué).
-#[instrument(skip(state), fields(db.system = "postgresql", limit, offset))]
+/// BM25 est le poste dominant, on ne le paie qu'une fois par jambe. Chaque hit
+/// reçoit un extrait surligné via [`crate::snippets::highlight`] (fallback corps
+/// tronqué).
+///
+/// Émet le signal d'usage du moteur `textes` sous le nom de span `search`, même
+/// vocabulaire `librejustice.search.*` que les décisions ([`crate::usage`]) :
+/// `{name="search"}` couvre donc les deux moteurs, ventilables par `.engine`.
+#[instrument(
+    name = "search",
+    skip(state, caller),
+    fields(
+        db.system = "postgresql",
+        limit,
+        offset,
+        librejustice.search.engine = tracing::field::Empty,
+        librejustice.search.source = tracing::field::Empty,
+        librejustice.search.query = tracing::field::Empty,
+        librejustice.search.identity = tracing::field::Empty,
+        librejustice.search.session = tracing::field::Empty,
+        librejustice.search.context = tracing::field::Empty,
+        librejustice.search.page = tracing::field::Empty,
+        librejustice.search.filters = tracing::field::Empty,
+        librejustice.search.results_count = tracing::field::Empty,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 pub async fn search_textes(
     state: &AppState,
@@ -876,29 +984,34 @@ pub async fn search_textes(
     nature: Option<&str>,
     source: Option<&str>,
     scope: Option<&str>,
+    at: Option<chrono::NaiveDate>,
     limit: i64,
     offset: i64,
+    caller: crate::usage::Caller,
 ) -> Result<ArticleSearchResponse> {
-    let checkout = || async {
-        state
-            .pool
-            .get()
-            .await
-            .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))
+    const ENGINE: lj_dtos::SearchEngine = lj_dtos::SearchEngine::Textes;
+    let filters = textes_filters(code, jurisdiction, nature, source, scope, at).to_string();
+    let shape = crate::usage::Shape {
+        page: crate::search_history::page_number(offset, limit).unwrap_or(1),
+        filters: &filters,
     };
+    caller.record_span(ENGINE, q, shape);
+    let checkout = || async { state.pool.get().await.map_err(ApiError::from) };
     let (conn_hits, conn_stats) = tokio::try_join!(checkout(), checkout())?;
     let repo_hits = DecisionRepository::new(&conn_hits);
     let repo_stats = DecisionRepository::new(&conn_stats);
 
     let text_uid = match code {
-        Some(c) if !c.is_empty() => Some(resolve_text(&repo_hits, c).await?),
+        Some(c) if !c.is_empty() => {
+            Some(resolve_text(state, &repo_hits, c).await?.text_uid.clone())
+        }
         _ => None,
     };
     // Expansion d'alias (acronymes/noms usuels → forme développée) OR-ée dans la
-    // jambe titre — substitut lexical au sémantique (ADR 0114).
+    // jambe titre.
     let expansions = lj_core::aliases::expand_query(q);
-    // Sur-facette « portée » (ADR 0196) → ensemble de natures (mapping code) :
-    // doctrine administrative = liste fermée, norme = son complément ouvert.
+    // Sur-facette « portée » → ensemble de natures (mapping code) : doctrine
+    // administrative = liste fermée, norme = son complément ouvert.
     let doctrine_natures: Vec<String> = lj_core::referential_labels::DOCTRINE_ADMIN_NATURES
         .iter()
         .map(|s| s.to_string())
@@ -926,6 +1039,7 @@ pub async fn search_textes(
             nature,
             source,
             nature_set,
+            at,
             limit,
             offset,
         ),
@@ -937,13 +1051,45 @@ pub async fn search_textes(
             nature,
             source,
             nature_set,
+            at,
         ),
     )?;
+    caller.record_outcome(ENGINE, q, shape, stats.total);
     Ok(ArticleSearchResponse {
         hits: hits_with_snippets(rows, q),
         total: stats.total,
         facets: facets_dto(stats),
     })
+}
+
+/// Filtres d'une recherche de textes, aux clés de l'URL de la page `/textes`
+/// (`origine`, pas `source`) : sans la query ni la fenêtre. Sérialisation
+/// partagée par l'historique en base et par l'attribut de span
+/// `librejustice.search.filters` — la profondeur va dans `page`, que
+/// l'historique ajoute ici et que le span porte à part.
+pub(crate) fn textes_filters(
+    code: Option<&str>,
+    jurisdiction: Option<&str>,
+    nature: Option<&str>,
+    source: Option<&str>,
+    scope: Option<&str>,
+    at: Option<chrono::NaiveDate>,
+) -> serde_json::Value {
+    let date = at.map(|d| d.to_string());
+    let mut filters = serde_json::Map::new();
+    for (key, value) in [
+        ("code", code),
+        ("jurisdiction", jurisdiction),
+        ("nature", nature),
+        ("origine", source),
+        ("scope", scope),
+        ("date", date.as_deref()),
+    ] {
+        if let Some(v) = value {
+            filters.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+        }
+    }
+    serde_json::Value::Object(filters)
 }
 
 /// Mappe les facettes du repo vers le DTO (chaque `FacetCount` devient un
@@ -965,7 +1111,7 @@ fn facets_dto(stats: ArticleSearchStats) -> ArticleSearchFacets {
             })
             .collect()
     };
-    // Sur-facette portée (ADR 0196) : agrégat des buckets nature par mapping code.
+    // Sur-facette portée : agrégat des buckets nature par mapping code.
     let mut scope_counts: std::collections::BTreeMap<&'static str, i64> =
         std::collections::BTreeMap::new();
     for row in &stats.nature {
@@ -986,7 +1132,7 @@ fn facets_dto(stats: ArticleSearchStats) -> ArticleSearchFacets {
         .collect();
     scope.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
     ArticleSearchFacets {
-        // Slugs auto-descriptifs (ADR 0209) : le label est la valeur.
+        // Slugs auto-descriptifs : le label est la valeur.
         code: map(stats.code, |_| None),
         jurisdiction: map(stats.jurisdiction, jurisdiction_label),
         nature: map(stats.nature, nature_label),
@@ -1000,24 +1146,18 @@ fn facets_dto(stats: ArticleSearchStats) -> ArticleSearchFacets {
 /// `/texte/{code}`).
 #[instrument(skip(state), fields(db.system = "postgresql"))]
 pub async fn code_catalogue(state: &AppState, head_only: bool) -> Result<CodeCatalogueResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
-    let rows = repo.list_legal_texts().await?;
-    let total = rows.len() as u64;
-    let entries: Vec<_> = rows
+    let entries = repo
+        .list_legal_texts(head_only)
+        .await?
         .into_iter()
         .map(catalogue_entry)
-        .filter(|e| !head_only || e.is_head())
         .collect();
-    Ok(CodeCatalogueResponse { entries, total })
+    Ok(CodeCatalogueResponse { entries })
 }
 
-/// Mappe une ligne de catalogue du repo vers le DTO (slug → `code`).
 fn catalogue_entry(row: LegalTextCatalogRow) -> CodeCatalogueEntry {
     CodeCatalogueEntry {
         code: row.slug,
@@ -1030,39 +1170,34 @@ fn catalogue_entry(row: LegalTextCatalogRow) -> CodeCatalogueEntry {
 
 // Au-delà de ce nombre d'articles, le sommaire renvoie la table des matières
 // (chips) ; en deçà, la vue-lecture intégrale — un texte court (BOFiP, décret,
-// arrêté, loi ordinaire) se lit sur sa page. Le seuil couvre p95 des natures
-// non-code (LOI 124, BOFIP 50) et laisse codes et CCN au sommaire. Partagé
-// avec le front (éligibilité d'une division à l'accordéon, ADR 0214).
+// arrêté, loi ordinaire) se lit sur sa page. Partagé avec le front (éligibilité
+// d'une division à l'accordéon).
 use lj_dtos::INLINE_READING_MAX;
 
 /// Table des matières d'un code (`GET /api/texte/{code}/sommaire`) : articles
 /// ordonnés, chacun avec son fil d'Ariane et son état. Textes courts
 /// (≤ [`INLINE_READING_MAX`] articles) : `reading` porte la vue-lecture
-/// intégrale (corps joints) à la place des entrées. 404 si le slug est inconnu
-/// (même résolution que les pages `/texte`).
+/// intégrale (corps joints) à la place des entrées. 404 si le slug est inconnu.
 #[instrument(skip(state), fields(db.system = "postgresql", code = %code))]
 pub async fn code_toc(
     state: &AppState,
     code: &str,
     date: Option<NaiveDate>,
 ) -> Result<CodeTocResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
-    let text_uid = resolve_text(&repo, code).await?;
-    // Arbre structurel réel daté (ADR 0207) à la date demandée (Chronolégi,
-    // ADR 0193 §5) sinon en vigueur aujourd'hui ; repli sur le sommaire à plat
-    // (title_path) pour les textes sans structure ingérée.
+    let text = resolve_text(state, &repo, code).await?;
+    let text_uid = &text.text_uid;
+    // Arbre structurel réel daté à la date demandée (Chronolégi) sinon en vigueur
+    // aujourd'hui ; repli sur le sommaire à plat (title_path) pour les textes sans
+    // structure ingérée.
     let at = date.unwrap_or_else(|| chrono::Utc::now().date_naive());
-    let tree = repo.toc_tree(&text_uid, at).await?;
+    let tree = repo.toc_tree(text_uid, at).await?;
     if !tree.is_empty() {
         let n_articles = tree.iter().filter(|r| r.child_kind == "article").count();
         let reading = if n_articles <= INLINE_READING_MAX {
-            repo.toc_text_reading(&text_uid, at)
+            repo.toc_text_reading(text_uid, at)
                 .await?
                 .into_iter()
                 .map(section_item)
@@ -1076,10 +1211,10 @@ pub async fn code_toc(
             reading,
         });
     }
-    let rows = repo.code_table_of_contents(&text_uid).await?;
+    let rows = repo.code_table_of_contents(text_uid).await?;
     if rows.len() <= INLINE_READING_MAX {
         let reading = repo
-            .flat_text_reading(&text_uid)
+            .flat_text_reading(text_uid)
             .await?
             .into_iter()
             .map(section_item)
@@ -1097,7 +1232,6 @@ pub async fn code_toc(
     })
 }
 
-/// Mappe un nœud d'arbre structurel du repo vers le DTO (ADR 0207).
 fn toc_node(row: TocTreeRow) -> TocNode {
     TocNode {
         kind: row.child_kind,
@@ -1109,9 +1243,9 @@ fn toc_node(row: TocTreeRow) -> TocNode {
     }
 }
 
-/// Vue-lecture d'une section (`GET /api/texte/{code}/section/{cid}`, ADR 0207) :
-/// le sous-arbre de la section en vigueur aujourd'hui, corps des articles
-/// joints. 404 si le slug ou le `cid` est inconnu.
+/// Vue-lecture d'une section (`GET /api/texte/{code}/section/{cid}`) : le
+/// sous-arbre de la section en vigueur aujourd'hui, corps des articles joints.
+/// 404 si le slug ou le `cid` est inconnu.
 #[instrument(skip(state), fields(db.system = "postgresql", code = %code, cid = %cid))]
 pub async fn law_section(
     state: &AppState,
@@ -1119,19 +1253,14 @@ pub async fn law_section(
     cid: &str,
     date: Option<NaiveDate>,
 ) -> Result<LawSectionResponse> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
     let summary = repo
         .law_code_summary(code)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // Chronolégi (ADR 0193 §5) : sous-arbre et corps à la date demandée,
-    // sinon en vigueur aujourd'hui.
+    // Sous-arbre et corps à la date demandée, sinon en vigueur aujourd'hui.
     let at = date.unwrap_or_else(|| chrono::Utc::now().date_naive());
     let (title, items) = repo
         .toc_section_reading(&summary.text_uid, cid, at)
@@ -1139,6 +1268,9 @@ pub async fn law_section(
         .ok_or(ApiError::NotFound)?;
     let tree = repo.toc_tree(&summary.text_uid, at).await?;
     let (ancestors, prev, next) = section_nav(&tree, cid);
+    let items: Vec<LawSectionItem> = items.into_iter().map(section_item).collect();
+    let top_cited = section_top_cited(&repo, &summary.text_uid, code, &items).await?;
+    let citing_texts = section_citing_texts(&repo, &summary.text_uid, &items).await?;
     Ok(LawSectionResponse {
         code: code.to_string(),
         code_title: Some(summary.title),
@@ -1147,8 +1279,96 @@ pub async fn law_section(
         ancestors,
         prev,
         next,
-        items: items.into_iter().map(section_item).collect(),
+        items,
+        top_cited,
+        citing_texts,
     })
+}
+
+/// Les [`SECTION_TOP_CITED`] articles les plus cités du sous-arbre **déjà lu** :
+/// une lecture de `citing_decision_counts` sur ses `num_key`, sans jointure ni
+/// relecture de l'arbre. `label` = le numéro porté par l'arête, celui que la
+/// vue-lecture affiche.
+async fn section_top_cited(
+    repo: &DecisionRepository<'_>,
+    text_uid: &str,
+    code: &str,
+    items: &[LawSectionItem],
+) -> Result<Vec<TopCitedArticle>> {
+    let labels: std::collections::HashMap<&str, &str> = items
+        .iter()
+        .filter(|i| i.kind == "article")
+        .filter_map(|i| Some((i.num_key.as_deref()?, i.label.as_str())))
+        .collect();
+    let num_keys: Vec<String> = labels.keys().map(|k| (*k).to_string()).collect();
+    Ok(repo
+        .citing_counts_for_articles(text_uid, &num_keys)
+        .await?
+        .into_iter()
+        .take(SECTION_TOP_CITED)
+        .map(|(num_key, count)| TopCitedArticle {
+            label: labels[num_key.as_str()].to_string(),
+            href: Some(format!("/texte/{code}/{num_key}")),
+            num_key,
+            count,
+        })
+        .collect())
+}
+
+/// Le même palmarès au périmètre du **texte entier** : le classement vient du
+/// repo, qui lit la table de compteurs sans énumérer les articles du code, et
+/// rend déjà le numéro affichable.
+async fn top_cited_articles(
+    repo: &DecisionRepository<'_>,
+    text_uid: &str,
+    code: &str,
+) -> Result<Vec<TopCitedArticle>> {
+    Ok(repo
+        .top_cited_articles(
+            text_uid,
+            SECTION_TOP_CITED as i64,
+            TOP_CITED_CANDIDATES as i64,
+        )
+        .await?
+        .into_iter()
+        .map(|(num_key, label, count)| TopCitedArticle {
+            label,
+            href: Some(format!("/texte/{code}/{num_key}")),
+            num_key,
+            count,
+        })
+        .collect())
+}
+
+/// Textes citant la division : agrégés au grain du texte citant, filtrés à
+/// [`SECTION_CITING_TEXT_MIN_ARTICLES`] articles visés et plafonnés comme les
+/// décisions du même bloc. La liste sort de la vue-lecture déjà lue — ses
+/// `num_key` sont exactement le sous-arbre daté.
+async fn section_citing_texts(
+    repo: &DecisionRepository<'_>,
+    text_uid: &str,
+    items: &[LawSectionItem],
+) -> Result<Vec<SectionCitingText>> {
+    let num_keys: Vec<String> = items
+        .iter()
+        .filter(|i| i.kind == "article")
+        .filter_map(|i| i.num_key.clone())
+        .collect();
+    Ok(repo
+        .section_citing_texts(
+            text_uid,
+            &num_keys,
+            SECTION_CITING_TEXT_MIN_ARTICLES,
+            SECTION_CITING_TEXTS as i64,
+        )
+        .await?
+        .into_iter()
+        .map(|(label, slug, article_count)| SectionCitingText {
+            label,
+            href: slug.map(|s| format!("/texte/{s}")),
+            article_count,
+        })
+        .collect())
 }
 
 /// Situe une section dans l'arbre aplati en ordre de lecture : divisions
@@ -1201,7 +1421,6 @@ fn section_nav(
     (ancestors, prev, next)
 }
 
-/// Mappe un item de vue-lecture du repo vers le DTO (ADR 0207).
 fn section_item(row: TocReadingRow) -> LawSectionItem {
     LawSectionItem {
         kind: row.child_kind,
@@ -1251,6 +1470,8 @@ fn hits_with_snippets(rows: Vec<ArticleSearchRow>, q: &str) -> Vec<ArticleSearch
                 titre_path: r.title_path,
                 snippet,
                 source: r.source,
+                status: (!r.status.is_empty()).then_some(r.status),
+                date_debut: r.date_debut.map(|d| d.to_string()),
             }
         })
         .collect()
@@ -1308,7 +1529,6 @@ mod tests {
     fn section_nav_ancetres_et_voisins() {
         let tree = nav_tree();
 
-        // c2 : ancêtres l1 > t1, précédent c1, suivant t2 (hors sous-arbre).
         let (anc, prev, next) = section_nav(&tree, "c2");
         assert_eq!(
             anc.iter().map(|r| r.cid.as_str()).collect::<Vec<_>>(),
@@ -1317,21 +1537,17 @@ mod tests {
         assert_eq!(prev.unwrap().cid, "c1");
         assert_eq!(next.unwrap().cid, "t2");
 
-        // t2 : le suivant saute au Livre 2 ; le précédent est le dernier bloc
-        // lu (c2), pas son parent t1.
         let (anc, prev, next) = section_nav(&tree, "t2");
         assert_eq!(anc.len(), 1);
         assert_eq!(prev.unwrap().cid, "c2");
         assert_eq!(next.unwrap().cid, "l2");
 
-        // Bornes : l1 n'a pas de précédent, l2 pas de suivant, racine sans ancêtre.
         let (anc, prev, next) = section_nav(&tree, "l1");
         assert!(anc.is_empty() && prev.is_none());
         assert_eq!(next.unwrap().cid, "l2");
         let (_, _, next) = section_nav(&tree, "l2");
         assert!(next.is_none());
 
-        // cid inconnu (texte sans arbre) : rien.
         let (anc, prev, next) = section_nav(&tree, "zzz");
         assert!(anc.is_empty() && prev.is_none() && next.is_none());
     }
@@ -1346,8 +1562,6 @@ mod tests {
 
     #[test]
     fn legifrance_source_url_none_for_curated() {
-        // Source curée (`source_uid` synthétique) : pas de page Légifrance ; elle porte
-        // sa propre `source_url` (ADR 0131) — pas de lien Légifrance fabriqué.
         assert_eq!(
             legifrance_source_url("JORFTEXT000000694290#6@1968-12-27", "2002-12-26"),
             None
@@ -1372,6 +1586,7 @@ mod tests {
             docket_numbers: Some(vec!["123456".to_string()]),
             publication_codes: Some(vec!["A".to_string()]),
             summary: None,
+            cited_num_keys: Vec::new(),
         };
         let refs = crate::referential::Referential::new(Vec::new(), Vec::new());
         let hit = citing_dto(row, &refs);
@@ -1379,7 +1594,7 @@ mod tests {
         assert_eq!(hit.jurisdiction_type, JurisdictionType::Ce);
         assert_eq!(hit.title, "Conseil d'État, 13 février 2024, 123456");
         assert_eq!(hit.date_lecture.as_deref(), Some("2024-02-13"));
-        // « A » = Recueil Lebon → portée majeure (groupes ADR 0167).
+        // « A » = Recueil Lebon → portée majeure.
         assert_eq!(hit.significance, Significance::Majeure);
     }
 }

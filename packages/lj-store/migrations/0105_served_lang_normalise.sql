@@ -1,8 +1,8 @@
--- ADR 0153 — langue servie normée : colonne `served_lang` sur `decision_sources`,
+-- Langue servie normée : colonne `served_lang` sur `decision_sources`,
 -- source unique de vérité de la langue de rendition. Elle remplace le doublon
 -- éparpillé `source_fields->>'languageisocode'` (CEDH, verbatim HUDOC 'FRE'/'ENG')
 -- vs `source_fields->>'resource_obtained_language'` (CJUE, langue négociée
--- 'fra'/'eng') ET la fonction `lang_rank` (ADR 0127) qui factorisait la définition
+-- 'fra'/'eng') ET la fonction `lang_rank` qui factorisait la définition
 -- de « FR » : tout consommateur lit désormais `served_lang`, aucun ne (re)connaît
 -- les clés brutes par source — c'est cette divergence qui avait causé le bug de
 -- `find_fr_source_uids` (n'testait que la clé CJUE, aveugle à la CEDH).

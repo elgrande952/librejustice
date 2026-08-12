@@ -1,33 +1,30 @@
-//! Réparation rétroactive des faux merges **intra-source** `dila-jade` (#47,
-//! ADR 0104) — analogue de [`super::unmerge`] (judilibre) pour le fond DILA JADE.
+//! Réparation rétroactive des faux merges **intra-source** `dila-jade` —
+//! analogue de [`super::unmerge`] (judilibre) pour le fond DILA JADE.
 //!
-//! La dédup historique (axe `canonical_ref`, ADR 0100) a fusionné des décisions
-//! distinctes d'un même fond `dila-jade` partageant la clé → le texte du
-//! **perdant** a été détruit (la ligne `decisions` ne garde que l'autorité). Pour
-//! le re-créer il faut son XML source : on le relit du **cache local DILA**
-//! (tarballs `<cache>/dila/jade/tarballs/*.tar.gz`) — aucun appel réseau.
+//! La dédup historique (axe `canonical_ref`) a fusionné des décisions distinctes
+//! d'un même fond `dila-jade` partageant la clé → le texte du **perdant** a été
+//! détruit (la ligne `decisions` ne garde que l'autorité). Pour le re-créer il
+//! faut son XML source : on le relit du **cache local DILA** (tarballs
+//! `<cache>/dila/jade/tarballs/*.tar.gz`), sans appel réseau.
 //!
-//! Différence clé avec judilibre : le cache judilibre est rangé par mois
-//! (`<jur>/<AAAAMM>.jsonl.gz`, lookup direct) ; les tarballs DILA ne sont **pas
-//! indexés par décision**. On fait donc **un seul passage streamé** sur les
-//! tarballs (comme [`super::dila`]), en re-matérialisant les seuls membres dont
-//! l'ID DILA est une perdante. Le jeu de perdantes est petit (~1 300) → on
-//! collecte les `Candidate` matchés en mémoire (passe 1, CPU dans
-//! `spawn_blocking`), puis on scinde + matérialise (passe 2, DB async). Un membre
-//! peut apparaître dans plusieurs tarballs (stock + incrément) → `done` garantit
-//! **une seule** scission par perdante (première occurrence ; évite les décisions
-//! squelettes orphelines).
+//! Les tarballs DILA ne sont pas indexés par décision, là où le cache judilibre
+//! est rangé par mois (`<jur>/<AAAAMM>.jsonl.gz`, lookup direct). On fait donc
+//! **un seul passage streamé** sur les tarballs (comme [`super::dila`]), en
+//! re-matérialisant les seuls membres dont l'ID DILA est une perdante. Le jeu de
+//! perdantes est petit → on collecte les `Candidate` matchés en mémoire (passe 1,
+//! CPU dans `spawn_blocking`), puis on scinde + matérialise (passe 2, DB async).
+//! Un membre peut apparaître dans plusieurs tarballs (stock + incrément) →
+//! `done` garantit **une seule** scission par perdante.
 //!
-//! Passe 2, per perdante (inverse d'une fusion) : `create_split_decision`
+//! Passe 2, par perdante (inverse d'une fusion) : `create_split_decision`
 //! (détache la provenance perdante vers une nouvelle décision squelette ;
-//! l'autorité reste sur l'origine, son texte y est déjà) puis `drain_batch_in_txn`
-//! (`IngestMode::All`, re-chunk + re-embed **vLLM strict**, jamais Cloudflare) —
-//! le tout dans une transaction par perdante (échec → rollback, laissée fusionnée).
+//! l'autorité reste sur l'origine, son texte y est déjà) puis
+//! `drain_batch_in_txn` (`IngestMode::All`, re-chunk + re-embed **vLLM strict**,
+//! jamais Cloudflare) — le tout dans une transaction par perdante (échec →
+//! rollback, laissée fusionnée).
 //!
-//! `--dry-run` (défaut CLI) : stream + comptage (cache-hit/miss), **aucune
-//! écriture, aucun GPU** — vérifiable sans risque même pendant le cron.
-//! `--limit N` : rollout borné (valider à `--limit 2` avant le run complet, comme
-//! #46).
+//! `--dry-run` (défaut CLI) : stream + comptage (cache-hit/miss), aucune
+//! écriture, aucun GPU. `--limit N` : rollout borné.
 
 use std::collections::{HashMap, HashSet};
 
@@ -60,9 +57,9 @@ struct Stats {
     failed: usize,
 }
 
-/// Défait les faux merges intra-source `dila-jade` (#47, ADR 0104). `execute =
-/// false` (dry-run) : stream + comptage, aucune écriture. `limit` : borne le
-/// nombre de splits écrits (rollout prudent).
+/// Défait les faux merges intra-source `dila-jade`. `execute = false` (dry-run) :
+/// stream + comptage, aucune écriture. `limit` : borne le nombre de splits
+/// écrits.
 pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -139,9 +136,8 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
                     }
                     let repaired = lj_sources::dila::repair_dila(&raw, Fond::Jade.source());
                     match classify_dila(repaired, &raw, Fond::Jade) {
-                        // Full ou Analysis : on re-matérialise le `Candidate` inclus
-                        // (re-split recovery — le texte de la perdante, intégral ou,
-                        // à défaut, son analyse, #33).
+                        // Full ou Analysis : on re-matérialise le `Candidate` inclus — le
+                        // texte de la perdante, intégral ou, à défaut, son analyse.
                         Ok(Some(ClassifiedDila::Full(cand) | ClassifiedDila::Analysis(cand))) => {
                             done.insert(id.clone());
                             out.push((id, cand));

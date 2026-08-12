@@ -1,4 +1,4 @@
-//! Construction du prompt de résumé + nettoyage de sortie (port de `summary.py`).
+//! Construction du prompt de résumé + nettoyage de sortie.
 //!
 //! PUR : pas d'appel LLM ici (l'I/O réseau vit dans `lj-ingest`). On expose le
 //! prompt versionné, le découpage tête/queue de l'input, et le nettoyage de la
@@ -17,9 +17,8 @@ pub const SUMMARY_PROMPT: &str = include_str!("../data/summary_prompt.txt");
 
 // --- Construction de l'entrée Mistral --------------------------------------
 //
-// mistral-small a 128k tokens de contexte (~400k c) ; la décision la plus longue
-// du corpus ≈ 99k c → on envoie le texte INTÉGRAL par défaut. Au-delà du cap
-// (rares géantes), on garde la TÊTE (parties, moyens, motifs) ET la QUEUE
+// mistral-small a 128k tokens de contexte : on envoie le texte INTÉGRAL par
+// défaut. Au-delà du cap, on garde la TÊTE (parties, moyens, motifs) ET la QUEUE
 // (dispositif) — jamais la tête seule, qui inverse l'issue.
 
 const SUMMARY_INPUT_CAP: usize = 80_000;
@@ -29,11 +28,8 @@ const ELISION: &str = "\n[...]\n";
 
 /// Borne l'input modèle : intégral si `≤ cap`, sinon tête + queue avec élision.
 ///
-/// Les bornes Python (`body_text[:HEAD]`, `body_text[-TAIL:]`) sont des slices
-/// sur des caractères Python (code points). On reproduit donc un découpage sur
-/// frontières de caractères (et non d'octets) pour rester fidèle aux longueurs.
+/// Découpage sur frontières de caractères (code points), pas d'octets.
 pub fn build_summary_input(body_text: &str) -> String {
-    // `len(body_text)` en Python compte les code points.
     let char_len = body_text.chars().count();
     if char_len <= SUMMARY_INPUT_CAP {
         return body_text.to_string();
@@ -57,8 +53,7 @@ pub fn build_summary_input(body_text: &str) -> String {
 //   le contenu et on retire juste les crochets → « M. W Y ».
 //
 // Le LLM recopie aussi parfois l'en-tête « [Décision] <jur>, <date>, <num> »
-// (interdit par le prompt) en première ligne ; il pollue alors la meta
-// description → on le retire.
+// (interdit par le prompt) en première ligne : on le retire.
 
 /// En-tête recopié en tête de résumé : ligne « [Décision]/Décision … <date ISO>
 /// … » suivie d'un saut de ligne. La date ISO (signature de la citation injectée
@@ -94,15 +89,13 @@ pub fn clean_summary(text: &str) -> String {
     let text = INITIAL.replace_all(&text, "$1");
     let text = SPACE_BEFORE_PUNCT.replace_all(&text, "$1");
     let text = MULTISPACE.replace_all(&text, " ");
-    // `subn` Python : on a besoin de savoir si quelque chose a été retiré en tête.
     let leading_removed = LEADING_JUNK.is_match(&text);
     let text = LEADING_JUNK.replace(&text, "");
     let text = text.trim();
 
     // Un placeholder retiré en tête de phrase laisse espace/ponctuation orphelins
-    // (`leading_removed`), puis une minuscule en première position : un résumé
-    // ouvre toujours une phrase, on recapitalise. On ne touche pas un texte déjà
-    // propre (fragments de test compris).
+    // (`leading_removed`), puis une minuscule en première position : un résumé ouvre
+    // toujours une phrase, on recapitalise.
     if leading_removed && first_char_is_lower(text) {
         capitalize_first(text)
     } else {
@@ -110,13 +103,13 @@ pub fn clean_summary(text: &str) -> String {
     }
 }
 
-/// `text[:1].islower()` Python : vrai ssi le premier caractère est une minuscule
-/// (au sens Unicode). Faux sur chaîne vide ou premier char non-cased.
+/// Vrai ssi le premier caractère est une minuscule (au sens Unicode). Faux sur
+/// chaîne vide ou premier char non-cased.
 fn first_char_is_lower(text: &str) -> bool {
     text.chars().next().is_some_and(|c| c.is_lowercase())
 }
 
-/// `text[0].upper() + text[1:]` Python : majuscule du premier caractère.
+/// Majuscule du premier caractère.
 fn capitalize_first(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
@@ -143,10 +136,8 @@ mod tests {
 
     #[test]
     fn build_input_head_tail_over_cap() {
-        // Caractères ASCII : 1 char = 1 octet, longueurs Python = longueurs char.
         let body: String = "x".repeat(SUMMARY_INPUT_CAP + 1);
         let out = build_summary_input(&body);
-        // tête + élision + queue
         assert_eq!(
             out.chars().count(),
             SUMMARY_INPUT_HEAD + ELISION.chars().count() + SUMMARY_INPUT_TAIL
@@ -162,7 +153,6 @@ mod tests {
 
     #[test]
     fn clean_keeps_names_strips_brackets() {
-        // « M. [W] [Y] » → « M. W Y »
         assert_eq!(
             clean_summary("M. [W] [Y] conteste le refus."),
             "M. W Y conteste le refus."
@@ -171,9 +161,7 @@ mod tests {
 
     #[test]
     fn clean_strips_placeholder_with_preposition() {
-        // « le comité du [7] » → « le comité »
         assert_eq!(clean_summary("le comité du [7] décide"), "le comité décide");
-        // « la cour de [Localité 5] » → « la cour »
         assert_eq!(
             clean_summary("la cour de [Localité 5] statue"),
             "la cour statue"
@@ -182,7 +170,6 @@ mod tests {
 
     #[test]
     fn clean_strips_locality_placeholder() {
-        // « [Localité 6] » → rien
         assert_eq!(
             clean_summary("La société [Localité 6] agit."),
             "La société agit."
@@ -201,7 +188,6 @@ mod tests {
 
     #[test]
     fn clean_recapitalizes_after_leading_junk() {
-        // placeholder retiré en tête → ponctuation orpheline → recapitalisation.
         assert_eq!(
             clean_summary("[7] saisit le tribunal."),
             "Saisit le tribunal."

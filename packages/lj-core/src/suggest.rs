@@ -1,15 +1,15 @@
-//! Récolte des n-grammes du vocabulaire d'autocomplétion (ADR 0216).
+//! Récolte des n-grammes du vocabulaire d'autocomplétion.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use crate::body_tok::is_stopword;
 
-/// Mots-outils qui **cassent la proposition** : copules, auxiliaires, modaux,
+/// Mots-outils qui cassent la proposition : copules, auxiliaires, modaux,
 /// relatifs, pronoms sujets, connecteurs — la plupart absents de la liste
-/// tantivy `French` (intouchable, parité BM25). Un n-gramme qui en contient
-/// un chevauche deux propositions (« garde à vue *est* immédiatement »,
-/// « garde à vue *il* résulte ») : interdits partout, bords comme intérieur.
+/// tantivy `French`. Un n-gramme qui en contient un chevauche deux propositions
+/// (« garde à vue *est* immédiatement », « garde à vue *il* résulte ») :
+/// interdits partout, bords comme intérieur.
 static CLAUSE_BREAKERS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "ainsi",
@@ -49,9 +49,9 @@ static CLAUSE_BREAKERS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Prépositions et déterminants propres au suggest qui ne peuvent **ni ouvrir
-/// ni fermer** un n-gramme mais restent admis à l'intérieur, comme les
-/// stopwords de l'index (« placement *sous* contrôle judiciaire »).
+/// Prépositions et déterminants propres au suggest qui ne peuvent ni ouvrir
+/// ni fermer un n-gramme mais restent admis à l'intérieur, comme les stopwords
+/// de l'index (« placement *sous* contrôle judiciaire »).
 static BORDER_ONLY: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "apres", "autre", "autres", "avant", "celle", "celles", "celui", "ceux", "chaque", "entre",
@@ -85,18 +85,17 @@ pub const MAX_KEY_TOKENS: usize = 8;
 pub const DISPLAY_SEP: u8 = 0x00;
 
 /// Émet les spans `[start, end)` des n-grammes 1..=[`MAX_N`] d'une suite de
-/// tokens body foldés. Trois règles : un n-gramme ne **commence ni ne
-/// finit** par un mot de bordure (stopword de l'index ou [`BORDER_ONLY`],
-/// admis à l'intérieur — « tribunal de commerce », « placement sous contrôle
-/// judiciaire ») ; il ne **contient jamais** de casseur de proposition
-/// ([`CLAUSE_BREAKERS`]) ; il ne **tronque jamais une suite de tokens
-/// numériques** — les montants éclatés par le tokenizer (« 1 500 »)
-/// produiraient sinon des fragments (« somme de 1 ») dont le df agrège des
-/// milliers de montants distincts et écrase le ranking. Les chiffres passent
-/// partout ailleurs (« article 700 », « loi du 29 juillet ») : les numéros
-/// rares — RG, dates isolées — sont éliminés par le plancher de df, pas par
-/// une règle. L'appelant joint les tokens du span (formes pliée et affichée,
-/// alignées index à index par le tokenizer).
+/// tokens body foldés. Trois règles : un n-gramme ne commence ni ne finit par un
+/// mot de bordure (stopword de l'index ou [`BORDER_ONLY`], admis à l'intérieur —
+/// « tribunal de commerce », « placement sous contrôle judiciaire ») ; il ne
+/// contient jamais de casseur de proposition ([`CLAUSE_BREAKERS`]) ; il ne
+/// tronque jamais une suite de tokens numériques — les montants éclatés par le
+/// tokenizer (« 1 500 ») produiraient sinon des fragments (« somme de 1 ») dont
+/// le df agrège des milliers de montants distincts. Les chiffres passent partout
+/// ailleurs (« article 700 », « loi du 29 juillet ») : les numéros rares — RG,
+/// dates isolées — sont éliminés par le plancher de df, pas par une règle.
+/// L'appelant joint les tokens du span (formes pliée et affichée, alignées index
+/// à index par le tokenizer).
 pub fn harvest_ngrams(toks: &[String], mut emit: impl FnMut(usize, usize)) {
     let border: Vec<bool> = toks.iter().map(|t| is_border_word(t)).collect();
     let broken: Vec<bool> = toks
@@ -141,14 +140,11 @@ mod tests {
     #[test]
     fn collocation_a_stopword_interne_capturee() {
         let ngrams = all("tribunal de commerce de paris");
-        // La collocation à stopword interne émerge en trigramme…
         assert!(ngrams.contains(&"tribunal de commerce".to_string()));
         assert!(ngrams.contains(&"commerce de paris".to_string()));
-        // …mais aucun n-gramme ne commence ni ne finit par un stopword.
         assert!(!ngrams.iter().any(|n| n.starts_with("de ")));
         assert!(!ngrams.iter().any(|n| n.ends_with(" de")));
         assert!(!ngrams.contains(&"de".to_string()));
-        // Unigrammes de contenu présents.
         assert!(ngrams.contains(&"tribunal".to_string()));
         assert!(ngrams.contains(&"paris".to_string()));
     }
@@ -163,10 +159,8 @@ mod tests {
 
     #[test]
     fn references_et_dates_numerotees_admises() {
-        // Les références numérotées sont du vocabulaire de premier plan…
         let ngrams = all("article 700 du code");
         assert!(ngrams.contains(&"article 700".to_string()));
-        // …y compris les lois citées par leur date.
         let ngrams = all("loi du 29 juillet 1881 presse");
         assert!(ngrams.contains(&"loi du 29".to_string()));
         assert!(ngrams.contains(&"29 juillet 1881".to_string()));
@@ -175,16 +169,12 @@ mod tests {
 
     #[test]
     fn suite_numerique_jamais_tronquee() {
-        // « 1 500 » (montant éclaté par le tokenizer) ne s'échantillonne pas :
-        // le fragment agrégerait le df de milliers de montants distincts.
         let ngrams = all("somme de 1 500 euros");
         assert!(!ngrams.contains(&"somme de 1".to_string()));
         assert!(!ngrams.contains(&"1".to_string()));
         assert!(!ngrams.contains(&"500 euros".to_string()));
-        // La suite entière, elle, passe (df individuel faible → plancher).
         assert!(ngrams.contains(&"1 500 euros".to_string()));
         assert!(ngrams.contains(&"somme".to_string()));
-        // Même règle sur les identifiants multi-tokens : pas de préfixe coupé.
         let ngrams = all("loi 78 17 informatique");
         assert!(!ngrams.contains(&"loi 78".to_string()));
         assert!(ngrams.contains(&"loi 78 17".to_string()));
@@ -199,14 +189,10 @@ mod tests {
 
     #[test]
     fn casseurs_de_proposition_bloques_partout() {
-        // « est » (absent de la liste tantivy) casse la proposition : aucun
-        // n-gramme ne le contient — ni « garde à vue est », ni « garde à vue
-        // est immédiatement ».
         let ngrams = all("la garde a vue est immediatement notifiee");
         assert!(!ngrams.iter().any(|n| n.contains("est")));
         assert!(ngrams.contains(&"garde a vue".to_string()));
         assert!(ngrams.contains(&"immediatement notifiee".to_string()));
-        // Idem pour le relatif « dont », même à l'intérieur.
         let ngrams = all("servitude dont beneficie le fonds");
         assert!(!ngrams.iter().any(|n| n.contains("dont")));
         assert!(ngrams.contains(&"servitude".to_string()));
@@ -224,8 +210,6 @@ mod tests {
 
     #[test]
     fn spans_alignes_sur_la_forme_affichee() {
-        // Les spans se rejouent sur les tokens display (mêmes frontières) :
-        // la forme accentuée du n-gramme s'obtient du même [start, end).
         let folded = tokenize("congés payés acquis");
         let display = crate::body_tok::tokenize_lower("congés payés acquis");
         let mut pairs = Vec::new();

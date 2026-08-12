@@ -1,4 +1,4 @@
--- ADR 0162 : slug universel des textes.
+-- Slug universel des textes.
 -- 1. Dédoublonnage des slugs existants : dans chaque groupe de doublons, le
 --    plus petit text_uid garde le slug nu, les autres prennent le suffixe
 --    `-{text_uid en minuscules}` (déterministe, jamais re-renommé).

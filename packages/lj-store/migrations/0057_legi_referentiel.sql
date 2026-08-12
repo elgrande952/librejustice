@@ -1,13 +1,13 @@
--- Migration 0057 — Référentiel LEGI versionné (ADR 0092).
+-- Migration 0057 — Référentiel LEGI versionné.
 --
 -- DDL bon marché uniquement : tables vides, aucun backfill. L'ingestion du fond
 -- LEGI (bootstrap `Freemium_legi_global_*.tar.gz` puis incréments quotidiens) se
 -- fait HORS-MIGRATION via `lj-ingest legi`, idempotente sur `legiarti` + checksum
 -- (#7). Le pont `legal_codes.legitext` est posé/recalculé hors-migration par
--- `bridge_legal_codes_legitext` (recomputable, ADR 0092).
+-- `bridge_legal_codes_legitext` (recomputable).
 --
 -- Deux vérités-source distinctes (#11) : `legal_codes`/`legal_articles` (libellés
--- bruts cités par les juges, ADR 0079) restent inchangés ; `legi_codes`/
+-- bruts cités par les juges) restent inchangés ; `legi_codes`/
 -- `legi_articles` portent le droit positif versionné. Le pont code↔code les relie
 -- sans les fusionner.
 
@@ -54,5 +54,5 @@ CREATE INDEX idx_legi_articles_vigueur ON legi_articles (legitext, num_key)
 
 -- ── Pont legal_codes ↔ legi_codes (recomputable, niveau code) ──────────────
 -- Posé sur les formes canoniques par matching `canon(name) = canon(titre)`
--- (bridge_legal_codes_legitext). Recomputable comme `canonical_id` (ADR 0079).
+-- (bridge_legal_codes_legitext). Recomputable comme `canonical_id`.
 ALTER TABLE legal_codes ADD COLUMN legitext TEXT REFERENCES legi_codes(legitext);

@@ -1,29 +1,27 @@
-//! ArianeWeb (ADR 0204) : analyses AJCE + existence des conclusions CRP →
+//! ArianeWeb : analyses AJCE + existence des conclusions CRP →
 //! bundles `commentaires[]` en `decision_sources` (`source = 'ariane-web'`,
 //! une ligne par décision CE, pivot `source_uid =
-//! ariane-web/<dossier>@<date>` — l'id interne `AW_DCE` de l'ADR ne tient
-//! pas : absent des documents pré-1968, cf. addendum).
+//! ariane-web/<dossier>@<date>`).
 //!
 //! Déroulé par **année** (l'année xsearch est celle de la date de lecture de
 //! la décision parente — analyses et conclusions d'une même décision tombent
 //! dans la même tranche) : énumération CRP puis AJCE, téléchargement HTML AJCE
 //! (cache disque shardé), parse pur, groupage et rattachement en mémoire par
-//! (n° dossier, date de lecture) — jamais l'ECLI brut (ADR 0095).
+//! (n° dossier, date de lecture) — jamais l'ECLI brut.
 //!
 //! Le réseau (pages xsearch, HTML des fiches) est crawlé par un pool borné de
 //! [`CRAWL_WORKERS`] threads, [`ariane::THROTTLE`] par worker ; la fusion des
 //! bundles reste séquentielle dans l'ordre d'énumération (checksums stables).
 //!
-//! Idempotence (#7) : `content_checksum` = xxh3-64 hex du bundle sérialisé,
+//! Idempotence : `content_checksum` = xxh3-64 hex du bundle sérialisé,
 //! skip si identique. Une année est marquée au manifeste quand elle est
 //! entièrement traitée **sans erreur transitoire** (téléchargement échoué).
 //! Les états durables côté source ne bloquent pas le marquage : orphelins
 //! (parente hors stock — avant ~1990 le CE en base est clairsemé), fiches
-//! vides et hits sans numéro (`vides`) — ils seraient identiques au re-run.
+//! vides et hits sans numéro (`vides`).
 //!
 //! Un orphelin dont le hit porte un n° `AW_DCE` n'est pas abandonné : le
-//! document intégral ArianeWeb devient la décision elle-même (ADR 0219),
-//! rang 0 — auto-cicatrisation du trou de versement CE → DILA.
+//! document intégral ArianeWeb devient la décision elle-même, rang 0.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -46,13 +44,12 @@ use super::batch::drain_batch;
 use super::embed::build_embedder_opt;
 use super::{content_checksum, generate_public_id, Candidate, IngestCounts, IngestMode};
 
-/// Première année sondée par défaut : le fond AJCE descend à 1976 (audit
-/// ADR 0095) — une marge basse, chaque année vide coûte une requête.
+/// Première année sondée par défaut : le fond AJCE descend à 1976 — une marge
+/// basse, chaque année vide coûte une requête.
 const FIRST_YEAR: u16 = 1960;
 
 /// Threads de crawl concurrents. Avec [`ariane::THROTTLE`] respecté par
-/// worker, le débit reste plafonné à ~8 req/s vers un site public — courtois,
-/// mais ~4× le crawl séquentiel (une année AJCE fraîche : ~10 min au lieu de ~35).
+/// worker, le débit reste plafonné vers un site public.
 const CRAWL_WORKERS: usize = 4;
 
 /// Bundle en construction pour une décision (clé : dossier principal + date).
@@ -67,7 +64,7 @@ struct Bundle {
     /// checksum stable quel que soit l'ordre d'énumération.
     analyses: Vec<(u32, AjceEntry)>,
     has_crp: bool,
-    /// N° `AW_DCE` de la décision parente (récupération ADR 0219) — premier
+    /// N° `AW_DCE` de la décision parente — premier
     /// hit qui en porte un fait foi.
     dce: Option<u32>,
 }
@@ -127,7 +124,7 @@ pub async fn sync_ariane(years: Vec<u16>, limit: Option<usize>) -> Result<()> {
     let mut totals = Stats::default();
     let mut budget = limit;
     // Orphelins dont le hit porte un n° AW_DCE : récupérés en fin de run
-    // (décision créée depuis le document intégral, ADR 0219).
+    // (décision créée depuis le document intégral).
     let mut recoverable: Vec<((String, String), Bundle)> = Vec::new();
 
     for year in years {
@@ -204,10 +201,7 @@ pub async fn sync_ariane(years: Vec<u16>, limit: Option<usize>) -> Result<()> {
 
         // Année marquée quand elle est entièrement traitée sans erreur
         // transitoire. Les états durables (`orphans`, `vides`) ne bloquent
-        // pas : identiques au re-run, ils condamneraient l'année à être
-        // re-balayée à chaque fill. Le raccrochage des orphelins passera par
-        // une purge du manifeste quand un fond CE profond arrivera (le cache
-        // HTML rend ce rejeu quasi gratuit).
+        // pas : identiques au re-run.
         if !exhausted && stats.erreurs == 0 {
             manifest.insert(year.to_string(), stats.analyses + stats.conclusions);
             write_manifest(&dir, &manifest)?;
@@ -335,9 +329,9 @@ fn fetch_hit(client: &reqwest::blocking::Client, dir: &Path, hit: &ArianeHit) ->
     };
     let parsed = parse_ajce_html(&html);
     let body = analyse_body(&parsed);
-    // Fiche « classement seul » (rubriques PCJA sans sommaire rédigé, fréquent
-    // 1986-1995) : le classement vaut d'être servi, l'entrée part avec un corps
-    // vide. Seule une fiche sans rien est un vrai vide.
+    // Fiche « classement seul » (rubriques PCJA sans sommaire rédigé) : le
+    // classement vaut d'être servi, l'entrée part avec un corps vide. Seule une
+    // fiche sans rien est un vrai vide.
     if body.is_empty() && parsed.rubriques.is_empty() {
         tracing::warn!(num, "analyse AJCE sans contenu, skippée");
         return HitFetch::Vide;
@@ -433,8 +427,7 @@ where
 
 /// Clé de groupage et de pivot d'un hit : (n° de dossier principal, date de
 /// lecture ISO) — la clé naturelle de la décision côté source. L'id interne
-/// `AW_DCE` ne pivote pas : absent des documents pré-1968 et qualifié
-/// d'instable/opaque par l'audit (ADR 0204, addendum).
+/// `AW_DCE` ne pivote pas : absent des documents pré-1968.
 fn bundle_key(hit: &ArianeHit) -> Option<(String, String)> {
     let dossier = hit.dossiers().first().cloned()?;
     let date = hit.date_iso()?.to_string();
@@ -503,7 +496,7 @@ fn enumerate(
     }
     if out.len() != total_count as usize {
         // Pagination serveur instable (tri sans requête) : signaler,
-        // ne pas masquer (pas de plafond silencieux).
+        // ne pas masquer.
         tracing::warn!(
             fond = fond.as_str(),
             year,
@@ -515,15 +508,14 @@ fn enumerate(
     Ok(out)
 }
 
-/// Récupération DCE (ADR 0219) : les bundles orphelins dont le hit xsearch
-/// porte un n° `AW_DCE` deviennent des décisions (source `ariane-web`, rang 0 —
-/// le texte cède à toute source officielle future, promotion ADR 0105), puis
-/// leurs bundles sont rattachés dans le même run.
+/// Récupération DCE : les bundles orphelins dont le hit xsearch porte un n°
+/// `AW_DCE` deviennent des décisions (source `ariane-web`, rang 0 — le texte
+/// cède à toute source officielle future), puis leurs bundles sont rattachés
+/// dans le même run.
 ///
 /// Avant de créer, l'ECLI du document DCE arbitre : si (numéro, date ECLI)
 /// pointe sur une décision du stock, l'orphelin est un **lien raté** (date de
-/// fiche erronée, zéros de tête) — on rattache, on ne crée pas. Mesure du
-/// 12/07/2026 : 20 liens ratés sur 96 orphelins à DCE.
+/// fiche erronée, zéros de tête) — on rattache, on ne crée pas.
 ///
 /// Idempotent : re-jouable, skip par checksum. Retourne (créées, rattachées,
 /// restées orphelines).
@@ -660,8 +652,7 @@ async fn recover_dce_orphans(
                     dila_fond: None,
                     // Forme payload-Judilibre minimale : le chemin linéaire
                     // (`Decision::from_source_fields_json`) reconstruit la
-                    // décision canonique depuis ces clés — la struct `decision`
-                    // ci-dessus ne sert qu'aux garde-fous amont.
+                    // décision canonique depuis ces clés.
                     prebuilt_source_fields: Some(serde_json::json!({
                         "jurisdiction": "ce",
                         "decision_date": true_date,
@@ -763,7 +754,7 @@ fn write_manifest(dir: &Path, manifest: &HashMap<String, usize>) -> Result<()> {
 mod tests {
     use super::{ecli_num_date, norm_dossier};
 
-    // Clés de rattachement : cas réels des liens ratés du 12/07/2026
+    // Clés de rattachement : cas réels de liens ratés
     // (99137 ArianeWeb vs 099137 JADE ; date de fiche 09/06 vs ECLI 23/06).
     #[test]
     fn norm_dossier_zeros_de_tete() {

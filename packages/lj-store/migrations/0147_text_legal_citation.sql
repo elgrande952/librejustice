@@ -1,4 +1,4 @@
--- ADR 0217 — renvois hyperliés dans les corps de normes : l'arête
+-- Renvois hyperliés dans les corps de normes : l'arête
 -- norme→article au grain span, jumelle de legal_citation (0097) côté cible
 -- et de text_case_citation (0136) côté émetteur. Émetteur = version
 -- d'article (owner_text_uid, owner_num_key, owner_date_debut) ou, si les

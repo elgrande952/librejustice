@@ -22,7 +22,7 @@ pub fn code_canonical_url(code: &str) -> String {
 /// intitulé / fil d'Ariane à défaut de texte), tronqué sur une frontière de mot.
 pub fn article_meta_description(article: &LawArticleResponse, title: &str) -> String {
     // Article modificatif : le `texte` est le résumé de liens brut (illisible en
-    // snippet SERP). On résume proprement depuis `modifications` (ADR 0173).
+    // snippet SERP). On résume proprement depuis `modifications`.
     if !article.modifications.is_empty() {
         return truncate_at_word(&modifying_description(article, title), META_DESCRIPTION_MAX);
     }
@@ -108,7 +108,7 @@ pub fn build_article_json_ld(
     use serde_json::{json, Map, Value};
 
     // URL sur la clé canonique (`numKey`), cohérente avec le `<link rel=canonical>`
-    // et résolue en lookup exact côté serve (ADR 0123 §2).
+    // et résolue en lookup exact côté serve.
     let url = article_canonical_url(&article.code, &article.num_key);
     let mut node = Map::new();
     node.insert("@type".into(), json!("Legislation"));
@@ -126,7 +126,7 @@ pub fn build_article_json_ld(
     }
     node.insert("dateModified".into(), json!(article.date_debut.clone()));
     node.insert("legislationDate".into(), json!(article.date_debut.clone()));
-    // `sameAs` = lien source canonique (ADR 0131) : Légifrance pour le natif, page du
+    // `sameAs` = lien source canonique : Légifrance pour le natif, page du
     // diffuseur pour le curé. Omis si aucune source n'est connue.
     if let Some(url) = &article.source_url {
         node.insert("sameAs".into(), json!(url.clone()));

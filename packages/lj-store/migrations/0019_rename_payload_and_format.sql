@@ -1,6 +1,6 @@
 -- Migration 0019 — Renomme decision_full_text.xml_gzip → source_payload_gzip
 -- et ajoute payload_format ('xml'|'json') pour distinguer XML opendata et JSON
--- Judilibre. Cf. ADR 0031.
+-- Judilibre.
 
 ALTER TABLE decision_full_text RENAME COLUMN xml_gzip TO source_payload_gzip;
 

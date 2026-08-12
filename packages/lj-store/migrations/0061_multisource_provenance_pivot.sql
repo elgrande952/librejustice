@@ -1,7 +1,7 @@
--- Migration 0061 — Pivot de provenance & identité canonique (ADR 0098), passe
+-- Migration 0061 — Pivot de provenance & identité canonique, passe
 -- ADDITIVE uniquement.
 --
--- Finalise la frontière de l'ADR 0098 §2 : `decision_sources` devient le pivot
+-- Finalise la frontière : `decision_sources` devient le pivot
 -- complet de provenance, `decisions` devient le canonique pur. Cette migration
 -- ne fait QUE les ajouts (no-op déployable seule, avant tout backfill) :
 --
@@ -13,14 +13,14 @@
 --     pour le filtre recherche, ré-ajouté — il avait été droppé en 0026 ; §2).
 --
 -- Le BACKFILL (portage des provenances + calcul `identity_key` + fusion
--- rétroactive des doublons, ADR 0098 §7) se fait HORS-MIGRATION via
+-- rétroactive des doublons) se fait HORS-MIGRATION via
 -- `lj-ingest dedup-backfill` (batché par keyset, repris), pour ne pas tenir une
 -- transaction longue sur ~3M lignes (base low-IOPS).
 --
 -- Le DROP des colonnes mono-source de `decisions` (`source_uid`,
 -- `content_checksum`, `source_fields`) + `decision_links` + `decisions
 -- .links_version` est différé à une migration ULTÉRIEURE, une fois les lecteurs
--- portés sur `decision_sources.source_uid` (ADR 0098 Conséquences, ordre staged).
+-- portés sur `decision_sources.source_uid` (ordre staged).
 
 -- ── decision_sources : pivot complet ───────────────────────────────────────
 ALTER TABLE decision_sources

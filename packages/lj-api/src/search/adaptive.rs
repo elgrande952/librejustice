@@ -35,9 +35,9 @@ async fn fetch_chunk_embeddings(
 }
 
 /// Embedding représentatif (chunk d'index minimal) de chaque décision, par
-/// `decision_id`. La jambe BM25 est désormais au grain décision (ADR 0084) sans
-/// chunk associé : on prend le 1er chunk comme proxy du document pour la
-/// géométrie des signaux (93,5 % des décisions sont mono-chunk → proxy exact).
+/// `decision_id`. La jambe BM25 est au grain décision, sans chunk associé : on
+/// prend le 1er chunk comme proxy du document pour la géométrie des signaux (la
+/// grande majorité des décisions est mono-chunk, où le proxy est exact).
 async fn fetch_decision_repr_embeddings(
     conn: &Client,
     decision_ids: &[i64],

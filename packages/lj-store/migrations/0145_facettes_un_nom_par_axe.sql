@@ -1,4 +1,4 @@
--- Migration 0145 — un nom par facette sur toutes les couches (ADR 0213).
+-- Migration 0145 — un nom par facette sur toutes les couches.
 --
 -- Renomme les namespaces d'uid de `facet_value` sur le nom de l'axe côté
 -- contrat (juridiction → jurisdiction_type, domaine → legal_domain,
@@ -7,7 +7,7 @@
 -- `chambre_uid` → `chamber_uid`, `voie_uid` → `procedure_uid`. Replie les
 -- clés des filtres d'historique sur le contrat renommé.
 --
--- ⚠️ `decisions_bm25` est déposé avant la réécriture de masse : les colonnes
+-- `decisions_bm25` est déposé avant la réécriture de masse : les colonnes
 -- réécrites ne sont pas dans l'index, mais chaque UPDATE non-HOT ré-indexerait
 -- la ligne entière (full_text retokenisé par Tantivy) — au volume d'un
 -- rebuild, en plus du bloat. Rebuild propre en fin de transaction, même

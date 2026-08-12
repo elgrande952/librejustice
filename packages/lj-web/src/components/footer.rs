@@ -1,5 +1,3 @@
-//! Pied de page. Port verbatim de `components/layout/footer.tsx`.
-
 use leptos::prelude::*;
 
 #[component]

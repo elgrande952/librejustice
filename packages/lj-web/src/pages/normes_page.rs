@@ -1,8 +1,9 @@
-//! Hubs du catalogue des normes (ADR 0255) — l'arborescence navigable vers
+//! Hubs du catalogue des normes — l'arborescence navigable vers
 //! les textes : `/normes` (catalogue par fond) → `/normes/{fond}` (années)
 //! → `/normes/{fond}/{annee}?page=N` (liste paginée de liens `/texte/{slug}` ;
 //! `annee` = année ou `sans-date`). Pages SSR crawlables. Le fond `codes`
-//! renvoie vers le catalogue `/codes` existant.
+//! a son propre catalogue `/normes/codes` (sommaire par code, pas un hub
+//! année — `CodeCataloguePage`).
 
 use leptos::either::Either;
 use leptos::prelude::*;
@@ -12,6 +13,7 @@ use leptos_router::hooks::{use_params_map, use_query_map};
 use lj_dtos::{NormCatalogueResponse, NormFondResponse, NormYearResponse};
 
 use crate::api::ApiClient;
+use crate::components::own_page_description;
 use crate::pages::juridictions_page::{
     breadcrumb_jsonld, fmt_count, set_cache_control, HubBreadcrumb, HubError, HubSkeleton,
     YearPagination,
@@ -43,6 +45,10 @@ fn year_token(year: Option<i32>) -> String {
 
 #[component]
 pub fn NormesPage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) :
+    // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
+    own_page_description();
+
     let catalogue = Resource::new_blocking(
         || (),
         |_| {
@@ -108,13 +114,7 @@ fn NormesLoaded(response: NormCatalogueResponse) -> impl IntoView {
                     .fonds
                     .into_iter()
                     .map(|f| {
-                        // Le fond `codes` a son propre catalogue navigable (sommaire
-                        // par code), pas un hub année.
-                        let href = if f.fond == "codes" {
-                            "/codes".to_string()
-                        } else {
-                            format!("/normes/{}", f.fond)
-                        };
+                        let href = format!("/normes/{}", f.fond);
                         let count = format!(
                             "{} texte{}",
                             fmt_count(f.text_count),
@@ -148,6 +148,10 @@ fn NormesLoaded(response: NormCatalogueResponse) -> impl IntoView {
 
 #[component]
 pub fn NormFondPage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) :
+    // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
+    own_page_description();
+
     let params = use_params_map();
     let hub = Resource::new_blocking(
         move || params.get().get("fond").unwrap_or_default(),
@@ -265,6 +269,10 @@ fn NormFondLoaded(hub: NormFondResponse) -> impl IntoView {
 
 #[component]
 pub fn NormYearPage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) :
+    // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
+    own_page_description();
+
     let params = use_params_map();
     let query = use_query_map();
     let page_data = Resource::new_blocking(

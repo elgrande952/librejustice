@@ -1,4 +1,4 @@
--- Rôles des textes publiés + fusion de doublons (ADR 0246).
+-- Rôles des textes publiés + fusion de doublons.
 -- `role` : rôle primaire dérivé (backfill rejouable `backfill-text-roles`).
 -- `alias_of` : manifestation redondante d'un instrument canonique — la
 -- recherche l'exclut, la page redirige, l'uid reste résolvable.

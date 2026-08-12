@@ -1,6 +1,6 @@
-//! `FilterDropdown` — coquille générique des dropdowns de la barre de filtres
-//! (gabarit de référence §9.1) : bouton `Libellé ▾` + panneau flottant multi-
-//! sélection (pas de fermeture au choix, contrairement à `DropdownSelect`).
+//! `FilterDropdown` — coquille générique des dropdowns de la barre de filtres :
+//! bouton `Libellé ▾` + panneau flottant multi-sélection (pas de fermeture au
+//! choix).
 //!
 //! Panneau en `position: fixed` (coordonnées mesurées à l'ouverture) : il
 //! échappe à l'`overflow-x-auto` de la barre, qui rognerait un panneau
@@ -18,13 +18,14 @@ use crate::helpers::cn;
 /// Id du dropdown ouvert dans la barre (`None` = aucun). Fourni par la barre de
 /// filtres ; chaque `FilterDropdown` s'y compare par son `id`.
 #[derive(Clone, Copy)]
-pub struct OpenDropdown(pub RwSignal<Option<&'static str>>);
+pub struct OpenDropdown(pub RwSignal<Option<String>>);
 
 #[component]
 pub fn FilterDropdown(
     /// Identifiant unique dans la barre (clé du contexte « un seul ouvert »).
-    id: &'static str,
-    label: &'static str,
+    #[prop(into)]
+    id: String,
+    #[prop(into)] label: String,
     /// Nombre de sélections actives : badge + style accent sur le bouton.
     #[prop(into)]
     active_count: Signal<usize>,
@@ -33,10 +34,15 @@ pub fn FilterDropdown(
     let open_id = use_context::<OpenDropdown>()
         .map(|c| c.0)
         .unwrap_or_else(|| RwSignal::new(None));
-    let is_open = Signal::derive(move || open_id.get() == Some(id));
+    // `id` est possédé (les axes du pot Annonces sont déclarés par le serveur,
+    // pas des littéraux) : on le stocke pour que les clôtures le comparent sans
+    // le déplacer.
+    let id = StoredValue::new(id);
+    let is_open =
+        Signal::derive(move || id.with_value(|id| open_id.get().as_deref() == Some(id.as_str())));
     // Lazy-mount : le contenu (arbres à centaines de lignes) n'est construit
-    // qu'à la première ouverture, puis gardé monté (le panneau se masque par
-    // `<Show>` mais l'état interne — saisie, déplis — vit dans les enfants).
+    // qu'à la première ouverture, puis gardé monté — l'état interne (saisie,
+    // déplis) vit dans les enfants et doit survivre à une fermeture.
     let has_opened = RwSignal::new(false);
 
     let container_ref = NodeRef::<leptos::html::Div>::new();
@@ -111,7 +117,7 @@ pub fn FilterDropdown(
             coords.set(Some((top, left, max_h)));
         }
         has_opened.set(true);
-        open_id.set(Some(id));
+        open_id.set(Some(id.get_value()));
     };
 
     let button_class = move || {
@@ -125,20 +131,17 @@ pub fn FilterDropdown(
         ])
     };
 
-    // Masquage par `display:none` inline (pas une classe `hidden` : elle
-    // perdrait la spécificité contre `flex` du même attribut).
+    // Masquage par `.lj-panel` (visibility), pas `display:none` : le panneau
+    // reste dans le flux de rendu, donc sa fermeture s'anime.
     let panel_style = move || {
-        let base = coords
+        coords
             .get()
             .map(|(top, left, max_h)| {
                 format!("position:fixed; top:{top}px; left:{left}px; max-height:{max_h}px;")
             })
-            .unwrap_or_default();
-        if is_open.get() {
-            base
-        } else {
-            format!("{base} display:none;")
-        }
+            // Avant toute mesure (SSR, première frame) : hors du flux, pour ne
+            // pas élargir le conteneur `inline-flex` de la barre.
+            .unwrap_or_else(|| "position:fixed; top:0; left:0;".to_string())
     };
 
     let children = StoredValue::new(children);
@@ -178,18 +181,17 @@ pub fn FilterDropdown(
                     />
                 </svg>
             </button>
-            <Show when=move || has_opened.get()>
-                // `overflow-hidden` + flex-col : le panneau est capé par la
-                // max-height mesurée, la zone scrollable vit dans les enfants
-                // (`min-h-0 flex-1 overflow-y-auto`) — le header (recherche
-                // intra-facette) reste fixe au-dessus.
-                <div
-                    style=panel_style
-                    class="z-50 flex w-80 flex-col overflow-hidden rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] p-3 shadow-lg"
-                >
-                    {children.with_value(|c| c())}
-                </div>
-            </Show>
+            // `overflow-hidden` + flex-col : le panneau est capé par la
+            // max-height mesurée, la zone scrollable vit dans les enfants
+            // (`min-h-0 flex-1 overflow-y-auto`) — le header (recherche
+            // intra-facette) reste fixe au-dessus.
+            <div
+                style=panel_style
+                data-open=move || is_open.get().then_some("true")
+                class="lj-panel z-50 flex w-80 flex-col overflow-hidden rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] p-3 shadow-lg"
+            >
+                <Show when=move || has_opened.get()>{children.with_value(|c| c())}</Show>
+            </div>
         </div>
     }
 }

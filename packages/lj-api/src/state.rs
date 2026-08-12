@@ -1,10 +1,6 @@
-//! État partagé axum (pool DB, settings, client Mistral du lazy-fill summary).
-//!
-//! Parité avec le lifespan FastAPI (`main.create_app`) : les ressources
-//! coûteuses (pool psycopg, client Mistral) sont construites **une fois** au
-//! démarrage et partagées pour toute la durée du process — jamais ré-init par
-//! requête. `AppState` est `Clone` (tous les champs sont `Arc`/`Pool`, donc le
-//! clone est un partage de handles, pas une copie profonde).
+//! État partagé axum : pool DB, settings, caches in-process, client Mistral.
+//! Les ressources coûteuses sont construites une fois au démarrage ; `AppState`
+//! est `Clone`, tous ses champs étant des handles partagés.
 
 use crate::config::Settings;
 use crate::embedder::build_query_embedder;
@@ -18,50 +14,29 @@ use moka::future::Cache;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Plafond **mémoire** du cache résultats (octets) : 150 Mio des 200 Mio totaux
-/// du process (l'embedding cache prend les 50 Mio restants, cf. `lj-llm`).
+/// Plafond mémoire du cache résultats, en octets.
 const SEARCH_CACHE_MAX_BYTES: u64 = 150 * 1024 * 1024;
-/// Overhead moka par entrée (nœud de la map + bookkeeping TinyLFU), ajouté au
-/// poids pesé pour que le plafond couvre la mémoire réelle, pas que le payload.
+/// Overhead moka par entrée, ajouté au poids pesé.
 const ENTRY_OVERHEAD: usize = 128;
-/// Plafond du cache rerank en NOMBRE d'entrées (chaque ordre LLM ≤ 50 `i64`,
-/// ~0,4 Kio + clé) : 50 000 entrées ≈ quelques dizaines de Mio, négligeable
-/// devant les 150 Mio du `search_cache`. L'éviction primaire reste le TTL 1 h.
+/// Plafond du cache rerank, en nombre d'entrées.
 const RERANK_CACHE_MAX_ENTRIES: u64 = 50_000;
+/// Plafond du cache de notes de rerank : une entrée par (query, document).
+const RERANK_SCORES_CACHE_MAX_ENTRIES: u64 = 100_000;
 
-/// Plafond du cache registre en nombre d'entrées : ~187 k entités à
-/// contentieux, mais seules les fiches visitées dans la fenêtre de 24 h
-/// comptent — 20 000 entrées × quelques Ko ≈ dizaines de Mio au pire.
+/// Plafond du cache des pages d'annonces, en nombre d'entrées.
+const ANNONCES_CACHE_MAX_ENTRIES: u64 = 2_000;
+
+/// Plafond du cache registre, en nombre d'entrées.
 const REGISTRE_CACHE_MAX_ENTRIES: u64 = 20_000;
 
-/// Pic de connexions DB qu'une recherche tient simultanément :
-/// `retrieve_hybrid` garde 3 conns (bm25 + ann + title, en `try_join` parallèle)
-/// puis les relâche AVANT `compute_adaptive_weights`, qui en reprend 2 en
-/// parallèle (embeddings ANN + repr décision). `rank_results` en tient 2
-/// (facettes + meta de `hydrate_all`), `paginate` 1. Pic = 3 (les jambes),
-/// irréductible sans sérialiser le `try_join`. Sémaphore = pool_max / 3
-/// (32 → 10) ; 10 × 3 = 30 ≤ pool, 2 conns de marge.
+/// Plafond du cache d'identité de texte, en nombre d'entrées.
+const TEXT_REF_CACHE_MAX_ENTRIES: u64 = 50_000;
+
+/// Pic de connexions DB qu'une recherche tient simultanément (les trois jambes
+/// de `retrieve_hybrid`). [`AppState::search_permits`] en dérive.
 const PEAK_CONNS_PER_SEARCH: usize = 3;
 
 /// État applicatif injecté dans les handlers (`State<AppState>`).
-///
-/// Champs portés depuis `app.state` (Python) :
-/// - `settings` / `pool` : configuration + pool DB partagés ;
-/// - `embedder` : embedder de requête construit **une fois** au démarrage et
-///   partagé (parité lifespan Python). Crucial pour le mode `auto`, dont le
-///   disjoncteur `degraded` (vLLM↔Cloudflare, ADR 0221) doit persister entre
-///   requêtes ;
-/// - `embedding_cache` : cache in-process des vecteurs de requête (`moka`, TTL
-///   7 j), parité du cache embeddings Redis Python ;
-/// - `search_cache` : cache in-process du bundle retrieval par recherche (`moka`,
-///   TTL 1 h, aligné sur le cache CDN `/search`). Évite de rejouer récupération +
-///   RRF + facettes + hydratation sur les pages 2+, les requêtes répétées ET les
-///   deux modes IA (clé ai_mode-indépendante) ; la clé exclut aussi
-///   `offset`/`limit`/`sort` (cf. `ranked_cache_key`) ;
-/// - `rerank_cache` : cache in-process de l'ordre LLM du top-50 (`moka`, TTL 1 h),
-///   keyé `(query, top-ids)`. Économise le quota Mistral : un toggle IA on↔off (ou
-///   un bundle reconstruit au même shortlist) sert l'ordre caché sans rappeler le
-///   reranker (cf. `search::reranked_order`).
 #[derive(Clone)]
 pub struct AppState {
     pub settings: Arc<Settings>,
@@ -70,55 +45,60 @@ pub struct AppState {
     pub embedding_cache: EmbeddingCache,
     pub search_cache: Cache<String, Arc<RankedResults>>,
     pub rerank_cache: Cache<String, Arc<Vec<i64>>>,
-    /// Cache mono-entrée du référentiel de facettes (`facet_value` +
-    /// `jurisdiction`, ADR 0146), TTL 1 h : labels résolus en mémoire, la DB
-    /// n'est relue qu'à l'expiration. Accès via `referential::referential`.
+    /// Notes de rerank par `(query, decision_id)`. Elles survivent au changement de
+    /// shortlist, là où l'ordre du `rerank_cache` ne survit pas.
+    pub rerank_scores_cache: Cache<(Arc<str>, i64), crate::rerank::DocScores>,
+    /// Budget de recherche par appelant, décrémenté sur MISS du `search_cache`.
+    /// En mode compteur tant que `settings.search_budget_enforce` est faux.
+    pub search_budget: crate::ratelimit::Budget,
+    /// Budget de rerank par appelant, décrémenté sur MISS du `rerank_cache`. Le
+    /// dépassement rend l'ordre RRF, jamais une erreur.
+    pub rerank_budget: crate::ratelimit::Budget,
+    /// Budget des sondes d'hydratation (`/api/client/hydration-failure`), non
+    /// authentifiées.
+    pub hydration_budget: crate::ratelimit::Budget,
+    /// Cache mono-entrée du référentiel de facettes. Accès via
+    /// `referential::referential`.
     pub referential_cache: Cache<(), Arc<Referential>>,
-    /// Cache mono-entrée des compteurs corpus de la page d'accueil
-    /// (`corpus-stats`), TTL 12 h : les chiffres (comptes exacts) ne bougent qu'à
-    /// l'ingest quotidien, donc un recalcul 2×/jour suffit. Accès via
+    /// Cache mono-entrée des compteurs corpus de la page d'accueil. Accès via
     /// `stats::corpus_stats`.
     pub corpus_stats_cache: Cache<(), Arc<CorpusStatsResponse>>,
-    /// Cache mono-entrée du catalogue des juridictions (`/api/juridictions`,
-    /// ADR 0253), TTL 12 h : l'agrégat compte 3,7 M de lignes, jamais par
-    /// requête. Accès via `jurisdiction_hubs::catalogue`.
+    /// Cache mono-entrée du catalogue des juridictions. Accès via
+    /// `jurisdiction_hubs::catalogue`.
     pub jurisdiction_catalogue_cache: Cache<(), Arc<lj_dtos::JurisdictionCatalogueResponse>>,
-    /// Cache mono-entrée du catalogue des normes (`/api/normes`, ADR 0255),
-    /// TTL 12 h : l'agrégat compte 1 M de lignes, jamais par requête. Accès
-    /// via `norm_hubs::catalogue`.
+    /// Cache mono-entrée du catalogue des normes. Accès via `norm_hubs::catalogue`.
     pub norm_catalogue_cache: Cache<(), Arc<lj_dtos::NormCatalogueResponse>>,
-    /// Borne le nombre de recherches qui tapent la DB en même temps à
-    /// `pool_max / PEAK_CONNS_PER_SEARCH`. Garantit que toute recherche admise
-    /// peut acquérir TOUTES ses connexions (admises × pic ≤ pool) : le
-    /// hold-and-wait ne peut plus former de cycle → pas de deadlock du pool, tout
-    /// en gardant le `try_join` parallèle intra-recherche. Au-delà, les recherches
-    /// excédentaires attendent un permit (backpressure) au lieu de figer le pool.
+    /// Cache des pages de `/annonces`, clé = filtre sérialisé. Accès via
+    /// `annonces::search`.
+    pub annonces_cache: Cache<String, Arc<lj_dtos::AnnonceSearchResponse>>,
+    /// Cache mono-entrée du catalogue des annonces.
+    pub annonces_catalogue_cache: Cache<(), Arc<lj_dtos::AnnonceCatalogueResponse>>,
+    /// Borne les recherches qui tapent la DB en même temps à
+    /// `pool_max / PEAK_CONNS_PER_SEARCH`, pour que toute recherche admise puisse
+    /// acquérir toutes ses connexions. Au-delà, les excédentaires attendent un permit.
     pub search_permits: Arc<tokio::sync::Semaphore>,
-    /// Cache in-process du volet registre des fiches entité (`moka`, TTL 24 h,
-    /// donnée quasi statique) : une entrée par uid, remplie par les APIs
-    /// publiques (ADR 0199). Accès via `registre::entity_registre`.
+    /// Cache du volet registre des fiches entité, une entrée par uid. Accès via
+    /// `registre::entity_registre`.
     pub registre_cache: Cache<String, Arc<lj_dtos::EntityRegistreResponse>>,
-    /// Cache mono-entrée du FST d'autocomplétion (blob `suggest_index`,
-    /// ADR 0216), TTL 24 h — l'index est reconstruit hors ligne, au mieux
-    /// quotidiennement. Accès via `routes::suggest_index`.
+    /// Cache mono-entrée du FST d'autocomplétion. Accès via `routes::suggest_index`.
     pub suggest_cache: Cache<(), Arc<crate::search::suggest::SuggestIndex>>,
-    /// Client HTTP partagé des appels registre (recherche-entreprises,
-    /// Opendatasoft DILA) — timeout court, la fiche dégrade sans bloquer.
+    /// Cache de la résolution `slug` → identité de texte. L'entrée `None` est cachée
+    /// aussi. Accès via `legi::resolve_text`.
+    pub text_ref_cache: Cache<String, Option<Arc<crate::legi::TextRef>>>,
+    /// Cache de la fraîcheur d'ingest par source. Accès via `legi::ingest_freshness`.
+    pub ingest_freshness_cache: Cache<String, Option<chrono::NaiveDate>>,
+    /// Client HTTP partagé des appels registre.
     pub registre_http: reqwest::Client,
+    /// Client Mistral du rerank listwise. `None` si le pool de clés est vide.
+    pub mistral: Option<Arc<lj_llm::mistral::MistralClient>>,
 }
 
 impl AppState {
-    /// Construit l'état applicatif au démarrage (parité lifespan FastAPI).
+    /// Construit l'état applicatif au démarrage.
     pub fn build(settings: Arc<Settings>, pool: Pool) -> Self {
-        // Embedder construit une fois (parité lifespan Python). `panic!` au boot
-        // sur config invalide (creds manquantes) — voir `build_query_embedder`.
         let embedder = Arc::new(build_query_embedder(&settings));
-        // Cache résultats : plafond MÉMOIRE (octets), pas un nombre d'entrées. Le
-        // `weigher` pèse chaque liste rankée (clé + payload `approx_weight` +
-        // overhead moka) ; moka évince (LRU/TTL) pour rester sous 150 Mio. TTL
-        // 1 h (aligné sur le cache CDN `/search`) : le corpus ne bouge qu'une
-        // fois/jour (ingest cron 3 h), donc 1 h ne sert jamais de périmé ; la
-        // pression mémoire reste l'éviction primaire.
+        let settings_search_budget = settings.search_budget_per_min;
+        let settings_rerank_budget = settings.rerank_budget_per_min;
         let search_cache = Cache::builder()
             .weigher(|k: &String, v: &Arc<RankedResults>| {
                 (k.len() + v.approx_weight() as usize + ENTRY_OVERHEAD).min(u32::MAX as usize)
@@ -127,39 +107,38 @@ impl AppState {
             .max_capacity(SEARCH_CACHE_MAX_BYTES)
             .time_to_live(Duration::from_secs(3600))
             .build();
-        // Cache rerank : l'ordre LLM est minuscule (≤50 `i64`) → plafond par
-        // NOMBRE d'entrées, pas en octets. TTL 1 h (aligné search_cache) : sur la
-        // fenêtre, un toggle IA on↔off ne consomme le quota Mistral qu'une fois.
         let rerank_cache = Cache::builder()
             .max_capacity(RERANK_CACHE_MAX_ENTRIES)
             .time_to_live(Duration::from_secs(3600))
             .build();
-        // Référentiel de facettes : une seule entrée (clé `()`), rechargée de la
-        // DB toutes les heures. Quelques centaines de lignes → poids négligeable.
+        let rerank_scores_cache = Cache::builder()
+            .max_capacity(RERANK_SCORES_CACHE_MAX_ENTRIES)
+            .time_to_live(Duration::from_secs(24 * 3600))
+            .build();
         let referential_cache = Cache::builder()
             .max_capacity(1)
             .time_to_live(Duration::from_secs(3600))
             .build();
-        // Compteurs corpus (page d'accueil) : une seule entrée (clé `()`), TTL 12 h.
-        // Le corpus ne grossit qu'à l'ingest quotidien → un recalcul (comptes exacts
-        // décisions + catalogue codes) deux fois/jour suffit, jamais par requête.
         let corpus_stats_cache = Cache::builder()
             .max_capacity(1)
             .time_to_live(Duration::from_secs(12 * 3600))
             .build();
-        // Catalogue des juridictions (ADR 0253) : même profil que les
-        // compteurs corpus — agrégat lourd, corpus mû par l'ingest quotidien.
         let jurisdiction_catalogue_cache = Cache::builder()
             .max_capacity(1)
             .time_to_live(Duration::from_secs(12 * 3600))
             .build();
-        // Catalogue des normes (ADR 0255) : même profil.
         let norm_catalogue_cache = Cache::builder()
             .max_capacity(1)
             .time_to_live(Duration::from_secs(12 * 3600))
             .build();
-        // Au moins 1 permit même si pool_max < PEAK (config exotique) : la
-        // recherche reste possible, juste sérialisée.
+        let annonces_cache = Cache::builder()
+            .max_capacity(ANNONCES_CACHE_MAX_ENTRIES)
+            .time_to_live(Duration::from_secs(15 * 60))
+            .build();
+        let annonces_catalogue_cache = Cache::builder()
+            .max_capacity(1)
+            .time_to_live(Duration::from_secs(3600))
+            .build();
         let search_permits = Arc::new(tokio::sync::Semaphore::new(
             (settings.pool_max / PEAK_CONNS_PER_SEARCH).max(1),
         ));
@@ -176,11 +155,40 @@ impl AppState {
             .max_capacity(1)
             .time_to_live(Duration::from_secs(24 * 3600))
             .build();
+        // Identité de texte par slug : plafond par nombre d'entrées (payload
+        // minuscule), TTL 1 h comme le référentiel de facettes — un texte
+        // nouvellement ingéré devient adressable dans l'heure.
+        let text_ref_cache = Cache::builder()
+            .max_capacity(TEXT_REF_CACHE_MAX_ENTRIES)
+            .time_to_live(Duration::from_secs(3600))
+            .build();
+        // Fraîcheur d'ingest : une entrée par source (poignée de valeurs),
+        // rafraîchie dans l'heure suivant le cron quotidien.
+        let ingest_freshness_cache = Cache::builder()
+            .max_capacity(64)
+            .time_to_live(Duration::from_secs(3600))
+            .build();
         let registre_http = reqwest::Client::builder()
             .timeout(crate::registre::UPSTREAM_TIMEOUT)
             .user_agent("librejustice.fr")
             .build()
             .expect("client HTTP registre");
+        // Client Mistral construit sur le pool ENTIER : les clés désactivées en
+        // base lui sont signalées à chaque rerank (`set_dead_fingerprints`), ce
+        // qui laisse une clé renouvelée revenir sans redémarrer le serveur.
+        let mistral = (!settings.mistral_api_keys.is_empty())
+            .then(|| {
+                lj_llm::mistral::MistralClient::new(
+                    settings.mistral_api_keys.clone(),
+                    settings.mistral_model.clone(),
+                )
+                .map(Arc::new)
+                .inspect_err(
+                    |err| tracing::warn!(error = %err, "client Mistral — rerank désactivé"),
+                )
+                .ok()
+            })
+            .flatten();
         Self {
             settings,
             pool,
@@ -188,14 +196,26 @@ impl AppState {
             embedding_cache: EmbeddingCache::default(),
             search_cache,
             rerank_cache,
+            rerank_scores_cache,
+            search_budget: crate::ratelimit::Budget::new("search", settings_search_budget),
+            rerank_budget: crate::ratelimit::Budget::new("rerank", settings_rerank_budget),
+            hydration_budget: crate::ratelimit::Budget::new(
+                "hydration",
+                crate::ratelimit::HYDRATION_PROBES_PER_MIN,
+            ),
             referential_cache,
             corpus_stats_cache,
             jurisdiction_catalogue_cache,
             norm_catalogue_cache,
+            annonces_cache,
+            annonces_catalogue_cache,
             search_permits,
             registre_cache,
             registre_http,
             suggest_cache,
+            text_ref_cache,
+            ingest_freshness_cache,
+            mistral,
         }
     }
 }

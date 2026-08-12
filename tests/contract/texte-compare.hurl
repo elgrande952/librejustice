@@ -1,5 +1,5 @@
 # ============================================================================
-# CONTRACT TESTS — route group: loi / comparateur de versions (ADR 0193)
+# CONTRACT TESTS — route group: loi / comparateur de versions
 #   GET /api/texte/{code}/{num}/compare/{de}/{a}
 # {{base}} = host root. Bornes = dates ISO de fenêtre de version (l'article
 # 16-13 du Code civil a deux versions stables : 2002-03-05 et 2004-08-07).
@@ -36,7 +36,7 @@ GET {{base}}/api/texte/inconnu-xyz/16-13/compare/2002-03-05/2004-08-07
 HTTP 404
 
 # ============================================================================
-# Chronolégi (ADR 0193 §5) — sommaire et section à date (`?date=YYYY-MM-DD`)
+# Chronolégi — sommaire et section à date (`?date=YYYY-MM-DD`)
 # ============================================================================
 
 GET {{base}}/api/texte/code-civil/sommaire?date=1990-01-01
@@ -64,7 +64,7 @@ jsonpath "$.reading[?(@.kind == 'article')].texte" count > 0
 jsonpath "$.entries" count == 0
 
 # ============================================================================
-# Commentaires de norme (ADR 0212) et travaux parlementaires (ADR 0215) sur la
+# Commentaires de norme et travaux parlementaires sur la
 # réponse article. Art. 8 CEDH : bundle curé (note de cabinet) ancré en base.
 # Art. L311-13 CESEDA : lois modificatrices → liens Légifrance composés.
 # ============================================================================
@@ -84,7 +84,7 @@ jsonpath "$.travauxParlementaires[0].label" contains "LOI"
 jsonpath "$.travauxParlementaires[0].href" matches /^https:\/\/www\.legifrance\.gouv\.fr\/jorf\/id\/JORFTEXT/
 
 # ============================================================================
-# Renvois hyperliés du corps (ADR 0217). Art. 1242 du Code civil (version 2016,
+# Renvois hyperliés du corps. Art. 1242 du Code civil (version 2016,
 # stable) : renvoie aux art. 1733 et 1734 du même code — spans codepoints
 # demi-ouverts sur `texte`, hrefs internes /texte/{slug}/{numKey}.
 # ============================================================================

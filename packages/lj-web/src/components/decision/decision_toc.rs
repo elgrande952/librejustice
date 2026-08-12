@@ -1,4 +1,4 @@
-//! Sommaire ancré de la décision (scroll-spy). Port de `decision-toc.tsx`.
+//! Sommaire ancré de la décision (scroll-spy).
 //!
 //! Rendu statique (SSR) : liens `#ancre`, première section active, rail + barre
 //! à la hauteur d'init (10px). Sous `hydrate`, le spy est branché : un shim JS
@@ -16,10 +16,7 @@ pub fn DecisionToc(sections: Vec<TocEntry>, chronology: Vec<ChronologyEntry>) ->
     let chronology_view = chronology_block(chronology);
     if sections.is_empty() {
         return view! {
-            <nav
-                aria-label="Sommaire de la décision"
-                class="flex flex-col gap-6 lg:sticky lg:top-20 lg:self-start"
-            >
+            <nav aria-label="Sommaire de la décision" class="flex flex-col gap-6">
                 {chronology_view}
             </nav>
         }
@@ -93,11 +90,10 @@ pub fn DecisionToc(sections: Vec<TocEntry>, chronology: Vec<ChronologyEntry>) ->
     };
     let bar_style = move || format!("height:{}px", progress_px.get());
 
+    // Le collage (`lg:sticky`) est porté par le conteneur du rail dans
+    // `decision_page.rs` — actions + sommaire collent d'un seul bloc.
     view! {
-        <nav
-            aria-label="Sommaire de la décision"
-            class="flex flex-col gap-6 lg:sticky lg:top-20 lg:self-start"
-        >
+        <nav aria-label="Sommaire de la décision" class="flex flex-col gap-6">
             <div class="flex flex-col gap-3">
                 <p class="text-xs uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
                     "Sommaire"
@@ -116,9 +112,9 @@ pub fn DecisionToc(sections: Vec<TocEntry>, chronology: Vec<ChronologyEntry>) ->
     .into_any()
 }
 
-/// Libellé de la nature d'un lien de chronologie (`decision_links.link_type`,
-/// ADR 0161), lu entre l'étape qui le porte et la décision attaquée en
-/// dessous : « CE — sur pourvoi contre — CAA ».
+/// Libellé de la nature d'un lien de chronologie (`decision_links.link_type`),
+/// lu entre l'étape qui le porte et la décision attaquée en dessous :
+/// « CE — sur pourvoi contre — CAA ».
 fn link_label(key: &str) -> Option<&'static str> {
     match key {
         "APPEL_DE" => Some("sur appel de"),
@@ -128,13 +124,12 @@ fn link_label(key: &str) -> Option<&'static str> {
     }
 }
 
-/// Chronologie de l'affaire (ADR 0169) sous le sommaire, du plus récent au
-/// plus ancien : une étape par décision de la chaîne appel/pourvoi/renvoi,
-/// posée en points sur un rail fin — le même idiome visuel que le rail du
-/// scroll-spy juste au-dessus. La décision courante porte le point plein
-/// accent (non cliquable) ; les autres naviguent et portent la hover card de
-/// décision (ADR 0168). La nature du lien (appel / pourvoi / renvoi,
-/// ADR 0161) s'affiche en italique entre les étapes. Vide ⇒ pas de bloc.
+/// Chronologie de l'affaire sous le sommaire, du plus récent au plus ancien :
+/// une étape par décision de la chaîne appel/pourvoi/renvoi, posée en points sur
+/// un rail fin — le même idiome visuel que le rail du scroll-spy juste au-dessus.
+/// La décision courante porte le point plein accent (non cliquable) ; les autres
+/// naviguent et portent la hover card de décision. La nature du lien (appel /
+/// pourvoi / renvoi) s'affiche en italique entre les étapes. Vide ⇒ pas de bloc.
 fn chronology_block(chronology: Vec<ChronologyEntry>) -> Option<impl IntoView> {
     (!chronology.is_empty()).then(|| {
         let steps = chronology
@@ -247,7 +242,7 @@ mod spy {
 
     // Construit les `SpyMetric` à partir des `Float64Array` parallèles aux ids
     // connus, puis résout et pose `active`/`progress_px`. Les ids non mesurés
-    // (NaN) sont filtrés. Barre bornée à 10px comme `Math.max(10, …)` côté React.
+    // (NaN) sont filtrés. Barre bornée à 10px.
     fn apply(
         section_ids: &[String],
         active: RwSignal<Option<String>>,
@@ -347,7 +342,7 @@ mod spy {
             ev.prevent_default();
             animate.set(true);
             // Repli si la cible n'est pas mesurable (le shim ne rappellera pas
-            // `on_landing`) : on pose au moins la section active, comme React.
+            // `on_landing`) : on pose au moins la section active.
             active.set(Some(id.clone()));
             let Some(node) = list_ref.get() else {
                 return;

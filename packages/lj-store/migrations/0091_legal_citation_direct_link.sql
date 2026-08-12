@@ -1,4 +1,4 @@
--- Migration 0091 — lien-span DIRECT par occurrence (ADR 0139, supersede 0134).
+-- Migration 0091 — lien-span DIRECT par occurrence (supersede 0134).
 --
 -- Tue le duo à deux temps « capture globale (cited_reference) → résolution snap
 -- (ref_text_uid) ». Le problème STRUCTUREL : cited_reference est GLOBAL (dédupliqué
@@ -11,7 +11,7 @@
 -- INLINE sur l'occurrence. Une occurrence est une entité de 1ʳᵉ classe : elle a son
 -- propre span, sa propre résolution dépendante du contexte, sa propre source
 -- (recognizer déterministe | oracle LLM | curateur humain) et son antécédent
--- d'anaphore. C'est exactement la prémisse qu'ADR 0134 avait à raison écartée quand
+-- d'anaphore. C'est exactement la prémisse écartée à raison quand
 -- la résolution était un batch GLOBAL recalculable — prémisse désormais inversée.
 --
 --   char_start / char_end : codepoints sur `decisions.full_text` immuable (ADR
@@ -26,7 +26,7 @@
 --   antecedent_char_*     : anaphore — span où l'antécédent est défini (même doc).
 --   source                : 'recognizer' | 'llm:<model>' | 'human'.
 --   confidence            : [0,1] (oracle/curateur).
---   extract_version       : version du producteur (gating re-extract, ADR 0085).
+--   extract_version       : version du producteur (gating re-extract).
 --
 -- ADDITIVE : `cited_reference` + `decision_citation` restent INTACTES. La bascule
 -- (résolveur + API + facettes lisent `legal_citation`) et le drop des anciennes

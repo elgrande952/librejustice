@@ -1,10 +1,10 @@
 //! Parser PUR du fond KALI (conventions collectives nationales, bulk DILA) —
-//! `payload XML → KaliArticle / KaliConteneur` (ADR 0120). Aucun I/O : les octets
-//! sont fournis par `lj-ingest`. Réutilise l'arbre XML minimal de
-//! [`lj_core::parsing`] et les helpers structurels du parser LEGI (`find_anywhere`,
-//! `clean_contenu`, `date_or_none`, `collect_titre_tm`) — la structure `<ARTICLE>`
-//! d'un `KALIARTI` est celle d'un `LEGIARTI` (mêmes `META_ARTICLE`/`CONTEXTE`/
-//! `BLOC_TEXTUEL`), seul le rattachement diffère (#11, pas de réimplémentation).
+//! `payload XML → KaliArticle / KaliConteneur`. Aucun I/O : les octets sont
+//! fournis par `lj-ingest`. Réutilise l'arbre XML minimal de
+//! [`lj_core::parsing`] et les helpers structurels du parser LEGI
+//! (`find_anywhere`, `clean_contenu`, `date_or_none`, `collect_titre_tm`) — la
+//! structure `<ARTICLE>` d'un `KALIARTI` est celle d'un `LEGIARTI` (mêmes
+//! `META_ARTICLE`/`CONTEXTE`/`BLOC_TEXTUEL`), seul le rattachement diffère.
 //!
 //! Deux écarts au modèle LEGI, propres à KALI :
 //! 1. **Rattachement au conteneur, pas au texte** : un `KALIARTI` porte dans son
@@ -15,8 +15,8 @@
 //! 2. **Articles sans numéro** : beaucoup de `KALIARTI` ont `<NUM/>` vide
 //!    (organisés par titre de section, pas numérotés). Le parseur les rend
 //!    quand même (`num_key` vide) : le référentiel citable les saute côté
-//!    pipeline d'ingest, mais l'assemblage du corps des TI (ADR 0223) les
-//!    consomme — le skip est une décision du consommateur, pas du parseur.
+//!    pipeline d'ingest, mais l'assemblage du corps des TI les consomme — le
+//!    skip est une décision du consommateur, pas du parseur.
 //!
 //! Les `ETAT` étendus de KALI (`VIGUEUR_ETEN` convention étendue par arrêté,
 //! `VIGUEUR_NON_ETEN` en vigueur pour les seuls signataires) sont **repliés sur
@@ -31,20 +31,22 @@ use lj_core::parsing::{build_tree, node_text};
 
 /// Une version d'article du fond KALI (`KALIARTI*.xml`, racine `<ARTICLE>`).
 /// `kalicont` = conteneur (la convention) sur lequel on ancre le `text_uid` —
-/// cf. écart #1 du module. Dates en `String` ISO ; conversion au bord store.
+/// cf. écart #1 du module. Dates en `String` ISO ; conversion au bord store ;
+/// sentinelle absorbée ⇔ `None` (fin ouverte / début inconnu).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KaliArticle {
     pub kaliarti: String,
     pub kalicont: String,
     /// Texte porteur (`CONTEXTE/TEXTE@cid`, le texte de base ou un avenant) —
-    /// sert à ordonner les blocs d'un conteneur (ADR 0223). Absent sur certains
-    /// articles ancrés directement au conteneur.
+    /// sert à ordonner les blocs d'un conteneur. Absent sur certains articles
+    /// ancrés directement au conteneur.
     pub kalitext: Option<String>,
     /// Vide pour les articles non numérotés (sections titrées) ; idem `num_key`.
     pub num: String,
     pub num_key: String,
     pub titre_text: Option<String>,
     pub etat: String,
+    /// Gardée brute, sentinelles incluses — cf. [`crate::legi::LegiArticle`].
     pub date_debut: String,
     pub date_fin: Option<String>,
     pub texte: Option<String>,
@@ -64,7 +66,7 @@ pub struct KaliConteneur {
     pub num_broch: Option<String>,
     /// `KALITEXT` du sommaire (`STRUCTURE_TXT/…/LIEN_TXT@idtxt`), dans l'ordre
     /// du fichier : texte de base d'abord, puis textes attachés/salaires.
-    /// L'ordre inter-textes de l'assemblage du corps des TI (ADR 0223).
+    /// L'ordre inter-textes de l'assemblage du corps des TI.
     pub textes: Vec<String>,
 }
 
@@ -83,9 +85,8 @@ fn canon_etat(raw: &str) -> String {
 ///
 /// Un article **sans numéro** (`<NUM/>` vide, section titrée) est rendu avec
 /// `num_key` vide — au consommateur de le sauter (référentiel citable) ou de le
-/// consommer (corps des TI, ADR 0223). `Err` ([`CoreError::Xml`]) si
-/// `ID`/`DATE_DEBUT`/`CONTENEUR@cid` manquent — frontière de validation
-/// source (#12).
+/// consommer (corps des TI). `Err` ([`CoreError::Xml`]) si
+/// `ID`/`DATE_DEBUT`/`CONTENEUR@cid` manquent — frontière de validation source.
 pub fn parse_kali_article(raw: &[u8]) -> Result<KaliArticle, CoreError> {
     let root =
         build_tree(raw).ok_or_else(|| CoreError::Xml("ARTICLE KALI: XML illisible".into()))?;
@@ -98,6 +99,9 @@ pub fn parse_kali_article(raw: &[u8]) -> Result<KaliArticle, CoreError> {
     let num = node_text(find_anywhere(&root, "META_ARTICLE/NUM")).unwrap_or_default();
     let num_key = lj_core::article_key::identity_key(&num);
 
+    // Présence obligatoire, valeur gardée brute : sur `DATE_DEBUT` la sentinelle
+    // marque l'absence de fenêtre de validité, pas un début inconnu (cf.
+    // `parse_legi_article`).
     let date_debut =
         node_text(find_anywhere(&root, "META_ARTICLE/DATE_DEBUT")).ok_or_else(|| {
             CoreError::Xml(format!(
@@ -136,7 +140,7 @@ pub fn parse_kali_article(raw: &[u8]) -> Result<KaliArticle, CoreError> {
         date_debut,
         date_fin,
         texte: clean_contenu(find_anywhere(&root, "BLOC_TEXTUEL/CONTENU")),
-        liens: collect_liens(&root),
+        liens: collect_liens(&root)?,
     })
 }
 
@@ -220,7 +224,7 @@ mod tests {
         let a = parse_kali_article(ARTI.as_bytes()).expect("ok");
         assert_eq!(a.kaliarti, "KALIARTI000005833715");
         // text_uid = CONTENEUR (la convention), PAS le TEXTE/avenant — mais le
-        // TEXTE porteur reste capté (ordre des blocs, ADR 0223).
+        // TEXTE porteur reste capté, pour l'ordre des blocs.
         assert_eq!(a.kalicont, "KALICONT000005635585");
         assert_eq!(a.kalitext.as_deref(), Some("KALITEXT000024359407"));
         assert_eq!(a.num, "5");
@@ -246,7 +250,7 @@ mod tests {
   <BLOC_TEXTUEL><CONTENU>Sans numero.</CONTENU></BLOC_TEXTUEL>
 </ARTICLE>"#;
         // NUM vide → article rendu quand même, num_key vide (le skip citable
-        // appartient au consommateur, ADR 0223) ; TEXTE absent → kalitext None.
+        // appartient au consommateur) ; TEXTE absent → kalitext None.
         let a = parse_kali_article(xml).expect("ok");
         assert!(a.num_key.is_empty());
         assert_eq!(a.kalitext, None);

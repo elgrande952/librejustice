@@ -5,7 +5,7 @@
 -- d'`EXTRACT_VERSION`). Couvre TOUS les champs d'extraction (outcome, parties,
 -- juridiction, domaine, facettes, sections…), pas seulement les citations — les
 -- liens de citations gold vivent, eux, dans `legal_citation` (source llm/human,
--- ADR 0139). Ici : un blob JSONB par (décision, kind, version).
+-- annotée). Ici : un blob JSONB par (décision, kind, version).
 --
 --   version : 1000 = gold/LLM curé (distinct d'EXTRACT_VERSION=8, le déterministe).
 --   kind    : 'extraction' (les 32 champs) | 'sections' | 'facets' | … extensible.

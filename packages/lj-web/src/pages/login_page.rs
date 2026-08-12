@@ -1,4 +1,4 @@
-//! Page `/connexion` — port de `apps/web/src/pages/login-page.tsx`.
+//! Page `/connexion`.
 //!
 //! Formulaire multi-actions (connexion, inscription, OAuth Google, renvoi de
 //! confirmation, mot de passe oublie). Tout le flux est client-side : la session
@@ -6,14 +6,11 @@
 //! effet client lit le hash d'erreur eventuel, redirige si deja connecte, puis
 //! cable les handlers sur le shim auth.
 //!
-//! Heberge aussi les modules partages de la tranche auth (la table de routage
-//! `pages/mod.rs` est figee, donc on declare ici ce que reset-password /
-//! authorize-mcp reutilisent) :
-//! - `auth_errors` : traduction FR des erreurs Supabase (port pur).
+//! Heberge aussi les modules partages de la tranche auth, reutilises par
+//! reset-password et authorize-mcp :
+//! - `auth_errors` : traduction FR des erreurs Supabase.
 //! - `browser` : bindings DOM + auth-gap (resend / updateUser / fetch OAuth).
 
-// `auth_errors` (traduction FR pure) n'est consomme que par `browser`
-// (hydrate-only) ; sous `test` ses fns sont exercees par les tests unitaires.
 #[cfg(any(feature = "hydrate", test))]
 #[path = "auth_errors.rs"]
 pub(crate) mod auth_errors;
@@ -24,7 +21,6 @@ pub(crate) mod browser;
 use leptos::prelude::*;
 use leptos_meta::{Meta, Title};
 
-/// Indication de robustesse du mot de passe (port de `PASSWORD_HINT`).
 const PASSWORD_HINT: &str =
     "Au moins 8 caractères, dont une minuscule, une majuscule et un chiffre.";
 
@@ -40,7 +36,6 @@ pub fn LoginPage() -> impl IntoView {
     let resend_notice = RwSignal::new(None::<String>);
     let show_resend = RwSignal::new(false);
 
-    // Hooks routeur captures une fois (lecture du `?next=`, navigation interne).
     #[cfg(feature = "hydrate")]
     let navigate = leptos_router::hooks::use_navigate();
     #[cfg(feature = "hydrate")]
@@ -83,7 +78,7 @@ pub fn LoginPage() -> impl IntoView {
             loading.set(true);
             leptos::task::spawn_local(async move {
                 if signup {
-                    match crate::auth::sign_up(&em, &pw, &signup_redirect()).await {
+                    match crate::auth::sign_up(&em, &pw, &signup_redirect(&next)).await {
                         Ok(()) => confirm_sent.set(true),
                         Err(msg) => error.set(Some(msg)),
                     }
@@ -91,8 +86,8 @@ pub fn LoginPage() -> impl IntoView {
                     match crate::auth::sign_in_password(&em, &pw).await {
                         Ok(()) => navigate(&next, Default::default()),
                         Err(msg) => {
-                            // Le shim a deja traduit ; le cas `email_not_confirmed`
-                            // est detecte sur le message FR correspondant.
+                            // Le shim a deja traduit : le cas
+                            // `email_not_confirmed` se detecte sur le message FR.
                             if msg.starts_with("Email non confirmé") {
                                 show_resend.set(true);
                             }
@@ -357,22 +352,27 @@ fn LoginForm(
 }
 
 /// Resout la destination de `?next=` : chemin interne relatif (`/` non suivi de
-/// `/`), sinon `/decisions`. Port de la regex `/^\/(?!\/)/`. Lue uniquement dans
-/// le chemin de navigation client (hydrate).
+/// `/`), sinon l'accueil. Les points d'entrée de la connexion posent tous
+/// `?next=` (page courante ou page protégée demandée) : le défaut ne sert que
+/// quand la destination est inconnue.
 #[cfg(feature = "hydrate")]
-fn next_url(raw: Option<String>) -> String {
-    let raw = raw.unwrap_or_else(|| "/decisions".to_string());
+pub(crate) fn next_url(raw: Option<String>) -> String {
+    let raw = raw.unwrap_or_else(|| "/".to_string());
     let bytes = raw.as_bytes();
     let internal = bytes.first() == Some(&b'/') && bytes.get(1) != Some(&b'/');
     if internal {
         raw
     } else {
-        "/decisions".to_string()
+        "/".to_string()
     }
 }
 
-/// Lien de redirection de confirmation d'inscription (origine + `/decisions`).
+/// Lien de redirection du mail de confirmation d'inscription : origine + la
+/// destination `?next=` (l'accueil par défaut, cf. `next_url`).
+///
+/// Le lien doit ramener là où l'inscription a commencé, paramètres OAuth de
+/// `/authorize-mcp` compris.
 #[cfg(feature = "hydrate")]
-fn signup_redirect() -> String {
-    format!("{}/decisions", browser::location_origin())
+fn signup_redirect(next: &str) -> String {
+    format!("{}{next}", browser::location_origin())
 }

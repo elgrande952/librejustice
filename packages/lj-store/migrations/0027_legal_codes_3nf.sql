@@ -1,4 +1,4 @@
--- Migration 0027 — Refonte 3NF de decision_legal_references (cf. ADR 0034).
+-- Migration 0027 — Refonte 3NF de decision_legal_references.
 --
 -- Ce que cette migration fait :
 --

@@ -1,20 +1,20 @@
-//! Annuaire des entités (ADR 0192) — point d'entrée vers les fiches
-//! `/entite/{ns}/{id}`. Deux surfaces :
+//! Annuaire des entités — point d'entrée vers les fiches `/entite/{ns}/{id}`.
+//! Deux surfaces :
 //!
 //! - `/annuaire` ([`AnnuairePage`]) : recherche + cartes de catégories (avec
 //!   compteurs) + résultats quand `?q=` est présent.
 //! - `/annuaire/{kind}` ([`AnnuaireDirectoryPage`]) : listing paginé d'une
 //!   catégorie, filtre barreau pour les avocats.
 //!
-//! Gabarit commun /decisions · /textes · /texte : conteneur 92rem, grille
-//! rail (240px) + colonne contenu bornée 3xl ; le rail des catégories
+//! Gabarit commun /decisions · /textes · /texte : conteneur 92rem, grille rail
+//! (240px) + colonne contenu bornée 3xl ; le rail des catégories
 //! ([`common::AnnuaireRail`]) vit dans la gouttière gauche des deux pages.
 //!
 //! Rendu SSR crawlable (routes en `PartiallyBlocked`, parité fiche entité) :
-//! résultats de recherche et listing sont des ressources **bloquantes** (dans
-//! le HTML initial) ; les compteurs (rail + cartes) sont streamés (non
-//! bloquants). Transport des données via [`crate::api::ApiClient`]
-//! (in-process au SSR, HTTP `/api/entities/*` côté hydrate).
+//! résultats de recherche et listing sont des ressources **bloquantes** (dans le
+//! HTML initial) ; les compteurs (rail + cartes) sont streamés (non bloquants).
+//! Transport des données via [`crate::api::ApiClient`] (in-process au SSR, HTTP
+//! `/api/entities/*` côté hydrate).
 
 mod common;
 mod directory;
@@ -27,6 +27,8 @@ use leptos_router::components::A;
 use leptos_router::hooks::use_query_map;
 use lj_dtos::AnnuaireStatsResponse;
 
+use crate::components::layout::{CONTENT_COL, GRID_2COL, SHELL};
+use crate::components::own_page_description;
 use crate::helpers::group_thousands;
 use crate::pages::annuaire::common::{
     entity_row, fetch_search, list_skeleton, max_decision_count, mini_bar, stats_resource,
@@ -43,6 +45,10 @@ fn query_term() -> Signal<String> {
 
 #[component]
 pub fn AnnuairePage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) :
+    // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
+    own_page_description();
+
     let term = query_term();
     let stats = stats_resource();
 
@@ -56,14 +62,14 @@ pub fn AnnuairePage() -> impl IntoView {
         <Meta name="description" content=description />
         <Link rel="canonical" href=url />
 
-        <div class="mx-auto w-full max-w-[92rem] flex-1 px-4 py-8 sm:px-6 lg:px-8">
+        <div class=format!("{SHELL} flex-1")>
             // Gabarit commun /decisions · /textes · /texte : gouttière 240px,
             // colonne contenu bornée 3xl.
-            <div class="grid gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12">
+            <div class=GRID_2COL>
                 <div class="hidden lg:block">
                     <AnnuaireRail stats=stats />
                 </div>
-                <div class="flex w-full min-w-0 max-w-3xl flex-col gap-6">
+                <div class=CONTENT_COL>
                     <header class="flex flex-col gap-2">
                         <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
                             "Annuaire"
@@ -122,8 +128,8 @@ fn SearchForm(term: Signal<String>) -> impl IntoView {
 
 /// Grille des catégories : cartes SSR crawlables liant `/annuaire/{kind}` ;
 /// double compteur en tuile (total du registre chargé + entités liées à des
-/// décisions, ADR 0233) et barre de proportion (part de la catégorie dans la
-/// somme des registres), streamés — rien tant que les stats ne sont pas là.
+/// décisions) et barre de proportion (part de la catégorie dans la somme des
+/// registres), streamés — rien tant que les stats ne sont pas là.
 #[component]
 fn CategoryGrid(stats: Resource<Option<AnnuaireStatsResponse>>) -> impl IntoView {
     let cards = Kind::ALL

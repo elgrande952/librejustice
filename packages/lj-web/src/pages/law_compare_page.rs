@@ -1,8 +1,8 @@
 //! Page `/texte/{code}/{num}/comparer/{de}/{a}` — comparateur de versions d'un
-//! article (ADR 0193). Diff calculé côté serveur (`LawCompareResponse`), rendu
-//! **inline** : suppressions barrées, insertions surlignées, une colonne de
-//! lecture. Deux sélecteurs de versions naviguent vers la nouvelle URL.
-//! `noindex` (combinatoire de paires) + canonique sur la page article.
+//! article. Diff calculé côté serveur (`LawCompareResponse`), rendu **inline** :
+//! suppressions barrées, insertions surlignées, une colonne de lecture. Deux
+//! sélecteurs de versions naviguent vers la nouvelle URL. `noindex`
+//! (combinatoire de paires) + canonique sur la page article.
 
 use leptos::either::Either;
 use leptos::prelude::*;

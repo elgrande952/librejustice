@@ -1,10 +1,9 @@
 //! Hydratation DB (metadata + facettes), denylist procédurale, construction des
 //! snippets et assemblage des `SearchHit` d'une page.
 //!
-//! Depuis l'ADR 0146, les facettes et les tags des hits sont résolus depuis le
-//! référentiel DB ([`crate::referential::Referential`]) : les compteurs se
-//! groupent par colonnes `_uid`/`jurisdiction_code`, les libellés viennent du
-//! cache — plus aucune table de labels compilée.
+//! Les facettes et les tags des hits sont résolus depuis le référentiel DB
+//! ([`crate::referential::Referential`]) : les compteurs se groupent par colonnes
+//! `_uid`/`jurisdiction_code`, les libellés viennent du cache.
 
 use std::collections::HashMap;
 
@@ -39,7 +38,7 @@ fn ranked(counter: &HashMap<String, i64>) -> Vec<(String, i64)> {
 }
 
 /// Choix d'une facette plate keyée par **uid complet** : `value` = suffixe
-/// d'uid, `label` résolu depuis le référentiel (ADR 0146 §4).
+/// d'uid, `label` résolu depuis le référentiel.
 fn uid_choices(counter: &HashMap<String, i64>, refs: &Referential) -> Vec<FacetChoice> {
     ranked(counter)
         .into_iter()
@@ -68,8 +67,8 @@ pub(crate) struct DecisionMeta {
     pub(crate) docket_numbers: Option<Vec<String>>,
     pub(crate) summary: Option<String>,
     pub(crate) chars: Option<i64>,
-    /// Axes formation (ADR 0170) : position recomposée + type de formation,
-    /// pour le siège du titre des hits.
+    /// Axes formation : position recomposée + type de formation, pour le siège du
+    /// titre des hits.
     pub(crate) chamber_position: Option<String>,
     pub(crate) formation_uid: Option<String>,
     pub(crate) chamber_uid: Option<String>,
@@ -94,12 +93,11 @@ pub(crate) async fn fetch_pub_ids_and_facets(
             &[&decision_ids],
         )
         .await?;
-    // Facettes instruments/articles depuis la relation du domaine (ADR 0145 M4) :
-    // token = ref_text_uid / ref_num_key, identiques aux valeurs des arrays de
-    // filtre legal_instruments/composite (migration 0098) ; libellé = titre
-    // catalogue, résolu ici. Seul le lié est facettable — le non-lié
-    // (`ref_text_uid` NULL) n'a ni token ni libellé (décision opérateur
-    // 2026-06-30 : on ne filtre pas vers ce qui ne mène nulle part).
+    // Facettes instruments/articles depuis la relation du domaine : token =
+    // ref_text_uid / ref_num_key, identiques aux valeurs des arrays de filtre
+    // legal_instruments/composite ; libellé = titre catalogue, résolu ici. Seul le
+    // lié est facettable — le non-lié (`ref_text_uid` NULL) n'a ni token ni
+    // libellé.
     let refs_rows = conn
         .query(
             "SELECT el->>2, lt.title, el->>3, \
@@ -114,7 +112,7 @@ pub(crate) async fn fetch_pub_ids_and_facets(
         .await?;
 
     let mut pub_ids: HashMap<i64, String> = HashMap::new();
-    // Facette juridiction (ADR 0163) : niveau 1 = tokens `jurisdiction_type`
+    // Facette juridiction : niveau 1 = tokens `jurisdiction_type`
     // (`TJ`), niveau 2 = codes `jurisdiction` (`parent` = token du type). L'office
     // est un axe séparé (`office:*`), en miroir du filtrage (`office_uid`) —
     // chaque décision compte sous son tribunal ET sous son office éventuel.
@@ -146,7 +144,7 @@ pub(crate) async fn fetch_pub_ids_and_facets(
         if let Some(uid) = chamber {
             *chamber_counter.entry(uid).or_insert(0) += 1;
         }
-        // Portée dérivée des codes (mapping total, ADR 0167) — pas de colonne.
+        // Portée dérivée des codes (mapping total) — pas de colonne.
         *significance_counter
             .entry(format!(
                 "significance:{}",
@@ -172,9 +170,8 @@ pub(crate) async fn fetch_pub_ids_and_facets(
         }
     }
 
-    // Agrégation par uid : le token est canonique (plus de variantes de casse
-    // à replier — c'était une servitude du token `text_key`). Le libellé
-    // (titre) accompagne le token pour l'affichage.
+    // Agrégation par uid : le token est canonique. Le libellé (titre) accompagne
+    // le token pour l'affichage.
     let mut li_counter: HashMap<String, i64> = HashMap::new();
     let mut li_labels: HashMap<String, String> = HashMap::new();
     let mut li_slugs: HashMap<String, Option<String>> = HashMap::new();
@@ -390,9 +387,9 @@ pub(crate) async fn hydrate_decisions(
 }
 
 /// `full_text` (TOAST pglz) des décisions d'**une page** (≤ `limit`), par
-/// `decision_id` : source unique du snippet (ADR 0084). Le moteur de highlight
-/// re-tokenise le texte fourni — aucun offset BM25 requis. Lu seulement pour les
-/// décisions réellement affichées, sur un miss `page_memo`.
+/// `decision_id` : source unique du snippet. Le moteur de highlight re-tokenise
+/// le texte fourni — aucun offset BM25 requis. Lu seulement pour les décisions
+/// réellement affichées, sur un miss `page_memo`.
 async fn load_full_texts(
     conn: &Client,
     decision_ids: &[i64],
@@ -416,7 +413,7 @@ async fn load_full_texts(
 /// Spans char `(char_start, char_end)` des chunks gagnants ANN d'une page, par
 /// `chunk_id` : fenêtre de fallback du snippet pour un hit purement sémantique
 /// (aucun terme requête dans `full_text`) — on montre alors la région du chunk
-/// gagnant plutôt que la tête de la décision (ADR 0084).
+/// gagnant plutôt que la tête de la décision.
 async fn load_chunk_spans(
     conn: &Client,
     chunk_ids: &[i64],
@@ -486,7 +483,7 @@ fn display_jurisdiction(m: &DecisionMeta, refs: &Referential) -> String {
     )
 }
 
-/// Titre d'affichage des cartes/topbar (ADR 0170) : « <juridiction résolue>,
+/// Titre d'affichage des cartes/topbar : « <juridiction résolue>,
 /// <date FR>, <n°> » — **sans** le siège (rendu à part, [`display_seat`], en 2ᵉ
 /// ligne). Une seule ligne, ne wrappe pas. Le titre BM25 (`search_title`), lui,
 /// garde le siège pour le matching.
@@ -558,8 +555,7 @@ fn make_hit(
 /// ≤`limit` décisions affichées ([`load_full_texts`]) + les spans char des
 /// chunks gagnants ANN ([`load_chunk_spans`], fenêtre de fallback). Suit le
 /// highlight tantivy de `full_text` + titres de la page (Tier 2, mémoïsé par
-/// page). Le snippet vient désormais du texte décision (ADR 0084), plus du body
-/// chunk (dropé).
+/// page). Le snippet vient du texte décision.
 pub(crate) async fn assemble_page(
     conn: &Client,
     ranked_page: &[(i64, f64, LegHit)],
@@ -587,10 +583,10 @@ pub(crate) async fn assemble_page(
     // Vieilles décisions opendata intégralement en MAJUSCULES (surtout Cassation) :
     // recasse déterministe pour l'affichage du snippet, en miroir de la vue détail
     // (`decisions.rs`), gardée par `is_caps_lock`. Le highlight re-tokenise insensible
-    // casse/accents (ADR 0084) → les `<mark>` se placent toujours correctement. CPU
-    // pur (tokenizer + dicos) : offload `spawn_blocking` car le runtime est
-    // `current_thread` (SSR Leptos, ADR 0061). La map recasée alimente les deux
-    // chemins de snippet (highlight + fallback brut).
+    // casse/accents → les `<mark>` se placent toujours correctement. CPU pur
+    // (tokenizer + dicos) : offload `spawn_blocking`, le runtime étant
+    // `current_thread` (SSR Leptos). La map recasée alimente les deux chemins de
+    // snippet (highlight + fallback brut).
     let full_texts = tokio::task::spawn_blocking(move || {
         full_texts
             .into_iter()
@@ -615,9 +611,8 @@ pub(crate) async fn assemble_page(
         .filter_map(|(d, _, _)| full_texts.get(d).map(|t| (*d, t.clone())))
         .collect();
     // `highlight` tokenise les textes + sélectionne les fragments : CPU pur (le
-    // tokenizer regex domine). On l'offload sur `spawn_blocking` (pool blocking
-    // dédié) : le runtime est `current_thread` (contrainte SSR Leptos, ADR 0061),
-    // donc ce CPU sur l'unique thread async sérialiserait sinon les requêtes en vol.
+    // tokenizer regex domine), offloadé sur `spawn_blocking` — le runtime est
+    // `current_thread` (contrainte SSR Leptos).
     let query_body = query_text.to_string();
     let body_task = tokio::task::spawn_blocking(move || {
         highlight(&body_docs, &query_body, snippets::DEFAULT_MAX_CHARS)
@@ -668,9 +663,9 @@ pub(crate) async fn assemble_page(
             .cloned()
             .or_else(|| titles.get(&decision_id).cloned())
             .unwrap_or_default();
-        // Résumé garanti en base et déjà joint au hot path (ADR 0051) : embarqué
+        // Résumé garanti en base et déjà joint au hot path : embarqué
         // dans chaque hit quel que soit le mode → vue « Résumé » instantanée côté
-        // front, sans aller-retour `/summary`. Coût DB nul (colonne déjà lue).
+        // front, sans aller-retour `/summary`.
         let summary = decision_meta.summary.clone();
         hits.push(make_hit(
             decision_meta,
@@ -728,7 +723,6 @@ mod tests {
             ("legal_domain:FISCAL".to_string(), 2),
         ]);
         let choices = domain_choices(&counter, &refs);
-        // Racines d'abord (count agrégé), feuilles ensuite (parent = suffixe racine).
         let civil = choices.iter().find(|c| c.value == "CIVIL").unwrap();
         assert_eq!((civil.count, civil.parent.clone()), (4, None));
         let fiscal = choices.iter().find(|c| c.value == "FISCAL").unwrap();
@@ -758,10 +752,8 @@ mod tests {
         let roots = HashMap::from([("TJ".to_string(), 5i64)]);
         let children = HashMap::from([(("TJ".to_string(), "tj_le_havre".to_string()), 4i64)]);
         let choices = jurisdiction_choices(&roots, &children, &refs);
-        // Racine : token `jurisdiction_type`, label résolu.
         assert_eq!(choices[0].value, "TJ");
         assert_eq!(choices[0].label, "Tribunal judiciaire");
-        // Enfant : code `jurisdiction`, parent = token racine.
         let child = choices.iter().find(|c| c.value == "tj_le_havre").unwrap();
         assert_eq!(child.parent.as_deref(), Some("TJ"));
         assert_eq!(child.label, "Tribunal judiciaire du Havre");

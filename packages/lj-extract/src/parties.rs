@@ -1,23 +1,17 @@
-//! Grain acteur de `decision_party` (ADR 0182) : à partir des 7 cellules NER
-//! plates (la projection), construit les lignes canoniques — valeur, qualité,
-//! côté, `resolve_key`, `nature` (axe 1 de l'ontologie 0180) et
-//! spans-évidences (`char_starts`/`char_ends`, codepoints sur `full_text`,
-//! convention 0143).
+//! Grain acteur de `decision_party` : à partir des 7 cellules NER plates,
+//! construit les lignes canoniques — valeur, qualité, côté, `resolve_key`,
+//! `nature` et spans-évidences (`char_starts`/`char_ends`, codepoints sur
+//! `full_text`).
 //!
-//! Les spans se dérivent par matching replié déterministe de la valeur dans
-//! le texte (fold_stable, runs d'espaces équivalents) — le même algorithme
-//! que l'auto-fill des gold spans (plan 2026-07-09) : moteur et gold parlent
-//! la même évidence. Une valeur de provenance métadonnée sans occurrence
-//! corps a des spans vides.
+//! Les spans se dérivent par matching replié déterministe de la valeur dans le
+//! texte (fold_stable, runs d'espaces équivalents). Une valeur de provenance
+//! métadonnée sans occurrence corps a des spans vides. Le pliage et la clé de
+//! résolution sont calculés ICI, le SQL ne replie jamais.
 //!
-//! Le pliage et la clé de résolution sont calculés ICI (le SQL ne replie
-//! jamais) — même pliage que le chargeur de registres (ADR 0179/0181).
-//!
-//! Pour `counsel_name`, la clé s'enrichit des évidences d'apposition
-//! (ADR 0188) : prénom devant l'occurrence → clé nom complet, barreau après
-//! l'occurrence → colonne `barreau` (slug officiel CNB). Le rôle explicite
-//! (substituant/substitué, postulant/plaidant) se capte au même endroit et
-//! les côtés contradictoires fusionnent en côté indéterminé (ADR 0192).
+//! Pour `counsel_name`, la clé s'enrichit des évidences d'apposition : prénom
+//! devant l'occurrence → clé nom complet, barreau après l'occurrence → colonne
+//! `barreau` (slug officiel CNB). Le rôle explicite se capte au même endroit et
+//! les côtés contradictoires fusionnent en côté indéterminé.
 
 use crate::compiled::fold_stable;
 
@@ -98,10 +92,10 @@ pub fn resolve_key(value: &str) -> String {
     }
 }
 
-/// Slugs officiels des 164 barreaux du registre CNB — segment barreau des uid
-/// `cnb:<barreau>:<nom-prenom>` (ADR 0188). Table de normalisation embarquée
-/// (même statut que `FORM_SIGLES`) ; à rafraîchir si un rechargement CNB fait
-/// apparaître un barreau.
+/// Slugs officiels des barreaux du registre CNB — segment barreau des uid
+/// `cnb:<barreau>:<nom-prenom>`. Table de normalisation embarquée (même statut
+/// que `FORM_SIGLES`) ; à rafraîchir si un rechargement CNB fait apparaître un
+/// barreau.
 const BARREAU_SLUGS: &[&str] = &[
     "agen",
     "ain",
@@ -270,7 +264,10 @@ const BARREAU_SLUGS: &[&str] = &[
 ];
 
 /// Ville-siège d'usage courant dans les décisions → slug du barreau
-/// (départemental ou composé) correspondant.
+/// (départemental ou composé) correspondant. Les barreaux ultramarins n'y sont
+/// pas : leur graphie se dérive de `lj_core::outremer`
+/// ([`barreau_outremer`]), table partagée avec le correcteur de
+/// `jurisdiction_code`.
 const BARREAU_ALIAS: &[(&str, &str)] = &[
     ("avesnes", "avesnes-sur-helpe"),
     ("avranches", "coutances-avranches"),
@@ -282,7 +279,6 @@ const BARREAU_ALIAS: &[(&str, &str)] = &[
     ("bonneville", "bonneville-et-les-pays-du-montblanc"),
     ("bourg-en-bresse", "ain"),
     ("cahors", "lot"),
-    ("cayenne", "guyane"),
     ("cergy-pontoise", "val-d-oise"),
     ("charleville-mezieres", "ardennes"),
     ("chaumont", "haute-marne"),
@@ -296,33 +292,24 @@ const BARREAU_ALIAS: &[(&str, &str)] = &[
     ("evry", "essonne"),
     ("evry-courcouronnes", "essonne"),
     ("foix", "ariege"),
-    ("fort-de-france", "fort-de-france-(martinique)"),
     ("gap", "hautes-alpes"),
-    ("guadeloupe", "guadeloupe,-saint-martin,-saint-barthelemy"),
     ("gueret", "creuse"),
-    ("la-reunion", "saint-denis-de-la-reunion"),
     ("la-rochelle", "la-rochelle-rochefort"),
     ("le-puy", "haute-loire"),
     ("le-puy-en-velay", "haute-loire"),
     ("lons-le-saunier", "jura"),
-    ("martinique", "fort-de-france-(martinique)"),
     ("mende", "lozere"),
     ("montauban", "tarn-et-garonne"),
     ("nanterre", "hauts-de-seine"),
     ("niort", "deux-sevres"),
-    ("noumea", "noumea-(nouvelle-caledonie)"),
-    ("nouvelle-caledonie", "noumea-(nouvelle-caledonie)"),
-    ("papeete", "papeete---tahiti-(nouvelle-caledonie)"),
     ("perpignan", "pyrenees-orientales"),
     ("pontoise", "val-d-oise"),
     ("privas", "ardeche"),
     ("rochefort", "la-rochelle-rochefort"),
     ("rodez", "aveyron"),
     ("sables-d-olonne", "les-sables-d-olonne"),
-    ("saint-denis", "saint-denis-de-la-reunion"),
     ("saint-malo", "saint-malo-dinan"),
     ("sarlat", "bergerac-sarlat"),
-    ("tahiti", "papeete---tahiti-(nouvelle-caledonie)"),
     ("thonon", "thonon-les-bains,-leman-et-genevois"),
     ("thonon-les-bains", "thonon-les-bains,-leman-et-genevois"),
     ("troyes", "aube"),
@@ -396,8 +383,7 @@ const PRIVATE_HEADS: &[&str] = &[
     "comite social et economique",
 ];
 
-/// Nature de l'acteur (axe 1 fermé, ADR 0180). `None` = le moteur ne se
-/// prononce pas (règle #12 : pas de classification forcée).
+/// Nature de l'acteur (axe 1 fermé). `None` = le moteur ne se prononce pas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nature {
     Physique,
@@ -529,12 +515,11 @@ fn match_at(folded: &[char], at: usize, needle: &[char]) -> Option<usize> {
     Some(i)
 }
 
-/// Évidences de résolution d'un avocat (ADR 0188) : clé nom complet quand un
-/// prénom est trouvé en apposition devant une occurrence (« Me Laura JAVERT »
-/// pour la valeur `Javert`), slug du barreau en apposition après, rôle
-/// explicite (ADR 0192). Une valeur nom-seul sans prénom garde sa clé
-/// nom-seul — structurellement irrésoluble contre les dénominations
-/// complètes du registre.
+/// Évidences de résolution d'un avocat : clé nom complet quand un prénom est
+/// trouvé en apposition devant une occurrence (« Me Laura JAVERT » pour la
+/// valeur `Javert`), slug du barreau en apposition après, rôle explicite. Une
+/// valeur nom-seul sans prénom garde sa clé nom-seul — structurellement
+/// irrésoluble contre les dénominations complètes du registre.
 fn counsel_evidence(
     folded: &[char],
     value: &str,
@@ -559,12 +544,12 @@ fn counsel_evidence(
     (key, barreau, role)
 }
 
-/// Rôle explicite en apposition (ADR 0192). La substitution encadre le nom :
-/// « Me X, substituant Me Y » fait de X le `substituant` (présent à
-/// l'audience) et de Y le `substitue` (titulaire du dossier) ; « substitué
-/// par Me Z » inverse la lecture. `postulant`/`plaidant` suivent le nom
-/// (style CA). La fenêtre avant s'arrête au prochain « Me »/« Maître » pour
-/// ne jamais lire le marqueur de l'avocat voisin.
+/// Rôle explicite en apposition. La substitution encadre le nom : « Me X,
+/// substituant Me Y » fait de X le `substituant` (présent à l'audience) et de Y
+/// le `substitue` (titulaire du dossier) ; « substitué par Me Z » inverse la
+/// lecture. `postulant`/`plaidant` suivent le nom (style CA). La fenêtre avant
+/// s'arrête au prochain « Me »/« Maître » pour ne jamais lire le marqueur de
+/// l'avocat voisin.
 fn counsel_role(folded: &[char], start: usize, end: usize) -> Option<&'static str> {
     fn bare(t: &str) -> &str {
         t.trim_matches(|c: char| !c.is_alphanumeric())
@@ -608,6 +593,43 @@ fn counsel_role(folded: &[char], start: usize, end: usize) -> Option<&'static st
         prev = t;
     }
     None
+}
+
+/// Fenêtre d'apposition cabinet après une occurrence de counsel : « Me X **de
+/// la** SELARL Y ». S'ouvre sur les connecteurs que l'extraction utilise pour
+/// ébarber la queue (`trim_counsel_tail`), collés au nom, et se ferme au
+/// premier marqueur `me`/`maitre` — « Me X de la SCP Y, Me Z » ne rattache pas
+/// Z au cabinet. Renvoie `[début, fin)` de la zone où le span d'un `law_firm`
+/// vaut apposition.
+fn firm_window(folded: &[char], end: usize) -> Option<(usize, usize)> {
+    const LIENS: [&str; 6] = [" de la ", " de l'", " du ", " de ", " - ", " – "];
+    let to = (end + 64).min(folded.len());
+    let w: String = folded[end..to].iter().collect();
+    let lien = LIENS.iter().find(|l| w.starts_with(**l))?;
+    let from = end + lien.chars().count();
+    // Le nom du cabinet peut être précédé d'une forme sociale redondante
+    // (« de la SELARL SELARL LE GUILLOU RODRIGUES ») : la fenêtre couvre le reste,
+    // bornée par le marqueur de l'avocat voisin.
+    let mut close = to;
+    let mut i = from;
+    while i < to {
+        let tok = i;
+        while i < to && !folded[i].is_whitespace() {
+            i += 1;
+        }
+        let bare: String = folded[tok..i].iter().collect();
+        if matches!(
+            bare.trim_matches(|c: char| !c.is_alphanumeric()),
+            "me" | "maitre"
+        ) {
+            close = tok;
+            break;
+        }
+        while i < to && folded[i].is_whitespace() {
+            i += 1;
+        }
+    }
+    (from < close).then_some((from, close))
 }
 
 /// Prénom en apposition : le texte entre le dernier marqueur « me »/« maitre »
@@ -665,6 +687,7 @@ fn barreau_after(folded: &[char], end: usize) -> Option<String> {
         .iter()
         .copied()
         .chain(BARREAU_ALIAS.iter().map(|(a, _)| *a))
+        .chain(lj_core::outremer::graphies())
     {
         let bounded = s == k || s.strip_prefix(k).is_some_and(|r| r.starts_with('-'));
         if bounded && best.is_none_or(|b| k.len() > b.len()) {
@@ -675,8 +698,24 @@ fn barreau_after(folded: &[char], end: usize) -> Option<String> {
         BARREAU_ALIAS
             .iter()
             .find(|(a, _)| *a == k)
-            .map_or(k, |(_, c)| *c)
+            .map(|(_, c)| *c)
+            .or_else(|| barreau_outremer(k))
+            .unwrap_or(k)
             .to_string()
+    })
+}
+
+/// Barreau ultramarin depuis n'importe quelle graphie du lieu : le registre
+/// CNB nomme tantôt par ressort (« guyane »), tantôt par ville de siège
+/// (« fort-de-france-(martinique) »), là où la décision écrit l'autre — on
+/// essaie donc toute la classe d'équivalence ([`lj_core::outremer`]) contre
+/// les slugs officiels, en tête de slug.
+fn barreau_outremer(place: &str) -> Option<&'static str> {
+    lj_core::outremer::equivalents(place).iter().find_map(|q| {
+        BARREAU_SLUGS.iter().copied().find(|k| {
+            let k = lj_core::text::slug(k);
+            k == *q || k.strip_prefix(q).is_some_and(|r| r.starts_with('-'))
+        })
     })
 }
 
@@ -706,15 +745,18 @@ pub struct ActorRow {
     pub resolve_key: String,
     pub nature: Option<Nature>,
     pub barreau: Option<String>,
-    /// `substituant` | `substitue` | `postulant` | `plaidant` (ADR 0192),
-    /// `None` = aucun marqueur.
+    /// `substituant` | `substitue` | `postulant` | `plaidant`, `None` = aucun
+    /// marqueur.
     pub role: Option<&'static str>,
+    /// `ord` de la ligne `law_firm` apposée au conseil, `None` hors counsel ou sans
+    /// apposition lisible.
+    pub firm_ord: Option<i32>,
     pub char_starts: Vec<i32>,
     pub char_ends: Vec<i32>,
 }
 
-/// Cellule NER plate : (qualité, côté, valeurs) — l'ordre des cellules
-/// définit `ord` intra-décision, comme le backfill 0181.
+/// Cellule NER plate : (qualité, côté, valeurs) — l'ordre des cellules définit
+/// `ord` intra-décision.
 pub type Cell<'a> = (&'static str, Option<&'static str>, &'a [String]);
 
 /// Construit les lignes acteur d'une décision depuis ses cellules plates.
@@ -745,15 +787,16 @@ pub fn actor_rows_folded(folded: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
                 nature: nature(quality, value),
                 barreau,
                 role,
+                firm_ord: None,
                 char_starts,
                 char_ends,
             });
         }
     }
-    // Cohérence de côté (ADR 0192) : une même valeur counsel émise des deux
-    // côtés par le NER est du bruit — un avocat ne représente jamais les
-    // deux parties. Une seule ligne, côté indéterminé ; spans identiques
-    // par construction (même valeur pliée), premier rôle non-nul conservé.
+    // Cohérence de côté : une même valeur counsel émise des deux côtés par le NER
+    // est du bruit — un avocat ne représente jamais les deux parties. Une seule
+    // ligne, côté indéterminé ; spans identiques par construction (même valeur
+    // pliée), premier rôle non-nul conservé.
     let mut out: Vec<ActorRow> = Vec::with_capacity(rows.len());
     let mut counsel_at: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for r in rows {
@@ -777,6 +820,33 @@ pub fn actor_rows_folded(folded: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
             }
         }
     }
+    // Apposition cabinet : après la fusion de côté, donc sur les index définitifs
+    // — `ord` EST l'index de la ligne chez les deux écrivains. Le cabinet retenu
+    // est celui dont un span commence au plus tôt dans la fenêtre ouverte par le
+    // connecteur.
+    let firms: Vec<(usize, i32)> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.quality == "law_firm")
+        .flat_map(|(i, r)| r.char_starts.iter().map(move |s| (i, *s)))
+        .collect();
+    if !firms.is_empty() {
+        for row in out.iter_mut().filter(|r| r.quality == "counsel_name") {
+            row.firm_ord = row
+                .char_ends
+                .iter()
+                .filter_map(|e| firm_window(&folded, *e as usize))
+                .filter_map(|(from, close)| {
+                    firms
+                        .iter()
+                        .filter(|(_, s)| (from..close).contains(&(*s as usize)))
+                        .min_by_key(|(_, s)| *s)
+                        .map(|(j, s)| (*s, *j as i32))
+                })
+                .min()
+                .map(|(_, j)| j);
+        }
+    }
     out
 }
 
@@ -786,21 +856,17 @@ mod tests {
 
     #[test]
     fn resolve_key_depouille_les_tetes() {
-        // sigle de forme (avec ou sans points)
         assert_eq!(resolve_key("SAS BE LIVE HOTELS"), "be live hotels");
         assert_eq!(resolve_key("S.A.S. NACC"), "nacc");
-        // article + société + qualificatifs développés
         assert_eq!(
             resolve_key("la société par actions simplifiée Vinci Construction"),
             "vinci construction"
         );
         assert_eq!(resolve_key("Société MONTDIS"), "montdis");
-        // rien à dépouiller : le pliage canonique seul
         assert_eq!(
             resolve_key("Caisse primaire d'assurance maladie de Lille"),
             "caisse primaire d'assurance maladie de lille"
         );
-        // valeur réduite à une forme : repli sur le pliage entier
         assert_eq!(resolve_key("SELARL"), "selarl");
         assert_eq!(resolve_key("la SOCIÉTÉ Yoplait France"), "yoplait france");
         assert_eq!(
@@ -832,9 +898,7 @@ mod tests {
             nature("party", "l'association Les Amis de la Terre"),
             Some(Nature::MoralePrivee)
         );
-        // Tête inconnue : le moteur ne se prononce pas.
         assert_eq!(nature("party", "Yoplait France"), None);
-        // « régiment »/« régie » ne matchent pas « region  » (frontière).
         assert_eq!(nature("party", "la régie des transports"), None);
     }
 
@@ -844,7 +908,6 @@ mod tests {
         let folded: Vec<char> = fold_stable(text).chars().collect();
         let (s, e) = evidence_spans(&folded, "société Yoplait France");
         assert_eq!(s.len(), 2);
-        // 1ʳᵉ occurrence : double espace + saut de ligne appariés.
         assert_eq!((s[0], e[0]), (3, 26));
         let verbatim: String = text
             .chars()
@@ -869,25 +932,20 @@ mod tests {
 
     #[test]
     fn counsel_evidence_prenom_en_apposition() {
-        // Prénom capté devant l'occurrence → clé nom complet.
         let (key, _, _) = counsel(
             "représentée par Me Laura JAVERT, avocat au barreau de MÂCON",
             "Javert",
         );
         assert_eq!(key, "laura javert");
-        // Prénom composé (2 tokens).
         let (key, _, _) = counsel("assisté de Maître Jean Pierre MYRIEL, avocat", "Myriel");
         assert_eq!(key, "jean pierre myriel");
-        // Pas de prénom entre le marqueur et la valeur → clé nom-seul.
         let (key, _, _) = counsel("Mme A, représentée par Me Merll, demande", "Merll");
         assert_eq!(key, "merll");
-        // Valeur déjà nom complet : pliage canonique tel quel (ordre du texte).
         let (key, _, _) = counsel(
             "par Me Aline JONDRETTE-MABEUF, avocat",
             "Aline JONDRETTE-MABEUF",
         );
         assert_eq!(key, "aline jondrette-mabeuf");
-        // Sans occurrence corps : clé nom-seul, pas de barreau.
         let (key, barreau, _) = counsel("aucun rapport ici", "Dupont");
         assert_eq!(key, "dupont");
         assert_eq!(barreau, None);
@@ -900,44 +958,64 @@ mod tests {
             "Enjolras",
         );
         assert_eq!(b.as_deref(), Some("rouen"));
-        // Préposition « des » + slug composé.
         let (_, b, _) = counsel(
             "la SCP GILLENORMAND, représentée par Me GILLENORMAND, avocats au barreau des ARDENNES",
             "Gillenormand",
         );
         assert_eq!(b.as_deref(), Some("ardennes"));
-        // Alias ville-siège → barreau départemental.
         let (_, b, _) = counsel(
             "Me François GAVROCHE, avocat au barreau de BOBIGNY",
             "François GAVROCHE",
         );
         assert_eq!(b.as_deref(), Some("seine-saint-denis"));
-        // « de l' » + frontière (le texte continue après le slug).
         let (_, b, _) = counsel("Me X, avocat au barreau de l'ESSONNE, substitué par", "X");
         assert_eq!(b.as_deref(), Some("essonne"));
-        // Barreau inconnu du registre → None.
         let (_, b, _) = counsel("Me Y, avocat au barreau de RURITANIE", "Y");
         assert_eq!(b, None);
+    }
+
+    #[test]
+    fn counsel_barreau_outremer_par_ville_ou_ressort() {
+        for (texte, attendu) in [
+            ("Me A, avocat au barreau de CAYENNE", "guyane"),
+            ("Me A, avocat au barreau de la GUYANE", "guyane"),
+            (
+                "Me A, avocat au barreau de FORT-DE-FRANCE",
+                "fort-de-france-(martinique)",
+            ),
+            (
+                "Me A, avocat au barreau de POINTE-A-PITRE",
+                "guadeloupe,-saint-martin,-saint-barthelemy",
+            ),
+            ("Me A, avocat au barreau de MAMOUDZOU", "mayotte"),
+            (
+                "Me A, avocat au barreau de SAINT-DENIS",
+                "saint-denis-de-la-reunion",
+            ),
+            (
+                "Me A, avocat au barreau de SAINT-PIERRE DE LA REUNION",
+                "saint-pierre-de-la-reunion",
+            ),
+        ] {
+            let (_, b, _) = counsel(texte, "A");
+            assert_eq!(b.as_deref(), Some(attendu), "{texte}");
+        }
     }
 
     #[test]
     fn counsel_role_substitution() {
         let text =
             "les observations de Me Brevet, substituant Me Chenildieu, représentant le préfet";
-        // Le substituant est suivi du marqueur.
         let (_, _, r) = counsel(text, "Brevet");
         assert_eq!(r, Some("substituant"));
-        // Le titulaire est précédé de « substituant Me ».
         let (_, _, r) = counsel(text, "Chenildieu");
         assert_eq!(r, Some("substitue"));
-        // Construction inverse « substitué par ».
         let text =
             "Me Jenny FANTINE, avocat au barreau de DRAGUIGNAN substitué par Me Eve TOUSSAINT";
         let (_, _, r) = counsel(text, "Jenny FANTINE");
         assert_eq!(r, Some("substitue"));
         let (_, _, r) = counsel(text, "Eve TOUSSAINT");
         assert_eq!(r, Some("substituant"));
-        // Aucun marqueur → None.
         let (_, _, r) = counsel("représentée par Me Merll, demande au tribunal", "Merll");
         assert_eq!(r, None);
     }
@@ -950,8 +1028,6 @@ mod tests {
         assert_eq!(r, Some("postulant"));
         let (_, _, r) = counsel(text, "Florence BAHOREL");
         assert_eq!(r, Some("plaidant"));
-        // La fenêtre de COURFEYRAC s'arrête au « Me » suivant : jamais le marqueur
-        // du voisin. Symétriquement BAHOREL ne voit pas « postulant ».
         let (_, b, _) = counsel(text, "Pascal COURFEYRAC");
         assert_eq!(b.as_deref(), Some("macon"));
     }
@@ -968,7 +1044,6 @@ mod tests {
             "les observations de Me Brevet, substituant Me Chenildieu",
             &cells,
         );
-        // Chenildieu émis des deux côtés → UNE ligne, côté indéterminé.
         let chenildieu: Vec<_> = rows
             .iter()
             .filter(|r| canon(&r.value) == "chenildieu")
@@ -976,9 +1051,94 @@ mod tests {
         assert_eq!(chenildieu.len(), 1);
         assert_eq!(chenildieu[0].side, None);
         assert_eq!(chenildieu[0].role, Some("substitue"));
-        // Brevet garde son côté.
         let brevet = rows.iter().find(|r| r.value == "Brevet").unwrap();
         assert_eq!(brevet.side, Some("defendant"));
         assert_eq!(brevet.role, Some("substituant"));
+    }
+
+    /// Construit les lignes d'un côté demandeur et rend, par valeur counsel, la
+    /// valeur du cabinet apposé (déréférencée via `firm_ord`).
+    fn appose(text: &str, names: &[&str], firms: &[&str]) -> Vec<(String, Option<String>)> {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let firms: Vec<String> = firms.iter().map(|s| s.to_string()).collect();
+        let cells: Vec<Cell<'_>> = vec![
+            ("law_firm", Some("applicant"), &firms),
+            ("counsel_name", Some("applicant"), &names),
+        ];
+        let rows = actor_rows(text, &cells);
+        rows.iter()
+            .filter(|r| r.quality == "counsel_name")
+            .map(|r| {
+                (
+                    r.value.clone(),
+                    r.firm_ord.map(|o| rows[o as usize].value.clone()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apposition_cabinet_par_connecteur() {
+        let text = "Représenté par Me Dominique LE GUILLOU de la SELARL SELARL LE GUILLOU \
+                    RODRIGUES, Plaidant, avocat au barreau de QUIMPER. Représentée par \
+                    Me Lydie LAPOUS de la SELARL LEMASSON & ASSOCIES, avocat au barreau \
+                    de SAINT-BRIEUC";
+        let got = appose(
+            text,
+            &["Dominique LE GUILLOU", "Lydie LAPOUS"],
+            &["SELARL LE GUILLOU RODRIGUES", "SELARL LEMASSON & ASSOCIES"],
+        );
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "Dominique LE GUILLOU".to_string(),
+                    Some("SELARL LE GUILLOU RODRIGUES".to_string())
+                ),
+                (
+                    "Lydie LAPOUS".to_string(),
+                    Some("SELARL LEMASSON & ASSOCIES".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn apposition_cabinet_bornee_par_le_voisin() {
+        let text = "Me Alexis GRIMAUD, Me Olivia EMIN de la SELARL EYDOUX MODELSKI";
+        let got = appose(
+            text,
+            &["Alexis GRIMAUD", "Olivia EMIN"],
+            &["SELARL EYDOUX MODELSKI"],
+        );
+        assert_eq!(got[0].1, None);
+        assert_eq!(got[1].1.as_deref(), Some("SELARL EYDOUX MODELSKI"));
+
+        let got = appose(
+            "Me Alexis GRIMAUD SELARL EYDOUX MODELSKI",
+            &["Alexis GRIMAUD"],
+            &["SELARL EYDOUX MODELSKI"],
+        );
+        assert_eq!(got[0].1, None);
+
+        let loin = format!(
+            "Me Alexis GRIMAUD de la {} SELARL EYDOUX MODELSKI",
+            "x ".repeat(40)
+        );
+        let got = appose(&loin, &["Alexis GRIMAUD"], &["SELARL EYDOUX MODELSKI"]);
+        assert_eq!(got[0].1, None);
+    }
+
+    #[test]
+    fn apposition_cabinet_connecteurs_et_absence() {
+        let got = appose(
+            "Me Paul BERAUDO de l'AARPI MEROTTO AVOCATS",
+            &["Paul BERAUDO"],
+            &["AARPI MEROTTO AVOCATS"],
+        );
+        assert_eq!(got[0].1.as_deref(), Some("AARPI MEROTTO AVOCATS"));
+
+        let got = appose("Me Paul BERAUDO de la SCP INCONNUE", &["Paul BERAUDO"], &[]);
+        assert_eq!(got[0].1, None);
     }
 }

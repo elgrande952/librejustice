@@ -1,8 +1,8 @@
-//! Encart « Parties » de la page décision (ADR 0224). Acteurs extraits de la
-//! décision (`decision_party`), **résolus au registre uniquement** — même
-//! règle que les références de lois : pas de fiche, pas d'affichage. Gabarit
-//! à la  : une carte par côté (demandeurs / défendeurs), les conseils
-//! du côté rattachés sous ses parties. Rien rendu si aucun acteur résolu.
+//! Encart « Parties » de la page décision. Acteurs extraits de la décision
+//! (`decision_party`), **résolus au registre uniquement** — même règle que les
+//! références de lois : pas de fiche, pas d'affichage. Gabarit façon secteur :
+//! une carte par côté (demandeurs / défendeurs), les conseils du côté rattachés
+//! sous ses parties. Rien rendu si aucun acteur résolu.
 
 use leptos::prelude::*;
 use leptos_router::components::A;

@@ -19,6 +19,9 @@ extern "C" {
     #[wasm_bindgen(js_name = "updatePassword", catch)]
     fn js_update_password(password: &str) -> Result<js_sys::Promise, JsValue>;
 
+    #[wasm_bindgen(js_name = "verifyEmailOtp", catch)]
+    fn js_verify_email_otp(token_hash: &str, kind: &str) -> Result<js_sys::Promise, JsValue>;
+
     // `getAccessToken` / `onAuthStateChange` : memes exports que `src/auth/`, lus
     // ici sous des noms Rust page-level (le jeton sert d'indicateur de session).
     #[wasm_bindgen(js_name = "getAccessToken")]
@@ -64,6 +67,11 @@ pub async fn resend_signup(email: &str) -> Result<(), String> {
 /// Mise a jour du mot de passe courant. `Err` = message FR traduit.
 pub async fn update_password(password: &str) -> Result<(), String> {
     await_void_translated(js_update_password(password)).await
+}
+
+/// Verification d'un lien de mail par `token_hash`. `Err` = message FR traduit.
+pub async fn verify_email_otp(token_hash: &str, kind: &str) -> Result<(), String> {
+    await_void_translated(js_verify_email_otp(token_hash, kind)).await
 }
 
 /// Jeton de session courant, ou `None`.

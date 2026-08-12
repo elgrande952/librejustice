@@ -1,5 +1,5 @@
 {
-  "_provenance": "GT des fonctions pures de construction de requête de lj-api/src/search.rs (detect_query_mode / translate_boolean / phrase_combo_parse / tokenize_body / content_chunks). Capturée à l'origine depuis l'oracle Python (retiré, ADR 0061) ; maintenue à la main depuis : split + strip alignés sur les stopwords de l'index chunks_bm25 (migration 0048) et dédup des clauses S5 encodés le 2026-06-10. Asservie par query_construction_parity_oracle (search.rs).",
+  "_provenance": "GT des fonctions pures de construction de requête de lj-api/src/search.rs (detect_query_mode / translate_boolean / phrase_combo_parse / tokenize_body / content_chunks). Capturée à l'origine depuis l'oracle Python (retiré, ADR 0061) ; maintenue à la main depuis : split + strip alignés sur les stopwords de l'index chunks_bm25 (migration 0048) et dédup des clauses S5 encodés le 2026-06-10. Asservie par query_construction_parity_oracle (search.rs). Proximité `PROCHE`/`NEAR` réécrite en phrase à slop tantivy le 2026-07-27 (forme infixe `A PROCHE5 B` → `\"A B\"~5` ; opérateur pendant droppé).",
   "cases": [
     {
       "query": "expulsion locative",
@@ -219,7 +219,7 @@
     {
       "query": "travail PROCHE3 dimanche",
       "mode": "lexical",
-      "translate_boolean": "+travail +PROCHE3 +dimanche",
+      "translate_boolean": "+\"travail dimanche\"~3",
       "phrase_combo_parse": "travail proche3 dimanche \"travail proche3 dimanche\"",
       "tokenize_body": [
         "travail",
@@ -237,7 +237,7 @@
     {
       "query": "\"travail dominical\"PROCHE3",
       "mode": "lexical",
-      "translate_boolean": "+\"travail dominical\" +~3",
+      "translate_boolean": "+\"travail dominical\"",
       "phrase_combo_parse": "travail dominical proche3 \"travail dominical proche3\"",
       "tokenize_body": [
         "travail",

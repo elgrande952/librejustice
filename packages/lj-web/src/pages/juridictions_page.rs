@@ -1,4 +1,4 @@
-//! Hubs juridiction (ADR 0253) — l'arborescence navigable vers les décisions :
+//! Hubs juridiction — l'arborescence navigable vers les décisions :
 //! `/juridictions` (catalogue par famille) → `/juridiction/{code}` (années)
 //! → `/juridiction/{code}/{annee}?page=N` (liste paginée de liens décision).
 //! Pages SSR crawlables : chaque décision est à quelques clics de la home.
@@ -14,6 +14,7 @@ use lj_dtos::{
 };
 
 use crate::api::ApiClient;
+use crate::components::own_page_description;
 use crate::pages::law_page::data::{sendable, PageError};
 
 /// Nombre avec séparateur de milliers FR (espace fine insécable).
@@ -30,7 +31,7 @@ pub(crate) fn fmt_count(n: i64) -> String {
 }
 
 /// JSON-LD `BreadcrumbList` schema.org d'un fil d'Ariane (label, url absolue).
-/// Partagé avec la page décision (maillage retour, ADR 0253).
+/// Partagé avec la page décision.
 pub(crate) fn breadcrumb_jsonld(items: &[(&str, String)]) -> String {
     let elements: Vec<_> = items
         .iter()
@@ -110,8 +111,18 @@ pub(crate) fn HubBreadcrumb(items: Vec<(String, Option<String>)>) -> impl IntoVi
                 .into_iter()
                 .enumerate()
                 .map(|(i, (label, href))| {
+                    // Le séparateur est TOUJOURS dans le DOM, masqué au premier
+                    // item par une classe. Un `Option` en tête de fragment répété
+                    // n'émet son marqueur d'hydratation que dans la branche `None`
+                    // une fois `debug_assertions` coupé : le curseur de nœuds du
+                    // client se désynchronise dès le 2e item et tachys panique
+                    // (`failed_to_cast_marker_node`), tuant l'hydratation de toute
+                    // la page.
+                    let separator_class = if i > 0 { "" } else { "hidden" };
                     view! {
-                        {(i > 0).then(|| view! { <span aria-hidden="true">"›"</span> })}
+                        <span aria-hidden="true" class=separator_class>
+                            "›"
+                        </span>
                         {match href {
                             Some(href) => Either::Left(
                                 view! {
@@ -137,6 +148,10 @@ pub(crate) fn HubBreadcrumb(items: Vec<(String, Option<String>)>) -> impl IntoVi
 
 #[component]
 pub fn JuridictionsPage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) :
+    // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
+    own_page_description();
+
     let catalogue = Resource::new_blocking(
         || (),
         |_| {
@@ -252,6 +267,10 @@ fn JuridictionGroup(group: JurisdictionTypeGroup) -> impl IntoView {
 
 #[component]
 pub fn JuridictionHubPage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) :
+    // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
+    own_page_description();
+
     let params = use_params_map();
     let hub = Resource::new_blocking(
         move || params.get().get("code").unwrap_or_default(),
@@ -372,6 +391,10 @@ fn JuridictionHubLoaded(hub: JurisdictionHubResponse) -> impl IntoView {
 
 #[component]
 pub fn JuridictionYearPage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) :
+    // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
+    own_page_description();
+
     let params = use_params_map();
     let query = use_query_map();
     let page_data = Resource::new_blocking(

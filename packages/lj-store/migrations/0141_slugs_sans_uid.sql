@@ -1,4 +1,4 @@
--- Slugs sans uid (ADR 0206).
+-- Slugs sans uid.
 --
 -- 1) Textes étrangers : radical débarrassé des marqueurs pays (gentilé, nom de
 --    pays, token alpha-2 historique, préfixe de dataset `jaf-`), identité pays

@@ -1,30 +1,66 @@
-//! Job `usage-terms` (ADR 0248) : matérialise `legal_article_usage` — sacs de
-//! n-grammes des contextes de citation (signal d'usage). Depuis l'ADR 0250
-//! (citations procédurales stockées), toutes les identités passent par le
-//! graphe `legal_citation` — y compris 700 CPC / L761-1.
+//! Job `usage-terms` : matérialise `legal_article_usage` — sacs de n-grammes
+//! des contextes de citation (signal d'usage). Toutes les identités passent par le
+//! graphe `legal_citation`, citations procédurales comprises.
+//!
+//! Le coût est dominé par la lecture TOAST des `full_text` échantillonnés (I/O) :
+//! les chunks, indépendants par construction, sont répartis sur `workers`
+//! connexions.
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
 use crate::config::Settings;
 
-pub async fn run(chunks: i32, min_citations: i64) -> Result<()> {
+pub async fn run(chunks: usize, min_citations: i64, workers: usize) -> Result<()> {
     let settings = Settings::from_env()?;
-    let pool =
-        lj_store::db::build_pool(&settings.db_url, 1).map_err(|e| anyhow!("build_pool: {e}"))?;
-    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    let repo = lj_store::repository::DecisionRepository::new(&conn);
+    let pool = lj_store::db::build_pool(&settings.db_url, workers)
+        .map_err(|e| anyhow!("build_pool: {e}"))?;
 
-    let pool_size = repo.usage_terms_build_pool(chunks, min_citations).await?;
-    println!("pool : {pool_size} identités (≥{min_citations} citations), {chunks} chunks");
-    let reset = repo.usage_terms_reset().await?;
-    println!("reset : {reset} sacs remis à NULL");
-    let mut total = 0u64;
-    for chunk in 0..chunks {
-        let n = repo.usage_terms_fill_chunk(chunk).await?;
-        total += n;
-        println!("chunk {chunk}/{chunks} : {n} sacs");
+    let identities = {
+        let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+        let repo = lj_store::repository::DecisionRepository::new(&conn);
+        let identities = repo.usage_terms_pool(min_citations).await?;
+        let reset = repo.usage_terms_reset().await?;
+        println!(
+            "pool : {} identités (≥{min_citations} citations), {chunks} chunks, {workers} workers ; reset : {reset} sacs",
+            identities.len()
+        );
+        Arc::new(identities)
+    };
+
+    let next = Arc::new(AtomicUsize::new(0));
+    let total = Arc::new(AtomicU64::new(0));
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..workers {
+        let pool = pool.clone();
+        let identities = Arc::clone(&identities);
+        let next = Arc::clone(&next);
+        let total = Arc::clone(&total);
+        set.spawn(async move {
+            let per_chunk = identities.len().div_ceil(chunks);
+            loop {
+                let chunk = next.fetch_add(1, Ordering::Relaxed);
+                if chunk >= chunks {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                let start = chunk * per_chunk;
+                let end = (start + per_chunk).min(identities.len());
+                let (uids, nums): (Vec<String>, Vec<String>) =
+                    identities[start..end].iter().cloned().unzip();
+                let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+                let repo = lj_store::repository::DecisionRepository::new(&conn);
+                let n = repo.usage_terms_fill_batch(&uids, &nums).await?;
+                total.fetch_add(n, Ordering::Relaxed);
+                println!("chunk {chunk}/{chunks} : {n} sacs");
+            }
+        });
     }
-    println!("sacs matérialisés : {total}");
+    while let Some(joined) = set.join_next().await {
+        joined.map_err(|e| anyhow!("worker: {e}"))??;
+    }
+    println!("sacs matérialisés : {}", total.load(Ordering::Relaxed));
 
     Ok(())
 }

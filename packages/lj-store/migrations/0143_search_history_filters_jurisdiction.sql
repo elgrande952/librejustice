@@ -1,4 +1,4 @@
--- Migration 0143 — filtres d'historique : clé `jurisdictionType` (ADR 0210).
+-- Migration 0143 — filtres d'historique : clé `jurisdictionType`.
 --
 -- `user_search_history.filters` est la projection serde du `SearchRequest`
 -- (camelCase). Le renommage 0142 fait écrire `jurisdictionType` ; les lignes

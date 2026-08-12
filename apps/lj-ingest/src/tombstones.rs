@@ -1,18 +1,15 @@
-//! Propagation des suppressions Judilibre vers la base (ADR 0087).
+//! Propagation des suppressions Judilibre vers la base.
 //!
 //! Le downloader (`lj-sources`) écrit une tombstone par décision supprimée côté
 //! Judilibre (action `deleted` de `/transactionalhistory`) dans
 //! `tombstones.jsonl`, puis `compact_archives` la retire du cache JSONL local.
-//! Mais compacter le cache ne dit jamais à Postgres de supprimer la ligne : sans
-//! ce module, une décision retirée par la Cour de cassation reste servie
-//! indéfiniment (le seul autre chemin de hard-delete, `reverses`, ne couvre que
-//! l'opendata).
+//! Compacter le cache ne dit rien à Postgres : c'est ce module qui supprime la
+//! ligne.
 //!
 //! On lit `tombstones.jsonl`, on reconstruit le `source_uid` (`judilibre/{id}`,
 //! cf. `parse_judilibre`) et on hard-delete via `DecisionRepository::delete`
 //! (cascade chunks/texte/refs, même chemin que `reverses`). Idempotent : un id
-//! déjà absent renvoie `false` — on re-traite le fichier entier à chaque ingest,
-//! comme `reverses` re-traite ses CSV.
+//! déjà absent renvoie `false` — on re-traite le fichier entier à chaque ingest.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -92,7 +89,6 @@ pub async fn prune_tombstones(
 mod tests {
     use super::*;
 
-    // Spec : dédup des ids, ordre stable, lignes vides ignorées.
     #[test]
     fn parse_dedups_and_skips_blanks() {
         let text = concat!(
@@ -108,7 +104,6 @@ mod tests {
         );
     }
 
-    // Spec : id absent ou vide → sauté (pas d'entrée fantôme).
     #[test]
     fn parse_skips_missing_or_empty_id() {
         let text = "{\"deleted_at\":\"x\"}\n{\"id\":\"\"}\n{\"id\":\"ok\"}\n";
@@ -116,7 +111,6 @@ mod tests {
         assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec!["ok".to_string()]);
     }
 
-    // Spec : ligne JSON invalide = erreur franche (pas de silence).
     #[test]
     fn parse_rejects_invalid_json() {
         assert!(parse_tombstone_ids("not json\n").is_err());

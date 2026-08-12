@@ -1,5 +1,4 @@
-//! Sections de rendu d'une décision (renderer pur). Port de
-//! `apps/web/src/lib/decision-sections.ts`.
+//! Sections de rendu d'une décision (renderer pur).
 
 use lj_dtos::{CitationSpan, DecisionDetail};
 
@@ -7,7 +6,7 @@ use lj_dtos::{CitationSpan, DecisionDetail};
 /// DTO `DecisionSection` (`kind`/`anchor`/`label`/`paragraphs`).
 ///
 /// `paragraph_spans` : mentions de citation cliquables alignées index-à-index sur
-/// `paragraphs` (ADR 0134). Vide ⇒ paragraphes en texte brut.
+/// `paragraphs`. Vide ⇒ paragraphes en texte brut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderSection {
     pub id: String,
@@ -22,7 +21,7 @@ fn spans_at(spans: &[Vec<CitationSpan>], i: usize) -> Vec<CitationSpan> {
     spans.get(i).cloned().unwrap_or_default()
 }
 
-/// Sections de rendu d'une décision. Port de `resolveDecisionSections` :
+/// Sections de rendu d'une décision :
 /// - `detail.sections` non-vide ⇒ map `{id: anchor, title: label, paragraphs}` ;
 /// - sinon `detail.paragraphs` vide ⇒ `[]` ;
 /// - sinon un bloc unique « Texte intégral » (ancre `texte-integral`).
@@ -60,10 +59,9 @@ pub struct TocEntry {
     pub title: String,
 }
 
-/// Sommaire de la décision. Port de la logique `tocSections` de
-/// `decision-page.tsx` : entrée `Synthèse` en tête, puis une entrée par `kind`
-/// canonique (première occurrence, ancrée sur `anchor`), avec repli sur les
-/// sections rendues quand l'API n'en fournit pas.
+/// Sommaire de la décision : entrée `Synthèse` en tête, puis une entrée par
+/// `kind` canonique (première occurrence, ancrée sur `anchor`), avec repli sur
+/// les sections rendues quand l'API n'en fournit pas.
 pub fn toc_sections(detail: &DecisionDetail, body_sections: &[RenderSection]) -> Vec<TocEntry> {
     let mut toc_body: Vec<TocEntry> = Vec::new();
     let mut seen_kinds: Vec<String> = Vec::new();

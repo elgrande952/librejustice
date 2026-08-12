@@ -1,10 +1,10 @@
-//! `ActiveFilterChips` — chips des filtres actifs sous la barre (gabarit
-//! de référence) : une chip par valeur sélectionnée (✕ = retrait), les bornes de
-//! dates fusionnées en une seule chip, « Tout effacer » à droite.
+//! `ActiveFilterChips` — chips des filtres actifs sous la barre : une chip par
+//! valeur sélectionnée (✕ = retrait), les bornes de dates fusionnées en une seule
+//! chip, « Tout effacer » à droite.
 //!
 //! `decision_chips` est pure (ParamsMap + facettes → chips) : les libellés se
-//! résolvent dans les facettes courantes, une valeur absente (URL partagée)
-//! retombe sur sa valeur brute.
+//! résolvent dans les facettes courantes, une valeur absente retombe sur sa
+//! valeur brute.
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_query_map;
@@ -45,7 +45,7 @@ pub fn decision_chips(map: &ParamsMap, facets: Option<&SearchFacets>) -> Vec<Act
             label,
         });
     }
-    // Office : facette plate à valeurs suffixe (`JEX`), ADR 0163.
+    // Office : facette plate à valeurs suffixe (`JEX`).
     let office = facets.map(|f| f.office.as_slice()).unwrap_or_default();
     for v in all("office") {
         let label = office
@@ -94,9 +94,8 @@ pub fn decision_chips(map: &ParamsMap, facets: Option<&SearchFacets>) -> Vec<Act
         }
     }
 
-    // Textes cités : instruments (`li`, libellé catalogue) et articles (`la`,
-    // clés composites « instrument|article », ADR 0071) — libellé
-    // « instrument · art. N ».
+    // Textes cités : instruments (`li`, libellé catalogue) et articles (`la`, clés
+    // composites « instrument|article ») — libellé « instrument · art. N ».
     let instruments = facets
         .map(|f| f.legal_instrument.as_slice())
         .unwrap_or_default();
@@ -127,7 +126,6 @@ pub fn decision_chips(map: &ParamsMap, facets: Option<&SearchFacets>) -> Vec<Act
         });
     }
 
-    // Dates : une seule chip pour `from`+`to`.
     let from = map.get("dateFrom").unwrap_or_default();
     let to = map.get("dateTo").unwrap_or_default();
     let date_label = match (from.is_empty(), to.is_empty()) {
@@ -152,8 +150,8 @@ pub fn ActiveFilterChips(#[prop(into)] facets: Signal<Option<SearchFacets>>) -> 
     let query_map = use_query_map();
     let nav = Nav::new();
 
-    // Map courante avec `q` réécrit par le texte (non soumis) de la barre —
-    // même règle que les mutations de la barre de filtres (contexte DraftQuery).
+    // Map courante avec `q` réécrit par le texte non soumis de la barre (contexte
+    // `DraftQuery`).
     let draft = use_context::<DraftQuery>().map(|d| d.0);
     let effective_map = move || {
         let mut map = query_map.get_untracked();
@@ -185,10 +183,9 @@ pub fn ActiveFilterChips(#[prop(into)] facets: Signal<Option<SearchFacets>>) -> 
     view! {
         <Show when=move || !chips.with(|c| c.is_empty())>
             <div class="flex flex-wrap items-center gap-2">
-                // Clé = key:value:LABEL : le libellé arrive avec les facettes
-                // (après la chip, rendue d'abord sur la valeur brute) — l'inclure
-                // dans la clé reconstruit la ligne à la résolution. Une poignée de
-                // chips : reconstruction triviale, pas de signal par ligne.
+                // Clé = key:value:LABEL : le libellé arrive avec les facettes, après la chip
+                // rendue d'abord sur la valeur brute ; l'inclure dans la clé reconstruit la
+                // ligne à la résolution.
                 <For
                     each=move || chips.get()
                     key=|chip: &ActiveChip| format!("{}:{}:{}", chip.key, chip.value, chip.label)
@@ -337,7 +334,6 @@ mod tests {
         let dates: Vec<&ActiveChip> = chips.iter().filter(|c| c.key == "dates").collect();
         assert_eq!(dates.len(), 1);
         assert_eq!(dates[0].label, "Du 2020-01-01 au 2021-06-30");
-        // Borne seule.
         let m = map_of(&[("dateFrom", "2020-01-01")]);
         let chips = decision_chips(&m, None);
         assert_eq!(chips[0].label, "Depuis le 2020-01-01");

@@ -15,14 +15,11 @@ infra/data/
 # (OFL), versionnée en LFS. Idem, la règle `data/` la masquerait.
 !packages/lj-api/data/
 # Données embarquées (include_str!) du crate lj-extract : gazetteer CCN, alias
-# d'instruments et de liaison (ADR 0145). Idem, la règle `data/` les masquerait.
+# d'instruments et de liaison. Idem, la règle `data/` les masquerait.
 !packages/lj-extract/data/
 
-# GT de ranking (lj-bench) : on ne versionne que la GT finale `<slug>.json` +
-# `_meta_extra_*.json`. Le scratch régénérable (pools, `_bodies_*/`,
-# `_summaries_*/`, méta yaml, archives) est désormais écrit dans `bench_dir`
-# (`<state_dir>/bench`, hors repo — règle #17) ; ces règles restent un garde-fou
-# pour la GT versionnée et un `_pool_*.json` égaré.
+# GT de ranking : seule la GT finale est versionnée. Le scratch régénérable vit
+# hors du repo, sous `state_dir` ; ces règles restent un garde-fou.
 apps/lj-bench/gt/ranking/*
 !apps/lj-bench/gt/ranking/*.json
 apps/lj-bench/gt/ranking/_pool_*.json

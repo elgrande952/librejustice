@@ -1,41 +1,41 @@
-//! Layout applicatif. Port de `components/layout/app-shell.tsx` (avec
-//! `DecisionBarProvider`). `children()` recoit l'`<Outlet/>` du Router.
+//! Layout applicatif. `children()` recoit
+//! l'`<Outlet/>` du Router.
 
 use leptos::prelude::*;
 use leptos_meta::Meta;
-use leptos_router::hooks::use_location;
 
 use crate::components::decision_bar::provide_decision_bar_contexts;
 use crate::components::{Footer, TopBar};
 use crate::seo::site_default;
 
 /// Drapeau de suppression de la `<meta description>` generique du site, lu par
-/// `AppShell` et pose par les pages qui n'en veulent pas (404 `NotFound`, en
-/// `robots noindex` sans description — parite avec l'export `meta` RR qui
-/// remplace la racine). La page decision passe deja par le filtre de path
-/// `/decision/*` (elle emet sa propre description ou aucune), donc n'a pas
-/// besoin de ce drapeau.
+/// `AppShell` et pose par les pages qui n'en veulent pas ou qui posent la leur
+/// (`own_page_description`).
 #[derive(Clone, Copy)]
 pub struct SuppressSiteDescription(pub RwSignal<bool>);
 
+/// Declare que la page emet sa propre `<meta name="description">` : la generique
+/// du site est retiree le temps ou la page est montee.
+///
+/// A appeler depuis le composant de route, synchroniquement : le `<head>` est
+/// serialise avant la resolution des `<Suspense>`, et une declaration venue d'un
+/// corps asynchrone arrive apres coup, laissant DEUX balises `description`.
+pub fn own_page_description() {
+    let suppress = expect_context::<SuppressSiteDescription>();
+    suppress.0.set(true);
+    on_cleanup(move || suppress.0.set(false));
+}
+
 #[component]
 pub fn AppShell(children: Children) -> impl IntoView {
-    // Contextes barre decision : ancetre de la TopBar (consommateur) et des pages
-    // routees (DecisionHeader / cartes resultats / voisines, producteurs).
     provide_decision_bar_contexts();
 
-    // `<Meta name="description">` generique du site. Pose ici (dans le Router)
-    // plutot qu'au niveau `App` : sur `/decision/*` la page emet sa propre
-    // description (et la branche erreur n'en emet aucune, comme le `meta`
-    // noindex de RR), donc on supprime la generique pour ne jamais avoir deux
-    // balises `description`. Reactif : a la navigation client la balise se
-    // monte/demonte selon la route, comme le remplacement de meta de RR.
-    let location = use_location();
+    // `<Meta name="description">` generique du site. Une page qui pose la sienne
+    // appelle `own_page_description()`, qui leve `suppress`.
     let suppress = RwSignal::new(false);
     provide_context(SuppressSiteDescription(suppress));
     let default_description = move || {
-        let on_content_route = !location.pathname.get().starts_with("/decision") && !suppress.get();
-        on_content_route.then(|| {
+        (!suppress.get()).then(|| {
             view! { <Meta name="description" content=site_default().description /> }
         })
     };
@@ -54,10 +54,8 @@ pub fn AppShell(children: Children) -> impl IntoView {
             </main>
             <Footer />
         </div>
-        // Apres `children()` : une page (ex. NotFound) qui pose `suppress` pendant
-        // son rendu synchrone est ainsi vue par cette cloture au moment de la
-        // serialisation SSR (ordre d'arbre). La balise sort toujours dans le
-        // <head> (leptos_meta), la position ici ne sert qu'a l'ordre de lecture.
+        // Apres `children()` : une page qui pose `suppress` pendant son rendu synchrone
+        // est ainsi vue par cette cloture au moment de la serialisation SSR.
         {default_description}
     }
 }

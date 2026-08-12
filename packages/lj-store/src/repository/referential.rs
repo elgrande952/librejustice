@@ -1,13 +1,13 @@
-//! Textes & articles de loi (`legal_text` / `legal_article`, ADR 0112) : upsert des
+//! Textes & articles de loi (`legal_text` / `legal_article`) : upsert des
 //! textes/articles, suppression LEGI par chemins, law-at-date, timeline des
 //! versions, résolution de code, décisions citantes et sitemaps.
 //!
-//! ADR 0112 : l'identité d'un texte = `text_uid` (globalement unique, `source` hors
-//! clé) ; l'identité d'une version d'article = `(text_uid, num_key, date_debut)`.
-//! `source`/`source_uid`/`source_url` sont la PROVENANCE par version. Les citations
-//! des décisions vivent dans `legal_citation` (module `citations`, ADR 0145),
-//! liées au catalogue par le linker de la passe d'extraction.
+//! L'identité d'un texte = `text_uid` (globalement unique, `source` hors clé) ;
+//! l'identité d'une version d'article = `(text_uid, num_key, date_debut)`.
+//! `source`/`source_uid`/`source_url` sont la provenance par version. Les
+//! citations des décisions vivent dans `legal_citation` (module `citations`).
 
+use super::norm_hubs::{NORM_FOND_EXPR, NORM_SCOPE};
 use super::support::legal_article_row_from_row;
 use super::types::{
     ArticleNeighborRow, ArticleRankHit, ArticleRrf, ArticleSearchRow, ArticleSearchStats,
@@ -16,22 +16,20 @@ use super::types::{
     LegalTextRow, SlugSourceRow, TocArticleRow, TocReadingRow,
 };
 use super::DecisionRepository;
-use crate::error::Result;
+use crate::error::{Result, StoreError};
 use chrono::NaiveDate;
-use lj_core::article_order::num_key_sort_key;
+use lj_core::normalizer::normalize_chars;
 use tokio_postgres::types::ToSql;
 
 /// Seuil de bascule des pages « décisions citantes » vers la marche par
-/// récence (ADR 0250) : au-delà de ce nombre de décisions citantes
-/// (`citing_decision_counts`, rebuild hebdo), le bitmap GIN + tri top-N
-/// visite trop de postings ; la marche descendante de l'index date de
-/// `decisions` trouve ses `limit` hits en ~`limit × N/df` itérations.
-const CITING_RECENCY_WALK_MIN_COUNT: i64 = 100_000;
+/// récence, en nombre de décisions citantes (`citing_decision_counts`).
+/// Partagé avec les citantes d'une division (`citations.rs`), qui l'applique à
+/// la somme des décomptes de ses articles.
+pub(super) const CITING_RECENCY_WALK_MIN_COUNT: i64 = 100_000;
 
 impl DecisionRepository<'_> {
-    /// Lit le référentiel `facet_value` entier (ADR 0146) : labels FR,
-    /// hiérarchie (`parent_uid`) et ordre d'affichage, dans l'ordre du seed
-    /// (`facet, sort`). Alimente le cache référentiel in-process de `lj-api`.
+    /// Lit le référentiel `facet_value` entier : labels FR, hiérarchie
+    /// (`parent_uid`) et ordre d'affichage, dans l'ordre du seed (`facet, sort`).
     #[tracing::instrument(name = "db.load_facet_values", skip(self), fields(db.system = "postgresql"))]
     pub async fn load_facet_values(&self) -> Result<Vec<FacetValueRow>> {
         let rows = self
@@ -55,10 +53,9 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Lit le référentiel `jurisdiction` entier (ADR 0146) : une ligne par
-    /// unité juridictionnelle (`tj_le_havre`, `ca_paris`…) avec code source,
-    /// type, ville et label FR. Alimente le cache référentiel in-process de
-    /// `lj-api` et les snapshots d'extraction (par `source_code`, ADR 0201).
+    /// Lit le référentiel `jurisdiction` entier : une ligne par unité
+    /// juridictionnelle (`tj_le_havre`, `ca_paris`…) avec code source, type,
+    /// ville et label FR.
     #[tracing::instrument(name = "db.load_jurisdictions", skip(self), fields(db.system = "postgresql"))]
     pub async fn load_jurisdictions(&self) -> Result<Vec<JurisdictionRow>> {
         let rows = self
@@ -80,24 +77,12 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Upsert idempotent (#7) d'un texte de loi sur son identité `text_uid`. Réécrit
-    /// le catalogue à chaque incrément ; rejoue sans dupliquer. `title_key` (=
-    /// `normalize_instrument(title)`) est calculé par l'appelant et stocké tel quel.
-    ///
-    /// Ne touche jamais `slug` : un slug est immuable une fois posé (ADR 0162) et
-    /// son unique écrivain est la passe [`Self::set_text_slugs`].
-    ///
-    /// Deux invariants inter-fonds (ADR 0225) :
-    /// - `body` n'est jamais **effacé** par un upsert qui n'en apporte pas —
-    ///   les corps viennent de passes dédiées (circulaires ADR 0222,
-    ///   traités/TI ADR 0223) que les syncs de métadonnées ne doivent pas
-    ///   balayer ;
-    /// - une fiche `jurisdiction='INTL'` (traité, taggée par le fond JORF,
-    ///   détection plus informée — ADR 0109) n'est pas rétrogradée par un
-    ///   fond qui revoit le même CID en DECRET/LOI (des décrets de
-    ///   publication vivent aussi en LEGI TNC).
+    /// Upsert idempotent d'un texte de loi sur son identité `text_uid`. `title_key`
+    /// (= `normalize_instrument(title)`) est calculé par l'appelant. Ne touche
+    /// jamais `slug`, posé par [`Self::set_text_slugs`], et n'efface jamais `body`.
     #[tracing::instrument(name = "db.upsert_legal_text", skip(self, text), fields(db.system = "postgresql"))]
     pub async fn upsert_legal_text(&self, text: &LegalTextRow) -> Result<()> {
+        let body = text.body.as_deref().map(normalize_chars);
         self.conn
             .execute(
                 "
@@ -107,14 +92,10 @@ impl DecisionRepository<'_> {
                    body, status)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT (text_uid) DO UPDATE SET
-                  jurisdiction = CASE WHEN legal_text.jurisdiction = 'INTL'
-                                      THEN legal_text.jurisdiction
-                                      ELSE EXCLUDED.jurisdiction END,
+                  jurisdiction = EXCLUDED.jurisdiction,
                   title = EXCLUDED.title,
                   title_key = EXCLUDED.title_key,
-                  nature = CASE WHEN legal_text.jurisdiction = 'INTL'
-                                THEN legal_text.nature
-                                ELSE EXCLUDED.nature END,
+                  nature = EXCLUDED.nature,
                   last_modified = EXCLUDED.last_modified,
                   date_texte = EXCLUDED.date_texte,
                   date_publi = EXCLUDED.date_publi,
@@ -136,7 +117,7 @@ impl DecisionRepository<'_> {
                     &text.eli,
                     &text.nor,
                     &text.instrument_key,
-                    &text.body,
+                    &body,
                     &text.status,
                 ],
             )
@@ -144,11 +125,9 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Insère un texte **seulement s'il est absent** (`ON CONFLICT DO NOTHING`).
-    /// Règle d'autorité de l'ingest JORF complet (ADR 0246, plan phase 4) : un
-    /// JORFTEXT déjà porté (version consolidée LEGI/TNC, corps curé) n'est
-    /// jamais écrasé par la fiche d'origine du fond JO. Renvoie `true` si la
-    /// ligne a été créée.
+    /// Insère un texte seulement s'il est absent (`ON CONFLICT DO NOTHING`) : un
+    /// JORFTEXT déjà porté n'est jamais écrasé par la fiche d'origine du fond JO.
+    /// Renvoie `true` si la ligne a été créée.
     pub async fn insert_legal_text_if_absent(&self, text: &LegalTextRow) -> Result<bool> {
         let n = self
             .conn
@@ -181,11 +160,11 @@ impl DecisionRepository<'_> {
         Ok(n == 1)
     }
 
-    /// Pose le corps d'un texte de référentiel (passe corps circulaires,
-    /// ADR 0222). UPDATE ciblé, jamais de création : `false` = `text_uid`
-    /// inconnu (PDF orphelin du fond, compté par l'appelant).
+    /// Pose le corps d'un texte de référentiel. UPDATE ciblé, jamais de création :
+    /// `false` = `text_uid` inconnu.
     #[tracing::instrument(name = "db.set_legal_text_body", skip(self, body), fields(db.system = "postgresql"))]
     pub async fn set_legal_text_body(&self, text_uid: &str, body: &str) -> Result<bool> {
+        let body = normalize_chars(body);
         let n = self
             .conn
             .execute(
@@ -196,9 +175,8 @@ impl DecisionRepository<'_> {
         Ok(n > 0)
     }
 
-    /// `text_uid` des textes d'une nature **sans articles ni corps réel**
-    /// (`body` NULL ou < 300 caractères) — les cibles du backfill des corps
-    /// traités/TI (ADR 0223).
+    /// `text_uid` des textes d'une nature sans articles ni corps réel (`body` NULL
+    /// ou < 300 caractères).
     pub async fn empty_legal_text_uids(&self, nature: &str) -> Result<Vec<String>> {
         let rows = self
             .conn
@@ -216,8 +194,7 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    /// Textes sans slug, `(text_uid, title)` triés par `text_uid` — l'ordre
-    /// déterministe de la passe d'assignation (ADR 0162).
+    /// Textes sans slug, `(text_uid, title)` triés par `text_uid`.
     pub async fn texts_without_slug(&self) -> Result<Vec<SlugSourceRow>> {
         let rows = self
             .conn
@@ -239,7 +216,6 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Slugs déjà posés (dédup de la passe d'assignation contre l'existant).
     pub async fn existing_text_slugs(&self) -> Result<Vec<String>> {
         let rows = self
             .conn
@@ -248,9 +224,9 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    /// Pose les slugs calculés par la passe d'assignation (unique écrivain de la
-    /// colonne, ADR 0162). Ne remplit que les `slug NULL` — un slug posé est
-    /// immuable. Renvoie le nombre de lignes écrites.
+    /// Pose les slugs calculés par la passe d'assignation, unique écrivain de la
+    /// colonne. Ne remplit que les `slug NULL` — un slug posé est immuable.
+    /// Renvoie le nombre de lignes écrites.
     pub async fn set_text_slugs(&self, slugs: &[(String, String)]) -> Result<u64> {
         let uids: Vec<&str> = slugs.iter().map(|(u, _)| u.as_str()).collect();
         let vals: Vec<&str> = slugs.iter().map(|(_, s)| s.as_str()).collect();
@@ -269,12 +245,9 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Pose le flag `num_prefix_agnostic` d'un texte (migration 0087) : la résolution
-    /// d'article matchera sur le cœur numérique préfixe-strippé pour ce texte (codes
-    /// territoriaux PF/NC cités avec un préfixe d'instrument incohérent). Séparé de
-    /// `upsert_legal_text` (qui ne touche pas la colonne en `ON CONFLICT`) pour ne pas
-    /// élargir `LegalTextRow` à tous ses sites de construction (LEGI/KALI/JORF…). Posé
-    /// par le seul loader de corpus curé, qui garantit l'unicité du cœur par texte.
+    /// Pose le flag `num_prefix_agnostic` d'un texte : la résolution d'article
+    /// matchera sur le cœur numérique préfixe-strippé pour ce texte (codes
+    /// territoriaux PF/NC cités avec un préfixe d'instrument incohérent).
     pub async fn set_legal_text_num_prefix_agnostic(
         &self,
         text_uid: &str,
@@ -289,23 +262,22 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Upsert idempotent (#7) d'une version d'article sur son identité
-    /// `(text_uid, num_key, date_debut)`. Skip si le `content_checksum` (xxh3-64 du
-    /// bloc source brut) est inchangé : le `WHERE` sur `DO UPDATE` ne réécrit que les
-    /// lignes dont le checksum diffère. Le checksum `u64` est stocké en `BIGINT` via
-    /// cast bit-à-bit `i64::from_ne_bytes` (Postgres n'a pas d'u64). `date_debut`
-    /// `None` → sentinelle '0001-01-01' (borne ouverte ; la PK interdit le NULL).
+    /// Upsert idempotent d'une version d'article sur son identité
+    /// `(text_uid, num_key, date_debut)`. Skip si le `content_checksum` (xxh3-64
+    /// du bloc source brut) est inchangé. Le checksum `u64` est stocké en `BIGINT`
+    /// via cast bit-à-bit `i64::from_ne_bytes`. `date_debut` `None` → sentinelle
+    /// '0001-01-01' (borne ouverte ; la PK interdit le NULL).
     ///
-    /// **Garde-fou identité (ADR 0236)** : le `DO UPDATE` exige `source_uid` égal —
-    /// un article chronique DISTINCT qui plie sur la même PK (numéro réellement
-    /// dupliqué dans le texte, ex. « Annexe II » par livre) ne peut plus écraser
-    /// silencieusement l'occupant. Le clash est détecté dans le même statement
-    /// (l'occupant lu sur le snapshot pré-insert) et remonté en WARN — la ligne
-    /// entrante est perdue, mais bruyamment (#12).
+    /// Le `DO UPDATE` exige `source_uid` égal : un article distinct qui plie sur la
+    /// même PK n'écrase pas l'occupant, il est remonté en WARN et perdu.
+    ///
     /// Renvoie `true` si la ligne a été insérée ou modifiée, `false` si skip.
     #[tracing::instrument(name = "db.upsert_legal_article", skip(self, art), fields(db.system = "postgresql"))]
     pub async fn upsert_legal_article(&self, art: &LegalArticleRow) -> Result<bool> {
         let checksum = i64::from_ne_bytes(art.content_checksum.to_ne_bytes());
+        let texte = art.texte.as_deref().map(normalize_chars);
+        let nota = art.nota.as_deref().map(normalize_chars);
+        let texte_original = art.texte_original.as_deref().map(normalize_chars);
         let row = self
             .conn
             .query_one(
@@ -315,8 +287,8 @@ impl DecisionRepository<'_> {
                     (text_uid, num, num_key, position, title_path, status, date_debut,
                      date_fin, texte, nota, content_checksum, source, source_uid, source_url,
                      texte_original, lang_original, translation, source_asof, source_upstream_url)
-                  VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, DATE '0001-01-01'),
-                          $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+                  SELECT $1, $2, $3, $4, $5, $6, COALESCE($7, DATE '0001-01-01'),
+                         $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
                   ON CONFLICT (text_uid, num_key, date_debut) DO UPDATE SET
                     num = EXCLUDED.num,
                     position = EXCLUDED.position,
@@ -333,7 +305,15 @@ impl DecisionRepository<'_> {
                     lang_original = EXCLUDED.lang_original,
                     translation = EXCLUDED.translation,
                     source_asof = EXCLUDED.source_asof,
-                    source_upstream_url = EXCLUDED.source_upstream_url
+                    source_upstream_url = EXCLUDED.source_upstream_url,
+                    -- Le chemin d'écriture n'attribue jamais un rang de lecture,
+                    -- il l'invalide (ADR 0276) : `NULL` marque le texte à
+                    -- recalculer, `refresh_reading_ranks` s'en charge en fin de
+                    -- passe. Une insertion arrive à `NULL` par défaut.
+                    reading_rank = CASE
+                      WHEN legal_article.title_path IS DISTINCT FROM EXCLUDED.title_path
+                        OR legal_article.position IS DISTINCT FROM EXCLUDED.position
+                      THEN NULL ELSE legal_article.reading_rank END
                   WHERE legal_article.content_checksum IS DISTINCT FROM EXCLUDED.content_checksum
                     AND legal_article.source_uid = EXCLUDED.source_uid
                   RETURNING 1
@@ -352,13 +332,13 @@ impl DecisionRepository<'_> {
                     &art.status,
                     &art.date_debut,
                     &art.date_fin,
-                    &art.texte,
-                    &art.nota,
+                    &texte,
+                    &nota,
                     &checksum,
                     &art.source,
                     &art.source_uid,
                     &art.source_url,
-                    &art.texte_original,
+                    &texte_original,
                     &art.lang_original,
                     &art.translation,
                     &art.source_asof,
@@ -388,9 +368,9 @@ impl DecisionRepository<'_> {
         Ok(written > 0)
     }
 
-    /// Rafraîchit la fraîcheur « as-of » d'une source *live* re-synchronisée
-    /// quotidiennement (legifrance/kali) : une ligne par source dans `ingest_freshness`,
-    /// posée à chaque ingest (ADR 0129). Évite de réécrire les ~1,9 M lignes d'articles.
+    /// Rafraîchit la fraîcheur « as-of » d'une source live re-synchronisée
+    /// quotidiennement (legifrance/kali) : une ligne par source dans
+    /// `ingest_freshness`.
     #[tracing::instrument(name = "db.upsert_ingest_freshness", skip(self), fields(db.system = "postgresql"))]
     pub async fn upsert_ingest_freshness(&self, source: &str, asof: NaiveDate) -> Result<()> {
         self.conn
@@ -403,9 +383,9 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Fraîcheur « as-of » d'une source *live* (legifrance/kali) depuis
-    /// `ingest_freshness` (ADR 0129). `None` si la source n'y figure pas (sources
-    /// non-live : la fraîcheur vit alors sur `legal_article.source_asof`).
+    /// Fraîcheur « as-of » d'une source live (legifrance/kali) depuis
+    /// `ingest_freshness`. `None` si la source n'y figure pas — la fraîcheur vit
+    /// alors sur `legal_article.source_asof`.
     #[tracing::instrument(name = "db.get_ingest_freshness", skip(self), fields(db.system = "postgresql"))]
     pub async fn get_ingest_freshness(&self, source: &str) -> Result<Option<NaiveDate>> {
         let row = self
@@ -419,8 +399,8 @@ impl DecisionRepository<'_> {
     }
 
     /// Paires distinctes `(source, source_url)` des lignes dont `source` est une
-    /// **catégorie/méthode** à reclasser (ADR 0131 : `treaty`, `eu-law`, `official-fr`,
-    /// `traduction-automatique`) **et** qui portent une URL — d'où le vrai libellé de
+    /// catégorie/méthode à reclasser (`treaty`, `eu-law`, `official-fr`,
+    /// `traduction-automatique`) et qui portent une URL, d'où le libellé de
     /// diffuseur se dérive (`diffuseur_label_from_url`). Lecture seule.
     #[tracing::instrument(name = "db.distinct_category_source_urls", skip(self), fields(db.system = "postgresql"))]
     pub async fn distinct_category_source_urls(
@@ -439,8 +419,8 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Reclasse `source` (ADR 0131) pour les lignes d'un couple `(ancien source, URL)`
-    /// donné vers le `nouveau` libellé de diffuseur. Renvoie le nombre de lignes. Idempotent.
+    /// Reclasse `source` pour les lignes d'un couple `(ancien source, URL)` donné
+    /// vers le `nouveau` libellé de diffuseur. Renvoie le nombre de lignes.
     #[tracing::instrument(name = "db.relabel_source_by_url", skip(self), fields(db.system = "postgresql"))]
     pub async fn relabel_source_by_url(&self, old: &str, url: &str, new: &str) -> Result<u64> {
         let n = self
@@ -453,11 +433,10 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Reclasse les traités du **bulk JORF** (`source='treaty'`, sans URL, `source_uid`
-    /// natif `JORFARTI…`) en `source='jorf'` (diffuseur DILA, ADR 0131) — la nature
-    /// « traité » reste portée par `jurisdiction='INTL'`. Exclut les **chaînes curées**
-    /// (avenants, `source_uid` propre au dataset) traitées par reload. Renvoie le nombre
-    /// de lignes. Idempotent.
+    /// Reclasse les traités du bulk JORF (`source='treaty'`, sans URL,
+    /// `source_uid` natif `JORFARTI…`) en `source='jorf'` — la nature « traité »
+    /// reste portée par `jurisdiction='INTL'`. Exclut les chaînes curées
+    /// (avenants, `source_uid` propre au dataset). Renvoie le nombre de lignes.
     #[tracing::instrument(name = "db.relabel_treaty_jorf_bulk", skip(self), fields(db.system = "postgresql"))]
     pub async fn relabel_treaty_jorf_bulk(&self) -> Result<u64> {
         let n = self
@@ -472,10 +451,9 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Canonicalise un libellé de diffuseur (`legal_article.source`) : `from` → `to`,
-    /// pour les variantes d'hôte d'un même diffuseur (ex. `jafbase.fr` → `jafbase`,
-    /// ADR 0131 « un libellé par diffuseur »). Idempotent (après coup plus aucune ligne
-    /// `from`). Renvoie le nombre de lignes modifiées.
+    /// Canonicalise un libellé de diffuseur (`legal_article.source`) : `from` →
+    /// `to`, pour les variantes d'hôte d'un même diffuseur (ex. `jafbase.fr` →
+    /// `jafbase`). Renvoie le nombre de lignes modifiées.
     #[tracing::instrument(name = "db.canonicalize_source_label", skip(self), fields(db.system = "postgresql"))]
     pub async fn canonicalize_source_label(&self, from: &str, to: &str) -> Result<u64> {
         let n = self
@@ -488,9 +466,9 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Reliquat post-reclassement : lignes encore sous un `source` catégorie/méthode
-    /// (URL vide, hors bulk JORF) — chaînes curées de traités & vieux codes traduits,
-    /// à corriger par reload de curation. `(source, nombre)`. Lecture seule.
+    /// Reliquat post-reclassement : lignes encore sous un `source`
+    /// catégorie/méthode (URL vide, hors bulk JORF). `(source, nombre)`.
+    /// Lecture seule.
     #[tracing::instrument(name = "db.count_category_source_leftovers", skip(self), fields(db.system = "postgresql"))]
     pub async fn count_category_source_leftovers(
         &self,
@@ -508,18 +486,16 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// `text_uid` (= `JORFTEXT…`/`EU/…`) de tous les textes internationaux du
-    /// catalogue (`jurisdiction ∈ ('INTL','UE')` = traités & droit primaire UE ;
-    /// le clivage traité ↔ JORF se lit sur la juridiction, pas sur `source`). Lu entre
-    /// les deux passes de l'ingest JORF (textes puis articles) pour ne **persister**
-    /// que les articles dont le `cid` parent est un traité (le reste du JO est ignoré) ;
-    /// leur `source` reste `jorf` (diffuseur DILA, ADR 0131). Lecture seule, idempotent.
-    #[tracing::instrument(name = "db.treaty_text_uids", skip(self), fields(db.system = "postgresql"))]
-    pub async fn treaty_text_uids(&self) -> Result<Vec<String>> {
+    /// `text_uid` des véhicules de publication : les cibles d'une arête `publie`
+    /// entrante possédée par une fiche instrument. Lecture seule.
+    #[tracing::instrument(name = "db.published_vehicle_uids", skip(self), fields(db.system = "postgresql"))]
+    pub async fn published_vehicle_uids(&self) -> Result<Vec<String>> {
         let rows = self
             .conn
             .query(
-                "SELECT text_uid FROM legal_text WHERE jurisdiction IN ('INTL', 'UE')",
+                "SELECT DISTINCT target_text_uid FROM legal_link
+                 WHERE verb = 'publie' AND direction = 'incoming'
+                   AND target_text_uid IS NOT NULL",
                 &[],
             )
             .await?;
@@ -527,11 +503,10 @@ impl DecisionRepository<'_> {
     }
 
     /// Suppression d'articles d'un fond DILA par chemins issus des
-    /// `liste_suppression_<fond>*.dat` (canal séparé, ADR 0092/0120). Le stem du
-    /// chemin `.dat` (`…/LEGIARTI000….xml` / `…/KALIARTI000….xml` ⇒ l'id) est le
-    /// `source_uid` (identifiant natif provider, hors identité) à purger pour le
-    /// `source` donné (`'legifrance'` LEGI/JORF, `'kali'` KALI). Renvoie le nombre de
-    /// lignes supprimées. Idempotent : un `source_uid` déjà absent ne compte pas.
+    /// `liste_suppression_<fond>*.dat`. Le stem du chemin `.dat`
+    /// (`…/LEGIARTI000….xml` / `…/KALIARTI000….xml`) est le `source_uid` à purger
+    /// pour le `source` donné (`'legifrance'` LEGI/JORF, `'kali'` KALI). Renvoie
+    /// le nombre de lignes supprimées.
     #[tracing::instrument(name = "db.delete_legal_articles_by_paths", skip(self, paths), fields(db.system = "postgresql", source, paths = paths.len()))]
     pub async fn delete_legal_articles_by_paths(
         &self,
@@ -556,17 +531,21 @@ impl DecisionRepository<'_> {
         if source_uids.is_empty() {
             return Ok(0);
         }
-        // Purge liée des arêtes du graphe (ADR 0174) AVANT les articles : la clé
-        // owner de `legal_link` se résout via la ligne d'article encore présente.
-        self.conn
-            .execute(
-                "DELETE FROM legal_link ll USING legal_article a \
-                 WHERE a.source = $1 AND a.source_uid = ANY($2) \
-                   AND ll.owner_text_uid = a.text_uid AND ll.owner_num_key = a.num_key \
-                   AND ll.owner_date_debut = a.date_debut",
-                &[&source, &source_uids],
-            )
-            .await?;
+        // Purge liée des arêtes du graphe AVANT les articles : la clé owner de
+        // `legal_link` se résout via la ligne d'article encore présente. Sauf `jorf` :
+        // une publication n'écrit aucun lien, et son triplet est celui de la version
+        // LEGI du jour de parution.
+        if source != "jorf" {
+            self.conn
+                .execute(
+                    "DELETE FROM legal_link ll USING legal_article a \
+                     WHERE a.source = $1 AND a.source_uid = ANY($2) \
+                       AND ll.owner_text_uid = a.text_uid AND ll.owner_num_key = a.num_key \
+                       AND ll.owner_date_debut = a.date_debut",
+                    &[&source, &source_uids],
+                )
+                .await?;
+        }
         let n = self
             .conn
             .execute(
@@ -578,11 +557,8 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Pose l'état de diffusion d'un lot de textes (ADR 0196 — abrogations
-    /// historiques du fond CIRCULAIRES). Ne touche que la `nature` donnée
-    /// (jamais un uid d'une autre famille par collision). Renvoie le nombre de
-    /// lignes modifiées ; un uid absent est ignoré (les listes d'abrogation
-    /// référencent des documents jamais publiés dans les stocks).
+    /// Pose l'état de diffusion d'un lot de textes. Ne touche que la `nature`
+    /// donnée. Renvoie le nombre de lignes modifiées ; un uid absent est ignoré.
     #[tracing::instrument(name = "db.set_legal_texts_status", skip(self, text_uids), fields(db.system = "postgresql", nature, status, uids = text_uids.len()))]
     pub async fn set_legal_texts_status(
         &self,
@@ -604,8 +580,32 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Corps monolithiques du référentiel (ADR 0196) : `(text_uid, body)` des
-    /// textes à corps — source de l'extraction texte→décision.
+    /// Fond UE en base : un texte porteur d'articles `eu-law`/`eur-lex` par
+    /// ligne — `(text_uid, celex, title, nature, jurisdiction, date_texte)`, le
+    /// CELEX lu sur `legal_article.source_url`.
+    #[allow(clippy::type_complexity)]
+    pub async fn eu_law_registry(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String, Option<NaiveDate>)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT t.text_uid, regexp_replace(min(a.source_url), '^.*/celex/', ''),
+                        t.title, t.nature, t.jurisdiction, t.date_texte
+                 FROM legal_article a
+                 JOIN legal_text t USING (text_uid)
+                 WHERE a.source IN ('eu-law', 'eur-lex') AND a.source_url LIKE '%/celex/%'
+                 GROUP BY t.text_uid, t.title, t.nature, t.jurisdiction, t.date_texte",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
+            .collect())
+    }
+
+    /// Corps monolithiques du référentiel : `(text_uid, body)` des textes à corps.
     pub async fn legal_text_bodies(&self) -> Result<Vec<(String, String)>> {
         let rows = self
             .conn
@@ -617,12 +617,10 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Page keyset de TOUTES les versions d'articles à corps (ADR 0217) —
-    /// émetteurs de la passe renvois/cases. Ordonnée par la PK
-    /// `(text_uid, num_key, date_debut)` : les versions d'un même texte
-    /// arrivent groupées, le writer peut flush au changement de `text_uid`.
-    /// `after` = dernière clé de la page précédente (`("", "", 0001-01-01)`
-    /// pour la première).
+    /// Page keyset de toutes les versions d'articles à corps, ordonnée par la PK
+    /// `(text_uid, num_key, date_debut)` : les versions d'un même texte arrivent
+    /// groupées. `after` = dernière clé de la page précédente
+    /// (`("", "", 0001-01-01)` pour la première).
     pub async fn legal_article_versions_page(
         &self,
         after: (&str, &str, NaiveDate),
@@ -646,11 +644,38 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Purge des articles d'un texte hors snapshot courant (source snapshot type
-    /// BOFiP, ADR 0196) : supprime les lignes du `source`/`text_uid` dont la version
-    /// n'est pas `keep_date` OU dont le `num_key` a disparu du document. Rejouable :
-    /// un snapshot identique ne supprime rien. Les arêtes `legal_link` des lignes
-    /// purgées partent d'abord (même règle que [`Self::delete_legal_articles_by_paths`]).
+    /// Corps de la version la plus récente de chaque `(text_uid, num_key)`
+    /// demandé, avec son `date_debut`. Une clé sans version à corps est absente du
+    /// résultat.
+    pub async fn legal_article_latest_bodies(
+        &self,
+        keys: &[(String, String)],
+    ) -> Result<Vec<(String, String, String, NaiveDate)>> {
+        let uids: Vec<&str> = keys.iter().map(|(u, _)| u.as_str()).collect();
+        let nums: Vec<&str> = keys.iter().map(|(_, n)| n.as_str()).collect();
+        let rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT ON (a.text_uid, a.num_key) \
+                     a.text_uid, a.num_key, a.texte, a.date_debut \
+                 FROM legal_article a \
+                 JOIN unnest($1::text[], $2::text[]) AS k(uid, num) \
+                   ON k.uid = a.text_uid AND k.num = a.num_key \
+                 WHERE a.texte IS NOT NULL \
+                 ORDER BY a.text_uid, a.num_key, a.date_debut DESC",
+                &[&uids, &nums],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect())
+    }
+
+    /// Purge des articles d'un texte hors snapshot courant : supprime les lignes
+    /// du `source`/`text_uid` dont la version n'est pas `keep_date` ou dont le
+    /// `num_key` a disparu du document. Les arêtes `legal_link` des lignes purgées
+    /// partent d'abord.
     #[tracing::instrument(name = "db.delete_legal_articles_versions_except", skip(self, keep_num_keys), fields(db.system = "postgresql", source, text_uid))]
     pub async fn delete_legal_articles_versions_except(
         &self,
@@ -682,11 +707,8 @@ impl DecisionRepository<'_> {
     }
 
     /// Purge tous les articles d'un texte donné (`text_uid`, globalement unique).
-    /// Sert le loader de corpus curé (`load-legal-corpus`) : un dataset est
-    /// autoritaire pour son texte, on purge avant rechargement (idempotence #7). Vaut
-    /// pour la forme mono-version (un article par `num_key`) comme multi-versions
-    /// (plusieurs lignes par `num_key`, identité `(text_uid, num_key, date_debut)`).
-    /// Renvoie le nombre de lignes supprimées.
+    /// Vaut pour la forme mono-version (un article par `num_key`) comme
+    /// multi-versions. Renvoie le nombre de lignes supprimées.
     #[tracing::instrument(name = "db.delete_legal_articles_by_text", skip(self), fields(db.system = "postgresql"))]
     pub async fn delete_legal_articles_by_text(&self, text_uid: &str) -> Result<u64> {
         let n = self
@@ -699,14 +721,10 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Collapse des doublons diffuseur (ADR 0115 §2) : supprime les coquilles
-    /// `LEGITEXT` **vides** (0 article) dont un **autre** texte porte le corps sous le
-    /// même `title_key` (le `JORFTEXT` porteur — LEGI keye ses lois non codifiées sous
-    /// des ids JORFTEXT). L'identité d'un acte = le porteur de corps, pas la coquille.
-    /// Idempotent, sûr : ne touche jamais un texte **cité** (`ref_text_uid`) ni un
-    /// texte porteur d'articles. Recrée-able par l'upsert si un corps arrive plus tard.
-    /// À lancer en fin d'ingest LEGI (les coquilles régénérées par incrément). Renvoie
-    /// le nombre de coquilles collapsées.
+    /// Collapse des doublons diffuseur : supprime les coquilles `LEGITEXT` vides
+    /// (0 article) dont un autre texte porte le corps sous le même `title_key`.
+    /// Ne touche jamais un texte cité (`ref_text_uid`) ni un texte porteur
+    /// d'articles. Renvoie le nombre de coquilles collapsées.
     #[tracing::instrument(name = "db.collapse_empty_legitext_doublons", skip(self), fields(db.system = "postgresql"))]
     pub async fn collapse_empty_legitext_doublons(&self) -> Result<u64> {
         let n = self
@@ -733,78 +751,45 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Rôles des textes publiés (ADR 0246), backfill v1 conservateur : reset à
-    /// `instrument` puis classification par signaux sûrs — motifs de titre pour
-    /// `individuel` et `habilitation`, et pour `vehicule` un décret « portant
-    /// publication » vide (ni corps ni article) porteur d'une arête `modifie`
-    /// sortante résolue (avenant publié dont l'instrument vit sur la fiche de
-    /// base — le décret de publication *principal* d'un traité n'a pas cette
-    /// arête et reste `instrument`, avec ou sans corps). Idempotent, recalcule
-    /// tout. Renvoie (individuel, habilitation, vehicule).
+    /// Rôles des textes publiés, classification scopée à un lot de `text_uid` :
+    /// les uids sont resetés à `instrument` puis re-classifiés. Tourne dans la
+    /// transaction/connexion de l'appelant. Renvoie
+    /// (individuel, habilitation, vehicule, modificatif).
+    #[tracing::instrument(name = "db.classify_text_roles_scoped", skip_all, fields(db.system = "postgresql", uids = uids.len()))]
+    pub async fn classify_text_roles_scoped(
+        &self,
+        uids: &[String],
+    ) -> Result<(u64, u64, u64, u64)> {
+        if uids.is_empty() {
+            return Ok((0, 0, 0, 0));
+        }
+        self.run_text_role_sqls(Some(uids)).await
+    }
+
+    /// Rôles des textes publiés, backfill pleine-table ; le régime établi passe
+    /// par [`Self::classify_text_roles_scoped`]. Recalcule tout. Renvoie
+    /// (individuel, habilitation, vehicule, modificatif).
     #[tracing::instrument(name = "db.backfill_text_roles", skip(self), fields(db.system = "postgresql"))]
-    pub async fn backfill_text_roles(&self) -> Result<(u64, u64, u64)> {
-        self.conn
-            .execute(
-                "UPDATE legal_text SET role = 'instrument' WHERE role <> 'instrument'",
-                &[],
-            )
-            .await?;
-        // Motifs mesurés sur le fond JORF complet (sondes 2026-07-21, faux
-        // positifs vérifiés sur échantillon) : « portant radiation » nu est
-        // ambigu (radiation de produits/spécialités des listes = normatif) —
-        // seuls « radiation des cadres » et « radiation (corps) » classent.
-        let individuel = self
-            .conn
-            .execute(
-                "
-                UPDATE legal_text SET role = 'individuel'
-                WHERE text_uid LIKE 'JORFTEXT%'
-                  AND (title ~* 'portant (nomination|promotion|titularisation|naturalisation|cessation de fonctions|admission à la retraite|acceptation de la démission|détachement|radiation des cadres|radiation \\()'
-                       OR title ~* '^avis de vacance'
-                       OR title ~* 'accordant la nationalité française|conférant l.honorariat|acceptant la démission|inscription au tableau d.avancement')
-                ",
-                &[],
-            )
-            .await?;
-        let habilitation = self
-            .conn
-            .execute(
-                "
-                UPDATE legal_text SET role = 'habilitation'
-                WHERE text_uid LIKE 'JORFTEXT%'
-                  AND title ~* 'autorisant (la ratification|l.approbation|l.adhésion|l.accession|le Président de la République à (ratifier|approuver|adhérer))'
-                  AND title !~* ' et (portant|modifiant)'
-                ",
-                &[],
-            )
-            .await?;
-        let vehicule = self
-            .conn
-            .execute(
-                "
-                UPDATE legal_text t SET role = 'vehicule'
-                WHERE t.text_uid LIKE 'JORFTEXT%'
-                  AND t.title ~* 'portant publication'
-                  AND t.body IS NULL
-                  AND NOT EXISTS (
-                        SELECT 1 FROM legal_article a WHERE a.text_uid = t.text_uid)
-                  AND EXISTS (
-                        SELECT 1 FROM legal_link l
-                        WHERE l.owner_text_uid = t.text_uid
-                          AND l.verb = 'modifie'
-                          AND l.direction = 'outgoing'
-                          AND l.target_text_uid IS NOT NULL
-                          AND l.target_text_uid <> t.text_uid)
-                ",
-                &[],
-            )
-            .await?;
-        Ok((individuel, habilitation, vehicule))
+    pub async fn backfill_text_roles(&self) -> Result<(u64, u64, u64, u64)> {
+        self.run_text_role_sqls(None).await
+    }
+
+    /// Exécute les six statements de [`text_role_sqls`] (reset + 5 passes), scopés
+    /// à `uids` si fournis. Renvoie
+    /// (individuel, habilitation, vehicule + vehicule_publie, modificatif).
+    async fn run_text_role_sqls(&self, uids: Option<&[String]>) -> Result<(u64, u64, u64, u64)> {
+        let mut counts = [0u64; 6];
+        for (i, sql) in text_role_sqls(uids.is_some()).iter().enumerate() {
+            counts[i] = match uids {
+                Some(uids) => self.conn.execute(sql.as_str(), &[&uids]).await?,
+                None => self.conn.execute(sql.as_str(), &[]).await?,
+            };
+        }
+        Ok((counts[1], counts[2], counts[3] + counts[4], counts[5]))
     }
 
     /// Aligne `legal_link.verb` sur le repli verbe/nom courant de
-    /// `lj_extract::legi::lien_verb` pour le stock écrit avant l'extension du
-    /// mapping (ADR 0246 §2). Idempotent. Renvoie le nombre de lignes alignées.
+    /// `lj_extract::legi::lien_verb`. Renvoie le nombre de lignes alignées.
     #[tracing::instrument(name = "db.normalize_link_verbs", skip(self), fields(db.system = "postgresql"))]
     pub async fn normalize_link_verbs(&self) -> Result<u64> {
         let n = self
@@ -829,12 +814,14 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Article servi à une date (law-at-date, ADR 0112 §7). `date` absente ⇒ version
-    /// en vigueur (`status = 'VIGUEUR'`). Sinon, la version dont l'intervalle
+    /// Article servi à une date. `date` absente ⇒ la version dans la fenêtre de
+    /// validité du jour, sinon la dernière. Sinon, la version dont l'intervalle
     /// `[date_debut, date_fin]` couvre `date` (la plus récente en cas de
     /// chevauchement) ; `date_debut` est NOT NULL (sentinelle '0001-01-01' = borne
-    /// ouverte basse). `None` si aucune version ne s'applique. Résolution vers
-    /// l'IDENTITÉ `(text_uid, num_key)`, la version choisie ici par la date.
+    /// ouverte basse). À date égale la version consolidée prime sur la publication
+    /// au JO (`(source='jorf') ASC`). `None` si aucune version ne s'applique.
+    /// Résolution vers l'identité `(text_uid, num_key)`, la version choisie ici par
+    /// la date.
     #[tracing::instrument(name = "db.law_article_at_date", skip(self), fields(db.system = "postgresql"))]
     pub async fn law_article_at_date(
         &self,
@@ -856,7 +843,7 @@ impl DecisionRepository<'_> {
                         WHERE text_uid = $1 AND num_key = $2
                           AND date_debut <= $3
                           AND (date_fin IS NULL OR date_fin >= $3)
-                        ORDER BY date_debut DESC
+                        ORDER BY date_debut DESC, (source = 'jorf') ASC
                         LIMIT 1
                         ",
                         &[&text_uid, &num_key, &d],
@@ -864,21 +851,24 @@ impl DecisionRepository<'_> {
                     .await?
             }
             None => {
-                // VIGUEUR préférée, sinon la dernière version (ADR 0162 §5) :
-                // un article abrogé reste lisible, son état est affiché.
+                let valid_a = article_valid_now("a");
+                let norm_a = article_is_norm("a");
                 self.conn
                     .query_opt(
-                        "
+                        &format!(
+                            "
                         SELECT text_uid, num, num_key, position, title_path, status,
                                date_debut, date_fin, texte, nota, content_checksum,
                                source, source_uid, source_url,
                                texte_original, lang_original, translation,
                                source_asof, source_upstream_url
-                        FROM legal_article
+                        FROM legal_article a
                         WHERE text_uid = $1 AND num_key = $2
-                        ORDER BY (status = 'VIGUEUR') DESC, date_debut DESC NULLS LAST
+                        ORDER BY ({valid_a}) DESC, ({norm_a}) DESC,
+                                 (source = 'jorf') ASC, date_debut DESC NULLS LAST
                         LIMIT 1
-                        ",
+                        "
+                        ),
                         &[&text_uid, &num_key],
                     )
                     .await?
@@ -887,21 +877,16 @@ impl DecisionRepository<'_> {
         Ok(row.map(legal_article_row_from_row))
     }
 
-    /// Lecture « à la suite » façon Légifrance (ADR 0112 §9) : les articles du texte
-    /// `text_uid`, version en vigueur à `date` (ou `VIGUEUR` si `date` absente), triés
-    /// par `position` (ordre de lecture réel, ≠ tri lexical). Un deep-link sur un
-    /// article = pré-scroll sur sa `position`, l'utilisateur scrolle sur les voisins
-    /// (26, 26-1, 26-2…). `position` NULL (référentiel pré-0112 pas encore réingéré)
-    /// trié en dernier ; fallback `num_key`. Champs bruts (mapping DTO côté `lj-api`).
+    /// Lecture « à la suite » : les articles du texte `text_uid`, version en
+    /// vigueur à `date` (ou `VIGUEUR` si `date` absente), triés par `position`
+    /// (ordre de lecture réel, ≠ tri lexical). `position` NULL trié en dernier ;
+    /// fallback `num_key`. Champs bruts.
     #[tracing::instrument(name = "db.law_text_articles", skip(self), fields(db.system = "postgresql"))]
     pub async fn law_text_articles(
         &self,
         text_uid: &str,
         date: Option<NaiveDate>,
     ) -> Result<Vec<LegalArticleRow>> {
-        // Une version par num_key : la plus récente couvrant `date` (ou la VIGUEUR).
-        // DISTINCT ON (num_key) + ORDER BY garantit une ligne par article ; on retrie
-        // ensuite par position pour la lecture.
         let rows = match date {
             Some(d) => {
                 self.conn
@@ -917,7 +902,7 @@ impl DecisionRepository<'_> {
                           FROM legal_article
                           WHERE text_uid = $1 AND date_debut <= $2
                             AND (date_fin IS NULL OR date_fin >= $2)
-                          ORDER BY num_key, date_debut DESC
+                          ORDER BY num_key, date_debut DESC, (source = 'jorf') ASC
                         ) v
                         ORDER BY position NULLS LAST, num_key
                         ",
@@ -926,24 +911,30 @@ impl DecisionRepository<'_> {
                     .await?
             }
             None => {
+                let valid_a = article_valid_now("a");
+                let norm_a = article_is_norm("a");
                 self.conn
                     .query(
-                        "
+                        &format!(
+                            "
                         SELECT text_uid, num, num_key, position, title_path, status,
                                date_debut, date_fin, texte, nota, content_checksum,
                                source, source_uid, source_url,
                                texte_original, lang_original, translation,
                                source_asof, source_upstream_url
                         FROM (
-                          -- VIGUEUR préférée, sinon dernière version (ADR 0162 §5).
+                          -- Fenêtre du jour préférée, sinon dernière version
+                          -- (ADR 0300 §3) ; vraie version avant moignon (0312),
+                          -- consolidée avant publication.
                           SELECT DISTINCT ON (num_key) *
-                          FROM legal_article
+                          FROM legal_article a
                           WHERE text_uid = $1
-                          ORDER BY num_key, (status = 'VIGUEUR') DESC,
-                                   date_debut DESC NULLS LAST
+                          ORDER BY num_key, ({valid_a}) DESC, ({norm_a}) DESC,
+                                   (source = 'jorf') ASC, date_debut DESC NULLS LAST
                         ) v
                         ORDER BY position NULLS LAST, num_key
-                        ",
+                        "
+                        ),
                         &[&text_uid],
                     )
                     .await?
@@ -952,9 +943,9 @@ impl DecisionRepository<'_> {
         Ok(rows.into_iter().map(legal_article_row_from_row).collect())
     }
 
-    /// Timeline des versions d'un article (ADR 0112), triée par `date_debut`
-    /// croissante. `source_uid` = identifiant natif de la version (LEGIARTI…). Dates
-    /// rendues en ISO `String` (`::text`) ; le mapping DTO est fait côté `lj-api`.
+    /// Timeline des versions d'un article, triée par `date_debut` croissante.
+    /// `source_uid` = identifiant natif de la version (LEGIARTI…). Dates rendues
+    /// en ISO `String` (`::text`).
     #[tracing::instrument(name = "db.law_article_versions", skip(self), fields(db.system = "postgresql"))]
     pub async fn law_article_versions(
         &self,
@@ -984,9 +975,8 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Sommaire d'un texte par son `slug` (ADR 0112) : métadonnées du `legal_text` +
-    /// nombre d'articles distincts toutes versions (ADR 0162 §5). `None` si le slug
-    /// est inconnu (pas de fallback #12 — l'appelant rend un 404).
+    /// Sommaire d'un texte par son `slug` : métadonnées du `legal_text` + nombre
+    /// d'articles distincts toutes versions. `None` si le slug est inconnu.
     #[tracing::instrument(name = "db.law_code_summary", skip(self), fields(db.system = "postgresql"))]
     pub async fn law_code_summary(&self, slug: &str) -> Result<Option<LawCodeSummaryRow>> {
         let row = self
@@ -1022,10 +1012,8 @@ impl DecisionRepository<'_> {
         }))
     }
 
-    /// Pose les dates de versions futures d'un texte (ADR 0178) : colonne
-    /// hors `LegalTextRow` (un seul écrivain, l'ingest LEGI — même patron que
-    /// `num_prefix_agnostic`). Écrit toujours, y compris vide (un incrément
-    /// qui vide `VERSIONS_A_VENIR` vide la colonne).
+    /// Pose les dates de versions futures d'un texte. Écrit toujours, y compris
+    /// vide (un incrément qui vide `VERSIONS_A_VENIR` vide la colonne).
     pub async fn set_legal_text_upcoming_versions(
         &self,
         text_uid: &str,
@@ -1040,30 +1028,29 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Résout un slug de code en `text_uid` par lookup **exact** (ADR 0112 §6 /
-    /// ADR 0123 §2).
+    /// Résout un slug de code en identité de texte — `text_uid` et titre humain —
+    /// par lookup exact.
     ///
-    /// `slug` = la chaîne d'URL `/texte/{slug}` — un slug canonique que **nos liens
-    /// portent** (stocké au DTO). Plus de `normalize_instrument` ni de fallback BM25
-    /// au runtime serve : c'est ce qui sort la pile `lj-extract` du chemin serve.
-    /// `None` si le slug est inconnu → 404 côté appelant (#12), jamais de pick
-    /// silencieux ; une forme legacy/tapée-main perd le rattrapage flou (assumé).
-    #[tracing::instrument(name = "db.resolve_referential_code", skip(self), fields(db.system = "postgresql"))]
-    pub async fn resolve_referential_code(&self, slug: &str) -> Result<Option<String>> {
+    /// `slug` = la chaîne d'URL `/texte/{slug}`, le slug canonique que nos liens
+    /// portent (stocké au DTO). `None` si le slug est inconnu → 404 côté appelant.
+    ///
+    /// Le titre voyage avec l'uid : la page article a besoin des deux (en-tête
+    /// « Article N du <titre> »), et c'est la même ligne.
+    #[tracing::instrument(name = "db.referential_ref", skip(self), fields(db.system = "postgresql"))]
+    pub async fn referential_ref(&self, slug: &str) -> Result<Option<(String, Option<String>)>> {
         let row = self
             .conn
             .query_opt(
-                "SELECT text_uid FROM legal_text WHERE slug = $1 LIMIT 1",
+                "SELECT text_uid, title FROM legal_text WHERE slug = $1 LIMIT 1",
                 &[&slug],
             )
             .await?;
-        Ok(row.map(|r| r.get(0)))
+        Ok(row.map(|r| (r.get(0), r.get(1))))
     }
 
-    /// Résout un slug d'instrument MCP (forme nom-libre slugifiée par
-    /// l'appelant) vers son `text_uid`, alphabet des colonnes de filtre.
-    /// `None` = inconnu → erreur corrective côté MCP, jamais de filtre
-    /// silencieusement vide (#12).
+    /// Résout un slug d'instrument MCP (forme nom-libre slugifiée par l'appelant)
+    /// vers son `text_uid`, alphabet des colonnes de filtre. `None` = inconnu →
+    /// erreur corrective côté MCP.
     #[tracing::instrument(name = "db.resolve_instrument_uid", skip(self), fields(db.system = "postgresql"))]
     pub async fn resolve_instrument_uid(&self, slug: &str) -> Result<Option<String>> {
         let row = self
@@ -1073,8 +1060,8 @@ impl DecisionRepository<'_> {
         Ok(row.map(|r| r.get(0)))
     }
 
-    /// Le slug existe-t-il au catalogue ? — pour router `get_legal_text`
-    /// vers `/texte/{slug}` après slugification du nom libre.
+    /// Le slug existe-t-il au catalogue ? — pour router `get_legal_text` vers
+    /// `/texte/{slug}` après slugification du nom libre.
     #[tracing::instrument(name = "db.law_slug_exists", skip(self), fields(db.system = "postgresql"))]
     pub async fn law_slug_exists(&self, slug: &str) -> Result<bool> {
         let row = self
@@ -1085,10 +1072,8 @@ impl DecisionRepository<'_> {
     }
 
     /// Suggestions `(slug, titre)` pour une valeur d'instrument inconnue, par
-    /// similarité trigramme tolérante aux fautes (pg_trgm, migration 0140).
-    /// `similarity` plein-champ (slug et titre entiers, pas `word_similarity`) :
-    /// un extent interne ne score plus — « code-civile » suggère « code-civil »
-    /// avant les lois longues dont le titre contient « code civil ».
+    /// similarité trigramme tolérante aux fautes (pg_trgm). `similarity`
+    /// plein-champ, sur le slug et le titre entiers.
     #[tracing::instrument(name = "db.suggest_instruments", skip(self), fields(db.system = "postgresql"))]
     pub async fn suggest_instruments(
         &self,
@@ -1109,40 +1094,17 @@ impl DecisionRepository<'_> {
         Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Titre humain d'un texte de référentiel par son `slug` — pour l'affichage
-    /// « Article N du <titre> » (le slug est une clé d'URL, pas un libellé). `None`
-    /// si le slug est inconnu.
-    #[tracing::instrument(name = "db.referential_title", skip(self), fields(db.system = "postgresql"))]
-    pub async fn referential_title(&self, slug: &str) -> Result<Option<String>> {
-        let row = self
-            .conn
-            .query_opt(
-                "SELECT title FROM legal_text WHERE slug = $1 LIMIT 1",
-                &[&slug],
-            )
-            .await?;
-        Ok(row.map(|r| r.get(0)))
-    }
-
-    /// Décisions citant un article (ADR 0112 §2 / 0145 M4) : backlinks depuis
-    /// les blobs `legal_citation.spans` (GIN `lj_cit_terms`, ADR 0247).
-    /// Paginée sous cap de fenêtre (`offset + limit ≤ 100`, tenu par la
-    /// validation d'entrée — routes). Champs bruts (mapping DTO côté `lj-api`).
+    /// Décisions citant un article : backlinks depuis les blobs
+    /// `legal_citation.spans`. Paginée sous cap de fenêtre (`offset + limit ≤ 100`,
+    /// tenu par la validation d'entrée). Champs bruts.
     ///
-    /// Deux plans selon le volume de citantes (`citing_decision_counts`,
-    /// ADR 0250) :
-    /// - article courant : bitmap GIN, tri portée (gabarit 
-    ///   « arrêt majeur », ADR 0167) puis date décroissante ;
-    /// - article ultra-cité (≥ [`CITING_RECENCY_WALK_MIN_COUNT`]) : marche
-    ///   descendante de `idx_decisions_date_lecture` avec filtre
-    ///   d'appartenance sur le blob — récence seule (trier par portée
-    ///   exigerait de visiter tous les postings).
+    /// Deux plans selon le volume de citantes (`citing_decision_counts`) : bitmap
+    /// GIN et tri portée puis date pour un article courant, marche descendante de
+    /// `idx_decisions_date_lecture` pour un article ultra-cité
+    /// (≥ [`CITING_RECENCY_WALK_MIN_COUNT`]), qui rend la récence seule.
     ///
     /// Bornée à la fenêtre de validité `[date_debut, date_fin)` de la version
-    /// servie : une décision rendue à la date D cite la version en vigueur à D,
-    /// pas une autre (`num_key` seul est version-agnostique — cf. renumérotations,
-    /// ex. cautionnement 2288 refondu au 2022-01-01). `date_fin` `None` = version
-    /// en vigueur (borne haute ouverte).
+    /// servie. `date_fin` `None` = version en vigueur.
     #[tracing::instrument(name = "db.law_decisions_citing", skip(self), fields(db.system = "postgresql"))]
     pub async fn law_decisions_citing(
         &self,
@@ -1172,11 +1134,8 @@ impl DecisionRepository<'_> {
             &date_fin,
         ];
         let rows = if citing_count >= CITING_RECENCY_WALK_MIN_COUNT {
-            // Marche par récence : l'EXISTS sur le blob n'est PAS indexable
-            // (pas de `@>` sur l'expression GIN) — le planner ne peut que
-            // descendre l'index date, coût ≈ limit × N/df itérations.
-            // `d.date_lecture >= $5` exclut les NULL : le scan arrière de
-            // l'index date sert l'ORDER BY sans tri.
+            // L'EXISTS sur le blob n'est pas indexable : `d.date_lecture >= $5` exclut les
+            // NULL et le scan arrière de l'index date sert l'ORDER BY sans tri.
             self.conn
                 .query(
                     "
@@ -1198,11 +1157,9 @@ impl DecisionRepository<'_> {
                 )
                 .await?
         } else {
-            // Autorité d'abord (gabarit  « arrêt majeur ») : rang de
-            // portée dérivé de `publication_codes` (mêmes groupes que la
-            // facette, ADR 0167/`lj_core::publication`), puis date
-            // décroissante. Les listes de codes sont des constantes du code —
-            // inlinées, pas des données.
+            // Autorité d'abord : rang de portée dérivé de `publication_codes` (mêmes
+            // groupes que la facette), puis date décroissante. Les listes de codes sont
+            // des constantes du code, inlinées.
             let rank_expr = {
                 let arr = |group: &str| {
                     let codes: Vec<String> = lj_core::publication::significance_codes(group)
@@ -1258,15 +1215,15 @@ impl DecisionRepository<'_> {
                 docket_numbers: r.get(5),
                 publication_codes: r.get(6),
                 summary: r.get(7),
+                cited_num_keys: Vec::new(),
             })
             .collect())
     }
 
-    /// Fil d'Ariane TOC d'une version d'article : les divisions enclosantes,
-    /// de la racine à la section directe (`label`, `child_cid`). Marche
-    /// remontante depuis l'arête de la version servie ; en cas d'arêtes
-    /// multiples au même niveau (section LEGI ré-écrite), une seule chaîne est
-    /// retenue. Vide si la version n'est pas dans la TOC (JORF, étranger).
+    /// Fil d'Ariane TOC d'une version d'article : les divisions enclosantes, de la
+    /// racine à la section directe (`label`, `child_cid`). Marche remontante depuis
+    /// l'arête de la version servie ; en cas d'arêtes multiples au même niveau, une
+    /// seule chaîne est retenue. Vide si la version n'est pas dans la TOC.
     #[tracing::instrument(name = "db.article_toc_breadcrumb", skip(self), fields(db.system = "postgresql"))]
     pub async fn article_toc_breadcrumb(
         &self,
@@ -1301,16 +1258,11 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Articles co-cités avec `(ref_text_uid, num_key)` dans les décisions
-    /// (« souvent cité avec », plan graphe Phase D) : échantillon des décisions
-    /// citant l'article (500, borne le coût sur les articles ultra-cités), puis
-    /// agrégat de leurs autres citations pondéré tf-idf saturé (ADR 0250) —
-    /// score `n/(n+20) × ln(N / df)` où `df` vient de
-    /// `citing_decision_counts` (rebuild hebdo) et `N` de l'estimation
-    /// planner de `decisions`. La saturation BM25 du tf est nécessaire :
-    /// en IDF linéaire, 700 CPC (n ≈ 490/500, IDF ≈ 1,2) dominait encore
-    /// l'article doctrinal (n ≈ 47, IDF ≈ 5) — mesuré sur civil 1240,
-    /// 2026-07-21. Seuil ≥ 3 co-occurrences ; le compte AFFICHÉ reste brut.
+    /// Articles co-cités avec `(ref_text_uid, num_key)` dans les décisions :
+    /// échantillon des décisions citant l'article (500), puis agrégat de leurs
+    /// autres citations pondéré tf-idf saturé — `n/(n+20) × ln(N / df)`, `df` depuis
+    /// `citing_decision_counts` et `N` de l'estimation planner de `decisions`.
+    /// Seuil ≥ 3 co-occurrences ; le compte affiché reste brut.
     #[tracing::instrument(name = "db.law_co_cited_articles", skip(self), fields(db.system = "postgresql"))]
     pub async fn law_co_cited_articles(
         &self,
@@ -1367,27 +1319,35 @@ impl DecisionRepository<'_> {
     }
 
     /// Itère `(slug, num, lastmod)` pour les articles en vigueur (sitemaps
-    /// `/texte/{slug}/{num}`, ADR 0112). `lastmod` = `COALESCE(t.last_modified,
-    /// a.date_debut, '1970-01-01')`, capé à `current_date` : DILA pose la
-    /// sentinelle 2999-01-01 (« vigueur indéfinie ») dans ces dates, et un
-    /// lastmod futur est invalide pour Google. Ordre déterministe `(slug, num)` ;
-    /// pas de pagination SQL — `build_sitemaps` pagine en mémoire.
+    /// `/texte/{slug}/{num}`). Une ligne par URL, pas par version : le
+    /// `DISTINCT ON` retient la version que sert `law_article_at_date`. `lastmod` =
+    /// `COALESCE(t.last_modified, a.date_debut)`, nullable et non filtré — les
+    /// sentinelles DILA remontent telles quelles, `plausible_lastmod` côté
+    /// `lj-ingest` décide de publier ou d'omettre. Ordre `(slug, num)` ; pas de
+    /// pagination SQL.
     #[tracing::instrument(name = "db.iter_referential_for_sitemap", skip(self), fields(db.system = "postgresql"))]
-    pub async fn iter_referential_for_sitemap(&self) -> Result<Vec<(String, String, NaiveDate)>> {
+    pub async fn iter_referential_for_sitemap(
+        &self,
+    ) -> Result<Vec<(String, String, Option<NaiveDate>)>> {
+        let (valid_a, norm_a, pick_a) = (
+            article_valid_now("a"),
+            article_is_norm("a"),
+            article_pick_order("a"),
+        );
         let rows = self
             .conn
             .query(
-                "
-                SELECT t.slug, a.num_key,
-                       LEAST(
-                           COALESCE(t.last_modified, a.date_debut, DATE '1970-01-01'),
-                           current_date
-                       )::date AS lastmod
+                &format!(
+                    "
+                SELECT DISTINCT ON (t.slug, a.num_key)
+                       t.slug, a.num_key,
+                       COALESCE(t.last_modified, a.date_debut)::date AS lastmod
                 FROM legal_article a
                 JOIN legal_text t ON t.text_uid = a.text_uid
-                WHERE a.status = 'VIGUEUR' AND t.slug IS NOT NULL
-                ORDER BY t.slug, a.num_key
-                ",
+                WHERE {valid_a} AND {norm_a} AND t.slug IS NOT NULL
+                ORDER BY t.slug, a.num_key, {pick_a}
+                "
+                ),
                 &[],
             )
             .await?;
@@ -1398,20 +1358,19 @@ impl DecisionRepository<'_> {
     }
 
     /// Itère `(slug, lastmod)` pour les codes navigables (pages TDM
-    /// `/texte/{slug}`, ADR 0237). Même filtre que `list_legal_texts` (le
-    /// catalogue `/codes`) : `slug` non nul, nature *navigable-comme-un-code*,
-    /// ≥1 article en vigueur. `lastmod` = `t.last_modified` capé à
-    /// `current_date` (DILA pose la sentinelle 2999). Ordre déterministe par
-    /// slug ; `build_sitemaps` pagine en mémoire.
+    /// `/texte/{slug}`). Même filtre que `list_legal_texts` : `slug` non nul,
+    /// nature navigable-comme-un-code, ≥1 article en vigueur. `lastmod` =
+    /// `t.last_modified` brut (nullable, sentinelles comprises). Ordre déterministe
+    /// par slug ; `build_sitemaps` pagine en mémoire.
     #[tracing::instrument(name = "db.iter_codes_for_sitemap", skip(self), fields(db.system = "postgresql"))]
-    pub async fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, NaiveDate)>> {
+    pub async fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, Option<NaiveDate>)>> {
+        let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
         let rows = self
             .conn
             .query(
-                "
-                SELECT t.slug,
-                       LEAST(COALESCE(t.last_modified, current_date), current_date)::date
-                           AS lastmod
+                &format!(
+                    "
+                SELECT t.slug, t.last_modified::date AS lastmod
                 FROM legal_text t
                 WHERE t.slug IS NOT NULL
                   AND (t.nature ILIKE 'code%'
@@ -1419,54 +1378,52 @@ impl DecisionRepository<'_> {
                            'LOI_ORGANIQUE', 'ORDONNANCE', 'DECRET_LOI', 'REGLEMENT',
                            'ETAT_CIVIL'))
                   AND EXISTS (SELECT 1 FROM legal_article a
-                              WHERE a.text_uid = t.text_uid AND a.status = 'VIGUEUR')
+                              WHERE a.text_uid = t.text_uid
+                                AND {valid_a} AND {norm_a})
                 ORDER BY t.slug
-                ",
+                "
+                ),
                 &[],
             )
             .await?;
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Rafraîchit les colonnes dénormalisées de `legal_article` depuis
-    /// `legal_text` pour les articles dont elles diffèrent : `code_title`
-    /// (titre du code parent, ADR 0114) et les colonnes de recherche
-    /// `jurisdiction`/`nature` (upper)/`slug`/`searchable` (ADR 0254). Appelé
-    /// en fin d'ingest référentiel : LEGI streame articles et codes
-    /// séparément, l'article n'a pas les attributs de son texte au parse → on
-    /// les pose ici. La colonne générée `search_title` (titre formé indexé)
-    /// est recalculée par Postgres sur les lignes touchées. Renvoie le nombre
-    /// de lignes mises à jour. Idempotent (#7).
+    /// Rafraîchit les colonnes dénormalisées de `legal_article` depuis `legal_text`
+    /// pour les articles dont elles diffèrent : `code_title` et les colonnes de
+    /// recherche `jurisdiction`/`nature` (upper)/`slug`/`searchable`. Appelé en fin
+    /// d'ingest référentiel, LEGI streamant articles et codes séparément. Pose aussi
+    /// [`ARTICLE_KIND_EXPR`]. Renvoie le nombre de lignes mises à jour.
     #[tracing::instrument(name = "db.refresh_article_denorm", skip(self), fields(db.system = "postgresql"))]
     pub async fn refresh_article_denorm(&self) -> Result<u64> {
-        // `UPDATE` global sur tout `legal_article` (~M lignes) : le scan du join
-        // dépasse le `statement_timeout` du pool (30 s) dès que le corpus grossit
-        // (observé sur load-legal-corpus). On le lève **localement**, dans une
-        // transaction dédiée — l'UPDATE n'écrit que les lignes dont une colonne
-        // a dérivé, reste idempotent (#7).
         self.conn.batch_execute("BEGIN").await?;
         let updated: Result<u64> = async {
             self.conn
                 .batch_execute("SET LOCAL statement_timeout = 0")
                 .await?;
+            let kind = ARTICLE_KIND_EXPR;
             let n = self
                 .conn
                 .execute(
-                    "UPDATE legal_article a SET \
-                       code_title = t.title, \
-                       jurisdiction = t.jurisdiction, \
-                       nature = upper(t.nature), \
-                       slug = t.slug, \
-                       searchable = (t.slug IS NOT NULL \
-                         AND t.role NOT IN ('individuel', 'vehicule', 'habilitation')) \
-                     FROM legal_text t \
-                     WHERE a.text_uid = t.text_uid \
-                       AND (a.code_title IS DISTINCT FROM t.title \
-                         OR a.jurisdiction IS DISTINCT FROM t.jurisdiction \
-                         OR a.nature IS DISTINCT FROM upper(t.nature) \
-                         OR a.slug IS DISTINCT FROM t.slug \
-                         OR a.searchable IS DISTINCT FROM (t.slug IS NOT NULL \
-                           AND t.role NOT IN ('individuel', 'vehicule', 'habilitation')))",
+                    &format!(
+                        "UPDATE legal_article a SET \
+                           code_title = t.title, \
+                           jurisdiction = t.jurisdiction, \
+                           nature = upper(t.nature), \
+                           slug = t.slug, \
+                           kind = {kind}, \
+                           searchable = (t.slug IS NOT NULL \
+                             AND t.role NOT IN ('individuel', 'vehicule', 'habilitation')) \
+                         FROM legal_text t \
+                         WHERE a.text_uid = t.text_uid \
+                           AND (a.code_title IS DISTINCT FROM t.title \
+                             OR a.jurisdiction IS DISTINCT FROM t.jurisdiction \
+                             OR a.nature IS DISTINCT FROM upper(t.nature) \
+                             OR a.slug IS DISTINCT FROM t.slug \
+                             OR a.kind IS DISTINCT FROM {kind} \
+                             OR a.searchable IS DISTINCT FROM (t.slug IS NOT NULL \
+                               AND t.role NOT IN ('individuel', 'vehicule', 'habilitation')))"
+                    ),
                     &[],
                 )
                 .await?;
@@ -1485,34 +1442,247 @@ impl DecisionRepository<'_> {
         }
     }
 
-    /// Recherche plein-texte d'articles (ADR 0114/0232/0233,
-    /// `/recherche-textes`), **titre-primaire**. Par jambe, le prédicat
-    /// combine titre conjonctif normalisé ×4 + filet titre OR ×0,25 + corps
-    /// ([`article_search_predicates`]) ; la fusion entre les jambes se fait
-    /// **par rang** (RRF, `1/(k + rang)`, jambes bornées à
-    /// [`ARTICLE_LEG_LIMIT`]) — les scores BM25 des index ne sont pas
-    /// comparables, les rangs le sont (ADR 0232, mesuré : nDCG@10 0,44 vs
-    /// 0,09). Cinq jambes (ADR 0234 puis 0235, nDCG@10 0,50 vs 0,38) :
-    /// - articles **domestiques** (jurisdiction FR/UE/INTL + pays nommés dans
-    ///   la requête, [`lj_core::jurisdictions::query_jurisdictions`]) ;
-    /// - articles **étrangers**, pondérés [`ARTICLE_FOREIGN_WEIGHT`] — les
-    ///   codes napoléoniens étrangers matchent mot pour mot les requêtes
-    ///   françaises et trustaient le top ;
-    /// - articles du **pays nommé** (ADR 0238,
-    ///   [`lj_core::jurisdictions::strip_query_jurisdictions`]) : requête
-    ///   débarrassée des tokens pays, bornée aux juridictions nommées — les
-    ///   articles de fond étrangers ne contiennent pas le nom de leur pays ;
-    ///   la jambe domestique exclut alors ces juridictions ;
-    /// - « textes à corps » (ADR 0196) ;
-    /// - **conteneurs** : textes navigables comme un code (filtre nature du
-    ///   catalogue, ADR 0133) sans corps mais à articles, titre matché par la
-    ///   forme conjonctive de la requête ou d'une expansion d'alias **pleine
-    ///   requête** (ADR 0238) — un hit `num = ''` (lien `/texte/{slug}`),
-    ///   prioritaire à rang égal (requête navigationnelle « code de la
-    ///   famille sénégalais », « code civil du sénégal »).
-    /// Articles `VIGUEUR`, optionnellement bornés à un `text_uid`.
-    /// `slug`/`code_title` joints pour le lien `/texte/{slug}/{num}` ;
-    /// `score` = score RRF fusionné.
+    /// Recalcule l'ordre de lecture des textes sales : ceux dont au moins un
+    /// article a `reading_rank IS NULL`. Seul écrivain d'un rang ; le chemin
+    /// d'écriture ne fait qu'invalider. Boucle par lots jusqu'à épuisement. Renvoie
+    /// (textes traités, lignes écrites).
+    #[tracing::instrument(name = "db.refresh_reading_ranks", skip(self), fields(db.system = "postgresql"))]
+    pub async fn refresh_reading_ranks(&self) -> Result<(u64, u64)> {
+        /// Lot de textes par aller-retour.
+        const BATCH: i64 = 500;
+        let (mut texts, mut rows) = (0u64, 0u64);
+        loop {
+            self.conn.batch_execute("BEGIN").await?;
+            let batch: Result<(u64, u64)> = async {
+                self.conn
+                    .batch_execute("SET LOCAL statement_timeout = 0")
+                    .await?;
+                self.refresh_reading_ranks_batch(BATCH).await
+            }
+            .await;
+            let (batch_texts, batch_rows) = match batch {
+                Ok(v) => {
+                    self.conn.batch_execute("COMMIT").await?;
+                    v
+                }
+                Err(e) => {
+                    let _ = self.conn.batch_execute("ROLLBACK").await;
+                    return Err(e);
+                }
+            };
+            if batch_texts == 0 {
+                return Ok((texts, rows));
+            }
+            texts += batch_texts;
+            rows += batch_rows;
+            tracing::debug!(texts, rows, "reading ranks");
+        }
+    }
+
+    /// Un lot du finisseur : les `limit` premiers textes sales, recalculés et
+    /// réécrits. Renvoie (textes, lignes écrites) ; `(0, 0)` quand plus rien n'est
+    /// sale.
+    async fn refresh_reading_ranks_batch(&self, limit: i64) -> Result<(u64, u64)> {
+        let uids: Vec<String> = self
+            .conn
+            .query(
+                "SELECT DISTINCT text_uid FROM legal_article
+                     WHERE reading_rank IS NULL LIMIT $1",
+                &[&limit],
+            )
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        if uids.is_empty() {
+            return Ok((0, 0));
+        }
+        // Version canonique de chaque article : le rang est une propriété de
+        // `(text_uid, num_key)`, partagée par ses versions.
+        let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
+        let inputs = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT DISTINCT ON (text_uid, num_key)
+                            text_uid, num_key, title_path, position
+                     FROM legal_article a
+                     WHERE text_uid = ANY($1)
+                     ORDER BY text_uid, num_key, ({valid_a}) DESC, ({norm_a}) DESC,
+                              (source = 'jorf') ASC, date_debut DESC NULLS LAST"
+                ),
+                &[&uids],
+            )
+            .await?;
+        let mut per_text: std::collections::HashMap<String, Vec<ReadingOrderInput>> =
+            std::collections::HashMap::new();
+        for r in &inputs {
+            per_text
+                .entry(r.get(0))
+                .or_default()
+                .push(ReadingOrderInput {
+                    num_key: r.get(1),
+                    title_path: r.get(2),
+                    position: r.get(3),
+                });
+        }
+        // Ordre structurel réel quand le texte a un arbre ingéré : la séquence DILA
+        // est l'autorité. Anchor `owner_uid`, `text_uid` porté le long de la récursion
+        // pour traiter tout le lot en une requête.
+        let structural = self
+            .conn
+            .query(
+                "WITH RECURSIVE tree AS (
+                   SELECT e.owner_uid AS root, e.child_kind, e.child_uid,
+                          e.child_num_key, ARRAY[e.seq] AS path, 1 AS depth
+                   FROM legal_toc_edge e
+                   WHERE e.owner_uid = ANY($1)
+                     AND e.date_debut <= current_date
+                     AND (e.date_fin IS NULL OR e.date_fin >= current_date)
+                   UNION ALL
+                   SELECT t.root, c.child_kind, c.child_uid, c.child_num_key,
+                          t.path || c.seq, t.depth + 1
+                   FROM tree t JOIN legal_toc_edge c ON c.owner_uid = t.child_uid
+                   WHERE t.child_kind = 'section' AND t.depth < 32
+                     AND c.date_debut <= current_date
+                     AND (c.date_fin IS NULL OR c.date_fin >= current_date)
+                 )
+                 SELECT root, child_num_key,
+                        row_number() OVER (PARTITION BY root ORDER BY path) AS rn
+                 FROM tree WHERE child_kind = 'article' AND child_num_key IS NOT NULL",
+                &[&uids],
+            )
+            .await?;
+        let mut structural_order: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, i64>,
+        > = std::collections::HashMap::new();
+        for r in &structural {
+            structural_order
+                .entry(r.get(0))
+                .or_default()
+                .insert(r.get(1), r.get(2));
+        }
+
+        let (mut u, mut k, mut ranks) = (Vec::new(), Vec::new(), Vec::new());
+        for (text_uid, mut entries) in per_text {
+            // Repli d'abord : il ordonne les articles absents de l'arbre du jour
+            // (abrogés, transférés, versions futures), qui se rangent derrière.
+            lj_core::article_order::sort_text_reading_order(
+                &mut entries,
+                |e| &e.num_key,
+                |e| e.title_path.as_deref(),
+                |e| e.position,
+            );
+            if let Some(order) = structural_order.get(&text_uid) {
+                entries.sort_by_key(|e| order.get(&e.num_key).copied().unwrap_or(i64::MAX));
+            }
+            for (rank, e) in entries.into_iter().enumerate() {
+                u.push(text_uid.clone());
+                k.push(e.num_key);
+                ranks.push(rank as i32);
+            }
+        }
+        let written = self
+            .conn
+            .execute(
+                "UPDATE legal_article a SET reading_rank = m.rank
+                     FROM unnest($1::text[], $2::text[], $3::int[])
+                          AS m(text_uid, num_key, rank)
+                     WHERE a.text_uid = m.text_uid AND a.num_key = m.num_key
+                       AND a.reading_rank IS DISTINCT FROM m.rank",
+                &[&u, &k, &ranks],
+            )
+            .await?;
+        Ok((uids.len() as u64, written))
+    }
+
+    /// Résout la cible d'un texte nommé en `text_uid`. Uid → tel quel ; slug
+    /// d'alias et motifs de slug d'instrument → lookup, borné aux textes visibles à
+    /// ≥ 1 article `VIGUEUR` ; à motifs ambigus, le texte au plus d'articles en
+    /// vigueur gagne.
+    async fn resolve_named_text(
+        &self,
+        target: lj_core::aliases::NamedTextTarget,
+    ) -> Result<Option<String>> {
+        use lj_core::aliases::NamedTextTarget as T;
+        let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
+        let sql = |cond: &str| {
+            format!(
+                "
+                SELECT t.text_uid
+                FROM legal_text t
+                WHERE {cond}
+                  AND coalesce(t.status, 'VIGUEUR') = 'VIGUEUR'
+                  AND {TEXT_ROLE_VISIBLE_SQL}
+                  AND EXISTS (SELECT 1 FROM legal_article a
+                              WHERE a.text_uid = t.text_uid
+                                AND {valid_a} AND {norm_a})
+                ORDER BY (SELECT count(*) FROM legal_article a
+                          WHERE a.text_uid = t.text_uid
+                            AND {valid_a} AND {norm_a}) DESC
+                LIMIT 1
+                "
+            )
+        };
+        let rows = match &target {
+            T::Uid(uid) => return Ok(Some(uid.clone())),
+            T::Slug(slug) => self.conn.query(&sql("t.slug = $1"), &[slug]).await?,
+            T::SlugPatterns(pats) => {
+                self.conn
+                    .query(&sql("t.slug LIKE ANY($1)"), &[pats])
+                    .await?
+            }
+        };
+        Ok(rows.first().map(|r| r.get(0)))
+    }
+
+    /// Catalogue `(text_uid, titre)` des codes navigables pour la jambe texte nommé
+    /// de [`Self::search_articles`] : nature navigable, rôle visible, ≥ 1 article
+    /// `VIGUEUR`, droit applicable en France, titre en « Code … ».
+    async fn named_code_catalog(&self) -> Result<Vec<(String, String)>> {
+        let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
+        let rows = self
+            .conn
+            .query(
+                &format!(
+                    "
+                    SELECT t.text_uid, t.title
+                    FROM legal_text t
+                    WHERE t.title ILIKE 'code %'
+                      AND t.jurisdiction IN ('FR', 'UE', 'INTL')
+                      AND coalesce(t.status, 'VIGUEUR') = 'VIGUEUR'
+                      AND {NAVIGABLE_TEXT_NATURES_SQL} AND {TEXT_ROLE_VISIBLE_SQL}
+                      AND EXISTS (SELECT 1 FROM legal_article a
+                                  WHERE a.text_uid = t.text_uid
+                                    AND {valid_a} AND {norm_a})
+                    "
+                ),
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// Recherche plein-texte d'articles (`/recherche-textes`), titre-primaire. Par
+    /// jambe, le prédicat combine titre conjonctif normalisé, filet titre OR et
+    /// corps ([`article_search_predicates`]) ; la fusion entre les jambes se fait
+    /// par rang (RRF, `1/(k + rang)`, jambes bornées à [`ARTICLE_LEG_LIMIT`]).
+    ///
+    /// Cinq jambes : articles domestiques (FR/UE/INTL + pays nommés), articles
+    /// étrangers pondérés [`ARTICLE_FOREIGN_WEIGHT`], articles du pays nommé
+    /// (requête débarrassée des tokens pays, les juridictions nommées sortant alors
+    /// de la jambe domestique), textes à corps, et conteneurs (textes navigables
+    /// comme un code, sans corps mais à articles — un hit `num = ''` vers
+    /// `/texte/{slug}`, prioritaire à rang égal). Plus, quand la requête nomme un
+    /// code du catalogue, les jambes code nommé : articles puis sacs d'usage du
+    /// code visé, requête débarrassée du nom de code.
+    ///
+    /// Articles valides à `at` (fenêtre de validité ; `None` = aujourd'hui), une
+    /// ligne par article, optionnellement bornés à un `text_uid`.
+    /// `slug`/`code_title` joints pour le lien `/texte/{slug}/{num}` ; `score` =
+    /// score RRF fusionné. La recherche à date déplace la fenêtre, pas le corpus :
+    /// on sert la version couvrant `at` des articles cherchables d'aujourd'hui.
     #[tracing::instrument(name = "db.search_articles", skip(self, expansions), fields(db.system = "postgresql", limit, offset))]
     #[allow(clippy::too_many_arguments)]
     pub async fn search_articles(
@@ -1524,23 +1694,25 @@ impl DecisionRepository<'_> {
         nature: Option<&str>,
         source: Option<&str>,
         nature_set: Option<(&[String], bool)>,
+        at: Option<NaiveDate>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<ArticleSearchRow>> {
-        // `$1` titre OR (requête enrichie), `$2` corps (requête brute ; la
-        // clause usage_terms est ajoutée boostée dans
-        // [`article_search_predicates`], ADR 0248), alternatives conjonctives en
-        // `$3..`, puis filtres optionnels et pagination.
+        // `$1` titre OR (requête enrichie), `$2` corps (requête brute ; la clause
+        // usage_terms est ajoutée boostée dans [`article_search_predicates`]),
+        // alternatives conjonctives en `$3..`, puis filtres optionnels et pagination.
         let mut params = ArticleSearchParams::new(article_title_query(query, expansions), query);
-        let (art_pred, txt_pred) = article_search_predicates(&mut params, query, expansions);
+        let (art_query, txt_query) = article_search_predicates(&mut params, query, expansions);
+        let art_pred = format!("a.id @@@ {art_query}");
         let (art_filters, txt_filters) =
             params.push_filters(text_uid, jurisdiction, nature, source, nature_set);
         let prim_ph = params.push(Box::new(primary_jurisdictions(query)));
-        // Jambe « pays nommé » (ADR 0238) : articles des juridictions que la
-        // requête nomme, requête débarrassée des tokens pays — les articles
-        // de fond étrangers ne contiennent pas le nom de leur pays, le BM25
-        // favorise les docs qui le portent (conventions fiscales…). La jambe
-        // articles domestique exclut alors ces juridictions (pas de doublon).
+        let date_sql = sql_date_expr(at);
+        let (valid_a, pick_a) = (article_valid_at("a", &date_sql), article_pick_order("a"));
+        let (valid_a2, pick_a2) = (article_valid_at("a2", &date_sql), article_pick_order("a2"));
+        let (norm_a, norm_a2) = (article_is_norm("a"), article_is_norm("a2"));
+        // Jambe « pays nommé » : articles des juridictions que la requête nomme,
+        // requête débarrassée des tokens pays ; la jambe domestique les exclut.
         let (art_ctry_excl, ctry_cte, ctry_union) =
             match lj_core::jurisdictions::strip_query_jurisdictions(query) {
                 Some((codes, stripped)) => {
@@ -1560,30 +1732,30 @@ impl DecisionRepository<'_> {
                     let s_ph = params.push(Box::new(stripped));
                     (
                         format!("\n  AND a.jurisdiction <> ALL(${codes_ph})"),
-                        // Single-table (ADR 0254) : prédicat 100 % indexé, les
-                        // colonnes d'affichage (dont slug/code_title
-                        // dénormalisés) jointes pour le seul top-K.
                         format!(
                             "
                     ctry AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
-                        SELECT a.text_uid, a.slug, a.code_title AS title, a.num,
+                        SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.text_uid, a.slug, a.code_title AS title, a.num,
                                a.num_key, a.title_path, a.status, a.source,
-                               a.texte, j.score
+                               a.date_debut, a.texte, j.score
                         FROM (
                           SELECT a.id, paradedb.score(a.id) AS score
                           FROM legal_article a
                           WHERE a.id @@@ paradedb.boolean(should => ARRAY[{conj_clause}\
                                 paradedb.boost({ARTICLE_TITLE_OR_BOOST}, paradedb.match('search_title', ${s_ph})), \
                                 paradedb.match('texte', ${s_ph})])
-                            AND a.status = 'VIGUEUR'
+                            AND {valid_a}
+                            AND {norm_a}
                             AND a.searchable
                             AND a.jurisdiction = ANY(${codes_ph}){art_filters}
                           ORDER BY paradedb.score(a.id) DESC
                           LIMIT {ARTICLE_LEG_LIMIT}
                         ) j
                         JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}
                       ) x
                     ),"
                         ),
@@ -1591,7 +1763,7 @@ impl DecisionRepository<'_> {
                             "
                       UNION ALL
                       SELECT text_uid, slug, title, num, num_key, title_path,
-                             status, source, texte,
+                             status, source, date_debut, texte,
                              1.0 / ({ARTICLE_RRF_K} + rk) AS rrf, -1 AS leg
                       FROM ctry"
                         ),
@@ -1599,10 +1771,115 @@ impl DecisionRepository<'_> {
                 }
                 None => (String::new(), String::new(), String::new()),
             };
-        // Jambe conteneurs : forme conjonctive de la requête + expansions
-        // d'alias PLEINE requête (« code civil du sénégal » → « code de la
-        // famille sénégalais », ADR 0238 — jamais les expansions embarquées,
-        // ADR 0234).
+        // Jambes « texte nommé » : requête débarrassée du nom du texte, bornée au
+        // texte visé (articles + sacs d'usage). Votes sommés avec les jambes globales.
+        let catalog = if lj_core::aliases::query_names_code(query) {
+            self.named_code_catalog().await?
+        } else {
+            Vec::new()
+        };
+        let named_code = match lj_core::aliases::strip_query_named_text(query, &catalog) {
+            Some((target, stripped)) => self
+                .resolve_named_text(target)
+                .await?
+                .map(|uid| (uid, stripped)),
+            None => None,
+        };
+        let (nmd_cte, nmd_union) = match &named_code {
+            Some((uid, stripped)) => {
+                let uid_ph = params.push(Box::new(uid.clone()));
+                let conj_clause = match lj_core::aliases::conj_title_query(stripped) {
+                    Some(c) => {
+                        let cph = params.push(Box::new(c));
+                        format!(
+                            "paradedb.boost({ARTICLE_TITLE_CONJ_BOOST}, \
+                             paradedb.match('search_title', ${cph}, \
+                             conjunction_mode => true)), "
+                        )
+                    }
+                    None => String::new(),
+                };
+                let s_ph = params.push(Box::new(stripped.clone()));
+                let mut cte = format!(
+                    "
+                    nmd AS (
+                      SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
+                      FROM (
+                        SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.text_uid, a.slug, a.code_title AS title, a.num,
+                               a.num_key, a.title_path, a.status, a.source,
+                               a.date_debut, a.texte, j.score
+                        FROM (
+                          SELECT a.id, paradedb.score(a.id) AS score
+                          FROM legal_article a
+                          WHERE a.id @@@ paradedb.boolean(should => ARRAY[{conj_clause}\
+                                paradedb.boost({ARTICLE_TITLE_OR_BOOST}, paradedb.match('search_title', ${s_ph})), \
+                                paradedb.match('texte', ${s_ph})])
+                            AND {valid_a}
+                            AND {norm_a}
+                            AND a.searchable
+                            AND a.text_uid = ${uid_ph}{art_filters}
+                          ORDER BY paradedb.score(a.id) DESC
+                          LIMIT {ARTICLE_LEG_LIMIT}
+                        ) j
+                        JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}
+                      ) x
+                    ),"
+                );
+                let mut union = format!(
+                    "
+                      UNION ALL
+                      SELECT text_uid, slug, title, num, num_key, title_path,
+                             status, source, date_debut, texte,
+                             1.0 / ({ARTICLE_RRF_K} + rk) AS rrf, -3 AS leg
+                      FROM nmd"
+                );
+                if !lj_core::usage::usage_reference_or_nav_query(stripped) {
+                    let g_ph = params.push(Box::new(lj_core::usage::usage_grams(stripped)));
+                    cte.push_str(&format!(
+                        "
+                    nmd_us AS (
+                      SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
+                      FROM (
+                        SELECT a.text_uid, a.slug, a.code_title AS title, a.num,
+                               a.num_key, a.title_path, a.status, a.source,
+                               a.date_debut, a.texte, paradedb.score(u.id) AS score
+                        FROM legal_article_usage u
+                        JOIN LATERAL (
+                          SELECT a2.text_uid, a2.slug, a2.code_title, a2.num,
+                                 a2.num_key, a2.title_path, a2.status,
+                                 a2.source, a2.date_debut, a2.texte, a2.searchable,
+                                 a2.jurisdiction, a2.nature
+                          FROM legal_article a2
+                          WHERE a2.text_uid = u.text_uid AND a2.num_key = u.num_key
+                            AND {valid_a2}
+                            AND {norm_a2}
+                          ORDER BY {pick_a2} LIMIT 1
+                        ) a ON true
+                        WHERE u.id @@@ paradedb.match('terms', ${g_ph})
+                          AND u.text_uid = ${uid_ph}
+                          AND a.searchable{art_filters}
+                        ORDER BY paradedb.score(u.id) DESC
+                        LIMIT {ARTICLE_LEG_LIMIT}
+                      ) x
+                    ),"
+                    ));
+                    union.push_str(&format!(
+                        "
+                      UNION ALL
+                      SELECT text_uid, slug, title, num, num_key, title_path,
+                             status, source, date_debut, texte,
+                             {ARTICLE_NAMED_USAGE_WEIGHT} / ({ARTICLE_RRF_K} + rk) AS rrf, 4 AS leg
+                      FROM nmd_us"
+                    ));
+                }
+                (cte, union)
+            }
+            None => (String::new(), String::new()),
+        };
+        // Jambe conteneurs : forme conjonctive de la requête + expansions d'alias
+        // pleine requête.
         let mut cont_alts: Vec<String> = Vec::new();
         cont_alts.extend(lj_core::aliases::conj_title_query(query));
         cont_alts.extend(
@@ -1625,11 +1902,8 @@ impl DecisionRepository<'_> {
                     many => format!("paradedb.boolean(should => ARRAY[{}])", many.join(", ")),
                 };
                 (
-                    // Fence `OFFSET 0` : seuls le match titre et la juridiction
-                    // (fast fields) descendent dans le scan ParadeDB — les
-                    // filtres non indexables (`nature ILIKE`…) redescendus en
-                    // heap filter forçaient un parcours de toute `legal_text`
-                    // (~1,6 s pour souvent 0 ligne).
+                    // Fence `OFFSET 0` : seuls le match titre et la juridiction descendent dans le
+                    // scan ParadeDB, les filtres non indexables restent au-dessus.
                     format!(
                         "
                     cont AS (
@@ -1654,7 +1928,7 @@ impl DecisionRepository<'_> {
                           AND {NAVIGABLE_TEXT_NATURES_SQL} AND {TEXT_ROLE_VISIBLE_SQL}
                           AND EXISTS (SELECT 1 FROM legal_article a
                                       WHERE a.text_uid = t.text_uid
-                                        AND a.status = 'VIGUEUR'){txt_filters}
+                                        AND {valid_a} AND {norm_a}){txt_filters}
                         ORDER BY t.score DESC
                         LIMIT {ARTICLE_LEG_LIMIT}
                       ) z
@@ -1665,7 +1939,7 @@ impl DecisionRepository<'_> {
                       UNION ALL
                       SELECT text_uid, slug, title, '' AS num, '' AS num_key,
                              NULL AS title_path, status, source,
-                             NULL::text AS texte,
+                             NULL::date AS date_debut, NULL::text AS texte,
                              1.0 / ({ARTICLE_RRF_K} + rk) AS rrf, -2 AS leg
                       FROM cont"
                     ),
@@ -1673,19 +1947,14 @@ impl DecisionRepository<'_> {
             }
             [] => (String::new(), String::new()),
         };
-        // Jambe « usage » (ADR 0248) : grammes de la requête contre les sacs
-        // de contextes de citation (`legal_article.usage_terms`). Elle RECOUVRE
-        // la jambe articles : ses votes se SOMMENT (GROUP BY final) —
-        // accumulation d'évidence, jamais un simple interleaving. Coupée sur
-        // les requêtes-référence et navigationnelles (garde).
+        // Jambe « usage » : grammes de la requête contre les sacs de contextes de
+        // citation (`legal_article.usage_terms`). Elle recouvre la jambe articles, ses
+        // votes se somment. Coupée sur les requêtes-référence et navigationnelles.
         let (us_cte, us_union) = if lj_core::usage::usage_reference_or_nav_query(query) {
             (String::new(), String::new())
         } else {
             let g_ph = params.push(Box::new(lj_core::usage::usage_grams(query)));
             (
-                // Le filtre navigable + visible et l'affichage (slug,
-                // code_title) viennent des colonnes dénormalisées de l'article
-                // résolu par le LATERAL (ADR 0254) — plus de join legal_text.
                 format!(
                     "
                     us AS (
@@ -1693,17 +1962,18 @@ impl DecisionRepository<'_> {
                       FROM (
                         SELECT a.text_uid, a.slug, a.code_title AS title, a.num,
                                a.num_key, a.title_path, a.status, a.source,
-                               a.texte, paradedb.score(u.id) AS score
+                               a.date_debut, a.texte, paradedb.score(u.id) AS score
                         FROM legal_article_usage u
                         JOIN LATERAL (
                           SELECT a2.text_uid, a2.slug, a2.code_title, a2.num,
                                  a2.num_key, a2.title_path, a2.status,
-                                 a2.source, a2.texte, a2.searchable,
+                                 a2.source, a2.date_debut, a2.texte, a2.searchable,
                                  a2.jurisdiction, a2.nature
                           FROM legal_article a2
                           WHERE a2.text_uid = u.text_uid AND a2.num_key = u.num_key
-                            AND a2.status = 'VIGUEUR'
-                          ORDER BY a2.date_debut DESC LIMIT 1
+                            AND {valid_a2}
+                            AND {norm_a2}
+                          ORDER BY {pick_a2} LIMIT 1
                         ) a ON true
                         WHERE u.id @@@ paradedb.match('terms', ${g_ph})
                           AND a.searchable{art_filters}
@@ -1716,68 +1986,116 @@ impl DecisionRepository<'_> {
                     "
                       UNION ALL
                       SELECT text_uid, slug, title, num, num_key, title_path,
-                             status, source, texte,
+                             status, source, date_debut, texte,
                              {ARTICLE_USAGE_WEIGHT} / ({ARTICLE_RRF_K} + rk) AS rrf, 3 AS leg
                       FROM us"
                 ),
             )
         };
-        let limit_ph = params.push(Box::new(limit));
-        let offset_ph = params.push(Box::new(offset));
-        // Jambes articles domestique et étrangère : deux scans ParadeDB
-        // **single-table TopK** (ADR 0254) — prédicat et filtres 100 % indexés
-        // (searchable/jurisdiction dénormalisés) + `ORDER BY score LIMIT`
-        // directement dans le scan, donc élagage WAND de bout en bout, y
-        // compris sur le boolean+boost (mesuré : 110 ms + 87 ms contre
-        // 1,05 s pour un scan partagé sans coupe qui score les ~415 k docs
-        // du filet corps). Les colonnes d'affichage (texte, title_path,
-        // slug/code_title dénormalisés…) ne sont jointes que pour les
-        // ≤ leg_limit lignes retenues. La coupe du top-K se fait par score
-        // seul (le tiebreak `num_key` du `row_number` n'intervient qu'après
-        // la coupe), puis fusion par rang. Tiebreak final par `leg` :
-        // conteneur, pays nommé, articles domestiques, textes à corps,
-        // articles étrangers. La pagination porte sur la fusion
-        // (≤ 5 × leg_limit docs atteignables — sans effet : le front pagine
-        // par 10-20, le MCP plafonne limit à 20).
-        let sql = format!(
-            "
-                    WITH{cont_cte}{ctry_cte}{us_cte}
-                    art AS (
+        // Jambe usage scopée au numéro cité : les sacs de contextes de citation des
+        // seuls articles qui portent le numéro. Le scope passe par le littéral
+        // `num_key` de l'index, sous `const_score(0, …)` : clause requise, poussée dans
+        // le scan Tantivy, sans peser sur le score.
+        let (nus_cte, nus_union) = match lj_core::article_key::query_article_keys(query).as_slice()
+        {
+            [] => (String::new(), String::new()),
+            keys => {
+                let k_ph = params.push(Box::new(keys.to_vec()));
+                let g_ph = params.push(Box::new(lj_core::usage::usage_grams(query)));
+                (
+                    format!(
+                        "
+                    nus AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
                         SELECT a.text_uid, a.slug, a.code_title AS title, a.num,
                                a.num_key, a.title_path, a.status, a.source,
-                               a.texte, j.score
+                               a.date_debut, a.texte, paradedb.score(u.id) AS score
+                        FROM legal_article_usage u
+                        JOIN LATERAL (
+                          SELECT a2.text_uid, a2.slug, a2.code_title, a2.num,
+                                 a2.num_key, a2.title_path, a2.status,
+                                 a2.source, a2.date_debut, a2.texte, a2.searchable,
+                                 a2.jurisdiction, a2.nature
+                          FROM legal_article a2
+                          WHERE a2.text_uid = u.text_uid AND a2.num_key = u.num_key
+                            AND {valid_a2}
+                            AND {norm_a2}
+                          ORDER BY {pick_a2} LIMIT 1
+                        ) a ON true
+                        WHERE u.id @@@ paradedb.boolean(must => ARRAY[
+                                paradedb.match('terms', ${g_ph}),
+                                paradedb.const_score(0, paradedb.term_set('num_key', ${k_ph}::text[]))])
+                          AND a.searchable{art_filters}
+                        ORDER BY paradedb.score(u.id) DESC
+                        LIMIT {ARTICLE_LEG_LIMIT}
+                      ) x
+                    ),"
+                    ),
+                    format!(
+                        "
+                      UNION ALL
+                      SELECT text_uid, slug, title, num, num_key, title_path,
+                             status, source, date_debut, texte,
+                             {ARTICLE_USAGE_WEIGHT} / ({ARTICLE_RRF_K} + rk) AS rrf, 5 AS leg
+                      FROM nus"
+                    ),
+                )
+            }
+        };
+        let limit_ph = params.push(Box::new(limit));
+        let offset_ph = params.push(Box::new(offset));
+        // Jambes articles domestique et étrangère : deux scans ParadeDB single-table
+        // TopK — prédicat et filtres indexés + `ORDER BY score LIMIT` dans le scan.
+        // Les colonnes d'affichage ne sont jointes que pour les ≤ leg_limit lignes
+        // retenues. Coupe du top-K par score seul, puis fusion par rang. Tiebreak
+        // final par `leg` : conteneur, pays nommé, articles domestiques, textes à
+        // corps, articles étrangers.
+        let sql = format!(
+            "
+                    WITH{cont_cte}{ctry_cte}{nmd_cte}{us_cte}{nus_cte}
+                    art AS (
+                      SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
+                      FROM (
+                        SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.text_uid, a.slug, a.code_title AS title, a.num,
+                               a.num_key, a.title_path, a.status, a.source,
+                               a.date_debut, a.texte, j.score
                         FROM (
                           SELECT a.id, paradedb.score(a.id) AS score
                           FROM legal_article a
                           WHERE {art_pred}
-                            AND a.status = 'VIGUEUR'
+                            AND {valid_a}
+                            AND {norm_a}
                             AND a.searchable
                             AND a.jurisdiction = ANY(${prim_ph}){art_ctry_excl}{art_filters}
                           ORDER BY paradedb.score(a.id) DESC
                           LIMIT {ARTICLE_LEG_LIMIT}
                         ) j
                         JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}
                       ) x
                     ),
                     art_f AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
-                        SELECT a.text_uid, a.slug, a.code_title AS title, a.num,
+                        SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.text_uid, a.slug, a.code_title AS title, a.num,
                                a.num_key, a.title_path, a.status, a.source,
-                               a.texte, j.score
+                               a.date_debut, a.texte, j.score
                         FROM (
                           SELECT a.id, paradedb.score(a.id) AS score
                           FROM legal_article a
                           WHERE {art_pred}
-                            AND a.status = 'VIGUEUR'
+                            AND {valid_a}
+                            AND {norm_a}
                             AND a.searchable
                             AND NOT (a.jurisdiction = ANY(${prim_ph})){art_ctry_excl}{art_filters}
                           ORDER BY paradedb.score(a.id) DESC
                           LIMIT {ARTICLE_LEG_LIMIT}
                         ) j
                         JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}
                       ) x
                     ),
                     txt AS (
@@ -1788,7 +2106,8 @@ impl DecisionRepository<'_> {
                                lower(t.nature) AS source, t.body AS texte,
                                paradedb.score(t.id) AS score
                         FROM legal_text t
-                        WHERE {txt_pred}
+                        WHERE t.id @@@ {txt_query}
+                          AND t.body IS NOT NULL AND {TEXT_ROLE_VISIBLE_SQL}
                           AND coalesce(t.status, 'VIGUEUR') = 'VIGUEUR'
                           AND t.slug IS NOT NULL{txt_filters}
                         ORDER BY paradedb.score(t.id) DESC
@@ -1796,26 +2115,27 @@ impl DecisionRepository<'_> {
                       ) y
                     )
                     SELECT u.text_uid, u.slug, u.title, u.num, u.num_key,
-                           u.title_path, u.status, u.source, u.texte,
+                           u.title_path, u.status, u.source, u.date_debut, u.texte,
                            sum(u.rrf)::float4 AS score
                     FROM (
                       SELECT text_uid, slug, title, num, num_key, title_path,
-                             status, source, texte,
+                             status, source, date_debut, texte,
                              1.0 / ({ARTICLE_RRF_K} + rk) AS rrf, 0 AS leg
                       FROM art
                       UNION ALL
                       SELECT text_uid, slug, title, '' AS num, '' AS num_key,
-                             NULL AS title_path, status, source, texte,
+                             NULL AS title_path, status, source,
+                             NULL::date AS date_debut, texte,
                              1.0 / ({ARTICLE_RRF_K} + rk) AS rrf, 1 AS leg
                       FROM txt
                       UNION ALL
                       SELECT text_uid, slug, title, num, num_key, title_path,
-                             status, source, texte,
+                             status, source, date_debut, texte,
                              {ARTICLE_FOREIGN_WEIGHT} / ({ARTICLE_RRF_K} + rk) AS rrf, 2 AS leg
-                      FROM art_f{ctry_union}{cont_union}{us_union}
+                      FROM art_f{ctry_union}{cont_union}{nmd_union}{us_union}{nus_union}
                     ) u
                     GROUP BY u.text_uid, u.slug, u.title, u.num, u.num_key,
-                             u.title_path, u.status, u.source, u.texte
+                             u.title_path, u.status, u.source, u.date_debut, u.texte
                     ORDER BY sum(u.rrf) DESC, min(u.leg), u.num_key
                     LIMIT ${limit_ph} OFFSET ${offset_ph}
                     "
@@ -1832,21 +2152,22 @@ impl DecisionRepository<'_> {
                 title_path: r.get(5),
                 status: r.get(6),
                 source: r.get(7),
-                texte: r.get(8),
-                score: r.get(9),
+                date_debut: r.get(8),
+                texte: r.get(9),
+                score: r.get(10),
             })
             .collect())
     }
 
-    /// Total exact + les quatre facettes de la recherche d'articles (ADR 0114) en
-    /// **une** requête `GROUPING SETS`, sous le même prédicat BM25 + filtres que
-    /// [`Self::search_articles`] : le prédicat (le poste dominant, ~1 s sur le
-    /// corpus complet) ne s'exécute qu'une fois au lieu de quatre. Les comptes
-    /// restent ceux du prédicat complet (filtres inclus) : l'UI montre la
-    /// composition du résultat courant, pas un univers non filtré. Chaque axe est
+    /// Total exact + les quatre facettes de la recherche d'articles, sous le même
+    /// prédicat BM25 + filtres que [`Self::search_articles`]. Les membres articles
+    /// et textes à corps sont comptés chacun par une passe `paradedb.aggregate` —
+    /// les quatre `terms` + le total `value_count`, tout le prédicat exprimé en
+    /// `searchqueryinput` ; le membre conteneurs reste en SQL. Fusion des comptes
+    /// par valeur côté app, sur le prédicat complet filtres inclus. Chaque axe est
     /// trié count décroissant puis valeur ascendante ; les valeurs vides sont
-    /// écartées. `nature` est normalisée `upper()` (le corpus curé mélange
-    /// `LOI`/`loi`, `CONSTITUTION`/`constitution`).
+    /// écartées, l'axe `code` plafonné à son top-[`ARTICLE_CODE_FACET_LIMIT`] et
+    /// `nature` normalisée `upper()`.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(name = "db.article_search_stats", skip(self, expansions), fields(db.system = "postgresql"))]
     pub async fn article_search_stats(
@@ -1858,18 +2179,118 @@ impl DecisionRepository<'_> {
         nature: Option<&str>,
         source: Option<&str>,
         nature_set: Option<(&[String], bool)>,
+        at: Option<NaiveDate>,
     ) -> Result<ArticleSearchStats> {
-        // Corps = requête brute ; la clause usage_terms (ADR 0248) est ajoutée
-        // par `article_search_predicates`, donc facettes cohérentes avec les
-        // résultats de `search_articles`.
-        let mut params = ArticleSearchParams::new(article_title_query(query, expansions), query);
-        let (art_pred, txt_pred) = article_search_predicates(&mut params, query, expansions);
-        let (art_filters, txt_filters) =
-            params.push_filters(text_uid, jurisdiction, nature, source, nature_set);
-        // Membre conteneurs (ADR 0234) : même appartenance que la jambe de
-        // hits — le prior de juridiction ne change pas l'appartenance des
-        // jambes articles (pondération de fusion seulement), il n'apparaît
-        // donc pas ici, sauf pour les conteneurs où c'est un filtre dur.
+        // Corps = requête brute ; la clause usage_terms est ajoutée par
+        // `article_search_predicates`. Les filtres SQL deviennent des clauses `must` du
+        // `searchqueryinput`. Jeu de paramètres dédié : chaque placeholder poussé doit
+        // être référencé par la requête qui le porte.
+        let mut params_art =
+            ArticleSearchParams::new(article_title_query(query, expansions), query);
+        let (art_query, _) = article_search_predicates(&mut params_art, query, expansions);
+        let mut agg_filters = String::new();
+        for (field, value) in [
+            ("text_uid", text_uid.map(str::to_string)),
+            ("jurisdiction", jurisdiction.map(str::to_string)),
+            ("nature", nature.map(str::to_uppercase)),
+            ("source", source.map(str::to_string)),
+        ] {
+            if let Some(v) = value {
+                let ph = params_art.push(Box::new(v));
+                agg_filters.push_str(&format!(", paradedb.term('{field}', ${ph})"));
+            }
+        }
+        let mut agg_must_not = String::new();
+        if let Some((natures, include)) = nature_set.filter(|(n, _)| !n.is_empty()) {
+            let terms: Vec<String> = natures
+                .iter()
+                .map(|n| {
+                    let ph = params_art.push(Box::new(n.clone()));
+                    format!("paradedb.term('nature', ${ph})")
+                })
+                .collect();
+            let set = format!("paradedb.boolean(should => ARRAY[{}])", terms.join(", "));
+            if include {
+                agg_filters.push_str(&format!(", {set}"));
+            } else {
+                // SQL `<> ALL` écarte aussi les natures NULL ; en Tantivy un doc sans champ ne
+                // matche pas le `must_not` — `exists()` rétablit la même sémantique.
+                agg_filters.push_str(", paradedb.exists('nature')");
+                agg_must_not = format!(", must_not => ARRAY[{set}]");
+            }
+        }
+        let valid_agg = article_valid_agg(&sql_date_expr(at));
+        let agg_row = self
+            .conn
+            .query_one(
+                &format!(
+                    "SELECT paradedb.aggregate('legal_article_bm25', \
+                       paradedb.boolean(must => ARRAY[{art_query}, \
+                         {valid_agg}, \
+                         paradedb.term('kind', 'article'), \
+                         paradedb.term('searchable', true){agg_filters}]{agg_must_not}), \
+                       '{ARTICLE_FACETS_AGG}'::json, \
+                       bucket_limit => {ARTICLE_FACETS_BUCKET_LIMIT})::text"
+                ),
+                &params_art.refs(),
+            )
+            .await?;
+        let agg_art: serde_json::Value = serde_json::from_str(agg_row.get(0))
+            .map_err(|e| StoreError::Invalid(format!("agrégat facettes articles: {e}")))?;
+
+        let mut params_txt =
+            ArticleSearchParams::new(article_title_query(query, expansions), query);
+        let txt_query = article_text_predicate(&mut params_txt, query, expansions);
+        let mut txt_filters_agg = String::new();
+        for (field, value) in [
+            ("text_uid", text_uid.map(str::to_string)),
+            ("jurisdiction", jurisdiction.map(str::to_string)),
+            ("nature_up", nature.map(str::to_uppercase)),
+            ("source", source.map(str::to_string)),
+        ] {
+            if let Some(v) = value {
+                let ph = params_txt.push(Box::new(v));
+                txt_filters_agg.push_str(&format!(", paradedb.term('{field}', ${ph})"));
+            }
+        }
+        let mut txt_must_not = vec![TEXT_ROLE_HIDDEN_TERMS.to_string()];
+        if let Some((natures, include)) = nature_set.filter(|(n, _)| !n.is_empty()) {
+            let terms: Vec<String> = natures
+                .iter()
+                .map(|n| {
+                    let ph = params_txt.push(Box::new(n.clone()));
+                    format!("paradedb.term('nature_up', ${ph})")
+                })
+                .collect();
+            let set = format!("paradedb.boolean(should => ARRAY[{}])", terms.join(", "));
+            // `legal_text.nature` est NOT NULL : `<> ALL` n'écarte aucune ligne à nature
+            // absente, un `must_not` nu a donc exactement la sémantique du SQL.
+            if include {
+                txt_filters_agg.push_str(&format!(", {set}"));
+            } else {
+                txt_must_not.push(set);
+            }
+        }
+        let txt_agg_row = self
+            .conn
+            .query_one(
+                &format!(
+                    "SELECT paradedb.aggregate('legal_text_body_bm25', \
+                       paradedb.boolean(must => ARRAY[{txt_query}, \
+                         paradedb.term('has_body', true), \
+                         paradedb.term('status_eff', 'VIGUEUR'), \
+                         paradedb.exists('slug'){txt_filters_agg}], \
+                         must_not => ARRAY[{}]), \
+                       '{TEXT_FACETS_AGG}'::json, \
+                       bucket_limit => {ARTICLE_FACETS_BUCKET_LIMIT})::text",
+                    txt_must_not.join(", ")
+                ),
+                &params_txt.refs(),
+            )
+            .await?;
+        let agg_txt: serde_json::Value = serde_json::from_str(txt_agg_row.get(0))
+            .map_err(|e| StoreError::Invalid(format!("agrégat facettes textes: {e}")))?;
+
         let mut cont_alts: Vec<String> = Vec::new();
         cont_alts.extend(lj_core::aliases::conj_title_query(query));
         cont_alts.extend(
@@ -1878,8 +2299,13 @@ impl DecisionRepository<'_> {
                 .filter_map(|e| lj_core::aliases::conj_title_query(e)),
         );
         cont_alts.dedup();
-        let cont_member = match cont_alts.as_slice() {
+        // `GROUPING(...)` encode le set actif en bitmask (bit levé = colonne NON
+        // groupée) : code = 0b0111, jurisdiction = 0b1011, nature = 0b1101,
+        // source = 0b1110, total = 0b1111.
+        let rows = match cont_alts.as_slice() {
+            [] => Vec::new(),
             [_, ..] => {
+                let mut params = ArticleSearchParams::empty();
                 let clauses: Vec<String> = cont_alts
                     .iter()
                     .map(|alt| {
@@ -1892,12 +2318,16 @@ impl DecisionRepository<'_> {
                     many => format!("paradedb.boolean(should => ARRAY[{}])", many.join(", ")),
                 };
                 let prim_ph = params.push(Box::new(primary_jurisdictions(query)));
-                // Même fence `OFFSET 0` que la jambe conteneurs des hits :
-                // seuls le match titre et la juridiction descendent dans le
-                // scan, les filtres non indexables restent côté SQL.
-                format!(
-                    "
-                      UNION ALL
+                let (_, txt_filters) =
+                    params.push_filters(text_uid, jurisdiction, nature, source, nature_set);
+                let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
+                self.conn
+                    .query(
+                        &format!(
+                            "
+                    SELECT GROUPING(u.slug, u.jurisdiction, u.nature, u.source) AS gset,
+                           u.slug, u.jurisdiction, u.nature, u.source, count(*) AS n
+                    FROM (
                       SELECT t.slug, t.jurisdiction, upper(t.nature) AS nature,
                              lower(t.nature) AS source
                       FROM (
@@ -1914,85 +2344,89 @@ impl DecisionRepository<'_> {
                         AND {NAVIGABLE_TEXT_NATURES_SQL} AND {TEXT_ROLE_VISIBLE_SQL}
                         AND EXISTS (SELECT 1 FROM legal_article a
                                     WHERE a.text_uid = t.text_uid
-                                      AND a.status = 'VIGUEUR'){txt_filters}"
-                )
-            }
-            [] => String::new(),
-        };
-        // `GROUPING(...)` encode le set actif en bitmask (bit levé = colonne NON
-        // groupée) : code = 0b0111, jurisdiction = 0b1011, nature = 0b1101,
-        // source = 0b1110, total (grand agrégat) = 0b1111. Mêmes jambes que
-        // la page de hits (les boosts n'affectent pas l'appartenance : comptes
-        // cohérents avec les hits sans dépendre de la fusion RRF).
-        let rows = self
-            .conn
-            .query(
-                &format!(
-                    "
-                    SELECT GROUPING(u.slug, u.jurisdiction, u.nature, u.source) AS gset,
-                           u.slug, u.jurisdiction, u.nature, u.source, count(*) AS n
-                    FROM (
-                      SELECT a.slug, a.jurisdiction, a.nature, a.source
-                      FROM legal_article a
-                      WHERE {art_pred}
-                        AND a.status = 'VIGUEUR'
-                        AND a.searchable{art_filters}
-                      UNION ALL
-                      SELECT t.slug, t.jurisdiction, upper(t.nature) AS nature,
-                             lower(t.nature) AS source
-                      FROM legal_text t
-                      WHERE {txt_pred}
-                        AND coalesce(t.status, 'VIGUEUR') = 'VIGUEUR'
-                        AND t.slug IS NOT NULL{txt_filters}{cont_member}
+                                      AND {valid_a} AND {norm_a}){txt_filters}
                     ) u
                     GROUP BY GROUPING SETS ((u.slug), (u.jurisdiction), (u.nature), (u.source), ())
                     "
-                ),
-                &params.refs(),
-            )
-            .await?;
-        let mut stats = ArticleSearchStats {
-            total: 0,
-            code: Vec::new(),
-            jurisdiction: Vec::new(),
-            nature: Vec::new(),
-            source: Vec::new(),
+                        ),
+                        &params.refs(),
+                    )
+                    .await?
+            }
         };
+        // Fusion des membres : sommes par valeur d'axe. Une troncature de l'agrégat
+        // Tantivy rendrait les comptes silencieusement faux → erreur franche.
+        let mut axes: [std::collections::BTreeMap<String, i64>; 4] = Default::default();
+        for (agg, membre) in [(&agg_art, "articles"), (&agg_txt, "textes")] {
+            for (map, axis) in axes
+                .iter_mut()
+                .zip(["slug", "jurisdiction", "nature", "source"])
+            {
+                let terms = &agg[axis];
+                // `slug` est coupé au top-100 dans l'agrégation même : un reste y est attendu.
+                // Sur les autres axes, énumérés en entier, un reste signifie des comptes faux.
+                if axis != "slug" && terms["sum_other_doc_count"].as_i64() != Some(0) {
+                    return Err(StoreError::Invalid(format!(
+                        "agrégat facettes {membre}: axe {axis} tronqué"
+                    )));
+                }
+                for bucket in terms["buckets"].as_array().into_iter().flatten() {
+                    let (Some(value), Some(count)) =
+                        (bucket["key"].as_str(), bucket["doc_count"].as_i64())
+                    else {
+                        return Err(StoreError::Invalid(format!(
+                            "agrégat facettes {membre}: bucket inattendu sur l'axe {axis}"
+                        )));
+                    };
+                    if !value.is_empty() {
+                        *map.entry(value.to_string()).or_default() += count;
+                    }
+                }
+            }
+        }
+        let mut total = (agg_art["total"]["value"].as_f64().unwrap_or(0.0)
+            + agg_txt["total"]["value"].as_f64().unwrap_or(0.0)) as i64;
         for r in &rows {
             let gset: i32 = r.get(0);
             let count: i64 = r.get(5);
-            let (axis, value): (&mut Vec<FacetCount>, Option<String>) = match gset {
-                0b0111 => (&mut stats.code, r.get(1)),
-                0b1011 => (&mut stats.jurisdiction, r.get(2)),
-                0b1101 => (&mut stats.nature, r.get(3)),
-                0b1110 => (&mut stats.source, r.get(4)),
+            let (idx, value): (usize, Option<String>) = match gset {
+                0b0111 => (0, r.get(1)),
+                0b1011 => (1, r.get(2)),
+                0b1101 => (2, r.get(3)),
+                0b1110 => (3, r.get(4)),
                 _ => {
-                    stats.total = count;
+                    total += count;
                     continue;
                 }
             };
             if let Some(value) = value.filter(|v| !v.is_empty()) {
-                axis.push(FacetCount { value, count });
+                *axes[idx].entry(value).or_default() += count;
             }
         }
-        for axis in [
-            &mut stats.code,
-            &mut stats.jurisdiction,
-            &mut stats.nature,
-            &mut stats.source,
-        ] {
+        let [mut code, jurisdiction, nature, source] = axes.map(|map| {
+            let mut axis: Vec<FacetCount> = map
+                .into_iter()
+                .map(|(value, count)| FacetCount { value, count })
+                .collect();
             axis.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
-        }
-        Ok(stats)
+            axis
+        });
+        // L'axe code est plafonné au top-N : l'énumération complète sert aux comptes
+        // exacts ci-dessus, elle n'est pas servie.
+        code.truncate(ARTICLE_CODE_FACET_LIMIT);
+        Ok(ArticleSearchStats {
+            total,
+            code,
+            jurisdiction,
+            nature,
+            source,
+        })
     }
 
     /// Bras du banc de ranking articles (`lj-bench article-rank-eval`) : les
     /// variantes du prédicat titre ([`ArticleTitleMode`]) et de la fusion
-    /// inter-jambes (score brut vs RRF) de [`Self::search_articles`], sans
-    /// filtre ni pagination. `(TitleMode::Or, rrf = None)` est la baseline
-    /// pré-ADR 0232 (OR ×4 + tri par score brut) ; la prod actuelle
-    /// correspond à `(OrConj, or_boost 0,25, rrf k=60, container,
-    /// foreign_weight 0,25)` (ADR 0234).
+    /// inter-jambes (score brut vs RRF) de [`Self::search_articles`], sans filtre
+    /// ni pagination.
     #[tracing::instrument(name = "db.search_articles_rank_arm", skip(self, expansions), fields(db.system = "postgresql", limit))]
     pub async fn search_articles_rank_arm(
         &self,
@@ -2003,17 +2437,11 @@ impl DecisionRepository<'_> {
         rrf: Option<ArticleRrf>,
         limit: i64,
     ) -> Result<Vec<ArticleRankHit>> {
-        // Jambe titre selon le mode : `Or` = requête enrichie ($1, comme la
-        // prod) boostée ×4 ; `Conj` = un `should` d'alternatives TOUTES
-        // conjonctives — requête et expansions d'alias, chacune normalisée
-        // pour le titre ([`lj_core::aliases::conj_title_query`] : « article »
-        // éliminé, nums recollés) et devant matcher en entier — boosté ×4 ;
-        // `OrConj` = les deux clauses, conjonctif ×4 + OR ×`or_boost` (le
-        // conjonctif prime quand il matche, l'OR reste un filet pour les
-        // requêtes que la conjonction rejette). Rien ne subsiste après
-        // normalisation → repli Or.
-        // Postgres ne type pas un placeholder jamais référencé : $1 porte donc
-        // la forme utile au mode choisi.
+        // Jambe titre selon le mode : `Or` = requête enrichie ($1) boostée ×4 ;
+        // `Conj` = un `should` d'alternatives toutes conjonctives, normalisées pour le
+        // titre et devant matcher en entier ; `OrConj` = les deux clauses. Rien ne
+        // subsiste après normalisation → repli Or. $1 porte la forme utile au mode
+        // choisi, Postgres ne typant pas un placeholder jamais référencé.
         let mut conj_alts: Vec<String> = std::iter::once(query.to_string())
             .chain(expansions.iter().cloned())
             .filter_map(|q| lj_core::aliases::conj_title_query(&q))
@@ -2059,8 +2487,8 @@ impl DecisionRepository<'_> {
             match title_mode {
                 ArticleTitleMode::Or => format!("paradedb.boost(4, {or})"),
                 ArticleTitleMode::Conj => format!("paradedb.boost(4, {})", conj()),
-                // `or_boost` module le filet OR (valeur code-contrôlée,
-                // inlinée : paradedb.boost n'accepte pas de placeholder).
+                // `or_boost` module le filet OR, inliné : `paradedb.boost` n'accepte pas de
+                // placeholder.
                 ArticleTitleMode::OrConj => {
                     format!(
                         "paradedb.boost(4, {}), paradedb.boost({or_boost}, {or})",
@@ -2069,9 +2497,19 @@ impl DecisionRepository<'_> {
                 }
             }
         };
+        let (valid_a, norm_a, pick_a) = (
+            article_valid_now("a"),
+            article_is_norm("a"),
+            article_pick_order("a"),
+        );
+        let (valid_a2, norm_a2, pick_a2) = (
+            article_valid_now("a2"),
+            article_is_norm("a2"),
+            article_pick_order("a2"),
+        );
         let art_pred = format!(
             "a.id @@@ paradedb.boolean(should => ARRAY[{}, paradedb.match('texte', $2)]) \
-             AND {TEXT_ROLE_VISIBLE_SQL}",
+             AND {valid_a} AND {norm_a} AND a.searchable",
             title_clause("search_title")
         );
         let txt_pred = format!(
@@ -2086,13 +2524,14 @@ impl DecisionRepository<'_> {
                 format!(
                     "
                     SELECT * FROM (
-                      SELECT t.slug, a.num, a.num_key, t.title, a.title_path, a.texte,
+                      (SELECT DISTINCT ON (a.text_uid, a.num_key)
+                             a.slug, a.num, a.num_key, a.code_title AS title,
+                             a.title_path, a.texte,
                              paradedb.score(a.id) AS score
                       FROM legal_article a
-                      JOIN legal_text t ON t.text_uid = a.text_uid
                       WHERE {art_pred}
-                        AND a.status = 'VIGUEUR'
-                        AND t.slug IS NOT NULL
+                      ORDER BY a.text_uid, a.num_key,
+                               paradedb.score(a.id) DESC, {pick_a})
                       UNION ALL
                       SELECT t.slug, '' AS num, '' AS num_key, t.title,
                              NULL AS title_path, t.body AS texte,
@@ -2118,39 +2557,44 @@ impl DecisionRepository<'_> {
                 let w_ph = params.push(Box::new(txt_weight));
                 let leg_ph = params.push(Box::new(leg_limit));
                 let limit_ph = params.push(Box::new(limit));
-                // 4 jambes mono-clause (titre et corps séparés, comme la
-                // recherche décisions) : un doc fort dans UNE jambe surface,
-                // le bruit d'une jambe ne contamine pas l'ordre des autres.
-                // Scores RRF sommés par doc (un article peut sortir des deux
-                // jambes articles). `$1` = requête titre enrichie (mode Or).
+                // 4 jambes mono-clause (titre et corps séparés). Scores RRF sommés par doc.
+                // `$1` = requête titre enrichie (mode Or).
                 format!(
                     "
                     WITH art_t AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
-                        SELECT t.slug, a.num, a.num_key, t.title, a.title_path, a.texte,
-                               paradedb.score(a.id) AS score
-                        FROM legal_article a
-                        JOIN legal_text t ON t.text_uid = a.text_uid
-                        WHERE a.id @@@ paradedb.match('search_title', $1)
-                          AND a.status = 'VIGUEUR'
-                          AND t.slug IS NOT NULL
-                        ORDER BY paradedb.score(a.id) DESC
-                        LIMIT ${leg_ph}
+                        SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.slug, a.num, a.num_key, a.code_title AS title,
+                               a.title_path, a.texte, j.score
+                        FROM (
+                          SELECT a.id, paradedb.score(a.id) AS score
+                          FROM legal_article a
+                          WHERE a.id @@@ paradedb.match('search_title', $1)
+                            AND {valid_a} AND {norm_a} AND a.searchable
+                          ORDER BY paradedb.score(a.id) DESC
+                          LIMIT ${leg_ph}
+                        ) j
+                        JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}
                       ) x
                     ),
                     art_b AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
-                        SELECT t.slug, a.num, a.num_key, t.title, a.title_path, a.texte,
-                               paradedb.score(a.id) AS score
-                        FROM legal_article a
-                        JOIN legal_text t ON t.text_uid = a.text_uid
-                        WHERE a.id @@@ paradedb.match('texte', $2)
-                          AND a.status = 'VIGUEUR'
-                          AND t.slug IS NOT NULL
-                        ORDER BY paradedb.score(a.id) DESC
-                        LIMIT ${leg_ph}
+                        SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.slug, a.num, a.num_key, a.code_title AS title,
+                               a.title_path, a.texte, j.score
+                        FROM (
+                          SELECT a.id, paradedb.score(a.id) AS score
+                          FROM legal_article a
+                          WHERE a.id @@@ paradedb.match('texte', $2)
+                            AND {valid_a} AND {norm_a} AND a.searchable
+                          ORDER BY paradedb.score(a.id) DESC
+                          LIMIT ${leg_ph}
+                        ) j
+                        JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}
                       ) x
                     ),
                     txt_t AS (
@@ -2221,34 +2665,32 @@ impl DecisionRepository<'_> {
                 let w_ph = params.push(Box::new(txt_weight));
                 let leg_ph = params.push(Box::new(leg_limit));
                 let limit_ph = params.push(Box::new(limit));
-                // Prior de juridiction optionnel : la jambe articles se scinde
-                // en domestique (FR/UE/INTL + pays nommés dans la requête) et
-                // étrangère pondérée `foreign_weight` — les codes napoléoniens
-                // étrangers matchent mot pour mot les requêtes françaises.
-                // Deux fusions : par rang (jambe RRF séparée, prod) ou par
-                // score (`foreign_score_merge`, membre UNION pondéré dans la
-                // jambe articles — équivalent boost Tantivy, même index donc
-                // scores comparables).
+                // Prior de juridiction optionnel : la jambe articles se scinde en domestique
+                // et étrangère pondérée `foreign_weight`. Deux fusions : par rang (jambe RRF
+                // séparée) ou par score (`foreign_score_merge`, membre UNION pondéré).
                 let mut prim_ph: Option<usize> = None;
                 let (art_juris, art_merge_union, artf_cte, artf_union) = match foreign_weight {
                     Some(w) if foreign_score_merge => {
                         let ph = params.push(Box::new(primary_jurisdictions(query)));
                         prim_ph = Some(ph);
                         (
-                            format!("\n  AND t.jurisdiction = ANY(${ph})"),
+                            format!("\n  AND a.jurisdiction = ANY(${ph})"),
                             format!(
                                 "
                         UNION ALL
-                        (SELECT t.slug, a.num, a.num_key, t.title, a.title_path, a.texte,
-                               paradedb.score(a.id) * {w}::float8 AS score
-                        FROM legal_article a
-                        JOIN legal_text t ON t.text_uid = a.text_uid
-                        WHERE {art_pred}
-                          AND a.status = 'VIGUEUR'
-                          AND t.slug IS NOT NULL
-                          AND t.jurisdiction <> ALL(${ph})
-                        ORDER BY paradedb.score(a.id) DESC
-                        LIMIT ${leg_ph})"
+                        (SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.slug, a.num, a.num_key, a.code_title AS title,
+                               a.title_path, a.texte, j.score
+                        FROM (
+                          SELECT a.id, paradedb.score(a.id) * {w}::float8 AS score
+                          FROM legal_article a
+                          WHERE {art_pred}
+                            AND a.jurisdiction <> ALL(${ph})
+                          ORDER BY paradedb.score(a.id) DESC
+                          LIMIT ${leg_ph}
+                        ) j
+                        JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a})"
                             ),
                             String::new(),
                             String::new(),
@@ -2258,23 +2700,26 @@ impl DecisionRepository<'_> {
                         let ph = params.push(Box::new(primary_jurisdictions(query)));
                         prim_ph = Some(ph);
                         (
-                            format!("\n  AND t.jurisdiction = ANY(${ph})"),
+                            format!("\n  AND a.jurisdiction = ANY(${ph})"),
                             String::new(),
                             format!(
                                 "
                     art_f AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
-                        SELECT t.slug, a.num, a.num_key, t.title, a.title_path, a.texte,
-                               paradedb.score(a.id) AS score
-                        FROM legal_article a
-                        JOIN legal_text t ON t.text_uid = a.text_uid
-                        WHERE {art_pred}
-                          AND a.status = 'VIGUEUR'
-                          AND t.slug IS NOT NULL
-                          AND t.jurisdiction <> ALL(${ph})
-                        ORDER BY paradedb.score(a.id) DESC
-                        LIMIT ${leg_ph}
+                        SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.slug, a.num, a.num_key, a.code_title AS title,
+                               a.title_path, a.texte, j.score
+                        FROM (
+                          SELECT a.id, paradedb.score(a.id) AS score
+                          FROM legal_article a
+                          WHERE {art_pred}
+                            AND a.jurisdiction <> ALL(${ph})
+                          ORDER BY paradedb.score(a.id) DESC
+                          LIMIT ${leg_ph}
+                        ) j
+                        JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}
                       ) x
                     ),"
                             ),
@@ -2289,10 +2734,8 @@ impl DecisionRepository<'_> {
                     }
                     None => (String::new(), String::new(), String::new(), String::new()),
                 };
-                // Jambe « termes d'usage » optionnelle (working-note
-                // 2026-07-20) : requête en grammes contre les sacs de
+                // Jambe « termes d'usage » optionnelle : requête en grammes contre les sacs de
                 // contextes de citation, jointe à la version en vigueur.
-                // Coupée sur les requêtes-référence et navigationnelles.
                 let usage_weight =
                     usage_weight.filter(|_| !lj_core::usage::usage_reference_or_nav_query(query));
                 let (usage_cte, usage_union) = match usage_weight {
@@ -2307,18 +2750,20 @@ impl DecisionRepository<'_> {
                     us AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
-                        SELECT t.slug, la.num, u.num_key, t.title, la.title_path, la.texte,
+                        SELECT la.slug, la.num, u.num_key, la.code_title AS title,
+                               la.title_path, la.texte,
                                paradedb.score(u.id) AS score
                         FROM {usage_table} u
-                        JOIN legal_text t ON t.text_uid = u.text_uid
                         JOIN LATERAL (
-                          SELECT a.num, a.title_path, a.texte FROM legal_article a
-                          WHERE a.text_uid = u.text_uid AND a.num_key = u.num_key
-                            AND a.status = 'VIGUEUR'
-                          ORDER BY a.date_debut DESC LIMIT 1
+                          SELECT a2.slug, a2.code_title, a2.num, a2.title_path,
+                                 a2.texte, a2.searchable
+                          FROM legal_article a2
+                          WHERE a2.text_uid = u.text_uid AND a2.num_key = u.num_key
+                            AND {valid_a2} AND {norm_a2}
+                          ORDER BY {pick_a2} LIMIT 1
                         ) la ON true
                         WHERE u.id @@@ paradedb.match('terms', ${g_ph})
-                          AND t.slug IS NOT NULL
+                          AND la.searchable
                         ORDER BY paradedb.score(u.id) DESC
                         LIMIT ${leg_ph}
                       ) x
@@ -2335,27 +2780,17 @@ impl DecisionRepository<'_> {
                     }
                     None => (String::new(), String::new()),
                 };
-                // Fusion finale : les jambes historiques sont doc-disjointes
-                // (scission par juridiction, types de docs différents) — le
-                // merge-sort des votes suffit. La jambe usage RECOUVRE la
-                // jambe articles : ses votes doivent se SOMMER par doc
-                // (accumulation d'évidence, comme la branche `split_title`),
-                // sinon elle ne peut qu'injecter des docs, jamais renforcer
-                // un doc déjà trouvé.
+                // Fusion finale : les jambes historiques sont doc-disjointes, le merge-sort
+                // des votes suffit. La jambe usage recouvre la jambe articles : ses votes se
+                // somment par doc.
                 let final_order = if usage_weight.is_some() {
                     "GROUP BY u.slug, u.num, u.num_key, u.title, u.title_path, u.texte
                     ORDER BY sum(u.rrf) DESC, min(u.leg), u.num_key"
                 } else {
                     "ORDER BY u.rrf DESC, u.leg, u.num_key"
                 };
-                // Jambe « pays nommé » optionnelle (ADR 0238) : articles des
-                // juridictions que la requête nomme, requête débarrassée des
-                // tokens pays — « conditions du divorce au sénégal » : les
-                // articles de fond ne contiennent pas « sénégal », le BM25
-                // favorise les docs qui le portent (conventions fiscales…).
-                // La jambe articles exclut alors ces juridictions (pas de
-                // doublon inter-jambes). Tiebreak -1 : sous le conteneur,
-                // au-dessus du domestique.
+                // Jambe « pays nommé » optionnelle ; la jambe articles exclut alors ces
+                // juridictions. Tiebreak -1 : sous le conteneur, au-dessus du domestique.
                 let ctry = country_leg
                     .then(|| lj_core::jurisdictions::strip_query_jurisdictions(query))
                     .flatten();
@@ -2376,24 +2811,28 @@ impl DecisionRepository<'_> {
                         };
                         let s_ph = params.push(Box::new(stripped));
                         (
-                            format!("\n  AND t.jurisdiction <> ALL(${codes_ph})"),
+                            format!("\n  AND a.jurisdiction <> ALL(${codes_ph})"),
                             format!(
                                 "
                     ctry AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
-                        SELECT t.slug, a.num, a.num_key, t.title, a.title_path, a.texte,
-                               paradedb.score(a.id) AS score
-                        FROM legal_article a
-                        JOIN legal_text t ON t.text_uid = a.text_uid
-                        WHERE a.id @@@ paradedb.boolean(should => ARRAY[{conj_clause}\
-                              paradedb.boost({ARTICLE_TITLE_OR_BOOST}, paradedb.match('search_title', ${s_ph})), \
-                              paradedb.match('texte', ${s_ph})])
-                          AND a.status = 'VIGUEUR'
-                          AND t.slug IS NOT NULL
-                          AND t.jurisdiction = ANY(${codes_ph})
-                        ORDER BY paradedb.score(a.id) DESC
-                        LIMIT ${leg_ph}
+                        SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.slug, a.num, a.num_key, a.code_title AS title,
+                               a.title_path, a.texte, j.score
+                        FROM (
+                          SELECT a.id, paradedb.score(a.id) AS score
+                          FROM legal_article a
+                          WHERE a.id @@@ paradedb.boolean(should => ARRAY[{conj_clause}\
+                                paradedb.boost({ARTICLE_TITLE_OR_BOOST}, paradedb.match('search_title', ${s_ph})), \
+                                paradedb.match('texte', ${s_ph})])
+                            AND {valid_a} AND {norm_a} AND a.searchable
+                            AND a.jurisdiction = ANY(${codes_ph})
+                          ORDER BY paradedb.score(a.id) DESC
+                          LIMIT ${leg_ph}
+                        ) j
+                        JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}
                       ) x
                     ),"
                             ),
@@ -2408,20 +2847,11 @@ impl DecisionRepository<'_> {
                     }
                     None => (String::new(), String::new(), String::new()),
                 };
-                // Jambe conteneurs optionnelle : `legal_text` SANS corps mais
-                // à articles en vigueur (les codes — disjointe de la jambe
-                // textes, bornée à `body IS NOT NULL`), titre en conjonctif
-                // SEUL et sur la seule forme conjonctive de la REQUÊTE (pas
-                // des expansions d'alias : « L442-1 du code de commerce »
-                // étendu en « code de commerce » faisait voler le rang 1 par
-                // le conteneur sur une requête d'article nommé), bornée aux natures
-                // navigables comme un code (le filtre du catalogue `/codes`,
-                // ADR 0133 — sinon tout décret/arrêté dont le titre matche
-                // vole un rang : « 15 … loi du 6 juillet 1989 » matchait un
-                // décret de 2025 par sa DATE) et au prior de juridiction quand
-                // il est actif (les conteneurs étrangers ne sortent que pays
-                // nommé). `leg = -1` : à rang RRF égal le conteneur prime
-                // (requête navigationnelle).
+                // Jambe conteneurs optionnelle : `legal_text` sans corps mais à articles en
+                // vigueur, titre en conjonctif seul et sur la seule forme conjonctive de la
+                // requête, bornée aux natures navigables comme un code et au prior de
+                // juridiction quand il est actif. `leg = -1` : à rang RRF égal le conteneur
+                // prime.
                 let mut cont_alts: Vec<String> = Vec::new();
                 if container {
                     cont_alts.extend(lj_core::aliases::conj_title_query(query));
@@ -2467,7 +2897,7 @@ impl DecisionRepository<'_> {
                           AND {NAVIGABLE_TEXT_NATURES_SQL} AND {TEXT_ROLE_VISIBLE_SQL}
                           AND EXISTS (SELECT 1 FROM legal_article a
                                       WHERE a.text_uid = t.text_uid
-                                        AND a.status = 'VIGUEUR'){cont_juris}
+                                        AND {valid_a} AND {norm_a}){cont_juris}
                         ORDER BY paradedb.score(t.id) DESC
                         LIMIT ${leg_ph}
                       ) z
@@ -2485,25 +2915,27 @@ impl DecisionRepository<'_> {
                     }
                     [] => (String::new(), String::new()),
                 };
-                // Chaque jambe est classée seule (le `row_number` re-trie le
-                // top-`leg_limit`, l'ORDER BY interne reste sur le seul score
-                // pour garder le Top-K scan ParadeDB), puis fusion par rang.
-                // Tiebreak : jambe articles d'abord (recherche titre-primaire).
+                // Chaque jambe est classée seule (l'ORDER BY interne reste sur le seul score
+                // pour garder le Top-K scan ParadeDB), puis fusion par rang. Tiebreak : jambe
+                // articles d'abord.
                 format!(
                     "
                     WITH{cont_cte}{ctry_cte}{artf_cte}{usage_cte}
                     art AS (
                       SELECT x.*, row_number() OVER (ORDER BY x.score DESC, x.num_key) AS rk
                       FROM (
-                        (SELECT t.slug, a.num, a.num_key, t.title, a.title_path, a.texte,
-                               paradedb.score(a.id) AS score
-                        FROM legal_article a
-                        JOIN legal_text t ON t.text_uid = a.text_uid
-                        WHERE {art_pred}
-                          AND a.status = 'VIGUEUR'
-                          AND t.slug IS NOT NULL{art_juris}{art_ctry_excl}
-                        ORDER BY paradedb.score(a.id) DESC
-                        LIMIT ${leg_ph}){art_merge_union}
+                        (SELECT DISTINCT ON (a.text_uid, a.num_key)
+                               a.slug, a.num, a.num_key, a.code_title AS title,
+                               a.title_path, a.texte, j.score
+                        FROM (
+                          SELECT a.id, paradedb.score(a.id) AS score
+                          FROM legal_article a
+                          WHERE {art_pred}{art_juris}{art_ctry_excl}
+                          ORDER BY paradedb.score(a.id) DESC
+                          LIMIT ${leg_ph}
+                        ) j
+                        JOIN legal_article a ON a.id = j.id
+                        ORDER BY a.text_uid, a.num_key, j.score DESC, {pick_a}){art_merge_union}
                       ) x
                     ),
                     txt AS (
@@ -2557,43 +2989,53 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Catalogue des codes (ADR 0114, `/codes`) : tout `legal_text` à slug + son nombre
-    /// d'articles en vigueur (`status = 'VIGUEUR'`, distincts par `num_key`). Trié par
-    /// titre. Champs bruts (mapping `CodeCatalogueEntry` côté `lj-api`).
     /// Compteurs corpus normatif pour la home (`GET /api/corpus-stats`) : nombre
-    /// total de textes (`legal_text`, toutes natures) et d'articles en vigueur
-    /// (identités `(text_uid, num_key)` distinctes). Corpus entier, pas le seul
-    /// catalogue navigable `/codes`. Un aller-retour, appelé 2×/jour derrière le
-    /// cache TTL — les deux comptes exacts sortent d'une requête.
+    /// total de textes et d'articles en vigueur (identités `(text_uid, num_key)`
+    /// distinctes). Corpus entier, pas le seul catalogue navigable. Les identités
+    /// distinctes se comptent par `GROUP BY` en sous-requête : `count(DISTINCT …)`
+    /// impose un tri sur un ROW composite qui déborde sur disque.
     #[tracing::instrument(name = "db.count_normative_corpus", skip(self), fields(db.system = "postgresql"))]
     pub async fn count_normative_corpus(&self) -> Result<(i64, i64)> {
+        let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
         let row = self
             .conn
             .query_one(
-                "
+                &format!(
+                    "
                 SELECT
                   (SELECT count(*) FROM legal_text) AS texts,
-                  (SELECT count(DISTINCT (text_uid, num_key)) FROM legal_article
-                   WHERE status = 'VIGUEUR') AS articles
-                ",
+                  (SELECT count(*) FROM (
+                     SELECT a.text_uid, a.num_key FROM legal_article a
+                      WHERE {valid_a} AND {norm_a}
+                      GROUP BY 1, 2) ids) AS articles
+                "
+                ),
                 &[],
             )
             .await?;
         Ok((row.get(0), row.get(1)))
     }
 
+    /// `head_only` borne le catalogue au fond `codes` (codes, constitutions, état
+    /// civil). Le filtre est posé en SQL sur l'expression indexée, et
+    /// `article_count` n'est calculé que pour les têtes.
     #[tracing::instrument(name = "db.list_legal_texts", skip(self), fields(db.system = "postgresql"))]
-    pub async fn list_legal_texts(&self) -> Result<Vec<LegalTextCatalogRow>> {
-        let rows = self
-            .conn
-            .query(
-                "
+    pub async fn list_legal_texts(&self, head_only: bool) -> Result<Vec<LegalTextCatalogRow>> {
+        let head_filter = if head_only {
+            format!("AND {NORM_FOND_EXPR} = 'codes'")
+        } else {
+            String::new()
+        };
+        let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
+        let sql = format!(
+            "
                 SELECT t.text_uid, t.slug, t.title, t.nature, t.jurisdiction,
                        (SELECT count(DISTINCT a.num_key)
                         FROM legal_article a
-                        WHERE a.text_uid = t.text_uid AND a.status = 'VIGUEUR') AS article_count
+                        WHERE a.text_uid = t.text_uid
+                          AND {valid_a} AND {norm_a}) AS article_count
                 FROM legal_text t
-                WHERE t.slug IS NOT NULL
+                WHERE {NORM_SCOPE}
                   -- Catalogue = textes *navigables comme un code* (ADR 0133) : codes
                   -- (`code*`/`CODE`), constitutions, lois/ordonnances. On écarte les
                   -- actes unitaires (arrêtés, décrets) et les conventions collectives
@@ -2602,17 +3044,18 @@ impl DecisionRepository<'_> {
                        OR upper(t.nature) IN ('CONSTITUTION', 'LOI_CONSTIT', 'LOI',
                            'LOI_ORGANIQUE', 'ORDONNANCE', 'DECRET_LOI', 'REGLEMENT',
                            'ETAT_CIVIL'))
+                  {head_filter}
                   -- … et seulement ceux qui ont AU MOINS un article en vigueur : on
-                  -- écarte les versions abrogées/transférées (tous articles ABROGE/
-                  -- MODIFIE/PÉRIMÉ → 0 en vigueur) et les coquilles sans articles. Elles
+                  -- écarte les versions abrogées/transférées (toutes fenêtres closes
+                  -- → 0 en vigueur) et les coquilles sans articles. Elles
                   -- doublonnent le code vivant avec un « 0 article » non navigable.
                   AND EXISTS (SELECT 1 FROM legal_article a
-                              WHERE a.text_uid = t.text_uid AND a.status = 'VIGUEUR')
+                              WHERE a.text_uid = t.text_uid
+                                AND {valid_a} AND {norm_a})
                 ORDER BY t.title
-                ",
-                &[],
-            )
-            .await?;
+                "
+        );
+        let rows = self.conn.query(&sql, &[]).await?;
         Ok(rows
             .iter()
             .map(|r| LegalTextCatalogRow {
@@ -2626,32 +3069,36 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Table des matières d'un code (ADR 0114, sommaire) : la version en vigueur de
-    /// chaque article (une ligne par `num_key`), triée par `position` (ordre de lecture
-    /// réel, `NULLS LAST`) puis **tri naturel** du `num_key`
-    /// ([`lj_core::article_order`]) — le tri lexical mettait « L. 10 » avant « L. 2 »
-    /// et les décrets avant la partie législative. Léger (pas de corps : clic =
-    /// navigation `/texte/{slug}/{num}`). Champs bruts (mapping `TocEntry` côté `lj-api`).
+    /// Table des matières d'un code : la version en vigueur de chaque article (une
+    /// ligne par `num_key`), dans l'ordre de lecture persisté (`reading_rank` —
+    /// `position` de la source quand elle existe, sinon divisions par clé médiane
+    /// et tri naturel des `num_key`). Léger, sans corps. Champs bruts (mapping
+    /// `TocEntry` côté `lj-api`).
     #[tracing::instrument(name = "db.code_table_of_contents", skip(self), fields(db.system = "postgresql"))]
     pub async fn code_table_of_contents(&self, text_uid: &str) -> Result<Vec<TocArticleRow>> {
+        let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
         let rows = self
             .conn
             .query(
-                "
+                &format!(
+                    "
                 SELECT num, num_key, title_path, status, position FROM (
-                  -- VIGUEUR préférée, sinon dernière version (ADR 0162 §5).
+                  -- Fenêtre du jour préférée, sinon dernière version (ADR 0300 §3) ;
+                  -- vraie version avant moignon (0312), consolidée avant publication.
                   SELECT DISTINCT ON (num_key) num, num_key, title_path, status,
-                         position, date_debut
-                  FROM legal_article
+                         position, reading_rank, date_debut
+                  FROM legal_article a
                   WHERE text_uid = $1
-                  ORDER BY num_key, (status = 'VIGUEUR') DESC,
-                           date_debut DESC NULLS LAST
+                  ORDER BY num_key, ({valid_a}) DESC, ({norm_a}) DESC,
+                           (source = 'jorf') ASC, date_debut DESC NULLS LAST
                 ) v
-                ",
+                ORDER BY reading_rank NULLS LAST, num_key
+                "
+                ),
                 &[&text_uid],
             )
             .await?;
-        let mut rows: Vec<TocArticleRow> = rows
+        Ok(rows
             .iter()
             .map(|r| TocArticleRow {
                 num: r.get(0),
@@ -2660,109 +3107,57 @@ impl DecisionRepository<'_> {
                 status: r.get(3),
                 position: r.get(4),
             })
-            .collect();
-        if rows.iter().all(|r| r.position.is_none()) {
-            // Codes LEGI (aucune position) : ordre de lecture par divisions
-            // médianes + tri naturel des num_key.
-            lj_core::article_order::sort_reading_order(
-                &mut rows,
-                |r| &r.num_key,
-                |r| r.title_path.as_deref(),
-            );
-        } else {
-            rows.sort_by_cached_key(|r| {
-                (
-                    r.position.is_none(),
-                    r.position,
-                    num_key_sort_key(&r.num_key),
-                )
-            });
-        }
-        Ok(rows)
+            .collect())
     }
 
-    /// Vue-lecture à plat d'un texte sans structure ingérée (BOFiP,
-    /// circulaires…) : la version en vigueur de chaque article avec son corps,
-    /// dans le même ordre de lecture que [`Self::code_table_of_contents`].
-    /// Champs au format [`TocReadingRow`] (que des articles, profondeur 1).
+    /// Vue-lecture à plat d'un texte sans structure ingérée (BOFiP, circulaires…) :
+    /// la version en vigueur de chaque article avec son corps, dans le même ordre
+    /// de lecture que [`Self::code_table_of_contents`]. Champs au format
+    /// [`TocReadingRow`] (que des articles, profondeur 1).
     #[tracing::instrument(name = "db.flat_text_reading", skip(self), fields(db.system = "postgresql"))]
     pub async fn flat_text_reading(&self, text_uid: &str) -> Result<Vec<TocReadingRow>> {
+        let (valid_a, norm_a) = (article_valid_now("a"), article_is_norm("a"));
         let rows = self
             .conn
             .query(
-                "
-                SELECT num, num_key, title_path, status, position, texte, nota FROM (
-                  -- VIGUEUR préférée, sinon dernière version (ADR 0162 §5).
-                  SELECT DISTINCT ON (num_key) num, num_key, title_path, status,
-                         position, texte, nota, date_debut
-                  FROM legal_article
+                &format!(
+                    "
+                SELECT num, num_key, status, texte, nota FROM (
+                  -- Fenêtre du jour préférée, sinon dernière version (ADR 0300 §3) ;
+                  -- vraie version avant moignon (0312), consolidée avant publication.
+                  SELECT DISTINCT ON (num_key) num, num_key, status,
+                         texte, nota, reading_rank, date_debut
+                  FROM legal_article a
                   WHERE text_uid = $1
-                  ORDER BY num_key, (status = 'VIGUEUR') DESC,
-                           date_debut DESC NULLS LAST
+                  ORDER BY num_key, ({valid_a}) DESC, ({norm_a}) DESC,
+                           (source = 'jorf') ASC, date_debut DESC NULLS LAST
                 ) v
-                ",
+                ORDER BY reading_rank NULLS LAST, num_key
+                "
+                ),
                 &[&text_uid],
             )
             .await?;
-        struct Row {
-            num: String,
-            num_key: String,
-            title_path: Option<String>,
-            status: String,
-            position: Option<i32>,
-            texte: Option<String>,
-            nota: Option<String>,
-        }
-        let mut rows: Vec<Row> = rows
-            .iter()
-            .map(|r| Row {
-                num: r.get(0),
-                num_key: r.get(1),
-                title_path: r.get(2),
-                status: r.get(3),
-                position: r.get(4),
-                texte: r.get(5),
-                nota: r.get(6),
-            })
-            .collect();
-        if rows.iter().all(|r| r.position.is_none()) {
-            lj_core::article_order::sort_reading_order(
-                &mut rows,
-                |r| &r.num_key,
-                |r| r.title_path.as_deref(),
-            );
-        } else {
-            rows.sort_by_cached_key(|r| {
-                (
-                    r.position.is_none(),
-                    r.position,
-                    num_key_sort_key(&r.num_key),
-                )
-            });
-        }
         Ok(rows
-            .into_iter()
+            .iter()
             .map(|r| TocReadingRow {
                 depth: 1,
                 child_kind: "article".to_string(),
                 child_cid: None,
-                child_num_key: Some(r.num_key),
-                label: r.num,
-                etat: r.status,
-                texte: r.texte,
-                nota: r.nota,
+                child_num_key: Some(r.get(1)),
+                label: r.get(0),
+                etat: r.get(2),
+                texte: r.get(3),
+                nota: r.get(4),
             })
             .collect())
     }
 
-    /// Articles voisins de `num_key` pour le contexte de lecture (ADR 0114), façon
-    /// Légifrance et **adaptatif** : texte court ⇒ tous les articles ; sinon la
-    /// division enclosante (même `title_path`) ; division trop grosse ⇒ fenêtre de
-    /// `±CONTEXT_WINDOW` autour de la `position`. Léger (pas de corps : clic =
-    /// navigation `/texte/{slug}/{num}`). Version servie = celle à `date` (ou
-    /// `VIGUEUR`), dédoublonnée par `num_key`, triée par `position` puis tri
-    /// naturel du `num_key` ([`lj_core::article_order`]) — même ordre que le
-    /// sommaire, la sélection de fenêtre en dépend.
+    /// Articles voisins de `num_key` pour le contexte de lecture, adaptatif : texte
+    /// court ⇒ tous les articles ; sinon la division enclosante ; division trop
+    /// grosse ⇒ fenêtre de `±CONTEXT_WINDOW`. Sans corps. Version servie = celle à
+    /// `date` (ou `VIGUEUR`), dédoublonnée par `num_key`, dans l'ordre de lecture
+    /// persisté (`reading_rank`).
     #[tracing::instrument(name = "db.article_context", skip(self), fields(db.system = "postgresql"))]
     pub async fn article_context(
         &self,
@@ -2770,109 +3165,372 @@ impl DecisionRepository<'_> {
         num_key: &str,
         date: Option<NaiveDate>,
     ) -> Result<Vec<ArticleNeighborRow>> {
-        let rows = match date {
-            Some(d) => {
-                self.conn
-                    .query(
-                        "
-                        SELECT num, num_key, status, title_path, position FROM (
-                          SELECT DISTINCT ON (num_key) num, num_key, status, title_path,
-                                 position, date_debut
-                          FROM legal_article
-                          WHERE text_uid = $1 AND date_debut <= $2
-                            AND (date_fin IS NULL OR date_fin >= $2)
-                          ORDER BY num_key, date_debut DESC
-                        ) v
-                        ",
-                        &[&text_uid, &d],
-                    )
-                    .await?
-            }
-            None => {
-                self.conn
-                    .query(
-                        "
-                        SELECT num, num_key, status, title_path, position FROM (
-                          SELECT DISTINCT ON (num_key) num, num_key, status, title_path,
-                                 position, date_debut
-                          FROM legal_article
-                          WHERE text_uid = $1 AND status = 'VIGUEUR'
-                          ORDER BY num_key, date_debut DESC
-                        ) v
-                        ",
-                        &[&text_uid],
-                    )
-                    .await?
-            }
+        // Deux stratégies selon la vue. Vue courante : parcours bornés — les divisions
+        // VIGUEUR sont contiguës en rang. Vue à date : agrégation globale — la
+        // division est celle du `title_path` des versions d'époque, dont les membres
+        // abrogés ou transférés depuis sont dispersés dans l'ordre du jour.
+        match date {
+            Some(d) => self.article_context_at(text_uid, num_key, d).await,
+            None => self.article_context_current(text_uid, num_key).await,
+        }
+    }
+
+    /// Contexte de la vue courante par parcours bornés. L'effectif se compte à
+    /// concurrence de `CONTEXT_FULL_MAX + 1`, puis division et fenêtre se lisent en
+    /// balayant l'index `(text_uid, reading_rank)` depuis le rang du courant,
+    /// plafonné à `CONTEXT_DIVISION_MAX` de chaque côté — une division est une
+    /// plage contiguë de rangs, le balayage s'arrête au premier changement de
+    /// `title_path`. Les articles au rang encore NULL sont invisibles des balayages.
+    async fn article_context_current(
+        &self,
+        text_uid: &str,
+        num_key: &str,
+    ) -> Result<Vec<ArticleNeighborRow>> {
+        let probe = CONTEXT_FULL_MAX as i64 + 1;
+        let (valid_a, norm_a, pick_a) = (
+            article_valid_now("a"),
+            article_is_norm("a"),
+            article_pick_order("a"),
+        );
+        let cur = self
+            .conn
+            .query_opt(
+                &format!(
+                    "
+                SELECT c.num, c.num_key, c.status, c.reading_rank, c.title_path,
+                       (SELECT count(*) FROM (
+                          SELECT DISTINCT num_key FROM legal_article a
+                          WHERE text_uid = $1 AND {valid_a} AND {norm_a} LIMIT $3
+                        ) s) AS n
+                FROM (
+                  SELECT num, num_key, status, reading_rank, title_path
+                  FROM legal_article a
+                  WHERE text_uid = $1 AND num_key = $2 AND {valid_a} AND {norm_a}
+                  ORDER BY {pick_a} LIMIT 1
+                ) c
+                "
+                ),
+                &[&text_uid, &num_key, &probe],
+            )
+            .await?;
+        let Some(cur) = cur else {
+            return Ok(Vec::new());
         };
-        let mut lite: Vec<ContextLite> = rows
-            .iter()
-            .map(|r| ContextLite {
+
+        if cur.get::<_, i64>(5) <= CONTEXT_FULL_MAX as i64 {
+            let rows = self
+                .conn
+                .query(
+                    &format!(
+                        "
+                    SELECT num, num_key, status FROM (
+                      SELECT DISTINCT ON (num_key) num, num_key, status, reading_rank
+                      FROM legal_article a
+                      WHERE text_uid = $1 AND {valid_a} AND {norm_a}
+                      ORDER BY num_key, {pick_a}
+                    ) s
+                    ORDER BY reading_rank NULLS LAST, num_key
+                    "
+                    ),
+                    &[&text_uid],
+                )
+                .await?;
+            return Ok(rows
+                .iter()
+                .map(|r| {
+                    let nk: String = r.get(1);
+                    ArticleNeighborRow {
+                        num: r.get(0),
+                        current: nk == num_key,
+                        num_key: nk,
+                        status: r.get(2),
+                    }
+                })
+                .collect());
+        }
+
+        let current_row = ArticleNeighborRow {
+            num: cur.get(0),
+            num_key: cur.get(1),
+            status: cur.get(2),
+            current: true,
+        };
+        let Some(cur_rank) = cur.get::<_, Option<i32>>(3) else {
+            // Rang en cours d'invalidation : impossible de situer l'article dans l'ordre,
+            // il s'affiche seul jusqu'au passage du finisseur.
+            return Ok(vec![current_row]);
+        };
+        let cur_title: Option<String> = cur.get(4);
+
+        let cap = CONTEXT_DIVISION_MAX as i64;
+        let rows = self
+            .conn
+            .query(
+                &format!(
+                    "
+                SELECT num, num_key, status, title_path, reading_rank FROM (
+                  (SELECT DISTINCT ON (reading_rank) num, num_key, status, title_path, reading_rank
+                   FROM legal_article a
+                   WHERE text_uid = $1 AND {valid_a} AND {norm_a} AND reading_rank < $2
+                   ORDER BY reading_rank DESC, {pick_a} LIMIT $3)
+                  UNION ALL
+                  (SELECT DISTINCT ON (reading_rank) num, num_key, status, title_path, reading_rank
+                   FROM legal_article a
+                   WHERE text_uid = $1 AND {valid_a} AND {norm_a} AND reading_rank > $2
+                   ORDER BY reading_rank ASC, {pick_a} LIMIT $3)
+                ) s
+                "
+                ),
+                &[&text_uid, &cur_rank, &cap],
+            )
+            .await?;
+
+        struct Neighbor {
+            num: String,
+            num_key: String,
+            status: String,
+            title_path: Option<String>,
+            rank: i32,
+        }
+        let (mut before, mut after): (Vec<Neighbor>, Vec<Neighbor>) = (Vec::new(), Vec::new());
+        for r in &rows {
+            let x = Neighbor {
                 num: r.get(0),
                 num_key: r.get(1),
                 status: r.get(2),
                 title_path: r.get(3),
-                position: r.get(4),
-            })
-            .collect();
-        lite.sort_by_cached_key(|r| {
-            (
-                r.position.is_none(),
-                r.position,
-                num_key_sort_key(&r.num_key),
+                rank: r.get(4),
+            };
+            if x.rank < cur_rank {
+                before.push(x);
+            } else {
+                after.push(x);
+            }
+        }
+        // Du plus proche au plus lointain, de chaque côté.
+        before.sort_by_key(|x| std::cmp::Reverse(x.rank));
+        after.sort_by_key(|x| x.rank);
+
+        let run = |side: &[Neighbor]| {
+            side.iter()
+                .take_while(|x| x.title_path == cur_title)
+                .count()
+        };
+        let (b_run, a_run) = (run(&before), run(&after));
+        let (nb, na) = if cur_title.is_some() && b_run + 1 + a_run <= CONTEXT_DIVISION_MAX {
+            (b_run, a_run)
+        } else {
+            (CONTEXT_WINDOW, CONTEXT_WINDOW)
+        };
+
+        let neighbor = |x: &Neighbor| ArticleNeighborRow {
+            num: x.num.clone(),
+            num_key: x.num_key.clone(),
+            status: x.status.clone(),
+            current: false,
+        };
+        let mut out = Vec::with_capacity(nb + 1 + na);
+        out.extend(before.iter().take(nb).rev().map(neighbor));
+        out.push(current_row);
+        out.extend(after.iter().take(na).map(neighbor));
+        Ok(out)
+    }
+
+    /// Contexte de la vue à date par agrégation globale : la division est
+    /// l'ensemble des versions d'époque partageant le `title_path` du courant, où
+    /// qu'elles soient dans l'ordre du jour. `row_number()` re-densifie l'ordre sur
+    /// l'ensemble filtré ; `NULLS LAST` place les articles absents de l'arbre du
+    /// jour en fin de texte.
+    async fn article_context_at(
+        &self,
+        text_uid: &str,
+        num_key: &str,
+        date: NaiveDate,
+    ) -> Result<Vec<ArticleNeighborRow>> {
+        let (full, division, window) = (
+            CONTEXT_FULL_MAX as i64,
+            CONTEXT_DIVISION_MAX as i64,
+            CONTEXT_WINDOW as i64,
+        );
+        let rows = self
+            .conn
+            .query(
+                "
+                WITH cur AS MATERIALIZED (
+                  SELECT title_path FROM legal_article
+                  WHERE text_uid = $1 AND num_key = $2
+                    AND date_debut <= $6 AND (date_fin IS NULL OR date_fin >= $6)
+                  ORDER BY date_debut DESC LIMIT 1
+                ), v AS (
+                  SELECT DISTINCT ON (num_key) num, num_key, status, reading_rank,
+                         (title_path IS NOT DISTINCT FROM (SELECT title_path FROM cur))
+                           AS same_division,
+                         date_debut
+                  FROM legal_article
+                  WHERE text_uid = $1
+                    AND date_debut <= $6 AND (date_fin IS NULL OR date_fin >= $6)
+                  ORDER BY num_key, date_debut DESC
+                ), r AS (
+                  SELECT num, num_key, status, same_division,
+                         row_number() OVER (ORDER BY reading_rank NULLS LAST, num_key) AS rn,
+                         count(*) OVER () AS n,
+                         count(*) FILTER (WHERE same_division) OVER () AS division_size
+                  FROM v
+                ), c AS (
+                  SELECT rn FROM r WHERE num_key = $2
+                )
+                SELECT num, num_key, status, rn = (SELECT rn FROM c) AS current
+                FROM r
+                WHERE (SELECT rn FROM c) IS NOT NULL
+                  AND CASE
+                    WHEN n <= $3 THEN true
+                    WHEN (SELECT title_path FROM cur) IS NOT NULL AND division_size <= $4
+                      THEN same_division
+                    ELSE rn BETWEEN (SELECT rn FROM c) - $5 AND (SELECT rn FROM c) + $5
+                  END
+                ORDER BY rn
+                ",
+                &[&text_uid, &num_key, &full, &division, &window, &date],
             )
-        });
-        Ok(select_article_context(lite, num_key))
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| ArticleNeighborRow {
+                num: r.get(0),
+                num_key: r.get(1),
+                status: r.get(2),
+                current: r.get(3),
+            })
+            .collect())
     }
 }
 
-/// Ligne légère pour le calcul du contexte (triée avant sélection).
-struct ContextLite {
-    num: String,
+/// Entrée du calcul de rang de lecture : la version canonique d'un article,
+/// réduite à ce dont l'ordre dépend.
+struct ReadingOrderInput {
     num_key: String,
-    status: String,
     title_path: Option<String>,
     position: Option<i32>,
 }
 
-/// Constantes du ranking de la recherche d'articles (ADR 0232), calées par le
-/// banc qrels `lj-bench article-rank-eval` (gt/articles/) : boost du titre
-/// conjonctif, poids du filet titre OR (0,25 = max-min mesuré : au-delà le
-/// filet ré-enterre les cibles descriptives), constante RRF et profondeur de
-/// jambe avant fusion.
+/// Constantes du ranking de la recherche d'articles : boost du titre
+/// conjonctif, poids du filet titre OR, constante RRF et profondeur de jambe
+/// avant fusion.
 const ARTICLE_TITLE_CONJ_BOOST: &str = "4";
 const ARTICLE_TITLE_OR_BOOST: &str = "0.25";
-/// Boost du match **conjonctif** corps d'une expansion concept→corps (ADR 0241) :
-/// la formule statutaire (« frais exposés non compris dans les dépens ») doit
-/// matcher en entier pour remonter l'article gouvernant, à parité de poids avec
-/// le titre conjonctif.
-const ARTICLE_BODY_CONCEPT_BOOST: &str = "4";
-/// Poids RRF de la jambe usage_terms (ADR 0248) : sacs de contextes de
-/// citation, votes SOMMÉS avec les autres jambes (elle recouvre la jambe
-/// articles — accumulation d'évidence). w=0,6 validé au banc (36 GT).
+/// Boost de la clause `num` ([`article_num_clause`]), multiplicatif sur le BM25
+/// de la jambe articles.
+const ARTICLE_NUM_BOOST: &str = "2";
+/// Poids RRF de la jambe usage_terms : sacs de contextes de citation, votes
+/// sommés avec les autres jambes (elle recouvre la jambe articles).
 const ARTICLE_USAGE_WEIGHT: &str = "0.8";
+/// Poids RRF de la jambe usage scopée au code nommé : grammes du concept seul
+/// contre les sacs du code visé.
+const ARTICLE_NAMED_USAGE_WEIGHT: &str = "4.0";
 const ARTICLE_RRF_K: &str = "60";
 const ARTICLE_LEG_LIMIT: i64 = 200;
-/// Poids RRF de la jambe articles étrangère (ADR 0234) : insensible entre
-/// 0,1 et 0,5 au banc (l'étranger ne remonte dans le top qu'à poids ~1).
+/// « En vigueur » = la fenêtre de validité, seule définition du référentiel :
+/// le littéral `status = 'VIGUEUR'` laisse dehors les articles que DILA ne
+/// stampe pas, dont tout le fonds JORF. Mêmes bornes que la lecture à date
+/// (`law_article_at_date`) : début inconnu `0001-01-01`, fin ouverte `NULL`.
+/// `date_debut`/`date_fin` étant des fast fields, le prédicat se pousse entier
+/// dans le scan Tantivy.
+pub(crate) fn article_valid_now(a: &str) -> String {
+    article_valid_at(a, "CURRENT_DATE")
+}
+/// La même fenêtre à une date arbitraire : `d` est une expression SQL de date
+/// (`CURRENT_DATE` ou littéral `DATE '2020-06-15'` rendu depuis un `NaiveDate`
+/// — le type ne sait produire que `%Y-%m-%d`, la splice est sûre).
+pub(crate) fn article_valid_at(a: &str, d: &str) -> String {
+    format!("{a}.date_debut <= {d} AND ({a}.date_fin IS NULL OR {a}.date_fin >= {d})")
+}
+/// Rend l'expression SQL de la date de consultation : `CURRENT_DATE` en
+/// l'absence de date demandée, sinon le littéral ISO du `NaiveDate`.
+fn sql_date_expr(at: Option<NaiveDate>) -> String {
+    match at {
+        Some(d) => format!("DATE '{d}'"),
+        None => "CURRENT_DATE".to_string(),
+    }
+}
+/// Seule définition de `legal_article.kind`, posée par
+/// [`Repository::refresh_article_denorm`] et lue par la recherche via
+/// [`article_is_norm`].
+///
+/// Un dispositif modificatif est consommé : son effet vit dans sa cible, et
+/// LEGI ne garde de la ligne qu'une mention générée de ce qu'elle a modifié.
+/// C'est le corps qui le dit, et lui seul.
+const ARTICLE_KIND_EXPR: &str = "CASE WHEN a.texte ~ \
+     '^[Aa] (modifié|abrogé|créé|transféré|dénoncé|annulé|remplacé|périmé) les dispositions suivantes' \
+     THEN 'edit' ELSE 'article' END";
+/// La recherche ne sert que des normes : un edit est lisible sur la fiche de
+/// son texte, avec son arête, mais n'est pas un document qu'on cherche.
+/// Égalité sur deux valeurs, `kind` étant un littéral de
+/// `legal_article_bm25` : poussée en `term`.
+pub(crate) fn article_is_norm(a: &str) -> String {
+    format!("{a}.kind = 'article'")
+}
+/// La même fenêtre qu'[`article_valid_at`], en `searchqueryinput` pour le
+/// chemin `paradedb.aggregate`. `d` = expression SQL de date
+/// ([`sql_date_expr`]). Deux clauses à splicer dans un `must` : `range` sur
+/// `date_debut`, et la disjonction `date_fin IS NULL OR date_fin >= $d` en
+/// `should` d'un `must_not exists` et d'un `range`. Le `must_not` est adossé à
+/// `all()` : un boolean Tantivy sans clause positive ne matche rien.
+fn article_valid_agg(d: &str) -> String {
+    format!(
+        "paradedb.range('date_debut', daterange(NULL, {d}, '(]')), \
+         paradedb.boolean(should => ARRAY[\
+           paradedb.boolean(must => ARRAY[paradedb.all()], \
+                            must_not => ARRAY[paradedb.exists('date_fin')]), \
+           paradedb.range('date_fin', daterange({d}, NULL, '[)'))])"
+    )
+}
+/// Départage des lignes d'un même article, après le score dans les jambes de
+/// recherche : la version consolidée d'abord, la publication au JO
+/// (`source='jorf'`) ensuite, puis la plus récente. Le score prime parce que
+/// les deux fonds sont complémentaires — d'un article modificatif, LEGI ne
+/// garde qu'un moignon et le lien vers sa cible, le JO garde le texte.
+fn article_pick_order(a: &str) -> String {
+    format!("({a}.source = 'jorf'), {a}.date_debut DESC")
+}
+/// Agrégation Tantivy des facettes articles (`paradedb.aggregate`, une passe) :
+/// un `terms` par axe + le total en `value_count` sur `id` (les `terms`
+/// ignorent les docs sans valeur, pas le total). L'axe `slug` ne demande que son
+/// top-100, tampon de fusion pour le top-[`ARTICLE_CODE_FACET_LIMIT`] servi.
+/// Les trois autres axes sont énumérés en entier et restent exacts, contrôlés
+/// par `sum_other_doc_count` au parsing.
+const ARTICLE_FACETS_AGG: &str = r#"{"slug":{"terms":{"field":"slug","size":100,"segment_size":5000}},"jurisdiction":{"terms":{"field":"jurisdiction","size":500}},"nature":{"terms":{"field":"nature","size":500}},"source":{"terms":{"field":"source","size":500}},"total":{"value_count":{"field":"id"}}}"#;
+const ARTICLE_FACETS_BUCKET_LIMIT: i64 = 1_000_000;
+/// Pendant de [`ARTICLE_FACETS_AGG`] pour le membre textes à corps, sur les
+/// champs fast de `legal_text_body_bm25`. Les axes `nature` et `source` y
+/// lisent deux champs distincts (`upper`/`lower` de la même colonne) là où
+/// `legal_article` porte deux colonnes dénormalisées.
+const TEXT_FACETS_AGG: &str = r#"{"slug":{"terms":{"field":"slug","size":100,"segment_size":5000}},"jurisdiction":{"terms":{"field":"jurisdiction","size":500}},"nature":{"terms":{"field":"nature_up","size":500}},"source":{"terms":{"field":"source","size":500}},"total":{"value_count":{"field":"id"}}}"#;
+/// Plafond de l'axe `code` retourné par les stats (top par count).
+const ARTICLE_CODE_FACET_LIMIT: usize = 20;
+/// Poids RRF de la jambe articles étrangère.
 const ARTICLE_FOREIGN_WEIGHT: &str = "0.25";
 
 /// Natures « navigables comme un code » — miroir du filtre du catalogue
-/// `/codes` (ADR 0133), alias `t` requis. Borne la jambe conteneurs : sans
-/// elle, tout décret/arrêté dont le titre matche la conjonction vole un rang.
+/// `/api/codes`, alias `t` requis. Borne la jambe conteneurs.
 const NAVIGABLE_TEXT_NATURES_SQL: &str = "(t.nature ILIKE 'code%' \
      OR upper(t.nature) IN ('CONSTITUTION', 'LOI_CONSTIT', 'LOI', \
          'LOI_ORGANIQUE', 'ORDONNANCE', 'DECRET_LOI', 'REGLEMENT', \
          'ETAT_CIVIL'))";
 
-/// Visibilité par défaut (ADR 0246 §6), alias `t` requis : la recherche ne
-/// sert pas les parutions sans objet consultable — actes individuels
-/// (nominations…), véhicules de publication, lois d'habilitation. Elles
-/// restent résolvables par uid.
+/// Visibilité par défaut, alias `t` requis : la recherche ne sert pas les
+/// parutions sans objet consultable — actes individuels (nominations…),
+/// véhicules de publication, lois d'habilitation. Elles restent résolvables par
+/// uid.
 const TEXT_ROLE_VISIBLE_SQL: &str = "t.role NOT IN ('individuel', 'vehicule', 'habilitation')";
 
-/// Juridictions primaires d'une requête (ADR 0234) : le droit applicable en
-/// France (FR/UE/INTL) + les pays que la requête nomme
+/// Miroir Tantivy de [`TEXT_ROLE_VISIBLE_SQL`] : les clauses `must_not` d'un
+/// `searchqueryinput`, sur le champ fast `role`. Même liste de rôles — les deux
+/// formes se lisent ensemble.
+const TEXT_ROLE_HIDDEN_TERMS: &str = "paradedb.term('role', 'individuel'), \
+     paradedb.term('role', 'vehicule'), paradedb.term('role', 'habilitation')";
+
+/// Juridictions primaires d'une requête : le droit applicable en France
+/// (FR/UE/INTL) + les pays que la requête nomme
 /// ([`lj_core::jurisdictions::query_jurisdictions`]).
 fn primary_jurisdictions(query: &str) -> Vec<String> {
     let mut primary: Vec<String> = ["FR", "UE", "INTL"].map(String::from).to_vec();
@@ -2885,90 +3543,124 @@ fn primary_jurisdictions(query: &str) -> Vec<String> {
 }
 
 /// Prédicats BM25 des deux jambes de la recherche d'articles et de ses
-/// facettes (ADR 0114/0232). Par jambe (`legal_article_bm25` /
-/// `legal_text_body_bm25`), `should` de trois clauses : titre **conjonctif
-/// normalisé** boosté ([`lj_core::aliases::conj_title_query`] par alternative
-/// requête/expansion — chaque alternative doit matcher le titre en entier),
-/// filet titre OR à faible poids ($1, requête enrichie des expansions), corps
-/// ($2, requête seule). Pousse les alternatives conjonctives dans `params`
-/// ($3..) ; requête réduite à rien (« article ») → filet OR seul. Le
-/// `t.body IS NOT NULL` borne la jambe textes aux familles à corps
-/// (circulaires… — l'index couvre tous les titres).
+/// facettes. Par jambe (`legal_article_bm25` / `legal_text_body_bm25`),
+/// `should` de trois clauses : titre conjonctif normalisé boosté (par
+/// alternative requête/expansion, chacune devant matcher le titre en entier),
+/// filet titre OR à faible poids ($1), corps ($2). Pousse les alternatives
+/// conjonctives dans `params` ($3..) ; requête réduite à rien → filet OR seul.
+/// Les deux jambes renvoient l'expression `searchqueryinput` nue (sans
+/// `id @@@`).
+///
+/// Qui n'en veut qu'une prend [`article_text_predicate`] : la jambe articles
+/// pousse les paramètres de sa clause `num`, qu'une requête textes ne
+/// référencerait pas — et un placeholder poussé sans être référencé fait
+/// échouer la requête entière.
 fn article_search_predicates(
     params: &mut ArticleSearchParams,
     query: &str,
     expansions: &[String],
 ) -> (String, String) {
+    let alt_phs = article_conj_alt_phs(params, query, expansions);
+    let art = format!(
+        "paradedb.boolean(should => ARRAY[{}, paradedb.match('texte', $2){}])",
+        article_title_clauses("search_title", &alt_phs),
+        article_num_clause(params, query),
+    );
+    (art, article_text_clause(&alt_phs))
+}
+
+/// Jambe textes seule — la facette textes, qui tourne dans sa propre requête
+/// avec son propre jeu de paramètres.
+fn article_text_predicate(
+    params: &mut ArticleSearchParams,
+    query: &str,
+    expansions: &[String],
+) -> String {
+    article_text_clause(&article_conj_alt_phs(params, query, expansions))
+}
+
+/// Alternatives conjonctives poussées dans `params` ($3..), communes aux deux
+/// jambes.
+fn article_conj_alt_phs(
+    params: &mut ArticleSearchParams,
+    query: &str,
+    expansions: &[String],
+) -> Vec<usize> {
     let mut conj_alts: Vec<String> = std::iter::once(query.to_string())
         .chain(expansions.iter().cloned())
         .filter_map(|q| lj_core::aliases::conj_title_query(&q))
         .collect();
     conj_alts.dedup();
-    let alt_phs: Vec<usize> = conj_alts
+    conj_alts
         .into_iter()
         .map(|a| params.push(Box::new(a)))
+        .collect()
+}
+
+/// Clauses titre d'une jambe : conjonctif normalisé boosté par alternative,
+/// plus le filet titre OR à faible poids ($1). Requête réduite à rien
+/// (« article ») → filet OR seul.
+fn article_title_clauses(field: &str, alt_phs: &[usize]) -> String {
+    let or = format!("paradedb.boost({ARTICLE_TITLE_OR_BOOST}, paradedb.match('{field}', $1))");
+    if alt_phs.is_empty() {
+        return or;
+    }
+    let alts: Vec<String> = alt_phs
+        .iter()
+        .map(|ph| format!("paradedb.match('{field}', ${ph}, conjunction_mode => true)"))
         .collect();
-    let title_clauses = |field: &str| {
-        let or = format!("paradedb.boost({ARTICLE_TITLE_OR_BOOST}, paradedb.match('{field}', $1))");
-        if alt_phs.is_empty() {
-            return or;
-        }
-        let alts: Vec<String> = alt_phs
-            .iter()
-            .map(|ph| format!("paradedb.match('{field}', ${ph}, conjunction_mode => true)"))
-            .collect();
-        let conj = match alts.as_slice() {
-            [single] => single.clone(),
-            many => format!("paradedb.boolean(should => ARRAY[{}])", many.join(", ")),
-        };
-        format!("paradedb.boost({ARTICLE_TITLE_CONJ_BOOST}, {conj}), {or}")
+    let conj = match alts.as_slice() {
+        [single] => single.clone(),
+        many => format!("paradedb.boolean(should => ARRAY[{}])", many.join(", ")),
     };
-    let concept_phs = push_concept_expansions(params, query);
-    // Jambe articles : prédicat 100 % indexé (`a.` seul) — le filtre de
-    // visibilité `t.role` s'applique côté join `legal_text` chez les
-    // consommateurs, pour que le scan ParadeDB reste sans heap filter.
-    let art = format!(
-        "a.id @@@ paradedb.boolean(should => ARRAY[{}, paradedb.match('texte', $2){}])",
-        title_clauses("search_title"),
-        concept_body_clause("texte", &concept_phs)
-    );
-    let txt = format!(
-        "t.id @@@ paradedb.boolean(should => ARRAY[{}, paradedb.match('body', $2){}]) \
-         AND t.body IS NOT NULL AND {TEXT_ROLE_VISIBLE_SQL}",
-        title_clauses("title"),
-        concept_body_clause("body", &concept_phs)
-    );
-    (art, txt)
+    format!("paradedb.boost({ARTICLE_TITLE_CONJ_BOOST}, {conj}), {or}")
 }
 
-/// Pousse les expansions concept→corps (ADR 0241) déclenchées par `query` et
-/// renvoie leurs placeholders `$N`. « frais irrépétibles » → « frais exposés non
-/// compris dans les dépens ». Vide si aucun synonyme déclenché.
-fn push_concept_expansions(params: &mut ArticleSearchParams, query: &str) -> Vec<usize> {
-    lj_core::aliases::concept_expansions(query)
-        .into_iter()
-        .map(|e| params.push(Box::new(e)))
-        .collect()
+/// Jambe textes à corps : la requête nue (sans `t.id @@@`, sans les clauses SQL
+/// de corps et de visibilité). Les hits la posent en prédicat SQL, les facettes
+/// la passent telle quelle à `paradedb.aggregate`.
+fn article_text_clause(alt_phs: &[usize]) -> String {
+    format!(
+        "paradedb.boolean(should => ARRAY[{}, paradedb.match('body', $2)])",
+        article_title_clauses("title", alt_phs),
+    )
 }
 
-/// Fragments SQL de clauses corps **conjonctives boostées** (ADR 0241) pour des
-/// placeholders déjà poussés (`phs`) et un `field` (`texte`/`body`) : la formule
-/// statutaire doit matcher en entier pour remonter l'article gouvernant, dont le
-/// terme doctrinal est absent. Chaque fragment commence par `, ` pour s'insérer
-/// dans un `ARRAY[…]` ; chaîne vide si `phs` vide.
-fn concept_body_clause(field: &str, phs: &[usize]) -> String {
-    phs.iter()
-        .map(|ph| {
-            format!(
-                ", paradedb.boost({ARTICLE_BODY_CONCEPT_BOOST}, \
-                 paradedb.match('{field}', ${ph}, conjunction_mode => true))"
-            )
-        })
-        .collect()
+/// Clause `num` de la jambe articles — le numéro d'article cité dans la
+/// requête, cherché sur le champ qui le porte, rendue prête à concaténer dans
+/// un `should` (`, clause` ; chaîne vide si la requête ne cite aucun numéro).
+///
+/// Deux formes par numéro, parce que le corpus en porte deux : collés
+/// (`L423-7`, un seul token) et pointés ou étoilés (`D. 423-7`, deux tokens) —
+/// d'où la forme conjonctive rendue par [`lj_core::article_key::display`], qui
+/// les cherche sans les confondre (`L. 423-7` n'atteint pas `R*423-7`).
+fn article_num_clause(params: &mut ArticleSearchParams, query: &str) -> String {
+    let mut alts: Vec<String> = Vec::new();
+    for key in lj_core::article_key::query_article_keys(query) {
+        let dotted = lj_core::article_key::display(&key);
+        let forms = if dotted == key {
+            vec![key]
+        } else {
+            vec![key.clone(), dotted]
+        };
+        for form in forms {
+            let ph = params.push(Box::new(form));
+            alts.push(format!(
+                "paradedb.match('num', ${ph}, conjunction_mode => true)"
+            ));
+        }
+    }
+    if alts.is_empty() {
+        return String::new();
+    }
+    format!(
+        ", paradedb.boost({ARTICLE_NUM_BOOST}, paradedb.boolean(should => ARRAY[{}]))",
+        alts.join(", ")
+    )
 }
 
-/// Construit la jambe titre : requête enrichie des expansions d'alias (OR implicite
-/// du `match`), substitut au sémantique.
+/// Construit la jambe titre : requête enrichie des expansions d'alias (OR
+/// implicite du `match`).
 fn article_title_query(query: &str, expansions: &[String]) -> String {
     if expansions.is_empty() {
         query.to_string()
@@ -2978,10 +3670,9 @@ fn article_title_query(query: &str, expansions: &[String]) -> String {
 }
 
 /// Accumulateur de paramètres SQL pour la recherche d'articles et ses facettes.
-/// `$1`/`$2` sont toujours la jambe titre et la jambe corps ; les filtres optionnels
-/// (`text_uid`/`jurisdiction`/`nature`/`source`) puis les bornes de pagination sont
-/// poussés à la suite, l'indexation des `$N` restant correcte quels que soient les
-/// filtres présents. Valeurs `Box`ées (idiom dynamique, cf. [`as_param_refs`]).
+/// `$1`/`$2` sont toujours la jambe titre et la jambe corps ; les filtres
+/// optionnels (`text_uid`/`jurisdiction`/`nature`/`source`) puis les bornes de
+/// pagination sont poussés à la suite.
 struct ArticleSearchParams {
     params: Vec<Box<dyn ToSql + Sync + Send>>,
 }
@@ -2993,6 +3684,12 @@ impl ArticleSearchParams {
         }
     }
 
+    /// Sans jambe titre ni jambe corps — pour une requête qui ne référence pas
+    /// `$1`/`$2` (Postgres refuse un placeholder jamais référencé).
+    fn empty() -> Self {
+        Self { params: Vec::new() }
+    }
+
     /// Pousse une valeur et renvoie son numéro de placeholder `$N` (1-indexé).
     fn push(&mut self, value: Box<dyn ToSql + Sync + Send>) -> usize {
         self.params.push(value);
@@ -3001,17 +3698,10 @@ impl ArticleSearchParams {
 
     /// Pousse les filtres présents et renvoie les DEUX clauses SQL `AND …`
     /// (chaînes vides si aucun filtre) : une pour la jambe articles, une pour la
-    /// jambe textes à corps (ADR 0196) — mêmes placeholders, colonnes propres à
-    /// chaque jambe. Côté articles, toutes les colonnes vivent sur
-    /// `legal_article` (dénormalisées, ADR 0254) et sont des champs de l'index
-    /// BM25 : les filtres s'appliquent dans le scan, le prédicat reste 100 %
-    /// indexé. `a.nature` est stockée en upper (le corpus curé mélange les
-    /// casses) ; `source` vaut `a.source` côté articles et `lower(t.nature)`
-    /// côté textes à corps (pas de diffuseur par ligne sur `legal_text` — la
-    /// famille tient lieu de jeton). `nature_set` (sur-facette portée, valeurs
-    /// upper) filtre les deux jambes : `(liste, true)` = nature DANS la liste,
-    /// `(liste, false)` = nature HORS liste (le complément « norme » est un
-    /// ensemble ouvert).
+    /// jambe textes à corps — mêmes placeholders, colonnes propres à chaque jambe.
+    /// `a.nature` est stockée en upper ; `source` vaut `a.source` côté articles et
+    /// `lower(t.nature)` côté textes à corps. `nature_set` filtre les deux jambes :
+    /// `(liste, true)` = nature dans la liste, `(liste, false)` = hors liste.
     fn push_filters(
         &mut self,
         text_uid: Option<&str>,
@@ -3048,14 +3738,90 @@ impl ArticleSearchParams {
     }
 
     fn refs(&self) -> Vec<&(dyn ToSql + Sync)> {
-        // `Send` sur les boxes garde le future de la méthode `Send` (frontière
-        // axum Handler) ; on retombe ici sur `&(dyn ToSql + Sync)` attendu par
-        // tokio-postgres (l'auto-trait `Send` est largué par coercion).
+        // `Send` sur les boxes garde le future de la méthode `Send` (frontière axum
+        // Handler) ; on retombe ici sur `&(dyn ToSql + Sync)` attendu par
+        // tokio-postgres.
         self.params
             .iter()
             .map(|p| &**p as &(dyn ToSql + Sync))
             .collect()
     }
+}
+
+/// Les six statements de classification des rôles : reset à `instrument` puis
+/// cinq passes par signaux sûrs — fonction pure, dumpable pour validation psql.
+/// `scoped` borne chaque statement aux `text_uid` d'un lot (`$1`).
+///
+/// Passes : motifs de titre pour `individuel` et `habilitation` ; pour
+/// `vehicule` deux signaux, un décret « portant publication » vide porteur
+/// d'une arête `modifie` sortante résolue, et la cible d'une arête `publie`
+/// entrante possédée par une fiche instrument. Une loi constitutionnelle est
+/// `modificatif` de l'instrument-Constitution.
+fn text_role_sqls(scoped: bool) -> [String; 6] {
+    // Deux fragments selon l'alias de la passe (`legal_text` nu ou `t`).
+    let scope = if scoped {
+        " AND text_uid = ANY($1)"
+    } else {
+        ""
+    };
+    let scope_t = if scoped {
+        " AND t.text_uid = ANY($1)"
+    } else {
+        ""
+    };
+    [
+        format!(
+            "UPDATE legal_text SET role = 'instrument' WHERE role <> 'instrument'{scope}"
+        ),
+        format!(
+            "
+            UPDATE legal_text SET role = 'individuel'
+            WHERE text_uid LIKE 'JORFTEXT%'{scope}
+              AND (title ~* 'portant (nomination|promotion|titularisation|naturalisation|cessation de fonctions|admission à la retraite|acceptation de la démission|détachement|radiation des cadres|radiation \\()'
+                   OR title ~* '^avis de vacance'
+                   OR title ~* 'accordant la nationalité française|conférant l.honorariat|acceptant la démission|inscription au tableau d.avancement')
+            "
+        ),
+        format!(
+            "
+            UPDATE legal_text SET role = 'habilitation'
+            WHERE text_uid LIKE 'JORFTEXT%'{scope}
+              AND title ~* 'autorisant (la ratification|l.approbation|l.adhésion|l.accession|le Président de la République à (ratifier|approuver|adhérer))'
+              AND title !~* ' et (portant|modifiant)'
+            "
+        ),
+        format!(
+            "
+            UPDATE legal_text t SET role = 'vehicule'
+            WHERE t.text_uid LIKE 'JORFTEXT%'{scope_t}
+              AND t.title ~* 'portant publication'
+              AND t.body IS NULL
+              AND NOT EXISTS (
+                    SELECT 1 FROM legal_article a WHERE a.text_uid = t.text_uid)
+              AND EXISTS (
+                    SELECT 1 FROM legal_link l
+                    WHERE l.owner_text_uid = t.text_uid
+                      AND l.verb = 'modifie'
+                      AND l.direction = 'outgoing'
+                      AND l.target_text_uid IS NOT NULL
+                      AND l.target_text_uid <> t.text_uid)
+            "
+        ),
+        format!(
+            "
+            UPDATE legal_text t SET role = 'vehicule'
+            WHERE t.role <> 'vehicule'{scope_t}
+              AND EXISTS (
+                    SELECT 1 FROM legal_link l
+                    WHERE l.verb = 'publie'
+                      AND l.direction = 'incoming'
+                      AND l.target_text_uid = t.text_uid)
+            "
+        ),
+        format!(
+            "UPDATE legal_text SET role = 'modificatif' WHERE nature = 'LOI_CONSTIT'{scope}"
+        ),
+    ]
 }
 
 /// Texte court : on affiche tous les articles (DDHC, courtes lois/traités).
@@ -3065,95 +3831,21 @@ const CONTEXT_DIVISION_MAX: usize = 80;
 /// Demi-fenêtre de repli (par position) quand la division est trop grosse.
 const CONTEXT_WINDOW: usize = 6;
 
-/// Sélection adaptative du contexte (ADR 0114), pure et testable. `rows` est déjà
-/// trié par `position`. Renvoie le sous-ensemble à afficher, l'article courant
-/// marqué `current`. Hiérarchie : tout (texte court) → division (même
-/// `title_path`) → fenêtre `±CONTEXT_WINDOW`. `current_num_key` absent ⇒ vide.
-fn select_article_context(
-    rows: Vec<ContextLite>,
-    current_num_key: &str,
-) -> Vec<ArticleNeighborRow> {
-    let n = rows.len();
-    let Some(idx) = rows.iter().position(|r| r.num_key == current_num_key) else {
-        return Vec::new();
-    };
-    let pick = |i: usize, rows: &[ContextLite]| ArticleNeighborRow {
-        num: rows[i].num.clone(),
-        num_key: rows[i].num_key.clone(),
-        status: rows[i].status.clone(),
-        current: i == idx,
-    };
-
-    if n <= CONTEXT_FULL_MAX {
-        return (0..n).map(|i| pick(i, &rows)).collect();
-    }
-    let cur_tp = &rows[idx].title_path;
-    if cur_tp.is_some() {
-        let division: Vec<usize> = (0..n).filter(|&i| rows[i].title_path == *cur_tp).collect();
-        if division.len() <= CONTEXT_DIVISION_MAX {
-            return division.into_iter().map(|i| pick(i, &rows)).collect();
-        }
-    }
-    let lo = idx.saturating_sub(CONTEXT_WINDOW);
-    let hi = (idx + CONTEXT_WINDOW + 1).min(n);
-    (lo..hi).map(|i| pick(i, &rows)).collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{select_article_context, ContextLite};
-
-    fn lite(num: &str, tp: Option<&str>) -> ContextLite {
-        ContextLite {
-            num: num.to_string(),
-            num_key: num.to_string(),
-            status: "VIGUEUR".to_string(),
-            title_path: tp.map(str::to_string),
-            position: None,
-        }
-    }
+    use super::text_role_sqls;
 
     #[test]
-    fn context_short_text_returns_all_articles() {
-        // DDHC-like : 17 articles, sous le seuil FULL → tout, courant marqué.
-        let rows: Vec<ContextLite> = (1..=17).map(|i| lite(&i.to_string(), None)).collect();
-        let out = select_article_context(rows, "9");
-        assert_eq!(out.len(), 17);
-        assert_eq!(out.iter().filter(|r| r.current).count(), 1);
-        assert!(out.iter().find(|r| r.num == "9").unwrap().current);
-    }
-
-    #[test]
-    fn context_large_text_returns_enclosing_division() {
-        // 200 articles, FULL dépassé ; la division de l'article courant compte 5
-        // membres (≤ DIVISION_MAX) → on rend la division entière, pas la fenêtre.
-        let mut rows: Vec<ContextLite> =
-            (1..=100).map(|i| lite(&i.to_string(), Some("A"))).collect();
-        rows.extend((101..=105).map(|i| lite(&i.to_string(), Some("B"))));
-        rows.extend((106..=200).map(|i| lite(&i.to_string(), Some("C"))));
-        let out = select_article_context(rows, "103");
-        assert_eq!(out.len(), 5, "toute la division B");
-        assert!(out
-            .iter()
-            .all(|r| ("101"..="105").contains(&r.num.as_str())));
-        assert!(out.iter().find(|r| r.num == "103").unwrap().current);
-    }
-
-    #[test]
-    fn context_huge_division_falls_back_to_window() {
-        // 200 articles tous dans la même division (> DIVISION_MAX) → fenêtre ±6
-        // autour de la position (13 articles), courant centré.
-        let rows: Vec<ContextLite> = (1..=200).map(|i| lite(&i.to_string(), Some("A"))).collect();
-        let out = select_article_context(rows, "100");
-        assert_eq!(out.len(), 13);
-        assert_eq!(out.first().unwrap().num, "94");
-        assert_eq!(out.last().unwrap().num, "106");
-        assert!(out.iter().find(|r| r.num == "100").unwrap().current);
-    }
-
-    #[test]
-    fn context_unknown_article_is_empty() {
-        let rows: Vec<ContextLite> = (1..=200).map(|i| lite(&i.to_string(), Some("A"))).collect();
-        assert!(select_article_context(rows, "999").is_empty());
+    fn text_role_sqls_cover_passes_and_scope() {
+        let full = text_role_sqls(false);
+        assert!(full.iter().all(|s| !s.contains("ANY($1)")));
+        assert!(full[0].contains("role = 'instrument'"));
+        assert!(full[1].contains("'individuel'"));
+        assert!(full[2].contains("'habilitation'"));
+        assert!(full[3].contains("'vehicule'") && full[3].contains("'modifie'"));
+        assert!(full[4].contains("'vehicule'") && full[4].contains("'publie'"));
+        assert!(full[5].contains("'modificatif'"));
+        let scoped = text_role_sqls(true);
+        assert!(scoped.iter().all(|s| s.contains("ANY($1)")));
     }
 }

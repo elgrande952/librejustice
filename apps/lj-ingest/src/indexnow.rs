@@ -1,14 +1,12 @@
-//! Push IndexNow — notifie Bing/Yandex des URLs (re)publiées (port de
-//! `apps/ingest/librejustice/indexnow.py`).
+//! Push IndexNow — notifie Bing/Yandex des URLs (re)publiées.
 //!
 //! IndexNow (<https://www.indexnow.org>) : un POST JSON avec une liste d'URLs et
 //! une clé publiée à `https://<host>/<key>.txt` suffit à signaler aux moteurs
 //! participants (Bing, Yandex…) de venir crawler. Pas d'OAuth, pas de quota
 //! Google. Limite protocole : 10 000 URLs par requête.
 //!
-//! Découplé de la boucle d'ingest (cf. ADR 0044) : la commande `librejustice
-//! indexnow` interroge `decisions` par `updated_at` et soumet par lots — aucun
-//! ralentissement du pipeline d'ingestion.
+//! Découplé de la boucle d'ingest : la commande `librejustice indexnow` interroge
+//! `decisions` par `updated_at` et soumet par lots.
 
 use anyhow::{Context, Result};
 use reqwest_middleware::ClientBuilder;
@@ -30,6 +28,11 @@ pub fn decision_url(public_id: &str) -> String {
     format!("https://{INDEXNOW_HOST}/decision/{public_id}")
 }
 
+/// URL canonique d'une fiche de consultation (pot Annonces).
+pub fn marche_url(uid: &str) -> String {
+    format!("https://{INDEXNOW_HOST}/marche/{uid}")
+}
+
 /// Corps JSON d'une soumission IndexNow. `urls` doit faire ≤ 10 000 entrées.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,10 +43,9 @@ pub struct IndexNowPayload {
     pub url_list: Vec<String>,
 }
 
-/// Construit le corps JSON d'une soumission (port de `build_payload`).
+/// Construit le corps JSON d'une soumission.
 ///
-/// Lève une erreur si `urls` dépasse la limite protocole — pas de silent
-/// fallback (AGENTS.md règle #12).
+/// Lève une erreur si `urls` dépasse la limite protocole.
 pub fn build_payload(key: &str, urls: Vec<String>) -> Result<IndexNowPayload> {
     if urls.len() > MAX_URLS_PER_REQUEST {
         anyhow::bail!(
@@ -59,12 +61,10 @@ pub fn build_payload(key: &str, urls: Vec<String>) -> Result<IndexNowPayload> {
     })
 }
 
-/// POST les URLs décision à IndexNow par lots de 10 000. Retourne le nb soumis.
+/// POST des URLs à IndexNow par lots de 10 000. Retourne le nb soumis.
 ///
-/// Lève une erreur si un lot échoue (4xx clé invalide, 5xx…) — pas de silent
-/// fallback (AGENTS.md règle #12). Port de `submit`.
-pub async fn submit(public_ids: &[String], key: &str) -> Result<usize> {
-    let urls: Vec<String> = public_ids.iter().map(|pid| decision_url(pid)).collect();
+/// Lève une erreur si un lot échoue (4xx clé invalide, 5xx…).
+pub async fn submit(urls: &[String], key: &str) -> Result<usize> {
     if urls.is_empty() {
         tracing::info!("indexnow_noop aucune_url");
         return Ok(0);
@@ -101,17 +101,19 @@ pub async fn submit(public_ids: &[String], key: &str) -> Result<usize> {
 mod tests {
     use super::*;
 
-    // Spec : URLs canoniques (host en dur, schéma /decision/<id>).
     #[test]
     fn url_helpers() {
         assert_eq!(
             decision_url("ce_12345"),
             "https://librejustice.fr/decision/ce_12345"
         );
+        assert_eq!(
+            marche_url("marche:1a2b3c"),
+            "https://librejustice.fr/marche/marche:1a2b3c"
+        );
         assert_eq!(key_location("abcdef"), "https://librejustice.fr/abcdef.txt");
     }
 
-    // Spec : build_payload sérialise en camelCase (keyLocation/urlList).
     #[test]
     fn payload_camel_case() {
         let payload =
@@ -123,7 +125,6 @@ mod tests {
         assert_eq!(json["urlList"][0], "https://librejustice.fr/decision/a");
     }
 
-    // Spec : dépassement de la limite protocole = erreur franche.
     #[test]
     fn payload_rejects_overflow() {
         let urls = vec!["x".to_string(); MAX_URLS_PER_REQUEST + 1];

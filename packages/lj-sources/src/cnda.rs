@@ -1,23 +1,23 @@
 //! Downloader CNDA (Cour nationale du droit d'asile) — I/O réseau au bord
-//! lj-sources (ADR 0096).
+//! lj-sources.
 //!
-//! La CNDA est **absente** de Judilibre/JADE/opendata : seule source = scraping
-//! du site `cnda.fr`. Deux niveaux fusionnés côté pipeline (une ligne `decisions`
-//! par numéro, grounding §Décisions de conception 2) :
-//! - **fiche HTML éditoriale** (liste paginée `?page=1..N`, 30 fiches/page,
-//!   N≈17 ⇒ ~500 décisions « jurisprudentielles », sous-ensemble curé) : titre
-//!   éditorial, `content_type`, abstract/analyse rédigé par la Cour (1300–2700
-//!   car.), lien « Voir la décision » (slug PDF **sans extension** sous
-//!   `/Media/mediatheque-cnda/images/<année>/`), date de mise en ligne.
-//! - **PDF Word lié** (texte intégral) : octets bruts → OCR Mistral
-//!   (`mistral-ocr-latest`, markdown par page) côté pipeline `lj-ingest`, mis en
-//!   cache local (`ocr/<numero>.md`) car payant et non déterministe.
+//! La CNDA est absente de Judilibre/JADE/opendata : seule source = scraping
+//! du site `cnda.fr`. Deux niveaux fusionnés côté pipeline (une ligne
+//! `decisions` par numéro) :
+//! - fiche HTML éditoriale (liste paginée `?page=1..N`, 30 fiches/page,
+//!   sous-ensemble curé « jurisprudentiel ») : titre éditorial, `content_type`,
+//!   abstract/analyse rédigé par la Cour (1300–2700 car.), lien « Voir la
+//!   décision » (slug PDF sans extension sous `/Media/mediatheque-cnda/…`),
+//!   date de mise en ligne.
+//! - PDF Word lié (texte intégral) : octets bruts → extraction côté pipeline
+//!   `lj-ingest`, avec cache local du markdown OCR (`ocr/<numero>.md`), l'OCR
+//!   Mistral étant payant et non déterministe.
 //!
 //! Le parsing métier (sections, ECLI fabriqué, `source_fields`) vit dans
-//! `lj-core::parse_cnda`, qui reçoit le markdown OCR nettoyé (`clean_ocr_markdown`)
-//! et les métadonnées fiche désérialisées. Throttle de courtoisie + User-Agent de
-//! contact. Le watermark (dernière page drainée / dernier numéro vu) est persisté
-//! façon [`crate::dila::DilaManifest`].
+//! `lj-core::parse_cnda`, qui reçoit le markdown OCR nettoyé
+//! (`clean_ocr_markdown`) et les métadonnées fiche désérialisées. Throttle de
+//! courtoisie + User-Agent de contact. Le watermark (dernière page drainée /
+//! dernier numéro vu) est persisté façon [`crate::dila::DilaManifest`].
 
 use crate::error::{Result, SourceError};
 use crate::html_strip::strip_html;
@@ -44,7 +44,7 @@ pub const LIST_PATH: &str = "/decisions-de-justice/jurisprudence/decisions-juris
 use crate::state_paths::CNDA_DIR;
 
 // ----------------------------------------------------------------------------
-// Client CNDA (async reqwest-middleware, comme cedh.rs / judilibre.rs)
+// Client CNDA (async reqwest-middleware)
 // ----------------------------------------------------------------------------
 
 /// Client CNDA (reqwest async + `TracingMiddleware`). Crawl HTML de la liste
@@ -104,9 +104,6 @@ impl CndaClient {
 
     /// HTML de la rubrique « dernières décisions » (canal d'incrément).
     pub async fn latest_html(&self) -> Result<String> {
-        // Refonte du site (vérifié 2026-06-15) : la rubrique est sous
-        // `/decisions-de-justice/dernieres-decisions` (l'ancienne, sous
-        // `/jurisprudence/`, renvoie 404).
         let url = format!("{}/decisions-de-justice/dernieres-decisions", self.base_url);
         self.get_html(&url).await
     }
@@ -119,9 +116,9 @@ impl CndaClient {
     }
 
     /// Octets bruts du PDF lié. `pdf_url` est le slug « Voir la décision »
-    /// (**sans extension `.pdf`**). Renvoie `None` si le PDF est introuvable
-    /// (404 / lien mort) ⇒ la décision sera traitée fiche-only côté pipeline
-    /// (grounding §Décisions 2). Erreur franche sur tout autre statut ≠ 200.
+    /// (sans extension `.pdf`). Renvoie `None` si le PDF est introuvable (404 /
+    /// lien mort) ⇒ la décision sera traitée fiche-only côté pipeline. Erreur
+    /// franche sur tout autre statut ≠ 200.
     pub async fn fetch_pdf(&self, pdf_url: &str) -> Result<Option<Vec<u8>>> {
         let url = self.absolutize(pdf_url);
         let resp = self
@@ -213,11 +210,10 @@ pub fn enumerate_fiche_urls(list_html: &str) -> Vec<String> {
 /// et non une page de navigation (rubrique racine, `dernieres-decisions`,
 /// pagination, ancres internes).
 fn is_fiche_path(path: &str) -> bool {
-    // Depuis la refonte du site (vérifié 2026-06-15), les fiches vivent sous la
-    // sous-rubrique `decisions-jurisprudentielles/<slug>` (et non plus directement
-    // sous `jurisprudence/<slug>`). Le préfixe inclut le `/` final : l'index nu
-    // `…/decisions-jurisprudentielles` (et sa pagination `?page=`) ne le matche pas
-    // → exclu comme page de navigation.
+    // Les fiches vivent sous la sous-rubrique
+    // `decisions-jurisprudentielles/<slug>`. Le préfixe inclut le `/` final :
+    // l'index nu (et sa pagination `?page=`) ne le matche pas, donc il est exclu
+    // comme page de navigation.
     let prefix = "/decisions-de-justice/jurisprudence/decisions-jurisprudentielles/";
     let Some(slug) = path.strip_prefix(prefix) else {
         return false;
@@ -258,13 +254,13 @@ pub struct CndaFiche {
     /// slug descriptif (`la-cnda-evalue-…`) + un lien `/documents/…` sans numéro,
     /// mais citent `n°25013796` dans l'analyse. Numéro propre = le plus fréquent.
     pub numero: Option<String>,
-    /// Date de lecture lue dans la **référence de décision** du corps
+    /// Date de lecture lue dans la référence de décision du corps
     /// (`CNDA 27 juillet 2016 M. A. n° 16012935 C`), distincte de la mise en ligne
     /// (`publication_date`). Repli pour les fiche-only sans PDF (donc sans
-    /// marqueur OCR) ni date de slug. ≠ date de mise en ligne (ADR 0096 §43/85).
+    /// marqueur OCR) ni date de slug.
     pub lecture_date: Option<String>,
     /// Date de mise en ligne de la fiche (texte brut, ex. `1 juin 2026`).
-    /// **≠ date de lecture** (piège audit §43/85) — informatif seulement.
+    /// ≠ date de lecture — informatif seulement.
     pub publication_date: Option<String>,
 }
 
@@ -284,12 +280,11 @@ impl CndaFiche {
     }
 }
 
-/// Parse une fiche HTML éditoriale en [`CndaFiche`]. Frontière de validation
-/// (#12) : on **exige** un lien PDF candidat OU un abstract éditorial — une fiche
-/// sans ni l'un ni l'autre est une page vidée de sa substance (DOM cassé) et lève
-/// une erreur franche plutôt que de produire une décision creuse. L'absence du
-/// *seul* PDF (lien mort) reste tolérée (fiche-only) ; c'est l'absence des deux
-/// qui signale un gabarit cassé.
+/// Parse une fiche HTML éditoriale en [`CndaFiche`]. Frontière de validation :
+/// on exige un lien PDF candidat OU un abstract éditorial — une fiche sans ni
+/// l'un ni l'autre est une page vidée de sa substance (DOM cassé) et lève une
+/// erreur franche plutôt que de produire une décision creuse. L'absence du seul
+/// PDF (lien mort) reste tolérée (fiche-only).
 pub fn parse_fiche(html: &str, fiche_url: &str) -> Result<CndaFiche> {
     let title = extract_h1(html).or_else(|| extract_meta(html, "og:title"));
     let pdf_url = extract_pdf_slug(html);
@@ -385,15 +380,15 @@ fn extract_meta(html: &str, key: &str) -> Option<String> {
 }
 
 /// Slug PDF du lien « Voir la décision » : un `href` sous
-/// `/Media/mediatheque-cnda/<segment>/…/<slug>` (sans extension `.pdf`). La
-/// refonte du site sert les PDF sous `…/documents/…` (et non plus seulement
-/// `…/images/…`) — on ne fige donc pas le segment. Parmi tous les hrefs média, on
-/// retient le **premier lien décision**, identifié par l'un des deux signaux :
-/// - slug portant un numéro (`…-n-NNNNNNNN-c`, cf. [`numero_from_slug`]) — fiches
-///   anciennes, slug = intitulé d'arrêt ;
-/// - chemin sous `…/documents/…` — fiches modernes au slug **descriptif**
+/// `/Media/mediatheque-cnda/<segment>/…/<slug>` (sans extension `.pdf`). Le
+/// segment n'est pas figé. Parmi tous les hrefs média, on retient le premier
+/// lien décision, identifié par l'un des deux signaux :
+/// - slug portant un numéro (`…-n-NNNNNNNN-c`, cf. [`numero_from_slug`]) —
+///   fiches anciennes, slug = intitulé d'arrêt ;
+/// - chemin sous `…/documents/…` — fiches modernes au slug descriptif
 ///   (`la-cnda-evalue-…`, sans numéro) où le PDF vit sous `documents/` (≠ les
-///   illustrations/logos sous `images/`). Le lien 302-redirige vers le fichier réel.
+///   illustrations/logos sous `images/`). Le lien 302-redirige vers le fichier
+///   réel.
 fn extract_pdf_slug(html: &str) -> Option<String> {
     static PDF_RE: OnceLock<Regex> = OnceLock::new();
     let re = PDF_RE.get_or_init(|| {
@@ -403,15 +398,15 @@ fn extract_pdf_slug(html: &str) -> Option<String> {
     re.captures_iter(html)
         .map(|c| {
             let raw = c[1].trim();
-            // Le slug est sans extension ; si une `.pdf` traîne, on la retire (audit).
+            // Le slug est sans extension ; si une `.pdf` traîne, on la retire.
             raw.strip_suffix(".pdf").unwrap_or(raw).to_string()
         })
         .find(|slug| numero_from_slug(slug).is_some() || slug.contains("/documents/"))
 }
 
-/// `content_type` = première ligne non vide du body **après** le titre éditorial
-/// (audit §42 : `Jurisprudence` / `Décision de justice`). Le strip plat fait
-/// remonter le h1 en tête, donc on saute la ligne qui répète le titre.
+/// `content_type` = première ligne non vide du body après le titre éditorial
+/// (`Jurisprudence` / `Décision de justice`). Le strip plat fait remonter le h1
+/// en tête, donc on saute la ligne qui répète le titre.
 fn content_type_line(body_text: &str, title: Option<&str>) -> Option<String> {
     body_text
         .lines()
@@ -422,8 +417,8 @@ fn content_type_line(body_text: &str, title: Option<&str>) -> Option<String> {
 }
 
 /// Abstract éditorial : la plus longue ligne dans la fenêtre 1300–2700 car.
-/// (audit §45 : le bloc d'analyse est nettement plus long que toute autre ligne
-/// du body). Heuristique best-effort ; `None` si rien dans la fenêtre.
+/// — le bloc d'analyse est nettement plus long que toute autre ligne du body.
+/// Heuristique best-effort ; `None` si rien dans la fenêtre.
 fn extract_abstract(body_text: &str) -> Option<String> {
     body_text
         .lines()
@@ -437,7 +432,7 @@ fn extract_abstract(body_text: &str) -> Option<String> {
 }
 
 /// Date de mise en ligne dans le body (`<jour> <mois> <année>` en français).
-/// Informatif seulement (la date indexée = date de lecture du PDF, audit §85).
+/// Informatif seulement : la date indexée est la date de lecture du PDF.
 fn extract_publication_date(body_text: &str) -> Option<String> {
     static DATE_RE: OnceLock<Regex> = OnceLock::new();
     let re = DATE_RE.get_or_init(|| {
@@ -465,10 +460,11 @@ fn decode_basic_entities(s: &str) -> String {
 // Numéro de décision (slug PDF / /Title PDF)
 // ----------------------------------------------------------------------------
 
-/// Extrait le numéro de décision d'un slug PDF. Le slug encode `…-n-<numéro>-<classement>`
-/// (audit §30 : `cnda-12-mai-2026-m.y.-n-26006334-c`). On cherche le segment
-/// numérique le plus long (≥ 6 chiffres), le numéro étant un identifiant long
-/// (`26006334`) tandis que les dates sont des nombres courts. `None` si aucun.
+/// Extrait le numéro de décision d'un slug PDF. Le slug encode
+/// `…-n-<numéro>-<classement>` (`cnda-12-mai-2026-m.y.-n-26006334-c`). On
+/// cherche le segment numérique le plus long (≥ 6 chiffres), le numéro étant un
+/// identifiant long (`26006334`) tandis que les dates sont des nombres courts.
+/// `None` si aucun.
 pub fn numero_from_slug(slug: &str) -> Option<String> {
     static NUM_RE: OnceLock<Regex> = OnceLock::new();
     let re = NUM_RE.get_or_init(|| Regex::new(r"\d{6,}").expect("regex numéro slug"));
@@ -477,8 +473,8 @@ pub fn numero_from_slug(slug: &str) -> Option<String> {
         .max_by_key(String::len)
 }
 
-/// Extrait le numéro de décision d'un `/Title` PDF (audit §56 : le `/Title` vaut
-/// exactement le numéro, ex. `26006334`). Tolère un titre bruité : on prend la
+/// Extrait le numéro de décision d'un `/Title` PDF : le `/Title` vaut
+/// exactement le numéro (ex. `26006334`). Tolère un titre bruité — on prend la
 /// première suite de ≥ 6 chiffres. `None` si aucune.
 pub fn numero_from_pdf_title(title: &str) -> Option<String> {
     static NUM_RE: OnceLock<Regex> = OnceLock::new();
@@ -555,9 +551,8 @@ pub fn manifest_path(data_dir: &Path) -> std::path::PathBuf {
 
 /// Chemin du PDF caché pour `numero` (`<data_dir>/cnda/payloads/<numero>.pdf`).
 /// La CNDA scrape des PDF un par un ; on les persiste comme les autres sources
-/// persistent leurs archives (`zips/` opendata, tarballs judilibre) pour qu'un
-/// re-run — ou une ré-extraction (changement d'extracteur/OCR) — relise le PDF
-/// localement au lieu de re-crawler cnda.fr (lent, throttlé, liens qui meurent).
+/// persistent leurs archives, pour qu'un re-run — ou une ré-extraction — relise
+/// le PDF localement au lieu de re-crawler cnda.fr.
 pub fn payload_path(data_dir: &Path, numero: &str) -> std::path::PathBuf {
     data_dir
         .join(CNDA_DIR)
@@ -587,12 +582,11 @@ pub fn save_cached_payload(data_dir: &Path, numero: &str, bytes: &[u8]) -> Resul
     Ok(())
 }
 
-/// Chemin du markdown OCR caché pour `numero` (`<data_dir>/cnda/ocr/<numero>.md`).
-/// 2ᵉ couche de cache au-dessus du PDF : l'OCR Mistral est **non déterministe,
-/// payant et rate-limité** ; on le fige par décision pour ne le rejouer **qu'une
-/// fois par PDF**. Tout l'aval (strip markdown + `clean_texte` + sections) devient
-/// alors un transform local pur, itérable sans re-OCR. Re-OCR seulement si le PDF
-/// source change (ADR 0108, même principe que jafbase).
+/// Chemin du markdown OCR caché pour `numero`
+/// (`<data_dir>/cnda/ocr/<numero>.md`). Deuxième couche de cache au-dessus du
+/// PDF : l'OCR Mistral n'est pas déterministe, on le fige par décision. Tout
+/// l'aval (strip markdown, `clean_texte`, sections) devient un transform local
+/// pur. Re-OCR seulement si le PDF source change.
 pub fn ocr_path(data_dir: &Path, numero: &str) -> std::path::PathBuf {
     data_dir
         .join(CNDA_DIR)
@@ -636,9 +630,6 @@ mod tests {
 
     #[test]
     fn enumerate_keeps_only_fiche_paths_dedup_ordered() {
-        // Structure du site post-refonte (vérifiée 2026-06-15) : fiches sous
-        // `decisions-jurisprudentielles/<slug>` ; l'index nu + sa pagination, les
-        // `dernieres-decisions`, ancres et sous-rubriques sœurs sont exclus.
         let html = r##"
             <a href="/decisions-de-justice/jurisprudence/decisions-jurisprudentielles?page=2">suiv</a>
             <a href="/decisions-de-justice/jurisprudence/decisions-jurisprudentielles">index</a>
@@ -662,7 +653,6 @@ mod tests {
 
     #[test]
     fn numero_from_slug_picks_long_number() {
-        // Le slug porte la date (nombres courts) + le numéro (≥ 6 chiffres).
         assert_eq!(
             numero_from_slug("cnda-12-mai-2026-m.y.-n-26006334-c").as_deref(),
             Some("26006334")
@@ -722,7 +712,6 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("En premier lieu,"));
-        // Le numéro se relit du slug PDF (triple source robuste).
         assert_eq!(
             numero_from_slug(fiche.pdf_url.as_deref().unwrap()).as_deref(),
             Some("26006334")
@@ -731,9 +720,6 @@ mod tests {
 
     #[test]
     fn parse_fiche_extracts_pdf_under_documents_segment_ignoring_asset_links() {
-        // Refonte du site : le PDF « Voir la décision » est servi sous
-        // `…/documents/…` (et non plus `…/images/…`). On ne fige pas le segment ;
-        // un autre href média sans numéro (logo) ne doit pas être pris pour le PDF.
         let abstract_txt = "En premier lieu, ".to_string()
             + &"la Cour relève le bien-fondé des craintes du requérant. ".repeat(25);
         assert!((1300..=2700).contains(&abstract_txt.chars().count()));
@@ -759,9 +745,6 @@ mod tests {
 
     #[test]
     fn parse_fiche_picks_documents_pdf_with_descriptive_slug_no_numero() {
-        // Fiche moderne : lien PDF sous `documents/` au slug **descriptif** (sans
-        // `-n-NNNNNNNN-`). Doit être retenu (signal `/documents/`), le numéro venant
-        // alors du corps (`n°25013796`), pas du slug ; le logo `images/` est ignoré.
         let abstract_txt = "En premier lieu, ".to_string()
             + &"la Cour évalue la crédibilité de la demande de protection. ".repeat(25);
         let html = format!(
@@ -779,7 +762,6 @@ mod tests {
             fiche.pdf_url.as_deref(),
             Some("/Media/mediatheque-cnda/documents/20257/juillet/la-cnda-evalue-la-credibilite-en-guinee")
         );
-        // Slug sans numéro → repli sur le corps.
         assert_eq!(numero_from_slug(fiche.pdf_url.as_deref().unwrap()), None);
         assert_eq!(fiche.numero.as_deref(), Some("25013796"));
     }
@@ -799,7 +781,6 @@ mod tests {
 
     #[test]
     fn parse_fiche_franc_error_when_no_pdf_no_abstract() {
-        // Gabarit cassé : ni lien PDF, ni bloc d'analyse → erreur franche (#12).
         let html = "<html><body><h1>Titre seul</h1><p>Jurisprudence</p></body></html>";
         let err = parse_fiche(html, "/broken").unwrap_err();
         assert!(matches!(err, SourceError::Invalid(_)));
@@ -807,17 +788,14 @@ mod tests {
 
     #[test]
     fn numero_from_body_picks_most_frequent() {
-        // La décision sujet recurre ; une décision citée n'apparaît qu'une fois.
         let body = "Par la décision n°21059246 citée, la Cour a statué. Dans la \
                     présente affaire n°25013796, … le n°25013796 est rejeté. Voir aussi \
                     n°25013796 pour le raisonnement.";
         assert_eq!(extract_numero_from_body(body).as_deref(), Some("25013796"));
-        // Variante casse/espace `N° 24031657`.
         assert_eq!(
             extract_numero_from_body("Décision N° 24031657 du jour").as_deref(),
             Some("24031657")
         );
-        // Aucun numéro à 6+ chiffres → None.
         assert_eq!(
             extract_numero_from_body("aucun numéro ici").as_deref(),
             None
@@ -846,15 +824,12 @@ mod tests {
 
     #[test]
     fn lecture_date_from_body_reads_decision_ref_not_publication() {
-        // Réf de décision `CNDA <date> … n°…` = date de lecture ; le `28 juillet
-        // 2016` qui suit `Jurisprudence` (content_type) est la mise en ligne.
         let body = "Jurisprudence 28 juillet 2016 Accueil … la Cour (CNDA 27 juillet \
                     2016 M. A. n° 16012935 C) juge que …";
         assert_eq!(
             extract_lecture_date_from_body(body).as_deref(),
             Some("27 juillet 2016")
         );
-        // CRR ancien.
         assert_eq!(
             extract_lecture_date_from_body("réf CRR 18 avril 2005 M. O. n° 455708").as_deref(),
             Some("18 avril 2005")
@@ -868,14 +843,11 @@ mod tests {
     #[test]
     fn cached_payload_roundtrip_and_path() {
         let dir = tempfile::tempdir().unwrap();
-        // Format de chemin = contrat (la ré-extraction s'appuie dessus).
         assert_eq!(
             payload_path(dir.path(), "25043827"),
             dir.path().join("cnda/payloads/25043827.pdf")
         );
-        // Cache miss avant écriture.
         assert_eq!(load_cached_payload(dir.path(), "25043827").unwrap(), None);
-        // Round-trip : écrit (création du répertoire) puis relit à l'identique.
         let bytes = b"%PDF-1.7 fake".to_vec();
         save_cached_payload(dir.path(), "25043827", &bytes).unwrap();
         assert_eq!(

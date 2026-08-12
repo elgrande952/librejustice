@@ -1,6 +1,3 @@
-//! Tests de la canonicalisation d'instruments (extraits de l'ancien
-//! `extract/common.rs` lors du découpage thématique).
-
 use super::*;
 
 #[test]
@@ -11,9 +8,8 @@ fn normalize_instrument_strips_article_and_titlecases() {
 
 #[test]
 fn normalize_instrument_recovers_caps_lock_source() {
-    // Vieilles décisions (Cassation) en CAPS : instruments non aliasés. La
-    // recasse normale doit s'appliquer plutôt que de préserver les majuscules
-    // comme des acronymes. Les acronymes réels restent restaurés.
+    // Vieilles décisions (Cassation) en CAPS : instruments non aliasés, recassés
+    // normalement. Les acronymes réels restent restaurés.
     assert_eq!(
         normalize_instrument("CODE DE PROCÉDURE PÉNALE"),
         "Code de procédure pénale"
@@ -22,17 +18,14 @@ fn normalize_instrument_recovers_caps_lock_source() {
         normalize_instrument("DÉCLARATION DES DROITS DE L'HOMME ET DU CITOYEN"),
         "Déclaration des droits de l'homme et du citoyen"
     );
-    // Acronyme standalone connu : préservé tel quel.
     assert_eq!(normalize_instrument("CESEDA"), "CESEDA");
-    // Acronyme interne restauré par instrument_internal_case.
     assert_eq!(normalize_instrument("LOI ELAN"), "Loi ELAN");
 }
 
 #[test]
 fn normalize_instrument_canonical_eu_civil_regulations() {
     // Surnom nu, numéro nu (sigle/« n° » manquants) et forme JO complète
-    // convergent vers la même clé numérotée — sinon le même règlement éclate
-    // en autant de graphies (missed côté GT, spurious côté extracteur).
+    // convergent vers la même clé numérotée.
     for v in [
         "Règlement Bruxelles I bis",
         "Règlement 1215/2012",
@@ -71,14 +64,13 @@ fn normalize_instrument_canonical_eu_civil_regulations() {
         normalize_instrument("Règlement Bruxelles II bis"),
         "Règlement (CE) n° 2201/2003"
     );
-    // Idempotence : une clé déjà canonique se renvoie elle-même.
     assert_eq!(
         normalize_instrument("Règlement (CE) n° 864/2007"),
         "Règlement (CE) n° 864/2007"
     );
     // La Convention de Rome de 1980 (≠ règlement Rome I) n'est pas happée par le
     // bloc « Règlement » : elle converge vers son titre long de Convention (loi
-    // applicable aux obligations contractuelles), pas vers un règlement.
+    // applicable aux obligations contractuelles).
     assert_eq!(
         normalize_instrument("Convention de Rome du 19 juin 1980"),
         "Convention de Rome du 19 juin 1980 sur la loi applicable aux obligations contractuelles"
@@ -105,7 +97,7 @@ fn normalize_instrument_canonical_foreign_and_conventions() {
         );
     }
     // COC tunisien/marocain : « Code des obligations ET DES CONTRATS » est un
-    // code DISTINCT, ne doit pas être conflé avec le CO suisse.
+    // code DISTINCT, à ne pas confler avec le CO suisse.
     assert_ne!(
         normalize_instrument("Code des obligations et des contrats"),
         "Code des obligations suisse"
@@ -125,7 +117,6 @@ fn normalize_instrument_canonical_foreign_and_conventions() {
         normalize_instrument("Convention de Vienne du 11 avril 1980"),
         cvim
     );
-    // Lugano : toute graphie → forme datée en vigueur.
     assert_eq!(
         normalize_instrument("Convention de lugano du 30 octobre 2007"),
         "Convention de Lugano du 30 octobre 2007"
@@ -145,12 +136,10 @@ fn normalize_instrument_canonical_foreign_and_conventions() {
         normalize_instrument("Statut de Rome de la Cour pénale internationale"),
         rome
     );
-    // La Haye 4 mai 1971 (accidents de la circulation) : forme courte datée → titre long.
     assert_eq!(
         normalize_instrument("Convention de la haye du 4 mai 1971"),
         "Convention de la haye du 4 mai 1971 sur la loi applicable en matière d'accidents de la circulation routière"
     );
-    // Rome : forme NUE (anaphore) converge aussi.
     assert_eq!(normalize_instrument("Convention de Rome"), rome);
     // La Haye / Bruxelles : dates SANS ambiguïté → titre long.
     assert_eq!(
@@ -188,7 +177,6 @@ fn normalize_instrument_strips_punct_glued_to_foreign_gentile() {
         normalize_instrument("Code civil suisse)"),
         normalize_instrument("Code civil suisse")
     );
-    // Gentilé final propre : inchangé (pas de troncature parasite).
     assert_eq!(
         normalize_instrument("Code des obligations suisse"),
         normalize_instrument("Code des obligations suisse")
@@ -197,10 +185,9 @@ fn normalize_instrument_strips_punct_glued_to_foreign_gentile() {
 
 #[test]
 fn foreign_codes_do_not_collapse_onto_french_homonym() {
-    // Garde droit étranger (ADR 0102 §B, étendue aux gentilés non-asile) : un
-    // code étranger ne doit JAMAIS se replier sur le code FR homonyme — sinon le
-    // linker confond le BGB allemand avec le code civil français. Le gentilé est
-    // conservé ; l'identité reste distincte.
+    // Garde droit étranger : un code étranger ne doit JAMAIS se replier sur le
+    // code FR homonyme, sinon le linker confond le BGB allemand avec le code civil
+    // français. Le gentilé est conservé ; l'identité reste distincte.
     for (raw, french) in [
         ("Code civil allemand", "Code civil"),
         (
@@ -262,7 +249,6 @@ fn eu_regulations_resolved_by_adoption_date() {
     ] {
         assert_eq!(normalize_instrument(raw), want, "{raw}");
     }
-    // Le numéro reste prioritaire sur la date quand les deux sont présents.
     assert_eq!(
         normalize_instrument("Règlement (CE) n° 593/2008 du 17 juin 2008"),
         "Règlement (CE) n° 593/2008"
@@ -272,8 +258,7 @@ fn eu_regulations_resolved_by_adoption_date() {
 #[test]
 fn german_native_code_names_converge_to_french_form() {
     // BGB / Bürgerliches Gesetzbuch (nom natif seul, natif + gloss, FR + gloss,
-    // sigle) → forme française d'usage unique. Sans quoi le même code éclate en
-    // une dizaine d'identités (recall ruiné).
+    // sigle) → forme française d'usage unique.
     for v in [
         "Bürgerliches gesetzbuch",
         "Bürgerliches gesetzbuch (code civil allemand)",
@@ -302,9 +287,8 @@ fn german_native_code_names_converge_to_french_form() {
 fn foreign_code_overcapture_truncated_after_gentile() {
     // Sur-capture de la borne droite de citation : la prose qui suit le gentilé
     // est happée dans l'identité. Le code étranger n'étant pas snappé (garde
-    // droit étranger), la queue survivait et éclatait l'identité (faux missed +
-    // faux spurious sur le MÊME article). On tronque après le gentilé : toutes
-    // ces graphies convergent vers le code étranger nu.
+    // droit étranger), la queue survivait et éclatait l'identité. On tronque
+    // après le gentilé : toutes ces graphies convergent vers le code étranger nu.
     for (raw, want) in [
         ("Code civil allemand à la suite", "Code civil allemand"),
         ("Code civil suisse agissant", "Code civil suisse"),
@@ -331,7 +315,6 @@ fn foreign_code_overcapture_truncated_after_gentile() {
     ] {
         assert_eq!(normalize_instrument(raw), want, "{raw}");
     }
-    // Le gentilé déjà en dernier token : rien à couper, identité intacte.
     assert_eq!(
         normalize_instrument("Code civil allemand"),
         "Code civil allemand"
@@ -353,7 +336,6 @@ fn normalize_instrument_canonical_cesdh() {
 
 #[test]
 fn normalize_instrument_cleans_truncation_tails() {
-    // Connecteur pendant laissé par la borne droite de citation.
     assert_eq!(
         normalize_instrument("Décret du 8 janvier 1995 et"),
         "Décret du 8 janvier 1995"
@@ -366,19 +348,16 @@ fn normalize_instrument_cleans_truncation_tails() {
         normalize_instrument("Convention collective applicable"),
         "Convention collective"
     );
-    // Queue verbale capturée depuis le corps.
     assert_eq!(
         normalize_instrument(
             "Livre des procédures fiscales et ont notifié à chaque prévenu un procès-verbal"
         ),
         "Livre des procédures fiscales"
     );
-    // Connecteur « et » légitime dans un vrai titre : intact.
     assert_eq!(
         normalize_instrument("Code monétaire et financier"),
         "Code monétaire et financier"
     );
-    // Forme sans connecteur → titre Légifrance.
     assert_eq!(
         normalize_instrument("Code procédure civile"),
         "Code de procédure civile"
@@ -389,7 +368,7 @@ fn normalize_instrument_cleans_truncation_tails() {
 #[test]
 fn normalize_instrument_strips_orphan_trailing_paren() {
     // « (article 52 § 1 du règlement) » capte l'instrument « règlement) » : la
-    // parenthèse fermante ORPHELINE est retirée (artefact ADR 0137, ≈28 K arêtes).
+    // parenthèse fermante ORPHELINE est retirée.
     assert_eq!(
         normalize_instrument("règlement)"),
         normalize_instrument("règlement")
@@ -399,7 +378,6 @@ fn normalize_instrument_strips_orphan_trailing_paren() {
         normalize_instrument("Règlement de la cour)"),
         normalize_instrument("Règlement de la cour")
     );
-    // Aucune sortie ne conserve une ')' orpheline finale.
     for s in [
         "règlement)",
         "code)",
@@ -408,19 +386,16 @@ fn normalize_instrument_strips_orphan_trailing_paren() {
     ] {
         assert!(!normalize_instrument(s).ends_with(')'), "{s}");
     }
-    // Paire ÉQUILIBRÉE d'un vrai titre UE : préservée, pas rabotée.
     let ue = normalize_instrument("Règlement (CE) n° 44/2001");
     assert!(ue.contains("(CE)"), "paire équilibrée perdue : {ue}");
 }
 
 #[test]
 fn normalize_instrument_trims_glued_prose_tail() {
-    // Verbe nu collé au nom : coupé, identité préservée.
     assert_eq!(
         normalize_instrument("Loi du 11 mars 1957 définit la représentation comme consistant"),
         "Loi du 11 mars 1957",
     );
-    // Tail coupé puis snap au titre Légifrance officiel.
     assert_eq!(
         normalize_instrument("Code de l'expropriation dispose"),
         "Code de l'expropriation pour cause d'utilité publique",
@@ -434,8 +409,8 @@ fn normalize_instrument_trims_glued_prose_tail() {
         "Loi du 12 juillet 1990",
     );
     // « et a <verbe> / et les articles » glué : coupé (auxiliaire/citation,
-    // jamais dans un titre). On NE coupe PAS « et le <nom> » (cf. test de
-    // non-fusion ci-dessous : appartient à de vrais titres).
+    // jamais dans un titre). On NE coupe PAS « et le <nom> », qui appartient à de
+    // vrais titres.
     assert_eq!(
         normalize_instrument("Loi du 29 juillet 1881 et a omis d'annuler d'office les jugements"),
         "Loi du 29 juillet 1881",
@@ -444,7 +419,6 @@ fn normalize_instrument_trims_glued_prose_tail() {
         normalize_instrument("Code de commerce et les articles L"),
         "Code de commerce",
     );
-    // Sous-titre boilerplate d'un Arrêté daté : coupé (extension Loi/Décret).
     assert_eq!(
         normalize_instrument("Arrêté du 27 décembre 2016 relatif aux conditions"),
         "Arrêté du 27 décembre 2016",
@@ -453,7 +427,6 @@ fn normalize_instrument_trims_glued_prose_tail() {
         normalize_instrument("Arrêté du 18 juin 1991 modifié relatif à la mise en place"),
         "Arrêté du 18 juin 1991",
     );
-    // Vrais titres avec « et » : intacts (pas de verbe nu).
     assert_eq!(
         normalize_instrument("Code monétaire et financier"),
         "Code monétaire et financier",
@@ -462,7 +435,6 @@ fn normalize_instrument_trims_glued_prose_tail() {
         normalize_instrument("Code de la construction et de l'habitation"),
         "Code de la construction et de l'habitation",
     );
-    // « relative aux droits… » SANS tête datée : PAS un boilerplate → intact.
     assert_eq!(
         normalize_instrument("Convention internationale relative aux droits de l'enfant"),
         "Convention internationale relative aux droits de l'enfant",
@@ -471,10 +443,9 @@ fn normalize_instrument_trims_glued_prose_tail() {
 
 #[test]
 fn normalize_instrument_trims_year_glued_prose() {
-    // Prose soudée SANS espace à un millésime (sur-capture borne droite,
-    // observée en prod : « Loi du 6 juillet 1989ordonner l'expulsion… »,
-    // « Décret du 28 décembre 2020portant application… »). Tous les
-    // prose-cuts ancrés sur `\s+` la ratent. Coupe à la lettre collée.
+    // Prose soudée SANS espace à un millésime (« Loi du 6 juillet 1989ordonner
+    // l'expulsion… », « Décret du 28 décembre 2020portant application… »). Tous
+    // les prose-cuts ancrés sur `\s+` la ratent : on coupe à la lettre collée.
     assert_eq!(
         normalize_instrument(
             "Loi du 6 juillet 1989ordonner l'expulsion des preneurs et de tout occupant"
@@ -485,12 +456,10 @@ fn normalize_instrument_trims_year_glued_prose() {
         normalize_instrument("Loi du 31 mai 1990visant la mise en œuvre du droit au logement"),
         "Loi du 31 mai 1990",
     );
-    // Le millésime nu (cas nominal) reste intact : pas de lettre collée.
     assert_eq!(
         normalize_instrument("Loi du 6 juillet 1989"),
         "Loi du 6 juillet 1989",
     );
-    // Numéro UE suivi d'un « / » (jamais d'une lettre) : intact.
     assert_eq!(
         normalize_instrument("Directive 2013/33/UE"),
         "Directive 2013/33/UE"
@@ -499,7 +468,6 @@ fn normalize_instrument_trims_year_glued_prose() {
 
 #[test]
 fn normalize_instrument_strips_citation_apparatus() {
-    // « modifié » final, avec ou sans virgule.
     assert_eq!(
         normalize_instrument("Loi du 6 juillet 1989 modifiée"),
         "Loi du 6 juillet 1989"
@@ -508,7 +476,6 @@ fn normalize_instrument_strips_citation_apparatus() {
         normalize_instrument("Accord franco-tunisien du 17 mars 1988 modifié"),
         "Accord franco-tunisien du 17 mars 1988"
     );
-    // « modifié du <date> » : le mot saute, la date-identité reste.
     assert_eq!(
         normalize_instrument("Accord franco-marocain modifié du 9 octobre 1987"),
         "Accord franco-marocain du 9 octobre 1987"
@@ -517,12 +484,10 @@ fn normalize_instrument_strips_citation_apparatus() {
         normalize_instrument("Loi modifiée du 31 décembre 1971"),
         "Loi du 31 décembre 1971"
     );
-    // « modifié par / notamment » : queue d'apparat coupée.
     assert_eq!(
         normalize_instrument("Loi n° 78-17 du 6 janvier 1978, modifiée notamment"),
         "Loi du 6 janvier 1978"
     );
-    // « devenu … » : renvoi, l'identité citée est la tête.
     assert_eq!(
         normalize_instrument("Loi du 25 janvier 1985 devenu l'article L"),
         "Loi du 25 janvier 1985"
@@ -533,7 +498,6 @@ fn normalize_instrument_strips_citation_apparatus() {
             ),
             "Traité instituant la Communauté économique européenne"
         );
-    // « ensemble <déterminant> » : jonction de visa coupée.
     assert_eq!(
         normalize_instrument(
             "Livre des procédures fiscales ensemble l'article 605 du code de procédure pénale"
@@ -546,12 +510,10 @@ fn normalize_instrument_strips_citation_apparatus() {
         ),
         "Loi du 10 décembre 1952"
     );
-    // « ensemble » nom commun (pas de déterminant derrière) : intact.
     assert_eq!(
         normalize_instrument("Convention collective d'un ensemble immobilier"),
         "Convention collective d'un ensemble immobilier"
     );
-    // « alors » nu en fin / « alors en vigueur ».
     assert_eq!(
         normalize_instrument("Décret du 22 décembre 1958 alors"),
         "Décret du 22 décembre 1958"
@@ -560,17 +522,14 @@ fn normalize_instrument_strips_citation_apparatus() {
         normalize_instrument("Loi n° 84-53 du 26 janvier 1984, alors en vigueur"),
         "Loi du 26 janvier 1984"
     );
-    // « visé ci-dessus » et « visé » final.
     assert_eq!(
         normalize_instrument("Loi du 11 juillet 1990 visée ci-dessus"),
         "Loi du 11 juillet 1990"
     );
-    // Forme courte sans date : rabattue sur le canonique daté (ADR 0112 §6).
     assert_eq!(
         normalize_instrument("Accord franco-tunisien visé"),
         "Accord franco-tunisien du 17 mars 1988"
     );
-    // « visée à l'article … » appartient à de vrais titres : intact.
     assert_eq!(
         normalize_instrument(
             "Arrêté du 9 janvier 2017 fixant la liste des pays sûrs visée à l'article L. 722-1"
@@ -581,17 +540,14 @@ fn normalize_instrument_strips_citation_apparatus() {
 
 #[test]
 fn normalize_instrument_date_and_number_graphies() {
-    // Jour zéro-paddé.
     assert_eq!(
         normalize_instrument("Loi du 06 juillet 1989 applicable à l'espèce"),
         "Loi du 6 juillet 1989"
     );
-    // Indicateur ordinal º au lieu du degré °.
     assert_eq!(
         normalize_instrument("Loi nº 78-17 du 6 janvier 1978"),
         "Loi du 6 janvier 1978"
     );
-    // Date tout-numérique dépliée en littéral.
     assert_eq!(
         normalize_instrument("Loi du 5/07/1985 à la charge de l'un"),
         "Loi du 5 juillet 1985"
@@ -600,12 +556,10 @@ fn normalize_instrument_date_and_number_graphies() {
         normalize_instrument("Arrêté du 18.12.2023"),
         "Arrêté du 18 décembre 2023"
     );
-    // Mois hors plage : graphie intacte.
     assert_eq!(
         normalize_instrument("Décision du 5/13/2020"),
         "Décision du 5/13/2020"
     );
-    // Tiret de numéro détaché.
     assert_eq!(
         normalize_instrument("Loi n° 2018 -1021 du 23 novembre 2018"),
         "Loi du 23 novembre 2018"
@@ -672,14 +626,12 @@ fn normalize_instrument_dated_head_keeps_adjective_and_pays() {
 
 #[test]
 fn normalize_instrument_cuts_everything_after_complete_date() {
-    // Sous-titre officiel : même cible que l'ancienne coupe à connecteurs.
     assert_eq!(
         normalize_instrument(
             "Loi n° 83-634 du 13 juillet 1983 portant droits et obligations des fonctionnaires"
         ),
         "Loi du 13 juillet 1983"
     );
-    // Queue de prose à vocabulaire ouvert (hors de toute whitelist).
     assert_eq!(
         normalize_instrument("Loi du 31 mai 1990 et mentionne la faculté"),
         "Loi du 31 mai 1990"
@@ -694,29 +646,24 @@ fn normalize_instrument_cuts_everything_after_complete_date() {
             ),
             "Décret du 11 décembre 2019"
         );
-    // Second instrument joint : la tête citée gagne.
     assert_eq!(
         normalize_instrument("Ordonnance du 14 mars 2016 et du décret n° 2016-884 du 29 juin 2016"),
         "Ordonnance du 14 mars 2016"
     );
-    // « 1er » (raté par l'ancienne coupe : \\d+ puis espace obligatoire).
     assert_eq!(
         normalize_instrument("Loi du 1er juillet 1901 relative au contrat d'association"),
         "Loi du 1er juillet 1901"
     );
-    // Date plurielle.
     assert_eq!(
         normalize_instrument("Loi des 16-24 août 1790 et le décret du 16 fructidor an III"),
         "Loi des 16-24 août 1790"
     );
-    // Famille conventionnelle : l'objet fait partie du nom, INTACT.
     assert_eq!(
         normalize_instrument(
             "Convention de Genève du 28 juillet 1951 relative au statut des réfugiés"
         ),
         "Convention de Genève"
     );
-    // Date incomplète (pas de millésime) : intact.
     assert_eq!(
         normalize_instrument("Décret du 2 thermidor an II"),
         "Décret du 2 thermidor an II"
@@ -737,7 +684,6 @@ fn normalize_instrument_collapses_dittography() {
         normalize_instrument("Code de procédure de procédure civile"),
         "Code de procédure civile"
     );
-    // Répétition NON adjacente d'un vrai titre : intacte.
     assert_eq!(
         normalize_instrument("Code de la construction et de l'habitation"),
         "Code de la construction et de l'habitation"
@@ -760,7 +706,6 @@ fn normalize_instrument_snaps_word_glued_prose() {
         normalize_instrument("Livre des procédures fiscalesle contribuable"),
         "Livre des procédures fiscales"
     );
-    // Extension réelle par ESPACE : titre officiel distinct, intact.
     assert_eq!(
         normalize_instrument("Code du travail maritime"),
         "Code du travail maritime"
@@ -769,9 +714,9 @@ fn normalize_instrument_snaps_word_glued_prose() {
 
 #[test]
 fn normalize_instrument_cuts_glued_verb_and_procedural_tail() {
-    // Corps de disposition avalé au titre du code (ADR 0137, ≈12 K arêtes) :
-    // le verbe conjugué / la queue procédurale n'appartient jamais à un titre de
-    // code ou de loi (syntagmes nominaux). On tronque au premier marqueur de prose.
+    // Corps de disposition avalé au titre du code : le verbe conjugué ou la queue
+    // procédurale n'appartient jamais à un titre de code ou de loi (syntagmes
+    // nominaux). On tronque au premier marqueur de prose.
     assert_eq!(
         normalize_instrument("Code de procédure civile mettent à la charge des parties"),
         "Code de procédure civile"
@@ -792,8 +737,8 @@ fn normalize_instrument_cuts_glued_verb_and_procedural_tail() {
         normalize_instrument("Code de procédure civile COMPOSITION DE LA COUR"),
         "Code de procédure civile"
     );
-    // GARDE-FOU régression : un qualificatif de titre (étranger, local, adjectif)
-    // ne doit JAMAIS être coupé — ce ne sont pas des marqueurs de prose.
+    // GARDE-FOU : un qualificatif de titre (étranger, local, adjectif) ne doit
+    // JAMAIS être coupé — ce ne sont pas des marqueurs de prose.
     assert_eq!(
         normalize_instrument("Code de procédure civile allemand"),
         "Code de procédure civile allemand"
@@ -821,7 +766,6 @@ fn normalize_instrument_snaps_unaccented_ceseda() {
         normalize_instrument("Code de l'entrée et de séjour des etrangers et du droit d'asile"),
         CESEDA
     );
-    // Dittographie + appareil de citation cumulés.
     assert_eq!(
         normalize_instrument(
             "Code de l'entrée de l'entrée et du séjour des étrangers et du droit d'asile modifié"
@@ -864,17 +808,15 @@ fn normalize_instrument_canonical_cesdh_protocols() {
             ),
             "Protocole n° 4 à la convention européenne de sauvegarde des droits de l'homme et des libertés fondamentales"
         );
-    // Protocoles NON-CESDH : intacts.
     assert_eq!(
         normalize_instrument("Protocole de la Haye du 23 novembre 2007"),
-        // (« haye » minusculisé par la recasse existante — hors périmètre)
+        // « haye » minusculisé par la recasse.
         "Protocole de la haye du 23 novembre 2007"
     );
 }
 
 #[test]
 fn normalize_instrument_degraded_eu_formats() {
-    // Tiret/espace au lieu de « / » dans le numéro UE (année première).
     assert_eq!(
         normalize_instrument(
             "Directive 2003-88 CE du Parlement européen et du Conseil du 4 novembre 2003"
@@ -885,19 +827,16 @@ fn normalize_instrument_degraded_eu_formats() {
         normalize_instrument("Directive 1993-104 CE du Conseil du 23 novembre 1993"),
         "Directive 1993/104/CE"
     );
-    // Interjection « dite retour » entre famille et numéro.
     assert_eq!(
         normalize_instrument(
             "Directive dite retour n° 2008/115/CE du Parlement européen et du Conseil"
         ),
         "Directive 2008/115/CE"
     );
-    // Alias d'usage après une identité datée : coupé.
     assert_eq!(
         normalize_instrument("Règlement CE du 20 décembre 2010 dit Rome III"),
         "Règlement CE du 20 décembre 2010"
     );
-    // Identité UE uniformisée : sigle nu, n° manquant, zéros de tête.
     assert_eq!(
         normalize_instrument("Règlement UE 2016/399 du Parlement européen et du Conseil du"),
         "Règlement (UE) n° 2016/399"
@@ -921,7 +860,7 @@ fn normalize_instrument_degraded_eu_formats() {
         "Directive 2003/88/CE"
     );
     // Alias = seule identité (aucun chiffre en tête) : intact.
-    // (« badinter » minusculisé par la recasse existante — hors périmètre)
+    // « badinter » minusculisé par la recasse.
     assert_eq!(
         normalize_instrument("Loi dite Badinter"),
         "Loi dite badinter"
@@ -931,8 +870,7 @@ fn normalize_instrument_degraded_eu_formats() {
 #[test]
 fn normalize_instrument_keeps_distinct_instruments_distinct() {
     // Le trim de prose ne doit JAMAIS tronquer un vrai titre au point de
-    // fusionner des instruments distincts (régression : « sur l'aide » et
-    // « et le <nom> » réduisaient tout à « Loi » / au préfixe commun).
+    // fusionner des instruments distincts.
     assert_ne!(
         normalize_instrument("Loi sur l'aide juridictionnelle"),
         "Loi"
@@ -949,11 +887,9 @@ fn normalize_instrument_keeps_distinct_instruments_distinct() {
                 "Convention entre le gouvernement de la République française et le gouvernement de Madagascar"
             ),
         );
-    // Anaphore datée : identité résoluble -> pas jetée.
     assert!(!is_unresolvable_instrument(
         "Ordonnance précité du 25 mars 2020"
     ));
-    // Anaphore nue (sans identité) : toujours jetée.
     assert!(is_unresolvable_instrument(
         "Décret précité sur l'absence d'imputabilité"
     ));
@@ -961,7 +897,6 @@ fn normalize_instrument_keeps_distinct_instruments_distinct() {
 
 #[test]
 fn normalize_instrument_standardizes_dated_number_to_date_form() {
-    // Numéro présent sous diverses formes (n°, no ASCII, nu) -> forme datée unique.
     assert_eq!(
         normalize_instrument("Loi n° 65-557 du 10 juillet 1965"),
         normalize_instrument("Loi du 10 juillet 1965"),
@@ -978,8 +913,8 @@ fn normalize_instrument_standardizes_dated_number_to_date_form() {
         normalize_instrument("Décret n° 67-223 du 17 mars 1967"),
         "Décret du 17 mars 1967",
     );
-    // Variantes d'espacement observées en prod : « n ° » (espace avant le °),
-    // « n » nu suivi du numéro. Le stripper tolère l'espacement → forme datée.
+    // Variantes d'espacement : « n ° » (espace avant le °), « n » nu suivi du
+    // numéro. Le stripper tolère l'espacement → forme datée.
     assert_eq!(
         normalize_instrument("Décret n ° 93-1362 du 30 décembre 1993"),
         "Décret du 30 décembre 1993",
@@ -999,10 +934,9 @@ fn normalize_instrument_standardizes_dated_number_to_date_form() {
 
 #[test]
 fn normalize_instrument_dated_number_idempotent_with_article() {
-    // Chaînes canoniques observées en prod (consolidation du 2026-06-12) :
-    // la forme préfixée d'article doit replier le numéro en une passe,
-    // comme la forme nue — sinon norm(norm(x)) ≠ norm(x) et la couche
-    // canonique produit raw → forme numérotée → forme datée.
+    // La forme préfixée d'article doit replier le numéro en une passe, comme la
+    // forme nue : sinon norm(norm(x)) ≠ norm(x) et la couche canonique produit
+    // raw → forme numérotée → forme datée.
     assert_eq!(
         normalize_instrument("la loi n° 65-557 du 10 juillet 1965"),
         "Loi du 10 juillet 1965"
@@ -1014,7 +948,6 @@ fn normalize_instrument_dated_number_idempotent_with_article() {
 
 #[test]
 fn normalize_instrument_eu_strips_to_number_identity() {
-    // Toute forme de surface d'une directive numérotée → clé du numéro seul.
     for form in [
         "Directive 2003/88/CE",
         "Directive 2003/88/CE du 4 novembre 2003",
@@ -1024,7 +957,6 @@ fn normalize_instrument_eu_strips_to_number_identity() {
     ] {
         assert_eq!(normalize_instrument(form), "Directive 2003/88/CE", "{form}");
     }
-    // Idem côté Règlement (numéro = identité), avec alias parenthétique.
     for form in [
         "Règlement (UE) n° 1215/2012",
         "Règlement (UE) n° 1215/2012 du 12 décembre 2012",
@@ -1037,12 +969,10 @@ fn normalize_instrument_eu_strips_to_number_identity() {
             "{form}"
         );
     }
-    // Vieille notation (CEE) + attribution sans date → même clé que la datée.
     assert_eq!(
         normalize_instrument("Règlement (CEE) n° 1408/71 du Conseil"),
         normalize_instrument("Règlement (CEE) n° 1408/71 du Conseil du 14 juin 1971"),
     );
-    // Directive SANS numéro (date = identité) : le strip ne s'applique pas.
     assert_eq!(
         normalize_instrument("Directive du 16 décembre 2008"),
         "Directive du 16 décembre 2008",
@@ -1056,7 +986,6 @@ fn unresolvable_instrument_flags_bare_stubs() {
     assert!(is_unresolvable_instrument("Décret susvisé"));
     assert!(is_unresolvable_instrument("Règlement précité"));
     assert!(is_unresolvable_instrument("Loi précitée"));
-    // Anaphore + queue de prose (le marqueur n'est plus en suffixe) : filtrée.
     assert!(is_unresolvable_instrument(
         "Décret précité sur l'absence d'imputabilité"
     ));
@@ -1066,20 +995,17 @@ fn unresolvable_instrument_flags_bare_stubs() {
     assert!(is_unresolvable_instrument("Règlement susvisé sur"));
     assert!(is_unresolvable_instrument("Décret du même jour"));
     assert!(is_unresolvable_instrument("Code du même"));
-    // Instruments réels : jamais filtrés.
     assert!(!is_unresolvable_instrument("Code civil"));
     assert!(!is_unresolvable_instrument("Loi du 10 juillet 1991"));
     assert!(!is_unresolvable_instrument("Décret du 8 janvier 1995"));
-    // Famille nue + identité réelle (date) après « du » non-anaphorique : gardée.
     assert!(!is_unresolvable_instrument("Arrêté du 25 juin 1980"));
-    // Marqueur présent mais tête non-nue (vrai titre) : gardé.
     assert!(!is_unresolvable_instrument("Code de commerce précité"));
 }
 
 #[test]
 fn unresolvable_flags_generic_convention_collective() {
-    // « Convention collective » sans domaine distinctif : anaphorique / générique,
-    // aucune CCN identifiable → filtrée (faux positif d'extraction, ~14k arêtes).
+    // « Convention collective » sans domaine distinctif : anaphorique ou
+    // générique, aucune CCN identifiable → filtrée.
     for g in [
         "Convention collective",
         "Convention collective nationale",
@@ -1093,7 +1019,6 @@ fn unresolvable_flags_generic_convention_collective() {
     ] {
         assert!(is_unresolvable_instrument(g), "devrait être générique: {g}");
     }
-    // CCN qualifiée (domaine / date) : reste distinctif → émise (résoluble).
     for ok in [
         "Convention collective nationale des transports routiers",
         "Convention collective de la métallurgie",
@@ -1110,8 +1035,8 @@ fn unresolvable_flags_generic_convention_collective() {
 
 #[test]
 fn unresolvable_prose_overcapture_dropped() {
-    // Famille + complément de prose sans identité : sur-capture droppée
-    // (cf. ADR 0074). La garde digit/intitulé épargne les vrais textes.
+    // Famille + complément de prose sans identité : sur-capture droppée. La garde
+    // digit/intitulé épargne les vrais textes.
     for g in [
         "Instruction de la demande",
         "Instruction à sa disposition",
@@ -1123,7 +1048,6 @@ fn unresolvable_prose_overcapture_dropped() {
     ] {
         assert!(is_unresolvable_instrument(g), "devrait être garble: {g}");
     }
-    // Vrais instruments : conservés.
     for ok in [
         "Code de l'entrée et du séjour des étrangers et du droit d'asile",
         "Livre des procédures fiscales",
@@ -1150,11 +1074,11 @@ fn normalize_nouveau_du_code() {
 
 #[test]
 fn normalize_instrument_treaty_short_forms_converge() {
-    // ADR 0112 §6 : chaque forme courte/variante d'un instrument international
-    // doit converger vers UNE chaîne canonique stable (sa text_key), JOIN-able
-    // au title_key du catalogue. Le canonique est la forme longue datée (accords
-    // bilatéraux) ou le titre long (conventions multilatérales / droit UE).
-    // Idempotence vérifiée par instrument : norm(norm(x)) == norm(x).
+    // Chaque forme courte/variante d'un instrument international doit converger
+    // vers UNE chaîne canonique stable (sa text_key), JOIN-able au title_key du
+    // catalogue. Le canonique est la forme longue datée (accords bilatéraux) ou
+    // le titre long (conventions multilatérales / droit UE). Idempotence vérifiée
+    // par instrument : norm(norm(x)) == norm(x).
     let groups: &[(&str, &[&str])] = &[
         (
             "Accord franco-algérien du 27 décembre 1968",
@@ -1211,7 +1135,6 @@ fn normalize_instrument_treaty_short_forms_converge() {
                 &once, canonical,
                 "{variant:?} doit converger vers le canonique"
             );
-            // Idempotence : repasser la sortie ne la change pas.
             assert_eq!(
                 normalize_instrument(&once),
                 once,
@@ -1223,14 +1146,12 @@ fn normalize_instrument_treaty_short_forms_converge() {
 
 #[test]
 fn snap_code_name_gating() {
-    // Non-code → None (le gating « commence par code » bloque).
     assert_eq!(snap_code_name("Loi du 10 juillet 1991"), None);
     assert!(snap_code_name("requérant").is_none());
 }
 
 #[test]
 fn normalize_instrument_german_sigles_with_gloss() {
-    // Sigle natif nu, + glose FR, + ponctuation collée → forme française d'usage.
     for v in [
         "BGB",
         "BGB allemand",

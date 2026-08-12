@@ -1,16 +1,20 @@
 //! Skeleton de chargement de la page décision : même grille `DecisionLayout`
-//! que la page chargée, avec les proportions du réel — carte « Synthèse »
-//! compacte, corps long, rail de voisins.
+//! que la page chargée, avec les proportions du réel — rail d'actions au-dessus
+//! du sommaire, carte « Synthèse » à huit champs, corps long, colonne de
+//! voisins (non sticky).
 use leptos::prelude::*;
 
 use crate::components::ui::Skeleton;
 
 use super::decision_layout::DecisionLayout;
+use super::decision_similar::SimilarCardsSkeleton;
 
 /// Lignes du TOC.
 const TOC_LINES: &[&str] = &["w-3/4", "w-2/3", "w-1/2", "w-3/5", "w-1/3"];
-/// Résumé de la carte « Synthèse ».
-const SUMMARY_LINES: &[&str] = &["w-full", "w-11/12", "w-3/5"];
+/// Résumé de la carte « Synthèse » — cinq lignes, la densité d'un résumé réel.
+const SUMMARY_LINES: &[&str] = &["w-full", "w-11/12", "w-full", "w-10/12", "w-3/5"];
+/// Chips de la rubrique « Matières », en largeurs de mots-clés.
+const MATIERE_CHIPS: &[&str] = &["w-32", "w-24", "w-28", "w-20"];
 /// Corps : paragraphes `(intitulé, lignes)` calquant la densité d'un jugement.
 const BODY_PARAS: &[(&str, &[&str])] = &[
     ("w-1/4", &["w-full", "w-full", "w-11/12", "w-full", "w-3/4"]),
@@ -31,9 +35,21 @@ fn lines(widths: &'static [&'static str]) -> impl IntoView {
 
 #[component]
 pub fn DecisionSkeleton() -> impl IntoView {
+    // Rail gauche : la barre d'actions (sélecteur de référence + impression +
+    // export) surmonte le sommaire sur la page réelle.
     let toc = view! {
-        <nav aria-hidden="true" class="flex flex-col gap-3 lg:sticky lg:top-20 lg:self-start">
-            {lines(TOC_LINES)}
+        <nav aria-hidden="true" class="flex flex-col gap-6 lg:sticky lg:top-20 lg:self-start">
+            <div class="flex items-center gap-2">
+                <Skeleton rounded="rounded-md" class="h-8 w-28" />
+                <Skeleton rounded="rounded-md" class="h-8 w-8" />
+                <Skeleton rounded="rounded-md" class="h-8 w-8" />
+            </div>
+            <div class="flex flex-col gap-3">
+                <Skeleton class="h-3 w-20" />
+                <div class="flex flex-col gap-3 border-l-2 border-[var(--color-rule)] pl-3">
+                    {lines(TOC_LINES)}
+                </div>
+            </div>
         </nav>
     }
     .into_any();
@@ -45,8 +61,10 @@ pub fn DecisionSkeleton() -> impl IntoView {
             <section class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6">
                 <Skeleton class="h-5 w-28" />
                 <div class="mt-3 flex flex-col gap-2">{lines(SUMMARY_LINES)}</div>
+                // Huit champs (juridiction, dossier, date, solution, domaine, formation,
+                // publication, portée) : la carte réelle en aligne quatre rangées de deux.
                 <div class="mt-4 grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
-                    {(0..4)
+                    {(0..8)
                         .map(|_| {
                             view! {
                                 <div class="flex flex-col gap-1">
@@ -57,9 +75,18 @@ pub fn DecisionSkeleton() -> impl IntoView {
                         })
                         .collect_view()}
                 </div>
+                // « Matières » : un intitulé puis une rangée de chips, pas des
+                // lignes de texte.
                 <div class="mt-5 border-t border-[var(--color-rule)] pt-4">
-                    <Skeleton class="h-4 w-44" />
-                    <div class="mt-3 flex flex-col gap-2">{lines(&["w-2/3", "w-1/2"])}</div>
+                    <Skeleton class="h-4 w-20" />
+                    <div class="mt-3 flex flex-wrap gap-2">
+                        {MATIERE_CHIPS
+                            .iter()
+                            .map(|w| {
+                                view! { <Skeleton rounded="rounded-full" class=format!("h-6 {w}") /> }
+                            })
+                            .collect_view()}
+                    </div>
                 </div>
             </section>
             <div class="flex flex-col gap-7">
@@ -79,18 +106,11 @@ pub fn DecisionSkeleton() -> impl IntoView {
     }
     .into_any();
 
+    // Intitulé « Décisions de principe similaires » : `w-56`, sa mesure réelle.
     let similar = view! {
-        <aside aria-hidden="true" class="flex flex-col gap-4 lg:sticky lg:top-20 lg:self-start">
-            <Skeleton class="h-5 w-40" />
-            <ul class="flex flex-col gap-3">
-                {(0..4)
-                    .map(|_| {
-                        view! {
-                            <li class="h-20 animate-pulse rounded-md border border-[var(--color-rule)] bg-[var(--color-vellum)]/50" />
-                        }
-                    })
-                    .collect_view()}
-            </ul>
+        <aside aria-hidden="true" class="flex flex-col gap-4">
+            <Skeleton class="h-5 w-56" />
+            <SimilarCardsSkeleton />
         </aside>
     }
     .into_any();

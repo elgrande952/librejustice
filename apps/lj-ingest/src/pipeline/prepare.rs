@@ -18,7 +18,7 @@ use super::{
     content_checksum, generate_public_id, Candidate, IngestMode, PreparedDecision, WriteMode,
 };
 
-/// Parse + classe un XML opendata (port de `_classify_raw`).
+/// Parse + classe un XML opendata.
 ///
 /// `archive_name` préfixe le `source_uid` (= `{zip}/{member}`). `None` →
 /// UID non reconnu (juridiction inconnue), skip côté appelant.
@@ -43,7 +43,7 @@ pub(super) fn classify_xml(raw: Vec<u8>, member: &str, archive_name: &str) -> Op
     })
 }
 
-/// Parse + classe une ligne JSON Judilibre (port de `_classify_judilibre_line`).
+/// Parse + classe une ligne JSON Judilibre.
 pub(super) fn classify_judilibre(line: Vec<u8>) -> Result<Option<Candidate>> {
     let payload: serde_json::Value =
         sonic_rs::from_slice(&line).context("ligne Judilibre JSON invalide")?;
@@ -67,9 +67,9 @@ pub(super) fn classify_judilibre(line: Vec<u8>) -> Result<Option<Candidate>> {
     }))
 }
 
-/// Triage idempotent d'un batch (port de `_triage_candidates`, mode
-/// `MISSING_HASH`) : dédup intra-batch par `source_uid` (last-wins) + précheck
-/// DB groupé. Renvoie `(survivants, skipped_unchanged, deduped)`.
+/// Triage idempotent d'un batch (mode `MISSING_HASH`) : dédup intra-batch par
+/// `source_uid` (last-wins) + précheck DB groupé. Renvoie
+/// `(survivants, skipped_unchanged, deduped)`.
 ///
 /// `require_embeddings` : si la décision existe, qu'elle a le même hash mais
 /// qu'il manque ses embeddings, on la re-traite quand même (re-embed).
@@ -79,7 +79,6 @@ pub(super) fn triage_candidates(
     require_embeddings: bool,
     mode: IngestMode,
 ) -> (Vec<Candidate>, usize, usize) {
-    // Dédup intra-batch : dernier candidat par source_uid gagne (dict Python).
     let total = candidates.len();
     let mut by_uid: HashMap<String, Candidate> = HashMap::with_capacity(total);
     for cand in candidates {
@@ -94,7 +93,6 @@ pub(super) fn triage_candidates(
         match existing.get(&uid) {
             None => survivors.push(cand),
             Some(prev) => {
-                // Mode ALL : UPDATE complet inconditionnel (ignore le hash).
                 if mode == IngestMode::All {
                     cand.decision_id = Some(prev.id);
                     cand.public_id = prev.public_id.clone().unwrap_or_else(generate_public_id);
@@ -104,14 +102,12 @@ pub(super) fn triage_candidates(
                 }
                 let same_hash = prev.content_checksum == cand.content_checksum;
                 if same_hash {
-                    // Re-embed si embeddings manquants.
                     if require_embeddings && !prev.has_embeddings {
                         cand.decision_id = Some(prev.id);
                         cand.public_id = prev.public_id.clone().unwrap_or_else(generate_public_id);
                         survivors.push(cand);
                         continue;
                     }
-                    // Backfill des identifiants (source_uid / public_id) si incomplet.
                     if prev.source_uid != uid || prev.public_id.is_none() {
                         cand.decision_id = Some(prev.id);
                         cand.public_id = prev.public_id.clone().unwrap_or_else(generate_public_id);
@@ -122,7 +118,6 @@ pub(super) fn triage_candidates(
                     skipped += 1;
                     continue;
                 }
-                // Hash différent → UPDATE complet.
                 tracing::info!(
                     source_uid = %uid,
                     old = %prev.content_checksum,
@@ -138,18 +133,20 @@ pub(super) fn triage_candidates(
     (survivors, skipped, deduped)
 }
 
-/// Clean + chunk + extract + gzip d'un survivant (port de `_prepare_write`).
+/// Clean + chunk d'un survivant.
 /// `None` → texte vide après clean (embargo Judilibre / XML vide) : skip non
 /// fatal, comptabilisé dans `empty_skipped`.
-pub(super) fn prepare_write(
+///
+/// Volontairement **sans contexte d'extraction** : c'est ce qui permet au premier
+/// lot de partir vers l'embedder pendant que le contexte s'hydrate. L'extraction
+/// structurée arrive après l'embed ([`extract_write`]).
+pub(super) fn chunk_write(
     candidate: Candidate,
     chunk_tokens: usize,
-    ctx: &super::ExtractCtx,
 ) -> Result<Option<PreparedDecision>> {
     if candidate.write_mode == WriteMode::SourceXmlOnly {
         // Backfill du `public_id` (+ format) seul : la ligne `decisions` n'est pas
-        // réécrite → pas de source_fields à bâtir (la provenance porte déjà le
-        // sien). Le payload brut n'est plus stocké (ADR 0085).
+        // réécrite → pas de source_fields à bâtir (la provenance porte déjà le sien).
         return Ok(Some(PreparedDecision {
             decision_id: candidate.decision_id,
             public_id: candidate.public_id,
@@ -159,21 +156,22 @@ pub(super) fn prepare_write(
             chunks: Vec::new(),
             payload_format: candidate.payload_format,
             extracted: None,
+            prebuilt_extracted: None,
             source_fields: serde_json::Value::Null,
         }));
     }
 
     let source_uid = candidate.decision.source_uid.clone();
 
-    // source_fields (ADR 0085) : payload moins le texte, offsets rebasés sur
-    // full_text. JSON → depuis le payload + sections ; XML → scalaires
-    // <Dossier>/<Audience> (sections recalculées au rendu/re-chunk).
+    // source_fields : payload moins le texte, offsets rebasés sur full_text. JSON →
+    // depuis le payload + sections ; XML → scalaires `<Dossier>`/`<Audience>`
+    // (sections recalculées au rendu/re-chunk).
     //
-    // Si `prebuilt_source_fields` est fourni, on l'utilise tel quel pour TOUTES
-    // les familles : c'est le chemin reconstruction-depuis-stockage (#39 re-embed,
-    // CEDH/CJUE/ArianeWeb `html`/`pdf`) où le `source_fields` canonique est déjà
-    // en base et où `raw_payload` n'existe plus (ADR 0085). En ingest normal il
-    // est `None` → on reconstruit depuis `raw_payload` par format (ci-dessous).
+    // `prebuilt_source_fields` fourni ⇒ utilisé tel quel pour TOUTES les familles :
+    // c'est le chemin reconstruction-depuis-stockage (re-embed, CEDH/CJUE/ArianeWeb),
+    // où le `source_fields` canonique est déjà en base et où `raw_payload` n'existe
+    // plus. En ingest normal il est `None` → on reconstruit depuis `raw_payload` par
+    // format (ci-dessous).
     let source_fields = match candidate.prebuilt_source_fields.clone() {
         Some(sf) => sf,
         None => match candidate.payload_format.as_str() {
@@ -188,16 +186,15 @@ pub(super) fn prepare_write(
                     .dila_fond
                     .ok_or_else(|| anyhow!("source_fields dila-xml sans fond {source_uid}"))?;
                 // `raw_payload` porte les octets DÉJÀ réparés (mojibake + entités) :
-                // `source_fields` est donc propre, alors que `content_checksum` reste
-                // calculé sur le brut pré-repair (idempotence #7).
+                // `source_fields` est donc propre, alors que `content_checksum` reste calculé sur
+                // le brut pré-repair.
                 build_source_fields_dila(&candidate.raw_payload, fond)
             }
             "html" | "pdf" => {
-                // `source_fields` préconstruits au classify, pas reconstruits du
-                // `raw_payload` (qui ne porte plus le texte source) : CEDH/CJUE depuis
-                // les métadonnées HUDOC/CDM (`html`, ADR 0094), ArianeWeb depuis le hit
-                // xsearch (`html` AJCE / `pdf` CRP, ADR 0095). Les colonnes ne portent
-                // pas de texte (il vit dans `full_text`).
+                // `source_fields` préconstruits au classify, pas reconstruits du `raw_payload`
+                // (qui ne porte plus le texte source) : CEDH/CJUE depuis les métadonnées
+                // HUDOC/CDM, ArianeWeb depuis le hit xsearch. Les colonnes ne portent pas de texte
+                // (il vit dans `full_text`).
                 candidate.prebuilt_source_fields.clone().ok_or_else(|| {
                     anyhow!(
                         "source_fields {} sans préconstruction {source_uid}",
@@ -209,11 +206,10 @@ pub(super) fn prepare_write(
         },
     };
 
-    // Chemin LINÉAIRE (#26/#34/#37, ADR 0085) : TOUTES les familles passent par
+    // Chemin LINÉAIRE : TOUTES les familles passent par
     // `Decision::from_source_fields` (le format a déjà été validé ci-dessus en
-    // bâtissant `source_fields`). Chunking + extraction tournent ainsi sur la
-    // représentation canonique unique, identique à l'aval (re-extract, rendu) —
-    // parité prouvée à 0 écart (`bench extract-fields-parity`, toutes familles).
+    // bâtissant `source_fields`). Chunking et extraction tournent ainsi sur la
+    // représentation canonique unique, identique à l'aval (re-extract, rendu).
     let decision = Decision::from_source_fields(
         &candidate.decision.texte_integral_clean,
         &source_fields,
@@ -226,10 +222,10 @@ pub(super) fn prepare_write(
         return Ok(None);
     }
 
-    // Chunking en mode char (tokenizer=None) : chemin nominal (rapide, sans
-    // tokenizer). Si l'heuristique chars/token sous-estime et qu'un chunk dépasse
-    // le contexte de l'embedder, `embed_writes` re-chunke ce batch en BPE exact
-    // (`rechunk_bpe`) et ré-essaie.
+    // Chunking en mode char (tokenizer=None) : chemin nominal, sans tokenizer. Si
+    // l'heuristique chars/token sous-estime et qu'un chunk dépasse le contexte de
+    // l'embedder, `embed_prepared` re-chunke ce batch en BPE exact (`rechunk_bpe`) et
+    // ré-essaie.
     let chunks = chunk_char(
         cleaned,
         &decision.metadata_header,
@@ -241,22 +237,6 @@ pub(super) fn prepare_write(
     )
     .map_err(|e| anyhow!("chunk_char {source_uid}: {e}"))?;
 
-    // Champs structurés : préconstruits par le parser pour les fonds scrapés hors
-    // nomenclature opendata/Judilibre (CNDA, ADR 0096 — `extract::routed` ne route
-    // que les 7 ordres FR), sinon dérivés via l'extracteur routé (sur la `Decision`
-    // canonique du chemin linéaire pour opendata/Judilibre).
-    let extracted = match candidate.prebuilt_extracted.clone() {
-        Some(fields) => fields,
-        None => lj_ingest::extract::extracted_fields(
-            &decision,
-            &ctx.link,
-            &ctx.vocab,
-            &ctx.chrono,
-            &ctx.jur_labels,
-        )
-        .map_err(|e| anyhow!("extract {source_uid}: {e}"))?,
-    };
-
     Ok(Some(PreparedDecision {
         decision_id: candidate.decision_id,
         public_id: candidate.public_id,
@@ -265,9 +245,38 @@ pub(super) fn prepare_write(
         write_mode: candidate.write_mode,
         chunks,
         payload_format: candidate.payload_format,
-        extracted: Some(extracted),
+        extracted: None,
+        prebuilt_extracted: candidate.prebuilt_extracted,
         source_fields,
     }))
+}
+
+/// Extraction structurée d'un préparé : l'extracteur routé tourne pour TOUTES les
+/// familles, sur la `Decision` canonique du chemin linéaire — même entrée que le
+/// reextract. Un parser source qui a préconstruit des champs de grain source
+/// (CNDA : solution du dispositif ; ArianeWeb : dates/dossiers de la fiche) les
+/// superpose au résultat via `merge_prebuilt` — l'extraction fournit le reste
+/// (citations, domaine, instruments, parties…).
+pub(super) fn extract_write(
+    mut prepared: PreparedDecision,
+    ctx: &super::ExtractCtx,
+) -> Result<PreparedDecision> {
+    if prepared.write_mode == WriteMode::SourceXmlOnly {
+        return Ok(prepared);
+    }
+    let full = lj_ingest::extract::extracted_fields(
+        &prepared.decision,
+        &ctx.link,
+        &ctx.vocab,
+        &ctx.chrono,
+        &ctx.jur_labels,
+    )
+    .map_err(|e| anyhow!("extract {}: {e}", prepared.decision.source_uid))?;
+    prepared.extracted = Some(match prepared.prebuilt_extracted.take() {
+        Some(pre) => lj_ingest::extract::merge_prebuilt(pre, full),
+        None => full,
+    });
+    Ok(prepared)
 }
 
 #[cfg(test)]
@@ -275,8 +284,6 @@ mod tests {
     use super::*;
     use crate::pipeline::tests_support::test_decision;
 
-    // Spec : triage MISSING_HASH — nouveau survit, hash identique skip,
-    // hash différent → update, dédup intra-batch last-wins.
     #[test]
     fn triage_skips_unchanged_and_updates_changed() {
         fn cand(uid: &str, checksum: &str) -> Candidate {
@@ -316,11 +323,7 @@ mod tests {
             },
         );
 
-        let candidates = vec![
-            cand("a", "h1"),  // identique → skip
-            cand("b", "new"), // changé → update (decision_id = 2)
-            cand("c", "h3"),  // nouveau → survit
-        ];
+        let candidates = vec![cand("a", "h1"), cand("b", "new"), cand("c", "h3")];
         let (survivors, skipped, deduped) =
             triage_candidates(candidates, &existing, false, IngestMode::MissingHash);
         assert_eq!(skipped, 1);
@@ -360,8 +363,6 @@ mod tests {
         assert_eq!(survivors[0].content_checksum, "h2");
     }
 
-    // Spec mode ALL : hash identique → UPDATE complet forcé (pas de skip),
-    // decision_id repris de l'existant, write_mode FULL.
     #[test]
     fn triage_all_mode_forces_full_update_ignoring_hash() {
         fn cand(uid: &str, checksum: &str) -> Candidate {
@@ -389,7 +390,6 @@ mod tests {
                 public_id: Some("pa".to_string()),
             },
         );
-        // Hash identique : skippé en MISSING_HASH, mais re-traité en ALL.
         let candidates = vec![cand("a", "same")];
         let (survivors, skipped, _) =
             triage_candidates(candidates, &existing, false, IngestMode::All);

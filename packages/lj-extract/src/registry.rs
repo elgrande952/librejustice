@@ -1,10 +1,6 @@
-//! Registre de parties (ADR 0175 V0, ontologie ADR 0180) : le point de
-//! convergence des moissons NER. Une entité = (valeur, côté, qualité) ; les
-//! champs plats (`companies`, `counsel`, `intervenors`) sont des projections
-//! [`PartyRegistry::view`]. V0 réindexe les moissons par gabarit telles
-//! quelles ; les vagues V1+ (fusion de coréférences, côté par force,
-//! résolution vers les référentiels ADR 0179) réécrivent la construction
-//! sans toucher les consommateurs.
+//! Registre de parties : le point de convergence des moissons NER. Une entité
+//! = (valeur, côté, qualité) ; les champs plats (`companies`, `counsel`,
+//! `intervenors`) sont des projections [`PartyRegistry::view`].
 
 /// Côté procédural, normalisé par degré (appelant→demandeur…).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,8 +9,7 @@ pub enum Side {
     Defendant,
 }
 
-/// Qualité de l'entité dans l'instance (axe Rôle de l'ontologie 0180,
-/// restreint aux cellules émises aujourd'hui).
+/// Qualité de l'entité dans l'instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Quality {
     /// Partie personne morale.
@@ -23,7 +18,7 @@ pub enum Quality {
     LawFirm,
     /// Avocat nommé.
     CounselName,
-    /// Intervenant (côté optionnel, structurellement `None` en V0).
+    /// Intervenant.
     Intervenor,
 }
 
@@ -35,8 +30,7 @@ pub struct Entity {
     pub quality: Quality,
 }
 
-/// Registre par document, mémoïsé sur `DocScan` — construit UNE fois, servi
-/// à tous les champs.
+/// Registre par document, mémoïsé sur `DocScan`.
 #[derive(Debug, Clone, Default)]
 pub struct PartyRegistry {
     pub entities: Vec<Entity>,

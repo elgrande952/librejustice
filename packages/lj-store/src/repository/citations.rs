@@ -1,35 +1,40 @@
-//! Citations à plat (ADR 0145) : une occurrence = une ligne `legal_citation`
+//! Citations à plat : une occurrence = une ligne `legal_citation`
 //! `(decision_id, char_start, char_end, ref_text_uid, ref_num_key,
 //! extract_version)`, écrite déjà liée par le linker in-pass de l'ingest.
 //! `ref_text_uid IS NULL` = non lié ; aucun état de résolution ni override en
-//! base — une correction de masse est un commit dans le code/TSV du linker,
-//! rejoué par la passe intégrale hebdomadaire.
+//! base.
 //!
 //! Écriture par décision / en bulk (skip-diff des sets inchangés), recompute
-//! des arrays dénormalisés de facettes (migration 0098), et lectures du
-//! `LinkSnapshot` (catalogue textes + articles).
+//! des arrays dénormalisés de facettes, et lectures du `LinkSnapshot`
+//! (catalogue textes + articles).
 
 use std::collections::{HashMap, HashSet};
 
-use super::types::CitationOccurrenceRow;
+use chrono::NaiveDate;
+
+use super::types::{CitationOccurrenceRow, CitingDecisionRow};
 use super::DecisionRepository;
 use crate::error::{Result, StoreError};
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::types::Type;
+use tokio_postgres::types::{ToSql, Type};
+
+use super::referential::CITING_RECENCY_WALK_MIN_COUNT;
 
 /// Item d'écriture bulk : `(decision_id, occurrences)`. `None` = extraction
 /// sans couche citations (écrit un set vide).
 pub type CitationWriteItem = (i64, Option<Vec<CitationOccurrenceRow>>);
 
-/// Arrays de facettes d'une décision depuis ses occurrences (migration 0098) :
+/// Arrays de facettes d'une décision depuis ses occurrences :
 /// `legal_instruments` = `ref_text_uid` distincts, `legal_article_composite` =
 /// `uid|num_key` distincts — `None` (SQL NULL) si vide, comme l'`ARRAY_AGG …
-/// FILTER` des fonctions de resync. Tri bytewise = `COLLATE "C"` (0109).
-/// Les occurrences `suivants` liées apportent leur famille (ADR 0226) via
-/// `families` — la même `_suivants_family_keys` que les fonctions de resync.
+/// FILTER` des fonctions de resync. Tri bytewise = `COLLATE "C"`.
+/// Les occurrences `suivants` liées apportent leur famille via `families` — la
+/// même `_suivants_family_keys` que les fonctions de resync, datée à `date` (la
+/// date de lecture de la décision).
 fn citation_facet_arrays(
     rows: &[CitationOccurrenceRow],
-    families: &HashMap<(String, String), Vec<String>>,
+    families: &HashMap<(String, String, NaiveDate), Vec<String>>,
+    date: NaiveDate,
 ) -> (Option<Vec<String>>, Option<Vec<String>>) {
     let mut instruments: Vec<String> = rows.iter().filter_map(|o| o.ref_text_uid.clone()).collect();
     instruments.sort_unstable();
@@ -42,7 +47,7 @@ fn citation_facet_arrays(
             };
             let mut keys = vec![format!("{uid}|{num}")];
             if o.suivants {
-                if let Some(fam) = families.get(&(uid.to_string(), num.to_string())) {
+                if let Some(fam) = families.get(&(uid.to_string(), num.to_string(), date)) {
                     keys.extend(fam.iter().map(|k| format!("{uid}|{k}")));
                 }
             }
@@ -58,73 +63,10 @@ fn citation_facet_arrays(
 }
 /// Empreinte d'une occurrence pour le skip-diff : `(char_start, char_end,
 /// ref_text_uid, ref_num_key, suivants)` — les éléments positionnels du blob
-/// `spans` (ADR 0247 ; ADR 0226 — le signal famille).
+/// `spans`.
 type OccurrenceFingerprint = (i32, i32, Option<String>, Option<String>, bool);
 
 impl DecisionRepository<'_> {
-    /// Paires `(text_uid, clé d'article)` de la denylist procédurale
-    /// (`lj_core::procedural`) résolues contre le catalogue. Depuis
-    /// l'ADR 0250 les citations procédurales SE STOCKENT ; ne sert plus que
-    /// la purge one-shot inverse (`purge-procedural-citations`), conservée
-    /// jusqu'à validation du backfill puis supprimée.
-    pub async fn procedural_ref_pairs(&self) -> Result<HashSet<(String, String)>> {
-        let slugs: Vec<&str> = lj_core::procedural::PROCEDURAL_ARTICLE_DENYLIST
-            .iter()
-            .map(|(s, _)| *s)
-            .collect();
-        let rows = self
-            .conn
-            .query(
-                "SELECT slug, text_uid FROM legal_text WHERE slug = ANY($1)",
-                &[&slugs],
-            )
-            .await?;
-        let uid_by_slug: HashMap<String, String> = rows
-            .into_iter()
-            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
-            .collect();
-        let mut pairs = HashSet::new();
-        for (slug, keys) in lj_core::procedural::PROCEDURAL_ARTICLE_DENYLIST {
-            if let Some(uid) = uid_by_slug.get(*slug) {
-                for key in *keys {
-                    pairs.insert((uid.clone(), key.to_string()));
-                }
-            }
-        }
-        Ok(pairs)
-    }
-
-    /// Supprime du stock les occurrences liées vers la denylist procédurale
-    /// (purge one-shot ADR 0211). Une paire à la fois — chaque passe cible
-    /// les blobs porteurs via le GIN `lj_cit_terms` (ADR 0247) et retranche
-    /// les spans visés ; les blobs vidés sont supprimés en fin de purge.
-    /// Renvoie le nombre de décisions réécrites.
-    pub async fn delete_procedural_citations(
-        &self,
-        pairs: &HashSet<(String, String)>,
-    ) -> Result<u64> {
-        let mut total = 0u64;
-        for (uid, key) in pairs {
-            total += self
-                .conn
-                .execute(
-                    "UPDATE legal_citation lc
-                     SET spans = (
-                         SELECT coalesce(jsonb_agg(s.el ORDER BY s.i), '[]'::jsonb)
-                         FROM jsonb_array_elements(lc.spans) WITH ORDINALITY AS s(el, i)
-                         WHERE s.el->>2 IS DISTINCT FROM $1
-                            OR s.el->>3 IS DISTINCT FROM $2)
-                     WHERE public.lj_cit_terms(lc.spans) @> ARRAY[$1 || '|' || $2]",
-                    &[uid, key],
-                )
-                .await?;
-        }
-        self.conn
-            .execute("DELETE FROM legal_citation WHERE spans = '[]'::jsonb", &[])
-            .await?;
-        Ok(total)
-    }
-
     /// (Ré)écrit la couche citations d'UNE décision — sucre sur
     /// [`Self::replace_citations_bulk`], l'unique chemin d'écriture recognizer
     /// (garde jamais-dégrader, skip-diff, séquence write → sync).
@@ -132,25 +74,25 @@ impl DecisionRepository<'_> {
         &self,
         decision_id: i64,
         occurrences: Option<&[CitationOccurrenceRow]>,
-    ) -> Result<()> {
+    ) -> Result<Vec<i64>> {
         self.replace_citations_bulk(&[(decision_id, occurrences.map(<[_]>::to_vec))])
             .await
     }
 
-    /// Écrit la couche citations d'un lot de décisions (ADR 0145) : garde
-    /// jamais-dégrader (une décision à version > `EXTRACT_VERSION` — révision
-    /// manuelle — n'est jamais remplacée par le recognizer), skip
-    /// côté Rust des décisions au set d'occurrences inchangé, puis DELETE +
-    /// COPY dans `legal_citation` et recompute des arrays de facettes (dans
-    /// cet ordre — les arrays dérivent de `legal_citation`, migration 0098).
-    /// Idempotent.
+    /// Écrit la couche citations d'un lot de décisions : garde jamais-dégrader
+    /// (une décision à version > `EXTRACT_VERSION` — révision manuelle — n'est
+    /// jamais remplacée par le recognizer), skip côté Rust des décisions au set
+    /// d'occurrences inchangé, puis DELETE + COPY dans `legal_citation` et
+    /// recompute des arrays de facettes (dans cet ordre — les arrays dérivent de
+    /// `legal_citation`). Idempotent. Rend les décisions RÉELLEMENT réécrites, pour
+    /// que l'appelant date leur page du jour.
     #[tracing::instrument(name = "db.replace_citations_bulk", skip(self, items), fields(db.system = "postgresql", items = items.len()))]
-    pub async fn replace_citations_bulk(&self, items: &[CitationWriteItem]) -> Result<()> {
+    pub async fn replace_citations_bulk(&self, items: &[CitationWriteItem]) -> Result<Vec<i64>> {
         if items.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // Invariant : jamais remplacer la couche citations d'une décision à
-        // version > EXTRACT_VERSION (révision manuelle, ADR 0140/0141).
+        // version > EXTRACT_VERSION (révision manuelle).
         let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
         let protected: HashSet<i64> = self
             .conn
@@ -165,24 +107,24 @@ impl DecisionRepository<'_> {
         let mut items = self.filter_unchanged_citations(items).await?;
         items.retain(|(id, _)| !protected.contains(id));
         if items.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let changed: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
         let v9_items: Vec<(i64, &[CitationOccurrenceRow])> = items
             .iter()
             .map(|(id, occ)| (*id, occ.as_deref().unwrap_or(&[])))
             .collect();
         self.write_citation_occurrences(&v9_items, lj_core::EXTRACT_VERSION)
-            .await
+            .await?;
+        Ok(changed)
     }
 
     /// Sous-ensemble des items à réécrire (skip-diff du re-extract). Une décision
     /// est « changée » si son set d'occurrences `(char_start, char_end,
     /// ref_text_uid, ref_num_key)` diffère des lignes `legal_citation` à
-    /// version ≤ courante de la DB — spans EUX-MÊMES comparés, pas seulement
-    /// les cibles : une
-    /// refonte du recognizer qui redistribue les offsets sans changer les
-    /// cibles serait skippée à tort. Converge : après réécriture, l'empreinte
-    /// DB == l'empreinte extraite → ne re-déclenche pas.
+    /// version ≤ courante de la DB — spans EUX-MÊMES comparés, pas seulement les
+    /// cibles. Converge : après réécriture, l'empreinte DB == l'empreinte extraite
+    /// → ne re-déclenche pas.
     pub(super) async fn filter_unchanged_citations(
         &self,
         items: &[CitationWriteItem],
@@ -240,27 +182,24 @@ impl DecisionRepository<'_> {
 
     /// Recalcule les arrays de facettes (`legal_instruments`,
     /// `legal_article_composite` sur `decisions` et `decision_chunks`) des
-    /// décisions passées, depuis leurs arêtes fraîchement réécrites. Remplace
-    /// les triggers 0076 (droppés en 0096, alternative re-confrontée et
-    /// écartée par l'ADR 0147) : appelé par [`Self::write_citation_occurrences`]
-    /// dans le même flux d'écriture. Les agrégats DISTINCT se calculent en
-    /// Rust depuis les occurrences déjà en mémoire (tri bytewise = COLLATE
-    /// "C", même ordre que les fonctions SQL de resync, migration 0109) — la
-    /// version SQL relisait `legal_citation` à peine écrite (~250 ms/lot de
-    /// 256 au profil reextract). Les UPDATE gardent `IS DISTINCT FROM` (zéro
-    /// churn si rien ne change — l'index vectoriel des chunks coûte cher).
+    /// décisions passées, depuis leurs arêtes fraîchement réécrites. Appelé par
+    /// [`Self::write_citation_occurrences`] dans le même flux d'écriture. Les
+    /// agrégats DISTINCT se calculent en Rust depuis les occurrences déjà en
+    /// mémoire (tri bytewise = COLLATE "C", même ordre que les fonctions SQL de
+    /// resync). Les UPDATE gardent `IS DISTINCT FROM` (zéro churn si rien ne
+    /// change).
     async fn sync_citation_facet_arrays(
         &self,
         items: &[(i64, &[CitationOccurrenceRow])],
     ) -> Result<()> {
-        let families = self
-            .suivants_families(items.iter().flat_map(|(_, rows)| rows.iter()))
-            .await?;
+        let dates = self.reading_dates(items).await?;
+        let families = self.suivants_families(items, &dates).await?;
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> =
             Vec::with_capacity(items.len() * 3);
         let mut value_rows: Vec<String> = Vec::with_capacity(items.len());
         for (pos, (decision_id, rows)) in items.iter().enumerate() {
-            let (instruments, composite) = citation_facet_arrays(rows, &families);
+            let (instruments, composite) =
+                citation_facet_arrays(rows, &families, dates[decision_id]);
             let base = pos * 3;
             if pos == 0 {
                 value_rows.push(format!(
@@ -312,22 +251,19 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Écrit la couche citations d'un lot de décisions (ADR 0145/0247) :
-    /// DELETE des blobs existants, **COPY binaire** d'une ligne jsonb par
-    /// décision porteuse dans `legal_citation`, puis
-    /// recompute des arrays de facettes dérivés — la paire write → sync est
-    /// scellée ICI et nulle part ailleurs (ADR 0147 : elle a cassé deux fois
-    /// quand elle était répétée chez les appelants). **La transaction
-    /// appartient à l'appelant** (mod.rs : le pipeline enveloppe ses
-    /// batches) — aucun BEGIN/COMMIT ici : un COMMIT imbriqué commiterait la
-    /// transaction externe prématurément et désatomiserait write ↔ sync.
-    /// `extract_version` = `EXTRACT_VERSION` (recognizer, jamais appelé sur
-    /// une décision à version supérieure — garde décision-niveau amont) ou
-    /// toute version explicite (`replace_citations_at_version`, remplace
-    /// tout). Asserts durs à
-    /// l'entrée (tri strict par `char_start`, zéro chevauchement, `char_end >
-    /// char_start`, `ref_num_key ⇒ ref_text_uid`) — l'amont les garantit, une
-    /// violation ici est un bug (règle #12, pas de rattrapage silencieux).
+    /// Écrit la couche citations d'un lot de décisions : DELETE des blobs
+    /// existants, **COPY binaire** d'une ligne jsonb par décision porteuse dans
+    /// `legal_citation`, puis recompute des arrays de facettes dérivés — la paire
+    /// write → sync est scellée ICI et nulle part ailleurs. **La transaction
+    /// appartient à l'appelant** (mod.rs : le pipeline enveloppe ses batches) —
+    /// aucun BEGIN/COMMIT ici : un COMMIT imbriqué commiterait la transaction
+    /// externe prématurément et désatomiserait write ↔ sync. `extract_version` =
+    /// `EXTRACT_VERSION` (recognizer, jamais appelé sur une décision à version
+    /// supérieure — garde décision-niveau amont) ou toute version explicite
+    /// (`replace_citations_at_version`, remplace tout). Asserts durs à l'entrée
+    /// (tri strict par `char_start`, zéro chevauchement, `char_end > char_start`,
+    /// `ref_num_key ⇒ ref_text_uid`) — l'amont les garantit, une violation ici est
+    /// un bug.
     pub(super) async fn write_citation_occurrences(
         &self,
         items: &[(i64, &[CitationOccurrenceRow])],
@@ -402,54 +338,90 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Familles « et suivants » (ADR 0226) des occurrences liées porteuses du
-    /// signal : une entrée `(uid, num_key) → num_keys` par ancre expansable —
-    /// `_suivants_family_keys` (migrations 0149/0151, alphabet public partout)
-    /// porte les garde-fous (section unique, VIGUEUR, cap 20 ; NULL sinon) et
-    /// reste la source partagée avec les fonctions de resync. Zéro requête
-    /// quand aucun span `suivants`.
-    async fn suivants_families<'a>(
+    /// Date de lecture des décisions du lot, `CURRENT_DATE` à défaut : la borne
+    /// qui date les familles « et suivants ». Lecture par PK.
+    async fn reading_dates(
         &self,
-        rows: impl Iterator<Item = &'a CitationOccurrenceRow>,
-    ) -> Result<HashMap<(String, String), Vec<String>>> {
-        let mut pairs: Vec<(String, String)> = rows
-            .filter(|o| o.suivants)
-            .filter_map(|o| Some((o.ref_text_uid.clone()?, o.ref_num_key.clone()?)))
-            .collect();
-        pairs.sort_unstable();
-        pairs.dedup();
-        if pairs.is_empty() {
+        items: &[(i64, &[CitationOccurrenceRow])],
+    ) -> Result<HashMap<i64, NaiveDate>> {
+        let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
+        Ok(self
+            .conn
+            .query(
+                "SELECT id, coalesce(date_lecture, CURRENT_DATE) \
+                 FROM decisions WHERE id = ANY($1)",
+                &[&ids],
+            )
+            .await?
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect())
+    }
+
+    /// Familles « et suivants » des occurrences liées porteuses du signal : une
+    /// entrée `(uid, num_key, date) → num_keys` par ancre expansable —
+    /// `_suivants_family_keys` porte les garde-fous (section unique, arête en
+    /// vigueur à la date, cap 20 ; NULL sinon) et reste la source partagée avec
+    /// les fonctions de resync. La date entre dans la clé : deux décisions de
+    /// dates différentes citant la même ancre n'ont pas la même famille. Zéro
+    /// requête quand aucun span `suivants`.
+    async fn suivants_families(
+        &self,
+        items: &[(i64, &[CitationOccurrenceRow])],
+        dates: &HashMap<i64, NaiveDate>,
+    ) -> Result<HashMap<(String, String, NaiveDate), Vec<String>>> {
+        let mut triples: Vec<(String, String, NaiveDate)> = Vec::new();
+        for (decision_id, rows) in items {
+            let date = *dates.get(decision_id).ok_or_else(|| {
+                StoreError::Invalid(format!("décision {decision_id} absente de `decisions`"))
+            })?;
+            triples.extend(
+                rows.iter()
+                    .filter(|o| o.suivants)
+                    .filter_map(|o| Some((o.ref_text_uid.clone()?, o.ref_num_key.clone()?, date))),
+            );
+        }
+        triples.sort_unstable();
+        triples.dedup();
+        if triples.is_empty() {
             return Ok(HashMap::new());
         }
-        let (uids, nums): (Vec<String>, Vec<String>) = pairs.into_iter().unzip();
+        let mut uids: Vec<String> = Vec::with_capacity(triples.len());
+        let mut nums: Vec<String> = Vec::with_capacity(triples.len());
+        let mut days: Vec<NaiveDate> = Vec::with_capacity(triples.len());
+        for (uid, num, date) in triples {
+            uids.push(uid);
+            nums.push(num);
+            days.push(date);
+        }
         let rows = self
             .conn
             .query(
-                "SELECT p.uid, p.num, _suivants_family_keys(p.uid, p.num) \
-                 FROM unnest($1::text[], $2::text[]) AS p(uid, num)",
-                &[&uids, &nums],
+                "SELECT p.uid, p.num, p.d, _suivants_family_keys(p.uid, p.num, p.d) \
+                 FROM unnest($1::text[], $2::text[], $3::date[]) AS p(uid, num, d)",
+                &[&uids, &nums, &days],
             )
             .await?;
         Ok(rows
             .into_iter()
             .filter_map(|r| {
-                let fam: Option<Vec<String>> = r.get(2);
-                Some(((r.get(0), r.get(1)), fam?))
+                let fam: Option<Vec<String>> = r.get(3);
+                Some(((r.get(0), r.get(1), r.get(2)), fam?))
             })
             .collect())
     }
 
     /// Slashnums UE (année/séquence) **cités mais absents** du catalogue, pour piloter
-    /// l'ingestion EUR-Lex (ADR 0138). Renvoie `(nature, slashnum, edges)` où `nature ∈
+    /// l'ingestion EUR-Lex. Renvoie `(nature, slashnum, edges)` où `nature ∈
     /// {reglement, directive}`, trié par mentions décroissantes (une ligne
     /// `legal_citation` non liée = une mention). « Absent » = aucun `legal_text` de
     /// la nature correspondante dont le `title` porte ce slashnum. Lecture seule.
     #[tracing::instrument(name = "db.cited_eu_slashnums_missing", skip(self), fields(db.system = "postgresql"))]
     pub async fn cited_eu_slashnums_missing(&self) -> Result<Vec<(String, String, i64)>> {
-        // ADR 0145 : les clés de capture ne sont plus stockées — la forme citée se
-        // retranche de `full_text` par les spans **non liés** de `legal_citation`
-        // (offsets codepoints 0143 = sémantique caractère de `substring`). Scan
-        // lourd (détoaste chaque décision porteuse) : commande manuelle rare.
+        // Les clés de capture ne sont pas stockées — la forme citée se retranche de
+        // `full_text` par les spans **non liés** de `legal_citation` (offsets
+        // codepoints = sémantique caractère de `substring`). Scan lourd (détoaste
+        // chaque décision porteuse) : commande manuelle rare.
         let rows = self
             .conn
             .query(
@@ -495,11 +467,16 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Lignes `legal_text` pour hydrater le `LinkSnapshot` du linker in-pass
-    /// (ADR 0145). Tuples plats — `lj-store` ne tire pas `lj-extract` (ADR
-    /// 0123 §3), la conversion vers `CatalogText` vit chez l'appelant :
+    /// Lignes `legal_text` pour hydrater le `LinkSnapshot` du linker in-pass.
+    /// Tuples plats, la conversion vers `CatalogText` vit chez l'appelant :
     /// `(text_uid, title, title_key, nature, jurisdiction, num_prefix_agnostic,
     /// n_vigueur)`.
+    ///
+    /// L'agrégat `legal_text × legal_article` scanne toute `legal_article`
+    /// (lignes larges) et dépasse le `statement_timeout` du pool (30 s) à froid
+    /// sur le corpus de prod : levé localement dans une transaction dédiée (même
+    /// pattern que `iter_entities_for_sitemap`). Chargement one-shot d'ingest, pas
+    /// de chemin requête utilisateur.
     #[allow(clippy::type_complexity)]
     #[tracing::instrument(name = "db.link_catalog_texts", skip(self), fields(db.system = "postgresql"))]
     pub async fn link_catalog_texts(
@@ -517,37 +494,57 @@ impl DecisionRepository<'_> {
             Option<String>,
         )>,
     > {
-        let rows = self
-            .conn
-            .query(
-                "SELECT t.text_uid, coalesce(t.title, ''), coalesce(t.title_key, ''),
-                        coalesce(t.nature, ''), t.jurisdiction,
-                        coalesce(t.num_prefix_agnostic, false),
-                        count(a.*) FILTER (WHERE a.status = 'VIGUEUR'),
-                        t.date_texte::text, t.nor
-                 FROM legal_text t
-                 LEFT JOIN legal_article a ON a.text_uid = t.text_uid
-                 GROUP BY t.text_uid, t.title, t.title_key, t.nature, t.jurisdiction,
-                          t.num_prefix_agnostic, t.date_texte, t.nor",
-                &[],
-            )
-            .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.get(0),
-                    r.get(1),
-                    r.get(2),
-                    r.get(3),
-                    r.get(4),
-                    r.get(5),
-                    r.get(6),
-                    r.get(7),
-                    r.get(8),
+        self.conn.batch_execute("BEGIN").await?;
+        let result: Result<Vec<_>> = async {
+            self.conn
+                .batch_execute("SET LOCAL statement_timeout = 0")
+                .await?;
+            let (valid_a, norm_a) = (
+                super::referential::article_valid_now("a"),
+                super::referential::article_is_norm("a"),
+            );
+            let rows = self
+                .conn
+                .query(
+                    &format!(
+                        "SELECT t.text_uid, coalesce(t.title, ''), coalesce(t.title_key, ''),
+                            coalesce(t.nature, ''), t.jurisdiction,
+                            coalesce(t.num_prefix_agnostic, false),
+                            count(a.*) FILTER (WHERE {valid_a} AND {norm_a}),
+                            t.date_texte::text, t.nor
+                     FROM legal_text t
+                     LEFT JOIN legal_article a ON a.text_uid = t.text_uid
+                     GROUP BY t.text_uid, t.title, t.title_key, t.nature, t.jurisdiction,
+                              t.num_prefix_agnostic, t.date_texte, t.nor"
+                    ),
+                    &[],
                 )
-            })
-            .collect())
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|r| {
+                    (
+                        r.get(0),
+                        r.get(1),
+                        r.get(2),
+                        r.get(3),
+                        r.get(4),
+                        r.get(5),
+                        r.get(6),
+                        r.get(7),
+                        r.get(8),
+                    )
+                })
+                .collect())
+        }
+        .await;
+        match &result {
+            Ok(_) => self.conn.batch_execute("COMMIT").await?,
+            Err(_) => {
+                let _ = self.conn.batch_execute("ROLLBACK").await;
+            }
+        }
+        result
     }
 
     /// Paires `(text_uid, num_key)` distinctes du catalogue d'articles —
@@ -562,13 +559,12 @@ impl DecisionRepository<'_> {
     }
 
     /// Recompute les arrays dénormalisés (`legal_instruments`/`legal_article_composite`,
-    /// décision ET chunks) pour les `decision_id ∈ [lo, hi)` depuis `legal_citation`
-    /// (migration 0098). Appelle les fonctions SQL `_sync_*_legal_instruments_for`
-    /// (garde IS DISTINCT FROM : ne réécrit que les rows changés → pas de ré-index
-    /// BM25 global). Lots autocommit hors transaction géante. Renvoie les comptes
-    /// de lignes corrigées `(decisions, chunks)` (migration 0101) — la dérive :
-    /// l'écrivain tenant write → sync atomiques, un compte non nul est le signal
-    /// d'un bug d'écrivain (ADR 0147).
+    /// décision ET chunks) pour les `decision_id ∈ [lo, hi)` depuis `legal_citation`.
+    /// Appelle les fonctions SQL `_sync_*_legal_instruments_for` (garde IS DISTINCT
+    /// FROM : ne réécrit que les rows changés → pas de ré-index BM25 global). Lots
+    /// autocommit hors transaction géante. Renvoie les comptes de lignes corrigées
+    /// `(decisions, chunks)` — la dérive : l'écrivain tenant write → sync atomiques,
+    /// un compte non nul est le signal d'un bug d'écrivain.
     #[tracing::instrument(name = "db.resync_legal_arrays_range", skip(self), fields(db.system = "postgresql"))]
     pub async fn resync_legal_arrays_range(&self, lo: i64, hi: i64) -> Result<(i64, i64)> {
         let d: i64 = self
@@ -592,12 +588,11 @@ impl DecisionRepository<'_> {
         Ok((d, c))
     }
 
-    /// Rebuild intégral de `citing_decision_counts` (ADR 0250) : décomptes de
-    /// décisions citantes par terme cité (alphabet `lj_cit_terms` — `uid` ou
-    /// `uid|num`). Une seule instruction (CTE modifiantes, même snapshot) :
-    /// upsert des termes recomptés + suppression des termes disparus, garde
-    /// `<>` pour ne réécrire que les décomptes changés. Hebdomadaire
-    /// (`resync-legal-arrays`), ~2-4 min. Renvoie le nombre de termes upsertés.
+    /// Rebuild intégral de `citing_decision_counts` : décomptes de décisions
+    /// citantes par terme cité (alphabet `lj_cit_terms` — `uid` ou `uid|num`). Une
+    /// seule instruction (CTE modifiantes, même snapshot) : upsert des termes
+    /// recomptés + suppression des termes disparus, garde `<>` pour ne réécrire
+    /// que les décomptes changés. Renvoie le nombre de termes upsertés.
     #[tracing::instrument(name = "db.rebuild_citing_decision_counts", skip(self), fields(db.system = "postgresql"))]
     pub async fn rebuild_citing_decision_counts(&self) -> Result<u64> {
         let n = self
@@ -624,6 +619,267 @@ impl DecisionRepository<'_> {
             )
             .await?;
         Ok(n)
+    }
+
+    /// Décomptes de décisions citantes d'un ensemble d'articles d'un même texte
+    /// (`citing_decision_counts` — clé `text_uid || '|' || num_key`), rendus
+    /// **triés par décompte décroissant** (`num_key` en second pour un ordre total,
+    /// donc un palmarès stable à décomptes égaux). Les articles sans décompte sont
+    /// absents : aucun décompte = aucune décision citante.
+    #[tracing::instrument(name = "db.citing_counts_for_articles", skip(self, num_keys), fields(db.system = "postgresql", keys = num_keys.len()))]
+    pub async fn citing_counts_for_articles(
+        &self,
+        text_uid: &str,
+        num_keys: &[String],
+    ) -> Result<Vec<(String, i64)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT k.num_key, c.decision_count \
+                 FROM unnest($2::text[]) AS k(num_key) \
+                 JOIN citing_decision_counts c \
+                   ON c.cited_term = $1 || '|' || k.num_key \
+                 ORDER BY c.decision_count DESC, k.num_key",
+                &[&text_uid, &num_keys],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// Palmarès « articles les plus cités » d'un **texte entier** (colonne droite
+    /// de `/texte/{code}`) : `(num_key, numéro affichable, décompte)`, du plus cité
+    /// au moins cité.
+    ///
+    /// Le classement se lit dans `citing_decision_counts` seul — un scan de la
+    /// table de compteurs filtré au préfixe du texte, indépendant de la taille du
+    /// code. Le filtre est un `LIKE 'uid|%'` et non une borne d'intervalle :
+    /// l'ordre de la collation n'est pas l'ordre des octets, et `< 'uid}'` rend
+    /// zéro ligne.
+    ///
+    /// Les `candidates` premiers termes du palmarès sont ensuite joints à
+    /// `legal_article` pour leur numéro affichable, ce qui écarte les articles
+    /// disparus du texte — d'où un vivier plus large que le `limit` demandé.
+    #[tracing::instrument(name = "db.top_cited_articles", skip(self), fields(db.system = "postgresql"))]
+    pub async fn top_cited_articles(
+        &self,
+        text_uid: &str,
+        limit: i64,
+        candidates: i64,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let rows = self
+            .conn
+            .query(
+                "WITH top AS ( \
+                     SELECT substring(c.cited_term FROM length($1) + 2) AS num_key, \
+                            c.decision_count \
+                     FROM citing_decision_counts c \
+                     WHERE c.cited_term LIKE $1 || '|%' \
+                     ORDER BY c.decision_count DESC \
+                     LIMIT $3 \
+                 ), labelled AS ( \
+                     SELECT DISTINCT ON (t.num_key) t.num_key, a.num, t.decision_count \
+                     FROM top t \
+                     JOIN legal_article a \
+                       ON a.text_uid = $1 AND a.num_key = t.num_key \
+                     ORDER BY t.num_key, a.date_debut DESC \
+                 ) \
+                 SELECT num_key, num, decision_count FROM labelled \
+                 ORDER BY decision_count DESC, num_key \
+                 LIMIT $2",
+                &[&text_uid, &limit, &candidates],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
+    }
+
+    /// Textes citant **au moins `min_articles`** des articles `num_keys` d'un
+    /// texte — les textes citants d'une division, agrégés au grain du texte citant
+    /// et classés par nombre d'articles visés. Le texte lui-même est écarté : ses
+    /// renvois internes pointeraient la page qu'on lit.
+    ///
+    /// Lecture par le **côté cible** de l'arête (`idx_legal_link_target_art`), le
+    /// citant étant alors `owner_text_uid` — un uid, pas un libellé à découper.
+    /// DILA écrit les deux copies d'une citation ; celle-ci est la seule qui donne
+    /// le citant.
+    ///
+    /// `direction = 'outgoing'` = « le propriétaire cite la cible » : le fichier du
+    /// citant porte `sens=source`.
+    ///
+    /// Seul le verbe `cite` est agrégé : les modificatifs ont leur propre bloc sur
+    /// la page article.
+    ///
+    /// Titres résolus **après** le `LIMIT`, sur les seules lignes rendues.
+    #[tracing::instrument(name = "db.section_citing_texts", skip(self, num_keys), fields(db.system = "postgresql", keys = num_keys.len()))]
+    pub async fn section_citing_texts(
+        &self,
+        text_uid: &str,
+        num_keys: &[String],
+        min_articles: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, Option<String>, i64)>> {
+        let rows = self
+            .conn
+            .query(
+                "WITH citing AS ( \
+                     SELECT l.owner_text_uid AS uid, \
+                            count(DISTINCT l.target_num_key) AS articles \
+                     FROM legal_link l \
+                     WHERE l.target_text_uid = $1 AND l.target_num_key = ANY($2) \
+                       AND l.direction = 'outgoing' AND l.verb = 'cite' \
+                       AND l.owner_text_uid <> $1 \
+                     GROUP BY 1 \
+                     HAVING count(DISTINCT l.target_num_key) >= $3 \
+                     ORDER BY articles DESC, uid \
+                     LIMIT $4 \
+                 ) \
+                 SELECT t.title AS label, t.slug, c.articles \
+                 FROM citing c \
+                 JOIN legal_text t ON t.text_uid = c.uid \
+                 ORDER BY c.articles DESC, label",
+                &[&text_uid, &num_keys, &min_articles, &limit],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
+    }
+
+    /// Décisions citant **au moins un** des articles `num_keys` d'un texte — les
+    /// citantes d'une division, qui agrège son sous-arbre. Même forme de ligne,
+    /// même pagination et même tri que les citantes d'un article
+    /// ([`Self::law_decisions_citing`]) : portée d'abord, puis date décroissante.
+    ///
+    /// **Dédupliqué par construction** : `legal_citation` porte une ligne blob par
+    /// décision, donc une décision citant trois articles de la division sort une
+    /// fois — aucun `DISTINCT`, aucun tri supplémentaire. Ces trois articles
+    /// ressortent dans `cited_num_keys`, l'intersection du blob avec les termes
+    /// interrogés.
+    ///
+    /// Deux plans selon le volume d'union (somme des `citing_decision_counts`
+    /// des `num_keys`), même arbitrage que pour un article :
+    /// - union courante : bitmap GIN (`&&` = OR des postings, indexable) ;
+    /// - union ≥ [`CITING_RECENCY_WALK_MIN_COUNT`] : marche descendante de
+    ///   `idx_decisions_date_lecture` avec filtre d'appartenance sur le blob —
+    ///   récence seule (trier par portée exigerait de visiter tous les postings).
+    ///
+    /// Pas de fenêtre de validité : une division n'en a pas une, chacun de ses
+    /// articles a la sienne. La date de consultation choisit la *composition* du
+    /// sous-arbre (l'énumération des `num_key` est datée), pas la fenêtre des
+    /// décisions.
+    #[tracing::instrument(name = "db.law_decisions_citing_any", skip(self, num_keys), fields(db.system = "postgresql", keys = num_keys.len()))]
+    pub async fn law_decisions_citing_any(
+        &self,
+        text_uid: &str,
+        num_keys: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CitingDecisionRow>> {
+        let terms: Vec<String> = num_keys.iter().map(|k| format!("{text_uid}|{k}")).collect();
+        let citing_count: i64 = self
+            .conn
+            .query_one(
+                // `sum(bigint)` rend un `numeric` : la somme se relit en i64
+                // seulement castée (le décompte par article, lui, est bigint).
+                "SELECT coalesce(sum(decision_count), 0)::bigint FROM citing_decision_counts \
+                 WHERE cited_term = ANY($1)",
+                &[&terms],
+            )
+            .await?
+            .get(0);
+        let params: [&(dyn ToSql + Sync); 3] = [&terms, &limit, &offset];
+        let rows = if citing_count >= CITING_RECENCY_WALK_MIN_COUNT {
+            // Marche par récence : l'EXISTS sur le blob n'est PAS indexable
+            // (pas de `&&` sur l'expression GIN) — le planner ne peut que descendre
+            // l'index date, coût ≈ limit × N/df itérations, d'autant plus faible que
+            // l'union est large. `d.date_lecture IS NOT NULL` écarte les décisions sans
+            // date : le scan arrière de l'index sert l'ORDER BY sans tri de tête.
+            self.conn
+                .query(
+                    "
+                    SELECT d.id, d.public_id, d.jurisdiction_type,
+                           j.label, d.date_lecture::text, d.docket_numbers,
+                           d.publication_codes, d.summary,
+                           ARRAY(SELECT DISTINCT el->>3
+                                 FROM jsonb_array_elements(lc.spans) AS el
+                                 WHERE (el->>2) || '|' || (el->>3) = ANY($1))
+                    FROM decisions d
+                    JOIN legal_citation lc ON lc.decision_id = d.id
+                    LEFT JOIN jurisdiction j ON j.code = d.jurisdiction_code
+                    WHERE d.date_lecture IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM jsonb_array_elements(lc.spans) AS el
+                          WHERE (el->>2) || '|' || (el->>3) = ANY($1))
+                    ORDER BY d.date_lecture DESC, d.id
+                    LIMIT $2 OFFSET $3
+                    ",
+                    &params,
+                )
+                .await?
+        } else {
+            // Autorité d'abord : rang de portée dérivé de `publication_codes`
+            // (mêmes groupes que la facette, `lj_core::publication`), puis date
+            // décroissante. Les listes de codes sont des constantes du code — inlinées,
+            // pas des données.
+            let rank_expr = {
+                let arr = |group: &str| {
+                    let codes: Vec<String> = lj_core::publication::significance_codes(group)
+                        .iter()
+                        .map(|c| format!("'{c}'"))
+                        .collect();
+                    format!("ARRAY[{}]", codes.join(","))
+                };
+                format!(
+                    "CASE WHEN d.publication_codes && {maj} THEN 0 \
+                          WHEN d.publication_codes && {imp} THEN 1 \
+                          WHEN d.publication_codes && {lim} THEN 2 \
+                          ELSE 3 END",
+                    maj = arr("majeure"),
+                    imp = arr("importante"),
+                    lim = arr("limitee"),
+                )
+            };
+            self.conn
+                .query(
+                    &format!(
+                        "
+                        SELECT d.id, d.public_id, d.jurisdiction_type,
+                               j.label, d.date_lecture::text, d.docket_numbers,
+                               d.publication_codes, d.summary,
+                               ARRAY(SELECT DISTINCT split_part(t, '|', 2)
+                                     FROM unnest(public.lj_cit_terms(lc.spans)) t
+                                     WHERE t = ANY($1)),
+                               {rank_expr} AS significance_rank
+                        FROM legal_citation lc
+                        JOIN decisions d ON d.id = lc.decision_id
+                        LEFT JOIN jurisdiction j ON j.code = d.jurisdiction_code
+                        WHERE public.lj_cit_terms(lc.spans) && $1::text[]
+                        -- Texte ISO 'YYYY-MM-DD' → tri == chronologique.
+                        ORDER BY significance_rank, d.date_lecture::text DESC NULLS LAST, d.id
+                        LIMIT $2 OFFSET $3
+                        "
+                    ),
+                    &params,
+                )
+                .await?
+        };
+        Ok(rows
+            .iter()
+            .map(|r| CitingDecisionRow {
+                id: r.get(0),
+                public_id: r.get(1),
+                jurisdiction_type: r.get(2),
+                jurisdiction_name: r.get(3),
+                date_lecture: r.get(4),
+                docket_numbers: r.get(5),
+                publication_codes: r.get(6),
+                summary: r.get(7),
+                cited_num_keys: r.get(8),
+            })
+            .collect())
     }
 
     /// Métadonnées `legal_text` par lot d'uids : `title_key`, `slug` et numéro
@@ -660,10 +916,9 @@ impl DecisionRepository<'_> {
         Ok(lo.zip(hi))
     }
 
-    /// (Ré)écrit les renvois norme→article d'un TEXTE du référentiel
-    /// (ADR 0217) : DELETE + COPY au grain `owner_text_uid` (corps + toutes
-    /// ses versions d'articles d'un coup — la passe traite le texte entier).
-    /// Idempotent.
+    /// (Ré)écrit les renvois norme→article d'un TEXTE du référentiel : DELETE +
+    /// COPY au grain `owner_text_uid` (corps + toutes ses versions d'articles d'un
+    /// coup — la passe traite le texte entier). Idempotent.
     pub async fn replace_text_legal_citations(
         &self,
         owner_text_uid: &str,
@@ -719,9 +974,124 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Spans de renvoi de la version d'article servie (ADR 0217), triés par
-    /// `char_start`, joints au catalogue (slug/titre de la cible + gate
-    /// « le texte a des articles » pour la mention nue).
+    /// Oracle DILA des renvois article→article : ce que chaque propriétaire
+    /// DÉCLARE citer (`legal_link`, bloc `<LIENS>` de la source), au grain
+    /// (propriétaire, article, numéro cité). Sert à départager le CODE quand
+    /// l'extracteur hésite entre deux textes portant le même numéro — la source
+    /// sait de quel décret du même jour elle parle.
+    ///
+    /// Dédoublonné en SQL. Les clés citées par PLUSIEURS codes depuis le même
+    /// article sortent aussi, à l'appelant de constater l'ambiguïté et de
+    /// s'abstenir.
+    pub async fn declared_article_cites(&self) -> Result<Vec<(String, String, String, String)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT owner_text_uid, COALESCE(owner_num_key, ''), \
+                        target_num_key, target_text_uid \
+                 FROM legal_link \
+                 WHERE typelien = 'CITATION' AND verb = 'cite' \
+                   AND direction = 'outgoing' \
+                   AND target_text_uid IS NOT NULL \
+                   AND target_num_key IS NOT NULL AND target_num_key <> ''",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect())
+    }
+
+    /// Volet banc : couverture et accord de code des spans du corps face à
+    /// l'oracle des renvois déclarés. Trois anti-jointures hachées sur des couples
+    /// dédoublonnés — offline, plusieurs minutes.
+    pub async fn text_refs_oracle_stats(&self) -> Result<super::types::TextRefsOracleStats> {
+        // Les deux CTE sont partagées par les trois mesures, mais les clés de
+        // jointure diffèrent (couple complet vs numéro seul) : trois passes.
+        const EDGES: &str = "SELECT DISTINCT owner_text_uid, COALESCE(owner_num_key, '') AS onk, \
+                                    target_num_key, target_text_uid \
+                             FROM legal_link \
+                             WHERE typelien = 'CITATION' AND verb = 'cite' \
+                               AND direction = 'outgoing' \
+                               AND target_text_uid IS NOT NULL \
+                               AND target_num_key IS NOT NULL AND target_num_key <> ''";
+        const SPANS: &str = "SELECT DISTINCT owner_text_uid, COALESCE(owner_num_key, '') AS onk, \
+                                    ref_num_key, ref_text_uid \
+                             FROM text_legal_citation \
+                             WHERE ref_text_uid IS NOT NULL AND ref_num_key IS NOT NULL";
+
+        let coverage = self
+            .conn
+            .query_one(
+                &format!(
+                    "WITH edges AS ({EDGES}), spans AS ({SPANS}) \
+                     SELECT count(*), count(s.onk), \
+                            count(*) FILTER (WHERE s.onk IS NULL \
+                                             AND e.owner_text_uid = e.target_text_uid), \
+                            count(*) FILTER (WHERE s.onk IS NULL \
+                                             AND e.owner_text_uid <> e.target_text_uid) \
+                     FROM edges e \
+                     LEFT JOIN spans s ON s.owner_text_uid = e.owner_text_uid \
+                                      AND s.onk = e.onk \
+                                      AND s.ref_text_uid = e.target_text_uid \
+                                      AND s.ref_num_key = e.target_num_key"
+                ),
+                &[],
+            )
+            .await?;
+        // Accord = la cible du span est PARMI celles déclarées pour ce numéro,
+        // pas « égale à l'une d'elles prise au hasard » : sur une clé que la source
+        // déclare vers deux textes, l'extracteur qui en choisit un a raison.
+        let agreement = self
+            .conn
+            .query_one(
+                &format!(
+                    "WITH edges AS ({EDGES}), spans AS ({SPANS}), \
+                          declared_keys AS (SELECT DISTINCT owner_text_uid, onk, target_num_key \
+                                            FROM edges), \
+                          comparable AS (SELECT s.* FROM spans s \
+                                         JOIN declared_keys k \
+                                           ON k.owner_text_uid = s.owner_text_uid \
+                                          AND k.onk = s.onk \
+                                          AND k.target_num_key = s.ref_num_key) \
+                     SELECT count(*), count(e.target_text_uid) \
+                     FROM comparable c \
+                     LEFT JOIN edges e ON e.owner_text_uid = c.owner_text_uid \
+                                      AND e.onk = c.onk \
+                                      AND e.target_num_key = c.ref_num_key \
+                                      AND e.target_text_uid = c.ref_text_uid"
+                ),
+                &[],
+            )
+            .await?;
+        let ambiguous = self
+            .conn
+            .query_one(
+                &format!(
+                    "WITH edges AS ({EDGES}) \
+                     SELECT count(*) FROM ( \
+                         SELECT owner_text_uid, onk, target_num_key \
+                         FROM edges GROUP BY 1, 2, 3 \
+                         HAVING count(DISTINCT target_text_uid) > 1) a"
+                ),
+                &[],
+            )
+            .await?;
+        Ok(super::types::TextRefsOracleStats {
+            declared: coverage.get(0),
+            with_span: coverage.get(1),
+            missing_internal: coverage.get(2),
+            missing_external: coverage.get(3),
+            compared: agreement.get(0),
+            agree: agreement.get(1),
+            ambiguous: ambiguous.get(0),
+        })
+    }
+
+    /// Spans de renvoi de la version d'article servie, triés par `char_start`,
+    /// joints au catalogue (slug/titre de la cible + gate « la fiche est lisible »
+    /// pour la mention nue).
     pub async fn article_citation_spans(
         &self,
         owner_text_uid: &str,
@@ -732,8 +1102,9 @@ impl DecisionRepository<'_> {
             .conn
             .query(
                 "SELECT c.char_start, c.char_end, lt.slug, c.ref_num_key, lt.title, \
-                        EXISTS (SELECT 1 FROM legal_article a \
-                                WHERE a.text_uid = lt.text_uid) AS has_articles \
+                        (EXISTS (SELECT 1 FROM legal_article a \
+                                 WHERE a.text_uid = lt.text_uid) \
+                         OR coalesce(length(lt.body), 0) > 0) AS readable \
                  FROM text_legal_citation c \
                  JOIN legal_text lt ON lt.text_uid = c.ref_text_uid \
                  WHERE c.owner_text_uid = $1 \
@@ -751,7 +1122,7 @@ impl DecisionRepository<'_> {
                 ref_slug: r.get(2),
                 ref_num_key: r.get(3),
                 ref_title: r.get(4),
-                ref_has_articles: r.get(5),
+                ref_readable: r.get(5),
             })
             .collect())
     }

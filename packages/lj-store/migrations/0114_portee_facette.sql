@@ -1,4 +1,4 @@
--- Portée jurisprudentielle en facette (ADR 0167) + relabel publication:AUTRE.
+-- Portée jurisprudentielle en facette + relabel publication:AUTRE.
 --
 -- `portee:*` — groupes de `publication_codes` au rang le plus fort
 -- (`portee_codes` de lj-core : majeure = r/A ; importante = b/l/c/B/C+/R ;
@@ -12,9 +12,10 @@ INSERT INTO facet_value (uid, facet, label, sort) VALUES
     ('portee:LIMITEE',      'portee', 'Limitée',      3),
     ('portee:INDETERMINEE', 'portee', 'Indéterminée', 4);
 
--- « Autre » (copie de référence) laissait croire à une catégorie éditoriale : c'est
+-- « Autre » (repris du référentiel de place) laissait croire à une catégorie
+-- éditoriale : c'est
 -- l'absence de toute mention de publication dans la source (TJ/CA/TCOM, TA/CAA,
--- cours européennes…).  ne classe pas ces décisions du tout.
+-- cours européennes…). Les référentiels de place ne les classent pas du tout.
 UPDATE facet_value
 SET label = 'Sans mention de publication'
 WHERE uid = 'publication:AUTRE';

@@ -1,13 +1,7 @@
-//! Extraction texte PDF born-digital au bord I/O (ADR 0095, frontière #1/#12).
+//! Extraction texte PDF born-digital au bord I/O.
 //!
-//! Les conclusions du rapporteur public (CRP) ArianeWeb sont des PDF
-//! born-digital (Word → Aspose, polices embarquées, aucune image → pas d'OCR).
 //! Le décodage de format vit dans `lj-sources` : ce module rend le texte plat
 //! pour que le parser pur de `lj-core` reçoive du texte, pas des octets PDF.
-//!
-//! Crate PUR Rust [`pdf_extract`] (pas de dép native pdfium/poppler, non
-//! garantie en CI/env). Si la qualité word-spacing/apostrophes s'avère
-//! insuffisante sur PDF réels, swap pdfium-render/poppler (follow-up ADR 0095).
 
 use crate::error::{Result, SourceError};
 use std::io::Write;
@@ -21,17 +15,14 @@ pub fn extract_pdf_text(bytes: &[u8]) -> Result<String> {
 }
 
 /// Extrait le texte d'un PDF via `pdftotext` (poppler, sous-process), ordre de
-/// lecture préservé, encodage UTF-8 (ADR 0124). Choisi pour la CNDA car son
-/// word-spacing est fidèle (≠ `pdf_extract`, qui coupe intra-mot) : le recollage
-/// par règles aval (`lj_core::parsing::reflow_cnda_pdf_text`) n'a plus qu'à
-/// rejoindre les retours de ligne visuels.
+/// lecture préservé, encodage UTF-8.
 ///
 /// PDF passé sur stdin, texte lu sur stdout (pas de fichier temporaire). Le PDF
-/// peut peser plusieurs Mo : on écrit stdin depuis un thread dédié pour ne pas
+/// peut peser plusieurs Mo : stdin est écrit depuis un thread dédié pour ne pas
 /// inter-bloquer le pipe stdout. Erreur franche si `pdftotext` est absent
 /// (`poppler-utils` requis) ou sort en échec (PDF chiffré/corrompu). Un PDF
-/// **scanné** (sans couche texte) réussit mais rend un texte quasi vide — c'est
-/// à l'appelant de basculer en repli OCR (cf. seuil pipeline).
+/// scanné (sans couche texte) réussit mais rend un texte quasi vide : c'est à
+/// l'appelant de basculer en repli OCR.
 pub fn pdftotext_extract(bytes: &[u8]) -> Result<String> {
     let mut child = Command::new("pdftotext")
         .args(["-q", "-enc", "UTF-8", "-", "-"])
@@ -68,9 +59,7 @@ pub fn pdftotext_extract(bytes: &[u8]) -> Result<String> {
 mod tests {
     use super::*;
 
-    /// PDF born-digital valide (police base-14 Helvetica encodée par printpdf) :
-    /// un PDF cousu à la main n'embarque pas de mapping glyphe→caractère, donc
-    /// l'extracteur rend du vide. On en génère un vrai à la volée.
+    /// PDF born-digital valide (police base-14 Helvetica encodée par printpdf).
     fn born_digital_pdf(text: &str) -> Vec<u8> {
         use printpdf::{
             BuiltinFont, Mm, Op, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt,
@@ -109,11 +98,6 @@ mod tests {
         );
     }
 
-    /// Déterminisme run-à-run (ADR 0095/0096) : `pdf-extract` est pur Rust, sans
-    /// dép native ni source d'entropie ; extraire deux fois le **même** PDF
-    /// born-digital doit rendre un texte **identique**. C'est ce qui garantit
-    /// qu'un re-extract futur (re-fetch du même PDF) reproduit le même
-    /// `texte_integral_clean`, donc les mêmes chunks (pas de re-embed).
     #[test]
     fn extraction_is_deterministic_run_to_run() {
         let pdf = born_digital_pdf("Cour nationale du droit d'asile N 26006334 DECIDE");

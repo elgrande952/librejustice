@@ -1,19 +1,19 @@
-//! Parser PUR du fond JORF (bulk DILA, ADR 0109) — `payload XML → JorfArticle /
+//! Parser PUR du fond JORF (bulk DILA) — `payload XML → JorfArticle /
 //! JorfTexte`. Aucun I/O : les octets sont fournis par `lj-ingest`.
 //!
-//! Le fond JORF partage la **structure XML de LEGI** (audit working-note
-//! 2026-06-17) : mêmes tags `META_COMMUN/ID`, `META_ARTICLE/NUM|ETAT|DATE_DEBUT|
-//! DATE_FIN`, `CONTEXTE/TEXTE@cid`, `BLOC_TEXTUEL/CONTENU`, mêmes sentinelles de
-//! date. Ce module **réutilise** les helpers de [`crate::legi`]
-//! (`find_anywhere`, `date_or_none`, `clean_contenu`, `collect_titre_tm`) — pas
-//! de duplication (#11) — et n'ajoute que les divergences JORF :
+//! Le fond JORF partage la **structure XML de LEGI** : mêmes tags
+//! `META_COMMUN/ID`, `META_ARTICLE/NUM|ETAT|DATE_DEBUT|DATE_FIN`,
+//! `CONTEXTE/TEXTE@cid`, `BLOC_TEXTUEL/CONTENU`, mêmes sentinelles de date. Ce
+//! module réutilise les helpers de [`crate::legi`] (`find_anywhere`,
+//! `date_or_none`, `clean_contenu`, `collect_titre_tm`) et n'ajoute que les
+//! divergences JORF :
 //! - **`NUM` souvent absent** (annonces, actes `TYPE=AUTONOME`) → `num:
 //!   Option<String>` (LEGI le rend obligatoire ; JORF non) ; idem `DATE_DEBUT`
 //!   (les annonces n'ont qu'une sentinelle) ;
 //! - **métadonnées texte plus riches** : `TITREFULL` (libellé descriptif vs
 //!   `TITRE` court), `NATURE` (DECRET/ARRETE/LOI/ANNONCES…), mots-clés `MC`
 //!   (détection des traités) et le graphe de liens `LIENS/LIEN` (rattachement
-//!   avenant→accord initial, ADR 0109 §4).
+//!   avenant→accord initial).
 
 use crate::legi::{clean_contenu, collect_titre_tm, date_or_none, find_anywhere};
 use lj_core::error::CoreError;
@@ -39,7 +39,7 @@ pub struct JorfArticle {
 
 /// Un lien `META_TEXTE_VERSION/LIENS/LIEN` : graphe inter-textes JORF. Pour les
 /// avenants d'un accord, `typelien ∈ {MODIFIE, MODIFICATION}` relie l'avenant à
-/// l'accord initial (ADR 0109 §4). `date_signa` = sentinelle absorbée en `None`.
+/// l'accord initial. `date_signa` = sentinelle absorbée en `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JorfLien {
     pub cid: String,
@@ -67,27 +67,27 @@ pub struct JorfTexte {
     /// Numéro propre de l'acte (`META_TEXTE_CHRONICLE/NUM`, ex. `65-557`), absent pour
     /// les actes non numérotés (arrêté/décret « du X »). Brique d'`instrument_key`.
     pub num: Option<String>,
-    /// NOR (`META_COMMUN/NOR`) — identifiant cross-diffuseur (même NOR LEGI↔JORF) ;
-    /// workhorse du collapse d'identité (ADR 0115, ~80 % de couverture).
+    /// NOR (`META_TEXTE_CHRONICLE/NOR`) — identifiant cross-diffuseur (même NOR
+    /// LEGI↔JORF) ; workhorse du collapse d'identité.
     pub nor: Option<String>,
-    /// ELI (`META_COMMUN/ID_ELI`) — identifiant autoritaire quand présent (~20 %).
+    /// ELI (`META_COMMUN/ID_ELI`) — identifiant autoritaire quand présent.
     pub eli: Option<String>,
     pub date_texte: Option<String>,
     pub date_publi: Option<String>,
-    pub mcs: Vec<String>,
     pub liens: Vec<JorfLien>,
 }
 
 /// Parse un `JORFARTI*.xml` (racine `<ARTICLE>`) en [`JorfArticle`]. Erreur
-/// franche ([`CoreError::Xml`]) si `ID` ou `cid` manquent (frontière #12) ;
-/// `NUM`/`DATE_DEBUT` absents sont tolérés (`None`) — divergence JORF vs LEGI.
+/// franche ([`CoreError::Xml`]) si `ID` ou `cid` manquent ; `NUM`/`DATE_DEBUT`
+/// absents sont tolérés (`None`) — divergence JORF vs LEGI.
 pub fn parse_jorf_article(raw: &[u8]) -> Result<JorfArticle, CoreError> {
     let root =
         build_tree(raw).ok_or_else(|| CoreError::Xml("ARTICLE JORF: XML illisible".into()))?;
 
     let jorfarti = node_text(find_anywhere(&root, "META_COMMUN/ID"))
         .ok_or_else(|| CoreError::Xml("ARTICLE JORF: META_COMMUN/ID manquant".into()))?;
-    let jorftext = find_anywhere(&root, "CONTEXTE/TEXTE")
+    let texte_node = find_anywhere(&root, "CONTEXTE/TEXTE");
+    let jorftext = texte_node
         .and_then(|t| t.attr("cid"))
         .ok_or_else(|| {
             CoreError::Xml(format!(
@@ -99,7 +99,17 @@ pub fn parse_jorf_article(raw: &[u8]) -> Result<JorfArticle, CoreError> {
     let num = node_text(find_anywhere(&root, "META_ARTICLE/NUM"));
     let num_key = num.as_deref().map(lj_core::article_key::identity_key);
     let etat = node_text(find_anywhere(&root, "META_ARTICLE/ETAT")).unwrap_or_default();
-    let date_debut = date_or_none(node_text(find_anywhere(&root, "META_ARTICLE/DATE_DEBUT")));
+    // Le fonds JORF ne date pas ses articles : `META_ARTICLE/DATE_DEBUT` et
+    // `DATE_FIN` portent la sentinelle. Une entrée de journal est datée par sa
+    // parution et n'a pas de fin de validité.
+    let date_debut = date_or_none(node_text(find_anywhere(&root, "META_ARTICLE/DATE_DEBUT")))
+        .or_else(|| {
+            date_or_none(
+                texte_node
+                    .and_then(|t| t.attr("date_publi"))
+                    .map(str::to_string),
+            )
+        });
     let date_fin = date_or_none(node_text(find_anywhere(&root, "META_ARTICLE/DATE_FIN")));
     let titre_text = find_anywhere(&root, "CONTEXTE").and_then(collect_titre_tm);
 
@@ -118,18 +128,22 @@ pub fn parse_jorf_article(raw: &[u8]) -> Result<JorfArticle, CoreError> {
 }
 
 /// Parse un `JORFTEXT*.xml` (racine `<TEXTE_VERSION>`) en [`JorfTexte`]. Erreur
-/// franche si `META_COMMUN/ID` ou `META_TEXTE_VERSION/TITRE` manquent.
+/// franche si `META_COMMUN/ID` manque, ou si `META_TEXTE_VERSION/TITRE` **et**
+/// `TITREFULL` manquent tous deux — le stock porte des `<TITRE/>` vides avec
+/// un `TITREFULL` rempli, le titre long fait foi.
 pub fn parse_jorf_texte(raw: &[u8]) -> Result<JorfTexte, CoreError> {
     let root = build_tree(raw)
         .ok_or_else(|| CoreError::Xml("TEXTE_VERSION JORF: XML illisible".into()))?;
 
     let jorftext = node_text(find_anywhere(&root, "META_COMMUN/ID"))
         .ok_or_else(|| CoreError::Xml("TEXTE_VERSION JORF: META_COMMUN/ID manquant".into()))?;
-    let titre = node_text(find_anywhere(&root, "META_TEXTE_VERSION/TITRE")).ok_or_else(|| {
-        CoreError::Xml(format!(
-            "TEXTE_VERSION JORF {jorftext}: META_TEXTE_VERSION/TITRE manquant"
-        ))
-    })?;
+    let titre = node_text(find_anywhere(&root, "META_TEXTE_VERSION/TITRE"))
+        .or_else(|| node_text(find_anywhere(&root, "META_TEXTE_VERSION/TITREFULL")))
+        .ok_or_else(|| {
+            CoreError::Xml(format!(
+                "TEXTE_VERSION JORF {jorftext}: META_TEXTE_VERSION/TITRE et TITREFULL manquants"
+            ))
+        })?;
 
     Ok(JorfTexte {
         jorftext,
@@ -137,26 +151,12 @@ pub fn parse_jorf_texte(raw: &[u8]) -> Result<JorfTexte, CoreError> {
         titre_full: node_text(find_anywhere(&root, "META_TEXTE_VERSION/TITREFULL")),
         nature: node_text(find_anywhere(&root, "META_COMMUN/NATURE")).unwrap_or_default(),
         num: node_text(find_anywhere(&root, "META_TEXTE_CHRONICLE/NUM")),
-        nor: node_text(find_anywhere(&root, "META_COMMUN/NOR")),
+        nor: node_text(find_anywhere(&root, "META_TEXTE_CHRONICLE/NOR")),
         eli: node_text(find_anywhere(&root, "META_COMMUN/ID_ELI")),
         date_texte: node_text(find_anywhere(&root, "META_TEXTE_CHRONICLE/DATE_TEXTE")),
         date_publi: node_text(find_anywhere(&root, "META_TEXTE_CHRONICLE/DATE_PUBLI")),
-        mcs: collect_mcs(&root),
         liens: collect_liens(&root),
     })
-}
-
-/// Mots-clés `MCS_TXT/MC` (plusieurs) — sert à détecter les accords ([`is_treaty`]).
-fn collect_mcs(root: &lj_core::parsing::XmlNode) -> Vec<String> {
-    find_anywhere(root, "MCS_TXT")
-        .map(|n| {
-            n.children
-                .iter()
-                .filter(|c| c.tag == "MC")
-                .filter_map(|c| c.text())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Liens `META_TEXTE_VERSION/LIENS/LIEN` (plusieurs) avec leurs attributs.
@@ -192,7 +192,7 @@ fn collect_liens(root: &lj_core::parsing::XmlNode) -> Vec<JorfLien> {
 /// le cid chronique et ses `STRUCT/LIEN_ART@id` dans l'ordre du fichier — qui
 /// est l'ordre du document au JO (les ids `JORFARTI`, eux, ne suivent PAS cet
 /// ordre). Tous les liens sont rendus, numérotés ou non : ce parseur sert
-/// l'assemblage du corps (ADR 0223), pas le référentiel citable.
+/// l'assemblage du corps, pas le référentiel citable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JorfStructOrder {
     pub jorftext: String,
@@ -222,41 +222,13 @@ pub fn parse_jorf_struct(raw: &[u8]) -> Result<JorfStructOrder, CoreError> {
     })
 }
 
-/// `true` si le texte JORF est un décret de **publication d'accord/traité**
-/// international (référentiel `source='treaty'`, ADR 0109 §1). Règle déterministe
-/// (#8) : mot-clé `MC` « ACCORD INTERNATIONAL » (le plus fiable, posé par la
-/// DILA), à défaut un titre « portant publication … » accolé à un terme d'accord.
-pub fn is_treaty(t: &JorfTexte) -> bool {
-    if t.mcs
-        .iter()
-        .any(|m| m.trim().eq_ignore_ascii_case("ACCORD INTERNATIONAL"))
-    {
-        return true;
-    }
-    let hay = t.titre_full.as_deref().unwrap_or(&t.titre).to_lowercase();
-    hay.contains("portant publication")
-        && [
-            "accord",
-            "convention",
-            "traité",
-            "traite",
-            "avenant",
-            "protocole",
-            "échange de lettres",
-            "echange de lettres",
-            "entente",
-        ]
-        .iter()
-        .any(|kw| hay.contains(kw))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // TEXTE_VERSION réel : décret 69-243 publiant l'accord franco-algérien 1968
-    // (extrait du stock Freemium_jorf_global). MC « ACCORD INTERNATIONAL » +
-    // LIENS vers les avenants (typelien MODIFIE/MODIFICATION).
+    // TEXTE_VERSION réel : décret 69-243 publiant l'accord franco-algérien 1968.
+    // MC « ACCORD INTERNATIONAL » + LIENS vers les avenants (typelien
+    // MODIFIE/MODIFICATION).
     const ACCORD_ALGERIEN: &str = r#"<TEXTE_VERSION>
 <META>
 <META_COMMUN><ID>JORFTEXT000000694290</ID><ORIGINE>JORF</ORIGINE><NATURE>DECRET</NATURE></META_COMMUN>
@@ -290,18 +262,6 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("27 décembre 1968"));
-        // Mots-clés multiples captés en ordre.
-        assert_eq!(
-            t.mcs,
-            vec![
-                "ACCORD INTERNATIONAL",
-                "FRANCE",
-                "ALGERIE",
-                "ACCORDS DE 1968"
-            ]
-        );
-        // 3 liens captés ; les avenants portent MODIFIE/MODIFICATION, la sentinelle
-        // de date du lien CITATION (2999) est absorbée en None.
         assert_eq!(t.liens.len(), 3);
         assert_eq!(t.liens[0].typelien, "MODIFIE");
         assert_eq!(t.liens[0].cid, "JORFTEXT000000333424");
@@ -309,41 +269,51 @@ mod tests {
         assert_eq!(t.liens[0].date_signa.as_deref(), Some("1986-03-07"));
         assert_eq!(t.liens[1].typelien, "MODIFICATION");
         assert_eq!(t.liens[2].typelien, "CITATION");
-        assert_eq!(t.liens[2].date_signa, None); // sentinelle 2999 → None
+        assert_eq!(t.liens[2].date_signa, None);
     }
 
-    #[test]
-    fn accord_is_detected_as_treaty() {
-        let t = parse_jorf_texte(ACCORD_ALGERIEN.as_bytes()).expect("texte");
-        assert!(is_treaty(&t));
-    }
-
-    #[test]
-    fn ordinary_decret_is_not_treaty() {
-        // Décret de nomination : pas de MC ACCORD INTERNATIONAL, titre sans
-        // « portant publication » d'accord.
-        let xml = r#"<TEXTE_VERSION>
-<META><META_COMMUN><ID>JORFTEXT000051871592</ID><NATURE>DECRET</NATURE></META_COMMUN>
-<META_SPEC><META_TEXTE_VERSION><TITRE>Décret du 8 juillet 2025 portant nomination</TITRE></META_TEXTE_VERSION></META_SPEC></META>
+    // TEXTE_VERSION réel : délibération CSA 2018-11. Le `META_COMMUN` du fond JORF
+    // ne porte que ID/ANCIEN_ID/ORIGINE/URL/NATURE ; NOR vit sous
+    // `META_TEXTE_CHRONICLE`, comme NUM et les dates.
+    const DELIBERATION_CSA: &str = r#"<TEXTE_VERSION>
+<META>
+<META_COMMUN><ID>JORFTEXT000036889522</ID><ANCIEN_ID/><ORIGINE>JORF</ORIGINE><URL>texte/version/JORF/TEXT/00/00/36/88/95/JORFTEXT000036889522.xml</URL><NATURE>DELIBERATION</NATURE></META_COMMUN>
+<META_SPEC>
+<META_TEXTE_CHRONICLE><CID>JORFTEXT000036889522</CID><NUM>2018-11</NUM><NOR>CSAC1812426X</NOR><DATE_PUBLI>2018-05-10</DATE_PUBLI><DATE_TEXTE>2018-04-18</DATE_TEXTE></META_TEXTE_CHRONICLE>
+<META_TEXTE_VERSION>
+<TITRE>Délibération n°2018-11 du 18 avril 2018</TITRE>
+<TITREFULL>Délibération n° 2018-11 du 18 avril 2018 du Conseil supérieur de l'audiovisuel relative à l'honnêteté et à l'indépendance de l'information et des programmes qui y concourent</TITREFULL>
+</META_TEXTE_VERSION>
+</META_SPEC>
+</META>
 </TEXTE_VERSION>"#;
-        let t = parse_jorf_texte(xml.as_bytes()).expect("texte");
-        assert!(!is_treaty(&t));
-        assert!(t.mcs.is_empty());
-        assert!(t.liens.is_empty());
-    }
 
     #[test]
-    fn treaty_detected_by_title_without_keyword() {
-        // Pas de MCS, mais titre « portant publication … convention ».
-        let xml = r#"<TEXTE_VERSION>
-<META><META_COMMUN><ID>JORFTEXT000000111111</ID><NATURE>DECRET</NATURE></META_COMMUN>
-<META_SPEC><META_TEXTE_VERSION>
-<TITRE>Décret n° 91-1 du 2 janvier 1991</TITRE>
-<TITREFULL>Décret n° 91-1 portant publication de la convention entre la France et le Maroc relative au statut des personnes et de la famille</TITREFULL>
-</META_TEXTE_VERSION></META_SPEC></META>
+    fn parse_texte_lit_le_nor_sous_la_chronique() {
+        let t = parse_jorf_texte(DELIBERATION_CSA.as_bytes()).expect("texte");
+        assert_eq!(t.nor.as_deref(), Some("CSAC1812426X"));
+        assert_eq!(t.num.as_deref(), Some("2018-11"));
+    }
+
+    // TEXTE_VERSION réel : accord de coopération T2S (JORFTEXT000033243907),
+    // `<TITRE/>` vide mais TITREFULL rempli.
+    const ACCORD_SANS_TITRE: &str = r#"<TEXTE_VERSION>
+<META>
+<META_COMMUN><ID>JORFTEXT000033243907</ID><ORIGINE>JORF</ORIGINE><NATURE/></META_COMMUN>
+<META_SPEC>
+<META_TEXTE_CHRONICLE><CID>JORFTEXT000033243907</CID><NUM/><NOR>AMFX1627336X</NOR><DATE_PUBLI>2016-10-16</DATE_PUBLI><DATE_TEXTE>2999-01-01</DATE_TEXTE></META_TEXTE_CHRONICLE>
+<META_TEXTE_VERSION>
+<TITRE/>
+<TITREFULL>Accord de coopération relatif à T2S entre surveillants et autorités compétentes pour la supervision des dépositaires centraux de titres</TITREFULL>
+</META_TEXTE_VERSION>
+</META_SPEC>
+</META>
 </TEXTE_VERSION>"#;
-        let t = parse_jorf_texte(xml.as_bytes()).expect("texte");
-        assert!(is_treaty(&t));
+
+    #[test]
+    fn parse_texte_titre_vide_replie_sur_titrefull() {
+        let t = parse_jorf_texte(ACCORD_SANS_TITRE.as_bytes()).expect("texte");
+        assert!(t.titre.starts_with("Accord de coopération relatif à T2S"));
     }
 
     // JORFARTI réel : annonce « accès protégé » à NUM vide (TYPE=AUTONOME),
@@ -362,10 +332,8 @@ mod tests {
         let a = parse_jorf_article(ARTICLE_ANNONCE.as_bytes()).expect("article");
         assert_eq!(a.jorfarti, "JORFARTI000051887074");
         assert_eq!(a.jorftext, "JORFTEXT000051887073");
-        // NUM vide → None (divergence JORF : LEGI lèverait une erreur).
         assert_eq!(a.num, None);
         assert_eq!(a.num_key, None);
-        // Sentinelles 2999 → None.
         assert_eq!(a.date_debut, None);
         assert_eq!(a.date_fin, None);
         assert_eq!(
@@ -376,8 +344,6 @@ mod tests {
 
     #[test]
     fn parse_article_with_num_normalizes_key() {
-        // Article de traité numéroté : num conservé, num_key canonique (jointure
-        // au libellé cité côté décisions).
         let xml = r#"<ARTICLE>
 <META><META_COMMUN><ID>JORFARTI000000694291</ID></META_COMMUN>
 <META_SPEC><META_ARTICLE><NUM>6</NUM><ETAT>VIGUEUR</ETAT><DATE_DEBUT>2002-08-09</DATE_DEBUT><DATE_FIN>2999-01-01</DATE_FIN></META_ARTICLE></META_SPEC></META>
@@ -393,9 +359,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_article_dates_from_publication() {
+        // JORFARTI réel (délibération CSA 2018-11, art. 1er) : DATE_DEBUT et DATE_FIN
+        // sentinelles, ETAT absent. La parution portée par CONTEXTE/TEXTE@date_publi
+        // date l'entrée.
+        let xml = r#"<ARTICLE>
+<META><META_COMMUN><ID>JORFARTI000036889523</ID></META_COMMUN>
+<META_SPEC><META_ARTICLE><NUM>1</NUM><DATE_DEBUT>2999-01-01</DATE_DEBUT><DATE_FIN>2999-01-01</DATE_FIN></META_ARTICLE></META_SPEC></META>
+<CONTEXTE><TEXTE cid="JORFTEXT000036889522" date_publi="2018-04-20" date_signature="2018-04-18" nature="DELIBERATION" nor="CSAC1812426X"/></CONTEXTE>
+<BLOC_TEXTUEL><CONTENU>Les éditeurs de services veillent à l'honnêteté de l'information.</CONTENU></BLOC_TEXTUEL>
+</ARTICLE>"#;
+        let a = parse_jorf_article(xml.as_bytes()).expect("article");
+        assert_eq!(a.date_debut.as_deref(), Some("2018-04-20"));
+        assert_eq!(a.date_fin, None);
+        assert_eq!(a.etat, "");
+    }
+
+    #[test]
     fn parse_struct_keeps_document_order_including_unnumbered() {
-        // Extrait réel (JORFTEXT000000209787) : les LIEN_ART sans num sont
-        // rendus dans l'ordre du fichier — c'est l'ordre du document (ADR 0223).
+        // Extrait réel (JORFTEXT000000209787) : les LIEN_ART sans num sont rendus dans
+        // l'ordre du fichier.
         let xml = r#"<TEXTELR>
 <META><META_SPEC><META_TEXTE_CHRONICLE><CID>JORFTEXT000000209787</CID></META_TEXTE_CHRONICLE></META_SPEC></META>
 <STRUCT>

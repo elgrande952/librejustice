@@ -1,4 +1,4 @@
--- Migration 0056 — Identité inter-sources & déduplication ECLI (ADR 0080).
+-- Migration 0056 — Identité inter-sources & déduplication ECLI.
 --
 -- DDL bon marché uniquement. Le backfill des provenances existantes (une ligne
 -- `decision_sources` par `decisions`, ~3M lignes) se fait HORS-MIGRATION via

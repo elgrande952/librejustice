@@ -1,11 +1,11 @@
--- Migration 0142 — `jurisdiction_type` : un concept, un nom (ADR 0210).
+-- Migration 0142 — `jurisdiction_type` : un concept, un nom.
 --
 -- Renomme la colonne FR `juridiction_type` en `jurisdiction_type` sur ses
 -- trois porteurs (`decisions`, `decision_chunks`, `jurisdiction`), aligné sur
 -- le reste du schéma déjà anglais (`jurisdiction_name`, `jurisdiction_code`,
 -- `jurisdiction_level`…).
 --
--- ⚠️ `decisions_bm25` DOIT être recréé dans la même transaction : le schéma
+-- `decisions_bm25` DOIT être recréé dans la même transaction : le schéma
 -- Tantivy fige le nom de champ à la création de l'index — après le RENAME,
 -- tout INSERT/UPDATE sur `decisions` échoue (« Error getting tokenizer for
 -- field: juridiction_type », vérifié sur pg_search 0.23.5) et le pushdown du

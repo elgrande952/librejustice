@@ -1,5 +1,4 @@
-//! Endpoints `/me/search-history` + hook d'insertion depuis `/search` (port de
-//! `search_history.py`). Cf. ADR 0036.
+//! Endpoints `/me/search-history` + hook d'insertion depuis `/search`.
 
 use deadpool_postgres::Pool;
 use lj_dtos::{ActivitySource, SearchEngine, SearchHistoryEntry, SearchRequest};
@@ -8,11 +7,11 @@ use crate::error::ApiError;
 use crate::me::ts_to_rfc3339;
 use crate::state::AppState;
 
-/// Borne haute de pagination de l'historique (parité `_MAX_ITEMS`).
+/// Borne haute de pagination de l'historique.
 pub const MAX_ITEMS: i64 = 100;
 
 /// Représentation chaîne d'un canal d'activité (`web` | `mcp`), pour les
-/// colonnes TEXT (parité `ActivitySource.value`).
+/// colonnes TEXT.
 pub(crate) fn source_value(source: ActivitySource) -> &'static str {
     match source {
         ActivitySource::Web => "web",
@@ -29,29 +28,41 @@ fn parse_source(raw: &str) -> Result<ActivitySource, ApiError> {
     }
 }
 
-/// Représentation chaîne du moteur interrogé (`decisions` | `textes`,
-/// ADR 0251), pour la colonne TEXT.
+/// Représentation chaîne du moteur interrogé (`decisions` | `textes` |
+/// `annonces`), pour la colonne TEXT.
 pub(crate) fn engine_value(engine: SearchEngine) -> &'static str {
     match engine {
         SearchEngine::Decisions => "decisions",
         SearchEngine::Textes => "textes",
+        SearchEngine::Annonces => "annonces",
     }
 }
 
-/// Désérialise un TEXT `decisions`/`textes` lu en base vers l'enum.
+/// Désérialise un TEXT `decisions`/`textes`/`annonces` lu en base vers l'enum.
 fn parse_engine(raw: &str) -> Result<SearchEngine, ApiError> {
     match raw {
         "decisions" => Ok(SearchEngine::Decisions),
         "textes" => Ok(SearchEngine::Textes),
+        "annonces" => Ok(SearchEngine::Annonces),
         other => Err(ApiError::Internal(format!("engine invalide {other:?}"))),
     }
 }
 
-/// Sérialise la `SearchRequest` en filtres JSONB, sans la query elle-même
-/// (parité `_filters_from_request` : `exclude={"query","limit","offset"}`,
-/// `exclude_none=True`). Les `Option` à `None` sont déjà omis par les
-/// `skip_serializing_if` du DTO ; on retire ici les trois clés exclues.
-pub(crate) fn filters_from_request(req: &SearchRequest) -> serde_json::Value {
+/// Numéro de page 1-based de la fenêtre `(offset, limit)` demandée, `None` sur
+/// la première page. Clé `page` de l'URL de la page de recherche (`?page=N`),
+/// pas la fenêtre brute : c'est le grain que l'utilisateur manipule.
+pub(crate) fn page_number(offset: i64, limit: i64) -> Option<i64> {
+    if offset == 0 {
+        return None;
+    }
+    Some(offset / limit + 1)
+}
+
+/// Sélection de facettes seule : la `SearchRequest` sans la query ni la fenêtre
+/// (les `Option` à `None` sont déjà omis par les `skip_serializing_if` du DTO).
+/// C'est ce que le span d'usage porte, la profondeur allant dans son propre
+/// attribut `page`.
+pub(crate) fn facet_filters(req: &SearchRequest) -> serde_json::Value {
     let mut value = serde_json::to_value(req).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = value.as_object_mut() {
         obj.remove("query");
@@ -61,13 +72,25 @@ pub(crate) fn filters_from_request(req: &SearchRequest) -> serde_json::Value {
     value
 }
 
-/// Insère une entrée d'historique. Échec silencieux (best-effort, parité
-/// `record_search`). Les appelants décisions sérialisent leurs filtres via
-/// [`filters_from_request`] ; les appelants textes posent leurs filtres
-/// propres (ADR 0251).
+/// Filtres JSONB de l'historique : [`facet_filters`] plus un `page` 1-based posé
+/// au-delà de la première page — dépouiller une recherche page à page donne donc
+/// des entrées distinctes.
+pub(crate) fn filters_from_request(req: &SearchRequest) -> serde_json::Value {
+    let mut value = facet_filters(req);
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(page) = page_number(i64::from(req.offset), i64::from(req.limit)) {
+            obj.insert("page".to_string(), page.into());
+        }
+    }
+    value
+}
+
+/// Insère une entrée d'historique. Échec silencieux (best-effort). Les appelants
+/// décisions sérialisent leurs filtres via [`filters_from_request`] ; les
+/// appelants textes posent leurs filtres propres.
 ///
-/// Gaté par `track_activity` directement dans l'INSERT (`WHERE EXISTS`, ADR
-/// 0056) : aucune ligne insérée si l'utilisateur a coupé l'enregistrement.
+/// Gaté par `track_activity` directement dans l'INSERT (`WHERE EXISTS`) : aucune
+/// ligne insérée si l'utilisateur a coupé l'enregistrement.
 pub async fn record_search(
     pool: &Pool,
     user_sub: &str,
@@ -99,8 +122,8 @@ pub async fn record_search(
     }
 }
 
-/// Page de recherches (plus récentes d'abord) + total complet (parité
-/// `fetch_history`). `total` via `COUNT(*) OVER()`. `limit` `None` → tout.
+/// Page de recherches (plus récentes d'abord) + total complet. `total` via
+/// `COUNT(*) OVER()`. `limit` `None` → tout.
 pub async fn fetch_history(
     pool: &Pool,
     user_sub: &str,
@@ -126,8 +149,6 @@ pub async fn fetch_history(
     let total = rows.first().map(|r| r.get::<_, i64>(6)).unwrap_or(0);
     let mut items = Vec::with_capacity(rows.len());
     for row in &rows {
-        // `filters` peut être NULL en théorie ? colonne NOT NULL DEFAULT '{}' →
-        // toujours présent ; on tolère NULL côté Python (`row[2] or {}`).
         let filters: Option<serde_json::Value> = row.get(2);
         items.push(SearchHistoryEntry {
             id: row.get(0),
@@ -141,7 +162,7 @@ pub async fn fetch_history(
     Ok((items, total))
 }
 
-/// `GET /me/search-history` (parité `list_history`). `limit` est borné
+/// `GET /me/search-history`. `limit` est borné
 /// `[1, MAX_ITEMS]` à la frontière HTTP (validation côté handler axum).
 pub async fn list_history(
     state: &AppState,
@@ -152,7 +173,7 @@ pub async fn list_history(
     fetch_history(&state.pool, user_sub, Some(limit), offset).await
 }
 
-/// `DELETE /me/search-history/{entry_id}` (parité `delete_entry`).
+/// `DELETE /me/search-history/{entry_id}`.
 /// `NotFound` (`entry_not_found`) si la ligne n'appartient pas à l'utilisateur.
 pub async fn delete_entry(state: &AppState, user_sub: &str, entry_id: i64) -> Result<(), ApiError> {
     let conn = state
@@ -173,7 +194,7 @@ pub async fn delete_entry(state: &AppState, user_sub: &str, entry_id: i64) -> Re
     Ok(())
 }
 
-/// `DELETE /me/search-history` — purge complète (parité `clear_history`).
+/// `DELETE /me/search-history` — purge complète.
 pub async fn clear_history(state: &AppState, user_sub: &str) -> Result<(), ApiError> {
     let conn = state
         .pool
@@ -225,17 +246,34 @@ mod tests {
         assert!(!obj.contains_key("query"));
         assert!(!obj.contains_key("limit"));
         assert!(!obj.contains_key("offset"));
-        // mode/sort/aiMode (non-None) restent (parité exclude_none).
         assert_eq!(obj.get("mode").and_then(|v| v.as_str()), Some("auto"));
         assert_eq!(obj.get("sort").and_then(|v| v.as_str()), Some("relevance"));
         assert_eq!(obj.get("aiMode").and_then(|v| v.as_bool()), Some(false));
     }
 
     #[test]
+    fn filters_carry_page_beyond_first() {
+        let first = filters_from_request(&base_request());
+        assert!(!first.as_object().unwrap().contains_key("page"));
+
+        let mut req = base_request();
+        req.offset = 40;
+        let third = filters_from_request(&req);
+        assert_eq!(
+            third
+                .as_object()
+                .unwrap()
+                .get("page")
+                .and_then(|v| v.as_i64()),
+            Some(3)
+        );
+        assert_ne!(first, third);
+    }
+
+    #[test]
     fn filters_omit_none_options() {
         let filters = filters_from_request(&base_request());
         let obj = filters.as_object().unwrap();
-        // Les Options None sont omises (skip_serializing_if = exclude_none).
         assert!(!obj.contains_key("jurisdictionType"));
         assert!(!obj.contains_key("dateFrom"));
     }

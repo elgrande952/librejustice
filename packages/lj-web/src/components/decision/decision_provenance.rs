@@ -1,7 +1,7 @@
 //! Bloc « Source » : provenance/audit en pied de décision (source d'origine,
 //! ECLI, permalien LibreJustice). Le contenu provient du builder partagé
-//! [`lj_dtos::provenance_rows`] — même source de vérité que l'export PDF et
-//! l'export DOCX (`pdf_export` / `docx_export`).
+//! [`lj_dtos::provenance_rows`] — même source de vérité que l'export PDF
+//! (`pdf_export`).
 use leptos::prelude::*;
 use lj_dtos::DecisionDetail;
 
@@ -26,7 +26,6 @@ pub fn DecisionProvenance(detail: DecisionDetail) -> impl IntoView {
 
 #[component]
 fn ProvenanceField(label: &'static str, value: String) -> impl IntoView {
-    // Permalien → lien cliquable ; ECLI → mono (identifiant) ; reste → texte.
     let value_view = match label {
         "Permalien" => {
             let href = value.clone();

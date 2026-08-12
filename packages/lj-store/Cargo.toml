@@ -19,4 +19,4 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # Ancrage RGPD du gold : checksum xxh3-64 de decisions.full_text au load
-# (citation_gold_anchor, ADR 0144 §6).
+# (citation_gold_anchor).

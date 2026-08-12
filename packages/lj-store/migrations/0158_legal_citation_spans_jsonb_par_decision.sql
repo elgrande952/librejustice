@@ -1,7 +1,7 @@
--- ADR 0247 — legal_citation : spans en jsonb au grain décision, inverse par
+-- legal_citation : spans en jsonb au grain décision, inverse par
 -- GIN d'expression. Élément de spans : tableau positionnel
 -- [char_start, char_end, ref_text_uid|null, ref_num_key|null, suivants],
--- ordonné par char_start (offsets codepoints ADR 0143 inchangés).
+-- ordonné par char_start (offsets codepoints inchangés).
 
 -- Termes d'inversion : uid (usage d'un texte) et uid|num (usage d'un
 -- article), distincts. Appels internes qualifiés public. : PG 18 construit

@@ -1,5 +1,4 @@
-//! Carte canonique des codes de publication → libellé, par ordre
-//! (port de `publication.py`, cf. ADR 0054).
+//! Carte canonique des codes de publication → libellé, par ordre.
 
 /// `Some(libellé)` joint depuis les codes (« Publié au bulletin · Rapport »),
 /// dédupliqué, ordre préservé, codes inconnus ignorés. `None` si vide.
@@ -55,7 +54,7 @@ pub fn significance_codes(group: &str) -> &'static [&'static str] {
 
 /// Clé `significance:*` d'une décision : groupe du code au rang le plus fort
 /// (`{b,r}` → `MAJEURE`), `INDETERMINEE` sans code classant. Mapping total —
-/// toute décision est facettable (ADR 0167).
+/// toute décision est facettable.
 pub fn significance_key(codes: &[String]) -> &'static str {
     for (group, key) in [
         ("majeure", "MAJEURE"),
@@ -97,7 +96,6 @@ mod tests {
 
     #[test]
     fn dedups_labels_preserving_order() {
-        // C, D, Z partagent « Inédit au recueil Lebon » : un seul libellé.
         let c = codes(&["C", "D", "Z"]);
         assert_eq!(
             publication_label(Some(&c)).as_deref(),
@@ -112,7 +110,6 @@ mod tests {
             publication_label(Some(&c)).as_deref(),
             Some("Publié au bulletin")
         );
-        // Que des codes inconnus → None.
         let only_unknown = codes(&["xyz", "???"]);
         assert_eq!(publication_label(Some(&only_unknown)), None);
     }
@@ -130,16 +127,13 @@ mod tests {
 
     #[test]
     fn significance_key_takes_strongest_rank() {
-        // `r` (rapport) l'emporte sur `b` (bulletin).
         assert_eq!(significance_key(&codes(&["b", "r", "c"])), "MAJEURE");
         assert_eq!(significance_key(&codes(&["A"])), "MAJEURE");
         assert_eq!(significance_key(&codes(&["b", "l"])), "IMPORTANTE");
-        // `l` seul (lettre de chambre) classe importante même sans `b`.
         assert_eq!(significance_key(&codes(&["l"])), "IMPORTANTE");
         assert_eq!(significance_key(&codes(&["c", "n"])), "IMPORTANTE");
         assert_eq!(significance_key(&codes(&["n"])), "LIMITEE");
         assert_eq!(significance_key(&codes(&["C", "D"])), "LIMITEE");
-        // Sans code classant (vide ou inconnu) : indéterminée.
         assert_eq!(significance_key(&[]), "INDETERMINEE");
         assert_eq!(significance_key(&codes(&["xyz"])), "INDETERMINEE");
     }

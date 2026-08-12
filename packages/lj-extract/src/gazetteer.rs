@@ -1,17 +1,14 @@
-//! Gazetteer CCN (ADR 0123) : snappe une forme citée « convention collective …»
-//! sur une **vraie** convention collective du catalogue KALI (KALICONT), ou
-//! renvoie `None`. PUR (règle #1) : la table des titres est embarquée
-//! (`data/ccn_gazetteer.json`, régénérée depuis le fond KALI), la normalisation
-//! vit ici.
+//! Gazetteer CCN : snappe une forme citée « convention collective … » sur une
+//! **vraie** convention collective du catalogue KALI (KALICONT), ou renvoie
+//! `None`. PUR : la table des titres est embarquée (`data/ccn_gazetteer.json`,
+//! régénérée depuis le fond KALI), la normalisation vit ici.
 //!
-//! Motivation (cf. `docs/working-notes/2026-06-22-convention-collective-extraction-debt.md`) :
-//! ~66 % des décisions citant un « convention collective » générique nomment en
-//! fait une CCN précise. Les décisions la citent en **forme courte** (« …des
-//! services de l'automobile ») ; le catalogue porte le **titre long** daté
-//! (« Convention collective nationale des services de l'automobile du 15 janvier
-//! 1981 »). On matche par **squelette de tokens distinctifs** (hors mots-outils,
-//! dates, numéros) avec un seuil de containment + unicité, pour snapper sans
-//! jamais mislinker (« Crédit agricole » ne se rabat pas sur « Crédit maritime »).
+//! Les décisions citent une CCN en **forme courte** (« …des services de
+//! l'automobile ») ; le catalogue porte le **titre long** daté (« Convention
+//! collective nationale des services de l'automobile du 15 janvier 1981 »). On
+//! matche par **squelette de tokens distinctifs** (hors mots-outils, dates,
+//! numéros) avec un seuil de containment + unicité, pour snapper sans jamais
+//! mislinker (« Crédit agricole » ne se rabat pas sur « Crédit maritime »).
 
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
@@ -199,8 +196,8 @@ impl CcnGazetteer {
 mod tests {
     use super::*;
 
-    /// Les formes citées (gold du loop d'annotation) doivent snapper sur la bonne
-    /// CCN — ou s'abstenir, jamais mislinker.
+    /// Les formes citées doivent snapper sur la bonne CCN — ou s'abstenir, jamais
+    /// mislinker.
     #[test]
     fn snaps_cited_short_forms_to_real_ccn() {
         let g = gazetteer();

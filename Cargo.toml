@@ -1,18 +1,10 @@
 [workspace]
 resolver = "2"
-members = [
-    "packages/lj-core",
-    "packages/lj-extract",
-    "packages/lj-telemetry",
-    "packages/lj-store",
-    "packages/lj-sources",
-    "packages/lj-llm",
-    "packages/lj-dtos",
-    "packages/lj-api",
-    "packages/lj-web",
-    "apps/lj-server",
-    "apps/lj-ingest",
-]
+# Des globs et non la liste des crates : le manifeste vaut alors pour tout arbre
+# qu'on lui donne, quels que soient les membres présents. Corollaire assumé, un
+# dossier de `packages/` ou `apps/` sans Cargo.toml fait échouer le chargement :
+# ces deux racines ne contiennent que des crates.
+members = ["packages/*", "apps/*"]
 
 [workspace.package]
 edition = "2021"
@@ -27,6 +19,8 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
+# Trait de corps HTTP (`Frame`, `SizeHint`) : version d'axum 0.8 / hyper 1.
+http-body = "1"
 tower-http = { version = "0.6", features = [
     "cors",
     "trace",
@@ -38,13 +32,18 @@ tower-http = { version = "0.6", features = [
 
 # Sérialisation
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value", "alloc"] }
 # sonic-rs : parse JSON SIMD sur le hot-path ingest (Judilibre). serde_json ailleurs.
 sonic-rs = "0.5"
 schemars = { version = "1", features = ["chrono04"] }
 
-# HTTP client
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "gzip"] }
+# HTTP client. `native-tls-vendored` : OpenSSL compile dans le binaire (aucune
+# libssl runtime), pour le seul connecteur annonces/klekoon — son hote ne
+# negocie que des suites TLS 1.2 CBC-SHA1, que rustls n'implemente pas.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "form", "rustls", "native-tls-vendored", "gzip", "blocking", "cookies"] }
+# Parsing d'URL. Un controle de redirect_uri OAuth compare un HOST, pas un prefixe
+# de chaine : `starts_with("http://localhost")` matche `localhost.attaquant.tld`.
+url = "2"
 # Middleware reqwest : spans HTTP client sortants (equivalent HTTPXClientInstrumentor).
 # reqwest-tracing emet un span tracing NATIF (sans la feature opentelemetry_* qui
 # epinglerait une vieille version d'otel) -> capte par la couche tracing-opentelemetry.
@@ -66,12 +65,12 @@ pgvector = { version = "0.4", features = ["postgres"] }
 tantivy = "=0.26.0"
 
 # XML tolérant
-quick-xml = "0.40"
+quick-xml = "0.41"
 
 # Texte / regex / single-pass tokenizer
 regex = "1"
 aho-corasick = "1"
-# Diff de rédactions d'articles (comparateur de versions, ADR 0193).
+# Diff de rédactions d'articles pour le comparateur de versions.
 similar = { version = "3", features = ["unicode"] }
 html-escape = "0.2"
 # FxHash : hasher non-cryptographique des index de snap citations (lj-extract,
@@ -81,8 +80,8 @@ rustc-hash = "2"
 # Parallélisme
 rayon = "1"
 
-# FST (automate minimal, dictionnaire tantivy) : vocabulaire d'autocomplétion
-# (ADR 0216) — build côté lj-ingest, probe préfixe côté lj-api.
+# FST (automate minimal, dictionnaire tantivy) : vocabulaire d'autocomplétion,
+# construit par lj-ingest et sondé par préfixe dans lj-api.
 fst = "0.4"
 
 # CLI
@@ -96,7 +95,7 @@ thiserror = "2"
 # local). http-proto + reqwest-blocking-client = exporteurs sur thread dedie
 # des Batch/PeriodicReader (pas de runtime tokio requis) ; le TLS vient de la
 # feature rustls deja activee sur `reqwest` (unification additive cargo).
-tracing = "0.1"
+tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.33"
 opentelemetry = "0.32"
@@ -123,21 +122,19 @@ rmcp = { version = "1", features = ["server", "macros"] }
 # try_get_with coalesce les chargements concurrents = lock anti-stampede natif.
 moka = { version = "0.12", features = ["future"] }
 zip = "8"
-# Export PDF/DOCX pur-Rust (remplacent l'ecriture std a la main) : printpdf
-# (default-features=false) + docx-rs. Pas un contrat de fil -> parite contenu.
+# Export PDF pur-Rust (remplace l'ecriture std a la main). Pas un contrat de
+# fil -> parite contenu.
 printpdf = { version = "0.9", default-features = false }
 # Parsing TTF (cmap + hmtx) pour embarquer une police Unicode dans le PDF :
 # printpdf en `default-features=false` n'embarque pas le parseur de police
 # (azul-layout) ; on alimente nous-mêmes ses maps glyphes via ttf-parser.
 ttf-parser = "0.25"
-docx-rs = "0.4"
-# Extraction texte PDF born-digital, crate PUR Rust (pas de dép native
-# pdfium/poppler) : conclusions CRP ArianeWeb au bord lj-sources (ADR 0095).
+# Extraction texte PDF born-digital, crate pur Rust : aucune dépendance native.
 pdf-extract = "0.10"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh64"] }
 flate2 = "1"
 csv = "1"
-# Lecteur d'archives `.tar` (combiné a flate2 pour `.tar.gz` DILA, ADR 0093).
+# Lecteur d'archives `.tar`, combiné à flate2 pour les `.tar.gz` DILA.
 tar = "0.4"
 
 # Calcul / tokenizer HF
@@ -146,7 +143,9 @@ tokenizers = "0.23"
 
 # Dates : jiff pour la logique métier (parsing dates FR en extraction) ; chrono
 # conservé uniquement comme codec timestamptz de tokio-postgres.
-jiff = "0.2"
+# tzdb-bundle-always : l'image de prod (ubuntu:24.04) n'a pas tzdata, or les
+# échéances de marchés (lj-core annonces) se posent en Europe/Paris.
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Front SSR/hydration (Leptos 0.8 + cargo-leptos). default-features=false sur
@@ -159,6 +158,11 @@ leptos_router = { version = "0.8.13", default-features = false }
 leptos_meta = { version = "0.8.6", default-features = false }
 leptos_axum = { version = "0.8.9", default-features = false }
 leptos-fetch = { version = "0.4.10", default-features = false }
+# Exécuteur des taches Leptos. DOIT resoudre vers la meme version que celle
+# tiree par leptos : c'est un `OnceLock` statique, deux versions donneraient
+# deux statics et notre executeur ne remplacerait plus rien. `install()` echoue
+# franchement si la course est perdue, plutot que de laisser la panne muette.
+any_spawner = "0.3"
 wasm-bindgen = "=0.2.108"
 wasm-bindgen-futures = "0.4.58"
 js-sys = "0.3.85"
@@ -180,13 +184,13 @@ lj-dtos = { path = "packages/lj-dtos" }
 lj-api = { path = "packages/lj-api" }
 lj-web = { path = "packages/lj-web" }
 
-# Serveur TLS in-process (ADR 0061 §3) : axum-server termine le TLS avec le cert
-# Cloudflare Origin CA statique. rustls via aws-lc-rs (déjà tiré par reqwest →
-# un seul provider crypto dans le binaire).
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Serveur HTTP de `lj-server`, pour son `Handle` : lui seul borne le drainage
+# des connexions en vol à l'arrêt. Sans `tls-rustls`, le TLS d'origine étant
+# terminé par le front `caddy`.
+axum-server = { version = "0.7" }
 
-# Projet cargo-leptos multi-crate (ADR 0061) : le binaire de déploiement
-# `lj-server` (API + MCP + SSR + assets + TLS) sert tout ; `lj-web` reste la lib
+# Projet cargo-leptos multi-crate : le binaire de déploiement `lj-server`
+# (API + MCP + SSR + assets) sert tout ; `lj-web` reste la lib
 # (cdylib wasm `hydrate` + rlib `ssr`). Les chemins style/assets sont relatifs à
 # la racine du workspace.
 [[workspace.metadata.leptos]]
@@ -202,31 +206,34 @@ site-addr = "127.0.0.1:3000"
 reload-port = 3001
 lib-features = ["hydrate"]
 lib-default-features = false
-# Noms de bundle content-hashés (`lj-web.<sha256>.wasm`…) → `/pkg` servi
-# `immutable` un an (cf. lj-server) : un nouveau build = de nouveaux noms, le
-# navigateur ne peut jamais hydrater un wasm périmé face au HTML SSR neuf.
-# `hash.txt` (écrit à côté du binaire) doit suivre le binaire au déploiement,
-# et `LEPTOS_HASH_FILES=true` être posé au runtime (compose).
+# Noms de bundle content-hashés, donc `/pkg` peut être servi `immutable` un an :
+# un nouveau build donne de nouveaux noms, et le navigateur ne peut pas hydrater
+# un wasm périmé face au HTML SSR neuf. `hash.txt` suit le binaire au
+# déploiement, et `LEPTOS_HASH_FILES=true` est posé au runtime.
 hash-files = true
 js-minify = true
-# Profil cargo dédié au bundle wasm (lib hydrate) : optimise la TAILLE sans
-# toucher `[profile.release]` que partage le binaire serveur (qui vise la vitesse).
-# Tout le gain vient du profil (opt-level=z + LTO fat + strip) : 931 -> 732 Ko
-# brotli (-21 %). `wasm-opt -Oz` par-dessus ne grattait plus que ~3 Ko (LLVM a
-# déjà tout fait), d'où pas de `wasm-opt-features` : pas une dépendance pour 0,4 %.
+# Profil dédié au bundle wasm : il optimise la taille sans toucher
+# `[profile.release]`, que partage le binaire serveur. Pas de
+# `wasm-opt-features` : cargo-leptos passe déjà `-Os`, et forcer `-Oz` rend un
+# brut plus petit mais un brotli plus gros, l'optimiseur troquant de la
+# redondance contre des séquences plus courtes.
 lib-profile-release = "wasm-release"
 
-# Profil dev du même projet, sans hashing : `cargo leptos watch` + `hash-files`
-# désynchronise les assets (les rebuilds incrémentaux écrivent des noms non
-# hashés sans rafraîchir hash.txt — bug ouvert cargo-leptos #271), ce qui
-# produit CSS vide et fausses erreurs d'hydratation en dev. `mise run dev`
-# sélectionne ce profil ; le build release (deploy) garde `librejustice`.
+# Projet de développement, sans hashing : les rebuilds incrémentaux de
+# `cargo leptos watch` écrivent des noms non hashés sans rafraîchir `hash.txt`
+# (cargo-leptos#271), ce qui donne un CSS vide et de fausses erreurs
+# d'hydratation.
+#
+# `site-root` distinct de celui du release : l'image de déploiement fait
+# `COPY target/site /app/site`, donc un watcher qui écrirait dans le même
+# répertoire ferait embarquer ses assets debug par le deploy, pendant que le
+# binaire référence les noms hashés de `hash.txt` — tout `/pkg` en 404.
 [[workspace.metadata.leptos]]
 name = "librejustice-dev"
 bin-package = "lj-server"
 lib-package = "lj-web"
 output-name = "lj-web"
-site-root = "target/site"
+site-root = "target/site-dev"
 site-pkg-dir = "pkg"
 tailwind-input-file = "packages/lj-web/style/main.css"
 assets-dir = "packages/lj-web/public"
@@ -236,29 +243,51 @@ lib-features = ["hydrate"]
 lib-default-features = false
 hash-files = false
 
-# Profil du binaire serveur (lj-server) + ingest/bench. `codegen-units = 16` +
-# `lto = false` : priorité à l'itération sur l'hôte de build, qui builde ET
-# déploie sur 2 cœurs (le thin-LTO est partiellement sériel → cher ici). Coût
-# runtime mesuré sur les hot-ops, vs `lto = "thin"` : highlight de recherche
-# +9 % (+247 µs), parse décision +4,6 % (+122 µs) — du sub-ms, noyé dans le
-# DB/ANN/rerank (dizaines de ms) d'une requête, donc invisible end-to-end ; en
-# échange le relink passe de ~secondes-à-minutes à quasi instantané. La TAILLE
-# du bundle wasm reste optimisée par `wasm-release` ci-dessous (lto=fat) qui
-# surcharge ce profil.
+# Projet de la vérification locale, qui ne builde le front que pour
+# wasm-bindgen. Il reprend la sélection, les features et les RUSTFLAGS du
+# `cargo test --workspace` qui précède : sinon chaque crate partagé a un second
+# exemplaire compilé, recompilé à chaque run.
+[[workspace.metadata.leptos]]
+name = "librejustice-ci"
+bin-package = "lj-server"
+lib-package = "lj-web"
+output-name = "lj-web"
+site-root = "target/site-ci"
+site-pkg-dir = "pkg"
+tailwind-input-file = "packages/lj-web/style/main.css"
+assets-dir = "packages/lj-web/public"
+site-addr = "127.0.0.1:3000"
+reload-port = 3001
+lib-features = ["hydrate"]
+lib-default-features = false
+hash-files = false
+bin-default-features = true
+bin-cargo-args = ["--workspace"]
+# Profil à lui : `cargo test` réécrit le mtime des unités partagées à contenu
+# identique, ce qui salit tout ce qui en dépend. Un profil sépare les unités
+# sans second `target`.
+bin-profile-dev = "ci"
+# `--cfg erase_components`, posé par défaut en debug, entre dans l'empreinte mais
+# pas dans le nom des unités : mêmes fichiers, deux empreintes, invalidation
+# mutuelle à chaque run.
+disable-erase-components = true
+
+# Profil des binaires. `codegen-units = 16` et `lto = false` donnent la priorité
+# à l'itération sur l'hôte de build, qui compile et déploie sur deux cœurs, le
+# thin-LTO étant partiellement sériel. Le coût runtime se compte en centaines de
+# microsecondes sur les hot-ops, noyées dans les dizaines de millisecondes de
+# DB/ANN/rerank d'une requête. La taille du bundle wasm reste, elle, optimisée
+# par `wasm-release` ci-dessous.
 [profile.release]
 lto = false
 codegen-units = 16
 
-# opt-0 sur nos deux crates serveur les plus lourds à recompiler (lj-web SSR
-# 12,7k LOC + lj-api 11,7k LOC). Un changement en amont de lj-web (lib métier)
-# force le recodegen release de cette clôture ; en opt-3 c'est ~4 min, en opt-0
-# ~1 min (mesuré : 4m04s → 1m08s, −72 %, cf. working-note build-speed). Les 646
-# deps externes restent opt-3 (cachées, non recompilées). Le bundle wasm est
-# protégé en opt-z par l'override wasm-release.package.lj-web ci-dessous (sinon il
-# hériterait de cet opt-0). Coûts assumés : render SSR ×2,2 (page décision cachée
-# CDN 7 j → ~nul en prod), binaire serveur +24 Mo (pas téléchargé), et hot-path
-# /api/search à opt-0 (non caché CDN) — risque latence à surveiller en prod
-# (span search p50/p95 Grafana) ; revert si régression.
+# opt-0 sur les deux crates serveur les plus lourds à recompiler : un changement
+# en amont de `lj-web` force le recodegen release de cette clôture, qui passe de
+# quatre minutes à une. Les dépendances externes restent opt-3, cachées. Le
+# bundle wasm est protégé par l'override `wasm-release.package.lj-web` plus bas,
+# sinon il hériterait de cet opt-0. En échange, le render SSR double et le
+# binaire grossit de 24 Mo.
 [profile.release.package.lj-web]
 opt-level = 0
 [profile.release.package.lj-api]
@@ -276,20 +305,34 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# Garde l'opt-z du bundle wasm : sans ça, l'override opt-0 de
-# `[profile.release.package.lj-web]` est hérité par wasm-release et ferait tomber
-# le wasm en opt-0 (taille). lj-api n'est pas dans le graphe wasm (hydrate sans
-# feature ssr) → pas de garde nécessaire pour lui.
+# Garde l'opt-z du bundle wasm : l'override opt-0 de
+# `[profile.release.package.lj-web]` est sinon hérité par `wasm-release`.
+# `lj-api` n'est pas dans le graphe wasm, il n'a pas besoin de garde.
 [profile.wasm-release.package.lj-web]
 opt-level = "z"
 
-# Boucle dev (`cargo leptos watch`) : le coût par save est dominé par le codegen
-# de lj-web (~6 s : expansion macros `view!` + monomorphisation Leptos) et le lien
-# de lj-server (~2,8 s : empaqueter le debuginfo dans un bin de ~5 Go). Le
-# debuginfo complet (`debug = 2`, défaut dev) pèse ~40 % du codegen lj-web (mesuré
-# A/B : 43,8 → 27,8 s en line-tables) ET alourdit le lien. `line-tables-only`
-# garde `fichier:ligne` dans les backtraces (ce qu'on veut en dev) en jetant le
-# debuginfo variables/types → ~40 % de codegen en moins sur chaque rebuild, des
-# deux côtés du watch (SSR + wasm hydrate). Pas de perte runtime (profil dev).
+# tachys forké : `AnyView` remplit `hydrate_async` pour chaque type erasé sous
+# le seul `cfg(hydrate)`, alors que seules les routes lazy l'atteignent — un
+# quart du bundle brotli en code mort. Le fork backporte leptos-rs/leptos#4438
+# sur la 0.2.15 publiée ; un `[patch]` sur le monorepo amont ferait entrer un
+# second `reactive_graph` dans le graphe. À retirer en 0.9, où le gate est
+# amont.
+[patch.crates-io]
+tachys = { git = "https://github.com/librejustice/tachys", rev = "d71bd7442162751080e5ff63d41af45e9a699e75" }
+
+# Un seul profil de développement, partagé par tout le monde : un réglage qui
+# diffère d'un poste à l'autre donne deux jeux d'artefacts pour le même code, et
+# un worktree neuf recompile alors tout le graphe.
+#
+# Le debuginfo pilote le coût — `debug = 2` pèse près de 40 % du codegen de
+# `lj-web` et alourdit le lien. On y perd `fichier:ligne` dans un backtrace ; le
+# message d'un `assert!` les porte encore, et une session de débogage qui a
+# besoin des numéros passe `CARGO_PROFILE_DEV_DEBUG=line-tables-only`.
 [profile.dev]
-debug = "line-tables-only"
+debug = 0
+
+# Sélectionné par `bin-profile-dev` du projet `librejustice-ci` ci-dessus. Il
+# n'en reste que le nom : c'est lui qui range les unités à part, les réglages
+# sont ceux de `dev`.
+[profile.ci]
+inherits = "dev"

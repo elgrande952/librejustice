@@ -1,4 +1,4 @@
-//! `ResultEmpty` (port de `result-empty.tsx`). Aucun résultat pour la requête.
+//! `ResultEmpty` : aucun résultat pour la requête.
 
 use leptos::prelude::*;
 

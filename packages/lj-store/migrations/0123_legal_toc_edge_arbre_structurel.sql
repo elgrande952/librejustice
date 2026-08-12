@@ -1,8 +1,8 @@
--- 0123 — legal_toc_edge : arbre structurel daté des textes DILA (ADR 0207).
+-- 0123 — legal_toc_edge : arbre structurel daté des textes DILA.
 -- Une ligne par enfant (article ou section) tel que listé par son propriétaire
 -- (`texte/struct` → owner = cid du texte ; `section_ta` → owner = id de version
 -- LEGISCTA). Écriture par remplacement par propriétaire, lecture par CTE
--- récursive filtrée par fenêtre [date_debut, date_fin) — cf. ADR 0207.
+-- récursive filtrée par fenêtre [date_debut, date_fin) —
 
 CREATE TABLE legal_toc_edge (
     owner_uid     TEXT NOT NULL,

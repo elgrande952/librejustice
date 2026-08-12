@@ -1,12 +1,11 @@
-//! Citations de jurisprudence (ADR 0165) : une occurrence = une ligne
-//! `case_citation` `(decision_id, char_start, char_end, target_ref,
-//! target_decision_id, extract_version)`. `target_ref` = clé pendante par
-//! famille ; `target_decision_id` posé par la résolution SQL (à l'écriture
-//! puis relink post-ingest — une cible peut arriver après ses citations).
+//! Citations de jurisprudence : une occurrence = une ligne `case_citation`
+//! `(decision_id, char_start, char_end, target_ref, target_decision_id,
+//! extract_version)`. `target_ref` = clé pendante par famille ;
+//! `target_decision_id` posé par la résolution SQL (à l'écriture puis relink
+//! post-ingest — une cible peut arriver après ses citations).
 //!
-//! Écriture par le patron de `citations.rs` : garde jamais-dégrader,
-//! skip-diff des sets inchangés (préserve les cibles déjà résolues),
-//! DELETE + COPY binaire.
+//! Écriture par le patron de `citations.rs` : garde jamais-dégrader, skip-diff des
+//! sets inchangés (préserve les cibles déjà résolues), DELETE + COPY binaire.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,6 +24,12 @@ pub type CaseCitationWriteItem = (i64, Option<Vec<CaseCitationRow>>);
 /// donnée d'extraction, il ne re-déclenche pas d'écriture.
 type CaseFingerprint = (i32, i32, String);
 
+/// Clé du verrou advisory transactionnel de la sonde inversée
+/// ([`DecisionRepository::attract_pending_citations`]) — hors de la plage des
+/// ids de décisions (le verrou par décision d'`apply_provenance` partage le
+/// même keyspace `pg_advisory_xact_lock(bigint)`).
+const ATTRACT_LOCK_KEY: i64 = 0x6c6a_5f61_7474_7261; // « lj_attra »
+
 impl DecisionRepository<'_> {
     /// (Ré)écrit les citations de jurisprudence d'UNE décision — sucre sur
     /// [`Self::replace_case_citations_bulk`].
@@ -32,24 +37,26 @@ impl DecisionRepository<'_> {
         &self,
         decision_id: i64,
         citations: Option<&[CaseCitationRow]>,
-    ) -> Result<()> {
+    ) -> Result<Vec<i64>> {
         self.replace_case_citations_bulk(&[(decision_id, citations.map(<[_]>::to_vec))])
             .await
     }
 
-    /// Écrit les citations de jurisprudence d'un lot de décisions (ADR 0165) :
-    /// garde jamais-dégrader (version > `EXTRACT_VERSION` = révision manuelle,
-    /// jamais remplacée), skip-diff des sets `(char_start, char_end,
-    /// target_ref)` inchangés (la passe intégrale hebdo ne doit pas churner,
-    /// et un set inchangé garde ses cibles résolues), puis DELETE + COPY
-    /// binaire. Les lignes réécrites repartent pendantes
-    /// (`target_decision_id` NULL) — la résolution par famille les reprend.
-    /// **La transaction appartient à l'appelant** (comme `citations.rs`).
-    /// Idempotent.
+    /// Écrit les citations de jurisprudence d'un lot de décisions : garde
+    /// jamais-dégrader (version > `EXTRACT_VERSION` = révision manuelle, jamais
+    /// remplacée), skip-diff des sets `(char_start, char_end, target_ref)` inchangés
+    /// (un set inchangé garde ses cibles résolues), puis DELETE + COPY binaire. Les
+    /// lignes réécrites repartent pendantes (`target_decision_id` NULL) — la résolution
+    /// par famille les reprend. **La transaction appartient à l'appelant.** Idempotent.
+    /// Rend les décisions RÉELLEMENT réécrites, pour que l'appelant date leur page du
+    /// jour.
     #[tracing::instrument(name = "db.replace_case_citations_bulk", skip(self, items), fields(db.system = "postgresql", items = items.len()))]
-    pub async fn replace_case_citations_bulk(&self, items: &[CaseCitationWriteItem]) -> Result<()> {
+    pub async fn replace_case_citations_bulk(
+        &self,
+        items: &[CaseCitationWriteItem],
+    ) -> Result<Vec<i64>> {
         if items.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
         let protected: HashSet<i64> = self
@@ -95,11 +102,9 @@ impl DecisionRepository<'_> {
             })
             .collect();
         if changed.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
-        // Asserts durs à l'entrée (tri strict, zéro chevauchement, span non
-        // vide) — l'amont les garantit, une violation est un bug (règle #12).
         for (decision_id, citations) in &changed {
             let mut prev_end = i32::MIN;
             for c in citations.as_deref().unwrap_or(&[]) {
@@ -155,28 +160,30 @@ impl DecisionRepository<'_> {
             self.resolve_case_citations_scoped(Some(&changed_ids))
                 .await?;
         }
-        Ok(())
+        Ok(changed_ids)
     }
 
-    /// Résout en batch toutes les citations pendantes dont la cible est en
-    /// base (relink post-ingest / passe hebdo — une cible peut arriver après
-    /// ses citations). Renvoie le nombre de citations résolues.
+    /// Résout en batch toutes les citations pendantes dont la cible est en base
+    /// (relink post-ingest / passe hebdo — une cible peut arriver après ses citations).
+    /// Renvoie le nombre de citations résolues.
     #[tracing::instrument(name = "db.resolve_pending_case_citations", skip(self), fields(db.system = "postgresql"))]
     pub async fn resolve_pending_case_citations(&self) -> Result<u64> {
         self.resolve_case_citations_scoped(None).await
     }
 
-    /// Résolution par famille (ADR 0165 §4) contre les `docket_numbers` des
-    /// cibles (GIN, migration 0113), clé reformatée côté requête au format
-    /// stocké. Match unique (`HAVING`-équivalent) → `target_decision_id` ;
-    /// CJUE multi-match → snap au document ARRÊT (type CELEX `J` du
-    /// `source_uid`, jamais les conclusions AG) ; ambigu ou introuvable →
-    /// reste pendant, relinkable. `ids` = portée at-write (lignes fraîchement
-    /// écrites), `None` = tout le pendant.
+    /// Résolution par famille contre les `docket_numbers` des cibles (GIN), clé
+    /// reformatée côté requête au format stocké. Match unique → `target_decision_id` ;
+    /// CJUE multi-match → snap au document ARRÊT (type CELEX `J` du `source_uid`,
+    /// jamais les conclusions AG) ; ambigu ou introuvable → reste pendant, relinkable.
+    /// `ids` = portée at-write (lignes fraîchement écrites), `None` = tout le pendant.
     async fn resolve_case_citations_scoped(&self, ids: Option<&[i64]>) -> Result<u64> {
+        let scope = match ids {
+            Some(_) => ResolveScope::ByDecision,
+            None => ResolveScope::All,
+        };
         let mut resolved = 0u64;
-        let mut sqls = resolve_case_family_sqls(ids.is_some());
-        sqls.push(resolve_from_links_sql(ids.is_some()));
+        let mut sqls = resolve_case_family_sqls(scope);
+        sqls.push(resolve_from_links_sql(scope));
         for sql in sqls {
             let n = match ids {
                 Some(ids) => self.conn.execute(sql.as_str(), &[&ids]).await?,
@@ -187,10 +194,23 @@ impl DecisionRepository<'_> {
         Ok(resolved)
     }
 
-    /// (Ré)écrit les citations de jurisprudence d'un TEXTE du référentiel
-    /// (ADR 0196 §5) : DELETE + COPY au grain `owner_text_uid` (corps + tous
-    /// ses articles d'un coup — l'extraction passe le texte entier). Les
-    /// lignes repartent pendantes ; la résolution se lance en fin de passe
+    /// Résolution par CLÉ pendante (sonde inversée) : familles + pont, bornés
+    /// aux `target_ref` d'un lot de clés candidates. Même sémantique d'unicité
+    /// que le sweep (les SQL de famille font foi).
+    async fn resolve_case_citations_by_key(&self, keys: &[String]) -> Result<u64> {
+        let mut resolved = 0u64;
+        let mut sqls = resolve_case_family_sqls(ResolveScope::ByKey);
+        sqls.push(resolve_from_links_sql(ResolveScope::ByKey));
+        for sql in sqls {
+            resolved += self.conn.execute(sql.as_str(), &[&keys]).await?;
+        }
+        Ok(resolved)
+    }
+
+    /// (Ré)écrit les citations de jurisprudence d'un TEXTE du référentiel : DELETE +
+    /// COPY au grain `owner_text_uid` (corps + tous ses articles d'un coup —
+    /// l'extraction passe le texte entier). Les lignes repartent pendantes ; la
+    /// résolution se lance en fin de passe
     /// ([`Self::resolve_pending_text_case_citations`]). Idempotent.
     pub async fn replace_text_case_citations(
         &self,
@@ -245,31 +265,113 @@ impl DecisionRepository<'_> {
     }
 
     /// Résout les `text_case_citation` pendantes : mêmes familles SQL que
-    /// `case_citation` (colonnes cibles identiques par construction, migration
-    /// 0136) — seul le nom de table change. Pas de pont `decision_links` (les
-    /// textes n'ont pas de chronologie).
+    /// `case_citation` (colonnes cibles identiques par construction) — seul le nom de
+    /// table change. Pas de pont `decision_links` (les textes n'ont pas de
+    /// chronologie).
     #[tracing::instrument(name = "db.resolve_pending_text_case_citations", skip(self), fields(db.system = "postgresql"))]
     pub async fn resolve_pending_text_case_citations(&self) -> Result<u64> {
         let mut resolved = 0u64;
-        for sql in resolve_case_family_sqls(false) {
+        for sql in resolve_case_family_sqls(ResolveScope::All) {
             let sql = sql.replace("case_citation", "text_case_citation");
             resolved += self.conn.execute(sql.as_str(), &[]).await?;
         }
         Ok(resolved)
     }
+
+    /// Jumeau par CLÉ de [`Self::resolve_pending_text_case_citations`] (sonde
+    /// inversée) — mêmes familles, table `text_case_citation`, sans pont.
+    async fn resolve_text_case_citations_by_key(&self, keys: &[String]) -> Result<u64> {
+        let mut resolved = 0u64;
+        for sql in resolve_case_family_sqls(ResolveScope::ByKey) {
+            let sql = sql.replace("case_citation", "text_case_citation");
+            resolved += self.conn.execute(sql.as_str(), &[&keys]).await?;
+        }
+        Ok(resolved)
+    }
+
+    /// Sonde inversée des pendants (à l'arrivée d'un lot de décisions CIBLES) : `keys`
+    /// = clés candidates par famille (`lj_extract::identity::pending_target_keys`,
+    /// inverse des reformatages des SQL de résolution), `canonical_refs` = identités
+    /// des cibles (clés de chronologie et clés `contested`). Sonde les index pendants
+    /// (`*_pending_target_idx`), puis ne rejoue les résolveurs par clé que sur les
+    /// hits : liens de chronologie d'abord, familles + pont ensuite, citations
+    /// texte→décision enfin. Zéro hit (cas courant) = zéro UPDATE. **Tourne dans la
+    /// transaction de l'appelant** ; sérialisée inter-workers par un verrou advisory
+    /// transactionnel (les UPDATE par clé sont corpus-wide, deux lots croisés
+    /// s'attendent au lieu de se deadlocker). Renvoie le nombre de pendants résolus.
+    #[tracing::instrument(name = "db.attract_pending_citations", skip_all, fields(db.system = "postgresql", keys = keys.len(), refs = canonical_refs.len()))]
+    pub async fn attract_pending_citations(
+        &self,
+        keys: &[String],
+        canonical_refs: &[String],
+    ) -> Result<u64> {
+        // Clés candidates côté citations : familles + `contested`/chronologie
+        // (une citation `contested` porte la clé canonical_ref de sa cible).
+        let citation_keys: Vec<String> = keys.iter().chain(canonical_refs).cloned().collect();
+        let case_hits = self.probe_pending("case_citation", &citation_keys).await?;
+        let text_hits = self.probe_pending("text_case_citation", keys).await?;
+        let link_hits = self.probe_pending("decision_links", canonical_refs).await?;
+        if case_hits.is_empty() && text_hits.is_empty() && link_hits.is_empty() {
+            return Ok(0);
+        }
+        self.conn
+            .execute("SELECT pg_advisory_xact_lock($1)", &[&ATTRACT_LOCK_KEY])
+            .await?;
+        let mut resolved = 0u64;
+        if !link_hits.is_empty() {
+            resolved += self.resolve_decision_links_by_key(&link_hits).await?;
+        }
+        if !case_hits.is_empty() {
+            resolved += self.resolve_case_citations_by_key(&case_hits).await?;
+        }
+        if !text_hits.is_empty() {
+            resolved += self.resolve_text_case_citations_by_key(&text_hits).await?;
+        }
+        Ok(resolved)
+    }
+
+    /// Clés pendantes effectivement présentes dans `table` parmi `keys` —
+    /// index-only scan sur l'index partiel `(target_ref) WHERE
+    /// target_decision_id IS NULL` (même prédicat que les résolveurs).
+    async fn probe_pending(&self, table: &str, keys: &[String]) -> Result<Vec<String>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT DISTINCT target_ref FROM {table} \
+                     WHERE target_decision_id IS NULL AND target_ref = ANY($1)"
+                ),
+                &[&keys],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
 }
 
-/// Pont chronologie → citations (spans pontés métadonnée, v22) : une citation
-/// pendante dont la clé est CELLE d'un lien de chronologie résolu de la même
-/// décision hérite de sa cible. Les clés `contested`
-/// (`ca|<loc>|<rg>|<date>`, `tj|…`, `tcom|…`) n'ont pas de famille docket —
-/// seul ce pont les résout. Les liens sont écrits et résolus AVANT les
+/// Portée d'une passe de résolution : tout le pendant (sweep `reconcile`),
+/// le pendant des décisions CITANTES d'un lot (at-write côté source, `$1` =
+/// ids), ou le pendant par CLÉ (`$1` = `target_ref[]` — sonde inversée, à
+/// l'arrivée de la cible).
+#[derive(Clone, Copy, PartialEq)]
+enum ResolveScope {
+    All,
+    ByDecision,
+    ByKey,
+}
+
+/// Pont chronologie → citations : une citation pendante dont la clé est CELLE d'un
+/// lien de chronologie résolu de la même décision hérite de sa cible. Les clés
+/// `contested` (`ca|<loc>|<rg>|<date>`, `tj|…`, `tcom|…`) n'ont pas de famille
+/// docket — seul ce pont les résout. Les liens sont écrits et résolus AVANT les
 /// citations dans le flux d'écriture (`decisions.rs`).
-fn resolve_from_links_sql(scoped: bool) -> String {
-    let scope = if scoped {
-        " AND c.decision_id = ANY($1)"
-    } else {
-        ""
+fn resolve_from_links_sql(scope: ResolveScope) -> String {
+    let scope = match scope {
+        ResolveScope::All => "",
+        ResolveScope::ByDecision => " AND c.decision_id = ANY($1)",
+        ResolveScope::ByKey => " AND c.target_ref = ANY($1)",
     };
     format!(
         "UPDATE case_citation c \
@@ -283,12 +385,12 @@ fn resolve_from_links_sql(scoped: bool) -> String {
 }
 
 /// Les sept UPDATE de résolution par famille — fonction pure (dumpable pour
-/// validation psql). `scoped` borne le pendant aux décisions d'un lot (`$1`).
-fn resolve_case_family_sqls(scoped: bool) -> Vec<String> {
-    let scope = if scoped {
-        " AND p.decision_id = ANY($1)"
-    } else {
-        ""
+/// validation psql). `scope` borne le pendant à un lot (`$1`).
+fn resolve_case_family_sqls(scope: ResolveScope) -> Vec<String> {
+    let scope = match scope {
+        ResolveScope::All => "",
+        ResolveScope::ByDecision => " AND p.decision_id = ANY($1)",
+        ResolveScope::ByKey => " AND p.target_ref = ANY($1)",
     };
     [
             // CC : clé chiffres seuls (7) reformatée « 18-23.954 ».
@@ -325,17 +427,15 @@ fn resolve_case_family_sqls(scoped: bool) -> Vec<String> {
                  {RESOLVE_UNIQUE_BY_TYPE}",
                 RESOLVE_UNIQUE_BY_TYPE = resolve_unique_by_type("CONSTIT"),
             ),
-            // RG (fond judiciaire) / AF (fond administratif TA/CAA, ADR 0165
-            // [af]) : même mécanique, scopée au tribunal (jurisdiction_code de
-            // la clé). Les clés NUES `rg||NUM` (juridiction non mappée) ne
-            // résolvent JAMAIS par construction — exclues d'emblée, sinon chaque
-            // numéro sonde le GIN pour rien (un RG court matche des dizaines de
-            // tribunaux).
+            // RG (fond judiciaire) / AF (fond administratif TA/CAA) : même mécanique, scopée
+            // au tribunal (jurisdiction_code de la clé). Les clés NUES `rg||NUM` (juridiction
+            // non mappée) ne résolvent JAMAIS par construction — exclues d'emblée, sinon
+            // chaque numéro sonde le GIN pour rien.
             resolve_by_jurisdiction_code("rg"),
             resolve_by_jurisdiction_code("af"),
-            // CJUE : docket = l'AFFAIRE (arrêt + conclusions + ordonnances le
-            // partagent) — match unique sinon snap au document arrêt (CELEX
-            // `6YYYY<cour>J…` du source_uid). Clé nue (« aff. 6/64 ») → C-.
+            // CJUE : docket = l'AFFAIRE (arrêt + conclusions + ordonnances le partagent) —
+            // match unique sinon snap au document arrêt (CELEX `6YYYY<cour>J…` du
+            // source_uid). Clé nue (« aff. 6/64 ») → C-.
             format!(
                 "{RESOLVE_HEAD} \
                  SELECT p.target_ref, \
@@ -387,19 +487,15 @@ const RESOLVE_TAIL: &str = " \
  WHERE c.target_ref = m.target_ref AND c.target_decision_id IS NULL \
    AND m.tid IS NOT NULL";
 
-/// Corps « match unique par type de juridiction » : ferme le CTE `keys` et
-/// résout chaque clé contre les décisions du type portant le docket.
+/// Corps « match unique par `jurisdiction_code` » : famille du fond (`rg`
+/// judiciaire, `af` administratif) — la clé porte `{prefix}|{code}|{docket}`, on
+/// résout le docket contre les décisions du MÊME `jurisdiction_code`. Clés nues
+/// (`{prefix}||NUM`, code vide) exclues d'emblée (jamais résolubles).
 ///
 /// Le lookup docket est clôturé (`OFFSET 0`) pour forcer le GIN seul : sans la
-/// clôture, le planner combine en `BitmapAnd` avec l'index `jurisdiction_type`
-/// et scanne des centaines de milliers d'entrées PAR clé (mesuré : 8,5 s par
-/// batch at-write sur la famille CC contre 1 ligne attendue du GIN). Le filtre
-/// juridiction s'applique après, sur les ~1-3 candidats du docket.
-/// Corps « match unique par `jurisdiction_code` » : famille du fond (`rg`
-/// judiciaire, `af` administratif) — la clé porte `{prefix}|{code}|{docket}`,
-/// on résout le docket contre les décisions du MÊME `jurisdiction_code`. Clés
-/// nues (`{prefix}||NUM`, code vide) exclues d'emblée (jamais résolubles). Même
-/// clôture `OFFSET 0` que [`resolve_unique_by_type`] pour forcer le GIN seul.
+/// clôture, le planner le combine en `BitmapAnd` avec l'index de juridiction et
+/// scanne des centaines de milliers d'entrées PAR clé. Le filtre juridiction
+/// s'applique après, sur les quelques candidats du docket.
 fn resolve_by_jurisdiction_code(prefix: &str) -> String {
     format!(
         "{RESOLVE_HEAD} \
@@ -443,7 +539,7 @@ mod tests {
     /// sept UPDATE pour validation psql (table temporaire + clés sondes).
     #[test]
     fn resolve_case_family_sqls_cover_families_and_scope() {
-        let all = resolve_case_family_sqls(false);
+        let all = resolve_case_family_sqls(ResolveScope::All);
         assert_eq!(all.len(), 7);
         for fam in [
             "'cc|%'",
@@ -461,7 +557,12 @@ mod tests {
             assert!(!s.contains("$1"), "portée $1 en mode global : {s}");
             println!("{s};\n");
         }
-        let scoped = resolve_case_family_sqls(true);
-        assert!(scoped.iter().all(|s| s.contains("ANY($1)")));
+        let by_decision = resolve_case_family_sqls(ResolveScope::ByDecision);
+        assert!(by_decision
+            .iter()
+            .all(|s| s.contains("p.decision_id = ANY($1)")));
+        let by_key = resolve_case_family_sqls(ResolveScope::ByKey);
+        assert!(by_key.iter().all(|s| s.contains("p.target_ref = ANY($1)")));
+        assert!(resolve_from_links_sql(ResolveScope::ByKey).contains("c.target_ref = ANY($1)"));
     }
 }

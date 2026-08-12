@@ -1,4 +1,4 @@
--- Migration 0062 — Retrait du graphe de citations décision↔décision (ADR 0098 §6).
+-- Migration 0062 — Retrait du graphe de citations décision↔décision.
 --
 -- Le doc-linking passe désormais par les provenances (`decision_sources`) ; le
 -- graphe de citations brutes est différé (recomputable depuis `source_fields`

@@ -1,4 +1,4 @@
-//! Downloader bulk DILA no-auth + réparation d'encodage au bord (ADR 0093).
+//! Downloader bulk DILA no-auth + réparation d'encodage au bord.
 //!
 //! La DILA diffuse les fonds JADE / CONSTIT en bulk XML sans
 //! authentification sur `https://echanges.dila.gouv.fr/OPENDATA/<FOND>/` : un
@@ -10,10 +10,9 @@
 //!
 //! La lecture des `.tar.gz` (XML + `.dat` de suppression) vit dans
 //! [`crate::tar_reader`]. Le parsing métier vit dans `lj-core` ; ce module est le
-//! bord I/O. C'est aussi ici, et pas dans le parser pur, que vit
-//! [`repair_dila`] : la réparation d'encodage (entités double-échappées +
-//! mojibake double-encodage des sous-arbres JADE) est une frontière de
-//! validation I/O propre à la diffusion DILA (AGENTS.md #1/#12).
+//! bord I/O, et c'est là que vit [`repair_dila`] : la réparation d'encodage
+//! (entités double-échappées + mojibake double-encodage des sous-arbres JADE) est
+//! une frontière de validation I/O propre à la diffusion DILA.
 
 use crate::downloader::{get_to_file_retrying, get_with_body_retrying};
 use crate::error::{Result, SourceError};
@@ -30,20 +29,20 @@ const DILA_BASE_URL: &str = "https://echanges.dila.gouv.fr/OPENDATA";
 const DILA_USER_AGENT: &str = "librejustice-dila-downloader/0.1 (+https://github.com/)";
 use crate::state_paths::DILA_DIR;
 
-/// Fonds DILA bulk no-auth (ADR 0093). Le segment de listing est en majuscules
+/// Fonds DILA bulk no-auth. Le segment de listing est en majuscules
 /// (`OPENDATA/JADE/`), le préfixe d'incrément aussi (`JADE_YYYYMMDD-HHMMSS`),
 /// l'infixe du stock est en minuscules (`Freemium_jade_global_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DilaFond {
     Jade,
     Constit,
-    /// Délibérations/décisions de la CNIL (fond `OPENDATA/CNIL/`, ADR 0185).
+    /// Délibérations/décisions de la CNIL (fond `OPENDATA/CNIL/`).
     Cnil,
     Legi,
     /// Journal officiel : décrets de publication des traités/accords (référentiel
-    /// `source='treaty'`, ADR 0109) + usage JORF général futur.
+    /// `source='treaty'`).
     Jorf,
-    /// Conventions collectives nationales (KALICONT/KALIARTI, ADR 0120).
+    /// Conventions collectives nationales (KALICONT/KALIARTI).
     Kali,
 }
 
@@ -88,7 +87,7 @@ impl DilaFond {
 /// Dossier local des `tar.gz` d'un fond DILA sous `data_dir`
 /// (`<data_dir>/dila/<infix>/tarballs/`). Source unique du layout pour
 /// [`sync_dila`] (qui y écrit les incréments téléchargés) et l'ingest (qui les
-/// relit). Le stock global (bootstrap auto au cold start) y est aussi déposé.
+/// relit). Le stock global y est aussi déposé.
 pub fn tarballs_dir(data_dir: &Path, fond: DilaFond) -> std::path::PathBuf {
     data_dir
         .join(DILA_DIR)
@@ -187,15 +186,12 @@ pub(crate) fn http_client() -> Result<reqwest::blocking::Client> {
         .user_agent(DILA_USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         // Timeout TOTAL généreux : un stock global multi-Go streamé peut prendre
-        // longtemps (read_timeout par-chunk absent du client blocking reqwest 0.13).
-        // Les 4 retries de get_to_file_retrying couvrent les coupures.
+        // longtemps (pas de read_timeout par chunk sur le client blocking reqwest).
         .timeout(Duration::from_secs(3600))
-        // PAS de réutilisation de connexion : DILA = downloads séquentiels (aucun
-        // gain de keepalive). Surtout, une connexion poolée réutilisée finit par
-        // se figer (spin CPU 100 %, fds multiples sur le même socket) sur le chemin
-        // réseau hôte ↔ echanges.dila.gouv.fr après quelques requêtes — chaque
-        // requête repart donc sur une connexion neuve (comportement de curl, qui
-        // lui ne fige jamais). Borne aussi le nombre de sockets ouverts.
+        // PAS de réutilisation de connexion : une connexion poolée réutilisée finit
+        // par se figer (spin CPU 100 %, fds multiples sur le même socket) sur le chemin
+        // réseau vers echanges.dila.gouv.fr. Chaque requête repart donc sur une
+        // connexion neuve, ce qui borne aussi le nombre de sockets ouverts.
         .pool_max_idle_per_host(0)
         .build()?)
 }
@@ -218,14 +214,12 @@ fn list_tarballs(client: &reqwest::blocking::Client, fond: DilaFond) -> Result<V
 }
 
 /// Exécute une opération réseau bloquante sous watchdog : si elle dépasse
-/// `threshold` sans rendre la main, un thread SÉPARÉ émet un `ERROR` (exporté vers
-/// Grafana via OTLP). Indispensable : le client blocking reqwest peut se figer en
-/// spin CPU 100 % SANS logger ni timeouter (son runtime tokio bloqué ne traite
-/// plus son propre timer) — sans ce watchdog l'incident est invisible et, dans le
-/// cron, fige toute la chaîne (`&&`) en silence. Le watchdog ne PEUT pas
-/// interrompre le spin (on ne tue pas proprement un thread bloqué) : il rend
-/// l'incident VISIBLE/alertable (`message=~"dila_network_stall"`). `drop(tx)` au
-/// retour réveille le watchdog immédiatement → zéro latence sur le cas normal.
+/// `threshold` sans rendre la main, un thread SÉPARÉ émet un `ERROR` exporté vers
+/// Grafana. Le client blocking reqwest peut se figer en spin CPU 100 % sans
+/// logger ni timeouter, son runtime tokio bloqué ne traitant plus son propre
+/// timer. Le watchdog ne PEUT pas interrompre le spin : il rend l'incident
+/// visible et alertable (`message=~"dila_network_stall"`). `drop(tx)` au retour
+/// le réveille immédiatement.
 pub(crate) fn with_stall_watchdog<T>(what: &str, threshold: Duration, op: impl FnOnce() -> T) -> T {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let label = what.to_string();
@@ -251,16 +245,12 @@ pub(crate) fn with_stall_watchdog<T>(what: &str, threshold: Duration, op: impl F
 /// Télécharge un tarball nommé sous `OPENDATA/<FOND>/` vers `dst` (tmp + rename).
 ///
 /// Idempotent par PRÉSENCE : on skip si `dst` existe. Les tarballs DILA (stock
-/// comme incréments) sont immuables — nommés par timestamp de publication — donc
-/// la présence suffit à décider du skip. On ne fait PAS de HEAD `Content-Length`
-/// préalable : sur le chemin hôte↔DILA le HEAD du client blocking reqwest se fige
-/// en spin CPU 100 % (runtime tokio wedgé, n'honore plus son timeout) et, sans
-/// retry, bloque la chaîne à vie. Le GET, lui, ne fige pas (connexion neuve +
-/// 4 retries dans `get_to_file_retrying`). Intégrité du téléchargement : un
-/// stream coupé en cours remonte une erreur post-`send()` → retenté ; le `.part`
-/// n'est renommé vers `dst` que sur GET complet (statut 200) ; une troncature
-/// "propre" résiduelle échoue de toute façon à la décompression `.tar.gz` à
-/// l'extraction.
+/// comme incréments) sont immuables, nommés par timestamp de publication. Pas de
+/// HEAD `Content-Length` préalable : sur le chemin hôte↔DILA le HEAD du client
+/// blocking reqwest se fige en spin CPU 100 % et bloque la chaîne à vie. Le
+/// `.part` n'est renommé vers `dst` que sur GET complet (statut 200) ; une
+/// troncature « propre » résiduelle échoue de toute façon à la décompression
+/// `.tar.gz`.
 fn download_tarball(
     client: &reqwest::blocking::Client,
     fond: DilaFond,
@@ -278,7 +268,7 @@ fn download_tarball(
     // Streamé sur disque (RAM ~constante : un stock global pèse plusieurs Go).
     let tmp = dst.with_extension("part");
     // Seuil large (600 s) : un stock global multi-Go peut légitimement streamer
-    // plusieurs minutes ; au-delà = spin (sinon infini).
+    // plusieurs minutes ; au-delà = spin.
     let (status, _, octets) =
         with_stall_watchdog(&format!("GET {name}"), Duration::from_secs(600), || {
             get_to_file_retrying(&url, &tmp, || client.get(&url).send())
@@ -333,8 +323,8 @@ pub fn sync_dila(data_dir: &Path, fond: DilaFond) -> Result<Vec<std::path::PathB
     let mut downloaded = Vec::new();
 
     // Cold start : bootstrap du stock global le plus récent AVANT les incréments,
-    // watermark calé sur sa date. Erreur franche si aucun stock publié (#12) — un
-    // fond ne peut pas démarrer par diff.
+    // watermark calé sur sa date. Erreur franche si aucun stock publié — un fond ne
+    // peut pas démarrer par diff.
     if !manifest.stock_fetched {
         let stock = stocks.last().ok_or_else(|| {
             SourceError::Invalid(format!(
@@ -375,7 +365,7 @@ pub fn sync_dila(data_dir: &Path, fond: DilaFond) -> Result<Vec<std::path::PathB
 /// d'incréments (`<FOND>_YYYYMMDD-HHMMSS.tar.gz`). Si le nom du stock est
 /// inattendu (préfixe/suffixe absents), on renvoie un watermark vide
 /// (`<SEGMENT>_.tar.gz`) — borne basse : tous les incréments s'appliqueront,
-/// l'idempotence par checksum (#7) absorbe un éventuel recouvrement.
+/// l'idempotence par checksum absorbe le recouvrement.
 fn stock_watermark(fond: DilaFond, stock_name: &str) -> String {
     let ts = stock_name
         .strip_prefix(&format!("Freemium_{}_global_", fond.stock_infix()))
@@ -385,28 +375,26 @@ fn stock_watermark(fond: DilaFond, stock_name: &str) -> String {
 }
 
 // ----------------------------------------------------------------------------
-// Réparation d'encodage (bord I/O — décision #3 du grounding, ADR 0093 §Décision)
+// Réparation d'encodage (bord I/O)
 // ----------------------------------------------------------------------------
 
 /// Répare l'XML brut DILA avant parsing pur (`lj-core`).
 ///
 /// Deux corrections, distinctes :
 /// 1. **Mojibake double-encodage UTF-8** (`Ã©`→`é`, `â€™`→`'`), confiné aux
-///    sous-arbres `SCT` / `ANA` / `CITATION_JP` de **JADE** uniquement
-///    (audit : le `CONTENU` est propre). On localise ces spans par regex et on
-///    applique [`undo_mojibake`] **dans le span seulement** — jamais global, qui
-///    casserait le texte propre adjacent (ADR 0093 §Alternatives).
+///    sous-arbres `SCT` / `ANA` / `CITATION_JP` de **JADE** uniquement (le
+///    `CONTENU` est propre). On localise ces spans par regex et on applique
+///    [`undo_mojibake`] **dans le span seulement**, jamais globalement.
 /// 2. **Entités double-échappées** (`&amp;nbsp;`, tous fonds) : de-escape global
 ///    en `\u{a0}`.
 ///
 /// Ordre : mojibake d'abord, de-escape ensuite. Le roundtrip latin1/cp1252
 /// reconstitue des octets par caractère ≤ 0xFF ; un `\u{a0}` (0xA0) injecté avant
 /// par la de-escape ferait échouer le décodage UTF-8 du span (0xA0 = octet de
-/// continuation isolé), neutralisant la réparation. La séquence `&amp;nbsp;`
-/// (ASCII pur) traverse le roundtrip inchangée.
+/// continuation isolé). La séquence `&amp;nbsp;` (ASCII pur) traverse le
+/// roundtrip inchangée.
 pub fn repair_dila(raw: &[u8], fond: DilaFond) -> Vec<u8> {
-    // Le document se déclare UTF-8 ; un octet isolé invalide n'arrive pas sur ce
-    // flux, mais `from_utf8_lossy` reste la frontière franche au cas où.
+    // Le document se déclare UTF-8 ; `from_utf8_lossy` est la frontière franche.
     let text = String::from_utf8_lossy(raw);
 
     let demojibake = if fond == DilaFond::Jade {
@@ -515,31 +503,23 @@ mod tests {
 
     #[test]
     fn stock_watermark_derives_increment_comparable_name() {
-        // Le watermark dérivé du stock doit trier AVANT les incréments postérieurs
-        // et APRÈS ceux du même jour antérieurs à l'heure du stock.
         let wm = stock_watermark(
             DilaFond::Legi,
             "Freemium_legi_global_20250713-140000.tar.gz",
         );
         assert_eq!(wm, "LEGI_20250713-140000.tar.gz");
-        assert!("LEGI_20250714-000000.tar.gz" > wm.as_str()); // postérieur → appliqué
-        assert!("LEGI_20250712-211706.tar.gz" < wm.as_str()); // antérieur → ignoré
-                                                              // Nom de stock inattendu → borne basse (timestamp vide), tout s'applique.
+        assert!("LEGI_20250714-000000.tar.gz" > wm.as_str());
+        assert!("LEGI_20250712-211706.tar.gz" < wm.as_str());
         assert_eq!(
             stock_watermark(DilaFond::Jade, "Freemium_autre.tar.gz"),
             "JADE_.tar.gz"
         );
     }
 
-    // ----- repair_dila (décision #3, tests #8) -----
+    // ----- repair_dila -----
 
-    /// `Ã©` (octets `\xc3\x83\xc2\xa9` décodés UTF-8) → `é` DANS un span ANA, et
-    /// `â€™` → `’` DANS un span SCT ; le `CONTENU` propre adjacent N'EST PAS
-    /// touché ; `&amp;nbsp;` est de-escapé globalement.
     #[test]
     fn repair_jade_fixes_mojibake_only_in_sct_ana_spans() {
-        // Mojibake tel qu'il apparaît une fois l'XML décodé en UTF-8 :
-        //   "Ã©" = é re-encodé latin-1 ; "dâ€™une" = d’une re-encodé cp1252.
         let raw = concat!(
             "<ROOT>",
             "<CONTENU>alinéa propre d'une décision</CONTENU>",
@@ -549,15 +529,11 @@ mod tests {
         );
         let out = String::from_utf8(repair_dila(raw.as_bytes(), DilaFond::Jade)).unwrap();
 
-        // Mojibake réparé dans les spans.
         assert!(out.contains("<SCT ID=\"x\" TYPE=\"PRINCIPAL\">d’une réf\u{a0}ici</SCT>"));
         assert!(out.contains("<ANA ID=\"y\">des éléments</ANA>"));
-        // CONTENU propre intact (octets é/d' non altérés).
         assert!(out.contains("<CONTENU>alinéa propre d'une décision</CONTENU>"));
     }
 
-    /// Un span propre adjacent au bruit reste byte-identique (pas de réparation
-    /// destructrice : `undo_mojibake` ne réécrit que si la séquence change).
     #[test]
     fn repair_jade_leaves_clean_span_untouched() {
         let raw = "<ROOT><ANA ID=\"z\">analyse déjà propre, n° 493597</ANA></ROOT>";
@@ -565,8 +541,6 @@ mod tests {
         assert_eq!(out, raw);
     }
 
-    /// Hors JADE, aucune réparation mojibake par span ; seul `&amp;nbsp;` est
-    /// de-escapé (CONSTIT).
     #[test]
     fn repair_non_jade_only_deescapes_entities() {
         let raw = "<ROOT><CONTENU>Ã© reste tel quel&amp;nbsp;fin</CONTENU></ROOT>";

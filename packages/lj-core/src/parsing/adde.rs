@@ -125,13 +125,11 @@ pub fn parse_adde_title(title: &str) -> Option<AddeCitation> {
     let year: u16 = caps[3].parse().ok()?;
     let date_iso = format!("{year:04}-{month:02}-{day:02}");
 
-    // Les dossiers suivent la date : on prend le reste du titre après la date.
     let after_date = &title[caps.get(0)?.end()..];
     let dockets: Vec<String> = after_date
         .split([',', ';'])
         .flat_map(|seg| seg.split(" et "))
         .filter_map(|seg| normalize_docket(seg, &jurisdiction))
-        // Un token de dossier contient au moins un chiffre.
         .filter(|d| d.chars().any(|c| c.is_ascii_digit()))
         .collect();
 

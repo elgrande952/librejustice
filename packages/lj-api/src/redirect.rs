@@ -1,20 +1,16 @@
-//! Redirection trailing-slash (parité Starlette `redirect_slashes=True`).
+//! Redirection trailing-slash.
 //!
-//! FastAPI/Starlette ne 404 pas sur une variante de slash : si le chemin demandé
-//! ne matche aucune route mais que le chemin avec le slash final basculé
-//! (ajouté/retiré) matche, Starlette renvoie un **307** vers le chemin canonique
-//! (méthode + corps préservés). axum exige un match exact et 404. On reproduit le
-//! 307 via le fallback du routeur racine.
+//! Si le chemin demandé ne matche aucune route mais que le chemin avec le slash
+//! final basculé (ajouté/retiré) matche, on renvoie un **307** vers le chemin
+//! canonique (méthode + corps préservés) via le fallback du routeur racine.
 //!
-//! Le fallback ne se déclenche QUE sur un miss de routage (aucune route ne matche
-//! le chemin) — exactement la condition de Starlette. Un 404 *retourné par un
-//! handler* (ex. décision absente) ne passe pas par ici.
+//! Le fallback ne se déclenche QUE sur un miss de routage (aucune route ne
+//! matche le chemin). Un 404 *retourné par un handler* (ex. décision absente)
+//! ne passe pas par ici.
 //!
 //! Détection sans introspection du routeur (non exposée par axum) : table des
 //! gabarits servis, tenue en miroir de `create_app` / `oauth` / `mcp`. Match au
-//! niveau du chemin uniquement ; le cas-limite méthode (Starlette n'exige le 307
-//! que sur un match FULL chemin+méthode) n'est pas reproduit — il ne survient que
-//! sur une combinaison mauvaise-méthode + mauvais-slash, hors de tout usage réel.
+//! niveau du chemin uniquement.
 
 use axum::extract::OriginalUri;
 use axum::http::StatusCode;
@@ -31,7 +27,6 @@ const SERVED_TEMPLATES: &[&str] = &[
     "/api/search-textes",
     "/api/decision/{p}",
     "/api/decision/{p}/similar",
-    "/api/decision/{p}/download.docx",
     "/api/decision/{p}/download.pdf",
     "/api/me",
     "/api/me/activity-tracking",
@@ -50,6 +45,8 @@ const SERVED_TEMPLATES: &[&str] = &[
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-protected-resource/mcp",
+    "/mcp/.well-known/oauth-authorization-server",
+    "/mcp/.well-known/oauth-protected-resource",
     // mcp (servi avec et sans slash, cf. `mcp::mcp_router`)
     "/mcp/",
     "/mcp",
@@ -88,8 +85,7 @@ fn toggle_trailing_slash(path: &str) -> Option<String> {
 }
 
 /// Fallback racine : 307 vers la variante de slash si elle matche une route,
-/// sinon 404 (parité Starlette `redirect_slashes`). La query string est
-/// préservée dans la `Location`.
+/// sinon 404. La query string est préservée dans la `Location`.
 pub async fn slash_redirect_fallback(OriginalUri(uri): OriginalUri) -> Response {
     let path = uri.path();
     if let Some(alt) = toggle_trailing_slash(path) {

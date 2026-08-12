@@ -1,10 +1,9 @@
-//! Lecteur d'archives `.tar.gz` bulk DILA/LEGI (miroir de `zip_reader.rs`, ADR 0093).
+//! Lecteur d'archives `.tar.gz` bulk DILA/LEGI (miroir de `zip_reader.rs`).
 //!
-//! Contrairement au ZIP (central directory = accès aléatoire), un tar.gz n'a
-//! pas d'index : on le lit en streaming via `GzDecoder` + `tar::Archive`, un
-//! membre à la fois. La mémoire utilisée est celle du plus gros membre lu, pas
-//! celle de l'archive entière — indispensable pour les **stocks globaux** (LEGI
-//! 1,5 M+ membres, plusieurs Go décompressés). `tar` remonte ses erreurs en
+//! Un tar.gz n'a pas d'index : on le lit en streaming via `GzDecoder` +
+//! `tar::Archive`, un membre à la fois. La mémoire utilisée est celle du plus
+//! gros membre lu, pas celle de l'archive entière — indispensable pour les
+//! **stocks globaux** (plusieurs Go décompressés). `tar` remonte ses erreurs en
 //! `std::io::Error`, captées par `SourceError::Io`.
 
 use crate::error::Result;
@@ -56,7 +55,7 @@ pub fn for_each_member(
 /// `f(nom)` un membre à la fois. Le `tar::Entries` avance seul au membre suivant
 /// (on ne `read_to_end` pas) : O(noms), pas de copie des octets (la décompression
 /// gzip reste, un `.tar.gz` n'étant pas seekable). Sert aux pré-passes qui
-/// décident sur le chemin seul (winner publie/inedit DILA, #36).
+/// décident sur le chemin seul.
 pub fn for_each_member_name(
     tar_path: &Path,
     mut f: impl FnMut(&str) -> anyhow::Result<()>,
@@ -79,8 +78,6 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
 
-    /// Construit un `.tar.gz` en mémoire avec 2 membres `.xml` (dont un en
-    /// `.XML` majuscule) + 1 membre non-`.xml`, écrit dans un fichier temporaire.
     fn build_fixture() -> tempfile::NamedTempFile {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let file = File::create(tmp.path()).unwrap();
@@ -104,8 +101,6 @@ mod tests {
         tmp
     }
 
-    /// `for_each_member` streame TOUS les fichiers (xml comme pdf) dans l'ordre
-    /// physique ; la classification (.xml/.dat/ignore) est au caller.
     #[test]
     fn streams_every_file_member_with_content() {
         let tmp = build_fixture();
@@ -128,7 +123,6 @@ mod tests {
         assert_eq!(members[2].0, "decisions/presentation.pdf");
     }
 
-    /// Une erreur remontée par le callback stoppe le streaming et propage.
     #[test]
     fn callback_error_propagates() {
         let tmp = build_fixture();

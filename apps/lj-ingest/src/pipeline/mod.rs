@@ -1,90 +1,111 @@
-//! Pipelines d'ingestion (port de `librejustice-store/pipelines/*` +
-//! orchestration CLI de `apps/ingest/.../cli.py`).
+//! Pipelines d'ingestion.
 //!
-//! Le contrat Rust replie l'orchestration complète ici (le Python la split entre
-//! `librejustice-store/pipelines/ingest*.py` et `cli.py`). On reproduit la
-//! logique métier — parse → triage idempotent → chunk → extract → (embed) →
-//! upsert — sans la machinerie d'orchestration Python (`asyncio.Queue` à trois
-//! étages, `ProcessPoolExecutor`). Côté Rust :
+//! L'orchestration complète vit ici : parse → triage idempotent → chunk →
+//! extract → (embed) → upsert.
 //!
-//! - CPU (parse + chunk + extract) parallélisé via **rayon** (sans GIL) ;
+//! - CPU (parse + chunk + extract) parallélisé via **rayon** ;
 //! - I/O DB / embed en **tokio** ;
 //! - batch de [`BATCH_SIZE`], idempotence via `content_checksum` (xxh3-64 du
-//!   payload brut, règle #7).
+//!   payload brut).
 //!
-//! Le pipeline streaming concurrent (embed batch N+1 pendant l'écriture du batch
-//! N) du Python n'est pas reporté tel quel : on traite batch par batch
-//! (prepare rayon → embed → write). Cf. `unresolved`.
+//! Deux ordonnancements sur le même chemin de code : `run_stream` (flux à étages
+//! découplés, le mur vaut l'embed) pour les sources de volume,
+//! `drain_batch`/`drain_batch_in_txn` (séquentiel) pour la maintenance et les
+//! écritures sous transaction de l'appelant.
 
 mod adde;
+mod affiliations;
+mod annonces;
 mod ariane;
 mod article_commentaires;
+mod attract;
 mod backfill;
 mod batch;
 mod bofip;
+mod chronicle_move;
 mod circulaires;
+mod cnb_history;
+mod cnb_rekey;
 mod cnda;
+mod cnda_solution;
 mod corpus_toc;
 mod dila;
 mod embed;
 mod embed_missing;
 mod eu_catalog;
+mod eu_law;
 mod eu_rproc;
 mod europe;
 mod false_merges;
 mod files;
 mod jorf;
+mod juricaf;
 mod kali;
 mod legal_corpus;
 mod legi;
 mod opendata;
 mod parties;
 mod prepare;
-mod purge_citations;
 mod reconcile;
 mod reextract;
 mod registries;
 mod rekey;
 mod resplit;
 mod roles;
+mod scope_alsace;
+mod scope_compteurs;
 mod slugs;
 mod suggest_build;
 mod text_refs;
+mod text_rename;
 mod treaty_bodies;
 mod unmerge;
 mod unmerge_dila;
 
 pub use adde::sync_adde;
+pub use affiliations::derive_affiliations;
+pub use annonces::{
+    annonces, annonces_backfill, annonces_discover, annonces_enrichir, annonces_jumeler,
+    annonces_regulariser,
+};
 pub use ariane::sync_ariane;
-pub use article_commentaires::seed_article_commentaires;
+pub use article_commentaires::{reconcile_article_commentaires, seed_article_commentaires};
 pub use backfill::{backfill_canonical_ref, backfill_ecli, merge_cross_source_duplicates};
 pub use bofip::{ingest_bofip, sync_bofip};
+pub use chronicle_move::move_chronicle;
 pub use circulaires::{sync_circulaires, sync_circulaires_bodies};
+pub use cnb_history::replay_cnb_history;
+pub use cnb_rekey::rekey_cnb;
 pub use cnda::{ingest_cnda, sync_cnda};
+pub use cnda_solution::backfill_cnda_solution;
 pub use dila::{ingest_dila, sync_dila, Fond};
 pub use embed_missing::embed_missing;
 pub use eu_catalog::ingest_eu_catalog;
+pub use eu_law::sync_eu_law;
 pub use eu_rproc::ingest_eu_rproc;
 pub use europe::{cache_cedh, ingest_cedh, ingest_cjue, sync_cedh, sync_cjue};
 pub use false_merges::analyze_false_merges;
 pub use jorf::{ingest_jorf, sync_jorf};
+pub use juricaf::juricaf_probe;
 pub use kali::{ingest_kali, sync_kali};
 pub use legal_corpus::{
-    canonicalize_source_labels, load_legal_corpus, relabel_sources, stamp_freshness,
+    canonicalize_source_labels, load_legal_corpus, reading_ranks, relabel_sources, stamp_freshness,
 };
 pub use legi::{backfill_links, backfill_textes, backfill_toc, ingest_legi, sync_legi};
 pub use opendata::{ingest_judilibre, ingest_opendata, refetch_judilibre, reingest_stale_opendata};
-pub use parties::{backfill_parties, relink_parties};
-pub use purge_citations::purge_procedural_citations;
-pub use reconcile::reconcile_pending;
+pub use parties::{reconcile_parties, relink_parties};
+pub use reconcile::reconcile_all;
 pub use reextract::reextract_fields;
 pub use registries::{load_registries, RegistrySource};
 pub use rekey::{rekey_article_keys, rekey_identity_keys};
 pub use resplit::resplit_false_merges;
 pub use roles::backfill_text_roles;
+pub use scope_alsace::scope_backfill_alsace;
+pub use scope_compteurs::scope_backfill_compteurs;
 pub use slugs::assign_slugs;
 pub use suggest_build::build_suggest;
 pub use text_refs::extract_text_refs;
+pub use text_rename::rename_texts;
 pub use treaty_bodies::backfill_treaty_bodies;
 pub use unmerge::unmerge_same_source;
 pub use unmerge_dila::unmerge_same_source_dila;
@@ -97,23 +118,21 @@ use lj_store::repository::{DecisionRepository, ExtractedFields};
 
 use crate::chunking::Chunk;
 
-/// Taille de batch (port de `_BATCH_SIZE = 128`).
 pub const BATCH_SIZE: usize = 128;
 
-/// Contexte d'extraction du run (ADR 0145 / 0156) : snapshot catalogue pour le
-/// linker in-pass (~155 k textes + ~2 M paires d'articles) + vocabulaire
-/// compilé (index de snap des citations). Hydraté à la première décision
-/// extraite du process, immuable ensuite — le lien est une fonction du
-/// catalogue **au moment de la passe**, la passe intégrale du dimanche rejoue
+/// Contexte d'extraction du run : snapshot catalogue pour le linker in-pass +
+/// vocabulaire compilé (index de snap des citations). Hydraté à la première
+/// décision extraite du process, immuable ensuite — le lien est une fonction du
+/// catalogue **au moment de la passe**, et la passe intégrale hebdomadaire rejoue
 /// tout le fonds sur le catalogue frais.
 pub(crate) struct ExtractCtx {
     pub link: LinkSnapshot,
     pub vocab: lj_extract::compiled::CompiledVocab,
-    /// Mapping (type, ville) → code de localisation pour les clés pendantes
-    /// de chronologie (ADR 0161), dérivé du référentiel `jurisdiction`.
+    /// Mapping (type, ville) → code de localisation pour les clés pendantes de
+    /// chronologie, dérivé du référentiel `jurisdiction`.
     pub chrono: lj_extract::chrono::ChronoSnapshot,
-    /// Labels guéris du référentiel `jurisdiction` (code → label avec ville),
-    /// pour composer `search_title` quand le libellé source est nu (ADR 0170).
+    /// Labels guéris du référentiel `jurisdiction` (code → label avec ville), pour
+    /// composer `search_title` quand le libellé source est nu.
     pub jur_labels: std::collections::HashMap<String, String>,
 }
 
@@ -135,9 +154,9 @@ pub(crate) async fn extract_ctx(conn: &Connection) -> anyhow::Result<&'static Ex
             let link = LinkSnapshot::build(texts.clone(), articles);
             let vocab = lj_extract::compiled::CompiledVocab::build(&texts, &link);
             let jurisdictions = repo.load_jurisdictions().await?;
-            // Snapshots keyés par `source_code` (ADR 0201) : l'extraction
-            // travaille en codes source (location Judilibre), le code
-            // canonique n'apparaît qu'à l'écriture (`ensure_jurisdictions`).
+            // Snapshots keyés par `source_code` : l'extraction travaille en codes
+            // source (location Judilibre), le code canonique n'apparaît qu'à l'écriture
+            // (`ensure_jurisdictions`).
             let jur_labels = jurisdictions
                 .iter()
                 .map(|j| (j.source_code.clone(), j.label.clone()))
@@ -158,7 +177,7 @@ pub(crate) async fn extract_ctx(conn: &Connection) -> anyhow::Result<&'static Ex
         .await
 }
 
-/// Mode de triage à l'ingest (port de `SourceMode`).
+/// Mode de triage à l'ingest.
 ///
 /// - [`IngestMode::MissingHash`] (défaut) : skip si le hash est identique, et
 ///   fast-skip d'un fichier entièrement ingéré via le manifeste.
@@ -171,18 +190,18 @@ pub enum IngestMode {
     All,
 }
 
-/// Calcule le checksum source (xxh3-64 hex du payload brut) pour l'idempotence.
+/// Calcule le checksum source (xxh3-64 hex du payload brut) pour
+/// l'idempotence.
 ///
-/// Port de `xxhash.xxh3_64_hexdigest(raw)` (règle #7). Le hash porte sur le
-/// payload **brut** (XML opendata ou ligne JSON Judilibre), jamais sur le texte
-/// nettoyé.
+/// Le hash porte sur le payload **brut** (XML opendata ou ligne JSON Judilibre),
+/// jamais sur le texte nettoyé.
 pub fn content_checksum(payload: &[u8]) -> String {
     let digest = xxhash_rust::xxh3::xxh3_64(payload);
     format!("{digest:016x}")
 }
 
-/// Génère un `public_id` URL-safe base64 sur 9 octets (port de
-/// `_generate_public_id`). Aléatoire (non déterministe) comme côté Python.
+/// Génère un `public_id` URL-safe base64 sur 9 octets. Aléatoire (non
+/// déterministe).
 pub(super) fn generate_public_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     // 9 octets pseudo-aléatoires → 12 chars base64 urlsafe (sans padding requis).
@@ -204,8 +223,8 @@ pub(super) fn generate_public_id() -> String {
     base64_urlsafe(&bytes)
 }
 
-/// Encodage base64 URL-safe (alphabet `-_`, sans padding) — port du
-/// `base64.urlsafe_b64encode(token_bytes(9))`. 9 octets → 12 caractères.
+/// Encodage base64 URL-safe (alphabet `-_`, sans padding). 9 octets → 12
+/// caractères.
 fn base64_urlsafe(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -226,7 +245,7 @@ fn base64_urlsafe(input: &[u8]) -> String {
     out
 }
 
-/// Mode d'écriture d'un candidat (port de `WriteMode`).
+/// Mode d'écriture d'un candidat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteMode {
     Full,
@@ -242,7 +261,7 @@ impl WriteMode {
     }
 }
 
-/// Candidat issu du parse d'un payload (port de `_Candidate`).
+/// Candidat issu du parse d'un payload.
 struct Candidate {
     decision_id: Option<i64>,
     public_id: String,
@@ -255,20 +274,24 @@ struct Candidate {
     /// `META_JURI_*` pour reconstruire `source_fields`. `None` pour les autres
     /// formats (XML opendata, JSON Judilibre).
     dila_fond: Option<DilaFond>,
-    /// `source_fields` déjà construits (`payload_format == "html"`, CEDH/CJUE,
-    /// ADR 0094) : les métadonnées HUDOC/CDM verbatim (colonnes/prédicats) plus
-    /// les sections rebasées sur `full_text`. `None` pour les formats dont
-    /// `prepare_write` reconstruit `source_fields` depuis `raw_payload`.
+    /// `source_fields` déjà construits (`payload_format == "html"`, CEDH/CJUE) :
+    /// les métadonnées HUDOC/CDM verbatim (colonnes/prédicats) plus les sections
+    /// rebasées sur `full_text`. `None` pour les formats dont `prepare_write`
+    /// reconstruit `source_fields` depuis `raw_payload`.
     prebuilt_source_fields: Option<serde_json::Value>,
-    /// Champs structurés déjà extraits par le parser pur (CNDA, ADR 0096) :
-    /// `extract::routed` ne route que les 7 ordres FR ; un fond scrapé hors
-    /// nomenclature opendata/Judilibre porte donc ses propres champs (solution_uid,
-    /// date_lecture…) calculés par `parse_cnda`. `None` → `prepare_write` passe par
-    /// l'extracteur routé `ExtractedFields::from_decision`.
+    /// Champs structurés déjà extraits par le parser pur (CNDA) : `extract::routed`
+    /// ne route que les 7 ordres FR ; un fond scrapé hors nomenclature
+    /// opendata/Judilibre porte donc ses propres champs (solution_uid, date_lecture…)
+    /// calculés par `parse_cnda`. `None` → `prepare_write` passe par l'extracteur
+    /// routé `ExtractedFields::from_decision`.
     prebuilt_extracted: Option<ExtractedFields>,
 }
 
-/// Décision préparée (clean + chunk + extract + gzip), port de `_PreparedDecision`.
+/// Décision préparée (clean + chunk).
+///
+/// L'extraction structurée arrive **après** l'embed (`extract_write`) : elle seule
+/// dépend du contexte d'extraction, dont l'hydratation se cache ainsi derrière le
+/// GPU au lieu de retarder le premier lot.
 struct PreparedDecision {
     decision_id: Option<i64>,
     public_id: String,
@@ -277,12 +300,16 @@ struct PreparedDecision {
     write_mode: WriteMode,
     chunks: Vec<Chunk>,
     payload_format: String,
+    /// Rempli par `extract_write` (étage post-embed) ; `None` en sortie de chunk.
     extracted: Option<ExtractedFields>,
-    /// Payload moins le texte, offsets rebasés sur `full_text` (ADR 0085).
+    /// Champs préconstruits par le parser source (CNDA, ArianeWeb…), superposés
+    /// au résultat de l'extracteur routé par `extract_write`.
+    prebuilt_extracted: Option<ExtractedFields>,
+    /// Payload moins le texte, offsets rebasés sur `full_text`.
     source_fields: serde_json::Value,
 }
 
-/// Cumul des compteurs d'un run (port des dataclasses `IngestSummary`/counts).
+/// Cumul des compteurs d'un run.
 #[derive(Debug, Default, Clone, Copy)]
 struct IngestCounts {
     created: usize,
@@ -351,25 +378,20 @@ mod tests_support {
 mod tests {
     use super::*;
 
-    // Spec règle #7 : content_checksum = xxh3-64 hex du payload brut.
     #[test]
     fn content_checksum_is_xxh3_64_hex() {
         // xxh3_64(b"") = 0x2d06800538d394c2 (vecteur de référence xxHash).
         assert_eq!(content_checksum(b""), "2d06800538d394c2");
-        // Stable et 16 hex.
         let h = content_checksum(b"hello world");
         assert_eq!(h.len(), 16);
         assert_eq!(h, content_checksum(b"hello world"));
         assert_ne!(h, content_checksum(b"hello worlD"));
     }
 
-    // Spec : base64 urlsafe, 9 octets → 12 chars, alphabet -_ sans padding.
     #[test]
     fn base64_urlsafe_matches_python() {
-        // base64.urlsafe_b64encode(bytes(range(9))) == b'AAECAwQFBgcI'
         let bytes: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
         assert_eq!(base64_urlsafe(&bytes), "AAECAwQFBgcI");
-        // Octets hauts → caractères - et _.
         assert_eq!(base64_urlsafe(&[0xff, 0xff, 0xff]), "____");
         assert_eq!(base64_urlsafe(&[0xfb, 0xff, 0xfe]), "-__-");
     }

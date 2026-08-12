@@ -1,6 +1,5 @@
 # ============================================================================
-# CONTRACT TESTS — route group: entities (fiche entité ADR 0189 + annuaire
-# ADR 0192)
+# CONTRACT TESTS — route group: entities (fiche entité + annuaire)
 #   GET /api/entity/{ns}/{id}
 #   GET /api/entity/{ns}/{id}/decisions
 #   GET /api/decision/{id}/parties
@@ -8,7 +7,7 @@
 #   GET /api/entities/directory
 #   GET /api/entities/stats
 # All public (auth=none). {{base}} = host root. Real prod anchors (registres
-# chargés, ADR 0179) : entité `siren:444608442` = ENEDIS (2237 décisions
+# chargés) : entité `siren:444608442` = ENEDIS (2237 décisions
 # citantes) ; décision `qlSPCVKPKFgt` a des parties résolues ; barreau `paris`
 # porte le plus d'avocats avec contentieux. Assertions STRUCTURELLES uniquement
 # (présence / type / enum / ordre), jamais des valeurs live.
@@ -225,7 +224,7 @@ HTTP 422
 
 
 # ---------------------------------------------------------------------------
-# directory: catégorie cabinets (ADR 0239)
+# directory: catégorie cabinets
 # ---------------------------------------------------------------------------
 GET {{base}}/api/entities/directory?kind=cabinets&page_size=5
 HTTP 200
@@ -235,8 +234,7 @@ jsonpath "$.items" isCollection
 
 
 # ===========================================================================
-# GET /api/entities/stats — compteurs par catégorie (registre + contentieux,
-# ADR 0233)
+# GET /api/entities/stats — compteurs par catégorie (registre + contentieux)
 # ===========================================================================
 GET {{base}}/api/entities/stats
 HTTP 200

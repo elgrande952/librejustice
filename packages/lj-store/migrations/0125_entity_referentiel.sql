@@ -1,4 +1,4 @@
--- ADR 0179 — référentiel d'entités (registres externes : SIRENE, RNA…).
+-- Référentiel d'entités (registres externes : SIRENE, RNA…).
 --
 -- `entity` porte l'état courant d'une entité de registre (uid namespacé
 -- 'siren:…', 'rna:…') ; `entity_denomination` porte ses dénominations

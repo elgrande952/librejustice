@@ -1,11 +1,11 @@
 //! `DecisionsFilterBar` — barre de filtres horizontale sous la barre de
-//! recherche (gabarit de référence §9.1) : `Date ▾ · Juridiction ▾ · Portée ▾ ·
-//! Domaine du droit ▾ · Textes cités ▾ · Plus de filtres`. « Plus de filtres »
-//! étend la barre en place avec les dropdowns Office, Dispositif et Publication
-//! (pas de modal) ; ils restent épinglés tant qu'un de leurs filtres est actif.
+//! recherche : `Date ▾ · Juridiction ▾ · Portée ▾ · Domaine du droit ▾ ·
+//! Textes cités ▾ · Plus de filtres`. « Plus de filtres » étend la barre en
+//! place avec les dropdowns Office, Dispositif et Publication (pas de modal) ;
+//! ils restent épinglés tant qu'un de leurs filtres est actif.
 //!
 //! Sync bidirectionnelle facettes ↔ query params, mutations via `query_state`
-//! (replace=true, drop `page`) — mécanique héritée verbatim de l'ex-FilterRail.
+//! (replace=true, drop `page`).
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_query_map;
@@ -158,8 +158,7 @@ pub fn DecisionsFilterBar(#[prop(into)] facets: Signal<Option<SearchFacets>>) ->
     view! {
         // Pas de grisage pendant un refetch : les dropdowns gardent les
         // facettes précédentes et restent pleinement interactifs (on peut
-        // enchaîner les coches) — le grisage `opacity-60` donnait une
-        // impression de menu figé/transparent à chaque clic de filtre.
+        // enchaîner les coches).
         <div
             role="toolbar"
             aria-label="Filtres de recherche"
@@ -265,8 +264,8 @@ pub fn DecisionsFilterBar(#[prop(into)] facets: Signal<Option<SearchFacets>>) ->
             </FilterDropdown>
 
             // Portée jurisprudentielle (majeure/importante/limitée/indéterminée,
-            // groupes de `publication_codes` — ADR 0167). Jumelle assumée de
-            // Publication, en lecture normalisée inter-ordres (gabarit ).
+            // groupes de `publication_codes`). Jumelle assumée de Publication, en
+            // lecture normalisée inter-ordres.
             <FilterDropdown id="significance" label="Portée" active_count=significance_count>
                 <FacetChecklist
                     choices=significance_choices
@@ -382,8 +381,8 @@ pub fn DecisionsFilterBar(#[prop(into)] facets: Signal<Option<SearchFacets>>) ->
 
             <Show when=move || show_more.get()>
                 // Office du juge (JEX, JAF, JCP, JLD, magistrat désigné…) : axe
-                // séparé de la juridiction (ADR 0163), en miroir du filtre
-                // `office_uid`. Masqué quand la facette est vide, sauf sélection.
+                // séparé de la juridiction, en miroir du filtre `office_uid`.
+                // Masqué quand la facette est vide, sauf sélection.
                 <Show when=move || {
                     !office_choices.get().is_empty() || office_count.get() > 0
                 }>
@@ -399,9 +398,9 @@ pub fn DecisionsFilterBar(#[prop(into)] facets: Signal<Option<SearchFacets>>) ->
                 </FilterDropdown>
                 </Show>
 
-                // Chambre (catégorie contrôlée uniforme tous ordres, ADR 0172) :
-                // sous-unité du siège, en miroir du filtre `chamber_uid`. Masquée
-                // quand la facette est vide, sauf sélection active.
+                // Chambre (catégorie contrôlée uniforme tous ordres) : sous-unité du
+                // siège, en miroir du filtre `chamber_uid`. Masquée quand la
+                // facette est vide, sauf sélection active.
                 <Show when=move || {
                     !chamber_choices.get().is_empty() || chamber_count.get() > 0
                 }>

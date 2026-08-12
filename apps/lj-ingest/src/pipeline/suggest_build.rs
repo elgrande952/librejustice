@@ -1,4 +1,4 @@
-//! Build du vocabulaire d'autocomplétion (ADR 0216) : n-grammes 1-5 comptés en
+//! Build du vocabulaire d'autocomplétion : n-grammes 1-5 comptés en
 //! doc-frequency sur un échantillon des décisions (`id % 10`), full scan des
 //! articles, titres `legal_text` injectés avec boost — sérialisés en
 //! `fst::Map` (clé `folded[\x00display]`, valeur `u64 = df_juris << 32 |
@@ -15,17 +15,15 @@ use lj_store::repository::{DecisionRepository, SUGGEST_FST_KEY};
 
 use crate::config::Settings;
 
-/// Échantillon décisions : une sur `SAMPLE_MODULO` (fréquences relatives —
-/// scanner 100 % n'apporte rien au top du vocabulaire).
+/// Échantillon décisions : une sur `SAMPLE_MODULO` (le vocabulaire ne dépend que
+/// de fréquences relatives).
 const SAMPLE_MODULO: i64 = 10;
 const BATCH: i64 = 500;
 /// Plafond de la map de comptage ; au-delà, prune lossy (seuil croissant).
-/// Dimensionné pour que le seuil de prune reste sous les planchers de df :
-/// à 6 M, l'espace des 4-5-grammes le faisait grimper à ~50 et mangeait
-/// toute la queue rare du vocabulaire (~5 Go de comptage à 24 M, la VM en a
-/// 125).
+/// Dimensionné pour que le seuil de prune reste sous les planchers de df, sans quoi
+/// la queue rare du vocabulaire disparaît.
 const COUNT_CAP: usize = 24_000_000;
-/// df plancher (mesuré sur l'échantillon côté juris) pour entrer au vocabulaire.
+/// df plancher côté juris pour entrer au vocabulaire.
 const MIN_DF_JURIS: u32 = 5;
 const MIN_DF_TEXTES: u32 = 3;
 /// Taille max du vocabulaire final (coupe par df décroissant).
@@ -211,9 +209,8 @@ pub async fn build_suggest() -> Result<()> {
         }
         let shown = display[s..e].join(" ");
         counter.bump(&key, &shown, DOMAIN_TEXTES, TITLE_BOOST);
-        // Cités tels quels dans les décisions : un df plancher côté
-        // jurisprudence les rend suggérables en mode juris, sous le
-        // vocabulaire réel du corpus (qui garde le dessus au ranking).
+        // Cités tels quels dans les décisions : un df plancher côté jurisprudence les rend
+        // suggérables en mode juris, sous le vocabulaire réel du corpus.
         counter.bump(&key, &shown, DOMAIN_JURIS, MIN_DF_JURIS);
         titles_kept += 1;
     }

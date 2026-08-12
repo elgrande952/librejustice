@@ -1,5 +1,5 @@
--- ADR 0181 — decision_party : acteurs par décision, résolus vers les
--- référentiels d'entités (ADR 0179).
+-- decision_party : acteurs par décision, résolus vers les
+-- référentiels d'entités.
 --
 -- Une ligne par valeur NER émise (coordonnées ontologie 0180 : qualité ×
 -- côté). `resolve_key` est calculée en Rust (fold_stable + tête de forme

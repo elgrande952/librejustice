@@ -1,16 +1,16 @@
 //! Re-embed ciblé des décisions orphelines : chunks présents mais `embedding`
-//! NULL (#39, opendata principalement). Op de maintenance idempotente.
+//! NULL. Op de maintenance idempotente.
 //!
-//! Reconstruit chaque décision depuis `(full_text, source_fields)` (ADR 0085) en
-//! un [`Candidate`] fidèle (même `source_uid`, même `content_checksum`, même
+//! Reconstruit chaque décision depuis `(full_text, source_fields)` en un
+//! [`Candidate`] fidèle (même `source_uid`, même `content_checksum`, même
 //! `public_id`) puis le passe au pipeline normal via [`drain_batch`] en
-//! `require_embeddings = true` : le triage voit `same_hash` + `!has_embeddings`
-//! → branche re-embed (ré-chunk identique par parité #37 + embed + `replace_chunks`).
-//! Aucune création ni changement d'identité — uniquement le remplissage des
-//! embeddings manquants.
+//! `require_embeddings = true` : le triage voit `same_hash` + `!has_embeddings` →
+//! branche re-embed (ré-chunk identique + embed + `replace_chunks`). Aucune
+//! création ni changement d'identité, uniquement le remplissage des embeddings
+//! manquants.
 //!
-//! Embedder **vLLM strict** ([`build_vllm_strict`]) : jamais de repli Cloudflare
-//! (coût) — erreur franche si vLLM est injoignable.
+//! Embedder **vLLM strict** ([`build_vllm_strict`]) : jamais de repli Cloudflare,
+//! erreur franche si vLLM est injoignable.
 
 use anyhow::{anyhow, Result};
 
@@ -27,14 +27,14 @@ use crate::config::Settings;
 /// reprise transparente.
 pub async fn embed_missing(limit: Option<usize>) -> Result<()> {
     let settings = Settings::from_env()?;
-    // Embedder vLLM strict : refuse Cloudflare (coût) et erreur si vLLM down.
+    // Embedder vLLM strict : refuse Cloudflare et erreur si vLLM est injoignable.
     let embedder = build_vllm_strict(&settings).await?;
 
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    // Op de maintenance : lève la borne API (build_pool pose statement_timeout=30s)
-    // — le scan de frontière du keyset au resume peut être long.
+    // Op de maintenance : lève la borne API (`build_pool` pose
+    // statement_timeout=30s) — le scan de frontière du keyset au resume peut être long.
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
@@ -67,9 +67,9 @@ pub async fn embed_missing(limit: Option<usize>) -> Result<()> {
                 tracing::warn!(decision_id = id, "orphelin sans provenance/full_text, skip");
                 continue;
             };
-            // Reconstruction canonique (ADR 0085) : decision portée par
-            // (full_text, source_fields). `source_fields` est passé en
-            // `prebuilt_source_fields` car `raw_payload` n'existe plus.
+            // Reconstruction canonique : décision portée par (full_text,
+            // source_fields). `source_fields` est passé en `prebuilt_source_fields` car
+            // `raw_payload` n'existe plus.
             let decision = Decision::from_source_fields(&full_text, &source_fields, &source_uid);
             candidates.push(Candidate {
                 decision_id: Some(id),

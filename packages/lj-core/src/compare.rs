@@ -1,11 +1,10 @@
-//! Diff de deux rédactions d'un article (comparateur de versions, ADR 0193).
+//! Diff de deux rédactions d'un article (comparateur de versions).
 //!
 //! Deux passes : diff **ligne** (alinéa) pour ancrer la structure du texte,
-//! puis diff **mot Unicode** (UAX #29) à l'intérieur des blocs remplacés —
-//! plus fin que le grain alinéa de Légifrance. Le texte se reconstruit en
-//! concaténant les segments d'un même côté (Equal+Delete = ancien,
-//! Equal+Insert = nouveau) ; les sauts de ligne restent dans les segments
-//! (rendu `whitespace-pre-line`).
+//! puis diff **mot Unicode** (UAX #29) à l'intérieur des blocs remplacés. Le
+//! texte se reconstruit en concaténant les segments d'un même côté
+//! (Equal+Delete = ancien, Equal+Insert = nouveau) ; les sauts de ligne restent
+//! dans les segments (rendu `whitespace-pre-line`).
 
 use similar::{ChangeTag, DiffTag, TextDiff};
 
@@ -112,15 +111,11 @@ mod tests {
 
     #[test]
     fn word_change_is_diffed_inside_the_alinea() {
-        // Cas 16-13 : rédaction 2002 → 2004 (« de ses caractéristiques
-        // génétiques » inchangé, le début de phrase remplacé au mot).
         let old = "Nul ne peut faire l'objet de discriminations en raison de ses caractéristiques génétiques.";
         let new = "Nul ne peut faire l'objet d'une discrimination en raison de ses caractéristiques génétiques.";
         let segments = compare_texts(old, new);
         assert_eq!(old_side(&segments), old);
         assert_eq!(new_side(&segments), new);
-        // Le tronc commun reste en Equal — le diff n'a pas dégénéré en
-        // suppression/réinsertion du texte entier.
         let equal_len: usize = segments
             .iter()
             .filter(|s| s.op == CompareOp::Equal)

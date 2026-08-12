@@ -1,4 +1,4 @@
-//! `ResultError` (port de `result-error.tsx`). Erreur de recherche (API down).
+//! `ResultError` : erreur de recherche (API down).
 
 use leptos::prelude::*;
 

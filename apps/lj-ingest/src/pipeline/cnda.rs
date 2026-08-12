@@ -1,4 +1,4 @@
-//! Source scrapée non-bulk : CNDA (asile, fiche HTML + PDF Word), ADR 0096.
+//! Source scrapée non-bulk : CNDA (asile, fiche HTML + PDF Word).
 
 use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
@@ -18,27 +18,25 @@ use super::{
 };
 
 /// Borne haute du crawl de pagination CNDA : au-delà de ce nombre de pages
-/// consécutives sans aucune fiche, on s'arrête (la liste curée fait ~17 pages —
-/// audit `cnda.md` — mais on ne code pas un N en dur : l'arrêt est piloté par
-/// l'épuisement réel de la pagination). Garde-fou borné (jamais une boucle
-/// infinie si le DOM change et rend toujours des liens).
+/// consécutives sans aucune fiche, on s'arrête. Garde-fou contre une boucle
+/// infinie si le DOM change et rend toujours des liens.
 const CNDA_MAX_PAGES: u32 = 200;
 
-/// Construit le candidat CNDA depuis un [`CndaParsed`] (ADR 0096) :
-/// `source_fields` préconstruits par le parser
-/// (`prebuilt_source_fields`), `payload_format` `pdf` (décision avec PDF) /
-/// `html` (fiche-only). Le `content_checksum` porte sur les **octets source
-/// bruts** (PDF, ou HTML de fiche si fiche-only — idempotence #7, grounding §3).
+/// Construit le candidat CNDA depuis un [`CndaParsed`] : `source_fields`
+/// préconstruits par le parser (`prebuilt_source_fields`), `payload_format` `pdf`
+/// (décision avec PDF) / `html` (fiche-only). Le `content_checksum` porte sur les
+/// octets source bruts (PDF, ou HTML de fiche si fiche-only).
 ///
-/// `solution_uid` (best-effort sur le dispositif) déborde de `Decision` ; on
-/// l'écrit **directement** via `prebuilt_extracted` (les fonds scrapés hors
-/// nomenclature opendata/Judilibre ne sont pas routés par `extract::routed`).
+/// `solution_uid` (best-effort sur le dispositif, connaissance CNDA que
+/// l'extracteur générique n'a pas) déborde de `Decision` ; on le pose via
+/// `prebuilt_extracted`, superposé à l'extraction routée complète au prepare
+/// (`merge_prebuilt` : le préconstruit prime, l'extraction fournit le reste).
 fn cnda_candidate(parsed: CndaParsed, raw_source: &[u8], payload_format: &str) -> Candidate {
     let extracted = ExtractedFields {
         // `parse_cnda` normalise déjà la date FR (`3 avril 2025`) en ISO
-        // `YYYY-MM-DD` sur `Decision.date_lecture`/`date_audience` (#12, bord
-        // source) ; on les parse ici en `NaiveDate` pour la colonne. Le texte FR
-        // libre reste en `source_fields` (`lecture_date`/`audience_date`).
+        // `YYYY-MM-DD` sur `Decision.date_lecture`/`date_audience` ; on les parse ici
+        // en `NaiveDate` pour la colonne. Le texte FR libre reste en `source_fields`
+        // (`lecture_date`/`audience_date`).
         date_lecture: parsed
             .decision
             .date_lecture
@@ -70,9 +68,8 @@ fn cnda_candidate(parsed: CndaParsed, raw_source: &[u8], payload_format: &str) -
 }
 
 /// Plancher de caractères non-blancs au-dessus duquel un PDF est réputé
-/// **natif-texte** (couche texte exploitable par `pdftotext`). Un PDF scanné rend
-/// quasi rien (< 100) ; une vraie décision CNDA dépasse largement (≥ 1500). Seuil
-/// prudent au milieu (ADR 0124).
+/// natif-texte (couche texte exploitable par `pdftotext`). Un PDF scanné rend
+/// quasi rien ; une vraie décision CNDA dépasse largement.
 const PDF_TEXT_LAYER_FLOOR: usize = 600;
 
 /// Vrai si l'extraction `pdftotext` a rendu une couche texte exploitable (≠ PDF
@@ -81,12 +78,11 @@ fn pdf_has_text_layer(extracted: &str) -> bool {
     extracted.chars().filter(|c| !c.is_whitespace()).count() >= PDF_TEXT_LAYER_FLOOR
 }
 
-/// Repli OCR pour un PDF CNDA **scanné** (ADR 0124 : marginal, ~1,5 % du corpus,
-/// vieux). Cache-first : relit le markdown caché (`<cache_dir>/cnda/ocr/<numero>.md`)
-/// — donc zéro appel live si déjà OCR-isé ; sinon OCR Mistral si une clé est
+/// Repli OCR pour un PDF CNDA scanné. Cache-first : relit le markdown caché
+/// (`<cache_dir>/cnda/ocr/<numero>.md`), sinon OCR Mistral si une clé est
 /// disponible (puis cache + throttle, l'IP datacenter se fait flaguer en rafale).
-/// `None` si pas de cache ET pas de clé/échec OCR → l'appelant skippe la décision
-/// (pas de downgrade fiche-only : retry ultérieur, le PDF reste caché).
+/// `None` si pas de cache ET pas de clé/échec OCR → l'appelant skippe la
+/// décision, le PDF restant caché pour un retry ultérieur.
 async fn scanned_ocr_fallback(
     client: Option<&MistralClient>,
     cache_dir: &std::path::Path,
@@ -113,17 +109,17 @@ async fn scanned_ocr_fallback(
     }
 }
 
-/// Crawl + ingest des décisions CNDA (ADR 0096). Calqué sur [`run_cedh`] :
-/// on pagine la liste jurisprudentielle (`list_page`), énumère
-/// les URL de fiches (`enumerate_fiche_urls`), et pour chaque fiche : parse la
-/// fiche HTML (`parse_fiche`), fetch le PDF lié (`fetch_pdf`) → extraction texte
-/// **déterministe** (`pdftotext` + `reflow_cnda_pdf_text`, ADR 0124 ; OCR Mistral
-/// en repli marginal pour les scannés, [`scanned_ocr_fallback`]) → `parse_cnda` →
-/// `drain_batch` (chemin upsert ECLI-first existant, `payload_format = "pdf"`,
+/// Crawl + ingest des décisions CNDA. Calqué sur [`run_cedh`] : on pagine la
+/// liste jurisprudentielle (`list_page`), énumère les URL de fiches
+/// (`enumerate_fiche_urls`), et pour chaque fiche : parse la fiche HTML
+/// (`parse_fiche`), fetch le PDF lié (`fetch_pdf`) → extraction texte
+/// déterministe (`pdftotext` + `reflow_cnda_pdf_text` ; OCR Mistral en repli
+/// marginal pour les scannés, [`scanned_ocr_fallback`]) → `parse_cnda` →
+/// `drain_batch` (chemin upsert existant, `payload_format = "pdf"`,
 /// `source_uid = cnda/{numero}`, `prebuilt_source_fields`/`prebuilt_extracted`).
-/// Décision **sans PDF** accessible (lien mort) ⇒ fiche-only (`payload_format =
+/// Décision sans PDF accessible (lien mort) ⇒ fiche-only (`payload_format =
 /// "html"`, checksum sur l'HTML de fiche). Idempotent (`source_uid`/
-/// `content_checksum`, #7). Throttle de courtoisie entre fetchs. Manifeste :
+/// `content_checksum`). Throttle de courtoisie entre fetchs. Manifeste :
 /// dernière page drainée + dernier numéro.
 ///
 /// `start_page` = première page à balayer (toujours 1 : la liste est antichrono,
@@ -152,15 +148,14 @@ async fn run_cnda(
     let (embedder, require_embeddings) = build_embedder_opt(&settings).await?;
     let client = CndaClient::new();
     // Extraction texte PDF : déterministe par défaut (`pdftotext` + recollage par
-    // règles, ADR 0124), fidèle et sans dépendance cloud sur le chemin chaud.
-    // L'OCR Mistral n'est qu'un **repli marginal** pour les rares PDF scannés
-    // (vieux, ~1,5 %, cache-first). Client **collant** sur le pool standard : on
-    // consomme une clé seule puis on bascule à l'épuisement (≠ round-robin qui
-    // exposerait tout le pool au flag OCR en une fenêtre).
+    // règles), sans dépendance cloud sur le chemin chaud. L'OCR Mistral n'est qu'un
+    // repli pour les rares PDF scannés (cache-first). Client dédié sur le pool
+    // standard, donc registre de quota dédié : le seau de `mistral-ocr` n'est pas
+    // celui du chat.
     let ocr_client = if settings.mistral_api_keys.is_empty() {
         None
     } else {
-        Some(MistralClient::new_sticky(
+        Some(MistralClient::new(
             settings.mistral_api_keys.clone(),
             "mistral-ocr-latest".to_string(),
         )?)
@@ -175,7 +170,7 @@ async fn run_cnda(
     // Mode ciblé (`--only`) : on ne traite/persiste que ces numéros, on crawle la
     // liste jusqu'à les avoir tous trouvés (le numéro n'étant pas dans le slug de
     // liste, il faut fetcher chaque fiche pour le connaître), puis on s'arrête.
-    // Le watermark n'est jamais touché (un run ciblé n'est pas un sync).
+    // Le watermark n'est jamais touché.
     let mut remaining = only;
     // Sync incrémental : la première décision croisée (tête de liste antichrono)
     // devient le nouveau watermark ; on s'arrête dès qu'on retombe sur `stop_at`.
@@ -209,14 +204,12 @@ async fn run_cnda(
             let fiche = parse_fiche(&fiche_html, fiche_url)
                 .map_err(|e| anyhow!("parse_fiche {fiche_url}: {e}"))?;
 
-            // Numéro = clé robuste depuis le slug `…-n-<numéro>-<classement>` (audit
-            // Numéro = clé robuste (≥ 6 chiffres, audit §30/103), par fiabilité :
-            // slug PDF `…-n-NNNNNNNN-c`, sinon slug de la fiche (même format, ex.
-            // `cnda-6-mai-2015-…-n-15001156-c` : les anciennes fiche-only portent le
-            // numéro dans leur URL), sinon le **corps** de la fiche (`n°NNNNNNNN` :
-            // les fiches modernes ont un slug descriptif + lien `/documents/…` sans
-            // numéro). Skip non fatal seulement si aucune source ne le donne.
-            // Calculé **avant** le fetch PDF : c'est la clé du cache local.
+            // Numéro = clé robuste (≥ 6 chiffres), par fiabilité : slug PDF
+            // `…-n-NNNNNNNN-c`, sinon slug de la fiche (même format, ex.
+            // `cnda-6-mai-2015-…-n-15001156-c`), sinon le corps de la fiche
+            // (`n°NNNNNNNN`, les fiches modernes ayant un slug descriptif et un lien
+            // `/documents/…` sans numéro). Skip non fatal seulement si aucune source ne le
+            // donne. Calculé avant le fetch PDF : c'est la clé du cache local.
             let Some(numero) = fiche
                 .pdf_url
                 .as_deref()
@@ -229,17 +222,15 @@ async fn run_cnda(
                 continue;
             };
 
-            // Mode ciblé : tout numéro hors liste `--only` est ignoré en silence
-            // (ni traité, ni compté skipped — ce n'est pas un échec, juste hors
-            // cible) avant le fetch PDF/OCR coûteux.
+            // Mode ciblé : tout numéro hors liste `--only` est ignoré en silence, avant
+            // le fetch PDF/OCR coûteux.
             if remaining.as_ref().is_some_and(|r| !r.contains(&numero)) {
                 continue;
             }
 
             // Early-exit du sync : la liste est antichrono. Dès qu'on retombe sur la
-            // décision la plus récente du run précédent, tout ce qui suit est plus
-            // ancien (déjà ingéré) — on arrête le crawl. Avant le fetch PDF/OCR
-            // (coûteux) : on ne paie l'OCR que pour le vrai incrément.
+            // décision la plus récente du run précédent, tout ce qui suit est plus ancien
+            // donc déjà ingéré — on arrête le crawl, avant le fetch PDF/OCR.
             if newest.is_none() {
                 newest = Some(numero.clone());
             }
@@ -249,10 +240,9 @@ async fn run_cnda(
             }
 
             // PDF lié (texte intégral) : cache-first. Le PDF récupéré est persisté
-            // sous `<cache_dir>/cnda/payloads/<numero>.pdf` (parité avec les zips
-            // opendata / tarballs judilibre) ; un re-run — ou une ré-extraction
-            // (changement d'extracteur/OCR) — le relit localement au lieu de
-            // re-crawler cnda.fr. Lien mort (`None`) ⇒ fiche-only (abstract éditorial).
+            // sous `<cache_dir>/cnda/payloads/<numero>.pdf` ; un re-run — ou une
+            // ré-extraction — le relit localement au lieu de re-crawler cnda.fr. Lien
+            // mort (`None`) ⇒ fiche-only (abstract éditorial).
             let pdf_bytes = match fiche.pdf_url.as_deref() {
                 Some(slug) => match load_cached_payload(&cache_dir, &numero)
                     .map_err(|e| anyhow!("cnda cache read {numero}: {e}"))?
@@ -274,15 +264,12 @@ async fn run_cnda(
                 None => None,
             };
 
-            // Texte intégral, ADR 0124 : extraction **déterministe** par défaut
-            // (`pdftotext` + recollage par règles, fidèle, hors-ligne), OCR Mistral
-            // en **repli marginal** pour les rares PDF scannés (cache-first).
             let (pdf_text, payload_format, raw_source): (String, &str, Vec<u8>) = match &pdf_bytes {
-                // Le payload « PDF » est parfois un DOCX Word (certaines décisions
-                // CNDA sont publiées en .docx). Born-digital ⇒ texte extrait du
-                // `word/document.xml` sans OCR (déterministe), Mistral OCR rejetant
-                // le DOCX (400). Le markdown DOCX passe par le même nettoyage que
-                // l'OCR (`clean_ocr_markdown` : 1 paragraphe par ligne).
+                // Le payload « PDF » est parfois un DOCX Word (certaines décisions CNDA
+                // sont publiées en .docx). Born-digital ⇒ texte extrait du
+                // `word/document.xml` sans OCR, Mistral OCR rejetant le DOCX (400). Le
+                // markdown DOCX passe par le même nettoyage que l'OCR (`clean_ocr_markdown` :
+                // 1 paragraphe par ligne).
                 Some(bytes) if lj_sources::docx::is_zip_container(bytes) => {
                     match lj_sources::docx::extract_docx_text(bytes) {
                         Ok(text) => (clean_ocr_markdown(&text), "docx", bytes.clone()),
@@ -295,13 +282,11 @@ async fn run_cnda(
                     }
                 }
                 Some(bytes) => {
-                    // Natif-texte (~98,5 %, tout l'incrément récent) : recollage
-                    // déterministe, aucun appel réseau. Un PDF **sans couche texte**
-                    // (scanné) OU que `pdftotext` **n'arrive pas à lire** (corrompu/
-                    // chiffré, code ≠ 0) bascule au même repli : OCR cache-first,
-                    // puis skip si indisponible. Surtout pas un `?` ici — une seule
-                    // décision illisible avorterait tout le run (cron nocturne), et
-                    // un skip préserve un `full_text` DB valide (pas d'écrasement).
+                    // Natif-texte : recollage déterministe, aucun appel réseau. Un PDF sans
+                    // couche texte (scanné) OU que `pdftotext` n'arrive pas à lire (corrompu,
+                    // chiffré, code ≠ 0) bascule au même repli : OCR cache-first, puis skip si
+                    // indisponible. Pas de `?` ici : une décision illisible n'avorte pas le run,
+                    // et un skip préserve le `full_text` en base.
                     let native = lj_sources::pdf::pdftotext_extract(bytes)
                         .ok()
                         .filter(|raw| pdf_has_text_layer(raw));
@@ -328,20 +313,19 @@ async fn run_cnda(
                         },
                     }
                 }
-                // Fiche-only : pas de PDF lié ; le checksum porte sur l'HTML de
-                // fiche (payload source brut, #7).
+                // Fiche-only : pas de PDF lié ; le checksum porte sur l'HTML de fiche
+                // (payload source brut).
                 None => {
                     fiche_only += 1;
                     (String::new(), "html", fiche_html.into_bytes())
                 }
             };
 
-            // Échec de parse non fatal : une décision qu'on ne peut ni lire
-            // (PDF illisible → fiche-only sans texte) ni identifier (fiche-only
-            // sans date de lecture → ECLI infabricable) est tracée et **skippée**,
-            // pas une cause d'abandon du bootstrap (cas réel : cnda/22042222, PDF
-            // corrompu sans date dérivable). Un bug de parser systématique
-            // ressortirait comme un afflux de warns + le récap skipped final.
+            // Échec de parse non fatal : une décision qu'on ne peut ni lire (PDF
+            // illisible → fiche-only sans texte) ni identifier (fiche-only sans date de
+            // lecture → ECLI infabricable) est tracée et skippée, pas une cause d'abandon
+            // du bootstrap. Un bug de parser systématique ressortirait comme un afflux de
+            // warns + le récap skipped final.
             let parsed = match parse_cnda(&pdf_text, &fiche.to_value(), &numero) {
                 Ok(parsed) => parsed,
                 Err(e) => {
@@ -395,8 +379,7 @@ async fn run_cnda(
         // Bootstrap (`stop_at == None`) : watermark = page + dernier numéro drainé,
         // point de reprise d'un crawl interrompu. En sync, le watermark (numéro le
         // plus récent) est posé une fois en fin de run, hors de la boucle. En mode
-        // ciblé (`remaining.is_some()`), jamais : un run `--only` ne fait pas avancer
-        // le point de reprise du crawl.
+        // ciblé (`remaining.is_some()`), jamais.
         if stop_at.is_none() && remaining.is_none() {
             if let Some(numero) = last_numero {
                 manifest.mark(page, numero);
@@ -424,8 +407,7 @@ async fn run_cnda(
     }
 
     // Mode ciblé : signale les numéros demandés jamais croisés dans la liste
-    // (retirés du corpus, ou numéro erroné) — sinon le run réussit en silence
-    // sans les avoir traités.
+    // (retirés du corpus, ou numéro erroné).
     if let Some(rem) = &remaining {
         if !rem.is_empty() {
             tracing::warn!(introuvables = ?rem, "cnda --only : numéros non trouvés dans la liste");
@@ -454,9 +436,9 @@ async fn run_cnda(
     Ok(())
 }
 
-/// Bootstrap CNDA : balaye la liste jurisprudentielle depuis la première page
-/// (ADR 0096). Idempotent (`source_uid`/`content_checksum`) — re-jouable sans
-/// dupliquer (le manifeste n'évite que le re-fetch réseau).
+/// Bootstrap CNDA : balaye la liste jurisprudentielle depuis la première page.
+/// Idempotent (`source_uid`/`content_checksum`) — re-jouable sans dupliquer (le
+/// manifeste n'évite que le re-fetch réseau).
 pub async fn ingest_cnda(mode: IngestMode, only: Vec<String>) -> Result<()> {
     if only.is_empty() {
         return run_cnda(1, mode, None, None).await;
@@ -466,16 +448,12 @@ pub async fn ingest_cnda(mode: IngestMode, only: Vec<String>) -> Result<()> {
     run_cnda(1, IngestMode::All, None, Some(only.into_iter().collect())).await
 }
 
-/// Sync incrémental CNDA : crawl antichrono **depuis la page 1** (les nouvelles
+/// Sync incrémental CNDA : crawl antichrono depuis la page 1 (les nouvelles
 /// décisions arrivent en tête de la liste curée), avec early-exit dès qu'on
-/// retombe sur la décision la plus récente du run précédent (`last_numero`). On ne
-/// paie l'OCR que pour le vrai incrément. Watermark absent (1ᵉʳ run après bascule)
-/// ⇒ balaye toute la liste une fois — idempotent (cache PDF/OCR + `content_checksum`)
-/// — puis se cale sur la tête.
-///
-/// Corrige le bug du watermark par page : l'ancien sync reprenait à
-/// `last_page_done + 1`, donc au-delà de la liste curée (~17 pages bornées) → 404
-/// immédiat → 0 décision, alors que le neuf paraît en page 1.
+/// retombe sur la décision la plus récente du run précédent (`last_numero`). On
+/// ne paie l'OCR que pour le vrai incrément. Watermark absent (1ᵉʳ run après
+/// bascule) ⇒ balaye toute la liste une fois — idempotent (cache PDF/OCR +
+/// `content_checksum`) — puis se cale sur la tête.
 pub async fn sync_cnda() -> Result<()> {
     use lj_sources::cnda::{manifest_path, CndaManifest};
     let settings = Settings::from_env()?;

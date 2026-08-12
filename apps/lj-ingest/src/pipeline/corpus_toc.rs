@@ -1,18 +1,16 @@
-//! Dérivation des arêtes `legal_toc_edge` d'un texte curé (ADR 0186).
+//! Dérivation des arêtes `legal_toc_edge` d'un texte curé.
 //!
 //! Le dataset curé porte la structure sous forme d'un `title_path` par article
-//! (fil d'Ariane ` > `-séparé, produit par la curation Python). Ce module en
-//! dérive l'arbre de divisions et l'émet dans le format d'écriture du store
-//! (`replace_toc_edges`) : racine ancrée `owner_uid = text_uid` (même ancrage
-//! que LEGI), divisions à cid-slug synthétique, articles joints par
-//! `source_uid` — la vue-lecture et le sommaire réel fonctionnent tels quels.
+//! (fil d'Ariane ` > `-séparé). Ce module en dérive l'arbre de divisions et
+//! l'émet dans le format d'écriture du store (`replace_toc_edges`) : racine
+//! ancrée `owner_uid = text_uid`, divisions à cid-slug synthétique, articles
+//! joints par `source_uid`.
 
 use lj_store::repository::{TocEdgeRow, TocOwner};
 
 /// Un article du dataset tel qu'inséré (clés finales, post dé-collision).
-/// Mono-version = un seul élément à fenêtre ouverte ; multi-versions
-/// (historique daté, ADR 0187) = une entrée par ligne `legal_article` insérée,
-/// en ordre chronologique.
+/// Mono-version = un seul élément à fenêtre ouverte ; multi-versions = une
+/// entrée par ligne `legal_article` insérée, en ordre chronologique.
 pub struct TocArticle {
     pub num: String,
     pub num_key: String,
@@ -21,8 +19,7 @@ pub struct TocArticle {
 }
 
 /// Une version datée d'un article, telle qu'insérée : l'arête TOC émise porte
-/// la même fenêtre — `toc_tree`/`toc_section_reading` à une date joignent la
-/// version couvrante, exactement comme pour un article LEGI.
+/// la même fenêtre.
 pub struct TocVersion {
     pub source_uid: String,
     pub status: String,
@@ -58,7 +55,7 @@ struct Division {
 }
 
 /// Dérive l'arbre TOC d'un texte curé. Vide si aucun article ne porte de
-/// `title_path` (corpus à plat : rien à écrire, la purge suffit).
+/// `title_path`.
 pub fn derive_corpus_toc(
     text_uid: &str,
     articles: &[TocArticle],
@@ -67,9 +64,8 @@ pub fn derive_corpus_toc(
         return Vec::new();
     }
 
-    // Arbre : divisions réutilisées par intitulé sous leur parent (même
-    // regroupement que le sommaire à plat du front — des blocs non contigus
-    // d'un même intitulé fusionnent).
+    // Divisions réutilisées par intitulé sous leur parent : des blocs non
+    // contigus d'un même intitulé fusionnent.
     let mut root: Vec<Node> = Vec::new();
     for (idx, art) in articles.iter().enumerate() {
         let mut level = &mut root;
@@ -130,8 +126,7 @@ fn emit(
             Node::Article(idx) => {
                 let art = &articles[*idx];
                 all_abroge &= art.current_status() == "ABROGE";
-                // Une arête par version insérée, fenêtrée comme elle : la CTE
-                // datée sélectionne la version couvrante (law-at-date).
+                // Une arête par version insérée, fenêtrée comme elle.
                 for v in &art.versions {
                     edges.push(TocEdgeRow {
                         child_kind: "article".to_string(),
@@ -254,21 +249,18 @@ mod tests {
         ];
         let out = derive_corpus_toc("be/cc", &arts);
 
-        // Racine ancrée owner_uid = text_uid, une seule division LIVRE I.
         let root = edges_of(&out, "be/cc");
         assert_eq!(root.len(), 1);
         assert_eq!(root[0].child_kind, "section");
         assert_eq!(root[0].child_cid.as_deref(), Some("livre-i-des-personnes"));
         assert_eq!(root[0].niv, Some(1));
 
-        // LIVRE I possède TITRE I puis TITRE II, dans l'ordre de lecture.
         let livre = edges_of(&out, "be/cc#s:livre-i-des-personnes");
         assert_eq!(
             livre.iter().map(|e| e.label.as_str()).collect::<Vec<_>>(),
             ["TITRE I.", "TITRE II."]
         );
 
-        // Les articles se joignent par source_uid et num_key.
         let titre1 = edges_of(&out, "be/cc#s:livre-i-des-personnes--titre-i");
         assert_eq!(titre1.len(), 2);
         assert_eq!(titre1[0].child_kind, "article");
@@ -306,7 +298,6 @@ mod tests {
 
     #[test]
     fn cids_collisionnes_suffixes() {
-        // Deux intitulés distincts, même slug (ponctuation différente).
         let arts = vec![art("1", Some("CHAPITRE I.")), art("2", Some("CHAPITRE, I"))];
         let out = derive_corpus_toc("t", &arts);
         let root = edges_of(&out, "t");
@@ -364,7 +355,6 @@ mod tests {
         assert_eq!(ch[1].child_uid, "t#1134@2023-01-01");
         assert_eq!(ch[1].date_debut, Some(d("2023-01-01")));
         assert_eq!(ch[1].date_fin, None);
-        // L'agrégat de division suit la version COURANTE (abrogée).
         let root = edges_of(&out, "t");
         assert_eq!(root[0].etat, "ABROGE");
     }

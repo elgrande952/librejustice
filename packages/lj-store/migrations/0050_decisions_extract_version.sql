@@ -1,4 +1,4 @@
--- Migration 0050 — Version du pipeline d'extraction par décision (ADR 0083).
+-- Migration 0050 — Version du pipeline d'extraction par décision.
 --
 -- ``decisions.extract_version`` : version de ``lj_core::extract`` qui a
 -- produit les champs structurés stockés de la décision (constante

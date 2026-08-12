@@ -1,10 +1,10 @@
-//! Référentiel d'entités (ADR 0179) : chargement des registres externes
-//! (SIRENE, RNA…) par remplacement de namespace + COPY binaire.
+//! Référentiel d'entités : chargement des registres externes (SIRENE, RNA…)
+//! par remplacement de namespace + COPY binaire.
 //!
 //! L'appelant (lj-ingest) streame la source et pousse des lots ; le
 //! remplacement est encadré par `entity_namespace_clear` (DELETE du
-//! namespace) et les lots par `entity_copy` — le tout dans la
-//! transaction que possède l'appelant (comme le pipeline d'ingest).
+//! namespace) et les lots par `entity_copy` — le tout dans la transaction que
+//! possède l'appelant.
 
 use super::types::{
     DecisionPartyReadRow, EntityContentieuxCounts, EntityCounselRow, EntityDecisionRow,
@@ -16,9 +16,8 @@ use crate::error::Result;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
 
-/// Une entité de registre prête à charger. Aucun folded : le pliage vit
-/// dans les index d'expression `lj_fold`/`lj_fold_all` (ADR 0245), jamais
-/// en heap.
+/// Une entité de registre prête à charger. Aucun folded : le pliage vit dans
+/// les index d'expression `lj_fold`/`lj_fold_all`, jamais en heap.
 #[derive(Debug, Clone)]
 pub struct EntityWriteItem {
     /// Uid namespacé (`siren:552081317`, `rna:W123456789`).
@@ -30,25 +29,64 @@ pub struct EntityWriteItem {
     /// Catégorie juridique source, brute (ex. `5710` Insee).
     pub forme: Option<String>,
     pub active: bool,
-    /// Patronyme composé plié, tirets normalisés en espaces (avocats CNB,
-    /// ADR 0195) — clé du sous-étage de résolution nom-seul.
+    /// Patronyme composé plié, tirets normalisés en espaces (avocats CNB) — clé
+    /// du sous-étage de résolution nom-seul.
     pub surname_key: Option<String>,
-    /// Catégorie d'annuaire (ADR 0239) — dérivée par le chargeur, écrivain
-    /// unique de la règle (namespace × nature × APE).
+    /// Catégorie d'annuaire — dérivée par le chargeur, écrivain unique de la
+    /// règle (namespace × nature × APE).
     pub category: &'static str,
     /// Code APE Insee brut (`69.10Z`, `siren:` seulement).
     pub ape: Option<String>,
     /// Slug barreau (`cnb:` seulement, 2ᵉ segment de l'uid).
     pub barreau: Option<String>,
-    /// Dénominations supplémentaires du jsonb `denominations` (ADR 0249 :
-    /// ordre inverse `NOM PRENOM` et nom commercial des EI) — surface de
-    /// résolution GIN, sans date.
+    /// Dénominations supplémentaires du jsonb `denominations` (ordre inverse
+    /// `NOM PRENOM` et nom commercial des EI) — surface de résolution GIN, sans
+    /// date.
     pub alt_denominations: Vec<String>,
+    /// Évidences d'activité datées `[{du?, au?, src}]` — consommées par
+    /// `lj_active_at` à la résolution. `None` = pas d'évidence (registres non
+    /// datés : SIRENE porte ses périodes dans `denominations`, RNA rien).
+    pub activity: Option<serde_json::Value>,
+}
+
+/// État courant d'une entité `cnb:` lu pour le diff d'upsert du reload.
+#[derive(Debug)]
+pub struct CnbEntityState {
+    pub uid: String,
+    pub active: bool,
+    pub activity: Option<serde_json::Value>,
+    pub barreau: Option<String>,
+    pub denomination: String,
+    pub surname_key: Option<String>,
+    pub forme: Option<String>,
+}
+
+/// Mise à jour d'une entité `cnb:` existante (upsert du reload).
+#[derive(Debug)]
+pub struct CnbEntityUpdate {
+    pub uid: String,
+    pub active: bool,
+    pub activity: Option<serde_json::Value>,
+    pub barreau: Option<String>,
+    pub denomination: String,
+    pub forme: Option<String>,
+    pub surname_key: Option<String>,
+}
+
+/// Arête d'affiliation avocat ↔ structure à écrire. Chaque borne absente est
+/// une borne INCONNUE, pas une borne infinie : `au` vide est l'état courant tant
+/// qu'un reload ne l'a pas fermée.
+#[derive(Debug, Clone)]
+pub struct AffiliationEdge {
+    pub entity_uid: String,
+    pub structure_uid: String,
+    pub du: Option<chrono::NaiveDate>,
+    pub au: Option<chrono::NaiveDate>,
 }
 
 /// Une dénomination historique datée (période close, hors nom courant) —
-/// stagée puis fusionnée dans `entity.denominations` (ADR 0245). Pas de
-/// folded : lj_fold_all le calcule à l'indexation.
+/// stagée puis fusionnée dans `entity.denominations`. Pas de folded :
+/// lj_fold_all le calcule à l'indexation.
 #[derive(Debug, Clone)]
 pub struct EntityHistoryWriteItem {
     pub entity_uid: String,
@@ -59,10 +97,9 @@ pub struct EntityHistoryWriteItem {
 
 impl DecisionRepository<'_> {
     /// Vide un namespace (`siren`, `rna`…) avant rechargement complet —
-    /// idempotence par remplacement (règle #7). À appeler dans la
-    /// transaction du chargeur ; lève le `statement_timeout` du pool pour
-    /// le reste de cette transaction (le DELETE de 12,8 M de lignes `siren:`
-    /// entretient les index annuaire de l'ADR 0239, au-delà des 30 s).
+    /// idempotence par remplacement. À appeler dans la transaction du chargeur ;
+    /// lève le `statement_timeout` du pool pour le reste de cette transaction (le
+    /// DELETE de masse entretient les index annuaire, au-delà des 30 s).
     pub async fn entity_namespace_clear(&self, namespace: &str) -> Result<u64> {
         self.conn
             .batch_execute("SET LOCAL statement_timeout = 0")
@@ -85,8 +122,8 @@ impl DecisionRepository<'_> {
             .conn
             .copy_in(
                 "COPY entity (uid, nature, denomination, denominations, \
-                 sigle, forme, active, surname_key, category, ape, barreau) \
-                 FROM STDIN (FORMAT binary)",
+                 sigle, forme, active, surname_key, category, ape, barreau, \
+                 activity) FROM STDIN (FORMAT binary)",
             )
             .await?;
         let writer = BinaryCopyInWriter::new(
@@ -103,6 +140,7 @@ impl DecisionRepository<'_> {
                 Type::TEXT,
                 Type::TEXT,
                 Type::TEXT,
+                Type::JSONB,
             ],
         );
         tokio::pin!(writer);
@@ -127,11 +165,339 @@ impl DecisionRepository<'_> {
                     &it.category,
                     &it.ape,
                     &it.barreau,
+                    &it.activity,
                 ])
                 .await?;
         }
         writer.finish().await?;
         Ok(())
+    }
+
+    /// État courant du namespace `cnb:` pour le diff d'upsert.
+    pub async fn entity_cnb_states(&self) -> Result<Vec<CnbEntityState>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT uid, active, activity, barreau, denomination, surname_key, forme \
+                 FROM entity WHERE uid LIKE 'cnb:%'",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| CnbEntityState {
+                uid: r.get(0),
+                active: r.get(1),
+                activity: r.get(2),
+                barreau: r.get(3),
+                denomination: r.get(4),
+                surname_key: r.get(5),
+                forme: r.get(6),
+            })
+            .collect())
+    }
+
+    /// Mise à jour bulk d'entités `cnb:` existantes (upsert du reload) :
+    /// active/activity/barreau/denomination/forme/surname_key. `denominations` est
+    /// reconstruit depuis la dénomination courante (écrivain unique de la forme,
+    /// comme `entity_copy`).
+    pub async fn entity_cnb_update_bulk(&self, items: &[CnbEntityUpdate]) -> Result<u64> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let uids: Vec<&str> = items.iter().map(|i| i.uid.as_str()).collect();
+        let actives: Vec<bool> = items.iter().map(|i| i.active).collect();
+        let activities: Vec<Option<&serde_json::Value>> =
+            items.iter().map(|i| i.activity.as_ref()).collect();
+        let barreaux: Vec<Option<&str>> = items.iter().map(|i| i.barreau.as_deref()).collect();
+        let denoms: Vec<&str> = items.iter().map(|i| i.denomination.as_str()).collect();
+        let formes: Vec<Option<&str>> = items.iter().map(|i| i.forme.as_deref()).collect();
+        let surnames: Vec<Option<&str>> = items.iter().map(|i| i.surname_key.as_deref()).collect();
+        let n = self
+            .conn
+            .execute(
+                "UPDATE entity e SET \
+                     active = u.active, activity = u.activity, barreau = u.barreau, \
+                     denomination = u.denomination, \
+                     denominations = jsonb_build_array(jsonb_build_object('d', u.denomination)), \
+                     forme = u.forme, surname_key = u.surname_key \
+                 FROM unnest($1::text[], $2::bool[], $3::jsonb[], $4::text[], \
+                             $5::text[], $6::text[], $7::text[]) \
+                      AS u(uid, active, activity, barreau, denomination, forme, surname_key) \
+                 WHERE e.uid = u.uid",
+                &[
+                    &uids,
+                    &actives,
+                    &activities,
+                    &barreaux,
+                    &denoms,
+                    &formes,
+                    &surnames,
+                ],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    // ── Affiliations avocat ↔ structure ───────────────────────────────────────
+
+    /// Arêtes OUVERTES (`au IS NULL`) d'une source — l'état courant que le
+    /// reload diffe. Renvoie `(entity_uid, structure_uid, du)`.
+    pub async fn affiliation_open_edges(
+        &self,
+        source: &str,
+    ) -> Result<Vec<(String, String, Option<chrono::NaiveDate>)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT entity_uid, structure_uid, du FROM entity_affiliation \
+                 WHERE source = $1 AND au IS NULL",
+                &[&source],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
+    }
+
+    /// Ferme des arêtes ouvertes (`au = date`) — départs et changements de
+    /// structure observés par le reload.
+    pub async fn affiliation_close_bulk(
+        &self,
+        source: &str,
+        entity_uids: &[String],
+        au: chrono::NaiveDate,
+    ) -> Result<u64> {
+        if entity_uids.is_empty() {
+            return Ok(0);
+        }
+        let n = self
+            .conn
+            .execute(
+                "UPDATE entity_affiliation SET au = $3 \
+                 WHERE source = $1 AND entity_uid = ANY($2) AND au IS NULL",
+                &[&source, &entity_uids, &au],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    /// Insère des arêtes. Borne absente = inconnue : `au` vide laisse l'arête
+    /// ouverte (état courant d'un reload), `au` posé écrit une période close
+    /// (période observée par un rejeu de snapshots).
+    pub async fn affiliation_insert_bulk(
+        &self,
+        source: &str,
+        rows: &[AffiliationEdge],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let entity_uids: Vec<&str> = rows.iter().map(|r| r.entity_uid.as_str()).collect();
+        let structure_uids: Vec<&str> = rows.iter().map(|r| r.structure_uid.as_str()).collect();
+        let dus: Vec<Option<chrono::NaiveDate>> = rows.iter().map(|r| r.du).collect();
+        let aus: Vec<Option<chrono::NaiveDate>> = rows.iter().map(|r| r.au).collect();
+        let n = self
+            .conn
+            .execute(
+                "INSERT INTO entity_affiliation (entity_uid, structure_uid, du, au, source) \
+                 SELECT u.entity_uid, u.structure_uid, u.du, u.au, $5 \
+                 FROM unnest($1::text[], $2::text[], $3::date[], $4::date[]) \
+                      AS u(entity_uid, structure_uid, du, au)",
+                &[&entity_uids, &structure_uids, &dus, &aus, &source],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    /// Supprime toutes les arêtes d'une source — un rejeu recalcule ses
+    /// évidences en entier depuis les snapshots, il les remplace.
+    pub async fn affiliation_source_clear(&self, source: &str) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM entity_affiliation WHERE source = $1",
+                &[&source],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    /// Arêtes dérivées des appositions des décisions : un conseil résolu vers
+    /// `cnb:` et le cabinet apposé résolu par `firm_ord`, attestés par au moins
+    /// `support` décisions DISTINCTES. Périodes CLOSES bornées par les dates de
+    /// lecture du support : l'index unique partiel n'admet qu'une arête ouverte par
+    /// source, or un avocat plaide légitimement pour deux structures sur la
+    /// période.
+    pub async fn affiliation_from_decisions(
+        &self,
+        support: i64,
+    ) -> Result<Vec<(AffiliationEdge, i64)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT c.entity_uid, f.entity_uid, min(d.date_lecture), max(d.date_lecture), \
+                        count(DISTINCT c.decision_id) \
+                 FROM decision_party c \
+                 JOIN decision_party f \
+                   ON f.decision_id = c.decision_id AND f.ord = c.firm_ord \
+                 JOIN decisions d ON d.id = c.decision_id \
+                 WHERE c.firm_ord IS NOT NULL \
+                   AND c.entity_uid LIKE 'cnb:%' \
+                   AND f.entity_uid IS NOT NULL \
+                   AND d.date_lecture IS NOT NULL \
+                 GROUP BY 1, 2 \
+                 HAVING count(DISTINCT c.decision_id) >= $1",
+                &[&support],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    AffiliationEdge {
+                        entity_uid: r.get(0),
+                        structure_uid: r.get(1),
+                        du: r.get(2),
+                        au: r.get(3),
+                    },
+                    r.get(4),
+                )
+            })
+            .collect())
+    }
+
+    // ── Re-key CNBF (one-shot) ────────────────────────────────────────────────
+
+    /// Uids `cnb:` référencés par `decision_party` sans entité en base —
+    /// les danglants du régime clear+copy (sorties + changements de barreau).
+    pub async fn dangling_cnb_party_uids(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT p.entity_uid FROM decision_party p \
+                 WHERE p.entity_uid LIKE 'cnb:%' \
+                   AND NOT EXISTS (SELECT 1 FROM entity e WHERE e.uid = p.entity_uid)",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Renomme des uids d'entités (le re-key garde la ligne : compteurs,
+    /// dénominations et liens par valeur suivent le rename des liens).
+    pub async fn entity_rename_bulk(&self, pairs: &[(String, String)]) -> Result<u64> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        let olds: Vec<&str> = pairs.iter().map(|p| p.0.as_str()).collect();
+        let news: Vec<&str> = pairs.iter().map(|p| p.1.as_str()).collect();
+        let n = self
+            .conn
+            .execute(
+                "UPDATE entity e SET uid = u.new_uid \
+                 FROM unnest($1::text[], $2::text[]) AS u(old_uid, new_uid) \
+                 WHERE e.uid = u.old_uid",
+                &[&olds, &news],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    /// Supprime des entités par uid (pieds de fichier, doublons fusionnés).
+    pub async fn entity_delete_bulk(&self, uids: &[String]) -> Result<u64> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let n = self
+            .conn
+            .execute("DELETE FROM entity WHERE uid = ANY($1)", &[&uids])
+            .await?;
+        Ok(n)
+    }
+
+    /// Réécrit `decision_party.entity_uid` old→new. `returning_decisions` :
+    /// renvoie les décisions touchées (fusions/danglants — leurs cibles
+    /// gagnent des liens, `refresh_annuaire_scoped` doit recompter) ; les
+    /// renames purs n'en ont pas besoin (le compteur suit la ligne d'entité).
+    pub async fn decision_party_remap_entity(
+        &self,
+        pairs: &[(String, String)],
+        returning_decisions: bool,
+    ) -> Result<(u64, Vec<i64>)> {
+        if pairs.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let olds: Vec<&str> = pairs.iter().map(|p| p.0.as_str()).collect();
+        let news: Vec<&str> = pairs.iter().map(|p| p.1.as_str()).collect();
+        if returning_decisions {
+            let rows = self
+                .conn
+                .query(
+                    "UPDATE decision_party p SET entity_uid = u.new_uid \
+                     FROM unnest($1::text[], $2::text[]) AS u(old_uid, new_uid) \
+                     WHERE p.entity_uid = u.old_uid \
+                     RETURNING p.decision_id",
+                    &[&olds, &news],
+                )
+                .await?;
+            let mut ids: Vec<i64> = rows.iter().map(|r| r.get(0)).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            Ok((rows.len() as u64, ids))
+        } else {
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE decision_party p SET entity_uid = u.new_uid \
+                     FROM unnest($1::text[], $2::text[]) AS u(old_uid, new_uid) \
+                     WHERE p.entity_uid = u.old_uid",
+                    &[&olds, &news],
+                )
+                .await?;
+            Ok((n, Vec::new()))
+        }
+    }
+
+    /// Dé-lie les liens pointant vers des uids donnés (purge des bidons).
+    pub async fn decision_party_unlink_uids(&self, uids: &[String]) -> Result<u64> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let n = self
+            .conn
+            .execute(
+                "UPDATE decision_party SET entity_uid = NULL WHERE entity_uid = ANY($1)",
+                &[&uids],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    /// Backfill du `du` d'arêtes ouvertes qui n'en avaient pas quand la source se
+    /// met à le déclarer (`acDateEntree` CNB).
+    pub async fn affiliation_backfill_du(
+        &self,
+        source: &str,
+        rows: &[(String, chrono::NaiveDate)],
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let entity_uids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        let dus: Vec<chrono::NaiveDate> = rows.iter().map(|r| r.1).collect();
+        let n = self
+            .conn
+            .execute(
+                "UPDATE entity_affiliation a SET du = u.du \
+                 FROM unnest($1::text[], $2::date[]) AS u(entity_uid, du) \
+                 WHERE a.source = $3 AND a.entity_uid = u.entity_uid \
+                   AND a.au IS NULL AND a.du IS NULL",
+                &[&entity_uids, &dus, &source],
+            )
+            .await?;
+        Ok(n)
     }
 
     /// Table de staging (temporaire, transaction du chargeur) des
@@ -213,7 +579,7 @@ impl DecisionRepository<'_> {
         Ok(row.get(0))
     }
 
-    // ── Fiche entité (lecture, ADR 0189) ──────────────────────────────────────
+    // ── Fiche entité (lecture) ────────────────────────────────────────────────
 
     /// En-tête d'une entité par uid (`entity`). `None` = uid inconnu (→ 404).
     pub async fn entity_header(&self, uid: &str) -> Result<Option<EntityHeaderRow>> {
@@ -237,8 +603,7 @@ impl DecisionRepository<'_> {
 
     /// Dénominations datées d'une entité (la courante incluse), ordre
     /// chronologique — période ouverte (`du` absent) d'abord. Lues du jsonb
-    /// `entity.denominations` (ADR 0245) ; tri textuel = chronologique
-    /// (dates ISO).
+    /// `entity.denominations` ; tri textuel = chronologique (dates ISO).
     pub async fn entity_denominations(&self, uid: &str) -> Result<Vec<EntityDenominationReadRow>> {
         let rows = self
             .conn
@@ -464,16 +829,59 @@ impl DecisionRepository<'_> {
         ))
     }
 
-    // ── Annuaire des entités (ADR 0192 / 0239) ─────────────────────────────────
+    // ── Annuaire des entités ──────────────────────────────────────────────────
 
-    /// Rafraîchit les compteurs annuaire portés par `entity` (ADR 0239) :
-    /// `decision_count` par UPDATE différentiel (pose les nouveaux décomptes de
-    /// décisions liées non soft-deleted, remet à 0 les entités déliées), puis
-    /// re-seed `annuaire_registre` (totaux registre + contentieux par
-    /// catégorie, ADR 0233). Appelé à la fin du relink des parties (règle #7 :
-    /// idempotent). Verrou de timeout local comme `resolve_pending_parties`
-    /// (l'agrégat balaie `decision_party` entière, au-delà des 30 s du pool).
-    /// Renvoie le nombre d'entités avec contentieux.
+    /// Rafraîchissement annuaire SCOPÉ (fin d'un run `reextract-fields` ciblé) :
+    /// recompte `decision_count` des seules entités actuellement liées aux décisions
+    /// du lot (recount absolu par entité, servi par l'index partiel `entity_uid` de
+    /// `decision_party`). Ni remise à 0 des entités totalement déliées, ni reseed
+    /// d'`annuaire_registre` — le `parties-relink` dominical repasse en pleine
+    /// table. Transaction propre, timeout levé. Renvoie le nombre d'entités
+    /// recomptées.
+    #[tracing::instrument(name = "db.refresh_annuaire_scoped", skip_all, fields(db.system = "postgresql", ids = decision_ids.len()))]
+    pub async fn refresh_annuaire_scoped(&self, decision_ids: &[i64]) -> Result<u64> {
+        if decision_ids.is_empty() {
+            return Ok(0);
+        }
+        self.conn.batch_execute("BEGIN").await?;
+        let result: Result<u64> = async {
+            self.conn
+                .batch_execute("SET LOCAL statement_timeout = 0")
+                .await?;
+            let n = self
+                .conn
+                .execute(
+                    "UPDATE entity e \
+                     SET decision_count = cnt.n \
+                     FROM ( \
+                         SELECT p.entity_uid, count(DISTINCT p.decision_id) AS n \
+                         FROM decision_party p \
+                         JOIN decisions d ON d.id = p.decision_id \
+                         WHERE p.entity_uid IN ( \
+                             SELECT DISTINCT entity_uid FROM decision_party \
+                             WHERE decision_id = ANY($1) AND entity_uid IS NOT NULL) \
+                           AND d.deleted_at IS NULL \
+                         GROUP BY p.entity_uid \
+                     ) cnt \
+                     WHERE e.uid = cnt.entity_uid AND e.decision_count <> cnt.n",
+                    &[&decision_ids],
+                )
+                .await?;
+            Ok(n)
+        }
+        .await;
+        match result {
+            Ok(n) => {
+                self.conn.batch_execute("COMMIT").await?;
+                Ok(n)
+            }
+            Err(e) => {
+                let _ = self.conn.batch_execute("ROLLBACK").await;
+                Err(e)
+            }
+        }
+    }
+
     #[tracing::instrument(name = "db.refresh_annuaire", skip(self), fields(db.system = "postgresql"))]
     pub async fn refresh_annuaire(&self) -> Result<u64> {
         self.conn.batch_execute("BEGIN").await?;
@@ -542,18 +950,14 @@ impl DecisionRepository<'_> {
         }
     }
 
-    /// Recherche d'entités par préfixe de dénomination pliée (`folded_prefix` déjà
-    /// plié côté appelant, du MÊME fold que `lj_fold` — conformité prouvée,
-    /// ADR 0245), filtre catégorie
-    /// optionnel — sur le registre COMPLET (ADR 0239), en DEUX jambes : le top
-    /// contentieux d'abord (index partiel `decision_count > 0`, tri borné à ce
-    /// sous-ensemble), puis le complément alphabétique du registre servi par
-    /// l'ordre d'`entity_prefix_idx` sans tri (`USING ~<~` :
-    /// l'ordre C de l'opclass text_pattern_ops est le seul que cet index sait
-    /// servir) — un préfixe court
-    /// (« sci  » ≈ 1,9 M de hits) payait ~5 s de top-N sur toute la plage. Le
-    /// préfixe est échappé côté appelant (wildcards LIKE neutralisés) et déjà
-    /// suffixé `%`.
+    /// Recherche d'entités par préfixe de dénomination pliée (`folded_prefix`
+    /// déjà plié côté appelant, du MÊME fold que `lj_fold`), filtre catégorie
+    /// optionnel — sur le registre COMPLET, en DEUX jambes : le top contentieux
+    /// d'abord (index partiel `decision_count > 0`, tri borné à ce sous-ensemble),
+    /// puis le complément alphabétique du registre servi par l'ordre
+    /// d'`entity_prefix_idx` sans tri (`USING ~<~` : l'ordre C de l'opclass
+    /// text_pattern_ops est le seul que cet index sait servir). Le préfixe est
+    /// échappé côté appelant (wildcards LIKE neutralisés) et déjà suffixé `%`.
     pub async fn entity_search(
         &self,
         folded_like: &str,
@@ -595,13 +999,13 @@ impl DecisionRepository<'_> {
     }
 
     /// Listing paginé d'une catégorie de l'annuaire — registre COMPLET, tri
-    /// contentieux décroissant puis dénomination (ADR 0239) ; filtre barreau
-    /// optionnel (avocats). Renvoie `(total, contentieux, page)` — `total` =
-    /// lignes paginables du filtre courant (le registre entier de la
-    /// catégorie, ou le sous-ensemble barreau), `contentieux` = celles avec
-    /// ≥ 1 décision. Sans barreau les deux viennent d'`annuaire_registre`
-    /// (O(1), rafraîchie au relink) ; avec barreau ils se comptent en live
-    /// (sous-ensemble petit, index partiel).
+    /// contentieux décroissant puis dénomination ; filtre barreau optionnel
+    /// (avocats). Renvoie `(total, contentieux, page)` — `total` = lignes
+    /// paginables du filtre courant (le registre entier de la catégorie, ou le
+    /// sous-ensemble barreau), `contentieux` = celles avec ≥ 1 décision. Sans
+    /// barreau les deux viennent d'`annuaire_registre` (O(1), rafraîchie au
+    /// relink) ; avec barreau ils se comptent en live (sous-ensemble petit, index
+    /// partiel).
     pub async fn entity_directory(
         &self,
         category: &str,
@@ -644,7 +1048,7 @@ impl DecisionRepository<'_> {
 
     /// Compteurs de l'annuaire par catégorie (page d'accueil) :
     /// `(category, registre, contentieux)` — matérialisés dans
-    /// `annuaire_registre` (rafraîchie au relink, ADR 0233/0239).
+    /// `annuaire_registre` (rafraîchie au relink).
     pub async fn annuaire_stats(&self) -> Result<Vec<(String, i64, i64)>> {
         let rows = self
             .conn
@@ -660,25 +1064,22 @@ impl DecisionRepository<'_> {
     }
 
     /// Itère `(namespace, local_id, lastmod)` pour les entités à publier au
-    /// sitemap (pages `/entite/{ns}/{id}`, ADR 0237). Périmètre = entités
-    /// avec ≥ 1 décision liée (`entity.decision_count > 0`, ADR 0239) **sauf
-    /// les avocats** (`category = 'avocats'`) : ce sont des personnes
-    /// physiques, exclues de la promotion SEO pour raison RGPD. `lastmod` =
-    /// date de la décision liée la plus récente
-    /// (`MAX(GREATEST(date_lecture, updated_at::date))`), capée à
+    /// sitemap (pages `/entite/{ns}/{id}`). Périmètre = entités avec ≥ 1 décision
+    /// liée (`entity.decision_count > 0`) **sauf les avocats**
+    /// (`category = 'avocats'`) : ce sont des personnes physiques, exclues de la
+    /// promotion SEO pour raison RGPD. `lastmod` = date de la décision liée la plus
+    /// récente (`MAX(GREATEST(date_lecture, updated_at::date))`), capée à
     /// `current_date`. `local_id` = uid privé de son préfixe `{namespace}:`.
     ///
-    /// Le `GROUP BY` sur le join `entity × decision_party × decisions`
-    /// dépasse le `statement_timeout` du pool (30 s) sur le corpus de prod :
-    /// levé localement dans une transaction dédiée (même pattern que
-    /// `refresh_article_denorm`). Batch quotidien du cron, pas de chemin
-    /// requête utilisateur.
+    /// Le `GROUP BY` sur le join `entity × decision_party × decisions` dépasse le
+    /// `statement_timeout` du pool (30 s) : levé localement dans une transaction
+    /// dédiée. Batch quotidien du cron, pas de chemin requête utilisateur.
     #[tracing::instrument(name = "db.iter_entities_for_sitemap", skip(self), fields(db.system = "postgresql"))]
     pub async fn iter_entities_for_sitemap(
         &self,
-    ) -> Result<Vec<(String, String, chrono::NaiveDate)>> {
+    ) -> Result<Vec<(String, String, Option<chrono::NaiveDate>)>> {
         self.conn.batch_execute("BEGIN").await?;
-        let result: Result<Vec<(String, String, chrono::NaiveDate)>> = async {
+        let result: Result<Vec<(String, String, Option<chrono::NaiveDate>)>> = async {
             self.conn
                 .batch_execute("SET LOCAL statement_timeout = 0")
                 .await?;
@@ -688,10 +1089,8 @@ impl DecisionRepository<'_> {
                     "
                     SELECT split_part(e.uid, ':', 1) AS namespace,
                            substr(e.uid, strpos(e.uid, ':') + 1) AS local_id,
-                           LEAST(
-                               MAX(GREATEST(d.date_lecture, d.updated_at::date)),
-                               current_date
-                           )::date AS lastmod
+                           MAX(GREATEST(d.date_lecture, d.updated_at::date))::date
+                               AS lastmod
                     FROM entity e
                     JOIN decision_party p ON p.entity_uid = e.uid
                     JOIN decisions d ON d.id = p.decision_id AND d.deleted_at IS NULL

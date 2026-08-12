@@ -1,4 +1,4 @@
--- Migration 0098 — facettes re-sourcées sur la relation du domaine (ADR 0145, M4).
+-- Migration 0098 — facettes re-sourcées sur la relation du domaine (M4).
 --
 -- Le token de filtre/facette passe de `text_key` / `text_key || '|' || article_key`
 -- (0076, découplé de la résolution) à `ref_text_uid` / `ref_text_uid || '|' ||

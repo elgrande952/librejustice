@@ -1,4 +1,4 @@
--- Migration 0119 — `decisions.search_title` écrit par l'ingest (ADR 0170 ét.5).
+-- Migration 0119 — `decisions.search_title` écrit par l'ingest (ét. 5).
 --
 -- La colonne était GENERATED ALWAYS … STORED sur `formation_or_chamber`
 -- (migration 0015), condamnée par le drop de cette colonne (séquencement

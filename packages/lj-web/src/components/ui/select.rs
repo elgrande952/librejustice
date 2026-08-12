@@ -1,4 +1,4 @@
-//! `Select` (port de `ui/select.tsx`). `<select>` natif stylise + chevron SVG.
+//! `Select` : `<select>` natif stylise + chevron SVG.
 
 use leptos::html;
 use leptos::prelude::*;

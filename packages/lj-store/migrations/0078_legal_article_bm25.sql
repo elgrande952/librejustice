@@ -1,4 +1,4 @@
--- Migration 0078 — Index BM25 sur le corps des articles (ADR 0114, /recherche-textes).
+-- Migration 0078 — Index BM25 sur le corps des articles (/recherche-textes).
 --
 -- `legal_article` n'a pas de clé mono-colonne (PK composite
 -- `(text_uid, num_key, date_debut)`, migration 0072). ParadeDB exige un
@@ -11,9 +11,9 @@
 -- `source`/`text_uid`/`status` en fast fields (filtre par code, par statut).
 -- Mêmes tokenizers que `decisions_bm25` (0053) : regex `[\p{L}\p{N}-]+` +
 -- ascii folding + stopwords FR `["a","à"]`, `record: position` (phrases).
--- Lexical seulement (pas de jambe sémantique en v1, ADR 0114).
+-- Lexical seulement (pas de jambe sémantique en v1).
 --
--- ⚠️ `ALTER TABLE ADD COLUMN … IDENTITY` réécrit la table (~3 M lignes,
+-- `ALTER TABLE ADD COLUMN … IDENTITY` réécrit la table (~3 M lignes,
 -- ACCESS EXCLUSIVE) et le build BM25 suit dans la même transaction : à appliquer
 -- en fenêtre de maintenance (les pages /loi lisent `legal_article`). Coût disque
 -- moindre que `decisions_bm25` (corps d'article ≪ corps de décision).

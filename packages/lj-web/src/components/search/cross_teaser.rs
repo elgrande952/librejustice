@@ -1,14 +1,8 @@
 //! Ponts croisés entre les deux moteurs : bloc « Dans les textes » dans le
-//! rail de `/decisions`, « Dans les décisions » dans celui de `/textes`. Un
-//! utilisateur qui pose une question de normes dans le moteur décisions (ou
-//! l'inverse) est rattrapé sur la page de résultats au lieu de relancer la
-//! même requête en boucle (note working-notes 2026-07-22).
+//! rail de `/decisions`, « Dans les décisions » dans celui de `/textes`.
 //!
-//! Le fetch (limit 3) part en parallèle de la recherche principale, depuis un
-//! `Effect` vers un signal — même doctrine que facettes/volumétrie du rail :
-//! jamais de lecture de `Resource` dans le rendu du rail, bloc précédent
-//! conservé pendant un refetch. Zéro résultat ou erreur ⇒ le bloc disparaît,
-//! aucun état d'erreur (enrichissement optionnel, pas un contenu).
+//! Le fetch part en parallèle de la recherche principale, depuis un `Effect`
+//! vers un signal. Zéro résultat ou erreur ⇒ le bloc disparaît.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -47,7 +41,6 @@ pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
                     SearchContext::Teaser,
                 )
                 .await;
-            // Réponse en retard (la requête a changé depuis) : ignorée.
             if query.get_untracked() != q {
                 return;
             }
@@ -68,8 +61,8 @@ pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
             .into_iter()
             .take(TEASER_ROWS)
             .map(|h| {
-                // Hit « texte entier » (`numKey` vide, texte à corps ADR 0196)
-                // → page du texte ; sinon page de l'article.
+                // `numKey` vide : hit « texte entier » → page du texte ; sinon page de
+                // l'article.
                 let (href, label) = if h.num_key.is_empty() {
                     (format!("/texte/{}", h.code), h.code_title)
                 } else {
@@ -181,8 +174,7 @@ fn teaser_search_request(q: &str) -> SearchRequest {
     }
 }
 
-/// Gabarit commun des deux blocs (même anatomie que les blocs de facettes du
-/// rail : filet haut, titre en petites capitales, lignes, lien « voir tout »).
+/// Gabarit commun des deux blocs.
 fn teaser_block(
     title: &'static str,
     rows: AnyView,

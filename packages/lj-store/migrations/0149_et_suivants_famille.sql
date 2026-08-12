@@ -1,11 +1,11 @@
--- 0149 — « et suivants » (ADR 0226) : le span de citation porte la locution,
+-- 0149 — « et suivants » : le span de citation porte la locution,
 -- la ligne porte le signal `suivants`, et la famille d'articles désignée
 -- (frères TOC de l'ancre, section unique, VIGUEUR, cap 20) alimente les
 -- arrays de facettes et le menu du span.
 --
--- Deux grains, UNE sémantique (leçon ADR 0147 — jamais deux implémentations) :
--- `_suivants_family_keys` porte l'expansion en clés PUBLIQUES (ADR 0209,
--- la forme de `legal_toc_edge.child_num_key`) — consommée par le menu UI ;
+-- Deux grains, UNE sémantique (jamais deux implémentations) :
+-- `_suivants_family_keys` porte l'expansion en clés PUBLIQUES
+-- (la forme de `legal_toc_edge.child_num_key`) — consommée par le menu UI ;
 -- `_suivants_family` l'enveloppe pour les facettes en forme CITABLE (celle
 -- de `legal_citation.ref_num_key`, ex. « L. 3213-2 »). Les conversions
 -- citable ↔ publique sont bornées au sous-ensemble trivialement inversible

@@ -1,4 +1,4 @@
--- ADR 0145 — citations à plat : la relation du domaine comme stockage.
+-- Citations à plat : la relation du domaine comme stockage.
 --
 -- « La décision D cite le texte T à la position S » est stockée telle quelle,
 -- cible inline, et rafraîchie en bloc par la passe d'extraction (ingest

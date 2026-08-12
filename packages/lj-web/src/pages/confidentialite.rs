@@ -1,5 +1,5 @@
-//! Politique de confidentialité. Port de `privacy-page.tsx`. `<Title>`
-//! propre, hérite de la description racine.
+//! Politique de confidentialité. `<Title>` propre, hérite de la description
+//! racine.
 
 use leptos::prelude::*;
 use leptos_meta::Title;
@@ -24,9 +24,9 @@ pub fn Confidentialite() -> impl IntoView {
                     ". Contact : "
                     <a
                         class="text-[var(--color-accent)] underline-offset-4 hover:underline"
-                        href="mailto:contact@librejustice.fr"
+                        href="mailto:support@librejustice.fr"
                     >
-                        "contact@librejustice.fr"
+                        "support@librejustice.fr"
                     </a>
                     "."
                 </p>
@@ -90,9 +90,9 @@ pub fn Confidentialite() -> impl IntoView {
                     "Si vous êtes cité dans une décision ou une fiche — anonymisation défaillante, donnée inexacte, ou simple volonté de ne plus apparaître — vous pouvez exercer votre droit d'opposition ou demander une correction par courriel à "
                     <a
                         class="text-[var(--color-accent)] underline-offset-4 hover:underline"
-                        href="mailto:contact@librejustice.fr"
+                        href="mailto:support@librejustice.fr"
                     >
-                        "contact@librejustice.fr"
+                        "support@librejustice.fr"
                     </a>
                     ", en indiquant l'URL de la page concernée. Réponse sous un mois au plus."
                 </p>
@@ -116,9 +116,9 @@ pub fn Confidentialite() -> impl IntoView {
                     "Pour toute autre demande, écrivez à "
                     <a
                         class="text-[var(--color-accent)] underline-offset-4 hover:underline"
-                        href="mailto:contact@librejustice.fr"
+                        href="mailto:support@librejustice.fr"
                     >
-                        "contact@librejustice.fr"
+                        "support@librejustice.fr"
                     </a>
                     " ou saisissez la "
                     <a

@@ -1,9 +1,11 @@
-//! Rail gauche de `/decisions` : volumétrie + synthèse cliquable des résultats
+//! Rail gauche de `/decisions` : synthèse cliquable des résultats
 //! (histogramme des années, textes les plus cités, juridictions, dispositif).
+//! Rendu par la page pour une requête seulement — sans requête le rail porte le
+//! bloc corpus (`corpus_intro::JuridictionsRail`).
 //! Desktop uniquement — le conteneur `aside` de la page est `hidden lg:block` ;
 //! sur mobile la volumétrie vit dans la rangée tri de la colonne résultats.
-//! Le pont croisé et l'aide à la recherche vivent dans la colonne DROITE de la
-//! page (`search_page.rs`).
+//! La volumétrie desktop, l'aide à la recherche et le pont croisé vivent dans
+//! la colonne DROITE de la page (`search_page.rs`).
 //!
 //! Chaque clic passe par la MÊME mutation d'URL que les dropdowns de la barre
 //! de filtres (`query_state` + `Nav`) : chip active, nettoyage par la chip ou
@@ -12,12 +14,11 @@
 //! affichés et interactifs, comme la barre de filtres.
 
 use leptos::prelude::*;
-use leptos_router::components::A;
 use leptos_router::hooks::use_query_map;
 use leptos_router::params::ParamsMap;
-use lj_dtos::{QueryMode, SearchFacets};
+use lj_dtos::SearchFacets;
 
-use crate::helpers::{format_results_count, group_thousands};
+use crate::helpers::group_thousands;
 
 use super::compact_search::{query_state, DraftQuery};
 use super::facet_widgets::Nav;
@@ -44,12 +45,7 @@ fn effective_map(map: ParamsMap, draft: Option<RwSignal<String>>) -> ParamsMap {
 }
 
 #[component]
-pub fn SearchRail(
-    #[prop(into)] query: Signal<String>,
-    #[prop(into)] volume: Signal<Option<(i64, QueryMode)>>,
-    #[prop(into)] facets: Signal<Option<SearchFacets>>,
-    #[prop(into)] loading: Signal<bool>,
-) -> impl IntoView {
+pub fn SearchRail(#[prop(into)] facets: Signal<Option<SearchFacets>>) -> impl IntoView {
     let query_map = use_query_map();
     let nav = Nav::new();
     let draft = use_context::<DraftQuery>().map(|d| d.0);
@@ -61,42 +57,6 @@ pub fn SearchRail(
             &value,
         ));
     });
-
-    // ── Volumétrie ────────────────────────────────────────────────────────────
-    let header = move || {
-        if loading.get() {
-            return view! {
-                <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">
-                    "Recherche en cours pour "
-                    <em class="not-italic">"«\u{00A0}"{move || query.get()}"\u{00A0}»"</em>
-                    "…"
-                </h2>
-            }
-            .into_any();
-        }
-        let Some((total, mode)) = volume.get() else {
-            return ().into_any();
-        };
-        let mode_label = match mode {
-            QueryMode::Lexical => "lexicale",
-            QueryMode::Hybrid => "sémantique",
-        };
-        view! {
-            <div class="flex flex-col gap-1">
-                <h2 class="font-sans text-xl text-[var(--color-ink)]">
-                    {format_results_count(total)}
-                </h2>
-                <p class="text-sm leading-snug text-[var(--color-ink-subtle)]">
-                    "pour "
-                    <em class="text-[var(--color-ink)]">"«\u{00A0}"{move || query.get()}"\u{00A0}»"</em>
-                </p>
-                <p class="text-xs text-[var(--color-ink-subtle)]">
-                    {format!("Recherche {mode_label}")}
-                </p>
-            </div>
-        }
-        .into_any()
-    };
 
     // ── Histogramme des années ────────────────────────────────────────────────
     let years = move || {
@@ -232,24 +192,15 @@ pub fn SearchRail(
         rail_list("Dispositif", "solution", rows, toggle)
     };
 
+    // Le premier bloc rendu perd son filet haut (pas de séparateur au-dessus
+    // du premier bloc d'une colonne) ; les suivants gardent le leur.
     view! {
-        <Show when=move || !query.get().is_empty()>
-            <div class="flex flex-col gap-4">
-                {header}
-                {years}
-                {cited}
-                {jurisdictions}
-                {solutions}
-                <div class="border-t border-[var(--color-rule)] pt-4">
-                    <A
-                        href="/juridictions"
-                        attr:class="text-[13px] text-[var(--color-ink-muted)] underline-offset-2 transition-colors hover:text-[var(--color-accent)] hover:underline"
-                    >
-                        "Parcourir le catalogue des décisions"
-                    </A>
-                </div>
-            </div>
-        </Show>
+        <div class="flex flex-col gap-4 [&>div:first-child]:border-t-0 [&>div:first-child]:pt-0">
+            {years}
+            {cited}
+            {jurisdictions}
+            {solutions}
+        </div>
     }
 }
 

@@ -1,5 +1,5 @@
--- ADR 0129 — fraîcheur structurée de la source (« as-of ») + source secondaire amont.
--- Deux axes distincts, NON confondus avec `translation` (officialité du texte, ADR 0116) :
+-- Fraîcheur structurée de la source (« as-of ») + source secondaire amont.
+-- Deux axes distincts, NON confondus avec `translation` (officialité du texte) :
 --   * `source`            (existant) = diffuseur/domaine (legifrance, jafbase, droitcamerounais.info…) ;
 --   * `source_authority`  = autorité du diffuseur — PAS une colonne : mapping pur en Rust (lj-core) ;
 --   * `source_asof`       = date « as-of » de fraîcheur (dernière base crédible que la copie est à jour) ;
@@ -28,6 +28,6 @@ INSERT INTO ingest_freshness (source, asof) VALUES
     ('jorf',       CURRENT_DATE)
 ON CONFLICT (source) DO NOTHING;
 
--- Backfill jafbase : la seule date crédible est la mise à jour du site (ADR 0108).
+-- Backfill jafbase : la seule date crédible est la mise à jour du site.
 UPDATE legal_article SET source_asof = DATE '2025-10-04'
     WHERE source = 'jafbase' AND source_asof IS NULL;

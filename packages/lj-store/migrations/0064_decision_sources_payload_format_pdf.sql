@@ -1,5 +1,5 @@
 -- Migration 0064 — Étend le CHECK payload_format de decision_sources pour
--- accueillir le PDF born-digital (ADR 0095/0096).
+-- accueillir le PDF born-digital.
 --
 -- Le CHECK de decision_full_text.payload_format a déjà été élargi à 'pdf' par
 -- 0059 (CRP ArianeWeb), mais le CHECK INLINE de decision_sources (posé par 0056,

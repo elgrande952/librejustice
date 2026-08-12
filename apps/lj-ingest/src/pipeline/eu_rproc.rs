@@ -1,14 +1,13 @@
-//! Ingestion catalogue des **règlements de procédure** des juridictions UE
-//! (Cour de justice, Tribunal, ex-Tribunal de la fonction publique) — corpus gap
-//! ADR 0137/0138.
+//! Ingestion catalogue des **règlements de procédure** des juridictions UE (Cour de
+//! justice, Tribunal, ex-Tribunal de la fonction publique).
 //!
-//! Ces instruments procéduraux sont cités ≈25 K fois par les décisions CJUE mais
-//! sans numéro année/séquence, la passe EUR-Lex droit dérivé (`ingest-eu-catalog`)
-//! ne les capte pas. On les ajoute en **entrées catalogue curées** (comme EUR-Lex,
-//! ADR 0138) : la forme dominante citée devient le `title_key` (liée par la règle
-//! de fold de titres du linker) ; les variantes (ancien nom de la juridiction,
-//! version datée) vivent en alias TSV du linker
-//! (`packages/lj-extract/data/link_aliases.tsv`, ADR 0145).
+//! Ces instruments procéduraux sont cités des milliers de fois par les décisions
+//! CJUE mais sans numéro année/séquence, et la passe EUR-Lex droit dérivé
+//! (`ingest-eu-catalog`) ne les capte pas. On les ajoute en **entrées catalogue
+//! curées** : la forme dominante citée devient le `title_key` (liée par la règle de
+//! fold de titres du linker) ; les variantes (ancien nom de la juridiction, version
+//! datée) vivent en alias TSV du linker
+//! (`packages/lj-extract/data/link_aliases.tsv`).
 //!
 //! Idempotent : dataset déjà présent non ré-écrit. `dry_run` liste sans écrire.
 
@@ -56,8 +55,8 @@ const RPROCS: &[Rproc] = &[
     },
 ];
 
-/// Génère les datasets catalogue des règlements de procédure (ADR 0137/0138).
-/// `dry_run` : n'écrit rien, liste les instruments.
+/// Génère les datasets catalogue des règlements de procédure. `dry_run` : n'écrit
+/// rien, liste les instruments.
 pub async fn ingest_eu_rproc(dry_run: bool) -> Result<()> {
     let settings = Settings::from_env()?;
     let dir = settings.legal_corpus_dir();

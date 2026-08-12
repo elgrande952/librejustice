@@ -1,18 +1,13 @@
-//! Runner de migrations idempotent (port de `migrator.py`).
+//! Runner de migrations idempotent.
 //!
-//! Les `.sql` sont embarqués via `include_str!` (pas de lecture fs au
-//! runtime). Crée `schema_migrations`, applique les versions non-vues dans une
-//! transaction unique chacune, lève si la base contient une version absente
-//! sur disque.
+//! Les `.sql` sont embarqués via `include_str!` (pas de lecture fs au runtime).
+//! Crée `schema_migrations`, applique les versions non-vues dans une transaction
+//! unique chacune, lève si la base contient une version absente sur disque.
 //!
 //! **Sérialisation inter-process.** Plusieurs runners peuvent appeler
-//! `apply_migrations` en même temps (cron `lj-ingest ingest` + un `load-legal-corpus`
-//! manuel, p. ex.). Sans garde, chacun lit les versions appliquées *avant* que
-//! l'autre n'ait committé, recalcule le même `pending`, et **rejoue** la même
-//! migration : deux reconstructions d'index multi-Go en parallèle, le perdant
-//! mourant ensuite sur la PK de `schema_migrations`. On préfixe donc tout
-//! l'application par un **verrou consultatif de session** ; le perdant attend,
-//! puis relit les versions et ne trouve plus rien à faire.
+//! `apply_migrations` en même temps : toute l'application est préfixée par un
+//! verrou consultatif de session. Le perdant attend, puis relit les versions et
+//! ne trouve plus rien à faire.
 
 use crate::db::Connection;
 use crate::error::{Result, StoreError};
@@ -26,7 +21,7 @@ pub struct Migration {
 }
 
 /// Liste statique des migrations embarquées, triées par version croissante.
-/// Source : `packages/lj-store/migrations/NNNN_*.sql` (copie des `.sql` Python).
+/// Source : `packages/lj-store/migrations/NNNN_*.sql`.
 pub fn embedded_migrations() -> Vec<Migration> {
     vec![
         Migration {
@@ -861,28 +856,228 @@ pub fn embedded_migrations() -> Vec<Migration> {
             name: "0166_legal_text_norm_fond_browse_index.sql",
             sql: include_str!("../migrations/0166_legal_text_norm_fond_browse_index.sql"),
         },
+        Migration {
+            version: 167,
+            name: "0167_decisions_jur_code_date_partial_covering.sql",
+            sql: include_str!("../migrations/0167_decisions_jur_code_date_partial_covering.sql"),
+        },
+        Migration {
+            version: 168,
+            name: "0168_legal_text_curated.sql",
+            sql: include_str!("../migrations/0168_legal_text_curated.sql"),
+        },
+        Migration {
+            version: 169,
+            name: "0169_legal_article_usage_text_uid_indexed.sql",
+            sql: include_str!("../migrations/0169_legal_article_usage_text_uid_indexed.sql"),
+        },
+        Migration {
+            version: 170,
+            name: "0170_entity_folded_gin_fastupdate_off.sql",
+            sql: include_str!("../migrations/0170_entity_folded_gin_fastupdate_off.sql"),
+        },
+        Migration {
+            version: 171,
+            name: "0171_legal_citation_terms_gin_fastupdate_off.sql",
+            sql: include_str!("../migrations/0171_legal_citation_terms_gin_fastupdate_off.sql"),
+        },
+        Migration {
+            version: 172,
+            name: "0172_chunks_legal_gin_fastupdate_off.sql",
+            sql: include_str!("../migrations/0172_chunks_legal_gin_fastupdate_off.sql"),
+        },
+        Migration {
+            version: 173,
+            name: "0173_legal_citation_autovacuum.sql",
+            sql: include_str!("../migrations/0173_legal_citation_autovacuum.sql"),
+        },
+        Migration {
+            version: 174,
+            name: "0174_article_commentaire_ancre_slug.sql",
+            sql: include_str!("../migrations/0174_article_commentaire_ancre_slug.sql"),
+        },
+        Migration {
+            version: 175,
+            name: "0175_article_commentaire_drop_text_uid.sql",
+            sql: include_str!("../migrations/0175_article_commentaire_drop_text_uid.sql"),
+        },
+        Migration {
+            version: 176,
+            name: "0176_entity_uid_pattern_idx.sql",
+            sql: include_str!("../migrations/0176_entity_uid_pattern_idx.sql"),
+        },
+        Migration {
+            version: 177,
+            name: "0177_legal_article_reading_rank.sql",
+            sql: include_str!("../migrations/0177_legal_article_reading_rank.sql"),
+        },
+        Migration {
+            version: 178,
+            name: "0178_entity_activity_affiliation.sql",
+            sql: include_str!("../migrations/0178_entity_activity_affiliation.sql"),
+        },
+        Migration {
+            version: 179,
+            name: "0179_annonces.sql",
+            sql: include_str!("../migrations/0179_annonces.sql"),
+        },
+        Migration {
+            version: 180,
+            name: "0180_suivants_family_datee.sql",
+            sql: include_str!("../migrations/0180_suivants_family_datee.sql"),
+        },
+        Migration {
+            version: 181,
+            name: "0181_decisions_updated_at_contenu.sql",
+            sql: include_str!("../migrations/0181_decisions_updated_at_contenu.sql"),
+        },
+        Migration {
+            version: 182,
+            name: "0182_decision_party_firm_ord.sql",
+            sql: include_str!("../migrations/0182_decision_party_firm_ord.sql"),
+        },
+        Migration {
+            version: 183,
+            name: "0183_drop_legal_text_curated.sql",
+            sql: include_str!("../migrations/0183_drop_legal_text_curated.sql"),
+        },
+        Migration {
+            version: 184,
+            name: "0184_annonce_flux_pur.sql",
+            sql: include_str!("../migrations/0184_annonce_flux_pur.sql"),
+        },
+        Migration {
+            version: 185,
+            name: "0185_legal_text_bm25_facet_fields.sql",
+            sql: include_str!("../migrations/0185_legal_text_bm25_facet_fields.sql"),
+        },
+        Migration {
+            version: 186,
+            name: "0186_legal_article_kind.sql",
+            sql: include_str!("../migrations/0186_legal_article_kind.sql"),
+        },
+        Migration {
+            version: 187,
+            name: "0187_legal_article_bm25_v2_fenetre_validite.sql",
+            sql: include_str!("../migrations/0187_legal_article_bm25_v2_fenetre_validite.sql"),
+        },
+        Migration {
+            version: 188,
+            name: "0188_legal_text_bm25_bascule.sql",
+            sql: include_str!("../migrations/0188_legal_text_bm25_bascule.sql"),
+        },
+        Migration {
+            version: 189,
+            name: "0189_legal_article_bm25_bascule.sql",
+            sql: include_str!("../migrations/0189_legal_article_bm25_bascule.sql"),
+        },
+        Migration {
+            version: 190,
+            name: "0190_decision_sources_drop_id.sql",
+            sql: include_str!("../migrations/0190_decision_sources_drop_id.sql"),
+        },
+        Migration {
+            version: 191,
+            name: "0191_annonce_acteur_libelle_et_contract.sql",
+            sql: include_str!("../migrations/0191_annonce_acteur_libelle_et_contract.sql"),
+        },
+        Migration {
+            version: 192,
+            name: "0192_legal_text_bm25_v2_text_uid.sql",
+            sql: include_str!("../migrations/0192_legal_text_bm25_v2_text_uid.sql"),
+        },
+        Migration {
+            version: 193,
+            name: "0193_legal_text_bm25_bascule_text_uid.sql",
+            sql: include_str!("../migrations/0193_legal_text_bm25_bascule_text_uid.sql"),
+        },
+        Migration {
+            version: 194,
+            name: "0194_annonce_source_drop_content_checksum.sql",
+            sql: include_str!("../migrations/0194_annonce_source_drop_content_checksum.sql"),
+        },
+        Migration {
+            version: 195,
+            name: "0195_mcp_tokens_empreinte.sql",
+            sql: include_str!("../migrations/0195_mcp_tokens_empreinte.sql"),
+        },
+        Migration {
+            version: 196,
+            name: "0196_users_sessions_valid_from.sql",
+            sql: include_str!("../migrations/0196_users_sessions_valid_from.sql"),
+        },
+        Migration {
+            version: 197,
+            name: "0197_annonce_trgm_chemin_archive.sql",
+            sql: include_str!("../migrations/0197_annonce_trgm_chemin_archive.sql"),
+        },
+        Migration {
+            version: 198,
+            name: "0198_ingest_cursor.sql",
+            sql: include_str!("../migrations/0198_ingest_cursor.sql"),
+        },
+        Migration {
+            version: 199,
+            name: "0199_drop_ingest_cursor.sql",
+            sql: include_str!("../migrations/0199_drop_ingest_cursor.sql"),
+        },
+        Migration {
+            version: 200,
+            name: "0200_drop_idx_decision_sources_active.sql",
+            sql: include_str!("../migrations/0200_drop_idx_decision_sources_active.sql"),
+        },
+        Migration {
+            version: 201,
+            name: "0201_annonce_redirect.sql",
+            sql: include_str!("../migrations/0201_annonce_redirect.sql"),
+        },
+        Migration {
+            version: 202,
+            name: "0202_mcp_tokens_drop_clair.sql",
+            sql: include_str!("../migrations/0202_mcp_tokens_drop_clair.sql"),
+        },
+        Migration {
+            version: 203,
+            name: "0203_article_scope_portee_datee.sql",
+            sql: include_str!("../migrations/0203_article_scope_portee_datee.sql"),
+        },
+        Migration {
+            version: 204,
+            name: "0204_text_filiation.sql",
+            sql: include_str!("../migrations/0204_text_filiation.sql"),
+        },
+        Migration {
+            version: 205,
+            name: "0205_scope_membership_default_scope.sql",
+            sql: include_str!("../migrations/0205_scope_membership_default_scope.sql"),
+        },
+        Migration {
+            version: 206,
+            name: "0206_legal_article_usage_bm25_v2_num_key.sql",
+            sql: include_str!("../migrations/0206_legal_article_usage_bm25_v2_num_key.sql"),
+        },
+        Migration {
+            version: 207,
+            name: "0207_legal_article_usage_bm25_bascule_num_key.sql",
+            sql: include_str!("../migrations/0207_legal_article_usage_bm25_bascule_num_key.sql"),
+        },
     ]
 }
 
 /// Clé du verrou consultatif sérialisant les runs de migration concurrents.
 /// Forme à **deux int4** (`pg_advisory_lock(int4, int4)`) → espace de verrous
-/// **disjoint** de celui des `pg_advisory_xact_lock(decision_id)` (bigint) du
-/// repository : aucune collision possible. `classid` = `'LJ'`, `objid` = `'mig'`.
-const MIGRATION_LOCK_CLASS: i32 = 0x4C4A; // "LJ"
-const MIGRATION_LOCK_OBJ: i32 = 0x6D6967; // "mig"
+/// disjoint de celui des `pg_advisory_xact_lock(decision_id)` (bigint) du
+/// repository. `classid` = `'LJ'`, `objid` = `'mig'`.
+const MIGRATION_LOCK_CLASS: i32 = 0x4C4A;
+const MIGRATION_LOCK_OBJ: i32 = 0x6D6967;
 
 /// Prend le verrou consultatif de **session** sérialisant les migrations. Le
 /// `SELECT pg_advisory_lock` peut bloquer bien au-delà des 30 s de
-/// `statement_timeout` posées par le pool (un pair reconstruit un index
-/// multi-Go) ; on le scoppe donc dans une transaction avec `SET LOCAL
-/// statement_timeout = 0`. Le verrou de session **survit au COMMIT** (il n'est
-/// pas lié à la transaction) et reste tenu jusqu'à `pg_advisory_unlock` ou la fin
-/// de session.
+/// `statement_timeout` posées par le pool ; on le scoppe donc dans une
+/// transaction avec `SET LOCAL statement_timeout = 0`. Le verrou de session
+/// survit au COMMIT et reste tenu jusqu'à `pg_advisory_unlock` ou la fin de
+/// session.
 async fn acquire_migration_lock(conn: &Connection) -> Result<()> {
-    // Breadcrumb début/fin : l'attente du verrou est silencieuse et non bornée
-    // (un pair peut le tenir des dizaines de minutes pendant une grosse
-    // migration) — une « prise » sans « obtenu » localise le hang, et
-    // `waited_ms` mesure la contention.
     tracing::info!("migrations : prise du verrou consultatif");
     let waited = std::time::Instant::now();
     conn.batch_execute("BEGIN").await?;
@@ -913,8 +1108,7 @@ async fn acquire_migration_lock(conn: &Connection) -> Result<()> {
     }
 }
 
-/// Crée la table `schema_migrations` si absente (port de
-/// `_ensure_schema_migrations`).
+/// Crée la table `schema_migrations` si absente.
 async fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
     conn.batch_execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (\
@@ -926,7 +1120,7 @@ async fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Versions déjà appliquées (port de `_applied_versions`).
+/// Versions déjà appliquées.
 async fn applied_versions(conn: &Connection) -> Result<Vec<i32>> {
     let rows = conn
         .query("SELECT version FROM schema_migrations", &[])
@@ -935,7 +1129,7 @@ async fn applied_versions(conn: &Connection) -> Result<Vec<i32>> {
 }
 
 /// Applique les migrations non-vues. Renvoie les versions effectivement
-/// appliquées (port de `apply_migrations`).
+/// appliquées.
 ///
 /// Sérialise les runners concurrents via un verrou consultatif de session
 /// (cf. doc de module), puis délègue à [`apply_migrations_locked`]. Le verrou est
@@ -943,8 +1137,7 @@ async fn applied_versions(conn: &Connection) -> Result<Vec<i32>> {
 pub async fn apply_migrations(conn: &Connection) -> Result<Vec<i32>> {
     acquire_migration_lock(conn).await?;
     let result = apply_migrations_locked(conn).await;
-    // Relâche le verrou de session sur tous les chemins (le perdant suivant
-    // pourra entrer et constater qu'il n'y a plus rien à faire).
+    // Relâche le verrou de session sur tous les chemins.
     let _ = conn
         .execute(
             "SELECT pg_advisory_unlock($1, $2)",
@@ -957,11 +1150,10 @@ pub async fn apply_migrations(conn: &Connection) -> Result<Vec<i32>> {
 /// Corps de [`apply_migrations`] exécuté **sous verrou** :
 ///
 /// 1. crée `schema_migrations` ;
-/// 2. liste les versions appliquées (relue *après* le verrou : le gagnant a déjà
-///    committé, donc le perdant voit ses migrations et n'en rejoue aucune) ;
+/// 2. liste les versions appliquées, relues *après* le verrou : le gagnant a
+///    déjà committé, donc le perdant voit ses migrations ;
 /// 3. lève [`StoreError::UnknownMigrations`] si une version en base n'a pas de
-///    fichier embarqué correspondant (signe d'un binaire plus ancien que la
-///    base) ;
+///    fichier embarqué correspondant (binaire plus ancien que la base) ;
 /// 4. applique chaque migration en attente, chacune dans sa propre transaction
 ///    (`BEGIN`/`COMMIT`, `ROLLBACK` sur erreur), puis insère la ligne
 ///    `schema_migrations`.
@@ -1004,29 +1196,49 @@ async fn apply_migrations_locked(conn: &Connection) -> Result<Vec<i32>> {
             name = migration.name,
             "application migration"
         );
+        let started = std::time::Instant::now();
         if let Err(err) = apply_one(conn, migration).await {
-            // best-effort rollback : on tente d'annuler la transaction ouverte
-            // avant de remonter l'erreur d'origine.
+            // best-effort rollback avant de remonter l'erreur d'origine.
             let _ = conn.batch_execute("ROLLBACK").await;
             return Err(err);
         }
+        tracing::info!(
+            version = migration.version,
+            name = migration.name,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "migration appliquée"
+        );
         newly_applied.push(migration.version);
     }
     Ok(newly_applied)
 }
 
+/// Marqueur de **première ligne** d'une migration à jouer hors transaction.
+/// Un seul besoin réel : `CREATE INDEX CONCURRENTLY`, que Postgres refuse dans
+/// un bloc transactionnel — et c'est le seul moyen de changer le schéma d'un
+/// index bm25 sans couper la recherche, ParadeDB n'autorisant pas deux index
+/// bm25 sur une table par le chemin ordinaire.
+const SANS_TRANSACTION: &str = "-- lj:sans-transaction";
+
 /// Applique une migration dans une transaction explicite. `applied_at` est posé
-/// par `now()` côté Postgres (équivaut au `datetime.now(UTC)` Python, sans
-/// dépendre de l'horloge du client).
+/// par `now()` côté Postgres, sans dépendre de l'horloge du client.
 async fn apply_one(conn: &Connection, migration: &Migration) -> Result<()> {
+    if migration.sql.starts_with(SANS_TRANSACTION) {
+        return apply_one_sans_transaction(conn, migration).await;
+    }
     conn.batch_execute("BEGIN").await?;
     // Les migrations sont du SQL de maintenance de confiance ; certaines
-    // reconstruisent des index de plusieurs Go (DROP+CREATE chunks_bm25, cf.
-    // 0026/0041/0046) bien au-delà des 30 s que `build_pool` arme sur chaque
-    // connexion pour borner les requêtes API. `SET LOCAL` : scoppé à la
+    // reconstruisent des index de plusieurs Go, bien au-delà des 30 s que
+    // `build_pool` arme sur chaque connexion. `SET LOCAL` : scoppé à la
     // transaction de la migration → la connexion repart propre dans le pool.
     conn.batch_execute("SET LOCAL statement_timeout = 0")
         .await?;
+    // `lock_timeout` borne l'ATTENTE d'un verrou, pas la durée du travail — une
+    // reconstruction d'index de 20 min passe, une DDL qui ne décroche pas son
+    // ACCESS EXCLUSIVE en 5 s échoue. La migration tourne serveur debout : une DDL
+    // en attente derrière une requête longue fait la queue devant elle toutes les
+    // requêtes suivantes sur la table.
+    conn.batch_execute("SET LOCAL lock_timeout = '5s'").await?;
     conn.batch_execute(migration.sql).await?;
     conn.execute(
         "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, now())",
@@ -1034,6 +1246,40 @@ async fn apply_one(conn: &Connection, migration: &Migration) -> Result<()> {
     )
     .await?;
     conn.batch_execute("COMMIT").await?;
+    Ok(())
+}
+
+/// Applique une migration marquée [`SANS_TRANSACTION`] : la DDL puis la ligne
+/// de `schema_migrations`, chacune en autocommit.
+///
+/// Trois conséquences de l'absence de transaction, toutes assumées :
+///
+/// - **Un seul statement dans le fichier.** Un message simple-query qui en
+///   porte plusieurs est lui aussi un bloc transactionnel : le `CONCURRENTLY`
+///   y serait rejeté. Une bascule d'index se découpe donc en deux migrations
+///   (création concurrente, puis `DROP`/`RENAME` transactionnels).
+/// - **Pas de rollback.** Un `CREATE INDEX CONCURRENTLY` interrompu laisse un
+///   index INVALIDE et la version non enregistrée ; le run suivant rejoue la
+///   migration et échoue sur « already exists ». La reprise passe par un
+///   `DROP INDEX` explicite de l'opérateur.
+/// - **Pas de `lock_timeout`.** `CONCURRENTLY` ne prend qu'un `SHARE UPDATE
+///   EXCLUSIVE` : il ne fait la queue devant personne, il attend seulement la
+///   fin des transactions en cours.
+///
+/// `SET LOCAL` n'a pas de portée hors transaction : le `statement_timeout` est
+/// posé au niveau session, puis `RESET` — qui restaure le `-c
+/// statement_timeout=30s` du pool (`db::SESSION_OPTIONS`), non le défaut
+/// serveur — avant de propager le sort de la DDL.
+async fn apply_one_sans_transaction(conn: &Connection, migration: &Migration) -> Result<()> {
+    conn.batch_execute("SET statement_timeout = 0").await?;
+    let ddl = conn.batch_execute(migration.sql).await;
+    conn.batch_execute("RESET statement_timeout").await?;
+    ddl?;
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, now())",
+        &[&migration.version],
+    )
+    .await?;
     Ok(())
 }
 
@@ -1063,11 +1309,36 @@ mod tests {
     }
 
     #[test]
+    fn sans_transaction_migrations_carry_a_single_statement() {
+        for m in embedded_migrations()
+            .iter()
+            .filter(|m| m.sql.starts_with(SANS_TRANSACTION))
+        {
+            let corps: String = m
+                .sql
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(
+                corps.matches(';').count(),
+                1,
+                "{} : un seul statement attendu hors transaction",
+                m.name
+            );
+            assert!(
+                corps.trim_end().ends_with(';'),
+                "{} : le statement doit clore le fichier",
+                m.name
+            );
+        }
+    }
+
+    #[test]
     fn first_migration_sql_is_non_empty() {
         let migs = embedded_migrations();
         let init = &migs[0];
         assert_eq!(init.name, "0001_init.sql");
-        // le SQL embarqué doit contenir la création de la table decisions.
         assert!(init.sql.contains("schema_migrations") || init.sql.contains("decisions"));
         assert!(!init.sql.trim().is_empty());
     }

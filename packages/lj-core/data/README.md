@@ -54,7 +54,7 @@ mesuré ≥ 97 % de précision sur la GT recasse.
   filtrés des participes féminins irréguliers (« mise », « prise ») et des
   collisions où le verbe en `-er` est dwarfé par le nom homographe.
 
-## `participle_context_fr.txt` — modèle contextuel participe `-é` (ADR 0072)
+## `participle_context_fr.txt` — modèle contextuel participe `-é`
 
 Désambiguïse le participe masc. `-é`/`-és` (présent/nom « condamne » vs participe
 « condamné » ; double homographe « arrête »/« arrêté » ; pluriels « exposés »,
@@ -67,7 +67,7 @@ repli sur la règle auxiliaire.
   accentuée), `flips` = voisins repliés qui inversent la décision par défaut
   (`p<token>` = mot précédent, `n<token>` = mot suivant ; `^`/`$` = début/fin).
 - **Source / construction** : appris hors-ligne sur ~29 000 décisions accentuées
-  en casse mixte (`apps/lj-bench/gt/ranking/_bodies_*`), **disjointes de la GT
+  en casse mixte, **disjointes de la GT
   recasse** (exclusion par `source_uid`). On retient la lecture majoritaire par
   forme et les contextes voisins ≥ 95 % décisifs (précision ≈ 99 % sur la cible).
   Les pluriels `-és` (clés repliées en `es`, longueur > 4 pour écarter « des »/

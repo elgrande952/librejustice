@@ -1,16 +1,15 @@
-//! Backfill offline du champ `decisions.summary` via Mistral (port de
-//! `apps/ingest/librejustice/summary.py` + `librejustice_api/{mistral,titles}.py`).
+//! Backfill offline du champ `decisions.summary` via Mistral.
 //!
 //! Pipeline :
 //!
 //! 1. Itération keyset sur `decisions` : rows dont `summary IS NULL` ou
 //!    `summary_prompt_version < target_version`.
-//! 2. Pour chaque row, on lit le texte intégral (`decisions.full_text`, ADR
-//!    0084) et on l'envoie à Mistral.
-//! 3. UPDATE via `DecisionRepository::set_summary` (pas de SQL inline).
+//! 2. Pour chaque row, on lit le texte intégral (`decisions.full_text`) et on
+//!    l'envoie à Mistral.
+//! 3. UPDATE via `DecisionRepository::set_summary`.
 //!
-//! Concurrence asyncio → ici un sémaphore Tokio. Retry exponentiel sur 429/5xx
-//! avec jitter (max 5 tentatives). Rotation de clés round-robin.
+//! Un sémaphore Tokio borne la concurrence. Retry exponentiel sur 429/5xx avec
+//! jitter (max 5 tentatives). Rotation de clés round-robin.
 
 use std::sync::Arc;
 
@@ -26,19 +25,13 @@ use crate::config::Settings;
 
 const MAX_RETRIES: u32 = 5;
 
-/// Concurrence **par clé** du sémaphore (`concurrency=None`) — simple borne
-/// d'appels en vol ; le débit réel est gouverné par [`MIN_INTERVAL_PER_KEY_MS`].
+/// Concurrence **par clé** du sémaphore (`concurrency=None`) — borne d'appels en
+/// vol, donc de mémoire et de connexions. Le débit, lui, est gouverné par le
+/// registre de quota du client : il lit les compteurs `x-ratelimit-*` de chaque
+/// réponse et n'admet que ce que la clé peut payer.
 const CONCURRENCY_PER_KEY: usize = 7;
 
-/// Throttle du client : intervalle minimum entre deux appels, **par clé** (le
-/// round-robin du pool divise l'intervalle global par le nombre de clés
-/// vivantes — une clé = une org, quotas indépendants). 5 s/clé ≈ 12 appels/min/
-/// org ; à ~4 k tokens le résumé moyen ≈ 48 k TPM, sous les 50 k du modèle le
-/// plus serré (`mistral-small-2603`). Les dépassements ponctuels (payloads
-/// longs) sont absorbés par le retry.
-const MIN_INTERVAL_PER_KEY_MS: u64 = 5_000;
-
-/// Libellés humains du `jurisdiction_type` (port de `juridictionTypeLabels`).
+/// Libellés humains du `jurisdiction_type`.
 fn juridiction_label(jurisdiction_type: &str) -> Option<&'static str> {
     Some(match jurisdiction_type {
         "TA" => "Tribunal administratif",
@@ -68,7 +61,6 @@ const FR_MONTHS: [&str; 12] = [
 ];
 
 /// « 2026-05-29 » → « 29 mai 2026 ». Passe-plat si pas une date ISO complète.
-/// Port de `_format_fr_date`.
 fn format_fr_date(date_lecture: &str) -> String {
     let parts: Vec<&str> = date_lecture.split('-').collect();
     if parts.len() != 3 {
@@ -88,7 +80,6 @@ fn format_fr_date(date_lecture: &str) -> String {
 }
 
 /// Nom de juridiction affichable : `jurisdiction_name` assaini, sinon libellé.
-/// Port de `decision_jurisdiction`.
 fn decision_jurisdiction(jurisdiction_type: &str, jurisdiction_name: Option<&str>) -> String {
     if let Some(name) = jurisdiction_name {
         let cleaned = name.trim().replace(" ,", ",");
@@ -102,8 +93,8 @@ fn decision_jurisdiction(jurisdiction_type: &str, jurisdiction_name: Option<&str
         .to_string()
 }
 
-/// Titre lisible « <juridiction>, <date FR>, <numéro> » (port de
-/// `decision_title`). Date/numéro optionnels.
+/// Titre lisible « <juridiction>, <date FR>, <numéro> ». Date et numéro
+/// optionnels.
 pub fn decision_title(
     jurisdiction_type: &str,
     jurisdiction_name: Option<&str>,
@@ -122,26 +113,23 @@ pub fn decision_title(
     parts.join(", ")
 }
 
-/// Génère le résumé neutre (≤500 c) d'une décision via le client Mistral
-/// partagé (port de `generate_summary`). En-tête « [Décision] <titre> » pour
-/// donner au modèle la juridiction exacte ; couche déterministe `clean_summary`
-/// pour retirer les codes d'anonymisation résiduels.
+/// Génère le résumé neutre (≤ 500 c) d'une décision via le client Mistral
+/// partagé. En-tête « [Décision] <titre> » pour donner au modèle la juridiction
+/// exacte ; couche déterministe `clean_summary` pour retirer les codes
+/// d'anonymisation résiduels.
 async fn generate_summary(
     client: &MistralClient,
     body_text: &str,
     title: &str,
 ) -> Result<String, MistralError> {
     let user_content = build_summary_input(&format!("[Décision] {title}\n\n{body_text}"));
-    // `prompt_cache_key` stable : SUMMARY_PROMPT (préfixe système) est identique sur
-    // toutes les décisions du backfill → tokens du prompt facturés à 10 % (cache Mistral).
     let raw = client
         .chat(SUMMARY_PROMPT, &user_content, Some(400), Some("sum-v8"))
         .await?;
     Ok(clean_summary(&raw))
 }
 
-/// Appelle `generate_summary` avec back-off exponentiel + jitter (port de
-/// `_call_with_retry`).
+/// Appelle `generate_summary` avec back-off exponentiel + jitter.
 ///
 /// Retries sur 429/5xx et transport ; 401 = clé morte → clé suivante sans
 /// back-off, au plus une passe du pool. Tout autre 4xx remonte immédiatement.
@@ -159,7 +147,7 @@ pub async fn call_with_retry(
             Err(MistralError::Status(401)) => {
                 spent_keys += 1;
                 if spent_keys >= client.key_count() {
-                    return Err(MistralError::Status(401)); // tout le pool mort
+                    return Err(MistralError::Status(401));
                 }
                 tracing::warn!(public_id, spent_keys, "summary_key_spent_rotate");
             }
@@ -186,7 +174,7 @@ pub async fn call_with_retry(
     }
 }
 
-/// Format ETA « 12h03m04s » (port de `_format_eta`).
+/// Format ETA « 12h03m04s ».
 pub fn format_eta(seconds: f64) -> String {
     let s = seconds.max(0.0) as u64;
     let h = s / 3600;
@@ -196,11 +184,10 @@ pub fn format_eta(seconds: f64) -> String {
 }
 
 /// Corps de la décision pour le résumé, depuis `decisions.full_text` (= le
-/// `texte_integral_clean` indexé, ADR 0084 — le payload brut a été droppé).
+/// `texte_integral_clean` indexé).
 ///
 /// On découpe `full_text` en lignes, on trim chacune, on jette les vides, et on
-/// joint par `\n\n` (= `_decision_paragraphs` joint par `"\n\n"` côté Python).
-/// `None` si pas de paragraphe non vide.
+/// joint par une ligne blanche. `None` si pas de paragraphe non vide.
 fn body_text_from_full_text(full_text: &str) -> Option<String> {
     let paragraphs: Vec<&str> = full_text
         .lines()
@@ -224,14 +211,12 @@ fn rand01() -> f64 {
 }
 
 /// Backfill `decisions.summary` jusqu'à `summary_prompt_version >=
-/// target_version` pour toutes les décisions ayant un payload source (port de
-/// `backfill_summaries`).
+/// target_version` pour toutes les décisions ayant un payload source.
 ///
 /// Lecture et écriture sur deux connexions distinctes du pool. Le débit est
-/// cadencé par le throttle du client ([`MIN_INTERVAL_PER_KEY_MS`] ÷ clés
-/// vivantes) ; un sémaphore borne les appels en vol ; les writes sont
-/// sérialisés (une connexion d'écriture, un UPDATE par décision).
-/// `concurrency=None` ⇒ clés vivantes × [`CONCURRENCY_PER_KEY`].
+/// cadencé par le registre de quota du client ; un sémaphore borne les appels en
+/// vol ; les writes sont sérialisés (une connexion d'écriture, un UPDATE par
+/// décision). `concurrency=None` ⇒ clés vivantes × [`CONCURRENCY_PER_KEY`].
 pub async fn backfill_summaries(
     target_version: i16,
     concurrency: Option<usize>,
@@ -256,9 +241,9 @@ pub async fn backfill_summaries(
         .get()
         .await
         .map_err(|e| anyhow!("pool.get write: {e}"))?;
-    // Backfill de maintenance : on lève la borne API (build_pool pose
-    // statement_timeout=30s). Le scan de frontière des décisions sans résumé sur
-    // ~3,5 M lignes dépasse 30s — batch long assumé, pas une requête interactive.
+    // Backfill de maintenance : on lève la borne API (`build_pool` pose
+    // `statement_timeout=30s`). Le scan de frontière des décisions sans résumé est
+    // un batch long, pas une requête interactive.
     fetch_conn
         .batch_execute("SET statement_timeout = 0")
         .await
@@ -271,8 +256,7 @@ pub async fn backfill_summaries(
     let write_repo = DecisionRepository::new(&write_conn);
 
     // Écarte les clés désactivées (`mistral_key_status`) puis dimensionne la
-    // concurrence sur le pool vivant : ~`CONCURRENCY_PER_KEY` requêtes en vol
-    // par clé à défaut d'override.
+    // concurrence sur le pool vivant.
     let disabled = fetch_repo.disabled_mistral_key_fingerprints().await?;
     let live_keys: Vec<String> = settings
         .mistral_api_keys
@@ -288,24 +272,21 @@ pub async fn backfill_summaries(
     }
     let keys = live_keys.len();
     let concurrency = concurrency.unwrap_or(keys * CONCURRENCY_PER_KEY).max(1);
-    let min_interval = std::time::Duration::from_millis(MIN_INTERVAL_PER_KEY_MS / keys as u64);
     tracing::info!(
         keys,
         disabled = disabled.len(),
         concurrency,
-        min_interval_ms = min_interval.as_millis() as u64,
         "summary_backfill_concurrency"
     );
 
-    let client = Arc::new(
-        MistralClient::new(live_keys, settings.mistral_model.clone())?
-            .with_min_interval(min_interval),
-    );
+    let client = Arc::new(MistralClient::new(
+        live_keys,
+        settings.mistral_model.clone(),
+    )?);
     let sem = Arc::new(Semaphore::new(concurrency));
 
     // Sampling de review : démarre la pagination keyset à un id aléatoire (avec
-    // wraparound côté repo), sinon le backfill commence toujours par les mêmes
-    // petits id.
+    // wraparound côté repo).
     let start_id = if shuffle {
         let max = fetch_repo.max_decision_id().await?;
         if max > 0 {
@@ -322,8 +303,6 @@ pub async fn backfill_summaries(
     let mut persisted: usize = 0;
     let mut marked: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Le repo matérialise les batches (frontières identiques au générateur
-    // Python) ; on traite chaque batch en concurrence bornée puis on persiste.
     let batches = fetch_repo
         .iter_decisions_missing_summary(
             target_version,
@@ -336,8 +315,6 @@ pub async fn backfill_summaries(
         .await?;
 
     for batch in batches {
-        // Reconstruit le corps de chaque décision (I/O DB séquentiel sur la
-        // connexion de lecture) avant de lancer les appels Mistral.
         let mut jobs: Vec<(i64, String, String)> = Vec::with_capacity(batch.len());
         for row in &batch {
             let title = row_title(row);
@@ -357,7 +334,6 @@ pub async fn backfill_summaries(
             }
         }
 
-        // Appels Mistral concurrents (le throttle du client cadence le débit).
         let mut tasks = Vec::with_capacity(jobs.len());
         for (decision_id, body, title) in jobs {
             let client = Arc::clone(&client);
@@ -370,7 +346,6 @@ pub async fn backfill_summaries(
         }
 
         processed += batch.len();
-        // Persiste les résumés au fil des complétions (writes sérialisés).
         for task in tasks {
             let (decision_id, result) = task.await.map_err(|e| anyhow!("join: {e}"))?;
             match result {
@@ -389,8 +364,7 @@ pub async fn backfill_summaries(
                 }
             }
         }
-        // Persiste les clés mortes découvertes pendant le batch.
-        for fp in client.spent_fingerprints() {
+        for fp in client.drain_spent_fingerprints() {
             if marked.insert(fp.clone()) {
                 write_repo
                     .mark_mistral_key_disabled(&fp, 401, "ingest")
@@ -418,8 +392,8 @@ pub async fn backfill_summaries(
     Ok(())
 }
 
-/// Titre lisible d'une ligne de backfill (port du `decision_title(...)` injecté
-/// dans le prompt). `docket_numbers` → premier numéro éventuel.
+/// Titre lisible d'une ligne de backfill, injecté dans le prompt.
+/// `docket_numbers` → premier numéro éventuel.
 fn row_title(row: &MissingSummaryRow) -> String {
     decision_title(
         &row.jurisdiction_type,
@@ -433,7 +407,6 @@ fn row_title(row: &MissingSummaryRow) -> String {
 mod tests {
     use super::*;
 
-    // Spec : _format_fr_date « 2026-05-29 » → « 29 mai 2026 », passe-plat sinon.
     #[test]
     fn fr_date() {
         assert_eq!(format_fr_date("2026-05-29"), "29 mai 2026");
@@ -443,7 +416,6 @@ mod tests {
         assert_eq!(format_fr_date("2026/05/29"), "2026/05/29");
     }
 
-    // Spec : decision_title « <juridiction>, <date>, <numéro> ».
     #[test]
     fn title_full() {
         let t = decision_title(
@@ -455,15 +427,12 @@ mod tests {
         assert_eq!(t, "Cour de cassation, 29 mai 2026, 24-17.384");
     }
 
-    // Spec : sans jurisdiction_name on retombe sur le libellé du type (jamais
-    // le code brut).
     #[test]
     fn title_falls_back_to_label() {
         let t = decision_title("TA", None, Some("2026-05-29"), None);
         assert_eq!(t, "Tribunal administratif, 29 mai 2026");
     }
 
-    // Spec : jurisdiction_name est assaini (« X , » → « X, ») et trimé.
     #[test]
     fn jurisdiction_sanitised() {
         assert_eq!(
@@ -473,7 +442,6 @@ mod tests {
         assert_eq!(decision_jurisdiction("CE", Some("   ")), "Conseil d'État");
     }
 
-    // Spec : format_eta « HhMMmSSs » zero-paddé minutes/secondes.
     #[test]
     fn eta_format() {
         assert_eq!(format_eta(0.0), "0h00m00s");

@@ -1,6 +1,6 @@
--- Migration 0081 — Stopwords anglais (sans collision FR) sur decisions_bm25 (ADR 0120).
+-- Migration 0081 — Stopwords anglais (sans collision FR) sur decisions_bm25.
 --
--- Corpus bilingue FR-prioritaire (ADR 0120, supersede 0094 §FR-only) : on ingère
+-- Corpus bilingue FR-prioritaire (supersede 0094 §FR-only) : on ingère
 -- désormais la version FR d'une décision européenne si elle existe, sinon la
 -- langue disponible (CEDH EN-only). Le texte anglais atterrit dans
 -- ``decisions.full_text``, indexé par ``decisions_bm25`` (seul index BM25 de

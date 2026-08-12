@@ -1,18 +1,14 @@
-//! Configuration ingest (port de `apps/ingest/librejustice/config.py`).
+//! Configuration ingest.
 //!
-//! Settings centralisé, prefix `LIBREJUSTICE_`. Pas de `std::env::var` dispersé
-//! ailleurs dans le crate : tout passe par [`Settings::from_env`].
+//! Settings centralisé, prefix `LIBREJUSTICE_` : tout passe par
+//! [`Settings::from_env`].
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 use lj_sources::state_paths::StatePaths;
 
-/// Lecture canonique de l'env, factorisée pour ne lire une variable qu'ici.
-///
-/// Le port Python s'appuie sur `pydantic-settings` (`env_prefix="LIBREJUSTICE_"`,
-/// `extra="ignore"`). On reproduit la même sémantique à la main : variable
-/// absente ou vide → `None`.
+/// Lecture canonique de l'env : variable absente ou vide → `None`.
 fn env_opt(key: &str) -> Option<String> {
     match std::env::var(key) {
         Ok(value) if !value.is_empty() => Some(value),
@@ -20,14 +16,14 @@ fn env_opt(key: &str) -> Option<String> {
     }
 }
 
-/// Variable string avec valeur par défaut (équivalent `Field(default=...)`).
+/// Variable string avec valeur par défaut.
 fn env_or(key: &str, default: &str) -> String {
     env_opt(key).unwrap_or_else(|| default.to_string())
 }
 
 /// Découpe une liste séparée par des virgules en éléments non vides, trimés.
 ///
-/// Port de `_split_gemini_keys` / `_split_mistral_keys` : `None`/vide → `[]`.
+/// `None`/vide → `[]`.
 fn split_csv(value: Option<String>) -> Vec<String> {
     value
         .into_iter()
@@ -44,7 +40,7 @@ fn split_csv(value: Option<String>) -> Vec<String> {
 ///
 /// Accepte un entier brut ou un suffixe d'échelle `k`/`m` (`"9k"` → 9000,
 /// `"1.5m"` → 1_500_000), insensible à la casse. Vide/absent → `None`. Valeur
-/// non parsable = erreur franche (une seule frontière de validation, règle #12).
+/// non parsable = erreur franche.
 fn parse_neuron_budget(raw: Option<String>) -> Result<Option<usize>> {
     let Some(raw) = raw else { return Ok(None) };
     let raw = raw.trim().to_ascii_lowercase();
@@ -67,10 +63,8 @@ fn parse_neuron_budget(raw: Option<String>) -> Result<Option<usize>> {
 
 /// Délai du watchdog en secondes (`LIBREJUSTICE_INGEST_WATCHDOG_SECS`).
 ///
-/// Absent/vide → défaut 4 h (14400 s) : couvre `db vacuum-full-chunks` (lock
-/// ~30-60 min) avec marge, tout en cassant un hang du même ordre que celui du
-/// 2026-06-11 (chaîne pendue ~7 h jusqu'au reboot). `0` désactive le watchdog.
-/// Valeur non parsable = erreur franche (une seule frontière de validation, #12).
+/// Absent/vide → défaut 4 h (14400 s). `0` désactive le watchdog. Valeur non
+/// parsable = erreur franche.
 fn parse_watchdog_secs(raw: Option<String>) -> Result<u64> {
     let Some(raw) = raw else { return Ok(14_400) };
     let raw = raw.trim();
@@ -83,9 +77,7 @@ fn parse_watchdog_secs(raw: Option<String>) -> Result<u64> {
 
 /// Paramètres runtime du pipeline d'ingestion.
 ///
-/// Source : variables d'environnement préfixées `LIBREJUSTICE_`, injectées par
-/// le shell local (`mise`/`direnv`) ou par la CI. Un seul nom par secret, pas
-/// d'alias de compatibilité — renommer à la source si besoin.
+/// Source : variables d'environnement préfixées `LIBREJUSTICE_`.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub state_dir: PathBuf,
@@ -109,10 +101,8 @@ pub struct Settings {
     pub otel_service_name: String,
     pub deployment_environment: Option<String>,
     /// Plafond dur de durée d'une invocation `lj-ingest` (watchdog). Au-delà, le
-    /// process logge une erreur et abandonne avec un code non nul, plutôt que de
-    /// rester pendu indéfiniment (le cron `&&` casse alors proprement). Couvre la
-    /// plus longue commande légitime (`db vacuum-full-chunks`, lock ~30-60 min)
-    /// avec marge. `0` = watchdog désactivé.
+    /// process logge une erreur et abandonne avec un code non nul. `0` = watchdog
+    /// désactivé.
     pub watchdog_secs: u64,
 }
 
@@ -156,8 +146,7 @@ impl Settings {
         })
     }
 
-    /// Chemins sous `state_dir` — source de vérité unique du layout
-    /// (`lj_sources::state_paths::StatePaths`).
+    /// Chemins sous `state_dir` (`lj_sources::state_paths::StatePaths`).
     pub fn paths(&self) -> StatePaths {
         StatePaths::new(self.state_dir.clone())
     }
@@ -168,7 +157,7 @@ impl Settings {
     }
 
     /// `ingest/corpus` — datasets légaux curés (métadonnées `legal_text` +
-    /// chemin du markdown OCR), chargés par `load-legal-corpus` (ADR 0108).
+    /// chemin du markdown OCR), chargés par `load-legal-corpus`.
     pub fn legal_corpus_dir(&self) -> PathBuf {
         self.paths().corpus()
     }
@@ -176,19 +165,13 @@ impl Settings {
 
 /// Injecte `pg_password` dans `db_url` si l'URL n'en porte pas déjà un.
 ///
-/// Port fidèle du `@model_validator _inject_pg_password` : on ne touche que si
-/// `pg_password` est posé et que l'URL n'a pas déjà de mot de passe. La forme
-/// reconstruite est `scheme://user:pwd@host[:port]/...` — identique à
-/// `urlunparse(parsed._replace(netloc=...))` côté Python.
+/// La forme reconstruite est `scheme://user:pwd@host[:port]/...`.
 fn inject_pg_password(db_url: &str, pg_password: Option<&str>) -> Result<String> {
     let Some(password) = pg_password.filter(|p| !p.is_empty()) else {
         return Ok(db_url.to_string());
     };
 
-    // Découpe scheme://netloc/reste — on n'a besoin que du netloc (autorité).
     let Some((scheme, after_scheme)) = db_url.split_once("://") else {
-        // Pas une URL avec autorité : on laisse tel quel (comme Python qui
-        // ne réécrit que si un hostname est présent).
         return Ok(db_url.to_string());
     };
     let (netloc, rest) = match after_scheme.find(['/', '?', '#']) {
@@ -196,13 +179,11 @@ fn inject_pg_password(db_url: &str, pg_password: Option<&str>) -> Result<String>
         None => (after_scheme, ""),
     };
 
-    // userinfo@host:port — sépare l'éventuel userinfo de host:port.
     let (userinfo, hostport) = match netloc.rsplit_once('@') {
         Some((info, hp)) => (Some(info), hp),
         None => (None, netloc),
     };
 
-    // Si un mot de passe est déjà présent (`user:pwd`), ne rien faire.
     if userinfo.is_some_and(|info| info.contains(':')) {
         return Ok(db_url.to_string());
     }
@@ -216,8 +197,6 @@ fn inject_pg_password(db_url: &str, pg_password: Option<&str>) -> Result<String>
 mod tests {
     use super::*;
 
-    // Spec : `_inject_pg_password` n'ajoute le mot de passe que si l'URL n'en
-    // porte pas déjà, en préservant user/host/port/path (ADR 0014).
     #[test]
     fn inject_password_when_absent() {
         let url = inject_pg_password(
@@ -258,7 +237,6 @@ mod tests {
         assert_eq!(url, "postgresql://lj:pw@db.internal/librejustice");
     }
 
-    // Spec : les clés Gemini/Mistral sont une liste CSV trimée, vides éliminés.
     #[test]
     fn split_csv_trims_and_filters() {
         assert_eq!(
@@ -269,7 +247,6 @@ mod tests {
         assert!(split_csv(Some("   ".to_string())).is_empty());
     }
 
-    // Spec : budget neurons — entier brut ou suffixe k/m, sinon erreur.
     #[test]
     fn parse_neuron_budget_scales_and_validates() {
         assert_eq!(parse_neuron_budget(None).unwrap(), None);
@@ -286,7 +263,6 @@ mod tests {
         assert!(parse_neuron_budget(Some("plein".into())).is_err());
     }
 
-    // Spec : computed field cache_dir.
     #[test]
     fn computed_dirs() {
         let settings = Settings {

@@ -9,11 +9,10 @@ use std::path::Path;
 /// GET retenté avec backoff, **envoi ET lecture du corps comme une unité**.
 ///
 /// Sur statut 200, lit le corps et le renvoie ; sinon (304/404/autre) renvoie le
-/// statut sans corps. Le point clé : une coupure en plein stream remonte une
-/// erreur reqwest `kind=Decode` **après** que `send()` a renvoyé `Ok` — un retry
-/// qui n'envelopperait que `send()` la laisserait passer (c'est le crash du
-/// 2026-06-09). Ici le `bytes()` est dans la même tentative, donc retenté aussi.
-/// Renvoie `(status, last_modified, corps si 200)`.
+/// statut sans corps. Une coupure en plein stream remonte une erreur reqwest
+/// `kind=Decode` **après** que `send()` a renvoyé `Ok` : le `bytes()` est dans la
+/// même tentative, donc retenté aussi. Renvoie `(status, last_modified, corps si
+/// 200)`.
 pub(crate) fn get_with_body_retrying(
     url: &str,
     mut attempt: impl FnMut() -> reqwest::Result<reqwest::blocking::Response>,
@@ -100,8 +99,7 @@ pub(crate) fn get_to_file_retrying(
     Err(last_err.expect("MAX_TRIES >= 1 → au moins une erreur capturée"))
 }
 
-/// `<chemin>.<ext>` (équivalent de `Path.with_suffix(suffix + ".ext")` Python
-/// qui *ajoute* l'extension, ne la remplace pas).
+/// `<chemin>.<ext>` : *ajoute* l'extension, ne la remplace pas.
 pub(super) fn path_with_added_extension(path: &Path, added: &str) -> std::path::PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".");

@@ -1,14 +1,13 @@
-//! Référentiels facettes côté extraction (ADR 0146/0148).
+//! Référentiels facettes côté extraction.
 //!
-//! Depuis v12, les scanners émettent les uids `solution:*`/`procedure:*`/`office:*`/
-//! `legal_domain:*` directement aux sites de classification — plus de mapping
-//! ancien-monde ici. Restent les dérivations transverses : `publication_uid`
-//! (codes source → rang le plus fort) et le référentiel `jurisdiction`
-//! (code + ligne à la volée).
+//! Les scanners émettent les uids `solution:*`/`procedure:*`/`office:*`/
+//! `legal_domain:*` directement aux sites de classification. Restent les
+//! dérivations transverses : `publication_uid` (codes source → rang le plus
+//! fort) et le référentiel `jurisdiction` (code + ligne à la volée).
 //!
-//! Chaque uid émis par les scanners existe dans le seed
-//! `0100_facet_referentiels.sql` (FK) — le test `emitted_uids_exist_in_seed`
-//! le garantit. Valeur inconnue en entrée → `None` (règle #12).
+//! Chaque uid émis par les scanners existe dans le seed des référentiels de
+//! facettes (FK) — le test `emitted_uids_exist_in_seed` le garantit. Valeur
+//! inconnue en entrée → `None`.
 
 /// Ligne du référentiel `jurisdiction` portée par une décision (le code est
 /// la FK de `decisions.jurisdiction_code` ; label/city servent à créer la
@@ -62,9 +61,9 @@ pub fn publication_uid(codes: &[String]) -> String {
 ///   donne) — le label de la ligne est RECONSTRUIT canoniquement depuis lui
 ///   ([`canonical_label`]), jamais recopié brut.
 ///
-/// `jurisdiction` = la cour, pour tous les ordres (ADR 0172) : la Cassation est
-/// une juridiction unique `cc`, la chambre vit dans les axes `chamber_position`
-/// / `chamber_uid` (ADR 0170), jamais dans l'identité de juridiction.
+/// `jurisdiction` = la cour, pour tous les ordres : la Cassation est une
+/// juridiction unique `cc`, la chambre vit dans les axes `chamber_position` /
+/// `chamber_uid`, jamais dans l'identité de juridiction.
 pub fn jurisdiction_ref(
     jurisdiction_type: &str,
     location: Option<&str>,
@@ -86,9 +85,8 @@ pub fn jurisdiction_ref(
             "cnil".to_string(),
             Some("Commission nationale de l'informatique et des libertés".to_string()),
         ),
-        // Cours européennes : lignes de premier rang chez de référence comme chez
-        // , au même niveau que CE/CASS — grain juridiction unique (nos
-        // colonnes ne portent aucune formation pour elles).
+        // Cours européennes : grain juridiction unique, nos colonnes ne portent aucune
+        // formation pour elles.
         "CJUE" => (
             "cjue".to_string(),
             Some("Cour de justice de l'Union européenne".to_string()),
@@ -110,11 +108,10 @@ pub fn jurisdiction_ref(
         "TA" | "CAA" => {
             let city = jurisdiction_name.and_then(city_from_name)?;
             let slug = slugify(&city);
-            // Nomenclatures fermées (9 CAA, 42 TA) : une ville hors liste est
-            // un nom de greffe corrompu (« CAA de VERSAILLESS », « Tribunal
-            // Administratif d Amiens ») → `None`, jamais de code fantôme.
-            // CAA : l'appelant replie sur le code cour du numéro de requête ;
-            // TA : la décision s'ingère sans facette juridiction (warn ingest).
+            // Nomenclatures fermées (9 CAA, 42 TA) : une ville hors liste est un nom de
+            // greffe corrompu (« CAA de VERSAILLESS », « Tribunal Administratif d Amiens »)
+            // → `None`, jamais de code fantôme. CAA : l'appelant replie sur le code cour du
+            // numéro de requête ; TA : la décision s'ingère sans facette juridiction.
             let closed_set = if jurisdiction_type == "CAA" {
                 CAA_CITY_SLUGS
             } else {
@@ -160,10 +157,9 @@ const CAA_CITY_SLUGS: &[&str] = &[
 ];
 
 /// Villes des 42 TA officiels (art. R. 221-3 CJA), dans l'alphabet
-/// d'extraction : slug du complément de nom APRÈS la préposition, donc
-/// « de La Réunion » → `reunion`. En queue, les variantes de greffe
-/// validées (formes source vivantes en base) — c'est ici qu'on capitalise
-/// quand le warn ingest surface une graphie nouvelle légitime.
+/// d'extraction : slug du complément de nom APRÈS la préposition, donc « de La
+/// Réunion » → `reunion`. En queue, les variantes de greffe validées — c'est là
+/// qu'on ajoute une graphie source nouvelle et légitime.
 const TA_CITY_SLUGS: &[&str] = &[
     "amiens",
     "bastia",
@@ -370,20 +366,17 @@ mod tests {
 
     #[test]
     fn jurisdiction_ref_grains() {
-        // TJ : code Judilibre + ville depuis le nom.
         let j =
             jurisdiction_ref("TJ", Some("tj76351"), Some("Tribunal judiciaire du Havre")).unwrap();
         assert_eq!(j.code, "tj76351");
         assert_eq!(j.city.as_deref(), Some("Havre"));
         assert_eq!(j.label, "Tribunal judiciaire du Havre");
 
-        // TCOM : code numérique nu → préfixé.
         let j =
             jurisdiction_ref("TCOM", Some("7801"), Some("Tribunal de commerce d'Evry")).unwrap();
         assert_eq!(j.code, "tcom7801");
         assert_eq!(j.city.as_deref(), Some("Evry"));
 
-        // CA : slug espaces → underscores.
         let j = jurisdiction_ref(
             "CA",
             Some("ca basse terre"),
@@ -392,24 +385,19 @@ mod tests {
         .unwrap();
         assert_eq!(j.code, "ca_basse_terre");
 
-        // CASS : juridiction unique `cc`, la chambre vit dans les axes (ADR 0172).
         let j = jurisdiction_ref("CC", None, Some("Cour de cassation")).unwrap();
         assert_eq!(j.code, "cc");
         assert_eq!(j.label, "Cour de cassation");
         assert_eq!(j.city, None);
 
-        // TA : ville depuis le nom.
         let j = jurisdiction_ref("TA", None, Some("Tribunal administratif de Melun")).unwrap();
         assert_eq!(j.code, "ta_melun");
-        // TA sans ville dans le nom → pas de code bancal.
         assert_eq!(jurisdiction_ref("TA", None, None), None);
 
-        // CE : unique.
         let j = jurisdiction_ref("CE", None, Some("Conseil d'Etat")).unwrap();
         assert_eq!(j.code, "ce");
         assert_eq!(j.label, "Conseil d'État");
 
-        // Cours européennes : grain juridiction, aucun champ source requis.
         let j = jurisdiction_ref("CJUE", None, None).unwrap();
         assert_eq!(j.code, "cjue");
         assert_eq!(j.label, "Cour de justice de l'Union européenne");
@@ -419,8 +407,7 @@ mod tests {
         assert_eq!(j.label, "Cour européenne des droits de l'homme");
     }
 
-    /// Nomenclature CAA fermée : un nom de greffe corrompu ne fabrique pas de
-    /// code fantôme (`caa_versailless`, `caa_montpellier` vus en prod).
+    /// Un nom de greffe corrompu ne fabrique pas de code fantôme.
     #[test]
     fn caa_city_outside_closed_set_yields_none() {
         assert_eq!(
@@ -448,9 +435,9 @@ mod tests {
         assert_eq!(j.code, "caa_versailles");
     }
 
-    /// Nomenclature TA fermée (42 cours R. 221-3 CJA) : ville inconnue →
-    /// `None` (la décision s'ingère sans facette) ; l'article de tête et les
-    /// variantes de greffe validées passent.
+    /// 42 cours (art. R. 221-3 CJA) : ville inconnue → `None`, la décision
+    /// s'ingère sans facette ; l'article de tête et les variantes de greffe validées
+    /// passent.
     #[test]
     fn ta_city_outside_closed_set_yields_none() {
         assert_eq!(
@@ -471,17 +458,16 @@ mod tests {
         assert_eq!(j.code, "ta_saint_barthelemy");
     }
 
-    /// Une seule façon d'écrire : le label est reconstruit canoniquement,
-    /// jamais recopié brut du libellé source.
+    /// Le label est reconstruit canoniquement, jamais recopié brut du libellé
+    /// source.
     #[test]
     fn labels_are_canonical() {
-        // Casse source hétérogène → préfixe type recanonisé.
         let j =
             jurisdiction_ref("TJ", Some("tj76351"), Some("TRIBUNAL JUDICIAIRE du Havre")).unwrap();
         assert_eq!(j.label, "Tribunal judiciaire du Havre");
 
-        // Libellé source nu (213 k cas prod) : label nu canonique, la ville
-        // arrivera d'une décision sœur du même code (ensure upgrade).
+        // Libellé source nu : label nu canonique, la ville arrivera d'une décision
+        // sœur du même code (ensure upgrade).
         let j = jurisdiction_ref("TJ", Some("tj76351"), Some("Tribunal judiciaire")).unwrap();
         assert_eq!(j.label, "Tribunal judiciaire");
         assert_eq!(j.city, None);
@@ -490,7 +476,7 @@ mod tests {
         let j = jurisdiction_ref("CA", Some("ca paris"), None).unwrap();
         assert_eq!(j.label, "Cour d'appel");
 
-        // Renommage 2025 : le TAE garde sa dénomination propre.
+        // Le TAE garde sa dénomination propre.
         let j = jurisdiction_ref(
             "TCOM",
             Some("7501"),
@@ -521,9 +507,9 @@ mod tests {
         );
     }
 
-    /// Chaque uid que les scanners v12 peuvent émettre existe dans le seed
-    /// 0100 (FK `facet_value`). Listes = sites d'émission de
-    /// `judilibre_outcome/special`, `opendata_outcome` et `cnda`.
+    /// Chaque uid que les scanners peuvent émettre existe dans le seed (FK
+    /// `facet_value`). Listes = sites d'émission de `judilibre_outcome/special`,
+    /// `opendata_outcome` et `cnda`.
     #[test]
     fn emitted_uids_exist_in_seed() {
         let sql = std::fs::read_to_string(concat!(
@@ -531,8 +517,8 @@ mod tests {
             "/../lj-store/migrations/0100_facet_referentiels.sql"
         ))
         .unwrap();
-        // Le seed 0100 est immuable ; la 0145 (ADR 0213) a renommé les
-        // namespaces en base — on applique le même renommage aux uids lus.
+        // Le seed initial est immuable ; une migration a renommé les namespaces en
+        // base — on applique le même renommage aux uids lus.
         let rename = |uid: String| -> String {
             for (old, new) in [
                 ("juridiction:", "jurisdiction_type:"),

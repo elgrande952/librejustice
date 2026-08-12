@@ -1,29 +1,26 @@
 //! Cache in-process des embeddings de query/passages.
 //!
-//! Parité sémantique avec le cache côté serveur Python (`embedder.py`) : un
-//! vecteur est stable pour un texte donné, TTL 7 jours (`_EMB_TTL`). La clé est
-//! fournie par l'appelant (le serveur calcule `emb:md5(text)`).
+//! Un vecteur est stable pour un texte donné, TTL 7 jours. La clé est fournie
+//! par l'appelant (le serveur calcule `emb:md5(text)`).
 //!
-//! Mono-serveur mono-process (axum) : plus de Valkey/Redis, le cache vit
-//! in-process via `moka`. Rien de caché ne nécessite de persistance. La valeur
-//! décodée (le vecteur) est stockée directement plutôt qu'un tableau JSON.
+//! Mono-serveur mono-process (axum) : le cache vit in-process via `moka`. Rien
+//! de caché ne nécessite de persistance. La valeur décodée (le vecteur) est
+//! stockée directement plutôt qu'un tableau JSON.
 
 use moka::future::Cache;
 use ndarray::Array1;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// TTL d'un vecteur caché : 7 jours (`_EMB_TTL` Python). Un vecteur est stable
-/// pour un texte donné.
+/// TTL d'un vecteur caché : 7 jours. Un vecteur est stable pour un texte donné.
 const EMB_TTL_SECONDS: u64 = 604_800;
 
-/// Plafond **mémoire** par défaut (octets) : 50 Mio des 200 Mio totaux du process
-/// (le cache résultats de recherche prend les 150 Mio restants, cf. `lj-api`).
-/// Une entrée ≈ vecteur 1024 `f32` (~4 Kio) → ~12 000 vecteurs chauds.
+/// Plafond **mémoire** par défaut (octets) : 50 Mio des 200 Mio totaux du process.
+/// Une entrée ≈ vecteur 1024 `f32` (~4 Kio), soit ~12 000 vecteurs chauds.
 const DEFAULT_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Overhead moka par entrée (nœud de la map + bookkeeping TinyLFU), ajouté au
-/// poids pesé pour que le plafond couvre la mémoire réelle, pas que le payload.
+/// poids pesé pour que le plafond couvre la mémoire réelle et pas le seul payload.
 const ENTRY_OVERHEAD: usize = 128;
 
 /// Cache d'embeddings in-process (clé = hash du texte ; valeur = vecteur). TTL
@@ -36,7 +33,7 @@ pub struct EmbeddingCache {
 
 impl EmbeddingCache {
     /// Construit le cache avec un plafond mémoire (octets) et le TTL de 7 jours
-    /// (parité `_EMB_TTL`). Le `weigher` pèse clé + vecteur + overhead moka.
+    /// Le `weigher` pèse clé + vecteur + overhead moka.
     pub fn new(max_bytes: u64) -> Self {
         let inner = Cache::builder()
             .weigher(|k: &String, v: &Arc<Array1<f32>>| {
@@ -73,7 +70,6 @@ mod tests {
 
     #[test]
     fn ttl_matches_python() {
-        // 7 jours en secondes (parité _EMB_TTL).
         assert_eq!(EMB_TTL_SECONDS, 7 * 24 * 3600);
     }
 

@@ -1,45 +1,23 @@
-//! Harnais parity-web SEO.
+//! Harnais SEO.
 //!
-//! Verrouille la parité du `<head>` SEO entre le front Rust (Leptos SSR) et
-//! l'oracle Node `apps/web` (React Router framework mode). Deux niveaux :
+//! Verrouille le `<head>` SEO du front Rust (Leptos SSR). Deux niveaux :
 //!
-//! - Shell générique : `<title>` posé par `App()` ; `<meta description>` posé par
-//!   `AppShell` depuis `seo::site_default()`, SUPPRIMÉE sur `/decision/*` (la page
-//!   y émet sa propre description) — parité RR : la route remplace la meta racine,
-//!   jamais deux balises `description`.
-//! - Routes dynamiques : la route `/decision/:id` (SEO-critique : title/desc/OG/
-//!   canonical/JSON-LD dans le HTML initial) et `/decisions` (hérite du shell —
-//!   pas de meta propre côté React, cf. `seo/search.rs`).
+//! - Shell générique : `<title>` posé par `App()` ; `<meta description>` posée par
+//!   `AppShell` depuis `seo::site_default()`, supprimée sur `/decision/*` où la
+//!   page émet la sienne.
+//! - Routes dynamiques : `/decision/:id` (title/desc/OG/canonical/JSON-LD dans le
+//!   HTML initial) et `/decisions` (hérite du shell).
 //!
-//! Limite connue : ces tests exercent les fonctions SEO pures + l'assemblage de
-//! balises, PAS le rendu de l'arbre `App`→`AppShell`→`DecisionPage` complet. La
-//! non-duplication de `<meta description>` (générique vs décision) relève de la
-//! composition des composants : vérifiée en live (curl sur serveur SSR + A/B
-//! Node, cf. working-notes), hors de portée d'un test fixture sans DB.
+//! Ces tests exercent les fonctions SEO pures et l'assemblage de balises, pas le
+//! rendu de l'arbre `App`→`AppShell`→`DecisionPage` complet.
 //!
-//! Comparaison : FIXTURE pour l'instant — on exerce les fonctions SEO pures
-//! (`seo::decision`, identiques byte-à-byte au port de `lib/decision-seo.ts`) et
-//! on assemble les balises exactement comme la page / l'export `meta` React les
-//! émet, puis on assert les valeurs attendues. L'oracle Node live (`apps/web`
-//! SSR ou le service `ssr`) n'était pas joignable hors-ligne au moment d'écrire
-//! ce harnais (ports 3000/5174 fermés) ; la comparaison live byte-exact contre
-//! le HTML rendu arrivera quand l'oracle tournera en CI/local.
-//!
-//! Divergence connue, NON sémantique : l'ordre des clés du JSON-LD diffère
-//! (`{"@type", ...common}` côté TS vs `@type` inséré après `common` côté Rust).
-//! Les crawlers parsent le JSON-LD en graphe — on compare donc le JSON-LD en
-//! `serde_json::Value` (indépendant de l'ordre des clés des objets), pas en
-//! octets.
-//!
-//! Gate `ssr` : `seo` n'est compilé que côté serveur dans le flux courant ; la
-//! cible wasm hydrate n'exécute pas `cargo test`.
+//! Gate `ssr` : `seo` n'est compilé que côté serveur.
 #![cfg(feature = "ssr")]
 
 use lj_dtos::{DecisionDetail, JurisdictionType};
 use lj_web::seo::decision::{build_json_ld, meta_description};
 use lj_web::seo::{canonical_url, site_default, OG_IMAGE};
 
-/// Extrait le contenu textuel d'une balise `<title>…</title>` d'un `<head>`.
 fn extract_title(head_html: &str) -> Option<&str> {
     let start = head_html.find("<title>")? + "<title>".len();
     let rest = &head_html[start..];
@@ -47,7 +25,6 @@ fn extract_title(head_html: &str) -> Option<&str> {
     Some(rest[..end].trim())
 }
 
-/// Extrait le `content` de la `<meta name="description" content="…">`.
 fn extract_meta_description(head_html: &str) -> Option<&str> {
     let tag_start = head_html.find(r#"name="description""#)?;
     let rest = &head_html[tag_start..];
@@ -57,7 +34,6 @@ fn extract_meta_description(head_html: &str) -> Option<&str> {
     Some(&after[..end])
 }
 
-/// Fixture de décision : champs minimaux pour exercer le SEO décision.
 fn fixture_detail() -> DecisionDetail {
     DecisionDetail {
         id: "ce-2024-470537".to_string(),
@@ -96,7 +72,7 @@ fn fixture_detail() -> DecisionDetail {
     }
 }
 
-// ── Shell générique (T0, conservé) ───────────────────────────────────────────
+// ── Shell générique ──────────────────────────────────────────────────────────
 
 #[test]
 fn site_default_locks_generic_title_and_description() {
@@ -129,9 +105,6 @@ fn head_extraction_matches_site_default() {
 
 // ── Route /decision/:id : SEO-critique ───────────────────────────────────────
 
-/// Assemble le `<head>` décision EXACTEMENT comme `DecisionLoaded` (Rust) et
-/// l'export `meta` de `decision-page.tsx` (React) le font, puis verrouille
-/// chaque balise. Parité title/description/OG/twitter/canonical.
 #[test]
 fn decision_route_head_matches_react_meta_contract() {
     let detail = fixture_detail();
@@ -139,25 +112,19 @@ fn decision_route_head_matches_react_meta_contract() {
     let description = meta_description(&detail, &title);
     let url = canonical_url(&detail.id);
 
-    // Title : `{titre canonique} - LibreJustice` — complet, même au-delà des
-    // ~60 caractères affichés par les moteurs (troncature SERP acceptée, cf.
-    // working-note 2026-07-24).
     let page_title = format!("{title} - LibreJustice");
     assert_eq!(
         page_title,
         "Conseil d'État, 12 mars 2024, n° 470537 - LibreJustice"
     );
 
-    // Description : phrase 1 du summary, tronquée au mot (≤ 160 c).
     assert_eq!(
         description,
         "Le Conseil d'État annule la décision attaquée pour erreur de droit."
     );
 
-    // URL canonique apex.
     assert_eq!(url, "https://librejustice.fr/decision/ce-2024-470537");
 
-    // Bloc OG/twitter rendu par `DecisionLoaded` (ordre + valeurs).
     let head = format!(
         "<title>{page_title}</title>\
          <meta name=\"description\" content=\"{description}\"/>\
@@ -188,8 +155,8 @@ fn decision_route_head_matches_react_meta_contract() {
     assert!(head.contains(&format!(r#"<link rel="canonical" href="{url}"/>"#)));
 }
 
-/// JSON-LD : comparé en `Value` (ordre des clés objet non significatif). On
-/// reconstruit le graphe attendu et on assert l'égalité sémantique.
+/// JSON-LD : comparé en `Value`, l'ordre des clés d'un objet n'étant pas
+/// significatif.
 #[test]
 fn decision_jsonld_matches_react_graph() {
     let detail = fixture_detail();
@@ -230,8 +197,6 @@ fn decision_jsonld_matches_react_graph() {
     assert_eq!(got, expected);
 }
 
-/// Cas `summary == None` : la description tombe sur le titre (parité fallback
-/// `detail.summary ? … : title`).
 #[test]
 fn decision_description_falls_back_to_title_without_summary() {
     let mut detail = fixture_detail();

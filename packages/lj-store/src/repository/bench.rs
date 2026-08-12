@@ -1,6 +1,6 @@
-//! Lectures/écritures hors chemin d'upsert : format de source (ADR 0085),
-//! résolution `public_id`↔`id`, corps/texte pour les bancs offline, backfills de
-//! reprise (re-extract, summary), génération et service des sitemaps.
+//! Lectures/écritures hors chemin d'upsert : format de source, résolution
+//! `public_id`↔`id`, corps/texte pour les bancs offline, backfills de reprise
+//! (re-extract, summary), génération et service des sitemaps.
 
 use super::support::now;
 use super::types::{GtDoc, MissingSummaryRow, SitemapRow};
@@ -10,14 +10,25 @@ use chrono::{DateTime, NaiveDate, Utc};
 use lj_core::{CERTIFIER_VERSION, EXTRACT_VERSION};
 use serde_json::Value;
 
-/// Champs d'extraction d'une révision chargée manuellement (annotation versée
-/// à une `extract_version` explicite, ADR 0148 §3) — mêmes colonnes de
-/// `decisions` que l'extraction déterministe, seule la version diffère.
-/// Périmètre = le **schéma cible** uniquement (dates, dockets, publication +
-/// uids de référentiels, ADR 0148) : la version couvre TOUT ce qui est extrait
-/// — champs, facettes, citations — d'un bloc. Le parsing du format
-/// d'annotation vit chez l'appelant (`lj-bench`) ; ici n'arrive que la
-/// projection typée conforme au schéma.
+/// Sort d'une écriture de révision manuelle par [`DecisionRepository::upsert_fields_at_version`].
+///
+/// `Unchanged` est distinct de `NotFound` : la décision existe et porte déjà
+/// exactement cette révision, et l'appelant doit poursuivre son traitement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualUpsert {
+    /// Au moins un champ différait : la ligne est réécrite, `updated_at` bumpé.
+    Applied,
+    /// Révision identique à celle en base : rien écrit, `updated_at` intact.
+    Unchanged,
+    /// Aucune décision pour ce `source_uid`, ou sa version l'emporte.
+    NotFound,
+}
+
+/// Champs d'extraction d'une révision chargée manuellement — mêmes colonnes de
+/// `decisions` que l'extraction déterministe, seule la version diffère. Elle
+/// couvre TOUT ce qui est extrait — champs, facettes, citations — d'un bloc. Le
+/// parsing du format d'annotation vit chez l'appelant ; ici n'arrive que la
+/// projection typée.
 #[derive(Debug, Clone, Default)]
 pub struct ManualFields {
     pub date_lecture: Option<NaiveDate>,
@@ -35,10 +46,8 @@ pub struct ManualFields {
 }
 
 impl DecisionRepository<'_> {
-    /// Persiste le `payload_format` (`xml`/`json`) d'une décision. Le payload
-    /// source brut a été droppé (ADR 0085, reconstructible depuis `full_text` +
-    /// `source_fields`) ; seul le format reste nécessaire pour choisir le
-    /// reconstructeur côté re-extract (`fetch_reextract_inputs`).
+    /// Persiste le `payload_format` (`xml`/`json`) d'une décision : c'est lui qui
+    /// choisit le reconstructeur côté re-extract (`fetch_reextract_inputs`).
     #[tracing::instrument(name = "db.set_payload_format", skip(self), fields(db.system = "postgresql"))]
     pub async fn set_payload_format(&self, decision_id: i64, payload_format: &str) -> Result<()> {
         self.conn
@@ -73,9 +82,8 @@ impl DecisionRepository<'_> {
     }
 
     /// Métadonnées d'identification par `decision_id` : `(id, public_id,
-    /// search_title)`. Sens inverse de [`Self::resolve_public_ids`] — utilisé par
-    /// le banc (`lj-bench rank-arms`) pour étiqueter les docs poolés à juger.
-    /// Les décisions sans `public_id` sont omises (jamais poolables côté API).
+    /// search_title)`. Sens inverse de [`Self::resolve_public_ids`]. Les décisions
+    /// sans `public_id` sont omises.
     pub async fn fetch_public_meta(&self, ids: &[i64]) -> Result<Vec<(i64, String, String)>> {
         let rows = self
             .conn
@@ -100,10 +108,7 @@ impl DecisionRepository<'_> {
     }
 
     /// Résumé v4 + titre par `decision_id` : `(id, search_title, summary)`.
-    /// Body-source du reranker listwise (ADR 0050/0051) ; sert au banc
-    /// (`lj-bench rerank-model-eval`) à reconstruire hors-ligne les `RerankItem`
-    /// du top-K sans passer par l'hydratation prod. Décisions sans `summary`
-    /// omises (le rerank prod les écarte aussi, résumé garanti non vide).
+    /// Décisions sans `summary` omises.
     pub async fn fetch_summaries(&self, ids: &[i64]) -> Result<Vec<(i64, String, String)>> {
         let rows = self
             .conn
@@ -126,10 +131,8 @@ impl DecisionRepository<'_> {
     }
 
     /// Texte intégral par `decision_id` : `(id, public_id, search_title,
-    /// full_text)`. Utilisé par le banc (`lj-bench dump-bodies`) pour
-    /// matérialiser les corps des docs à juger d'une campagne de complétion GT.
-    /// Lit `decisions.full_text` (grain décision, ADR 0084) — plus la
-    /// recombinaison des chunks. Décisions sans `public_id`/`full_text` omises.
+    /// full_text)`, lu sur `decisions.full_text` (grain décision). Décisions sans
+    /// `public_id`/`full_text` omises.
     pub async fn fetch_bodies(&self, ids: &[i64]) -> Result<Vec<(i64, String, String, String)>> {
         let rows = self
             .conn
@@ -153,9 +156,7 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Texte intégral (`decisions.full_text`, grain décision ADR 0085) par id —
-    /// banc BM25 offline (`lj-bench rank-bsweep`). Lit le texte indexé tel quel,
-    /// pas la recombinaison des chunks de [`Self::fetch_bodies`]. Décisions sans
+    /// Texte intégral (`decisions.full_text`, grain décision) par id. Décisions sans
     /// `full_text` omises.
     pub async fn fetch_full_texts(&self, ids: &[i64]) -> Result<Vec<(i64, String)>> {
         let rows = self
@@ -172,10 +173,8 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Corps + métadonnées grain décision pour la matérialisation GT
-    /// (`lj-bench gt-pool`) : `full_text` indexé (ADR 0085, pas la recombinaison
-    /// chunks de [`Self::fetch_bodies`]) + juridiction/niveau/date/titre pour le
-    /// `_meta_<slug>.yaml`. Décisions sans `full_text` omises.
+    /// Corps + métadonnées grain décision pour la matérialisation GT : `full_text`
+    /// indexé + juridiction/niveau/date/titre. Décisions sans `full_text` omises.
     pub async fn fetch_gt_docs(&self, ids: &[i64]) -> Result<Vec<GtDoc>> {
         let rows = self
             .conn
@@ -202,10 +201,8 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Échantillon aléatoire de `full_text` (`TABLESAMPLE SYSTEM`) — banc BM25
-    /// offline (`lj-bench rank-bsweep`) : sert à estimer la longueur moyenne
-    /// (avgdl) du champ indexé, tokenisée côté banc avec le tokenizer de l'index.
-    /// `sample_pct` est piloté par le code (jamais une entrée externe).
+    /// Échantillon aléatoire de `full_text` (`TABLESAMPLE SYSTEM`). `sample_pct` est
+    /// piloté par le code, jamais une entrée externe.
     pub async fn sample_full_texts(&self, sample_pct: f64) -> Result<Vec<String>> {
         let sql = format!(
             "SELECT full_text FROM decisions TABLESAMPLE SYSTEM ({sample_pct}) \
@@ -215,10 +212,9 @@ impl DecisionRepository<'_> {
         Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
-    /// Fréquence documentaire `df` d'un terme indexé `term` dans `full_text` —
-    /// banc BM25 offline (`lj-bench rank-bsweep`), pour l'IDF. `term` est déjà
-    /// folded/lowercased comme le tokenizer de l'index ; `paradedb.term` ne le
-    /// re-tokenise pas (comparaison directe aux termes de `decisions_bm25`).
+    /// Fréquence documentaire `df` d'un terme indexé `term` dans `full_text`.
+    /// `term` est déjà folded/lowercased comme le tokenizer de l'index ;
+    /// `paradedb.term` ne le re-tokenise pas.
     pub async fn bm25_term_doc_count(&self, term: &str) -> Result<i64> {
         let row = self
             .conn
@@ -240,13 +236,11 @@ impl DecisionRepository<'_> {
         Ok(row.get::<_, i64>(0))
     }
 
-    /// Entrées du re-extract (ADR 0085) : `(payload_format, full_text,
-    /// source_fields, source_uid)` d'une décision, pour reconstruire le payload
-    /// source via `reconstruct_{json,xml}_payload` et re-parser. `full_text` est
-    /// le texte canonique (`decisions`) ; `payload_format`/`source_fields`/
-    /// `source_uid` viennent de la **provenance autoritaire** (ADR 0098 §4.2 :
-    /// rang max active) — celle dont le texte EST `full_text`. `None` si pas de
-    /// provenance active ou si `full_text`/`source_fields` manque.
+    /// Entrées du re-extract : `(payload_format, full_text, source_fields,
+    /// source_uid)`, de quoi reconstruire le payload source et le re-parser. Les
+    /// trois derniers viennent de la provenance autoritaire (rang max active),
+    /// celle dont le texte EST `full_text`. `None` si pas de provenance active ou si
+    /// `full_text`/`source_fields` manque.
     pub async fn fetch_reextract_inputs(
         &self,
         decision_id: i64,
@@ -261,7 +255,7 @@ impl DecisionRepository<'_> {
                     SELECT source_fields, source_uid
                     FROM decision_sources
                     WHERE decision_id = d.id AND deleted_at IS NULL
-                    ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, id ASC
+                    ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC
                     LIMIT 1
                 ) ds ON true
                 WHERE d.id = $1
@@ -279,12 +273,9 @@ impl DecisionRepository<'_> {
         }
     }
 
-    /// Entrées de re-extraction d'un **lot de `decision_id`** en **une seule
-    /// requête** (`d.id = ANY($1)`), au lieu d'un aller-retour par id. Même
-    /// projection que [`Self::fetch_reextract_inputs`] (provenance autoritaire via
-    /// `JOIN LATERAL`), plus l'`id` en tête pour ré-apparier côté appelant. Les ids
-    /// sans provenance active / `full_text`/`source_fields` manquant sont omis ;
-    /// l'ordre n'est pas garanti (l'appelant ré-apparie par `id`). Read-only.
+    /// Même projection que [`Self::fetch_reextract_inputs`] pour un lot d'ids en une
+    /// requête, plus l'`id` en tête pour ré-apparier. Les ids incomplets sont omis ;
+    /// l'ordre n'est pas garanti.
     pub async fn fetch_reextract_inputs_batch(
         &self,
         ids: &[i64],
@@ -299,7 +290,7 @@ impl DecisionRepository<'_> {
                     SELECT source_fields, source_uid
                     FROM decision_sources
                     WHERE decision_id = d.id AND deleted_at IS NULL
-                    ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, id ASC
+                    ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC
                     LIMIT 1
                 ) ds ON true
                 WHERE d.id = ANY($1)
@@ -324,13 +315,10 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Entrées de re-extraction adressées **par `source_uid`** (et non par
-    /// `decision_id`) : pour le banc d'extraction, dont la GT est clé sur le
-    /// `source_uid` exact de la provenance annotée. Renvoie, pour chaque uid
-    /// trouvé avec un `full_text` + `source_fields` non nuls, le triplet
-    /// `(source_uid, full_text, source_fields)` — la matière de
-    /// [`lj_core::parsing::Decision::from_source_fields`] (ADR 0085). Batch
-    /// `= ANY($1)` ; les uids absents / incomplets sont simplement omis.
+    /// Même chose, adressé par `source_uid` : le triplet `(source_uid, full_text,
+    /// source_fields)`, matière de
+    /// [`lj_core::parsing::Decision::from_source_fields`]. Les uids absents ou
+    /// incomplets sont omis.
     pub async fn fetch_reextract_inputs_by_source_uids(
         &self,
         source_uids: &[String],
@@ -363,14 +351,11 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Keyset (par `decision_id`) des décisions **multi-provenances tout-judilibre**
-    /// (≥2 `decision_sources` actifs, tous `source='judilibre'`) avec, pour chacune,
-    /// la liste de ses provenances `(source_uid, payload_format, source_fields)` —
-    /// la matière de la détection des faux merges (#29 / ADR 0100) : recalculer
-    /// `canonical_ref` par provenance et flaguer les décisions dont les clés
-    /// divergent. Read-only. Renvoie les lignes triées `(decision_id, ds.id)` :
-    /// l'appelant regroupe par `decision_id`. `last_id` = dernier `decision_id`
-    /// traité (reprise).
+    /// Keyset (par `decision_id`) des décisions multi-provenances tout-judilibre
+    /// (≥ 2 `decision_sources` actifs, tous `source='judilibre'`), avec la liste de
+    /// leurs provenances `(source_uid, payload_format, source_fields)`. Lignes
+    /// triées `(decision_id, ds.id)` : l'appelant regroupe. `last_id` = dernier
+    /// `decision_id` traité.
     pub async fn fetch_judilibre_multiprovenance_batch(
         &self,
         last_id: i64,
@@ -412,20 +397,14 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Keyset (par `decision_id`) des décisions ayant **au moins un chunk sans
-    /// embedding** (orphelins #39), avec, pour chacune, les entrées de
-    /// reconstruction (ADR 0085) **plus** le `public_id` et le `content_checksum`
-    /// existants — pour rebâtir un `Candidate` fidèle qui re-traverse le pipeline
-    /// (re-chunk + embed) **sans changer l'identité ni le checksum** (le re-embed
-    /// déclenché par la garde `require_embeddings && !has_embeddings`). Driven par
-    /// `decision_chunks.embedding IS NULL` (volume minuscule, ~1.8k).
+    /// Keyset des décisions ayant au moins un chunk sans embedding, avec les
+    /// entrées de reconstruction plus le `public_id` et le `content_checksum`
+    /// existants — de quoi rebâtir un `Candidate` fidèle qui re-traverse le pipeline
+    /// sans changer l'identité ni le checksum.
     ///
-    /// Le keyset est porté par le CTE `ids` (LEFT JOIN sur décision + provenance) :
-    /// chaque `decision_id` candidat est **toujours** renvoyé (l'appelant avance
-    /// `last_id` au max du lot), avec ses champs de reconstruction en `Option` —
-    /// `None` si la décision n'a pas de provenance active / pas de `full_text`
-    /// (lignes incomplètes ignorées à la reconstruction, sans bloquer la reprise).
-    /// `last_id` = dernier `decision_id` traité (reprise). Renvoie
+    /// Chaque `decision_id` candidat est toujours renvoyé (l'appelant avance
+    /// `last_id` au max du lot), champs de reconstruction en `Option` : `None` quand
+    /// la décision n'a pas de provenance active ou pas de `full_text`. Renvoie
     /// `(id, Option<(public_id, payload_format, full_text, source_fields,
     /// source_uid, content_checksum)>)`.
     #[allow(clippy::type_complexity)]
@@ -453,7 +432,7 @@ impl DecisionRepository<'_> {
                     SELECT payload_format, source_fields, source_uid, content_checksum
                     FROM decision_sources
                     WHERE decision_id = ids.id AND deleted_at IS NULL
-                    ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, id ASC
+                    ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC
                     LIMIT 1
                 ) ds ON true
                 ORDER BY ids.id
@@ -488,12 +467,9 @@ impl DecisionRepository<'_> {
         Ok(out)
     }
 
-    /// Keyset des décisions à re-parser : `full_text` présent et
-    /// ``extract_version`` strictement sous la version courante du pipeline
-    /// (reprise de ``reextract-fields``, ADR 0083) — les versions ≥ courante,
-    /// dont les révisions manuelles (> courante par convention), sont hors
-    /// worklist. Le re-extract part de la reconstruction `(full_text,
-    /// source_fields)` — plus du payload (ADR 0085).
+    /// Keyset des décisions à re-parser : `full_text` présent, ``extract_version``
+    /// sous la version courante. Les révisions manuelles (version > courante) sont
+    /// hors worklist.
     pub async fn decision_ids_for_reextract(&self, last_id: i64, limit: i64) -> Result<Vec<i64>> {
         let rows = self
             .conn
@@ -514,11 +490,9 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    /// Certifie un lot de décisions à `certified_version` (ADR 0125 Inc.2-bis) : le
-    /// re-extract par défaut les skippera tant que `certified_version >= CERTIFIER_VERSION`.
-    /// Appelé par l'oracle haut-recall (Inc.2) sur les décisions dont la capture est
-    /// prouvée complète + résolue. Renvoie le nb de lignes mises à jour. **Setter
-    /// uniquement** : invalidation = bump de `CERTIFIER_VERSION` (comparaison, sans write).
+    /// Certifie un lot de décisions à `certified_version` : le re-extract par défaut
+    /// les skippe tant que `certified_version >= CERTIFIER_VERSION`. Setter
+    /// uniquement — l'invalidation est un bump de la constante.
     pub async fn certify_decisions(&self, ids: &[i64], version: i32) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
@@ -533,10 +507,8 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Nombre de décisions **périmées** (`extract_version` ≠ courante, `full_text`
-    /// présent) : la **traîne** restant à ré-extraire par le mode par défaut de
-    /// `reextract-fields` (même prédicat que [`Self::decision_ids_for_reextract`]).
-    /// Read-only ; sert à afficher l'avancement `processed/total` + ETA.
+    /// Nombre de décisions périmées, même prédicat que
+    /// [`Self::decision_ids_for_reextract`] : sert l'avancement `processed/total`.
     pub async fn count_decisions_for_reextract(&self) -> Result<i64> {
         let row = self
             .conn
@@ -553,14 +525,8 @@ impl DecisionRepository<'_> {
         Ok(row.get(0))
     }
 
-    /// **Worklist complète** des ids de décisions périmées (même prédicat que
-    /// [`Self::count_decisions_for_reextract`]), triée par id. Un seul scan (~5 s
-    /// sur 3,6 M) qui remplace les milliers de keyset filtrés `id > cursor AND
-    /// extract_version != courant` — ces derniers dégradent (l'index PK élimine un
-    /// préfixe v8 croissant). La liste (~8 Mo/M ids) est ensuite partitionnée entre
-    /// workers concurrents. À 25 % de lignes périmées le seq scan est optimal (un
-    /// index ne serait pas retenu) ; il ne paierait qu'à forte convergence, où il
-    /// reste peu de travail.
+    /// Worklist complète des ids périmés, triée par id, en un seul scan, ensuite
+    /// partitionnée entre workers concurrents.
     pub async fn stale_decision_ids_for_reextract(&self) -> Result<Vec<i64>> {
         let rows = self
             .conn
@@ -578,12 +544,9 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    /// Worklist de la **passe intégrale** (ADR 0145, `--full`) : TOUT le fonds
-    /// jusqu'à la version courante incluse — même déjà à jour, même certifié —
-    /// c'est le relink hebdomadaire (le `LinkSnapshot` du run voit le
-    /// catalogue du jour ; le skip Rust des sets de citations inchangés borne
-    /// les écritures au delta). Les révisions manuelles (version > courante)
-    /// restent hors worklist.
+    /// Worklist de la passe intégrale (`--full`) : tout le fonds jusqu'à la version
+    /// courante incluse, même déjà à jour, même certifié — c'est le relink
+    /// hebdomadaire. Les révisions manuelles restent hors worklist.
     pub async fn all_decision_ids_for_reextract(&self) -> Result<Vec<i64>> {
         let rows = self
             .conn
@@ -600,37 +563,52 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    /// Écrit une révision des champs d'extraction **dans les colonnes de
-    /// `decisions`** — schéma cible + uids de facettes — stampée
-    /// `extract_version = version` : même modèle que l'extraction
-    /// déterministe, seule la version diffère (une version > courante n'est
-    /// jamais réécrite par le recognizer). Les champs absents/`None` écrivent
-    /// NULL (révision exhaustive : absent = confirmé absent), sauf
-    /// `jurisdiction_code` (COALESCE : porté aussi par les métadonnées
-    /// source, jamais dégradé par une annotation muette). Renvoie `false` si
-    /// aucune décision ne matche le `source_uid` ou si la décision porte une
-    /// version supérieure (invariant : jamais dégrader une `extract_version`
-    /// plus grande).
+    /// Écrit une révision des champs d'extraction dans les colonnes de `decisions`,
+    /// stampée `extract_version = version` ; une version > courante n'est jamais
+    /// réécrite par le recognizer. Les champs `None` écrivent NULL (révision
+    /// exhaustive : absent = confirmé absent), sauf `jurisdiction_code` (COALESCE :
+    /// porté aussi par les métadonnées source).
+    ///
+    /// N'écrit que sur différence : une révision identique laisse `updated_at`
+    /// intact. `cible` vide = `NotFound` (pas de décision, ou version supérieure) ;
+    /// `cible` non vide sans ligne écrite = `Unchanged`.
     pub async fn upsert_fields_at_version(
         &self,
         source_uid: &str,
         version: i16,
         fields: &ManualFields,
-    ) -> Result<bool> {
-        let n = self
+    ) -> Result<ManualUpsert> {
+        let row = self
             .conn
-            .execute(
-                "UPDATE decisions d SET
-                     date_lecture = $2, date_audience = $3, docket_numbers = $4,
-                     publication_codes = $5,
-                     solution_uid = $6, procedure_uid = $7, office_uid = $8,
-                     legal_domain_uid = $9,
-                     chamber_position = $10, chamber_uid = $11, formation_uid = $12,
-                     jurisdiction_code = COALESCE($13, d.jurisdiction_code),
-                     extract_version = $14, updated_at = now()
-                 FROM decision_sources ds
-                 WHERE ds.decision_id = d.id AND ds.source_uid = $1
-                   AND (d.extract_version IS NULL OR d.extract_version <= $14)",
+            .query_one(
+                "WITH cible AS (
+                     SELECT d.id
+                     FROM decisions d
+                     JOIN decision_sources ds ON ds.decision_id = d.id
+                     WHERE ds.source_uid = $1
+                       AND (d.extract_version IS NULL OR d.extract_version <= $14)
+                 ), maj AS (
+                     UPDATE decisions d SET
+                         date_lecture = $2, date_audience = $3, docket_numbers = $4,
+                         publication_codes = $5,
+                         solution_uid = $6, procedure_uid = $7, office_uid = $8,
+                         legal_domain_uid = $9,
+                         chamber_position = $10, chamber_uid = $11, formation_uid = $12,
+                         jurisdiction_code = COALESCE($13, d.jurisdiction_code),
+                         extract_version = $14, updated_at = now()
+                     FROM cible
+                     WHERE d.id = cible.id
+                       AND (d.date_lecture, d.date_audience, d.docket_numbers,
+                            d.publication_codes, d.solution_uid, d.procedure_uid,
+                            d.office_uid, d.legal_domain_uid, d.chamber_position,
+                            d.chamber_uid, d.formation_uid, d.jurisdiction_code,
+                            d.extract_version)
+                           IS DISTINCT FROM
+                           ($2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                            COALESCE($13, d.jurisdiction_code), $14)
+                     RETURNING 1
+                 )
+                 SELECT (SELECT count(*) FROM cible), (SELECT count(*) FROM maj)",
                 &[
                     &source_uid,
                     &fields.date_lecture,
@@ -649,17 +627,20 @@ impl DecisionRepository<'_> {
                 ],
             )
             .await?;
-        Ok(n > 0)
+        let trouvee: i64 = row.get(0);
+        let ecrite: i64 = row.get(1);
+        Ok(match (trouvee, ecrite) {
+            (0, _) => ManualUpsert::NotFound,
+            (_, 0) => ManualUpsert::Unchanged,
+            _ => ManualUpsert::Applied,
+        })
     }
 
     /// Remplace la couche citations d'une décision à une `extract_version`
-    /// explicite (ADR 0145 §3) : la révision est exhaustive, le set fourni
-    /// EST la vérité — DELETE + COPY via l'écrivain commun. Les `rows`
-    /// arrivent déjà validées au bord (parse de l'appelant : bornes, tri,
-    /// ancrage `surface == full_text[span]`, cohérence status ↔ cible) —
-    /// même type que le recognizer, seule la version diffère. Renvoie `None`
-    /// si aucun `source_uid` ne matche ou si la décision porte une version
-    /// supérieure (jamais dégrader), sinon le nombre de lignes insérées.
+    /// explicite : le set fourni EST la vérité, DELETE + COPY via l'écrivain commun.
+    /// Les `rows` arrivent déjà validées par l'appelant. `None` si aucun
+    /// `source_uid` ne matche ou si la décision porte une version supérieure, sinon
+    /// le nombre de lignes insérées.
     pub async fn replace_citations_at_version(
         &self,
         source_uid: &str,
@@ -683,12 +664,9 @@ impl DecisionRepository<'_> {
         Ok(Some(rows.len() as u64))
     }
 
-    /// Keyset des décisions à re-parser **ciblées par `jurisdiction_type`**,
-    /// **indépendamment de `extract_version`** (ré-extraction d'un comportement
-    /// nouveau sur un sous-ensemble — ex. famille générique CNDA/CEDH/CJUE/CONSTIT/TC
-    /// après câblage des citations, ADR 0102 §B) **sans bump global** de
-    /// `EXTRACT_VERSION` (qui re-parserait 3,9 M décisions). `full_text` présent.
-    /// Les révisions manuelles (`extract_version` > courante) restent exclues.
+    /// Keyset des décisions à re-parser ciblées par `jurisdiction_type`,
+    /// indépendamment de `extract_version` et sans bump global. Révisions manuelles
+    /// exclues.
     pub async fn decision_ids_for_reextract_by_juridiction(
         &self,
         last_id: i64,
@@ -714,17 +692,13 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    /// Keyset des décisions à re-parser **ciblées par un texte cité**
-    /// (`ref_text_uid`, ADR 0145 M4), **indépendamment de `extract_version`**.
-    /// Pour rejouer extract+link sur le seul gisement d'un instrument, sans bump
-    /// global ni re-parse de tout un `jurisdiction_type`. `full_text` présent,
-    /// révisions manuelles (`extract_version` > courante) exclues. À combiner
-    /// avec `--field legal_references` (ne touche que les citations, via
-    /// `replace_citations`).
+    /// Décisions à re-parser ciblées par un texte cité (`ref_text_uid`),
+    /// indépendamment de `extract_version` : à combiner avec
+    /// `--field legal_references`. Un seul scan, GIN-piloté : la work-list part de
+    /// `legal_citation` (`lj_cit_terms`), pas d'un keyset sur `decisions`.
+    /// L'appelant lève le `statement_timeout`.
     pub async fn decision_ids_for_reextract_by_citing_ref_uid(
         &self,
-        last_id: i64,
-        limit: i64,
         ref_text_uid: &str,
     ) -> Result<Vec<i64>> {
         let rows = self
@@ -732,19 +706,15 @@ impl DecisionRepository<'_> {
             .query(
                 "
                 SELECT d.id
-                FROM decisions d
-                WHERE d.id > $1
-                  AND d.full_text IS NOT NULL
-                  AND (d.extract_version IS NULL OR d.extract_version <= $4)
-                  AND EXISTS (
-                      SELECT 1 FROM legal_citation lc
-                      WHERE lc.decision_id = d.id
-                        AND public.lj_cit_terms(lc.spans) @> ARRAY[$3]
-                  )
+                FROM (SELECT DISTINCT lc.decision_id
+                      FROM legal_citation lc
+                      WHERE public.lj_cit_terms(lc.spans) @> ARRAY[$1]) c
+                JOIN decisions d ON d.id = c.decision_id
+                WHERE d.full_text IS NOT NULL
+                  AND (d.extract_version IS NULL OR d.extract_version <= $2)
                 ORDER BY d.id
-                LIMIT $2
                 ",
-                &[&last_id, &limit, &ref_text_uid, &EXTRACT_VERSION],
+                &[&ref_text_uid, &EXTRACT_VERSION],
             )
             .await?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
@@ -768,19 +738,15 @@ impl DecisionRepository<'_> {
     }
 
     /// Itère `(public_id, lastmod)` pour toutes les décisions, en ordre PK.
-    ///
-    /// Port de `iter_decisions_for_sitemap`. `lastmod` est
-    /// `GREATEST(date_lecture, updated_at::date)` côté SQL : `date_lecture`
-    /// quand connue (cas dominant), sinon le timestamp d'ingestion. On exclut
-    /// les décisions sans `public_id`. Pagination keyset par `d.id` — le
-    /// générateur Python est matérialisé ici en `Vec` (consommé en une passe
-    /// par `build_sitemaps`).
+    /// `lastmod` = `GREATEST(date_lecture, updated_at::date)`. Les décisions sans
+    /// `public_id` sont exclues ; pagination keyset par `d.id`, matérialisée en
+    /// `Vec`.
     #[tracing::instrument(name = "db.iter_decisions_for_sitemap", skip(self), fields(db.system = "postgresql"))]
     pub async fn iter_decisions_for_sitemap(
         &self,
         batch_size: i64,
-    ) -> Result<Vec<(String, NaiveDate)>> {
-        let mut out: Vec<(String, NaiveDate)> = Vec::new();
+    ) -> Result<Vec<(String, Option<NaiveDate>)>> {
+        let mut out: Vec<(String, Option<NaiveDate>)> = Vec::new();
         let mut last_id: i64 = 0;
         loop {
             let rows = self
@@ -803,7 +769,7 @@ impl DecisionRepository<'_> {
             }
             for row in &rows {
                 let public_id: String = row.get(1);
-                let lastmod: NaiveDate = row.get(2);
+                let lastmod: Option<NaiveDate> = row.get(2);
                 out.push((public_id, lastmod));
             }
             last_id = rows[rows.len() - 1].get::<_, i64>(0);
@@ -813,11 +779,9 @@ impl DecisionRepository<'_> {
         }
     }
 
-    /// Remplace l'intégralité de la table `sitemaps` par `files` (régénération
-    /// complète du cron). `DELETE` global puis `INSERT` de chaque ligne : les
-    /// sub-sitemaps d'un run précédent (corpus rétréci) disparaissent
-    /// automatiquement — équivalent du `sweep_orphans` R2 d'hier. L'appelant
-    /// wrappe l'appel dans une transaction (cf. contrat repo, comme le pipeline).
+    /// Remplace l'intégralité de la table `sitemaps` par `files` : les sub-sitemaps
+    /// d'un run précédent disparaissent. L'appelant wrappe l'appel dans une
+    /// transaction.
     #[tracing::instrument(name = "db.replace_sitemaps", skip(self, files), fields(db.system = "postgresql", count = files.len()))]
     pub async fn replace_sitemaps(&self, files: &[SitemapRow]) -> Result<()> {
         self.conn.execute("DELETE FROM sitemaps", &[]).await?;
@@ -833,9 +797,7 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Lit un sitemap par nom de fichier — `(body, content_type)`, `None` si
-    /// absent. Sert les routes `/sitemap.xml` + `/sitemap-{n}.xml.gz` de
-    /// `lj-server`.
+    /// Lit un sitemap par nom de fichier — `(body, content_type)`, `None` si absent.
     #[tracing::instrument(name = "db.fetch_sitemap", skip(self), fields(db.system = "postgresql"))]
     pub async fn fetch_sitemap(&self, filename: &str) -> Result<Option<(Vec<u8>, String)>> {
         let row = self
@@ -848,12 +810,8 @@ impl DecisionRepository<'_> {
         Ok(row.map(|r| (r.get(0), r.get(1))))
     }
 
-    /// Itère les `public_id` des décisions dont `updated_at >= since`.
-    ///
-    /// Port de `iter_public_ids_updated_since`. Sert le push IndexNow
-    /// post-ingest (ADR 0044) : couvre les décisions nouvellement upsertées ET
-    /// celles dont le `summary` vient d'être (re)généré (`set_summary` bumpe
-    /// `updated_at`). Pagination keyset par `id`, matérialisée en `Vec`.
+    /// Itère les `public_id` des décisions dont `updated_at >= since`. Pagination
+    /// keyset par `id`, matérialisée en `Vec`.
     #[tracing::instrument(name = "db.iter_public_ids_updated_since", skip(self), fields(db.system = "postgresql"))]
     pub async fn iter_public_ids_updated_since(
         &self,
@@ -893,27 +851,16 @@ impl DecisionRepository<'_> {
 
     /// Itère les décisions sans summary à jour, par batches.
     ///
-    /// Port de `iter_decisions_missing_summary`. Chaque ligne =
-    /// `(decision_id, public_id, jurisdiction_type, jurisdiction_name,
-    /// date_lecture, docket_numbers)` — les quatre dernières servent à
-    /// reconstruire le titre côté appelant. Sélectionne les rows dont `summary
-    /// IS NULL` ; avec `include_stale`, aussi celles dont
-    /// `summary_prompt_version < target_version` (régénération de masse
-    /// explicite — jamais par défaut : un bump de version ne doit pas déclencher
-    /// la réécriture du stock historique). Exclut les
-    /// tombstones (`deleted_at IS NOT NULL` — vidés RGPD, jamais résumables) et
-    /// les décisions sans corps (`full_text IS NULL`) : sans ce filtre la
-    /// requête re-scanne à chaque run ~34 k tombstones que l'aval écarte en
-    /// `no_body`. `deleted_at IS NULL` est servi par l'index partiel
-    /// `idx_decisions_active`. Pagination keyset
-    /// stable sur `ORDER BY d.id`. `limit`, s'il est fourni, borne le nombre
-    /// total de lignes yieldées sur toute l'itération. `wrap` : avec
-    /// `start_id > 0`, une fois l'arc `]start_id, max]` épuisé, reprend sur
-    /// `]0, start_id]` (sampling de review).
+    /// Chaque ligne = `(decision_id, public_id, jurisdiction_type,
+    /// jurisdiction_name, date_lecture, docket_numbers)` — les quatre dernières
+    /// reconstruisent le titre côté appelant. `summary IS NULL`, plus avec
+    /// `include_stale` les `summary_prompt_version < target_version`. Tombstones et
+    /// décisions sans corps exclues. `limit` borne le total yieldé sur toute
+    /// l'itération ; `wrap` reprend sur `]0, start_id]` une fois l'arc
+    /// `]start_id, max]` épuisé.
     ///
-    /// Renvoie tous les batches matérialisés (l'appelant les traite en
-    /// séquence ; le générateur Python streame, mais les frontières de batch
-    /// — donc l'identité des appels Mistral concurrents — sont préservées).
+    /// Renvoie tous les batches matérialisés : les frontières de batch, donc
+    /// l'identité des appels Mistral concurrents, sont préservées.
     #[allow(clippy::type_complexity)]
     #[tracing::instrument(name = "db.iter_decisions_missing_summary", skip(self), fields(db.system = "postgresql"))]
     pub async fn iter_decisions_missing_summary(
@@ -991,8 +938,6 @@ impl DecisionRepository<'_> {
                 batches.push(batch);
             }
             if n == 0 || (n as i64) < remaining {
-                // Arc courant épuisé. En mode wrap, on rejoue une fois sur le
-                // bas de la plage `]0, start_id]` ; sinon on s'arrête.
                 if wrap && !wrapped && start_id > 0 {
                     wrapped = true;
                     ceiling = start_id;

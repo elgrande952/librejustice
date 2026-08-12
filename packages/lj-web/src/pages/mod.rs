@@ -1,12 +1,10 @@
-//! Pages (routes). Faites en T0 : confidentialite, landing, mcp_guide,
-//! mentions_legales, not_found. Le reste est STUBBE (placeholder qui compile) —
-//! a remplir par les agents de tranche selon le mapping de routes d'`app.rs`.
-
 pub mod activity_page;
+pub mod annonces_page;
 pub mod annuaire;
 pub mod authorize_mcp_page;
 pub mod code_catalogue_page;
 pub mod confidentialite;
+pub mod confirm_page;
 pub mod decision_page;
 pub mod entity_page;
 pub mod juridictions_page;
@@ -27,10 +25,12 @@ pub mod sources_page;
 pub mod textes_page;
 
 pub use activity_page::ActivityPage;
+pub use annonces_page::{AnnoncesCataloguePage, AnnoncesDepartementPage, AnnoncesPage, MarchePage};
 pub use annuaire::{AnnuaireDirectoryPage, AnnuairePage};
 pub use authorize_mcp_page::AuthorizeMcpPage;
 pub use code_catalogue_page::CodeCataloguePage;
 pub use confidentialite::Confidentialite;
+pub use confirm_page::ConfirmPage;
 pub use decision_page::DecisionPage;
 pub use entity_page::EntityPage;
 pub use juridictions_page::{JuridictionHubPage, JuridictionYearPage, JuridictionsPage};

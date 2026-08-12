@@ -1,5 +1,5 @@
-//! LEGI (référentiel versionné, ADR 0092) : ingest tarball stock/incrément,
-//! sync incrémental, résolution citation→article (ADR 0097).
+//! LEGI (référentiel versionné) : ingest tarball stock/incrément, sync
+//! incrémental, résolution citation→article.
 
 use std::path::Path;
 
@@ -12,12 +12,12 @@ use crate::config::Settings;
 /// Taille de batch des upserts LEGI (articles puis codes).
 const LEGI_BATCH_SIZE: usize = 512;
 
-/// Classe d'un membre XML du fond LEGI, déduite de son chemin (ADR 0092).
+/// Classe d'un membre XML du fond LEGI, déduite de son chemin.
 ///
 /// Les `ARTICLE` (`…/article/…/LEGIARTI*.xml`), les `TEXTE_VERSION`
 /// (`…/texte/version/…/LEGITEXT*.xml`), les `TEXTELR` (`…/texte/struct/…`) et
-/// les `SECTION_TA` (`…/section_ta/…`) sont ingérés (ADR 0092 + 0175) ;
-/// l'arbre `eli/` est hors-périmètre.
+/// les `SECTION_TA` (`…/section_ta/…`) sont ingérés ; l'arbre `eli/` est
+/// hors-périmètre.
 enum LegiMember {
     Article,
     Texte,
@@ -51,21 +51,22 @@ fn classify_legi_member(name: &str) -> LegiMember {
 }
 
 /// Convertit une date ISO (`YYYY-MM-DD`) émise par le parser pur en `NaiveDate`
-/// au bord store. Erreur franche (#12) si le format est invalide.
+/// au bord store. Erreur franche si le format est invalide.
 fn legi_date(iso: &str) -> Result<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(iso, "%Y-%m-%d")
         .map_err(|e| anyhow!("date LEGI invalide {iso:?}: {e}"))
 }
 
 /// Convertit une [`lj_extract::legi::LegiArticle`] (dates ISO `String`) en
-/// [`LegalArticleRow`] (ADR 0112 §1) : `text_uid` = LEGITEXT parent, identité de
-/// version `(text_uid, num_key, date_debut)`. Provenance LEGI : `source_uid` =
-/// LEGIARTI (le « CID » d'où l'URL Légifrance se dérive, §3). `num_key` (déjà
-/// `normalize_article` côté parser pur) et `title_path` (`titre_text`) tels quels.
+/// [`LegalArticleRow`] : `text_uid` = LEGITEXT parent, identité de version
+/// `(text_uid, num_key, date_debut)`. Provenance LEGI : `source_uid` = LEGIARTI,
+/// le CID d'où l'URL Légifrance se dérive. `num_key` (déjà `normalize_article`
+/// côté parser pur) et `title_path` (`titre_text`) tels quels.
 fn legi_article_row(
     art: lj_extract::legi::LegiArticle,
     content_checksum: u64,
 ) -> Result<lj_store::repository::LegalArticleRow> {
+    let date_debut = Some(legi_date(&art.date_debut)?);
     let date_fin = match art.date_fin {
         Some(d) => Some(legi_date(&d)?),
         None => None,
@@ -74,15 +75,15 @@ fn legi_article_row(
         text_uid: art.legitext,
         num: art.num,
         num_key: art.num_key,
-        // Le tar LEGI n'expose pas l'ordre de lecture du code → `position` non
-        // renseignée (lecture « à la suite » repli sur `num_key`, ADR 0112 §9).
+        // Le tar LEGI n'expose pas l'ordre de lecture du code : `position` non
+        // renseignée, lecture « à la suite » en repli sur `num_key`.
         position: None,
         title_path: art.titre_text,
         status: art.etat,
-        date_debut: Some(legi_date(&art.date_debut)?),
+        date_debut,
         date_fin,
         texte: art.texte,
-        // Droit FR officiel, monolingue (ADR 0116).
+        // Droit FR officiel, monolingue.
         texte_original: None,
         lang_original: None,
         translation: "officiel".to_string(),
@@ -91,42 +92,20 @@ fn legi_article_row(
         source: "legifrance".to_string(),
         source_uid: art.legiarti,
         source_url: None,
-        // Source *live* autoritaire : fraîcheur dérivée de `ingest_freshness` (ADR 0129),
-        // pas stockée par ligne.
+        // Source *live* autoritaire : fraîcheur dérivée de `ingest_freshness`, pas
+        // stockée par ligne.
         source_asof: None,
         source_upstream_url: None,
     })
 }
 
-/// Direction d'un lien (ADR 0174), **relative au propriétaire** — l'attribut DILA
-/// `sens` étant inexploitable (cf. `lj_extract::legi::collect_liens`). L'auteur
-/// d'une modification/citation est toujours le texte le plus récent :
-/// - cible sans date (article de code consolidé, sentinelle absorbée) → le
-///   propriétaire agit dessus → `outgoing` ;
-/// - propriétaire = article de code (`LEGITEXT`) → il subit l'action d'un texte
-///   daté (un code n'est jamais l'auteur d'une modif) → `incoming` ;
-/// - propriétaire = texte daté (loi/décret/convention) → `incoming` ssi la cible
-///   est plus récente que lui (elle agit), `outgoing` sinon (elle est plus
-///   ancienne : le propriétaire la modifie ou la cite).
-fn link_direction(
-    owner: &lj_store::repository::LegalLinkOwner,
-    target_date: Option<chrono::NaiveDate>,
-) -> &'static str {
-    match target_date {
-        None => "outgoing",
-        Some(_) if owner.text_uid.starts_with("LEGITEXT") => "incoming",
-        Some(td) if owner.date_debut.is_some_and(|od| td > od) => "incoming",
-        Some(_) => "outgoing",
-    }
-}
-
 /// Convertit les [`lj_extract::legi::LegiLien`] d'un fichier en lignes
-/// [`LegalLinkRow`] (ADR 0174) au bord store : dates parsées (sentinelles déjà
-/// absorbées côté parser), direction calculée depuis l'`owner` ([`link_direction`]),
-/// `target_num_key` = `normalize_article` pour la résolution des cibles article
-/// sans ID. Partagé avec le pipeline KALI (même bloc `<LIENS>`).
+/// [`LegalLinkRow`] au bord store : dates parsées (sentinelles déjà absorbées
+/// côté parser), direction décodée par le parser depuis `(typelien, sens)`
+/// (`lj_extract::legi::lien_direction`), `target_num_key` = `normalize_article`
+/// pour la résolution des cibles article sans ID. Partagé avec le pipeline KALI
+/// (même bloc `<LIENS>`).
 pub(crate) fn legal_link_rows(
-    owner: &lj_store::repository::LegalLinkOwner,
     liens: Vec<lj_extract::legi::LegiLien>,
 ) -> Result<Vec<lj_store::repository::LegalLinkRow>> {
     liens
@@ -146,7 +125,7 @@ pub(crate) fn legal_link_rows(
             Ok(lj_store::repository::LegalLinkRow {
                 typelien: l.typelien,
                 verb: l.verb,
-                direction: link_direction(owner, target_date).to_string(),
+                direction: l.direction.to_string(),
                 target_kind: l.target_kind.as_str().to_string(),
                 target_uid: l.target_uid,
                 target_text_uid: l.target_text_uid,
@@ -161,9 +140,9 @@ pub(crate) fn legal_link_rows(
         .collect()
 }
 
-/// Convertit un [`lj_extract::legi::LegiToc`] (arbre structurel, ADR 0207) en
-/// item d'écriture `legal_toc_edge` au bord store : dates parsées, `seq`
-/// implicite (ordre du `Vec`).
+/// Convertit un [`lj_extract::legi::LegiToc`] (arbre structurel) en item
+/// d'écriture `legal_toc_edge` au bord store : dates parsées, `seq` implicite
+/// (ordre du `Vec`).
 fn legi_toc_item(
     toc: lj_extract::legi::LegiToc,
 ) -> Result<(
@@ -204,12 +183,12 @@ fn legi_toc_item(
     ))
 }
 
-/// Propriétaires `legal_toc_edge` visés par une liste de suppression `.dat`
-/// (ADR 0207) : les stems `LEGISCTA` (versions de section) des chemins
-/// `section_ta` — un fichier = un propriétaire, purge précise. Les racines
-/// (`texte/struct`, owner = cid partagé entre versions) ne sont **pas**
-/// purgées ici : la suppression d'un texte entier passe par
-/// `prune_orphan_toc_edges` (plus d'articles ⇒ plus d'arbre).
+/// Propriétaires `legal_toc_edge` visés par une liste de suppression `.dat` :
+/// les stems `LEGISCTA` (versions de section) des chemins `section_ta` — un
+/// fichier = un propriétaire, purge précise. Les racines (`texte/struct`, owner =
+/// cid partagé entre versions) ne sont **pas** purgées ici : la suppression d'un
+/// texte entier passe par `prune_orphan_toc_edges` (plus d'articles ⇒ plus
+/// d'arbre).
 fn toc_owners_from_paths(paths: &[String]) -> Vec<String> {
     paths
         .iter()
@@ -226,11 +205,10 @@ fn toc_owners_from_paths(paths: &[String]) -> Vec<String> {
 }
 
 /// Convertit une [`lj_extract::legi::LegiCode`] (dates ISO `String`) en
-/// [`LegalTextRow`] `jurisdiction='FR'` (ADR 0112 §1). `text_uid` = CID
-/// chronique (identité partagée avec les articles et la TOC, ADR 0225),
-/// `title` = TITREFULL descriptif quand présent (le TITRE d'un TNC est nu),
-/// `title_key` = `normalize_instrument(titre)` (posé côté Rust à la frontière
-/// d'ingest). La provenance vit sur les versions.
+/// [`LegalTextRow`] `jurisdiction='FR'`. `text_uid` = CID chronique (identité
+/// partagée avec les articles et la TOC), `title` = TITREFULL descriptif quand
+/// présent (le TITRE d'un TNC est nu), `title_key` = `normalize_instrument(titre)`.
+/// La provenance vit sur les versions.
 fn legi_code_row(code: lj_extract::legi::LegiCode) -> Result<lj_store::repository::LegalTextRow> {
     let last_modified = match code.derniere_modification {
         Some(d) => Some(legi_date(&d)?),
@@ -248,9 +226,8 @@ fn legi_code_row(code: lj_extract::legi::LegiCode) -> Result<lj_store::repositor
         // Un code n'a pas de date de signature unique ; date_publi non portée par LEGI.
         date_texte: None,
         date_publi: None,
-        // Identité d'un code = son slug, pas la cascade ADR 0115 (ni date ni
-        // numéro) — mais le NOR des actes datés (arrêtés, décrets) sert de
-        // clé de résolution au linker.
+        // Identité d'un code = son slug, ni date ni numéro. Le NOR des actes datés
+        // (arrêtés, décrets) sert de clé de résolution au linker.
         eli: None,
         nor: code.nor,
         instrument_key: None,
@@ -259,18 +236,18 @@ fn legi_code_row(code: lj_extract::legi::LegiCode) -> Result<lj_store::repositor
     })
 }
 
-/// Ingère un stock ou un incrément LEGI (`tar.gz` bulk DILA, ADR 0092).
+/// Ingère un stock ou un incrément LEGI (`tar.gz` bulk DILA).
 ///
 /// Streaming des membres (`tar_reader::for_each_member`) : les `LEGIARTI*.xml`
-/// sont parsés en [`lj_extract::legi::parse_legi_article`], les `LEGITEXT*.xml` (sous
-/// `texte/version/`) en [`lj_extract::legi::parse_legi_texte`] ; le reste est ignoré.
-/// `content_checksum` = xxh3-64 des octets bruts du membre (idempotence #7) ;
-/// l'upsert article skippe les lignes au checksum inchangé. Les suppressions
+/// sont parsés en [`lj_extract::legi::parse_legi_article`], les `LEGITEXT*.xml`
+/// (sous `texte/version/`) en [`lj_extract::legi::parse_legi_texte`] ; le reste
+/// est ignoré. `content_checksum` = xxh3-64 des octets bruts du membre ; l'upsert
+/// article skippe les lignes au checksum inchangé. Les suppressions
 /// (`liste_suppression_legi*.dat`) sont appliquées après les upserts via
 /// `delete_legal_articles_by_paths` (canal séparé). `payload_format = 'dila-xml'`.
 ///
 /// `path` = chemin local d'un `Freemium_legi_global_*.tar.gz` (stock) ou d'un
-/// incrément `LEGI_*.tar.gz` (téléchargement hors-bande, ADR 0093).
+/// incrément `LEGI_*.tar.gz`.
 pub async fn ingest_legi(path: &Path) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -286,23 +263,20 @@ pub async fn ingest_legi(path: &Path) -> Result<()> {
         .collapse_empty_legitext_doublons()
         .await
         .map_err(|e| anyhow!("collapse_empty_legitext_doublons: {e}"))?;
-    // Slugs des textes nouveaux (ADR 0162).
     let slugged = super::slugs::assign_text_slugs(&repo).await?;
     tracing::info!(collapsed, slugged, "ingest_legi collapse doublons");
     Ok(())
 }
 
 /// Ingère un unique `tar.gz` LEGI via `repo` (boucle membres → parse → upsert +
-/// suppressions `.dat`). Helper partagé par [`ingest_legi`] (bootstrap manuel
-/// d'un tarball) et [`sync_legi`] (chaque incrément téléchargé). Renvoie
-/// `(upserted, skipped, errors)`. Idempotent par `content_checksum` (#7).
+/// suppressions `.dat`). Partagé par [`ingest_legi`] et [`sync_legi`]. Renvoie
+/// `(upserted, skipped, errors)`. Idempotent par `content_checksum`.
 async fn ingest_legi_tarball(
     repo: &DecisionRepository<'_>,
     path: &Path,
 ) -> Result<(usize, usize, usize)> {
-    // Type des messages remontés par le lecteur (membres parsés). Rows boxées
-    // (variantes de tailles très inégales). Chaque row voyage avec les arêtes
-    // de son bloc <LIENS> (ADR 0174).
+    // Messages remontés par le lecteur (membres parsés). Rows boxées (variantes de
+    // tailles très inégales). Chaque row voyage avec les arêtes de son bloc <LIENS>.
     enum LegiMsg {
         Article(
             Box<(
@@ -327,11 +301,11 @@ async fn ingest_legi_tarball(
         ParseErr,
     }
 
-    // Lecture+parsing (gzip+tar+XML = CPU sync) en thread bloquant, BORNÉE par un
-    // canal : RAM ~constante (le stock global a 1,5 M+ membres → JAMAIS tout en
-    // mémoire, cf. tar_reader::for_each_member). Le DB reste côté async — le `repo`
-    // emprunte la connexion, non déplaçable dans spawn_blocking. Backpressure : si
-    // le canal est plein (flush DB en cours), le lecteur attend sur blocking_send.
+    // Lecture et parsing (gzip + tar + XML, CPU sync) en thread bloquant, bornés par
+    // un canal : la RAM reste constante sur un stock global de plus d'un million de
+    // membres. Le DB reste côté async — le `repo` emprunte la connexion, non
+    // déplaçable dans spawn_blocking. Backpressure : canal plein ⇒ le lecteur attend
+    // sur blocking_send.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<LegiMsg>(LEGI_BATCH_SIZE * 4);
     let tar_path = path.to_path_buf();
     let reader = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -352,17 +326,15 @@ async fn ingest_legi_tarball(
             }
             let msg = match classify_legi_member(&name) {
                 LegiMember::Article => match lj_extract::legi::parse_legi_article(&raw) {
+                    // Article sans numéro (non citable) : hors référentiel — annexes,
+                    // placeholders, visas/signatures des TNC. Même partage que KALI et que les
+                    // JORFARTI sans NUM.
+                    Ok(art) if art.num_key.is_empty() => return Ok(()),
                     Ok(mut art) => {
                         let checksum = xxhash_rust::xxh3::xxh3_64(&raw);
                         let liens = std::mem::take(&mut art.liens);
-                        let built = legi_article_row(art, checksum).and_then(|row| {
-                            let owner = lj_store::repository::LegalLinkOwner {
-                                text_uid: row.text_uid.clone(),
-                                num_key: row.num_key.clone(),
-                                date_debut: row.date_debut,
-                            };
-                            Ok((row, legal_link_rows(&owner, liens)?))
-                        });
+                        let built = legi_article_row(art, checksum)
+                            .and_then(|row| Ok((row, legal_link_rows(liens)?)));
                         match built {
                             Ok(pair) => LegiMsg::Article(Box::new(pair)),
                             Err(e) => {
@@ -381,16 +353,7 @@ async fn ingest_legi_tarball(
                         let liens = std::mem::take(&mut code.liens);
                         let upcoming = std::mem::take(&mut code.versions_a_venir);
                         let built = legi_code_row(code).and_then(|row| {
-                            let owner = lj_store::repository::LegalLinkOwner {
-                                text_uid: row.text_uid.clone(),
-                                num_key: String::new(),
-                                date_debut: None,
-                            };
-                            Ok((
-                                row,
-                                upcoming_dates(&upcoming)?,
-                                legal_link_rows(&owner, liens)?,
-                            ))
+                            Ok((row, upcoming_dates(&upcoming)?, legal_link_rows(liens)?))
                         });
                         match built {
                             Ok(triple) => LegiMsg::Code(Box::new(triple)),
@@ -497,7 +460,7 @@ async fn ingest_legi_tarball(
             .map_err(|e| anyhow!("replace_toc_edges: {e}"))?;
     }
 
-    // Suppressions appliquées après les upserts (un incrément ajoute ET retire, #7).
+    // Suppressions appliquées après les upserts : un incrément ajoute ET retire.
     let mut deleted: u64 = 0;
     for paths in dat_paths {
         deleted += repo
@@ -511,13 +474,20 @@ async fn ingest_legi_tarball(
             .map_err(|e| anyhow!("delete_toc_edges_by_owners: {e}"))?;
     }
 
-    // Pose `code_title` (titre du code dénormalisé → titre formé `search_title`,
-    // ADR 0114) sur les articles dont il diffère : LEGI streame articles et codes
-    // séparément, l'article n'a pas le titre du code au parse.
+    // Pose `code_title` (titre du code dénormalisé → titre formé `search_title`) sur
+    // les articles dont il diffère : LEGI streame articles et codes séparément,
+    // l'article n'a pas le titre du code au parse.
     let retitled = repo
         .refresh_article_denorm()
         .await
         .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
+    // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
+    // rangs, ce finisseur les recalcule.
+    let (ranked_texts, ranked_rows) = repo
+        .refresh_reading_ranks()
+        .await
+        .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
+    tracing::info!(ranked_texts, ranked_rows, "reading ranks");
 
     tracing::info!(
         source = %path.display(),
@@ -531,10 +501,9 @@ async fn ingest_legi_tarball(
     Ok((upserted, skipped, errors))
 }
 
-/// Upsert d'un batch d'articles LEGI vers `referential_articles` (idempotent #7) ;
-/// cumule modifiés/skippés. Les arêtes `legal_link` des articles réellement
-/// écrits sont remplacées dans la foulée (checksum inchangé ⇒ liens inchangés,
-/// on ne les réécrit pas — ADR 0174).
+/// Upsert d'un batch d'articles LEGI vers `referential_articles` ; cumule
+/// modifiés/skippés. Les arêtes `legal_link` des articles réellement écrits sont
+/// remplacées dans la foulée : checksum inchangé ⇒ liens inchangés.
 async fn flush_legi_articles(
     repo: &DecisionRepository<'_>,
     articles: Vec<(
@@ -573,16 +542,16 @@ async fn flush_legi_articles(
     Ok(())
 }
 
-/// Dates `VERSIONS_A_VENIR` (ISO) → `NaiveDate` au bord store (ADR 0178). La
-/// sentinelle `2222-02-22` (date inconnue) est une vraie date, conservée.
+/// Dates `VERSIONS_A_VENIR` (ISO) → `NaiveDate` au bord store. La sentinelle
+/// `2222-02-22` (date inconnue) est une vraie date, conservée.
 fn upcoming_dates(dates: &[String]) -> Result<Vec<chrono::NaiveDate>> {
     dates.iter().map(|d| legi_date(d)).collect()
 }
 
 /// Upsert d'un batch de codes LEGI vers `legal_text` (ON CONFLICT `text_uid`) +
-/// dates de versions futures (`upcoming_versions`, ADR 0178) + remplacement des
-/// arêtes texte-niveau (`owner_num_key = ''`, ADR 0174) — l'upsert texte est
-/// inconditionnel, le reste suit.
+/// dates de versions futures (`upcoming_versions`) + remplacement des arêtes
+/// texte-niveau (`owner_num_key = ''`). L'upsert texte est inconditionnel, le
+/// reste suit.
 async fn flush_legi_codes(
     repo: &DecisionRepository<'_>,
     codes: Vec<(
@@ -617,13 +586,12 @@ async fn flush_legi_codes(
     Ok(())
 }
 
-/// Backfill one-shot du graphe `legal_link` (ADR 0174) : streame des tarballs
-/// DILA (stock global puis incréments, dans l'ordre chronologique ; fonds LEGI
-/// **et** KALI, discriminés par membre), parse les blocs `<LIENS>` et remplace
-/// les arêtes par propriétaire — **sans upsert d'articles**, donc hors gate
-/// `content_checksum`. Rejouable (remplacement). Les `.dat` sont ignorés (les
-/// suppressions ont déjà été rejouées par le sync) : une passe finale purge les
-/// arêtes dont le propriétaire n'existe plus en base.
+/// Backfill one-shot du graphe `legal_link` : streame des tarballs DILA (stock
+/// global puis incréments, dans l'ordre chronologique ; fonds LEGI **et** KALI,
+/// discriminés par membre), parse les blocs `<LIENS>` et remplace les arêtes par
+/// propriétaire — **sans upsert d'articles**, donc hors gate `content_checksum`.
+/// Rejouable. Les `.dat` sont ignorés ; une passe finale purge les arêtes dont le
+/// propriétaire n'existe plus en base.
 pub async fn backfill_links(paths: &[std::path::PathBuf]) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -673,6 +641,10 @@ async fn backfill_links_tarball(repo: &DecisionRepository<'_>, path: &Path) -> R
                 LegiMember::Article => lj_extract::legi::parse_legi_article(&raw)
                     .map_err(|e| e.to_string())
                     .and_then(|mut art| {
+                        // Article LEGI sans numéro : non ingéré, donc pas d'owner.
+                        if art.num_key.is_empty() {
+                            return Ok(None);
+                        }
                         let liens = std::mem::take(&mut art.liens);
                         let owner = lj_store::repository::LegalLinkOwner {
                             text_uid: art.legitext,
@@ -681,7 +653,7 @@ async fn backfill_links_tarball(repo: &DecisionRepository<'_>, path: &Path) -> R
                                 legi_date(&art.date_debut).map_err(|e| e.to_string())?,
                             ),
                         };
-                        let rows = legal_link_rows(&owner, liens).map_err(|e| e.to_string())?;
+                        let rows = legal_link_rows(liens).map_err(|e| e.to_string())?;
                         Ok(Some((owner, rows)))
                     }),
                 LegiMember::Texte => lj_extract::legi::parse_legi_texte(&raw)
@@ -693,7 +665,7 @@ async fn backfill_links_tarball(repo: &DecisionRepository<'_>, path: &Path) -> R
                             num_key: String::new(),
                             date_debut: None,
                         };
-                        let rows = legal_link_rows(&owner, liens).map_err(|e| e.to_string())?;
+                        let rows = legal_link_rows(liens).map_err(|e| e.to_string())?;
                         Ok(Some((owner, rows)))
                     }),
                 // Les fichiers de structure ne portent pas de bloc <LIENS>.
@@ -715,8 +687,7 @@ async fn backfill_links_tarball(repo: &DecisionRepository<'_>, path: &Path) -> R
                                         legi_date(&art.date_debut).map_err(|e| e.to_string())?,
                                     ),
                                 };
-                                let rows =
-                                    legal_link_rows(&owner, liens).map_err(|e| e.to_string())?;
+                                let rows = legal_link_rows(liens).map_err(|e| e.to_string())?;
                                 Ok(Some((owner, rows)))
                             })
                     }
@@ -766,11 +737,11 @@ async fn backfill_links_tarball(repo: &DecisionRepository<'_>, path: &Path) -> R
     Ok(())
 }
 
-/// Backfill one-shot de l'arbre structurel `legal_toc_edge` (ADR 0207) :
-/// streame des tarballs LEGI (stock global puis incréments), parse les
-/// `TEXTELR`/`SECTION_TA` et remplace les arêtes par propriétaire — hors gate
-/// `content_checksum`, rejouable. Passe finale : purge des arbres dont le
-/// texte n'a plus d'articles en base.
+/// Backfill one-shot de l'arbre structurel `legal_toc_edge` : streame des
+/// tarballs LEGI (stock global puis incréments), parse les `TEXTELR`/`SECTION_TA`
+/// et remplace les arêtes par propriétaire — hors gate `content_checksum`,
+/// rejouable. Passe finale : purge des arbres dont le texte n'a plus d'articles en
+/// base.
 pub async fn backfill_toc(paths: &[std::path::PathBuf]) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -865,10 +836,10 @@ async fn backfill_toc_tarball(repo: &DecisionRepository<'_>, path: &Path) -> Res
     Ok(())
 }
 
-/// Backfill one-shot des métadonnées de textes (ADR 0178) : streame des
-/// tarballs LEGI et rejoue l'upsert `legal_text` (inconditionnel) + les dates
-/// `upcoming_versions` depuis les `TEXTE_VERSION` — textes seulement, ni
-/// articles ni liens ni arbre. Rejouable.
+/// Backfill one-shot des métadonnées de textes : streame des tarballs LEGI et
+/// rejoue l'upsert `legal_text` (inconditionnel) + les dates `upcoming_versions`
+/// depuis les `TEXTE_VERSION` — textes seulement, ni articles ni liens ni arbre.
+/// Rejouable.
 pub async fn backfill_textes(paths: &[std::path::PathBuf]) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -882,8 +853,8 @@ pub async fn backfill_textes(paths: &[std::path::PathBuf]) -> Result<()> {
     for path in paths {
         backfill_textes_tarball(&repo, path).await?;
     }
-    // Slugs des textes nouveaux (ADR 0162) — la passe crée des fiches
-    // (ré-ancrage CID, ADR 0225), pas seulement des mises à jour.
+    // Slugs des textes nouveaux : la passe crée des fiches, pas seulement des mises
+    // à jour.
     let slugged = super::slugs::assign_text_slugs(&repo).await?;
     tracing::info!(tarballs = paths.len(), slugged, "backfill_textes terminé");
     Ok(())
@@ -948,20 +919,17 @@ async fn backfill_textes_tarball(repo: &DecisionRepository<'_>, path: &Path) -> 
     Ok(())
 }
 
-/// Sync incrémental LEGI (référentiel versionné, ADR 0092/0093) : télécharge les
-/// incréments `LEGI_*.tar.gz` postérieurs au watermark via
-/// [`lj_sources::dila::sync_dila`] (même mécanisme manifeste/watermark que les
-/// autres fonds DILA, ordre lexicographique = chronologique), PUIS ingère chaque
-/// incrément fraîchement téléchargé via [`ingest_legi_tarball`].
+/// Sync incrémental LEGI : télécharge les incréments `LEGI_*.tar.gz` postérieurs
+/// au watermark via [`lj_sources::dila::sync_dila`] (ordre lexicographique =
+/// chronologique), PUIS ingère chaque incrément fraîchement téléchargé via
+/// [`ingest_legi_tarball`].
 ///
 /// **Auto-switch cold ↔ warm** : au 1er run (`stock_fetched == false`) `sync_dila`
 /// télécharge le **stock global** `Freemium_legi_global_*` (multi-Go) EN PREMIER,
 /// cale le watermark sur sa date, puis enchaîne les incréments ; ensuite il ne
-/// renvoie que les nouveaux. Le stock est donc ingéré comme n'importe quel
-/// tarball renvoyé (`ingest_legi_tarball`). Un re-run ne re-télécharge ni ne
-/// ré-applique (≤ watermark ignoré), et l'upsert article skippe les checksums
-/// inchangés (#7). `Command::Legi { path }` reste pour ingérer un tarball isolé
-/// depuis le disque (dev/reprise), sans toucher au watermark.
+/// renvoie que les nouveaux. Un re-run ne re-télécharge ni ne ré-applique, et
+/// l'upsert article skippe les checksums inchangés. `Command::Legi { path }` reste
+/// pour ingérer un tarball isolé depuis le disque, sans toucher au watermark.
 pub async fn sync_legi() -> Result<()> {
     let settings = Settings::from_env()?;
     let downloaded =
@@ -984,22 +952,21 @@ pub async fn sync_legi() -> Result<()> {
         errors += e;
     }
 
-    // Collapse des coquilles LEGITEXT vides régénérées par les incréments (ADR 0115
-    // §2) : une fois, après tous les incréments (le corps JORFTEXT et la coquille
-    // LEGITEXT peuvent arriver dans des tarballs différents).
+    // Collapse des coquilles LEGITEXT vides régénérées par les incréments : une
+    // fois, après tous les incréments — le corps JORFTEXT et la coquille LEGITEXT
+    // peuvent arriver dans des tarballs différents.
     let collapsed = repo
         .collapse_empty_legitext_doublons()
         .await
         .map_err(|e| anyhow!("collapse_empty_legitext_doublons: {e}"))?;
 
     // Arbres structurels des textes disparus (suppression `.dat` de tous leurs
-    // articles) : purge une fois par sync (ADR 0207).
+    // articles) : purge une fois par sync.
     let toc_pruned = repo
         .prune_orphan_toc_edges()
         .await
         .map_err(|e| anyhow!("prune_orphan_toc_edges: {e}"))?;
 
-    // Slugs des textes nouveaux (ADR 0162).
     let slugged = super::slugs::assign_text_slugs(&repo).await?;
 
     tracing::info!(
@@ -1013,66 +980,4 @@ pub async fn sync_legi() -> Result<()> {
         "sync_legi"
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::link_direction;
-    use lj_store::repository::LegalLinkOwner;
-
-    fn owner(text_uid: &str, date: Option<&str>) -> LegalLinkOwner {
-        LegalLinkOwner {
-            text_uid: text_uid.to_string(),
-            num_key: "x".to_string(),
-            date_debut: date.map(|d| d.parse().expect("date owner")),
-        }
-    }
-
-    fn td(d: &str) -> Option<chrono::NaiveDate> {
-        Some(d.parse().expect("target date"))
-    }
-
-    /// Cible sans date (article de code consolidé, sentinelle absorbée) : le
-    /// propriétaire agit dessus → sortant, quel que soit le propriétaire.
-    #[test]
-    fn undated_target_is_outgoing() {
-        assert_eq!(
-            link_direction(&owner("JORFTEXT000", Some("2004-01-01")), None),
-            "outgoing"
-        );
-        assert_eq!(
-            link_direction(&owner("LEGITEXT000", None), None),
-            "outgoing"
-        );
-    }
-
-    /// Propriétaire = article de code (LEGITEXT) + cible datée : le code subit
-    /// toujours l'action d'un texte daté (jamais auteur d'une modif) → entrant.
-    /// Cas C. civ. 16-13 ← loi 2004-800 (la date de la loi ≈ date de la version).
-    #[test]
-    fn code_owner_dated_target_is_incoming() {
-        let civ = owner("LEGITEXT000006070721", Some("2004-08-07"));
-        assert_eq!(link_direction(&civ, td("2004-08-06")), "incoming");
-    }
-
-    /// Propriétaire = texte daté (loi/JORF) : entrant ssi la cible est plus
-    /// récente (elle agit sur le propriétaire), sortant si plus ancienne.
-    #[test]
-    fn dated_owner_uses_recency() {
-        let ord = owner("JORFTEXT000032004939", Some("2016-02-11"));
-        // Modifié par une loi plus récente (2018) → entrant.
-        assert_eq!(link_direction(&ord, td("2018-04-20")), "incoming");
-        // Cite un décret plus ancien (1989) → sortant.
-        assert_eq!(link_direction(&ord, td("1989-09-06")), "outgoing");
-    }
-
-    /// Propriétaire daté sans date connue (sentinelle non résolue) → sortant par
-    /// défaut (comparaison temporelle impossible).
-    #[test]
-    fn dated_owner_without_date_defaults_outgoing() {
-        assert_eq!(
-            link_direction(&owner("JORFTEXT000", None), td("2018-04-20")),
-            "outgoing"
-        );
-    }
 }

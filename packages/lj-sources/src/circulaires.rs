@@ -1,24 +1,23 @@
-//! Fond DILA CIRCULAIRES (ADR 0196) : circulaires et instructions applicables
-//! signalées par les ministères (`OPENDATA/CIRCULAIRES/`, ≥ 2009).
+//! Fond DILA CIRCULAIRES : circulaires et instructions applicables signalées par
+//! les ministères (`OPENDATA/CIRCULAIRES/`, ≥ 2009).
 //!
-//! **Layout non-Freemium** (recon 2026-07-10) — trois familles de fichiers :
+//! Trois familles de fichiers :
 //! - stocks `xml/<année>_xml.tar.gz` (2009→2014, figés) — arbo interne
 //!   `MM/cir_<ID>.xml` ;
 //! - `txt/abroge_txt.tar` (2013→2015-01, figé) — listes d'abrogation/suppression
 //!   par chemins ;
 //! - flux `FLUX/<année>/circulaire_<jjmmaa><hh>h<mm>.tar.gz` +
-//!   `FLUX/Annee_en_cours/` — créations ET mises à jour **last-write-wins par
-//!   `ID_CIRCULAIRE`** (une abrogation moderne = re-export `ETAT=A`), arbo
-//!   interne `xml/YYYY/MM/cir_<ID>.xml` (+ `pdf/…`).
+//!   `FLUX/Annee_en_cours/` — créations ET mises à jour last-write-wins par
+//!   `ID_CIRCULAIRE` (une abrogation moderne = re-export `ETAT=A`), arbo interne
+//!   `xml/YYYY/MM/cir_<ID>.xml` (+ `pdf/…`).
 //!
-//! Le XML est de la **métadonnée pure** (titre, NOR, dates, état V/A, résumé,
-//! textes de référence) — le corps n'existe qu'en PDF (`pdf/`, ~19 Go), track
-//! ultérieur. Le pivot d'identité est `ID_CIRCULAIRE` (le NOR est vide sur
-//! ~14 % du stock 2009).
+//! Le XML est de la métadonnée pure (titre, NOR, dates, état V/A, résumé, textes
+//! de référence) — le corps n'existe qu'en PDF (`pdf/`). Le pivot d'identité est
+//! `ID_CIRCULAIRE`, le NOR étant vide sur une partie du stock 2009.
 //!
-//! Chausse-trappes portées par ce module : UTF-8 tronqué/mojibake du stock
-//! 2009 (lecture lossy), dérive de schéma silencieuse (`OPPOSABLE` absent du
-//! XSD, listes auto-fermées) → arbre `XmlNode` tolérant, pas de serde strict.
+//! Chausse-trappes portées par ce module : UTF-8 tronqué/mojibake du stock 2009
+//! (lecture lossy), dérive de schéma silencieuse (`OPPOSABLE` absent du XSD,
+//! listes auto-fermées) → arbre `XmlNode` tolérant, pas de serde strict.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -55,7 +54,7 @@ pub enum CircKind {
     Flux,
 }
 
-/// Un tarball PDF du fond à rejouer pour la passe corps (ADR 0222) : stock
+/// Un tarball PDF du fond à rejouer pour la passe corps : stock
 /// `pdf/<année>_pdf.tar.gz` ou tarball de flux (PDF compagnons du XML).
 #[derive(Debug)]
 pub struct CircPdfTarball {
@@ -66,11 +65,10 @@ pub struct CircPdfTarball {
 }
 
 /// Planifie un sync : liste le fond, télécharge ce qui manque localement, et
-/// renvoie les fichiers **pas encore ingérés** (absents du manifest) dans
-/// l'ordre de rejeu correct : stocks (par année) → abrogations historiques →
-/// flux (ordre chronologique du nom). L'appelant ingère puis appelle
-/// [`mark_circulaire_done`] par fichier — un crash au milieu reprend où il
-/// s'était arrêté (les téléchargements présents sont skippés).
+/// renvoie les fichiers pas encore ingérés (absents du manifest) dans l'ordre de
+/// rejeu correct : stocks (par année) → abrogations historiques → flux (ordre
+/// chronologique du nom). L'appelant ingère puis appelle [`mark_circulaire_done`]
+/// par fichier — un crash au milieu reprend où il s'était arrêté.
 pub fn plan_circulaires_sync(dir: &Path) -> Result<Vec<CircTarball>> {
     fs::create_dir_all(dir)?;
     let done = read_manifest(dir, MANIFEST)?;
@@ -120,11 +118,11 @@ pub fn plan_circulaires_sync(dir: &Path) -> Result<Vec<CircTarball>> {
     Ok(out)
 }
 
-/// Planifie la passe corps (ADR 0222) : stocks PDF (`pdf/<année>_pdf.tar.gz`,
-/// par année) puis flux (les tarballs de flux, partagés avec le sync
-/// métadonnées, sont réutilisés depuis le cache ; téléchargés au besoin).
-/// Renvoie les fichiers absents du manifest `pdf-manifest.json` dans l'ordre
-/// de rejeu last-write-wins par `ID_CIRCULAIRE`.
+/// Planifie la passe corps : stocks PDF (`pdf/<année>_pdf.tar.gz`, par année)
+/// puis flux (les tarballs de flux, partagés avec le sync métadonnées, sont
+/// réutilisés depuis le cache ; téléchargés au besoin). Renvoie les fichiers
+/// absents du manifest `pdf-manifest.json` dans l'ordre de rejeu
+/// last-write-wins par `ID_CIRCULAIRE`.
 pub fn plan_circulaires_pdf_sync(dir: &Path) -> Result<Vec<CircPdfTarball>> {
     fs::create_dir_all(dir)?;
     let done = read_manifest(dir, PDF_MANIFEST)?;
@@ -177,7 +175,7 @@ fn list_flux_names(client: &reqwest::blocking::Client) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Manifest du sync métadonnées (XML) / de la passe corps (PDF, ADR 0222).
+/// Manifest du sync métadonnées (XML) / de la passe corps (PDF).
 const MANIFEST: &str = "manifest.json";
 const PDF_MANIFEST: &str = "pdf-manifest.json";
 
@@ -291,7 +289,7 @@ pub struct Circulaire {
     /// `V` (vigueur) ou `A` (abrogée/retirée de la diffusion).
     pub etat: String,
     pub titre: String,
-    /// NOR — vide sur ~14 % du stock 2009 → `None`.
+    /// NOR — vide sur une partie du stock 2009 → `None`.
     pub nor: Option<String>,
     /// `DATE_SIGNATURE` ISO brute (jamais vide ; valeurs aberrantes possibles —
     /// stockée telle quelle, la validation vit à la frontière du pipeline).
@@ -308,11 +306,11 @@ pub struct Circulaire {
     pub textes_ref: Vec<String>,
 }
 
-/// Parse un membre `cir_<ID>.xml` (stock ou flux). Lecture **lossy** (UTF-8
+/// Parse un membre `cir_<ID>.xml` (stock ou flux). Lecture lossy (UTF-8
 /// tronqué/mojibake du stock 2009). Champ d'identité manquant = erreur franche.
 pub fn parse_circulaire_xml(raw: &[u8]) -> Result<Circulaire> {
-    // Lossy systématique : 5 fichiers 2009 portent un RESUME tronqué en pleine
-    // séquence multi-octets ; le reste passe inchangé.
+    // Lossy systématique : des fichiers 2009 portent un RESUME tronqué en pleine
+    // séquence multi-octets.
     let cleaned = String::from_utf8_lossy(raw);
     let root = lj_core::parsing::build_tree(cleaned.as_bytes())
         .ok_or_else(|| SourceError::Invalid("circulaire: XML illisible".into()))?;
@@ -389,8 +387,8 @@ pub fn circulaire_pdf_member_id(name: &str) -> Option<String> {
     id.starts_with("cir_").then(|| id.to_string())
 }
 
-/// Relit le markdown OCR caché d'une circulaire scannée
-/// (`<dir>/ocr/<id>.md`, ADR 0222). `None` si absent.
+/// Relit le markdown OCR caché d'une circulaire scannée (`<dir>/ocr/<id>.md`).
+/// `None` si absent.
 pub fn load_cached_circulaire_ocr(dir: &Path, id: &str) -> Result<Option<String>> {
     let path = circ_ocr_path(dir, id);
     if path.exists() {
@@ -417,8 +415,7 @@ fn circ_ocr_path(dir: &Path, id: &str) -> PathBuf {
 }
 
 /// Dépose un PDF scanné en file d'attente OCR (`<dir>/ocr-pending/<id>.pdf`,
-/// atomique). Écrit quand le repli OCR échoue (pas de clé / pool épuisé) : le
-/// retry ne coûte que ce fichier, jamais un re-stream du tarball d'origine.
+/// atomique). Écrit quand le repli OCR échoue (pas de clé, pool épuisé).
 pub fn save_pending_circulaire_pdf(dir: &Path, id: &str, pdf: &[u8]) -> Result<()> {
     let path = circ_pending_path(dir, id);
     if let Some(parent) = path.parent() {
@@ -489,7 +486,6 @@ mod tests {
 
     #[test]
     fn champs_optionnels_absents_toleres() {
-        // Schéma minimal (dérive : balises absentes, listes vides).
         let xml = r#"<CIRCULAIRE><ID_CIRCULAIRE>26000</ID_CIRCULAIRE><ETAT>A</ETAT><TITRE>Vieille circulaire</TITRE><NUMERO_NOR></NUMERO_NOR></CIRCULAIRE>"#;
         let c = parse_circulaire_xml(xml.as_bytes()).unwrap();
         assert_eq!(c.id, "cir_26000");
@@ -500,8 +496,6 @@ mod tests {
 
     #[test]
     fn utf8_tronque_lossy() {
-        // RESUME coupé en pleine séquence multi-octets (é = 0xC3 0xA9) : le
-        // parse ne panique pas et l'identité survit.
         let mut raw =
             br#"<CIRCULAIRE><ID_CIRCULAIRE>26042</ID_CIRCULAIRE><TITRE>T</TITRE><RESUME>caf"#
                 .to_vec();
@@ -513,7 +507,6 @@ mod tests {
 
     #[test]
     fn ordre_chronologique_des_flux() {
-        // jj-mm-aa dans le nom : l'ordre lexical est FAUX, la clé le corrige.
         let mut names = vec![
             "circulaire_02012618h00.tar.gz", // 2 janv. 2026
             "circulaire_22122518h00.tar.gz", // 22 déc. 2025

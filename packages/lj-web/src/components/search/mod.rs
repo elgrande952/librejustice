@@ -1,7 +1,9 @@
-//! Composants de recherche : port de `apps/web/src/components/search/*`.
+//! Composants de recherche.
 
 pub mod active_filters;
+pub mod annonce_results;
 pub mod compact_search;
+pub mod corpus_intro;
 pub mod cross_teaser;
 pub mod date_range_picker;
 pub mod facet_widgets;
@@ -23,7 +25,13 @@ pub mod syntax_hint;
 pub mod text_results;
 
 pub use active_filters::ActiveFilterChips;
+pub use annonce_results::AnnoncesView;
 pub use compact_search::CompactSearch;
+pub use corpus_intro::{
+    corpus_stats, DecisionsCorpusLine, DecisionsCorpusSummary, DecisionsCorpusTeaser,
+    DecisionsExamples, JuridictionsRail, NormesRail, TextesCorpusLine, TextesCorpusSummary,
+    TextesCorpusTeaser, TextesExamples,
+};
 pub use cross_teaser::{DecisionsTeaser, TextesTeaser};
 pub use date_range_picker::DateRangePicker;
 pub use filter_bar::DecisionsFilterBar;

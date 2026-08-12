@@ -1,8 +1,8 @@
-//! Backend Cloudflare Workers AI (port de `embedding/cloudflare.py`).
+//! Backend Cloudflare Workers AI.
 //!
 //! POST `accounts/{id}/ai/run/{model}` avec `{"text": [...]}`. Chaque chunk est
 //! envoyé seul (1 vecteur attendu par appel). Les passages trop longs sont
-//! re-chunkés par caractères puis moyennés et re-normalisés (parité Python).
+//! re-chunkés par caractères puis moyennés et re-normalisés.
 
 use crate::backend::{format_query, Embedder, EMBEDDING_DIM, LEGAL_QUERY_INSTRUCTION};
 use crate::error::{EmbedError, Result};
@@ -30,8 +30,8 @@ pub struct CloudflareWorkersAIEmbedder {
     chunk_chars: usize,
     timeout_s: f64,
     neuron_budget: Option<usize>,
-    // ClientWithMiddleware : TracingMiddleware emet un span HTTP par appel
-    // (url.full inclus) — alimente le row "Cloudflare Workers AI" du cockpit.
+    // ClientWithMiddleware : TracingMiddleware émet un span HTTP par appel
+    // (url.full inclus).
     client: ClientWithMiddleware,
     /// Neurons cumulés (header `cf-ai-neurons`), pour le budget. Mutex pour
     /// rester `&self` (le trait `Embedder` n'accorde qu'un emprunt partagé).
@@ -39,7 +39,7 @@ pub struct CloudflareWorkersAIEmbedder {
 }
 
 impl CloudflareWorkersAIEmbedder {
-    /// Modèle par défaut côté serveur (égal à `DEFAULT_MODEL` Python).
+    /// Modèle par défaut côté serveur.
     pub const DEFAULT_MODEL: &'static str = "@cf/qwen/qwen3-embedding-0.6b";
 
     pub fn new(
@@ -75,9 +75,8 @@ impl CloudflareWorkersAIEmbedder {
         )
     }
 
-    /// Port de `_chunk_with` : découpe récursive par caractères sous le cap
-    /// tokens. Opère sur les *char boundaries* (le slicing Python est par
-    /// codepoint Unicode).
+    /// Découpe récursive par caractères sous le cap tokens. Opère sur les
+    /// *char boundaries*.
     fn chunk_with(&self, text: &str, chunk_chars: usize) -> Vec<String> {
         let chars: Vec<char> = text.chars().collect();
         let n = chars.len();
@@ -112,7 +111,7 @@ impl CloudflareWorkersAIEmbedder {
     }
 
     /// POST d'un batch d'inputs ; renvoie `(n_inputs, dim)`. Applique le budget
-    /// neurons et vérifie la forme (port de `_post`).
+    /// neurons et vérifie la forme.
     async fn post(&self, inputs: &[String]) -> Result<Array2<f32>> {
         let expected = inputs.len();
         let resp = self
@@ -196,7 +195,7 @@ impl CloudflareWorkersAIEmbedder {
         Ok(arr)
     }
 
-    /// Embed chaque chunk seul puis concatène (port de `_embed_chunks`).
+    /// Embed chaque chunk seul puis concatène.
     async fn embed_chunks(&self, chunks: &[String]) -> Result<Array2<f32>> {
         if chunks.is_empty() {
             return Ok(Array2::<f32>::zeros((0, self.dim)));
@@ -210,7 +209,7 @@ impl CloudflareWorkersAIEmbedder {
     }
 }
 
-/// Heuristique tokens (port de `_estimate_tokens`).
+/// Heuristique tokens.
 fn estimate_tokens(text: &str) -> usize {
     let chars = text.chars().count() as f64;
     let est = (chars / CHARS_PER_TOKEN_MEDIAN).round() as usize;
@@ -218,8 +217,8 @@ fn estimate_tokens(text: &str) -> usize {
 }
 
 impl Embedder for CloudflareWorkersAIEmbedder {
-    /// Port de `embed_passages` : chunk par texte, embed tous les chunks à plat,
-    /// puis pour chaque texte : 1 chunk → tel quel, n>1 → moyenne re-normalisée.
+    /// Chunk par texte, embed tous les chunks à plat, puis pour chaque texte :
+    /// 1 chunk → tel quel, n>1 → moyenne re-normalisée.
     async fn embed_passages(&self, texts: &[String]) -> Result<Array2<f32>> {
         let chunks_per_text: Vec<Vec<String>> = texts.iter().map(|t| self.chunk(t)).collect();
         let flat: Vec<String> = chunks_per_text.iter().flatten().cloned().collect();
@@ -249,7 +248,7 @@ impl Embedder for CloudflareWorkersAIEmbedder {
         Ok(out)
     }
 
-    /// Port de `embed_query` : préfixe l'instruction puis embed chunk par chunk.
+    /// Préfixe l'instruction puis embed chunk par chunk.
     async fn embed_query(&self, texts: &[String]) -> Result<Array2<f32>> {
         let prefixed: Vec<String> = texts
             .iter()
@@ -278,10 +277,8 @@ mod tests {
 
     #[test]
     fn estimate_tokens_floor_and_median() {
-        // max(1, round(len / 3.41)).
         assert_eq!(estimate_tokens(""), 1);
         assert_eq!(estimate_tokens("a"), 1);
-        // 341 chars / 3.41 = 100.
         let s = "a".repeat(341);
         assert_eq!(estimate_tokens(&s), 100);
     }
@@ -289,7 +286,6 @@ mod tests {
     #[test]
     fn chunk_short_text_single() {
         let e = CloudflareWorkersAIEmbedder::new("a", "t", "m");
-        // Texte court, sous le cap tokens → un seul chunk.
         let chunks = e.chunk("petit texte");
         assert_eq!(chunks, vec!["petit texte".to_string()]);
     }
@@ -297,8 +293,6 @@ mod tests {
     #[test]
     fn chunk_splits_by_chars() {
         let e = CloudflareWorkersAIEmbedder::new("a", "t", "m");
-        // 60000 chars > CF_CHUNK_CHARS (24000) → plusieurs morceaux, recouvrant
-        // tout le texte sans chevauchement (window stride = chunk_chars).
         let text = "x".repeat(60_000);
         let chunks = e.chunk(&text);
         assert!(chunks.len() >= 3);

@@ -95,7 +95,6 @@ fn location_table() -> &'static [(&'static str, &'static str)] {
         ("8602", "Tribunal de commerce de Poitiers"),
         ("9201", "Tribunal de commerce de Nanterre"),
         ("9301", "Tribunal de commerce de Bobigny"),
-        // Boucle 2026-06-03
         ("ca_chambery", "Cour d'appel de Chambéry"),
         ("ca_dijon", "Cour d'appel de Dijon"),
         ("tj01053", "Tribunal judiciaire de Bourg-en-Bresse"),

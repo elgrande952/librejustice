@@ -19,10 +19,9 @@ use super::query::{is_boolean_query, phrase_combo_parse, translate_boolean};
 const MAX_RESULTS: usize = 100;
 const RELATIVE_SCORE_THRESHOLD: f64 = 0.3;
 const RRF_RANK_CONSTANT: f64 = 60.0;
-/// Sur-récupération chunk des jambes body/ANN (ADR 0080) : la LIMIT SQL est au
-/// grain chunk, le classement de jambe au grain décision — ×1,1 suffit pour que
-/// `leg_limit` chunks couvrent `leg_limit` décisions distinctes (1,08
-/// chunk/décision en moyenne sur le corpus, p90 = 1).
+/// Sur-récupération chunk des jambes body/ANN : la LIMIT SQL est au grain
+/// chunk, le classement de jambe au grain décision — ×1,1 suffit pour que
+/// `leg_limit` chunks couvrent `leg_limit` décisions distinctes.
 const POOL_OVERFETCH: f64 = 1.1;
 
 /// LIMIT chunk d'une jambe body/ANN pour `leg_limit` décisions visées.
@@ -69,10 +68,9 @@ pub(crate) async fn bm25_leg(
     bm25_parse_leg(conn, req, &body_query, leg_limit).await
 }
 
-/// BM25 body au grain décision sur `decisions_bm25` (`full_text`). Plus de
-/// sur-récupération ni de pooling : la `LIMIT` SQL est directement en décisions
-/// (ADR 0084, supersede la jambe chunk + ×1,1 de l'ADR 0080). Renvoie
-/// `{decision_id: score}`, symétrique de [`title_leg`].
+/// BM25 body au grain décision sur `decisions_bm25` (`full_text`) : la `LIMIT`
+/// SQL est directement en décisions. Renvoie `{decision_id: score}`, symétrique
+/// de [`title_leg`].
 #[tracing::instrument(skip(conn, req, translated_query), fields(leg_limit))]
 pub(crate) async fn bm25_parse_leg(
     conn: &Client,
@@ -111,8 +109,8 @@ pub(crate) async fn bm25_parse_leg(
         .collect())
 }
 
-/// BM25 sur le champ `search_title` de `decisions_bm25`, au grain décision
-/// (ADR 0084). Renvoie `{decision_id: score}`.
+/// BM25 sur le champ `search_title` de `decisions_bm25`, au grain décision.
+/// Renvoie `{decision_id: score}`.
 ///
 /// Mêmes filtres que la jambe body : TOUS les filtres (article composite et
 /// instrument compris) s'appliquent ici aussi — la jambe titre ne peut pas
@@ -187,7 +185,7 @@ pub(crate) async fn ann_leg(
         cf = chunk_filter,
         limit_idx = limit_idx,
     );
-    // SET LOCAL dans une transaction (probes + prefilter), comme search.py.
+    // SET LOCAL dans une transaction (probes + prefilter).
     let tx = conn.transaction().await?;
     tx.batch_execute(&format!(
         "SET LOCAL vchordrq.probes = {probes}; SET LOCAL vchordrq.prefilter = {};",
@@ -210,11 +208,11 @@ pub(crate) async fn ann_leg(
 
 // ── Pooling décision + fusion RRF + truncate ─────────────────────────────────
 
-/// Max-pool chunk→décision (ADR 0080) puis troncature aux `leg_limit`
-/// meilleures décisions (score desc, tie-break id) : la jambe a sur-récupéré
-/// [`POOL_OVERFETCH`] chunks, le classement entrant en fusion RRF est au
-/// grain décision et de profondeur `leg_limit`, comme la jambe titre. Le
-/// `LegHit` gagnant est conservé (chunk du snippet).
+/// Max-pool chunk→décision puis troncature aux `leg_limit` meilleures
+/// décisions (score desc, tie-break id) : la jambe a sur-récupéré
+/// [`POOL_OVERFETCH`] chunks, le classement entrant en fusion RRF est au grain
+/// décision et de profondeur `leg_limit`, comme la jambe titre. Le `LegHit`
+/// gagnant est conservé (chunk du snippet).
 pub(crate) fn pool_max_per_decision(hits: &[LegHit], leg_limit: usize) -> HashMap<i64, LegHit> {
     let mut out: HashMap<i64, LegHit> = HashMap::new();
     for h in hits {
@@ -252,12 +250,12 @@ fn ranks_by_score<F: Fn(i64) -> f64>(ids: &[i64], score: F) -> HashMap<i64, usiz
         .collect()
 }
 
-/// Fusion RRF au grain décision (ADR 0080/0084). `bm25` et `title` sont des
-/// scores par décision (jambes `decisions_bm25`) ; `ann` porte le `LegHit` du
-/// chunk gagnant (seule jambe chunk-grain). Le chunk d'affichage du hit fusionné
-/// vient de la jambe ANN — il ancre la fenêtre du snippet sémantique
-/// ([`super::hydrate::assemble_page`]) — sinon un chunk synthétique (snippet depuis
-/// `full_text`).
+/// Fusion RRF au grain décision. `bm25` et `title` sont des scores par décision
+/// (jambes `decisions_bm25`) ; `ann` porte le `LegHit` du chunk gagnant (seule
+/// jambe chunk-grain). Le chunk d'affichage du hit fusionné vient de la jambe
+/// ANN — il ancre la fenêtre du snippet sémantique
+/// ([`super::hydrate::assemble_page`]) — sinon un chunk synthétique (snippet
+/// depuis `full_text`).
 pub(crate) fn fuse_ranks(
     bm25: &HashMap<i64, f64>,
     ann: &HashMap<i64, LegHit>,
@@ -325,11 +323,6 @@ mod tests {
 
     #[test]
     fn rrf_fusion_tiebreak_parity_oracle() {
-        // `_fuse_ranks` (Python) sur 3 jambes avec ex aequo, poids défaut (1,1,1),
-        // rc=60. Ordre + scores figés depuis l'oracle : verrouille la formule RRF
-        // ET le tie-break déterministe `(-score, decision_id)` (gap #2, HashMap Rust
-        // non ordonné). bm25 {1:5,2:5,3:1} (1,2 ex aequo) ; ann {2:9,4:2} ;
-        // title {1:3,4:3} (1,4 ex aequo).
         let mk = |did: i64, raw_score: f64| LegHit {
             decision_id: did,
             chunk_id: did * 10,
@@ -361,10 +354,6 @@ mod tests {
 
     #[test]
     fn rrf_fusion_title_only_synthetic_chunk_parity_oracle() {
-        // Doc présent UNIQUEMENT dans la jambe title → chunk synthétique
-        // (`chunk_id=-1`, `chunk_index=0`), comme `_LegHit` côté Python.
-        // bm25 {1:4} ; ann {1:2, 2:7} ; title {5:9}. Ordre/scores figés depuis
-        // l'oracle ; doc 2 et doc 5 ex aequo → tie-break par id.
         let mk = |did: i64, raw_score: f64| LegHit {
             decision_id: did,
             chunk_id: did * 10,
@@ -383,7 +372,6 @@ mod tests {
             .map(|(_, s, _)| (s * 1e12).round() / 1e12)
             .collect();
         assert_eq!(scores, vec![0.032522474881, 0.016393442623, 0.016393442623]);
-        // Le chunk de doc 5 (title-only) est synthétique.
         let (_, _, chunk5) = fused.iter().find(|(d, _, _)| *d == 5).unwrap();
         assert_eq!(chunk5.chunk_id, -1, "chunk synthétique title-only");
         assert_eq!(chunk5.chunk_index, 0);
@@ -401,8 +389,6 @@ mod tests {
 
     #[test]
     fn pool_keeps_winning_chunk_of_decision() {
-        // Trois chunks de la décision 1 (scores ANN négatifs = -distance) :
-        // un seul hit en sortie, celui du meilleur chunk.
         let hits = vec![
             leg_hit(1, 10, -0.4),
             leg_hit(1, 11, -0.2),
@@ -418,8 +404,6 @@ mod tests {
 
     #[test]
     fn pool_truncates_to_leg_limit_decisions() {
-        // 4 décisions, leg_limit 2 → top-2 par score poolé ; tie-break par id
-        // (3 et 4 à égalité : 3 gagne).
         let hits = vec![
             leg_hit(1, 10, 1.0),
             leg_hit(2, 20, 5.0),
@@ -434,10 +418,6 @@ mod tests {
 
     #[test]
     fn pool_recovers_decision_below_chunk_cutoff() {
-        // Le scénario d'ADR 0080 : leg_limit = 2 mais la tête du classement
-        // CHUNK est saturée par les chunks de la décision 1 ; la décision 2,
-        // au-delà du rang 2 en chunks (sur-récupération), entre quand même
-        // dans le top-2 décisions après pooling.
         let overfetched = vec![
             leg_hit(1, 10, 9.0),
             leg_hit(1, 11, 8.0),
@@ -459,7 +439,6 @@ mod tests {
         title.insert(1i64, 3.0);
         title.insert(2i64, 1.0);
         let fused = fuse_ranks(&bm25, &ann, &title, 1.0, 1.0, 1.0);
-        // doc 1 présent dans bm25 (rang 1) + title (rang 1) ⇒ score plus haut.
         assert_eq!(fused[0].0, 1);
     }
 
@@ -468,7 +447,7 @@ mod tests {
         let fused = vec![
             (1i64, 1.0, LegHit::synthetic_title_only(1)),
             (2i64, 0.4, LegHit::synthetic_title_only(2)),
-            (3i64, 0.2, LegHit::synthetic_title_only(3)), // < 0.3 du top → coupé
+            (3i64, 0.2, LegHit::synthetic_title_only(3)),
         ];
         let kept = truncate_fused(fused);
         assert_eq!(kept.len(), 2);

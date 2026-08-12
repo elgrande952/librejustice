@@ -1,30 +1,29 @@
 //! Adaptateur telemetrie du serveur API : construit les [`lj_telemetry::InitOpts`]
-//! depuis [`Settings`] (regle #5 : toute config OTel passe par `Settings`) et
-//! delegue l'installation a la crate partagee `lj-telemetry` (voir ADR 0062).
-//!
-//! L'instrumentation des spans naît des `#[instrument]` / `tracing::span!` cote
-//! code metier ; les metriques (scraper Postgres) passent par [`meter`].
+//! depuis [`Settings`] et delegue l'installation a `lj-telemetry`.
 
 use crate::config::Settings;
 use anyhow::Result;
 use lj_telemetry::{InitOpts, OtlpCreds, TelemetryGuard};
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::EnvFilter;
 
-pub use lj_telemetry::meter;
+pub use lj_telemetry::{meter, unattended_request_span};
 
 /// Initialise la telemetrie de l'API. Renvoie un guard de flush a garder vivant
-/// pour toute la duree du process (flush des batch processors a l'arret).
+/// pour toute la duree du process.
 pub fn init_telemetry(settings: &Settings) -> Result<TelemetryGuard> {
-    // Filtre : `RUST_LOG` si present, sinon `info`. Le `trace_extractor`
-    // d'axum-tracing-opentelemetry WARN « can not set parent trace_id »
-    // (SpanDisabled) sur chaque requete au span non echantillonne — health
-    // checks compris, ~21 lignes/min qui noient les logs : on ne garde que
-    // ses erreurs.
+    // `otel::tracing` est la cible du span serveur d'`OtelAxumLayer`, emis au
+    // niveau TRACE : sous le plancher `info` il n'est jamais cree et la couche
+    // est inerte.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
         .add_directive(
             "axum_tracing_opentelemetry=error"
+                .parse()
+                .expect("directive de filtre valide"),
+        )
+        .add_directive(
+            "otel::tracing=trace"
                 .parse()
                 .expect("directive de filtre valide"),
         );
@@ -47,8 +46,10 @@ pub fn init_telemetry(settings: &Settings) -> Result<TelemetryGuard> {
         json: false,
         service_name: settings.otel_service_name.clone(),
         deployment_environment: settings.deployment_environment.clone(),
-        // API : haut volume, on ne ship que WARN+ en logs OTLP.
-        otlp_log_level: LevelFilter::WARN,
+        otlp_log_filter: Targets::new()
+            .with_default(LevelFilter::WARN)
+            .with_target(crate::usage::LOG_TARGET, LevelFilter::INFO)
+            .with_target(crate::ratelimit::LOG_TARGET, LevelFilter::INFO),
         otlp,
     })
 }

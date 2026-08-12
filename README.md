@@ -22,8 +22,9 @@ DILA/Légifrance, EUR-Lex…).
 
 ## Ce que les sources officielles n'offrent pas
 
-Les bases publiques sont des silos (Judilibre = ordre judiciaire seul, JADE =
-ZIP XML sans moteur, Légifrance = consultation document par document).
+Les bases publiques sont des silos, chacun avec son moteur borné à son fonds
+(Judilibre = ordre judiciaire seul ; l'open data de la justice administrative
+= mots-clés, juridiction et dates sur CE/CAA/TA ; Légifrance = les textes).
 LibreJustice les consolide et ajoute la couche qui manque :
 
 - **recherche en langage naturel** (hybride lexicale + sémantique) avec
@@ -57,8 +58,10 @@ agent compatible via [skills](https://skills.sh) :
 npx skills add librejustice/librejustice
 ```
 
-Avec Le Chat, Perplexity ou claude.ai : ajouter un connecteur custom pointant
-sur `https://librejustice.fr/mcp`.
+Sur claude.ai, LibreJustice est listé dans le répertoire des connecteurs :
+[claude.ai/directory/connectors/librejustice](https://claude.ai/directory/connectors/librejustice).
+Un clic, puis l'autorisation OAuth. Avec ChatGPT, Le Chat ou Perplexity :
+ajouter un connecteur custom pointant sur `https://librejustice.fr/mcp`.
 
 ## Stack
 
@@ -78,7 +81,7 @@ Workspace Cargo **pur Rust**, scindé en deux racines :
   - `lj-api` — couche API (Axum + MCP rmcp + OAuth).
   - `lj-web` — front Leptos (SSR + hydratation WASM), Tailwind.
 - `apps/` — binaires livrables :
-  - `lj-server` — déploiement unique : API + MCP/OAuth + SSR + TLS.
+  - `lj-server` — déploiement unique : API + MCP/OAuth + SSR.
   - `lj-ingest` — CLI d'ingestion + runner cron.
 
 ## Build & dev
@@ -91,20 +94,30 @@ mise run test      # rustfmt --check + clippy -D warnings + cargo test --workspa
 mise run dev       # lj-server fusionné (cargo leptos watch, :3000)
 ```
 
-Pour une base locale : `podman compose -f infra/docker-compose.yml up -d postgres`.
+Pour une base locale : `mise run dbs`. La tâche prépare l'état de Postgres sous
+`LIBREJUSTICE_STATE_DIR` — propriétaire du répertoire de données, et copie de la
+configuration montée par le conteneur — avant de le démarrer.
 
 ## Déploiement
 
 Mono-serveur via **podman compose** (`infra/docker-compose.yml`) : Postgres
-(ParadeDB + VectorChord), le binaire fusionné `lj-server` et le cron
-d'ingestion. Renseigner `.env` (voir `.env.example`), puis :
+(ParadeDB + VectorChord), le binaire fusionné `lj-server`, un front `caddy` et
+le cron d'ingestion. Renseigner `.env` (voir `.env.example`), puis :
 
 ```bash
+mise run ensure-pg                                                          # état + conf Postgres
 podman compose -f infra/docker-compose.yml --profile prod up -d --build
 podman compose -f infra/docker-compose.yml exec -T cron lj-ingest migrate   # migrations
 ```
 
-`lj-server` sert l'API, le MCP/OAuth, le SSR et les assets (TLS in-process).
+`lj-server` sert l'API, le MCP/OAuth, le SSR et les assets. Il écoute en clair ;
+c'est `caddy` qui tient `:443` et termine le TLS, de sorte que la socket reste
+liée quand le conteneur applicatif est recréé.
+
+La configuration Postgres livrée (`infra/pg-conf/`) porte ce que l'application
+exige — extensions, réglages ParadeDB, compression — avec un dimensionnement de
+machine de développement. Une instance de production relève `shared_buffers` et
+`effective_cache_size` selon son matériel.
 
 ## Licence
 

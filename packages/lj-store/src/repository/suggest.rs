@@ -1,6 +1,5 @@
-//! Blob FST d'autocomplétion (`suggest_index`, ADR 0216) : écrit par
-//! `lj-ingest build-suggest`, lu d'un bloc par `lj-server` au premier
-//! `/suggest`.
+//! Blob FST d'autocomplétion (`suggest_index`) : écrit par `lj-ingest
+//! build-suggest`, lu d'un bloc par `lj-server` au premier `/suggest`.
 
 use crate::error::Result;
 
@@ -34,9 +33,9 @@ impl DecisionRepository<'_> {
         Ok(row.map(|r| r.get(0)))
     }
 
-    /// Lot keyset de corps de décisions **échantillonné** (`id % modulo = 0`,
-    /// ADR 0216 : le ranking du suggest ne consomme que des fréquences
-    /// relatives). Renvoie `(id, full_text)` au-delà de `after_id`, ordre d'id.
+    /// Lot keyset de corps de décisions **échantillonné** (`id % modulo = 0` : le
+    /// ranking du suggest ne consomme que des fréquences relatives). Renvoie
+    /// `(id, full_text)` au-delà de `after_id`, ordre d'id.
     #[tracing::instrument(name = "db.suggest_decision_texts", skip(self), fields(db.system = "postgresql"))]
     pub async fn suggest_decision_texts_batch(
         &self,
@@ -77,10 +76,9 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Les titres de `legal_text` visibles en recherche (ADR 0246 §6 — les
-    /// nominations, véhicules de publication et lois d'habilitation ne sont
-    /// pas suggérés) — injectés entiers dans le vocabulaire du mode textes
-    /// avec boost de df (ADR 0216).
+    /// Les titres de `legal_text` visibles en recherche — les nominations, véhicules
+    /// de publication et lois d'habilitation ne sont pas suggérés. Injectés entiers
+    /// dans le vocabulaire du mode textes avec boost de df.
     #[tracing::instrument(name = "db.suggest_text_titles", skip(self), fields(db.system = "postgresql"))]
     pub async fn suggest_text_titles(&self) -> Result<Vec<String>> {
         let rows = self

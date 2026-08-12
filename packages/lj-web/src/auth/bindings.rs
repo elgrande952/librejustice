@@ -18,6 +18,9 @@ extern "C" {
     #[wasm_bindgen(js_name = "hasSession")]
     fn js_has_session() -> js_sys::Promise;
 
+    #[wasm_bindgen(js_name = "sessionInStorage")]
+    fn js_session_in_storage() -> bool;
+
     #[wasm_bindgen(js_name = "signInPassword", catch)]
     fn js_sign_in_password(email: &str, password: &str) -> Result<js_sys::Promise, JsValue>;
 
@@ -45,6 +48,12 @@ extern "C" {
 pub async fn get_access_token() -> Option<String> {
     let value = JsFuture::from(js_get_access_token()).await.ok()?;
     value.as_string()
+}
+
+/// `true` si une session vit dans le storage local (lecture synchrone, sans
+/// reseau — insensible au deadline de [`get_access_token`]).
+pub fn session_in_storage() -> bool {
+    js_session_in_storage()
 }
 
 /// Email de la session courante, ou `None` (anonyme).

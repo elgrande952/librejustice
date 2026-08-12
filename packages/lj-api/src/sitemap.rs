@@ -1,12 +1,11 @@
-//! Service HTTP des sitemaps depuis Postgres (ADR 0064).
+//! Service HTTP des sitemaps depuis Postgres.
 //!
-//! Remplace le Worker Cloudflare + bucket R2 : le cron (`lj-ingest sitemap`)
-//! upsert la table `sitemaps`, ces routes la servent. Le CDN Cloudflare cache
-//! les réponses (`Cache-Control` 1 h) → Postgres touché rarement.
+//! Le cron (`lj-ingest sitemap`) upsert la table `sitemaps`, ces routes la
+//! servent. Le CDN Cloudflare cache les réponses (`Cache-Control` 1 h).
 //!
 //! - `GET /sitemap.xml` → ligne `sitemap-index.xml` (entrée robots/Google) ;
 //! - `GET /sitemaps/{file}` → ligne `{file}` (ex. `sitemap-1.xml.gz`). Le nom
-//!   complet est UN segment de chemin : matchit/axum 0.8 n'autorise pas de
+//!   complet est un segment de chemin : matchit/axum 0.8 n'autorise pas de
 //!   capture préfixe+suffixe dans un segment (`/sitemap-{n}.xml.gz` est refusé),
 //!   d'où le préfixe `/sitemaps/` qui isole la capture sans shadower les routes
 //!   Leptos.
@@ -42,11 +41,7 @@ async fn sitemap_sub(State(state): State<AppState>, Path(file): Path<String>) ->
 /// Lit la ligne `filename` et la sert avec son `Content-Type` + `Cache-Control` ;
 /// 404 si absente.
 async fn serve(state: &AppState, filename: &str) -> Result<Response> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let Some((body, content_type)) = DecisionRepository::new(&conn)
         .fetch_sitemap(filename)
         .await?

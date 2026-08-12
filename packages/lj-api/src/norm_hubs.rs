@@ -1,4 +1,4 @@
-//! Hubs du catalogue des normes (ADR 0255) : catalogue `/api/normes`, hub
+//! Hubs du catalogue des normes : catalogue `/api/normes`, hub
 //! `/api/normes/{fond}`, page année `/api/normes/{fond}/{annee}` (`annee` =
 //! année ou `sans-date`). Chemins de crawl SSR vers les textes — réponses
 //! stables (le corpus bouge à l'ingest quotidien), cache CDN long côté routes.
@@ -31,17 +31,24 @@ pub async fn catalogue(state: &AppState) -> Result<Arc<NormCatalogueResponse>> {
 }
 
 async fn load_catalogue(state: &AppState) -> Result<Arc<NormCatalogueResponse>> {
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let counts = DecisionRepository::new(&conn).norm_catalogue().await?;
+    // Le fond `codes` affiche le compte de son catalogue `/normes/codes` (codes +
+    // constitutions avec ≥ 1 article en vigueur), pas le compte brut de la
+    // taxonomie : la carte et la page disent le même nombre.
+    let codes_count = crate::legi::code_catalogue(state, true)
+        .await?
+        .entries
+        .len() as i64;
 
     let fonds = NORM_FONDS
         .iter()
         .filter_map(|fond| {
-            let count = counts.iter().find(|(f, _)| f == fond).map(|(_, c)| *c)?;
+            let count = if *fond == "codes" {
+                codes_count
+            } else {
+                counts.iter().find(|(f, _)| f == fond).map(|(_, c)| *c)?
+            };
             Some(NormFondEntry {
                 fond: (*fond).to_string(),
                 label: norm_fond_label(fond).unwrap_or(fond).to_string(),
@@ -53,14 +60,11 @@ async fn load_catalogue(state: &AppState) -> Result<Arc<NormCatalogueResponse>> 
 }
 
 /// Hub d'un fond : années couvertes + volume. 404 si le fond est inconnu de
-/// la taxonomie, vide, ou `codes` (son catalogue est `/codes`).
+/// la taxonomie, vide, ou `codes` (son catalogue est `/normes/codes`, servi
+/// par `/api/codes`).
 pub async fn hub(state: &AppState, fond: &str) -> Result<NormFondResponse> {
     let label = browsable_fond_label(fond)?;
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let years = DecisionRepository::new(&conn).norm_fond_years(fond).await?;
     if years.is_empty() {
         return Err(ApiError::NotFound);
@@ -86,11 +90,7 @@ pub async fn year_page(
     page: u32,
 ) -> Result<NormYearResponse> {
     let label = browsable_fond_label(fond)?;
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
     let total = repo
         .norm_fond_years(fond)
@@ -124,7 +124,7 @@ pub async fn year_page(
 }
 
 /// Libellé d'un fond navigable par hub année — 404 sur un fond hors
-/// taxonomie et sur `codes` (couvert par le catalogue `/codes`).
+/// taxonomie et sur `codes` (couvert par le catalogue `/normes/codes`).
 fn browsable_fond_label(fond: &str) -> Result<String> {
     if fond == "codes" || !NORM_FONDS.contains(&fond) {
         return Err(ApiError::NotFound);

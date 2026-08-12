@@ -1,6 +1,5 @@
-//! Chargement de données des pages /texte (Resources). Calqué sur
-//! `pages::decision_page::data` : fetchers via l'`ApiClient`, erreurs
-//! sérialisables, `sendable` aiguillé par cible.
+//! Chargement de données des pages /texte (Resources) : fetchers via
+//! l'`ApiClient`, erreurs sérialisables, `sendable` aiguillé par cible.
 
 use leptos::prelude::*;
 use lj_dtos::{
@@ -13,8 +12,9 @@ use crate::api::{ApiClient, PageParams};
 
 pub use crate::pages::decision_page::data::{sendable, PageError};
 
-/// Limite de décisions citantes affichées sous l'article (première page).
-const CITING_LIMIT: u32 = 20;
+/// Limite de décisions citantes affichées sous un article ou une division ; la
+/// profondeur passe par `/decisions?legalArticle=…`.
+const CITING_LIMIT: u32 = 5;
 
 /// Clé d'article LEGI extraite de la route `/texte/{code}/{num}[/{date}]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,9 +78,36 @@ pub async fn fetch_citing(code: String, num: String, date: Option<String>) -> Ci
     }
 }
 
-/// Articles co-cités résolus (« souvent cité avec », Phase D). Ne rejette
-/// jamais : l'erreur est repliée en silence (liste vide) — le bloc est un
-/// enrichissement, pas un contenu porteur.
+/// Charge les décisions citant une division (non bloquant, streamé via
+/// `<Suspense>`) : union du sous-arbre. `date` = consultation Chronolégi, qui
+/// choisit la composition de ce sous-arbre. Ne rejette jamais : erreur repliée en
+/// `error`.
+pub async fn fetch_section_citing(code: String, cid: String, date: Option<String>) -> CitingResult {
+    if code.trim().is_empty() || cid.trim().is_empty() {
+        return CitingResult {
+            hits: Vec::new(),
+            error: None,
+        };
+    }
+    let page = PageParams {
+        limit: CITING_LIMIT,
+        offset: 0,
+    };
+    match client()
+        .fetch_law_section_citing(&code, &cid, date.as_deref(), page)
+        .await
+    {
+        Ok(hits) => CitingResult { hits, error: None },
+        Err(err) => CitingResult {
+            hits: Vec::new(),
+            error: Some(err.message),
+        },
+    }
+}
+
+/// Articles co-cités résolus (« souvent cité avec »). Ne rejette jamais :
+/// l'erreur est repliée en silence (liste vide) — le bloc est un enrichissement,
+/// pas un contenu porteur.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelatedResult {
     pub items: Vec<CoCitedArticle>,
@@ -97,10 +124,10 @@ pub async fn fetch_related(code: String, num: String) -> RelatedResult {
     }
 }
 
-/// Table des matières d'un code résolue. `tree` = arbre structurel réel
-/// (ADR 0207), prime sur `entries` (repli à plat) ; `reading` = vue-lecture
-/// intégrale des textes courts (corps joints), prime sur les deux. Ne rejette
-/// jamais : l'erreur est repliée en `error` (parité `CitingResult`).
+/// Table des matières d'un code résolue. `tree` = arbre structurel réel, prime
+/// sur `entries` (repli à plat) ; `reading` = vue-lecture intégrale des textes
+/// courts (corps joints), prime sur les deux. Ne rejette jamais : l'erreur est
+/// repliée en `error`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TocResult {
     pub entries: Vec<TocEntry>,
@@ -109,8 +136,8 @@ pub struct TocResult {
     pub error: Option<String>,
 }
 
-/// Charge la table des matières d'un code (non bloquant, streamé via `<Suspense>`).
-/// `date` = consultation Chronolégi (`?date=`, ADR 0193 §5), absente = en
+/// Charge la table des matières d'un code (non bloquant, streamé via
+/// `<Suspense>`). `date` = consultation Chronolégi (`?date=`), absente = en
 /// vigueur. Ne rejette jamais : erreur repliée en `error`.
 pub async fn fetch_toc(code: String, date: Option<String>) -> TocResult {
     if code.trim().is_empty() {
@@ -137,7 +164,7 @@ pub async fn fetch_toc(code: String, date: Option<String>) -> TocResult {
     }
 }
 
-/// Charge la vue-lecture d'une section (`/texte/{code}/section/{cid}`, ADR 0207).
+/// Charge la vue-lecture d'une section (`/texte/{code}/section/{cid}`).
 /// `date` = consultation Chronolégi (`?date=`). Bloquant SSR (SEO).
 pub async fn fetch_section(
     code: String,
@@ -186,9 +213,8 @@ pub async fn fetch_code_summary(code: String) -> Result<lj_dtos::LawCodeSummary,
     Ok(summary)
 }
 
-/// Clé du comparateur de versions `/texte/{code}/{num}/comparer/{de}/{a}`
-/// (ADR 0193). `de`/`a` = dates ISO de fenêtre de version (`initiale` = borne
-/// ouverte).
+/// Clé du comparateur de versions `/texte/{code}/{num}/comparer/{de}/{a}`.
+/// `de`/`a` = dates ISO de fenêtre de version (`initiale` = borne ouverte).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompareKey {
     pub code: String,

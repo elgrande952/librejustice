@@ -1,8 +1,8 @@
-//! Helpers calendaires partagés par les deux syncs (port des fonctions de dates).
+//! Helpers calendaires partagés par les deux syncs.
 
 use chrono::{Datelike, NaiveDate};
 
-/// `["YYYYMM", ...]` inclus de `earliest` au mois courant (port de `_month_range`).
+/// `["YYYYMM", ...]` inclus de `earliest` au mois courant.
 pub(super) fn month_range(earliest: &str, today: NaiveDate) -> Vec<String> {
     let (mut y, mut m) = parse_year_month(earliest);
     let (end_y, end_m) = (today.year(), today.month() as i32);
@@ -26,7 +26,7 @@ fn parse_year_month(s: &str) -> (i32, i32) {
     (y, m)
 }
 
-/// `(date_start, date_end)` ISO inclusifs d'un mois `YYYYMM` (port de `_month_bounds`).
+/// `(date_start, date_end)` ISO inclusifs d'un mois `YYYYMM`.
 pub(super) fn month_bounds(yyyymm: &str) -> (String, String) {
     let year: i32 = yyyymm[0..4].parse().unwrap();
     let month: u32 = yyyymm[4..6].parse().unwrap();
@@ -41,7 +41,7 @@ pub(super) fn month_bounds(yyyymm: &str) -> (String, String) {
     (start, last_day.format("%Y-%m-%d").to_string())
 }
 
-/// `YYYYMM` de `date_start` au mois courant inclus (port de `_list_target_months`).
+/// `YYYYMM` de `date_start` au mois courant inclus.
 pub(super) fn list_target_months(date_start_iso: &str, today: NaiveDate) -> Vec<String> {
     let start =
         NaiveDate::parse_from_str(date_start_iso, "%Y-%m-%d").expect("date_start ISO YYYY-MM-DD");
@@ -79,7 +79,6 @@ mod tests {
             month_bounds("202612"),
             ("2026-12-01".to_string(), "2026-12-31".to_string())
         );
-        // Février bissextile.
         assert_eq!(
             month_bounds("202402"),
             ("2024-02-01".to_string(), "2024-02-29".to_string())

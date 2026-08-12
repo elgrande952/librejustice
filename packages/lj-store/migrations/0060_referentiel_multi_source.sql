@@ -1,4 +1,4 @@
--- Migration 0060 — Référentiel normatif multi-source (ADR 0097).
+-- Migration 0060 — Référentiel normatif multi-source.
 --
 -- Supersede le schéma 0057 (tables `legi_codes`/`legi_articles`, identité
 -- mono-source `legitext`/`legiarti`, pont `legal_codes.legitext`). Ces tables
@@ -11,9 +11,9 @@
 -- `(source, source_uid)` + `jurisdiction` les accueille.
 --
 -- Deux vérités-source distinctes (#11) : `legal_codes`/`legal_articles` (libellés
--- bruts cités par les juges, ADR 0079) ≠ `referential_*` (droit positif curated).
+-- bruts cités par les juges) ≠ `referential_*` (droit positif curated).
 -- Le pont `legal_codes.referential_text_id` + la résolution matérialisée
--- `legal_article_resolution` les relient sans les fusionner (ADR 0097 §2).
+-- `legal_article_resolution` les relient sans les fusionner.
 --
 -- Backfill réel (HORS-MIGRATION, par `resolve-refs` côté Rust) : `legal_articles
 -- .num_key` (1,5 M lignes, `normalize_article(label)` — fonction pure Rust que
@@ -60,7 +60,7 @@ WITH (key_field = 'id');
 -- `source_uid` = LEGIARTI (LEGI), CELEX-article… (clé d'idempotence #7).
 -- `(source, text_source_uid)` → `referential_texts(source, source_uid)` (PAS de
 -- FK : un article peut précéder son texte parent dans un incrément, back-fill
--- `title_path` différé, ADR 0092 inchangé). `num_key` = normalize_article(num),
+-- `title_path` différé). `num_key` = normalize_article(num),
 -- écrit côté Rust. `date_debut` NULLABLE = borne ouverte (sources non versionnées :
 -- traités, conventions). `status` 'VIGUEUR' par défaut côté parser.
 CREATE TABLE referential_articles (
@@ -93,7 +93,7 @@ CREATE INDEX idx_ref_articles_vigueur
 -- `bridge_legal_codes_referential` sur les formes canoniques.
 ALTER TABLE legal_codes ADD COLUMN referential_text_id BIGINT REFERENCES referential_texts(id);
 
--- ── legal_articles.num_key (clé de jointure fine du pont, ADR 0097 §2) ──────
+-- ── legal_articles.num_key (clé de jointure fine du pont) ──────
 -- `normalize_article(label)`, écrite à l'upsert (frontière Rust) ; back-fill des
 -- 1,5 M lignes existantes par `resolve-refs` (SQL ne peut pas appeler la fonction
 -- pure Rust). NULL = pas encore résolu.
@@ -111,6 +111,6 @@ CREATE TABLE legal_article_resolution (
     num_key             TEXT NOT NULL
 );
 
--- Reverse « décisions citant l'article X » (exact, ADR 0097 §2).
+-- Reverse « décisions citant l'article X » (exact).
 CREATE INDEX idx_lar_reverse
     ON legal_article_resolution (ref_source, ref_text_source_uid, num_key);

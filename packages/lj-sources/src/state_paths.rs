@@ -7,8 +7,7 @@
 //! - `bench/`, `analysis/` : scratch lu par `lj-bench`.
 //!
 //! `sources/` (matière première sourcée à la main), `tls/` et `pgdata/`
-//! (conteneur Postgres) restent hors code ; le layout complet vit dans
-//! l'ADR + la working-note.
+//! (conteneur Postgres) restent hors code.
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +21,7 @@ pub(crate) const OPENDATA_DIR: &str = "opendata_conseil_etat";
 pub(crate) const CEDH_DIR: &str = "cedh";
 pub(crate) const CNDA_DIR: &str = "cnda";
 pub(crate) const CJUE_DIR: &str = "cjue";
+pub(crate) const EU_LAW_DIR: &str = "eu_law";
 
 /// Résout et compose les chemins sous `state_dir`.
 #[derive(Debug, Clone)]
@@ -55,13 +55,19 @@ impl StatePaths {
         self.root.join("ingest/cache")
     }
 
-    /// `ingest/corpus` — datasets légaux curés (chargés par `load-legal-corpus`,
-    /// ADR 0108).
+    /// `ingest/corpus` — datasets légaux curés (chargés par
+    /// `load-legal-corpus`).
     pub fn corpus(&self) -> PathBuf {
         self.root.join("ingest/corpus")
     }
 
-    /// `bench` — scratch régénérable du banc (règle #17).
+    /// `ingest/instruments` — datasets de frappe d'identités d'instruments
+    /// (`mint-instruments`).
+    pub fn instruments(&self) -> PathBuf {
+        self.root.join("ingest/instruments")
+    }
+
+    /// `bench` — scratch régénérable du banc.
     pub fn bench(&self) -> PathBuf {
         self.root.join("bench")
     }
@@ -105,6 +111,12 @@ impl StatePaths {
     pub fn cjue(&self) -> PathBuf {
         self.cache().join(CJUE_DIR)
     }
+
+    /// `ingest/cache/eu_law` — manifeste du fond eu-law (watermark delta +
+    /// versions futures en attente).
+    pub fn eu_law(&self) -> PathBuf {
+        self.cache().join(EU_LAW_DIR)
+    }
 }
 
 /// `$HOME/.local/share/librejustice`.
@@ -119,13 +131,12 @@ fn default_state_dir() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// Fige le layout : une mauvaise chaîne casse l'ingest silencieusement
-    /// (downloader écrit ici, pipeline lit là).
     #[test]
     fn layout_is_stable() {
         let p = StatePaths::new(PathBuf::from("/s"));
         assert_eq!(p.cache(), PathBuf::from("/s/ingest/cache"));
         assert_eq!(p.corpus(), PathBuf::from("/s/ingest/corpus"));
+        assert_eq!(p.instruments(), PathBuf::from("/s/ingest/instruments"));
         assert_eq!(p.bench(), PathBuf::from("/s/bench"));
         assert_eq!(p.analysis(), PathBuf::from("/s/analysis"));
         assert_eq!(p.ariane(), PathBuf::from("/s/ingest/cache/ariane"));
@@ -138,5 +149,6 @@ mod tests {
         assert_eq!(p.cedh(), PathBuf::from("/s/ingest/cache/cedh"));
         assert_eq!(p.cnda(), PathBuf::from("/s/ingest/cache/cnda"));
         assert_eq!(p.cjue(), PathBuf::from("/s/ingest/cache/cjue"));
+        assert_eq!(p.eu_law(), PathBuf::from("/s/ingest/cache/eu_law"));
     }
 }

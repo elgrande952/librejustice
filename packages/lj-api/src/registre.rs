@@ -1,21 +1,20 @@
-//! Volet registre de la fiche entité (ADR 0199) : proxy mince vers les APIs
+//! Volet registre de la fiche entité : proxy mince vers les APIs
 //! publiques — recherche-entreprises.api.gouv.fr (identité SIRENE + dirigeants
 //! RNE + finances) et Opendatasoft DILA (chronologie BODACC par SIREN, annonces
-//! JOAFE par RNA). Aucun stock local : cache in-process 24 h
+//! JOAFE par RNA, projetées par `annonces_bodacc` / `annonces_joafe` dans le
+//! `AnnonceHit` du pot). Aucun stock local : cache in-process 24 h
 //! (`AppState::registre_cache`) et dégradation propre — API indisponible →
 //! section vide, jamais d'erreur. Les PDF (JOAFE, INPI) restent des liens
 //! sortants, jamais proxifiés.
-//!
-//! Sondes, quotas et cartographie section ↔ API : working-note
-//! `2026-07-11_annuaire-registres-apis-affichage.md`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use lj_dtos::{
-    EntityRegistreResponse, RegistreAnnonceDto, RegistreDirigeantDto, RegistreEntrepriseDto,
-    RegistreFinanceDto, RegistreLienDto,
+    AnnonceHit, EntityAnnonceGroupDto, EntityRegistreResponse, RegistreDirigeantDto,
+    RegistreEntrepriseDto, RegistreFinanceDto, RegistreLienDto, ANNONCE_FOND_BODACC,
+    ANNONCE_FOND_JOAFE,
 };
 use serde::Deserialize;
 use tracing::instrument;
@@ -29,10 +28,6 @@ pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
 const ANNONCES_LIMIT: usize = 10;
 
 const RECHERCHE_ENTREPRISES: &str = "https://recherche-entreprises.api.gouv.fr/search";
-const BODACC_RECORDS: &str =
-    "https://bodacc-datadila.opendatasoft.com/api/explore/v2.1/catalog/datasets/annonces-commerciales/records";
-const JOAFE_RECORDS: &str =
-    "https://journal-officiel-datadila.opendatasoft.com/api/explore/v2.1/catalog/datasets/jo_associations/records";
 
 /// Volet registre d'une entité (`GET /entity/{ns}/{id}/registre`). Namespaces
 /// sans volet (`cnb:`, `oacc:`…) → réponse vide. Seules les réponses dont tous
@@ -45,20 +40,30 @@ pub async fn entity_registre(
     id: &str,
 ) -> Result<EntityRegistreResponse> {
     let key = format!("{ns}:{id}");
-    if let Some(hit) = state.registre_cache.get(&key).await {
-        return Ok((*hit).clone());
-    }
-    let (response, complete) = match ns {
-        "siren" => registre_entreprise(state, id).await,
-        "rna" => registre_association(state, id).await,
-        _ => (empty(), true),
+    let mut response = match state.registre_cache.get(&key).await {
+        Some(hit) => (*hit).clone(),
+        None => {
+            let (response, complete) = match ns {
+                "siren" => registre_entreprise(state, id).await,
+                "rna" => registre_association(state, id).await,
+                _ => (empty(), true),
+            };
+            if complete {
+                state
+                    .registre_cache
+                    .insert(key.clone(), Arc::new(response.clone()))
+                    .await;
+            }
+            response
+        }
     };
-    if complete {
-        state
-            .registre_cache
-            .insert(key, Arc::new(response.clone()))
-            .await;
-    }
+    // Nos lignes `annonce` complètent le live DILA dans la même liste de
+    // groupes, hors du cache 24 h — celui-ci ne protège que des appels d'APIs
+    // externes, et une consultation close ou nouvelle doit se voir à la moisson
+    // suivante. Nos groupes passent en tête.
+    let mut groupes = crate::annonces::entity_groups(state, &key).await?;
+    groupes.append(&mut response.annonces);
+    response.annonces = groupes;
     Ok(response)
 }
 
@@ -66,7 +71,6 @@ fn empty() -> EntityRegistreResponse {
     EntityRegistreResponse {
         entreprise: None,
         annonces: Vec::new(),
-        annonces_total: 0,
         liens: Vec::new(),
     }
 }
@@ -95,15 +99,13 @@ async fn registre_entreprise(state: &AppState, id: &str) -> (EntityRegistreRespo
     ];
     let (entreprise, bodacc) = tokio::join!(
         fetch_recherche_entreprises(state, &siren),
-        fetch_bodacc(state, &siren)
+        crate::annonces_bodacc::pour_entite(state, &siren, ANNONCES_LIMIT)
     );
     let complete = entreprise.is_ok() && bodacc.is_ok();
-    let (annonces, annonces_total) = bodacc.unwrap_or_default();
     (
         EntityRegistreResponse {
             entreprise: entreprise.unwrap_or(None),
-            annonces,
-            annonces_total,
+            annonces: groupe_live(ANNONCE_FOND_BODACC, bodacc.unwrap_or_default()),
             liens,
         },
         complete,
@@ -244,59 +246,12 @@ fn effectif_label(code: &str) -> Option<&'static str> {
 /// Payload Opendatasoft (BODACC et JOAFE partagent la même enveloppe v2.1 ;
 /// `total_count` et `results` sont toujours présents).
 #[derive(Deserialize)]
-struct OdsRecords<T> {
-    total_count: i64,
-    results: Vec<T>,
-}
-
-#[derive(Deserialize)]
-struct BodaccRecord {
-    dateparution: Option<String>,
-    familleavis_lib: Option<String>,
-}
-
-/// Chronologie BODACC d'un SIREN (procédures collectives, modifications,
-/// radiations, dépôts de comptes), plus récente d'abord. Le champ `registre`
-/// est composite (`siren,greffe`) → `like`.
-async fn fetch_bodacc(
-    state: &AppState,
-    siren: &str,
-) -> std::result::Result<(Vec<RegistreAnnonceDto>, i64), ()> {
-    let where_clause = format!("registre like \"{siren}\"");
-    let limit = ANNONCES_LIMIT.to_string();
-    let payload: OdsRecords<BodaccRecord> = get_json(
-        state,
-        BODACC_RECORDS,
-        &[
-            ("where", where_clause.as_str()),
-            ("order_by", "dateparution desc"),
-            ("select", "dateparution,familleavis_lib"),
-            ("limit", limit.as_str()),
-        ],
-    )
-    .await?;
-    let annonces = payload
-        .results
-        .into_iter()
-        .filter_map(|r| {
-            Some(RegistreAnnonceDto {
-                date: r.dateparution,
-                famille: r.familleavis_lib?,
-                url_pdf: None,
-            })
-        })
-        .collect();
-    Ok((annonces, payload.total_count))
+pub(crate) struct OdsRecords<T> {
+    pub(crate) total_count: i64,
+    pub(crate) results: Vec<T>,
 }
 
 // ── Associations (`rna:`) ─────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct JoafeRecord {
-    dateparution: Option<String>,
-    typeavis: Option<String>,
-    url_pdf: Option<String>,
-}
 
 /// Annonces JOAFE d'un RNA (création, modification, dissolution, comptes),
 /// avec le PDF officiel DILA en lien direct.
@@ -312,52 +267,71 @@ async fn registre_association(state: &AppState, id: &str) -> (EntityRegistreResp
     if rna.is_empty() {
         return (empty(), true);
     }
-    let where_clause = format!("numero_rna=\"{rna}\"");
-    let limit = ANNONCES_LIMIT.to_string();
-    let fetched: std::result::Result<OdsRecords<JoafeRecord>, ()> = get_json(
-        state,
-        JOAFE_RECORDS,
-        &[
-            ("where", where_clause.as_str()),
-            ("order_by", "dateparution desc"),
-            ("select", "dateparution,typeavis,url_pdf"),
-            ("limit", limit.as_str()),
-        ],
-    )
-    .await;
+    let fetched = crate::annonces_joafe::pour_entite(state, &rna, ANNONCES_LIMIT).await;
     let complete = fetched.is_ok();
-    let payload = fetched.unwrap_or(OdsRecords {
-        total_count: 0,
-        results: Vec::new(),
-    });
-    let annonces = payload
-        .results
-        .into_iter()
-        .filter_map(|r| {
-            Some(RegistreAnnonceDto {
-                date: r.dateparution,
-                famille: r.typeavis?,
-                url_pdf: r.url_pdf,
-            })
-        })
-        .collect();
     (
         EntityRegistreResponse {
             entreprise: None,
-            annonces,
-            annonces_total: payload.total_count,
+            annonces: groupe_live(ANNONCE_FOND_JOAFE, fetched.unwrap_or_default()),
             liens: Vec::new(),
         },
         complete,
     )
 }
 
+/// Un fond live en groupe de la fiche : sa clé est le fond, son libellé celui
+/// du pot. Aucune ligne → aucun groupe (une section vide n'est pas une info).
+fn groupe_live(fond: &str, (items, total): (Vec<AnnonceHit>, i64)) -> Vec<EntityAnnonceGroupDto> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    vec![EntityAnnonceGroupDto {
+        key: fond.to_string(),
+        label: lj_dtos::annonce_fond_label(fond)
+            .unwrap_or(fond)
+            .to_string(),
+        total,
+        items,
+    }]
+}
+
 // ── Transport ────────────────────────────────────────────────────────────────
 
-/// GET JSON avec l'échec réduit à `Err(())` : l'appelant dégrade, le détail
-/// part en `warn` (une fiche ne doit jamais échouer parce qu'un registre
-/// public est indisponible).
-async fn get_json<T: serde::de::DeserializeOwned>(
+/// Nature d'un échec amont, en un mot indexable côté Loki : `timeout`,
+/// `connect`, `status`, `decode`, `body`, `other`. Les conduites à tenir sont
+/// opposées — un `timeout` interroge [`UPSTREAM_TIMEOUT`], un `status` dit que
+/// l'API a répondu et nous a refusés (quota), un `connect` est du réseau.
+fn upstream_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_status() {
+        "status"
+    } else if e.is_decode() {
+        "decode"
+    } else if e.is_body() {
+        "body"
+    } else {
+        "other"
+    }
+}
+
+/// Chaîne d'erreur complète. Le `Display` de `reqwest::Error` s'arrête à
+/// « error sending request for url (…) » et range la cause réelle dans
+/// `source()` : sans la dérouler, un DNS mort, un TCP refusé et une poignée de
+/// main TLS ratée s'écrivent pareil dans le log.
+fn chain(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        out.push_str(&format!(" -> {s}"));
+        src = s.source();
+    }
+    out
+}
+
+pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     state: &AppState,
     url: &str,
     query: &[(&str, &str)],
@@ -369,7 +343,7 @@ async fn get_json<T: serde::de::DeserializeOwned>(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| tracing::warn!(url, error = %e, "registre upstream failed"))?;
+        .map_err(|e| tracing::warn!(url, kind = upstream_kind(&e), error = %chain(&e), "registre upstream failed"))?;
     response
         .json::<T>()
         .await
@@ -380,10 +354,6 @@ async fn get_json<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
 
-    /// Verrouille le mapping du payload recherche-entreprises (forme réelle
-    /// observée le 2026-07-11, valeurs fictives, réduit aux champs consommés) :
-    /// dirigeants personne physique/morale, finances triées, tranche
-    /// d'effectif résolue.
     #[test]
     fn presente_une_entreprise_depuis_le_payload_recherche_entreprises() {
         let raw = serde_json::json!({
@@ -411,18 +381,13 @@ mod tests {
         );
         assert_eq!(dto.activite_naf.as_deref(), Some("62.01Z"));
         assert_eq!(dto.effectif.as_deref(), Some("20 à 49 salariés"));
-        // Le dirigeant sans nom ni dénomination est écarté, pas paniqué.
         assert_eq!(dto.dirigeants.len(), 2);
         assert_eq!(dto.dirigeants[0].nom, "JEAN MADELEINE");
         assert_eq!(dto.dirigeants[1].nom, "HOLDING X");
-        // Finances plus récentes d'abord.
         assert_eq!(dto.finances[0].annee, "2023");
         assert_eq!(dto.finances[0].resultat_net, Some(-123_456));
     }
 
-    /// L'API renvoie `null` (pas un champ absent) quand la donnée RNE manque —
-    /// observé en prod le 2026-07-11 : le décodage doit passer et produire
-    /// une fiche sans dirigeants ni finances.
     #[test]
     fn decode_les_champs_rne_null() {
         let raw = serde_json::json!({

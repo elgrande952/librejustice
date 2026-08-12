@@ -1,28 +1,27 @@
-//! Réparation des faux merges judilibre (#29 / ADR 0100 §5).
+//! Réparation des faux merges judilibre.
 //!
-//! La dédup historique (clé 0098 `identity_key` sans `location`) a fusionné des
-//! décisions **distinctes** partageant un RG. `fuse_cluster` a conservé les
+//! La dédup historique (clé `identity_key` sans `location`) a fusionné des
+//! décisions distinctes partageant un RG. `fuse_cluster` a conservé les
 //! `decision_sources` des membres supprimés (re-pointés vers le canonique) : une
 //! décision faussement fusionnée porte donc ≥2 provenances actives dont les
-//! `canonical_ref` (ADR 0100) **divergent**. Le `full_text`/chunks/embeddings des
-//! membres supprimés sont perdus → il faut **re-fetch** + ré-ingérer.
+//! `canonical_ref` divergent. Le `full_text`/chunks/embeddings des membres
+//! supprimés sont perdus, d'où le re-fetch.
 //!
 //! Cette passe :
 //! 1. recalcule `canonical_ref` par provenance (`Decision::from_source_fields`,
 //!    full_text vide — les discriminants vivent dans les champs structurés) ;
-//! 2. **planifie** le scinde (logique pure, testée) : groupe par `canonical_ref`,
-//!    désigne un groupe **gardé** (clé minimale, déterministe) qui réutilise la
-//!    ligne canonique, et les groupes divergents à reconstituer ; tout `None` ⇒
-//!    **ambigu**, jamais scindé (spécificité 100 %, #12) ;
+//! 2. planifie le scinde (logique pure, testée) : groupe par `canonical_ref`,
+//!    désigne un groupe gardé (clé minimale, déterministe) qui réutilise la ligne
+//!    canonique, et les groupes divergents à reconstituer ; tout `None` ⇒ ambigu,
+//!    jamais scindé ;
 //! 3. en `--execute` (write, gaté) : crée une décision séparée par groupe
-//!    divergent (re-pointe ses provenances), puis **re-fetch chaque groupe — gardé
-//!    inclus** — et ré-ingère (re-chunk + re-embed ciblé vLLM local). Re-fetcher le
-//!    groupe gardé rend l'élection sans effet sur la correction : chaque décision
-//!    récupère son **propre** contenu depuis la source, jamais celui d'un voisin
-//!    (la ligne `decisions` ne porte ni `source_uid` ni `location` permettant de
-//!    certifier à qui appartient son contenu — on ne devine donc pas, on re-fetch).
+//!    divergent (re-pointe ses provenances), puis re-fetch chaque groupe — gardé
+//!    inclus — et ré-ingère (re-chunk + re-embed ciblé vLLM local). Chaque
+//!    décision récupère ainsi son propre contenu depuis la source : la ligne
+//!    `decisions` ne porte ni `source_uid` ni `location` qui certifierait à qui
+//!    appartient son contenu.
 //!
-//! `--dry-run` (défaut) : émet le PLAN exact sans **aucune** écriture.
+//! `--dry-run` (défaut) : émet le PLAN exact sans aucune écriture.
 
 use std::collections::BTreeMap;
 
@@ -65,16 +64,16 @@ pub(crate) struct SplitGroup {
 /// Plan de réparation d'une décision multi-provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResplitPlan {
-    /// Toutes les provenances portent la **même** `canonical_ref` → fusion
+    /// Toutes les provenances portent la même `canonical_ref` → fusion
     /// légitime (Cass abrégé+intégrale…) : rien à scinder.
     Legit,
     /// ≥1 provenance sans `canonical_ref` (`None`) → on ne peut pas certifier la
-    /// séparation : **jamais scindée** (#12, spécificité 100 %).
+    /// séparation : jamais scindée.
     Ambiguous,
     /// Cluster déjà réparé (≤1 provenance) → SKIP idempotent (un re-run ne
     /// retombe pas dessus, car le cluster n'est plus multi-provenance).
     AlreadySplit,
-    /// Faux merge : `keep` = groupe **gardé** (réutilise la ligne canonique, clé
+    /// Faux merge : `keep` = groupe gardé (réutilise la ligne canonique, clé
     /// minimale pour le déterminisme) ; `splits` = les groupes divergents à
     /// reconstituer (ordre déterministe par `canonical_ref`). Tous les groupes,
     /// gardé inclus, sont re-fetchés à l'exécution.
@@ -85,11 +84,10 @@ pub(crate) enum ResplitPlan {
 }
 
 /// Planifie la réparation d'une décision faux-merge à partir de ses provenances.
-/// Fonction **pure** (rule #8 : logique métier à cas limites). Groupe par
-/// `canonical_ref` (BTreeMap → ordre déterministe), désigne le groupe de clé
-/// **minimale** comme gardé (réutilise la ligne canonique). Le contenu de chaque
-/// groupe — gardé inclus — étant re-fetché à l'exécution, ce choix n'influe que sur
-/// quelle ligne `decisions` est réutilisée, jamais sur la correction du contenu.
+/// Fonction pure. Groupe par `canonical_ref` (BTreeMap → ordre déterministe),
+/// désigne le groupe de clé minimale comme gardé (réutilise la ligne canonique).
+/// Le contenu de chaque groupe — gardé inclus — étant re-fetché à l'exécution, ce
+/// choix n'influe que sur quelle ligne `decisions` est réutilisée.
 ///
 /// - 0 ou 1 provenance → `AlreadySplit` (rien à faire / déjà scindé).
 /// - une provenance sans clé (`None`) → `Ambiguous` (jamais scindée).
@@ -133,7 +131,7 @@ pub(crate) fn plan_resplit(provenances: &[Provenance]) -> ResplitPlan {
     ResplitPlan::FalseMerge { keep, splits }
 }
 
-/// `canonical_ref` (ADR 0100) d'une provenance judilibre, recalculée depuis
+/// `canonical_ref` d'une provenance judilibre, recalculée depuis
 /// `(source_fields, source_uid)` avec full_text vide. `None` si non-routée ou si
 /// les briques fiables manquent.
 pub(super) fn provenance_canonical_ref(source_fields: &Value, source_uid: &str) -> Option<String> {
@@ -164,14 +162,14 @@ struct Stats {
     split_decisions_created: u64,
 }
 
-/// Réparation des faux merges judilibre (#29 / ADR 0100 §5).
+/// Réparation des faux merges judilibre.
 ///
-/// `dry_run` (défaut côté CLI) : émet le PLAN exact, **aucune écriture** (ni DB,
-/// ni réseau, ni GPU) — `client` est ignoré.
+/// `dry_run` (défaut côté CLI) : émet le PLAN exact, aucune écriture (ni DB, ni
+/// réseau, ni GPU) — `client` est ignoré.
 /// `execute = !dry_run` : crée les décisions scindées, re-fetch via `client` +
-/// ré-ingère leur contenu (re-chunk + re-embed ciblé vLLM local, jamais
-/// Cloudflare). SAVEPOINT par cluster, reprise idempotente. **À NE PAS lancer
-/// pendant l'ingest JADE** (écritures concurrentes + contention GPU vLLM).
+/// ré-ingère leur contenu (re-chunk + re-embed ciblé vLLM local). SAVEPOINT par
+/// cluster, reprise idempotente. À NE PAS lancer pendant l'ingest JADE (écritures
+/// concurrentes + contention GPU vLLM).
 pub async fn resplit_false_merges(
     client: Option<&JudilibreClient>,
     dry_run: bool,
@@ -188,9 +186,8 @@ pub async fn resplit_false_merges(
     let repo = DecisionRepository::new(&conn);
 
     // Embedder seulement en mode execute (le dry-run ne touche ni réseau ni GPU).
-    // Re-embed ciblé via `build_vllm_strict` : vLLM local uniquement, **jamais**
-    // Cloudflare (coût ; ADR 0100 §5) — erreur franche si vLLM injoignable, pas de
-    // repli payant (règle projet, #12).
+    // Re-embed ciblé via `build_vllm_strict` : vLLM local uniquement, erreur franche
+    // si vLLM est injoignable.
     let embedder = if dry_run {
         None
     } else {
@@ -232,8 +229,8 @@ pub async fn resplit_false_merges(
                 ResplitPlan::FalseMerge { keep, splits } => {
                     stats.repairable_clusters += 1;
                     stats.decisions_to_reconstruct += splits.len() as u64;
-                    // Tous les groupes sont re-fetchés (gardé inclus) → l'élection
-                    // n'écrase jamais : chaque décision récupère son propre contenu.
+                    // Tous les groupes sont re-fetchés (gardé inclus) : chaque décision
+                    // récupère son propre contenu.
                     stats.source_uids_to_refetch += keep.source_uids.len() as u64
                         + splits
                             .iter()
@@ -266,7 +263,7 @@ pub async fn resplit_false_merges(
                             &mut stats,
                         )
                         .await?;
-                        // Rollout prudent : stop après N clusters réparés (write).
+                        // Stop après N clusters réparés (write).
                         if limit.is_some_and(|l| stats.repairable_clusters as usize >= l) {
                             tracing::info!(
                                 limit = ?limit,
@@ -294,7 +291,7 @@ pub async fn resplit_false_merges(
     } else {
         "EXECUTE (write)"
     };
-    println!("\n=== resplit-false-merges [{mode}] (#29 / ADR 0100 §5) ===");
+    println!("\n=== resplit-false-merges [{mode}] ===");
     println!(
         "clusters multi-provenances vus           : {}",
         stats.clusters_seen
@@ -337,15 +334,14 @@ pub async fn resplit_false_merges(
     Ok(())
 }
 
-/// Exécute le scinde d'un cluster (write) **dans sa propre transaction** : crée
+/// Exécute le scinde d'un cluster (write) dans sa propre transaction : crée
 /// chaque décision divergente, re-pointe ses provenances, re-fetch + ré-ingère son
-/// contenu (re-chunk + re-embed ciblé), **puis re-fetch le groupe gardé en place**
-/// sur la ligne canonique (l'élection devient sans effet sur la correction). Tout
-/// le cluster commit ou rollback en bloc — un échec re-fetch d'un groupe (décision
-/// disparue côté Judilibre) ne casse PAS le cluster : groupe scindé laissé vide /
-/// gardé laissé tel quel (compté en `refetch_failed`). Le compteur
-/// `split_decisions_created` est validé **après** le COMMIT (jamais avant un
-/// rollback potentiel).
+/// contenu (re-chunk + re-embed ciblé), puis re-fetch le groupe gardé en place sur
+/// la ligne canonique. Tout le cluster commit ou rollback en bloc — un échec
+/// re-fetch d'un groupe (décision disparue côté Judilibre) ne casse PAS le
+/// cluster : groupe scindé laissé vide, gardé laissé tel quel (compté en
+/// `refetch_failed`). Le compteur `split_decisions_created` est validé après le
+/// COMMIT.
 async fn execute_resplit(
     conn: &Connection,
     canonical_id: i64,
@@ -374,8 +370,7 @@ async fn execute_resplit(
 
             // Décision squelette : identité (canonical_ref) + jurisdiction_type du
             // groupe posés ici ; le contenu (full_text/chunks/embeddings) et l'ECLI
-            // sont écrits par le re-fetch (write_canonical_content, autorité
-            // triviale de la nouvelle décision).
+            // sont écrits par le re-fetch (`write_canonical_content`).
             let jur_type = group.jurisdiction_type.as_deref().unwrap_or("tj");
             let public_id = generate_public_id();
             let new_id = repo
@@ -389,9 +384,9 @@ async fn execute_resplit(
                 .await?;
             created += 1;
 
-            // Re-fetch + ré-ingest ciblé : le source_uid pointe désormais new_id →
-            // le contenu y atterrit (drain_batch mode All). Échec (décision
-            // disparue côté Judilibre) → groupe conservé vide, pas de rollback.
+            // Re-fetch + ré-ingest ciblé : le source_uid pointe désormais new_id, le
+            // contenu y atterrit (drain_batch mode All). Échec (décision disparue côté
+            // Judilibre) → groupe conservé vide, pas de rollback.
             match refetch_into(conn, client, embedder, &object_ids).await {
                 Ok(()) => {}
                 Err(e) => {
@@ -401,13 +396,11 @@ async fn execute_resplit(
             }
         }
 
-        // Groupe gardé : ses source_uids pointent déjà vers `canonical_id` → le
-        // re-fetch ré-ingère son contenu **en place** (full_text/chunks/embeddings
-        // + identité réécrits par l'update). On ne suppose donc PAS que le canonique
-        // sert déjà ce contenu — on le récupère depuis la source, ce qui neutralise
-        // toute mauvaise élection. Échec (décision disparue côté Judilibre) →
-        // contenu existant conservé, compté `refetch_failed` (audit manuel : le
-        // cluster devient mono-identité et ne sera pas re-tenté).
+        // Groupe gardé : ses source_uids pointent déjà vers `canonical_id`, le
+        // re-fetch ré-ingère son contenu en place (full_text/chunks/embeddings +
+        // identité réécrits par l'update). Échec (décision disparue côté Judilibre) →
+        // contenu existant conservé, compté `refetch_failed` ; le cluster devient
+        // mono-identité et ne sera pas re-tenté.
         let keep_object_ids: Vec<String> = keep
             .source_uids
             .iter()
@@ -453,8 +446,6 @@ mod tests {
 
     #[test]
     fn two_groups_keep_is_min_key() {
-        // Groupe gardé = clé minimale (déterministe) : tj75011 garde, tj80021 scinde.
-        // L'élection n'écrase rien : les deux groupes sont re-fetchés à l'exécution.
         let plan = plan_resplit(&[
             p("judilibre/a", Some("tj|tj80021|26/00051|2026-01-20")),
             p("judilibre/b", Some("tj|tj75011|26/00051|2026-01-20")),
@@ -478,8 +469,6 @@ mod tests {
 
     #[test]
     fn three_provenances_two_groups() {
-        // 2 provenances partagent une clé, 1 diverge → 1 seul split. Clé minimale
-        // (tj75011) gardée, l'autre (tj80021, 2 provenances) scindée.
         let plan = plan_resplit(&[
             p("judilibre/a", Some("tj|tj80021|26/00051|2026-01-20")),
             p("judilibre/b", Some("tj|tj80021|26/00051|2026-01-20")),
@@ -499,7 +488,6 @@ mod tests {
 
     #[test]
     fn three_distinct_groups() {
-        // 3 clés distinctes → garde la minimale (nancy), scinde 2 (ordre déterministe).
         let plan = plan_resplit(&[
             p("judilibre/a", Some("ca|ca paris|21 00002|2021-03-01")),
             p("judilibre/b", Some("ca|ca nancy|21 00002|2021-03-01")),
@@ -511,14 +499,12 @@ mod tests {
         assert_eq!(keep.canonical_ref, "ca|ca nancy|21 00002|2021-03-01");
         assert_eq!(keep.source_uids, vec!["judilibre/b".to_string()]);
         assert_eq!(splits.len(), 2);
-        // Tri par canonical_ref : paris avant riom.
         assert_eq!(splits[0].canonical_ref, "ca|ca paris|21 00002|2021-03-01");
         assert_eq!(splits[1].canonical_ref, "ca|ca riom|21 00002|2021-03-01");
     }
 
     #[test]
     fn ambiguous_none_never_split() {
-        // Spécificité 100 % : une provenance sans clé → jamais scindée.
         assert_eq!(
             plan_resplit(&[
                 p("judilibre/a", Some("tj|tj80021|26/00051|2026-01-20")),
@@ -534,7 +520,6 @@ mod tests {
 
     #[test]
     fn all_same_key_is_legit() {
-        // Cass abrégé + intégrale : même clé → fusion légitime, pas de scinde.
         assert_eq!(
             plan_resplit(&[
                 p("judilibre/a", Some("cc|611|2020-01-15")),
@@ -546,8 +531,6 @@ mod tests {
 
     #[test]
     fn already_split_is_idempotent() {
-        // Cluster déjà réparé (≤1 provenance restante) → SKIP : un re-run ne
-        // re-scinde pas (réversibilité / idempotence, ADR 0100 §5).
         assert_eq!(
             plan_resplit(&[p("judilibre/a", Some("tj|tj80021|26/00051|2026-01-20"))]),
             ResplitPlan::AlreadySplit

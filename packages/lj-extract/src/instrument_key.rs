@@ -1,15 +1,16 @@
-//! Clé d'identité canonique d'un instrument normatif, **indépendante du diffuseur**
-//! (ADR 0115). Filet de la cascade d'identité `ELI → NOR → instrument_key` : quand un
-//! acte n'a ni ELI ni NOR (vieux fonds, sources hors DILA), on le ré-identifie par
-//! `nature | date | numéro` — la forme par laquelle il est *cité* (« loi n° 65-557 du
-//! 10 juillet 1965 »). Deux manifestations diffuseur d'un même acte (LEGITEXT/JORFTEXT)
-//! produisent la **même** clé → collapse en une identité.
+//! Clé d'identité canonique d'un instrument normatif, **indépendante du
+//! diffuseur**. Filet de la cascade d'identité `ELI → NOR → instrument_key` :
+//! quand un acte n'a ni ELI ni NOR (vieux fonds, sources hors DILA), on le
+//! ré-identifie par `nature | date | numéro` — la forme par laquelle il est
+//! *cité* (« loi n° 65-557 du 10 juillet 1965 »). Deux manifestations diffuseur
+//! d'un même acte (LEGITEXT/JORFTEXT) produisent la **même** clé → collapse en
+//! une identité.
 //!
-//! Pur (#1) : aucune I/O. Le numéro est fourni par l'appelant (lu dans `<NUM>` ou parsé
-//! du titre à la frontière de parsing). La clé n'est émise que pour un acte **numéroté**
-//! et **daté** : `nature|date` seul collisionne (mille arrêtés le même jour) — pour ces
-//! actes non numérotés (longue traîne JO), l'identité reste l'uid-diffuseur (pas de
-//! collapse à faire, ADR 0115 §5 : ce résidu est purgé, pas dédupliqué).
+//! Pur : aucune I/O. Le numéro est fourni par l'appelant (lu dans `<NUM>` ou
+//! parsé du titre à la frontière de parsing). La clé n'est émise que pour un acte
+//! **numéroté** et **daté** : `nature|date` seul collisionne (mille arrêtés le
+//! même jour) — pour ces actes non numérotés (longue traîne JO), l'identité reste
+//! l'uid-diffuseur.
 
 use crate::extract::common::fold;
 

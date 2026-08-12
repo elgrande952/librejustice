@@ -1,28 +1,26 @@
-//! Page de recherche de décisions `/decisions` (gabarit de référence) :
+//! Page de recherche de décisions `/decisions` (gabarit du secteur) :
 //! CompactSearch + barre de filtres horizontale + résultats. La recherche de
 //! textes vit sur sa propre page `/textes` (moteurs et filtres distincts,
 //! aucune recherche transverse). État dans les query params ; données via
 //! `leptos-fetch` (SWR) ; DTO `lj-dtos`.
 //!
-//! Anatomie alignée sur la page décision : même conteneur `max-w-[92rem]` et
-//! même colonne gauche (240px, gouttière 48) que le sommaire d'une décision —
-//! elle porte le rail de synthèse (`SearchRail`). La colonne de contenu
-//! (barre, filtres, liste) prend le reste et se borne à `max-w-3xl`. Une
-//! colonne DROITE (240px) porte le pont croisé « Dans les textes » et l'aide à
-//! la recherche — c'est le premier bloc sacrifié : elle n'apparaît qu'à partir
-//! de 88rem (240 + 48 + 768 + 48 + 240 + padding), largeur où tout tient à
-//! pleine mesure — jamais de compression du contenu pour la loger.
+//! Anatomie alignée sur la page décision (`DecisionLayout`) : même conteneur
+//! `max-w-[92rem]` et même grille `240px | minmax(0,1fr) | 280px` dès `lg` —
+//! colonne gauche = rail de facettes (`SearchRail`), colonne DROITE (280px) =
+//! volumétrie + aide à la recherche + pont croisé « Dans les textes ». La
+//! colonne de contenu (barre, filtres, liste) prend le reste et se borne à
+//! `max-w-3xl`.
 //!
-//! `<Title>` dynamique reflétant la requête `q` de l'URL (l'onglet lit la
-//! recherche en cours) ; hérite de la description racine.
+//! `<Title>` dynamique reflétant la requête `q` de l'URL ; hérite de la
+//! description racine.
 
 use leptos::prelude::*;
 use leptos_meta::Title;
-use leptos_router::components::A;
 use leptos_router::hooks::use_query_map;
 use lj_dtos::{QueryMode, SearchResponse};
 
 use crate::components::client_only::ClientOnly;
+use crate::components::layout::{CONTENT_COL, GRID_3COL, SHELL, SIDE_RAIL};
 use crate::components::search::compact_search::search_data::{
     cached_search, search_is_loading, search_resource, SeenSearchKeys,
 };
@@ -31,24 +29,29 @@ use crate::components::search::compact_search::search_state::{
 };
 use crate::components::search::compact_search::DraftQuery;
 use crate::components::search::{
-    ActiveFilterChips, CompactSearch, DecisionsFilterBar, Pagination, ResultEmpty, ResultError,
-    ResultList, ResultSkeleton, SearchRail, SortSelect, SyntaxHint, TextesTeaser,
+    corpus_stats, ActiveFilterChips, CompactSearch, DecisionsCorpusLine, DecisionsCorpusSummary,
+    DecisionsExamples, DecisionsFilterBar, JuridictionsRail, Pagination, ResultEmpty, ResultError,
+    ResultList, ResultSkeleton, SearchRail, SortSelect, SyntaxHint, TextesCorpusTeaser,
+    TextesTeaser,
 };
 use crate::helpers::{format_results_count, total_pages};
 
-/// `/decisions` est **rendue côté client** (ADR 0063) : route non indexée, et la
-/// plus coûteuse en SSR (~20 ms p50 / 48 ms p95 vs ~2 ms pour la landing, car elle
-/// rend CompactSearch + FilterRail + cartes + facettes côté serveur) **et** seule
+/// `/decisions` est **rendue côté client** : route non indexée, la plus coûteuse
+/// en SSR (elle rend CompactSearch + cartes + facettes côté serveur) et la seule
 /// porteuse des mismatches d'hydratation (toggle IA `localStorage`, date-picker,
-/// nav). `ClientOnly` rend un squelette statique au SSR + 1er rendu, puis monte le
-/// corps réactif après hydratation : ~0 rendu serveur du contenu lourd, classe de
-/// mismatch supprimée. Les routes SEO (décision, landing, légal, mcp-guide) restent
-/// SSR.
+/// nav). `ClientOnly` rend un squelette statique au SSR et au 1er rendu, puis
+/// monte le corps réactif après hydratation. Les routes SEO (décision, landing,
+/// légal, mcp-guide) restent SSR.
 #[component]
 pub fn SearchPage() -> impl IntoView {
     let query_map = use_query_map();
+    // `leptos_meta` réévalue cette clôture après le démontage de la route, quand
+    // `query_map` est déjà libéré : `try_get` au lieu de `get`.
     let title = move || {
-        let q = query_map.get().get("q").unwrap_or_default();
+        let q = query_map
+            .try_get()
+            .and_then(|params| params.get("q"))
+            .unwrap_or_default();
         let q = q.trim();
         if q.is_empty() {
             "Décisions - LibreJustice".to_string()
@@ -72,11 +75,11 @@ pub fn SearchPage() -> impl IntoView {
 #[component]
 fn SearchPageSkeleton() -> impl IntoView {
     view! {
-        <div class="mx-auto w-full max-w-[92rem] px-4 py-8 sm:px-6 lg:px-8">
+        <div class=SHELL>
             <h1 class="sr-only">"Recherche"</h1>
-            <div class="grid grid-cols-1 gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12">
+            <div class=GRID_3COL>
                 <div class="hidden lg:block"></div>
-                <div class="flex w-full min-w-0 max-w-3xl flex-col gap-6">
+                <div class=CONTENT_COL>
                     <div class="h-12 w-full animate-pulse rounded-lg bg-[var(--color-rule)]/40"></div>
                     <ResultSkeleton />
                 </div>
@@ -95,7 +98,7 @@ fn SearchPageBody() -> impl IntoView {
     )));
 
     view! {
-        <div class="mx-auto w-full max-w-[92rem] px-4 py-8 sm:px-6 lg:px-8">
+        <div class=SHELL>
             <h1 class="sr-only">"Recherche"</h1>
             <DecisionsView />
         </div>
@@ -104,8 +107,12 @@ fn SearchPageBody() -> impl IntoView {
 
 /// Corps décisions : rail de synthèse à gauche (colonne alignée sur le
 /// sommaire de la page décision), colonne contenu à droite — barre de
-/// recherche, filtres horizontaux, chips, tri et résultats (gabarit de référence).
-/// Sans requête, ni filtres ni résultats — juste l'invite.
+/// recherche, filtres horizontaux, chips, tri et résultats (gabarit du secteur).
+/// Sans requête, la page garde la même anatomie : les emplacements de
+/// volumétrie, de rail et de pont croisé sont remplis par du global corpus
+/// (`corpus_intro`), donc l'aide à la recherche reste à la même place ; seuls
+/// les filtres et la liste, qui n'existent que pour une requête, cèdent la
+/// place à l'invite.
 #[component]
 fn DecisionsView() -> impl IntoView {
     let query_map = use_query_map();
@@ -118,10 +125,9 @@ fn DecisionsView() -> impl IntoView {
     });
     let key = Signal::derive(move || key_from_map(&query_map.get()));
     let resource = search_resource(key);
-    // Facettes et volumétrie remontées de la réponse par `Effect` (jamais lire
-    // la `Resource` dans le rendu du rail/de la barre — mismatch hydratation +
-    // panic « already disposed » documentés). Mises à jour sur réponse Ok
-    // SEULEMENT : pendant un refetch, rail et barre gardent les valeurs
+    // Facettes et volumétrie remontées de la réponse par `Effect` : ne jamais lire
+    // la `Resource` dans le rendu du rail ou de la barre. Mises à jour sur réponse
+    // Ok SEULEMENT — pendant un refetch, rail et barre gardent les valeurs
     // précédentes, interactives.
     let facets = RwSignal::new(None::<lj_dtos::SearchFacets>);
     let volume = RwSignal::new(None::<(i64, QueryMode)>);
@@ -131,41 +137,47 @@ fn DecisionsView() -> impl IntoView {
             facets.set(resp.facets);
         }
     });
-    // Skeleton : clé en premier chargement (`is_loading` leptos-fetch) ET rien
-    // en cache pour elle — la lecture SYNCHRONE du cache évite les deux écueils :
-    // pas de flash au retour depuis `/decision` (cache présent → rendu direct),
-    // skeleton bien affiché quand une mutation de filtre retombe sur une clé
-    // vue mais évincée du cache (l'ancien garde « clé déjà vue » le masquait :
-    // la zone semblait morte pendant la recherche).
+    // Skeleton : clé en premier chargement (`is_loading` leptos-fetch) ET rien en
+    // cache pour elle. La lecture SYNCHRONE du cache donne les deux comportements :
+    // pas de flash au retour depuis `/decision` (cache présent → rendu direct), et
+    // skeleton bien affiché quand une mutation de filtre retombe sur une clé vue
+    // mais évincée du cache.
     let is_loading = search_is_loading(key);
     let show_skeleton =
         Signal::derive(move || is_loading.get() && cached_search(&key.get()).is_none());
+    let has_query = Signal::derive(move || !query.get().is_empty());
+    let stats = corpus_stats();
 
     view! {
-        <div class="grid grid-cols-1 gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12 min-[88rem]:grid-cols-[240px_minmax(0,1fr)_240px]">
-            <aside
-                aria-label="Synthèse des résultats"
-                class="hidden min-w-0 lg:sticky lg:top-20 lg:block lg:max-h-[calc(100dvh-6rem)] lg:self-start lg:overflow-y-auto"
-            >
-                <SearchRail query=query volume=volume facets=facets loading=show_skeleton />
+        <div class=GRID_3COL>
+            <aside aria-label="Synthèse des résultats" class=SIDE_RAIL>
+                <Show when=move || has_query.get() fallback=move || view! { <JuridictionsRail /> }>
+                    <SearchRail facets=facets />
+                </Show>
             </aside>
-            <div class="flex w-full min-w-0 max-w-3xl flex-col gap-6">
+            <div class=CONTENT_COL>
                 <div class="flex flex-col gap-3">
                     <CompactSearch />
-                    // Sous la barre, sauf quand la colonne droite — qui porte
-                    // alors l'aide — est affichée (requête non vide, ≥ 88rem).
-                    <div
-                        class="flex self-start"
-                        class=("min-[88rem]:hidden", move || !query.get().is_empty())
-                    >
-                        <SyntaxHint />
+                    // Ligne compacte mobile, rendue dans les DEUX états juste sous la
+                    // barre : volumétrie des résultats ou volumétrie du corpus, et
+                    // l'aide calée à droite — elle ne se déplace donc pas entre l'avant
+                    // et l'après recherche. Sur desktop la volumétrie vit dans la
+                    // colonne droite (`lg:hidden` ici).
+                    <div class="flex items-baseline gap-3 lg:hidden">
+                        <Show
+                            when=move || has_query.get()
+                            fallback=move || view! { <DecisionsCorpusLine stats=stats /> }
+                        >
+                            <MobileSummary volume=volume loading=show_skeleton />
+                        </Show>
+                        <SyntaxHint class="ml-auto shrink-0" />
                     </div>
                 </div>
-                <Show when=move || !query.get().is_empty() fallback=move || view! { <PromptEmpty /> }>
+                <Show when=move || has_query.get() fallback=move || view! { <PromptEmpty /> }>
                     <div class="flex min-w-0 flex-col gap-4">
-                        // Tri sur la ligne des filtres, calé à droite (gabarit
-                        //  `… · Plus de filtres + Trier par ▾`) ; la barre
-                        // wrappe dans sa colonne, le tri reste en haut à droite.
+                        // Tri sur la ligne des filtres, calé à droite (gabarit secteur
+                        // `… · Plus de filtres + Trier par ▾`) ; la barre wrappe dans sa
+                        // colonne, le tri reste en haut à droite.
                         <div class="flex items-start justify-between gap-4">
                             <div class="min-w-0 flex-1">
                                 <DecisionsFilterBar facets=facets />
@@ -173,44 +185,55 @@ fn DecisionsView() -> impl IntoView {
                             <SortSelect />
                         </div>
                         <ActiveFilterChips facets=facets />
-                        <MobileSummary volume=volume loading=show_skeleton />
                         <SearchResults query=query resource=resource key=key show_skeleton=show_skeleton />
                     </div>
                 </Show>
             </div>
-            // Colonne droite : pont croisé vers le moteur textes + aide à la
-            // recherche. Sous 88rem elle disparaît (le contenu garde sa pleine
-            // mesure) ; l'aide retombe alors sous la barre.
-            <aside
-                aria-label="Voir aussi"
-                class="hidden min-w-0 min-[88rem]:sticky min-[88rem]:top-20 min-[88rem]:block min-[88rem]:max-h-[calc(100dvh-6rem)] min-[88rem]:self-start min-[88rem]:overflow-y-auto"
-            >
-                <Show when=move || !query.get().is_empty()>
-                    <div class="flex flex-col gap-4">
-                        <div class="border-t border-[var(--color-rule)] pt-4">
-                            <SyntaxHint />
-                        </div>
-                        // Pont croisé : la même requête posée au moteur textes —
-                        // un utilisateur qui cherche une norme ici est rattrapé.
-                        <TextesTeaser query=query />
+            // Colonne droite : volumétrie, aide à la recherche, puis pont croisé
+            // vers le moteur textes (la même requête posée à l'autre moteur). Les
+            // trois emplacements sont remplis requête vide par leur pendant corpus,
+            // dans le même gabarit : la page vide garde l'anatomie de la page de
+            // résultats. Sous lg la colonne disparaît.
+            <aside aria-label="Voir aussi" class=SIDE_RAIL>
+                <div class="flex flex-col gap-4">
+                    <Show
+                        when=move || has_query.get()
+                        fallback=move || view! { <DecisionsCorpusSummary stats=stats /> }
+                    >
+                        <SearchSummary query=query volume=volume loading=show_skeleton />
+                    </Show>
+                    <div class="flex self-start">
+                        <SyntaxHint />
                     </div>
-                </Show>
+                    <Show
+                        when=move || has_query.get()
+                        fallback=move || view! { <TextesCorpusTeaser stats=stats /> }
+                    >
+                        <TextesTeaser query=query />
+                    </Show>
+                </div>
             </aside>
         </div>
     }
 }
 
-/// Volumétrie compacte de la rangée tri, mobile uniquement (sur desktop elle
-/// vit dans le rail).
+/// Volumétrie desktop, en tête de la colonne droite : « N résultats / pour
+/// « q » / Recherche <mode> », ou l'état d'attente pendant un chargement à
+/// cache froid.
 #[component]
-fn MobileSummary(
+fn SearchSummary(
+    #[prop(into)] query: Signal<String>,
     #[prop(into)] volume: Signal<Option<(i64, QueryMode)>>,
     #[prop(into)] loading: Signal<bool>,
 ) -> impl IntoView {
     move || {
         if loading.get() {
             return view! {
-                <p class="text-sm text-[var(--color-ink-subtle)] lg:hidden">"Recherche en cours…"</p>
+                <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">
+                    "Recherche en cours pour "
+                    <em class="not-italic">"«\u{00A0}"{move || query.get()}"\u{00A0}»"</em>
+                    "…"
+                </h2>
             }
             .into_any();
         }
@@ -222,7 +245,46 @@ fn MobileSummary(
             QueryMode::Hybrid => "sémantique",
         };
         view! {
-            <p class="text-sm text-[var(--color-ink-subtle)] lg:hidden">
+            <div class="flex flex-col gap-1">
+                <h2 class="font-sans text-xl text-[var(--color-ink)]">
+                    {format_results_count(total)}
+                </h2>
+                <p class="text-sm leading-snug text-[var(--color-ink-subtle)]">
+                    "pour "
+                    <em class="text-[var(--color-ink)]">"«\u{00A0}"{move || query.get()}"\u{00A0}»"</em>
+                </p>
+                <p class="text-xs text-[var(--color-ink-subtle)]">
+                    {format!("Recherche {mode_label}")}
+                </p>
+            </div>
+        }
+        .into_any()
+    }
+}
+
+/// Volumétrie compacte, rendue dans la ligne mobile qui porte aussi l'aide à la
+/// recherche (sur desktop la volumétrie vit dans la colonne droite).
+#[component]
+fn MobileSummary(
+    #[prop(into)] volume: Signal<Option<(i64, QueryMode)>>,
+    #[prop(into)] loading: Signal<bool>,
+) -> impl IntoView {
+    move || {
+        if loading.get() {
+            return view! {
+                <p class="text-sm text-[var(--color-ink-subtle)]">"Recherche en cours…"</p>
+            }
+            .into_any();
+        }
+        let Some((total, mode)) = volume.get() else {
+            return ().into_any();
+        };
+        let mode_label = match mode {
+            QueryMode::Lexical => "lexicale",
+            QueryMode::Hybrid => "sémantique",
+        };
+        view! {
+            <p class="text-sm text-[var(--color-ink-subtle)]">
                 <span class="font-medium text-[var(--color-ink)]">{format_results_count(total)}</span>
                 {format!(" · Recherche {mode_label}")}
             </p>
@@ -242,15 +304,11 @@ fn SearchResults(
     #[prop(into)] key: Signal<crate::components::search::compact_search::search_state::SearchKey>,
     #[prop(into)] show_skeleton: Signal<bool>,
 ) -> impl IntoView {
-    // Anime la liste à chaque NOUVELLE recherche (clé jamais vue cette session) ;
-    // pas de rejeu au retour vers une recherche déjà en cache (rendu instantané →
-    // rejouer l'effet mimerait un reload). Port de la logique `animate` du loader
-    // Node : `true` sur cache-miss, `false` quand `getQueryData(key)` existe déjà.
-    // Une nouvelle recherche = changement de requête, filtre, tri, page OU mode IA
-    // → ses cartes rejouent l'animation « rise » (dont l'activation du mode IA).
-    // Set de clés vues PARTAGÉ via contexte (fourni par `App`) : il survit au
-    // remontage de `SearchPage` au retour depuis `/decision`, donc une recherche
-    // déjà vue ne rejoue pas l'animation. Fallback local hors provider.
+    // Anime la liste à chaque NOUVELLE recherche — clé jamais vue cette session,
+    // c'est-à-dire changement de requête, filtre, tri, page ou mode IA. Set de clés
+    // vues PARTAGÉ via contexte (fourni par `App`) : il survit au remontage de
+    // `SearchPage` au retour depuis `/decision`, donc une recherche déjà vue ne
+    // rejoue pas l'animation. Fallback local hors provider.
     let seen_keys = use_context::<SeenSearchKeys>()
         .map(|s| s.0)
         .unwrap_or_else(|| StoredValue::new(std::collections::HashSet::<SearchKey>::new()));
@@ -262,11 +320,9 @@ fn SearchResults(
                 fallback=move || {
                     // Au retour depuis une décision la donnée est déjà en cache : on la
                     // lit de façon SYNCHRONE et on rend la liste dans la frame de
-                    // montage. Le poll asynchrone du <Suspense> insérait sinon une frame
-                    // où la zone résultats est vide (shell peint en haut de page) avant
-                    // l'apparition de la liste — le « flash » résiduel. Cache froid
-                    // (premier chargement) → <Transition> + Suspend (streaming SSR ;
-                    // le skeleton est piloté en amont par le <Show> `show_skeleton`).
+                    // montage. Cache froid (premier chargement) → <Transition> + Suspend
+                    // (streaming SSR ; le skeleton est piloté en amont par le <Show>
+                    // `show_skeleton`).
                     move || {
                         let current_key = key.get();
                         match cached_search(&current_key) {
@@ -367,8 +423,6 @@ fn ResultsBody(
             //      mais AVANT le paint (checkpoint micro-tâches < étape de rendu),
             //      donc la frame de montage peint déjà à la bonne position ;
             //   3. rAF — filet de sécurité si la liste se monte une frame plus tard.
-            // Sans ce relais, scroll_to clampait (page courte → peinte en haut puis
-            // saut), l'ancien défaut.
             scroll();
             leptos::task::spawn_local(async move { scroll() });
             request_animation_frame(scroll);
@@ -379,7 +433,13 @@ fn ResultsBody(
     let hits = result.hits;
     let all_hit_ids = result.all_hit_ids;
     let page = key.get_untracked().page;
-    let ai_mode = key.get_untracked().ai_mode;
+    // Vue par défaut des cartes = le mode de recherche RÉSOLU par le serveur, pas
+    // le toggle IA : une recherche booléenne/lexicale s'ouvre sur l'extrait
+    // surligné (c'est le passage qui matche les opérateurs saisis), une recherche
+    // sémantique sur le résumé. Le toggle, lui, ne gouverne que le reclassement
+    // LLM — no-op en lexical — et n'est jamais décoché à la place de
+    // l'utilisateur.
+    let open_on_summary = result.query_mode == QueryMode::Hybrid;
 
     view! {
         <div class="flex min-w-0 flex-col gap-6">
@@ -389,16 +449,14 @@ fn ResultsBody(
                 page=page
                 total=total
                 page_size=SEARCH_LIMIT
-                auto_load_summary=ai_mode
+                auto_load_summary=open_on_summary
                 animate=animate
             />
             // `current_page`/`total_pages` STATIQUES (pas d'abonnement réactif) :
             // `ResultsBody` est reconstruit en entier à chaque nouvelle recherche, donc
-            // la page courante est fixe pour une instance. Surtout, dériver de `key`
-            // (signal de page) ferait ré-évaluer la pagination depuis un scope que le
-            // `<Suspense>` dispose au changement de clé → panic « reactive value already
-            // disposed » → runtime WASM mort (freeze). `page`/`pages` sont déjà calculés
-            // ci-dessus.
+            // la page courante est fixe pour une instance. Dériver de `key` (signal de
+            // page) ferait ré-évaluer la pagination depuis un scope que le `<Suspense>`
+            // dispose au changement de clé → panic « reactive value already disposed ».
             <Pagination
                 current_page=Signal::derive(move || page)
                 total_pages=Signal::derive(move || pages)
@@ -408,31 +466,22 @@ fn ResultsBody(
     .into_any()
 }
 
-/// Plafond de pages affichées (parité `totalPages(total, 10, 40)` côté React :
-/// `RESULTS_CAP=400` borne déjà à 40 pages, le cap URL `MAX_PAGES=10` borne la
-/// navigation — on garde 40 ici pour la parité du calcul `total_pages`).
+/// Plafond de pages affichées : `RESULTS_CAP=400` borne déjà à 40 pages, le cap
+/// URL `MAX_PAGES=10` borne la navigation.
 const MAX_PAGES_DISPLAY: i64 = 40;
 
 /// Invite initiale (requête vide).
 #[component]
 fn PromptEmpty() -> impl IntoView {
     view! {
-        <div class="flex flex-col items-start gap-3 border-t border-[var(--color-rule)] py-16">
-            <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
-                "Recherche"
-            </p>
+        <div class="flex flex-col items-start gap-3">
             <h2 class="font-sans text-2xl text-[var(--color-ink)]">
                 "Saisissez une requête pour commencer."
             </h2>
             <p class="max-w-prose text-[var(--color-ink-muted)]">
                 "La recherche fonctionne en langage naturel ou avec des opérateurs booléens. La detection du mode est automatique."
             </p>
-            <A
-                href="/juridictions"
-                attr:class="text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
-            >
-                "Parcourir le catalogue des décisions"
-            </A>
+            <DecisionsExamples />
         </div>
     }
 }

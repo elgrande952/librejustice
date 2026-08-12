@@ -1,11 +1,9 @@
-//! Signaux structurés d'une clé de citation (ADR 0144, `citation_key`).
-//! Regexes sur la CHAÎNE DE CLÉ (jamais le texte) — linking ADR 0116.
+//! Signaux structurés d'une clé de citation (`citation_key`). Regexes sur la
+//! CHAÎNE DE CLÉ, jamais le texte.
 //!
-//! `key_signals(text_key)` est une **fonction pure de la chaîne de clé seule**
-//! — jamais du contexte de capture : c'est le contexte (raw_text première
-//! frappe) qui a produit la pourriture first-writer-wins de l'ancien
-//! vocabulaire. Les règles du résolveur (DatedAct, EuNum, ForeignCode…)
-//! matchent sur CES signaux, plus jamais par regex sur de la prose.
+//! `key_signals(text_key)` est une **fonction pure de la chaîne de clé seule**,
+//! jamais du contexte de capture. Les règles du résolveur (DatedAct, EuNum,
+//! ForeignCode…) matchent sur CES signaux, plus jamais par regex sur de la prose.
 //!
 //! Versionné par [`SIGNAL_VERSION`] : une évolution du parse se rejoue par
 //! `reparse-key-signals` sur les clés à version inférieure.
@@ -42,8 +40,8 @@ pub enum KeyNature {
     Ccn = 12,
 }
 
-/// Gate de citabilité (ADR 0137), discriminants stables = valeurs de la
-/// colonne `citation_key.citability` (int2). ≠ 0 ⇒ le résolveur saute la clé.
+/// Gate de citabilité, discriminants stables = valeurs de la colonne
+/// `citation_key.citability` (int2). ≠ 0 ⇒ le résolveur saute la clé.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i16)]
 pub enum Citability {
@@ -181,10 +179,9 @@ fn classify_citability(text_key: &str, folded: &str, nature: KeyNature) -> Citab
         return Citability::PrivateStatut;
     }
     // « Règlement » sans marqueur UE ni citabilité tranchée = règlement d'une
-    // instance locale/privée non catalogable (procédure, jeu, service…) —
-    // SAUF la forme légistique datée à queue de titre (« règlement du
-    // 17 décembre 2013 établissant les règles… ») : c'est le droit dérivé UE
-    // cité par date sans numéro, jamais le style d'un règlement privé/local.
+    // instance locale ou privée non catalogable — SAUF la forme légistique datée à
+    // queue de titre (« règlement du 17 décembre 2013 établissant les règles… ») :
+    // c'est le droit dérivé UE cité par date sans numéro.
     if nature == KeyNature::Autre
         && folded.starts_with("reglement")
         && !re_eu_dated_title().is_match(folded)
@@ -495,8 +492,6 @@ fn re_private_statut() -> &'static Regex {
 mod tests {
     use super::*;
 
-    // Alignement 1:1 stems ↔ map ISO : chaque stem a exactement une entrée
-    // (une clé étrangère non mappée serait un trou silencieux de ForeignCode).
     #[test]
     fn gentile_iso_map_covers_every_stem() {
         for stem in FOREIGN_NATIONALITY_STEMS {
@@ -516,12 +511,10 @@ mod tests {
         assert_eq!(s.jurisdiction, Some("CH"));
         assert_eq!(s.citability, Citability::Citable);
 
-        // Ambiguïté d'État : gentilé reconnu, pays indécidable → None.
         let s = key_signals("Code de la famille congolais");
         assert_eq!(s.nature, KeyNature::CodeEtranger);
         assert_eq!(s.jurisdiction, None);
 
-        // Code FR : jamais de juridiction.
         let s = key_signals("Code de procédure civile");
         assert_eq!(s.nature, KeyNature::Code);
         assert_eq!(s.jurisdiction, None);
@@ -534,12 +527,10 @@ mod tests {
         assert_eq!(s.act_num.as_deref(), Some("91-647"));
         assert_eq!(s.act_date, Date::new(1991, 7, 10).ok());
 
-        // « 1er » : jour ordinal.
         let s = key_signals("Décret du 1er juillet 2009");
         assert_eq!(s.nature, KeyNature::Decret);
         assert_eq!(s.act_date, Date::new(2009, 7, 1).ok());
 
-        // La date de tête (l'avenant) gagne sur la date du texte hôte.
         let s = key_signals("Avenant du 25 août 2016 à la convention du 14 janvier 1971");
         assert_eq!(s.act_date, Date::new(2016, 8, 25).ok());
     }
@@ -554,7 +545,6 @@ mod tests {
         assert_eq!(s.nature, KeyNature::DirectiveUe);
         assert_eq!(s.act_num.as_deref(), Some("2008/115"));
 
-        // « Règlement » non-UE : ni nature UE, ni citable.
         let s = key_signals("Règlement de copropriété");
         assert_eq!(s.nature, KeyNature::Autre);
         assert_eq!(s.citability, Citability::PrivateStatut);
@@ -580,7 +570,6 @@ mod tests {
             key_signals("Règlement intérieur de l'entreprise").citability,
             Citability::PrivateStatut
         );
-        // Fragment : famille nue (même critère que le drop du recognizer).
         assert_eq!(key_signals("Livre VIII").citability, Citability::Fragment);
     }
 }

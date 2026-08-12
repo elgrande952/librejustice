@@ -1,8 +1,7 @@
-//! Présentateurs MCP dédiés — port fidèle de `mcp_presenters.py`.
+//! Présentateurs MCP dédiés.
 //!
 //! Transforme les DTO HTTP internes ([`lj_dtos`]) en sorties MCP plus concises
-//! et plus lisibles. Les sorties sont des structs `camelCase` (= `_CamelModel`
-//! côté Python, `alias_generator=to_camel`, `extra="forbid"`).
+//! et plus lisibles. Les sorties sont des structs `camelCase`.
 
 use lj_dtos::{
     ArticleSearchResponse, BookmarkItem, CitationSpan, DecisionDetail, DecisionViewItem,
@@ -15,9 +14,8 @@ use std::collections::BTreeMap;
 use crate::referential::Referential;
 use crate::titles::decision_title;
 
-/// `jurisdiction_type` (enum) → code brut, clé des lignes `jurisdiction_type:*` du
-/// référentiel et des titres. Les présentateurs Python recevaient déjà la
-/// chaîne brute ; ici on reconstruit le code depuis l'enum sérialisé.
+/// `jurisdiction_type` (enum) → code brut, clé des lignes `jurisdiction_type:*`
+/// du référentiel et des titres. Le code est reconstruit depuis l'enum sérialisé.
 fn jurisdiction_type_code(jt: lj_dtos::JurisdictionType) -> &'static str {
     use lj_dtos::JurisdictionType::*;
     match jt {
@@ -168,8 +166,8 @@ pub struct McpDecisionDetail {
     /// pas de recours : seuls les liens connus du corpus sont chaînés.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub case_chronology: Vec<McpChronologyStep>,
-    /// Commentaires institutionnels (ADR 0204), type DTO tel quel : `analyse`
-    /// (corps servi sur place), `conclusions` / `note` (liens sortants).
+    /// Commentaires institutionnels, type DTO tel quel : `analyse` (corps servi
+    /// sur place), `conclusions` / `note` (liens sortants).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub commentaires: Vec<lj_dtos::Commentaire>,
     pub text: String,
@@ -272,8 +270,8 @@ pub struct McpLawArticleVersion {
 
 /// Article de loi servi à une date (law-at-date) : identité citable + texte +
 /// `url` publique + timeline des versions. Slim comme [`McpDecisionDetail`] :
-/// on laisse tomber les internes du DTO web (`legiarti`/`legitext`, provenance
-/// de traduction, autorité de diffuseur, contexte de lecture…).
+/// les internes du DTO web (`legiarti`/`legitext`, provenance de traduction,
+/// autorité de diffuseur, contexte de lecture…) sont laissés de côté.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpLawArticle {
@@ -292,7 +290,7 @@ pub struct McpLawArticle {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nota: Option<String>,
     pub versions: Vec<McpLawArticleVersion>,
-    /// Commentaires de norme (ADR 0212), même forme que côté décision.
+    /// Commentaires de norme, même forme que côté décision.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub commentaires: Vec<lj_dtos::Commentaire>,
 }
@@ -314,9 +312,7 @@ pub struct McpLawSearchHit {
 /// Bloc facettes compact de la recherche d'articles, même contrat que
 /// [`McpSearchFacets`] : une map `token de filtre → nombre d'articles` par
 /// paramètre de `search_legal_texts`, chaque clé se repasse verbatim dans le
-/// filtre du même nom. Chaque axe est plafonné au top-10 (la traîne
-/// `jurisdiction` monte à 60+ pays à quelques hits — mesuré ~700 chars de
-/// bruit par réponse).
+/// filtre du même nom. Chaque axe est plafonné au top-10.
 #[derive(Debug, Clone, Serialize)]
 pub struct McpLawSearchFacets {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -353,8 +349,8 @@ pub fn present_search_response(response: &SearchResponse, web_base_url: &str) ->
                 _ => (None, Some(strip_marks(&hit.best_chunk.snippet))),
             };
             McpSearchHit {
-                // Le titre du hit web porte déjà le siège composé (ADR 0170) :
-                // on le reprend débarrassé du highlight.
+                // Le titre du hit web porte déjà le siège composé : on le reprend
+                // débarrassé du highlight.
                 title: strip_marks(&hit.title_html),
                 url: format!("{web_base_url}/decision/{}", hit.id),
                 ai_summary,
@@ -373,8 +369,8 @@ pub fn present_search_response(response: &SearchResponse, web_base_url: &str) ->
             }
         })
         .collect();
-    // Le bloc facettes n'apporte du raffinement que si le total déborde la
-    // page servie ; une requête déjà couverte par ses hits s'en passe.
+    // Le bloc facettes n'apporte du raffinement que si le total déborde la page
+    // servie.
     let facets = response
         .facets
         .as_ref()
@@ -455,8 +451,8 @@ fn present_search_facets(f: &SearchFacets) -> Option<McpSearchFacets> {
     (!empty).then_some(facets)
 }
 
-/// Libellé du type de juridiction depuis le référentiel `jurisdiction_type:*`
-/// (repli sur le code brut faute d'entrée — cache d'une heure vs seed frais).
+/// Libellé du type de juridiction depuis le référentiel `jurisdiction_type:*`,
+/// repli sur le code brut faute d'entrée.
 fn type_label(jt: lj_dtos::JurisdictionType, refs: &Referential) -> &str {
     let code = jurisdiction_type_code(jt);
     refs.jurisdiction_type_label(code).unwrap_or(code)
@@ -470,8 +466,8 @@ fn tag_key(tag: &Option<FacetTag>) -> Option<String> {
 }
 
 /// Présente le détail complet d'une décision (titre + url + texte concaténé).
-/// Les citations résolues du corps (`paragraph_spans`, ADR 0134 — celles que le
-/// front rend cliquables) sont rendues en liens markdown inline dans `text`.
+/// Les citations résolues du corps (`paragraph_spans`, celles que le front rend
+/// cliquables) sont rendues en liens markdown inline dans `text`.
 pub fn present_decision_detail(
     detail: &DecisionDetail,
     web_base_url: &str,
@@ -507,22 +503,17 @@ pub fn present_decision_detail(
         })
         .collect();
     let appellate_fate = appellate_fate(&case_chronology);
-    // Le sort connu ouvre ET clôt le texte : les consommateurs LLM lisent le
-    // corps et sautent les métadonnées — une session réelle a écrit « aucun
-    // recours connu » sur un jugement dont la réponse énonçait la
-    // confirmation en premier champ ; la même erreur a survécu à la bannière
-    // en première ligne (l'attention des modèles privilégie la fin d'un long
-    // output), d'où la répétition en dernière ligne.
+    // Le sort connu ouvre et clôt le texte : les consommateurs LLM lisent le
+    // corps et sautent les métadonnées, et l'attention des modèles privilégie la
+    // fin d'un long output.
     let text = match &appellate_fate {
         Some(fate) => format!(
             "[SORT DE CETTE DÉCISION SUR RECOURS : {fate}]\n\n{text}\n\n[RAPPEL — SORT DE CETTE DÉCISION SUR RECOURS : {fate}]"
         ),
         None => text,
     };
-    // Le sort marque aussi le titre : c'est le champ copié au moment de
-    // rédiger une citation — une session réelle a reçu la bannière aux deux
-    // extrémités du texte et a quand même cité le jugement infirmé comme
-    // soutien (« aucun recours connu »).
+    // Le sort marque aussi le titre : c'est le champ copié au moment de rédiger
+    // une citation.
     let title = {
         let base = decision_title(
             type_label(detail.jurisdiction_type, refs),
@@ -577,13 +568,12 @@ fn appellate_fate(chronology: &[McpChronologyStep]) -> Option<String> {
 /// Enveloppe chaque citation résolue d'un texte (paragraphe de décision,
 /// corps d'article) en lien markdown `[texte](url)`, sans réécrire le span.
 /// Cible unique = son `href`. Cibles multiples (plage « articles 3 à 6 »,
-/// « et suivants », fusion de chevauchements — le front rend un menu, ADR
-/// 0125) : la première résolue enveloppe le span, les suivantes sont
-/// appendues juste après en liens labellisés « (+ [label](url), …) » —
-/// chaque article de la plage reste ouvrable. Les spans sans aucune cible
-/// résolue restent en clair. Offsets en codepoints locaux au paragraphe,
-/// spans fusionnés non chevauchants et ordonnés (invariant du producteur,
-/// ADR 0134).
+/// « et suivants », fusion de chevauchements — le front rend un menu) : la
+/// première résolue enveloppe le span, les suivantes sont appendues juste après
+/// en liens labellisés « (+ [label](url), …) » — chaque article de la plage
+/// reste ouvrable. Les spans sans aucune cible résolue restent en clair. Offsets
+/// en codepoints locaux au paragraphe, spans fusionnés non chevauchants et
+/// ordonnés (invariant du producteur).
 fn paragraph_with_links(text: &str, spans: &[CitationSpan], web_base_url: &str) -> String {
     if spans.is_empty() {
         return text.to_string();
@@ -628,7 +618,6 @@ pub fn present_saved_searches(entries: &[SearchHistoryEntry]) -> McpSavedSearche
             .iter()
             .map(|entry| McpSavedSearch {
                 query: entry.query.clone(),
-                // `entry.filters or None` : un objet vide / null → None.
                 filters: filters_or_none(&entry.filters),
                 source: enum_code(&entry.source),
                 searched_at: entry.created_at.clone(),
@@ -751,8 +740,8 @@ fn law_article_title(num: &str, code_title: Option<&str>) -> String {
 
 /// Présente un article law-at-date pour MCP : identité, texte, `url` publique
 /// `/texte/{code}/{numKey}`, et la timeline des versions (état + bornes).
-/// Les renvois résolus du corps (`texte_spans`, ADR 0217 — ceux que le front
-/// rend cliquables, hrefs datés quand l'article est servi à date) sont rendus
+/// Les renvois résolus du corps (`texte_spans`, ceux que le front rend
+/// cliquables, hrefs datés quand l'article est servi à date) sont rendus
 /// en liens markdown inline dans `text`, comme les citations des décisions.
 pub fn present_law_article(article: &LawArticleResponse, web_base_url: &str) -> McpLawArticle {
     McpLawArticle {
@@ -819,8 +808,110 @@ pub fn present_law_search(
     }
 }
 
-/// `entry.filters or None` côté Python : un objet `{}`/`null` est tombé sur
-/// `None`, sinon on garde la valeur telle quelle.
+// ── Annonces ────────────────────────────────────────────────────────────────
+
+/// Une consultation servie à un client MCP : de quoi décider d'y aller (objet,
+/// acheteur, où, quand ça ferme) et où aller (`url` = la fiche, `platformUrl` =
+/// la plateforme de dépôt). Les liens profonds (RC, DCE) restent sur la fiche :
+/// un client MCP ne télécharge pas un dossier de consultation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAnnonceHit {
+    pub title: String,
+    /// Le fond dont l'annonce vient (`marche`, `bodacc`).
+    pub fund: String,
+    /// Qui l'annonce concerne, et comment son fond le nomme.
+    pub actor: String,
+    pub actor_role: String,
+    pub url: String,
+    pub platform_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub departement: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpv: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<String>,
+    pub published: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// Canaux qui publient l'avis (`boamp`, `atexo`…).
+    pub channels: Vec<String>,
+}
+
+/// Sortie de `search_annonces` : le total exact, la page, et les facettes en
+/// map `token de filtre → nombre` — mêmes jetons que les filtres d'entrée.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAnnonceSearchResponse {
+    pub total: i64,
+    pub hits: Vec<McpAnnonceHit>,
+    /// La barre de filtres telle que les backends la déclarent : `clé d'axe →
+    /// (jeton → compte)`. Un axe absent est un filtre que les fonds interrogés
+    /// ne savent pas exécuter, pas un axe vide.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub facets: BTreeMap<String, BTreeMap<String, i64>>,
+}
+
+/// Projette une page d'annonces pour MCP. Les axes de facette sont plafonnés
+/// au top des comptes, l'ordre des choix étant déjà celui du référentiel.
+pub fn present_annonce_search(
+    response: &lj_dtos::AnnonceSearchResponse,
+    web_base_url: &str,
+) -> McpAnnonceSearchResponse {
+    let counts = |choices: &[lj_dtos::FacetChoice], cap: usize| {
+        let mut tri: Vec<&lj_dtos::FacetChoice> = choices.iter().collect();
+        tri.sort_by_key(|c| std::cmp::Reverse(c.count));
+        tri.into_iter()
+            .take(cap)
+            .map(|c| (c.value.clone(), c.count))
+            .collect::<BTreeMap<_, _>>()
+    };
+    const CAP: usize = 15;
+    McpAnnonceSearchResponse {
+        total: response.total,
+        hits: response
+            .groupes
+            .iter()
+            .flat_map(|g| g.hits.iter())
+            .map(|h| McpAnnonceHit {
+                title: h.titre.clone(),
+                fund: h.fond.clone(),
+                actor: h.acteur.clone(),
+                actor_role: h.acteur_role.clone(),
+                url: url_annonce(web_base_url, h),
+                platform_url: h.url_action.clone(),
+                departement: h.departement_label.clone(),
+                nature: h.famille.as_ref().map(|f| f.label.clone()),
+                cpv: h.cpv.as_ref().map(|c| c.label.clone()),
+                deadline: h.echeance.clone(),
+                published: h.date_publication.clone(),
+                reference: h.reference.clone(),
+                channels: h.canaux.clone(),
+            })
+            .collect(),
+        facets: response
+            .axes
+            .iter()
+            .map(|axe| (axe.key.clone(), counts(&axe.choices, CAP)))
+            .filter(|(_, m): &(String, BTreeMap<String, i64>)| !m.is_empty())
+            .collect(),
+    }
+}
+
+/// L'URL publique d'une annonce : la fiche `/marche/{uid}` quand nous la
+/// servons, la page officielle du fond quand nous n'en avons pas — l'URL est la
+/// seule clé, elle doit s'ouvrir.
+fn url_annonce(web_base_url: &str, hit: &lj_dtos::AnnonceHit) -> String {
+    if hit.fond == lj_dtos::ANNONCE_FOND_MARCHE {
+        format!("{web_base_url}/marche/{}", hit.uid)
+    } else {
+        hit.url_action.clone()
+    }
+}
+
+/// Un objet `{}`/`null` tombe sur `None`, sinon on garde la valeur telle quelle.
 fn filters_or_none(filters: &serde_json::Value) -> Option<serde_json::Value> {
     match filters {
         serde_json::Value::Null => None,
@@ -829,8 +920,7 @@ fn filters_or_none(filters: &serde_json::Value) -> Option<serde_json::Value> {
     }
 }
 
-/// Retire les balises `<mark>`/`</mark>` du snippet web pour MCP (port de
-/// `_strip_marks`).
+/// Retire les balises `<mark>`/`</mark>` du snippet web pour MCP.
 fn strip_marks(text: &str) -> String {
     text.replace("<mark>", "").replace("</mark>", "")
 }
@@ -912,15 +1002,12 @@ mod tests {
         };
         let out = present_search_response(&resp, "https://librejustice.fr");
         let hit = &out.hits[0];
-        // mode lexical → snippet sans <mark>, jamais le résumé.
         assert_eq!(hit.snippet.as_deref(), Some("un bail commercial"));
         assert_eq!(hit.ai_summary, None);
         assert_eq!(hit.title, "Cour de cassation, 29 mai 2026, 24-17.384");
         assert_eq!(hit.url, "https://librejustice.fr/decision/cc-123");
         assert_eq!(hit.chars, 4200);
-        // Procedure absente (procédure ordinaire = null, ADR 0146) → champ omis.
         assert_eq!(hit.procedure, None);
-        // Métadonnées = tokens de filtre (FacetTag.key), pas les labels FR.
         assert_eq!(hit.jurisdiction_type, "CC");
         assert_eq!(hit.jurisdiction_code.as_deref(), Some("cc"));
         assert_eq!(hit.chamber.as_deref(), Some("SOC"));
@@ -963,9 +1050,6 @@ mod tests {
         assert_eq!(out.hits[0].ai_summary, None);
     }
 
-    /// Bloc facettes compact : clés = tokens de filtre (racines juridiction
-    /// dépréfixées, top-15 cours avec troncature annoncée, instruments par
-    /// slug) ; omis quand les hits couvrent déjà le total.
     #[test]
     fn facets_compact_to_filter_tokens() {
         let choice = |value: &str, count: i64, parent: Option<&str>| FacetChoice {
@@ -1003,12 +1087,10 @@ mod tests {
         assert_eq!(f.jurisdiction_type.get("TA"), Some(&74));
         assert_eq!(f.jurisdiction_code.len(), 15);
         assert_eq!(f.jurisdiction_code.get("ta_ville00"), Some(&17));
-        // 17 cours, top-15 gardées → 2 annoncées.
         assert_eq!(f.other_courts, Some(2));
         assert_eq!(f.solution.get("REJET"), Some(&63));
         assert_eq!(f.legal_instrument.get("code-civil"), Some(&657));
 
-        // total couvert par la page → pas de bloc.
         let resp = SearchResponse {
             query: "bail".into(),
             total: 1,
@@ -1057,7 +1139,6 @@ mod tests {
         let out = present_decision_detail(&detail, "https://librejustice.fr", &refs());
         assert_eq!(out.text, "Para 1.\n\nPara 2.");
         assert_eq!(out.url, "https://librejustice.fr/decision/ce-1");
-        // jurisdiction_name absent → libellé du type (référentiel `jurisdiction_type:*`).
         assert_eq!(out.title, "Conseil d'État, 6 août 2024");
     }
 
@@ -1143,8 +1224,6 @@ mod tests {
 
     #[test]
     fn detail_renders_resolved_citations_as_markdown_links() {
-        // Offsets en CODEPOINTS : les « é » (2 octets UTF-8) avant le span
-        // décaleraient le rendu si le code comptait en octets.
         let para = "Vu l'énoncé de l'article 700 du CPC.";
         let span = |targets: Vec<CitationTarget>| CitationSpan {
             start: 17,
@@ -1187,7 +1266,6 @@ mod tests {
             commentaires: vec![],
         };
 
-        // Cible unique résolue → span enveloppé, URL préfixée du domaine.
         let resolved = detail(vec![span(vec![target(Some(
             "/texte/code-de-procedure-civile/700",
         ))])]);
@@ -1199,7 +1277,6 @@ mod tests {
              \n\nRejette la requête."
         );
 
-        // Multi-cibles, une seule résolue : elle enveloppe, pas d'appendice.
         let multi = detail(vec![span(vec![
             target(None),
             target(Some("/texte/code-de-procedure-civile/700")),
@@ -1210,8 +1287,6 @@ mod tests {
             .contains("](https://librejustice.fr/texte/code-de-procedure-civile/700)"));
         assert!(!out.text.contains("(+ "));
 
-        // Plage multi-résolue : la première enveloppe le span, les suivantes
-        // sont appendues en liens labellisés — chaque cible reste ouvrable.
         let range = detail(vec![span(vec![
             target(Some("/texte/code-de-procedure-civile/700")),
             CitationTarget {
@@ -1226,7 +1301,6 @@ mod tests {
              (https://librejustice.fr/texte/code-de-procedure-civile/701))"
         ));
 
-        // Aucune cible résolue → texte inchangé.
         let unresolved = detail(vec![span(vec![target(None)])]);
         let out = present_decision_detail(&unresolved, "https://librejustice.fr", &refs());
         assert_eq!(out.text, format!("{para}\n\nRejette la requête."));
@@ -1249,7 +1323,6 @@ mod tests {
             titre_text: None,
             date_fin: None,
             texte: Some("Sous réserve de l'article 1241, tout fait…".into()),
-            // Renvoi ADR 0217, href daté (article servi à date explicite).
             texte_spans: vec![CitationSpan {
                 start: 18,
                 end: 30,
@@ -1279,7 +1352,6 @@ mod tests {
             context: vec![],
             modifications: vec![],
             modified_by: vec![],
-            cites: vec![],
             cited_by: vec![],
             commentaires: vec![],
             travaux_parlementaires: vec![],
@@ -1310,6 +1382,8 @@ mod tests {
                 titre_path: Some("Livre Ier > Titre XVIII".into()),
                 snippet: "les <mark>dépens</mark>".into(),
                 source: "legifrance".into(),
+                status: Some("VIGUEUR".into()),
+                date_debut: None,
             }],
             total: 1,
             facets: ArticleSearchFacets {

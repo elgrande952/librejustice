@@ -1,10 +1,10 @@
--- Migration 0083 — TOAST lz4 sur decisions.full_text (ADR 0126).
+-- Migration 0083 — TOAST lz4 sur decisions.full_text.
 --
 -- `full_text` (corps des décisions : ~37 Go non compressé, la colonne la plus
 -- volumineuse du schéma) était épinglé en compression `pglz` (défaut historique
 -- PG). Sur la box OVH (CPU contraint, RAM/IO abondants), lz4 est mesuré ~4×
 -- plus rapide en compression et ~1,5× en décompression, pour +2,7 % de taille
--- (négligeable) — cf. ADR 0126. Le GUC `default_toast_compression = lz4`
+-- (négligeable) — Le GUC `default_toast_compression = lz4`
 -- (infra/postgresql.conf) couvre les colonnes en compression « default » ;
 -- `full_text` étant épinglé `pglz`, il faut ce `SET COMPRESSION` explicite.
 --
@@ -13,5 +13,5 @@
 -- cohabitent sans souci — chaque datum porte son algo) et se convertissent
 -- organiquement au fil des ré-ingests. PAS de rewrite forcé de l'existant :
 -- recompresser `full_text` réécrit le tuple et reconstruirait l'index BM25 de
--- 13 Go (cf. ADR 0126, section « existant »), pour un gain marginal en lecture.
+-- 13 Go, pour un gain marginal en lecture.
 ALTER TABLE decisions ALTER COLUMN full_text SET COMPRESSION lz4;

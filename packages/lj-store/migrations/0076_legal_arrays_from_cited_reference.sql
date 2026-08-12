@@ -1,5 +1,5 @@
 -- Migration 0076 — arrays légaux dénormalisés alimentés par cited_reference
--- (ADR 0112 phase B, P5 cutover). Bascule la SOURCE des fast fields/GIN de filtre
+-- (phase B, P5 cutover). Bascule la SOURCE des fast fields/GIN de filtre
 -- (`decisions.legal_instruments` / `legal_article_composite` et leurs homonymes
 -- chunk) du 3NF (legal_codes/legal_articles/decision_legal_references) vers le
 -- modèle unifié (decision_citation → cited_reference).

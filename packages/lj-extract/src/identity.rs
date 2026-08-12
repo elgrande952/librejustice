@@ -1,30 +1,15 @@
-//! Identité canonique inter-sources : `canonical_ref` (ADR 0100).
+//! Identité canonique inter-sources : `canonical_ref`.
 //!
-//! `canonical_ref` est la **citation légale** d'une décision (cour (+ ville) |
+//! `canonical_ref` est la citation légale d'une décision (cour (+ ville) |
 //! numéro/RG propre | date), normalisée — l'identité de repli quand l'ECLI
-//! officiel manque et la clé de pont inter-sources. Pure (aucune I/O, aucune
+//! officiel manque, et la clé de pont inter-sources. Pure (aucune I/O, aucune
 //! dépendance native) : c'est une fonction du `Decision` déjà parsé + de son
-//! extracteur. Sa construction est **typée par juridiction** (le numéro n'est
-//! pas unique de la même façon partout, ADR 0100 §2) :
+//! extracteur. Sa construction est typée par juridiction, le numéro n'étant pas
+//! unique de la même façon partout : voir [`decision_canonical_ref`].
 //!
-//! - **Cassation** (`CC`) : `cc|<pourvoi minimal>|<date>` — le pourvoi minimal
-//!   canonicalise les pourvois joints (abrégé Bulletin et intégrale partagent
-//!   la clé).
-//! - **CA / TJ / TCOM** : `<type>|<location>|<rg>|<date>` — la `location` (code
-//!   tribunal Judilibre, unique par tribunal) est **obligatoire** : sans elle le
-//!   RG collisionne entre tribunaux (cause des faux merges). Absente → `None`.
-//! - **CAA** : `caa|<rg>|<date>` — le RG porte le code cour (`23MA01123` =
-//!   Marseille) → clé auto-suffisante, **indépendante du nom** (que l'opendata
-//!   place parfois à un placeholder « CAA » → désync JADE ↔ opendata, ADR 0106).
-//!   Repli sur `<nom>|<rg>|<date>` si le RG n'est pas préfixé-cour (déchet).
-//! - **Admin TA/CE** : `<nom juridiction (porte la ville)>|<rg>|<date>`. Le numéro
-//!   de requête est globalement unique → pont JADE ↔ opendata sain.
-//! - **Autres** (CONSTIT/TC/CEDH/CJUE/CNDA…) : `<type>|<numéro>|<date>`.
-//!
-//! `canonical_ref` **n'est pas garantie unique** (affaires sérielles : même
-//! cour, RG et date, décisions distinctes — ADR 0100 §1). La clé n'est émise que
-//! si ses briques fiables sont présentes (sinon `None` : pas d'identité stable,
-//! on ne fusionne pas — règle #12, pas de clé bancale).
+//! `canonical_ref` n'est pas garantie unique (affaires sérielles : même cour, RG
+//! et date, décisions distinctes). La clé n'est émise que si ses briques fiables
+//! sont présentes, sinon `None` : pas d'identité stable, on ne fusionne pas.
 
 use lj_core::decision::Decision;
 
@@ -42,12 +27,12 @@ pub(crate) fn looks_like_pourvoi(num: &str) -> bool {
     num.contains('-') && num.chars().any(|c| c.is_ascii_digit())
 }
 
-/// Vrai si le RG (normalisé : minuscules) a la **forme d'un RG CAA préfixé-cour**
+/// Vrai si le RG (normalisé : minuscules) a la forme d'un RG CAA préfixé-cour
 /// `AAcc…` — deux chiffres (année), deux lettres (code cour : `ma`=Marseille,
 /// `nt`=Nantes, `pa`=Paris…), puis un chiffre. Le préfixe identifie la cour de
-/// façon déterministe : le RG est alors auto-suffisant (le nom de juridiction est
-/// redondant, ADR 0106). Faux pour les RG déchet (`rectification`) ou tronqués,
-/// qui collisionneraient entre cours → repli sur la clé par nom.
+/// façon déterministe : le RG est alors auto-suffisant, le nom de juridiction est
+/// redondant. Faux pour les RG déchet (`rectification`) ou tronqués, qui
+/// collisionneraient entre cours → repli sur la clé par nom.
 pub(crate) fn looks_like_caa_rg(rg: &str) -> bool {
     let b = rg.as_bytes();
     b.len() >= 5
@@ -58,8 +43,8 @@ pub(crate) fn looks_like_caa_rg(rg: &str) -> bool {
         && b[4].is_ascii_digit()
 }
 
-/// Replie les diacritiques français usuels (déterministe, sans dépendance
-/// Unicode native — `lj-core` est pur). Suffisant pour les noms de juridiction.
+/// Replie les diacritiques français usuels, sans dépendance Unicode native.
+/// Suffisant pour les noms de juridiction.
 fn fold_accents(c: char) -> char {
     match c {
         'à' | 'â' | 'ä' | 'á' | 'ã' => 'a',
@@ -69,7 +54,7 @@ fn fold_accents(c: char) -> char {
         'ô' | 'ö' | 'ó' | 'ò' | 'õ' => 'o',
         'ù' | 'û' | 'ü' | 'ú' => 'u',
         'ÿ' | 'ý' => 'y',
-        'œ' => 'o', // approx : œ → o (collision improbable sur un nom de juridiction)
+        'œ' => 'o',
         other => other,
     }
 }
@@ -88,27 +73,23 @@ pub(crate) fn normalize_component(s: &str) -> String {
     folded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `canonical_ref` (citation légale, ADR 0100) d'une décision : identité dérivée
-/// de ce que la décision tranche, auto-suffisante (même clé ⟺ même décision),
-/// `None` si les discriminants fiables manquent (on ne fusionne pas — pas de clé
-/// bancale, #12). Distincte de l'`ecli` officiel (résolu en premier), **non
-/// garantie unique** (affaires sérielles, ADR 0100 §1).
+/// `canonical_ref` d'une décision : identité dérivée de ce que la décision
+/// tranche, auto-suffisante (même clé ⟺ même décision), `None` si les
+/// discriminants fiables manquent. Distincte de l'`ecli` officiel (résolu en
+/// premier), non garantie unique (affaires sérielles).
 ///
-/// Typée par juridiction (le numéro n'est pas unique de la même façon partout) :
-/// - **Cassation** (`CC`) : `cc|<pourvoi minimal>|<date>` — le pourvoi minimal
+/// Typée par juridiction, le numéro n'étant pas unique de la même façon partout :
+/// - Cassation (`CC`) : `cc|<pourvoi minimal>|<date>` — le pourvoi minimal
 ///   canonicalise les pourvois joints (abrégé `{611,854}` et intégrale `{611}`
 ///   → `611`), donc abrégé Bulletin et intégrale partagent la clé.
-/// - **CA / TJ / TCOM** : `<type>|<location>|<rg>|<date>` — le `location`
-///   (code tribunal Judilibre, unique par tribunal) est **obligatoire** : sans
-///   lui le RG collisionne entre tribunaux (cause des faux merges). Absent → `None`.
-/// - **CAA** : `caa|<rg>|<date>` — le RG porte le code cour → clé indépendante du
-///   nom (ADR 0106) ; repli `<nom>|<rg>|<date>` si RG non préfixé-cour.
-/// - **Admin TA/CE** : `<nom juridiction (porte la ville)>|<rg>|<date>`.
-/// - **Autres** (CONSTIT/TC/CEDH/CJUE/CNDA…) : `<type>|<numéro>|<date>`, sources
+/// - CA / TJ / TCOM : `<type>|<location>|<rg>|<date>` — le `location`
+///   (code tribunal Judilibre, unique par tribunal) est obligatoire : sans lui
+///   le RG collisionne entre tribunaux. Absent → `None`.
+/// - CAA : `caa|<rg>|<date>` — le RG porte le code cour → clé indépendante du
+///   nom ; repli `<nom>|<rg>|<date>` si RG non préfixé-cour.
+/// - Admin TA/CE : `<nom juridiction (porte la ville)>|<rg>|<date>`.
+/// - Autres (CONSTIT/TC/CEDH/CJUE/CNDA…) : `<type>|<numéro>|<date>`, sources
 ///   sans recoupement.
-///
-/// NB Phase A (ADR 0100) : le n° de décision (sépare QPC vs fond d'une même cour)
-/// et Portalis viendront enrichir la clé (champs à capter à l'extraction).
 pub fn decision_canonical_ref(d: &Decision) -> Option<String> {
     let jt = d.jurisdiction_type.as_deref()?;
     let date = crate::extract::extract_date_lecture(d).or_else(|| d.date_lecture.clone())?;
@@ -142,12 +123,11 @@ pub fn decision_canonical_ref(d: &Decision) -> Option<String> {
         }
         "CAA" => {
             // Le RG CAA porte le code cour (23**MA**01123 = Marseille) → clé
-            // auto-suffisante `caa|<rg>|<date>`, **indépendante du nom de
-            // juridiction** (que l'opendata place parfois à un placeholder « CAA »
-            // → désync JADE ↔ opendata, ADR 0106). On n'émet la clé RG que si le RG
-            // est au format préfixé-cour (`looks_like_caa_rg`) : un RG déchet
-            // (« rectification ») collisionnerait entre cours → repli sur le nom
-            // (qui porte la ville, donc pas de collision inter-cour).
+            // auto-suffisante `caa|<rg>|<date>`, indépendante du nom de juridiction (que
+            // l'opendata place parfois à un placeholder « CAA »). On n'émet la clé RG que
+            // si le RG est au format préfixé-cour (`looks_like_caa_rg`) : un RG déchet
+            // (« rectification ») collisionnerait entre cours → repli sur le nom, qui porte
+            // la ville.
             let rg = dockets
                 .first()
                 .map(|n| normalize_component(n))
@@ -162,8 +142,8 @@ pub fn decision_canonical_ref(d: &Decision) -> Option<String> {
             Some(format!("{jur}|{rg}|{date}"))
         }
         "TA" | "CE" => {
-            // Admin TA/CE : la ville vit dans le nom de juridiction (le RG n'est
-            // pas préfixé-cour — TA mono-source opendata ; CE national mono-cour).
+            // Admin TA/CE : la ville vit dans le nom de juridiction (le RG n'est pas
+            // préfixé-cour — TA mono-source opendata ; CE national mono-cour).
             let jur = crate::extract::extract_jurisdiction_name(d)
                 .or_else(|| d.jurisdiction_name.clone())
                 .map(|s| normalize_component(&s))?;
@@ -182,6 +162,65 @@ pub fn decision_canonical_ref(d: &Decision) -> Option<String> {
             Some(format!("{}|{numero}|{date}", normalize_component(jt)))
         }
     }
+}
+
+/// Pourvoi au format canonique stocké (`18-23.954`) — le seul que la
+/// résolution par famille CC sait reformater (clé 7 chiffres).
+fn is_canonical_pourvoi(docket: &str) -> bool {
+    let b = docket.as_bytes();
+    b.len() == 9
+        && b[2] == b'-'
+        && b[5] == b'.'
+        && [0usize, 1, 3, 4, 6, 7, 8]
+            .iter()
+            .all(|&i| b[i].is_ascii_digit())
+}
+
+/// Clés `target_ref` candidates qu'une citation pendante emploierait pour
+/// viser une décision d'identité `(jurisdiction_type, jurisdiction_code,
+/// docket_numbers)` — l'inverse exact des reformatages clé→docket des SQL
+/// de résolution par famille (`resolve_case_family_sqls`). À l'arrivée d'une
+/// cible, ces clés sondent l'index des pendantes. Une clé manquée n'est jamais
+/// une erreur (le pendant reste pendant, rattrapé par `reconcile`) ; une clé en
+/// trop est un miss de sonde. Par famille :
+/// - `CC` : `cc|<7 chiffres>` ssi le docket est au format canonique
+///   (`18-23.954` → `cc|1823954`) — les autres formes sont irrésolubles par
+///   le sweep aussi ;
+/// - `CE`/`CEDH`/`CONSTIT` : `<préfixe>|<docket>` tel quel ;
+/// - `CJUE` : `cjue|<docket minuscule>` + variante sans préfixe `c-` (la clé
+///   nue « aff. 6/64 » résout en C-) ;
+/// - tout type à `jurisdiction_code` : `rg|<code>|<docket>` ET
+///   `af|<code>|<docket>` (le code discrimine déjà dans le SQL).
+pub fn pending_target_keys(
+    jurisdiction_type: &str,
+    jurisdiction_code: Option<&str>,
+    docket_numbers: &[String],
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    for docket in docket_numbers {
+        match jurisdiction_type {
+            "CC" if is_canonical_pourvoi(docket) => {
+                let digits: String = docket.chars().filter(char::is_ascii_digit).collect();
+                keys.push(format!("cc|{digits}"));
+            }
+            "CE" => keys.push(format!("ce|{docket}")),
+            "CEDH" => keys.push(format!("cedh|{docket}")),
+            "CONSTIT" => keys.push(format!("constit|{docket}")),
+            "CJUE" => {
+                let lower = docket.to_lowercase();
+                if let Some(bare) = lower.strip_prefix("c-") {
+                    keys.push(format!("cjue|{bare}"));
+                }
+                keys.push(format!("cjue|{lower}"));
+            }
+            _ => {}
+        }
+        if let Some(code) = jurisdiction_code.filter(|c| !c.is_empty()) {
+            keys.push(format!("rg|{code}|{docket}"));
+            keys.push(format!("af|{code}|{docket}"));
+        }
+    }
+    keys
 }
 
 #[cfg(test)]
@@ -247,14 +286,38 @@ mod tests {
     }
 
     #[test]
+    fn pending_target_keys_invert_family_reformats() {
+        assert_eq!(
+            pending_target_keys("CC", None, &["18-23.954".into()]),
+            vec!["cc|1823954"]
+        );
+        assert!(pending_target_keys("CC", None, &["1823954".into()]).is_empty());
+        assert_eq!(
+            pending_target_keys("CJUE", None, &["C-561/19".into()]),
+            vec!["cjue|561/19", "cjue|c-561/19"]
+        );
+        assert_eq!(
+            pending_target_keys("CJUE", None, &["T-123/20".into()]),
+            vec!["cjue|t-123/20"]
+        );
+        assert_eq!(
+            pending_target_keys("CA", Some("ca_paris"), &["21/04532".into()]),
+            vec!["rg|ca_paris|21/04532", "af|ca_paris|21/04532"]
+        );
+        assert!(pending_target_keys("CA", None, &["21/04532".into()]).is_empty());
+        assert_eq!(
+            pending_target_keys("CE", None, &["498887".into()]),
+            vec!["ce|498887"]
+        );
+    }
+
+    #[test]
     fn admin_key_uses_docket_and_jurisdiction_name() {
         let mut d = base();
         d.jurisdiction_type = Some("TA".into());
         d.jurisdiction_name = Some("Tribunal administratif d'Amiens".into());
         d.numero_dossier = Some("2204150".into());
         d.date_lecture = Some("2022-08-15".into());
-        // jurisdiction_name de l'extracteur opendata peut différer ; on vérifie la
-        // forme `nom|rg|date` et que le RG/date sont corrects.
         let key = decision_canonical_ref(&d).unwrap();
         let parts: Vec<&str> = key.split('|').collect();
         assert_eq!(parts.len(), 3);
@@ -268,8 +331,6 @@ mod tests {
 
     #[test]
     fn canonical_ref_tj_same_rg_different_location_splits() {
-        // Cœur du bug : « 26/00051 » à deux tribunaux distincts = décisions
-        // différentes. La `location` (code tribunal) doit les séparer.
         let mut amiens = base();
         amiens.jurisdiction_type = Some("TJ".into());
         amiens.jurisdiction_location = Some("tj80021".into());
@@ -280,14 +341,12 @@ mod tests {
 
         assert!(cref(&amiens).is_some());
         assert_ne!(cref(&amiens), cref(&compiegne));
-        // Même tribunal + même RG + même date = même décision (re-publication).
         let repub = amiens.clone();
         assert_eq!(cref(&amiens), cref(&repub));
     }
 
     #[test]
     fn canonical_ref_tj_without_location_is_none() {
-        // Sans location, le RG n'est pas une identité sûre → pas de clé.
         let mut d = base();
         d.jurisdiction_type = Some("TJ".into());
         d.numero_dossiers = Some(vec!["26/00051".into()]);
@@ -297,15 +356,13 @@ mod tests {
 
     #[test]
     fn canonical_ref_caa_rg_based_bridges_jade_and_opendata() {
-        // Cœur du fix (ADR 0106) : le RG CAA porte le code cour → clé `caa|rg|date`
-        // identique côté JADE (nom complet) et opendata (placeholder « CAA »).
         let mut jade = base();
         jade.jurisdiction_type = Some("CAA".into());
         jade.jurisdiction_name = Some("Cour administrative d'appel de Marseille".into());
         jade.numero_dossier = Some("23MA01123".into());
         jade.date_lecture = Some("2024-05-14".into());
         let mut opendata = jade.clone();
-        opendata.jurisdiction_name = Some("CAA".into()); // placeholder opendata
+        opendata.jurisdiction_name = Some("CAA".into());
 
         assert_eq!(cref(&jade).unwrap(), "caa|23ma01123|2024-05-14");
         assert_eq!(cref(&jade), cref(&opendata));
@@ -313,8 +370,6 @@ mod tests {
 
     #[test]
     fn canonical_ref_caa_rg_prefix_separates_courts() {
-        // Le préfixe du RG (MA vs NT) discrimine la cour : pas de collision même
-        // n° d'ordre + même date entre deux cours distinctes.
         let mut marseille = base();
         marseille.jurisdiction_type = Some("CAA".into());
         marseille.numero_dossier = Some("24MA00434".into());
@@ -326,21 +381,17 @@ mod tests {
 
     #[test]
     fn canonical_ref_caa_junk_rg_falls_back_to_name() {
-        // RG déchet (non préfixé-cour) → repli sur le nom (qui porte la ville),
-        // jamais `caa|rectification|date` (collisionnerait entre cours).
         let mut d = base();
         d.jurisdiction_type = Some("CAA".into());
         d.jurisdiction_name = Some("Cour administrative d'appel de Lyon".into());
         d.numero_dossier = Some("rectification".into());
         d.date_lecture = Some("2025-03-04".into());
         let key = cref(&d).unwrap();
-        // Repli par nom : surtout PAS `caa|rectification|date` (collision inter-cour).
         assert!(
             !key.starts_with("caa|"),
             "repli attendu, pas la clé RG : {key}"
         );
         assert!(key.contains("|rectification|2025-03-04"));
-        // Même RG déchet sans nom → pas de clé (pas de clé bancale, #12).
         let mut noname = d.clone();
         noname.jurisdiction_name = None;
         assert_eq!(cref(&noname), None);
@@ -348,8 +399,6 @@ mod tests {
 
     #[test]
     fn canonical_ref_cassation_joined_pourvois_canonicalize() {
-        // Abrégé Bulletin (pourvois joints) et intégrale (un seul) → même clé
-        // via le pourvoi minimal.
         let mut integrale = base();
         integrale.jurisdiction_type = Some("CC".into());
         integrale.numero_dossiers = Some(vec!["88-14.611".into()]);

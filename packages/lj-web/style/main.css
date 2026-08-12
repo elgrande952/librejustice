@@ -73,6 +73,10 @@
   --color-parchment: oklch(98% 0.012 85);
   --color-vellum: oklch(95% 0.014 85);
   --color-rule: oklch(86% 0.012 85);
+  /* Crête du balayage des skeletons : toujours PLUS CLAIRE que `vellum`, le
+     fond des barres — d'où un token par thème et non `parchment`, qui passe
+     sous `vellum` en sombre (20 % contre 24 %) et inverserait le balayage. */
+  --color-skeleton-sheen: oklch(99% 0.008 85);
   --color-ink: oklch(18% 0.04 255);
   --color-ink-muted: oklch(45% 0.025 255);
   --color-ink-subtle: oklch(53% 0.018 255);
@@ -134,39 +138,20 @@
   }
 
   html {
-    scrollbar-gutter: stable;
     background-color: var(--color-background);
     color-scheme: light dark;
   }
 
-  /* Firefox — renderer custom cohérent partout */
-  @supports not selector(::-webkit-scrollbar) {
-    html,
-    .filter-scroll {
-      scrollbar-width: thin;
-      scrollbar-color: oklch(78% 0.013 85) oklch(98% 0.012 85);
-    }
-  }
-
-  /* Chrome / Safari / Edge */
-  ::-webkit-scrollbar {
-    width: 5px;
-    height: 5px;
-  }
-
-  ::-webkit-scrollbar-thumb {
-    background-color: oklch(78% 0.013 85);
-    border-radius: 9999px;
-  }
-
-  ::-webkit-scrollbar-track {
-    background: oklch(98% 0.012 85);
-  }
-
-  ::-webkit-scrollbar-button {
-    display: none;
-    height: 0;
-    width: 0;
+  /* Scrollbars : propriétés STANDARD uniquement, largeur par DÉFAUT.
+     Surtout pas de ::-webkit-scrollbar : styler ce pseudo-élément force une
+     scrollbar classique toujours visible qui occupe la largeur du layout.
+     Sans lui, les plateformes à scrollbars overlay (macOS, iOS/Android,
+     Windows 11) gardent leur barre flottante native au-dessus du DOM — zéro
+     largeur perdue, comme github.com. Pas de scrollbar-width non plus :
+     `thin` donne une barre plus maigre que la norme (Google, Bing…), dure à
+     attraper. On ne pose que la teinte, assortie au thème. */
+  * {
+    scrollbar-color: oklch(78% 0.013 85) transparent;
   }
 
   body {
@@ -252,6 +237,99 @@
 }
 
 @layer utilities {
+  /* Motion commune à tous les panneaux déroulants (menu du site, sélecteurs,
+     facettes, suggestions, menu copier). Porte le mouvement seul — le fond,
+     la bordure, l'ombre et le rayon restent des utilitaires Tailwind sur
+     chaque panneau, qui divergent légitimement (le panneau du hero prolonge
+     la barre : arrondi bas seulement, pas de bordure haute).
+
+     Le panneau reste MONTÉ et se masque par `visibility` : un panneau démonté
+     à la fermeture n'a plus de frames à animer, et `display` ne se transitionne
+     pas. Le délai `visibility 0s linear .22s` retient le masquage jusqu'à la
+     fin du fondu de sortie ; à l'ouverture la règle `[data-open]` n'a pas de
+     délai, donc le panneau redevient visible dès la première frame.
+     `pointer-events` et `visibility` gardent le panneau fermé hors du flux
+     d'interaction et hors de l'arbre d'accessibilité. */
+  .lj-panel {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-0.375rem);
+    transition:
+      opacity 0.18s,
+      transform 0.22s cubic-bezier(0.16, 1, 0.3, 1),
+      visibility 0s linear 0.22s;
+  }
+
+  .lj-panel[data-open] {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+    transition:
+      opacity 0.18s,
+      transform 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* Skeletons : balayage lumineux au lieu du clignotement `animate-pulse` de
+     Tailwind. Toutes les barres y pulsaient EN PHASE — sur une page décision
+     qui en aligne une cinquantaine, la page entière battait d'un bloc. Le
+     balayage traverse la barre, donc chacune s'éclaire à son tour selon sa
+     position et l'attente se lit comme un mouvement, pas comme un
+     stroboscope.
+
+     Ne pose ni fond ni rayon : ils restent en utilitaires Tailwind sur les
+     appelants (mêmes couche et spécificité — les y écrire ici ouvrirait un
+     conflit d'ordre).
+
+     `::after` échappe au reset `prefers-reduced-motion` de `@layer base` : le
+     sélecteur `*` ne matche que des éléments, jamais un pseudo-élément. Sans
+     le reset explicite ci-dessous, le balayage resterait — et pire, il
+     tournerait à `animation-duration: 0.01ms` en boucle infinie. */
+  .lj-skeleton {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .lj-skeleton::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    translate: -100% 0;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      var(--color-skeleton-sheen),
+      transparent
+    );
+    animation: lj-skeleton-sweep 1.6s ease-in-out infinite;
+  }
+
+  @keyframes lj-skeleton-sweep {
+    to {
+      translate: 100% 0;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .lj-skeleton::after {
+      animation: none;
+    }
+  }
+
+  /* Le reset `prefers-reduced-motion` global de `@layer base` écrase les
+     durées (règle `*`, en `!important`) mais pas les DÉLAIS, et une règle
+     non-`!important` de `base` perdrait de toute façon contre la couche
+     `utilities`. D'où ce reset ici, dans la même couche que les deux règles
+     ci-dessus : sinon `.lj-panel` garderait ses 220 ms de retard sur
+     `visibility` à la fermeture. */
+  @media (prefers-reduced-motion: reduce) {
+    .lj-panel,
+    .lj-panel[data-open] {
+      transition: none;
+    }
+  }
+
   /* Filet décoratif horizontal — séparateur éditorial */
   .rule-hairline {
     border-top: 1px solid var(--color-rule);
@@ -310,6 +388,49 @@
     color: var(--color-ink-subtle);
     font-feature-settings: "tnum" on;
   }
+
+  /* Déclencheur du menu : hamburger ⇄ croix par vrai morphing. Une rotation
+     seule perd cos θ d'emprise horizontale (la croix paraît plus petite) ;
+     on compense par un scale-x qui suit 1/cos θ FRAME PAR FRAME : rotation
+     linéaire + courbe de scale calée dessus (et sa miroir au retour), donc
+     l'emprise du glyphe reste 16px à chaque instant de la transition —
+     aucun trait ne paraît rétrécir ou s'allonger. */
+  .lj-burger-line {
+    position: absolute;
+    height: 1.5px;
+    width: 1rem;
+    border-radius: 9999px;
+    background: currentColor;
+    transition:
+      rotate 200ms linear,
+      translate 200ms linear,
+      scale 200ms cubic-bezier(0.3, 0.8, 0.45, 1);
+  }
+
+  .lj-burger-line-top {
+    translate: 0 -3px;
+  }
+
+  .lj-burger-line-bottom {
+    translate: 0 3px;
+  }
+
+  .lj-burger-open .lj-burger-line {
+    scale: 1.4142 1;
+    translate: 0 0;
+    transition:
+      rotate 200ms linear,
+      translate 200ms linear,
+      scale 200ms cubic-bezier(0.55, 0, 0.7, 0.2);
+  }
+
+  .lj-burger-open .lj-burger-line-top {
+    rotate: 45deg;
+  }
+
+  .lj-burger-open .lj-burger-line-bottom {
+    rotate: -45deg;
+  }
 }
 
 /*
@@ -332,21 +453,12 @@
   --color-mode-lexical: oklch(75% 0.11 70);
   --color-mode-lexical-soft: oklch(30% 0.06 70);
   --color-accent-foreground: oklch(20% 0.005 260);
+  --color-skeleton-sheen: oklch(31% 0.008 260);
 }
 
-@supports not selector(::-webkit-scrollbar) {
-  .dark,
-  .dark .filter-scroll {
-    scrollbar-color: oklch(48% 0.008 260) oklch(20% 0.005 260);
-  }
-}
-
-.dark ::-webkit-scrollbar-thumb {
-  background-color: oklch(48% 0.008 260);
-}
-
-.dark ::-webkit-scrollbar-track {
-  background: oklch(20% 0.005 260);
+.dark,
+.dark * {
+  scrollbar-color: oklch(48% 0.008 260) transparent;
 }
 
 .dark ::selection {

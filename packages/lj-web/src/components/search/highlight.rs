@@ -1,10 +1,8 @@
-//! Rendu de snippets `<mark>…</mark>` (port de `HighlightedSnippet`).
+//! Rendu de snippets `<mark>…</mark>`.
 //!
-//! Le backend échappe tout SAUF les balises `<mark>`. On reproduit le `split`
-//! sur `/(<mark>.*?<\/mark>)/g` du React : on émet des segments `Mark`/`Plain`
-//! rendus en `<mark>`/texte brut. JAMAIS de `inner_html` (qui injecterait du
-//! HTML non sanitisé) — Leptos échappe le texte des segments `Plain` et le
-//! contenu des `Mark`.
+//! Le backend échappe tout SAUF les balises `<mark>` : on émet des segments
+//! `Mark`/`Plain` rendus en `<mark>`/texte brut. JAMAIS de `inner_html` — Leptos
+//! échappe le texte des segments `Plain` et le contenu des `Mark`.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -18,7 +16,7 @@ enum Seg {
     Plain(String),
 }
 
-/// Découpe le texte en segments `<mark>` / hors-mark (non-greedy, comme la regex).
+/// Découpe le texte en segments `<mark>` / hors-mark (non-greedy).
 fn split(text: &str) -> Vec<Seg> {
     let mut segs = Vec::new();
     let mut rest = text;
@@ -60,15 +58,13 @@ enum CiteSeg {
 /// Découpe `text` (codepoints) aux bornes des `spans`, supposés disjoints et
 /// triés par début (contrat de `spans_for_range` côté API), demi-ouverts
 /// `[start, end)` en CODEPOINTS locaux. Émet une suite alternée texte/citation.
-/// Spans vides ⇒ un seul segment `Plain`. Les spans hors bornes (offsets
-/// incohérents) sont ignorés défensivement à la seule frontière de découpe.
+/// Spans vides ⇒ un seul segment `Plain`. Les spans hors bornes sont ignorés.
 fn split_spans(text: &str, spans: &[CitationSpan]) -> Vec<CiteSeg> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let mut segs = Vec::new();
     let mut cursor = 0usize;
     for span in spans {
-        // Borne au texte ; ignore un span dégénéré ou hors plage.
         if span.start < cursor || span.end > n || span.start >= span.end {
             continue;
         }
@@ -88,11 +84,9 @@ fn split_spans(text: &str, spans: &[CitationSpan]) -> Vec<CiteSeg> {
 }
 
 /// Rend une mention de citation : 1 cible → `<a>` (enveloppé d'une hover card
-/// quand le href est prévisualisable, ADR 0168 — `at_date` = date de la
-/// décision hôte, pour servir la version d'article qu'elle appliquait) ;
-/// ≥2 cibles → [`CiteMenu`]. Une cible sans `href` n'est pas décorée : l'API ne
-/// fabrique un span que résolu (mort du pointillé, 2026-07-05) — texte brut en
-/// repli défensif de DTO.
+/// quand le href est prévisualisable — `at_date` = date de la décision hôte, pour
+/// servir la version d'article qu'elle appliquait) ; ≥2 cibles → [`CiteMenu`].
+/// Une cible sans `href` n'est pas décorée : texte brut.
 fn cite_view(text: String, targets: Vec<CitationTarget>, at_date: Option<&str>) -> AnyView {
     let mut linked: Vec<(String, String)> = targets
         .into_iter()
@@ -101,9 +95,6 @@ fn cite_view(text: String, targets: Vec<CitationTarget>, at_date: Option<&str>) 
     if linked.len() <= 1 {
         return match linked.pop() {
             Some((href, label)) => match preview_kind(&href, at_date) {
-                // Carte hover : la tooltip native `title` ferait doublon et
-                // flotterait par-dessus le panneau — on l'omet (la carte porte
-                // déjà le label et bien plus).
                 Some(kind) => {
                     let link = view! {
                         <A
@@ -115,7 +106,6 @@ fn cite_view(text: String, targets: Vec<CitationTarget>, at_date: Option<&str>) 
                     };
                     view! { <HoverPreview kind=kind>{link}</HoverPreview> }.into_any()
                 }
-                // Sans carte, le `title` reste la seule glose du lien.
                 None => view! {
                     <A
                         href=href
@@ -210,16 +200,16 @@ fn CiteMenu(text: String, linked: Vec<(String, String)>) -> impl IntoView {
     }
 }
 
-/// Rend un paragraphe de décision avec ses citations cliquables (ADR 0134).
-/// Overlay composé SERVER-SIDE via [`split_spans`] (cf. [`cite_view`]), le reste
-/// en texte brut. JAMAIS d'`inner_html` — Leptos échappe chaque segment, SSR
-/// crawlable. Aucun span ⇒ texte brut tel quel.
+/// Rend un paragraphe de décision avec ses citations cliquables. Overlay composé
+/// SERVER-SIDE via [`split_spans`] (cf. [`cite_view`]), le reste en texte brut.
+/// JAMAIS d'`inner_html` — Leptos échappe chaque segment, SSR crawlable. Aucun
+/// span ⇒ texte brut tel quel.
 #[component]
 pub fn CitedParagraph(
     text: String,
     spans: Vec<CitationSpan>,
-    /// Date de la décision hôte : les hover cards d'articles servent la
-    /// version en vigueur à cette date (ADR 0168).
+    /// Date de la décision hôte : les hover cards d'articles servent la version en
+    /// vigueur à cette date.
     #[prop(optional_no_strip)]
     at_date: Option<String>,
 ) -> impl IntoView {
@@ -236,13 +226,12 @@ pub fn CitedParagraph(
     view! { <p>{views}</p> }.into_any()
 }
 
-/// Rend le corps d'un article de norme avec ses renvois cliquables
-/// (ADR 0217) : même composition que [`CitedParagraph`] (offsets codepoints
-/// demi-ouverts sur le texte entier, jamais d'`inner_html`), en un seul bloc
-/// `<div>` — la mise en forme du corps repose sur `whitespace-pre-line`, pas
-/// sur des paragraphes. La date d'un renvoi Chronolégi voyage dans le href
-/// lui-même (l'API date les liens quand la lecture l'est) : pas d'`at_date`
-/// de contexte.
+/// Rend le corps d'un article de norme avec ses renvois cliquables : même
+/// composition que [`CitedParagraph`] (offsets codepoints demi-ouverts sur le
+/// texte entier, jamais d'`inner_html`), en un seul bloc `<div>` — la mise en
+/// forme du corps repose sur `whitespace-pre-line`, pas sur des paragraphes. La
+/// date d'un renvoi Chronolégi voyage dans le href lui-même : pas d'`at_date` de
+/// contexte.
 #[component]
 pub fn CitedBlock(text: String, spans: Vec<CitationSpan>, class: &'static str) -> impl IntoView {
     if spans.is_empty() {
@@ -258,7 +247,7 @@ pub fn CitedBlock(text: String, spans: Vec<CitationSpan>, class: &'static str) -
     view! { <div class=class>{views}</div> }.into_any()
 }
 
-/// Rend un texte avec ses `<mark>` surlignés (mêmes classes que le TSX).
+/// Rend un texte avec ses `<mark>` surlignés.
 #[component]
 pub fn Highlighted(#[prop(into)] text: String) -> impl IntoView {
     let views = split(&text)
@@ -291,11 +280,8 @@ mod tests {
         }
     }
 
-    /// (c) Le split produit les bons segments texte/citation/texte, avec
-    /// découpe en CODEPOINTS (texte multi-octets).
     #[test]
     fn split_spans_segments_text_cite_text() {
-        // "voir article 1240 du code" — « 1240 » aux codepoints 13..17.
         let text = "voir article 1240 du code";
         let segs = split_spans(text, &[span(13, 17, Some("/texte/code-civil/1240"))]);
         assert_eq!(segs.len(), 3);
@@ -318,15 +304,13 @@ mod tests {
 
     #[test]
     fn split_spans_multibyte_codepoint_offsets() {
-        // « é » est 1 codepoint / 2 octets : la découpe doit indexer en codepoints.
         let text = "café 1240 thé";
-        // « 1240 » = codepoints 5..9.
         let segs = split_spans(text, &[span(5, 9, None)]);
         assert_eq!(segs.len(), 3);
         match &segs[1] {
             CiteSeg::Cite { text, targets } => {
                 assert_eq!(text, "1240");
-                assert!(targets[0].href.is_none()); // non résolu → souligné non-cliquable
+                assert!(targets[0].href.is_none());
             }
             _ => panic!("segment 1 doit être Cite"),
         }
@@ -348,8 +332,6 @@ mod tests {
 
     #[test]
     fn split_spans_carries_multiple_targets_for_one_span() {
-        // « articles 1382 et 1383 du code civil » : un span, deux cibles → un seul
-        // segment Cite portant les deux (rendu = menu déroulant côté composant).
         let text = "articles 1382 et 1383 du code civil";
         let multi = CitationSpan {
             start: 0,
@@ -375,10 +357,8 @@ mod tests {
 
     #[test]
     fn split_spans_multi_occurrence_emits_each() {
-        // Deux mentions disjointes → deux segments Cite.
         let text = "1240 puis 1241";
         let segs = split_spans(text, &[span(0, 4, Some("/a")), span(10, 14, Some("/b"))]);
-        // Cite("1240"), Plain(" puis "), Cite("1241")
         assert_eq!(segs.len(), 3);
         assert!(matches!(&segs[0], CiteSeg::Cite { text, .. } if text == "1240"));
         assert!(matches!(&segs[2], CiteSeg::Cite { text, .. } if text == "1241"));

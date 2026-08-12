@@ -5,10 +5,9 @@ node_modules/
 docs/working-notes/
 *.log
 
-# Contexte de build = racine du repo, mais l'image (infra/Dockerfile.app, ADR 0065)
-# ne COPY que les artefacts de `mise run build-app` : les 2 binaires release + les
-# assets SSR. On exclut le reste de target/ (debug ~19G, front, deps release) pour
-# ne pas tar 22G de contexte à chaque build d'image.
+# Le contexte de build est la racine du repo, mais l'image ne copie que les
+# artefacts de `mise run build-app` : les deux binaires release et les assets
+# SSR. Le reste de `target/` pèse des dizaines de gigaoctets.
 target/*
 !target/release
 target/release/*

@@ -1,5 +1,5 @@
 -- Migration 0101 — les fonctions de sync des arrays de facettes rapportent la
--- dérive (ADR 0147).
+-- dérive.
 --
 -- Même recompute que 0098 (agrégat depuis `legal_citation`, garde
 -- `IS DISTINCT FROM`), mais RETURNS bigint = nombre de lignes corrigées.

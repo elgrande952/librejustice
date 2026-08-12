@@ -1,5 +1,4 @@
 -- Migration 0010 : tables OAuth 2.1 pour l'accès MCP tiers
--- ADR : voir docs/adr/ (décision structurante MCP auth)
 
 CREATE TABLE mcp_clients (
     client_id   TEXT PRIMARY KEY,

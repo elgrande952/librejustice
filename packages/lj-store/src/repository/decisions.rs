@@ -1,4 +1,4 @@
-//! Upsert des métadonnées décision et écriture du contenu canonique (ADR 0098) :
+//! Upsert des métadonnées décision et écriture du contenu canonique :
 //! `upsert`/`update_existing`, application de provenance, écriture canonique,
 //! création, et mise à jour batchée des champs ré-extractibles.
 
@@ -25,11 +25,8 @@ impl DecisionRepository<'_> {
     }
 
     /// Nombre de décisions **actives** (non soft-deleted) = corpus réellement
-    /// indexé et cherchable. Compte exact plutôt que l'estimation `pg_class.
-    /// reltuples`, qui sur-estime de plusieurs centaines de milliers après le
-    /// bloat des UPDATE de ré-extraction ; et `reltuples` ne peut de toute façon
-    /// pas filtrer `deleted_at`. Servi via cache 12 h (stats accueil) → un seq
-    /// scan 2×/jour est négligeable.
+    /// indexé et cherchable. Compte exact : `pg_class.reltuples` ne peut pas
+    /// filtrer `deleted_at`. Servi via cache 12 h (stats accueil).
     #[tracing::instrument(name = "db.count_active_decisions", skip(self), fields(db.system = "postgresql"))]
     pub async fn count_active_decisions(&self) -> Result<i64> {
         let row = self
@@ -40,6 +37,30 @@ impl DecisionRepository<'_> {
             )
             .await?;
         Ok(row.get::<_, i64>(0))
+    }
+
+    /// Identité de cible d'un lot de décisions actives — l'entrée de la sonde
+    /// inversée (`attract_pending_citations`) : de quoi générer les clés
+    /// candidates (`lj_extract::identity::pending_target_keys`) depuis les
+    /// valeurs STOCKÉES (code juridiction canonicalisé, dockets écrits).
+    /// Renvoie `(jurisdiction_type, jurisdiction_code, docket_numbers,
+    /// canonical_ref)`.
+    pub async fn decision_target_identities(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<(String, Option<String>, Vec<String>, Option<String>)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT jurisdiction_type, jurisdiction_code, docket_numbers, canonical_ref \
+                 FROM decisions WHERE id = ANY($1) AND deleted_at IS NULL",
+                &[&ids],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect())
     }
 
     #[tracing::instrument(name = "db.upsert", skip(self, decision, extracted), fields(db.system = "postgresql"))]
@@ -62,14 +83,14 @@ impl DecisionRepository<'_> {
             )));
         }
 
-        // ADR 0098 §4 : l'upsert est **piloté par `source_uid`** (pivot
-        // d'idempotence sur `decision_sources`).
+        // L'upsert est **piloté par `source_uid`** (pivot d'idempotence sur
+        // `decision_sources`).
         if let Some((id, stored_checksum, active)) =
             self.find_provenance(&decision.source_uid).await?
         {
             // Provenance connue (active OU tombstonée) → ré-update en place, même
-            // décision (§4.1). Skip seulement si active ET checksum inchangé ;
-            // une provenance tombstonée se ressuscite même à checksum égal.
+            // décision. Skip seulement si active ET checksum inchangé ; une provenance
+            // tombstonée se ressuscite même à checksum égal.
             if active && stored_checksum == content_checksum {
                 return Ok(UpsertResult {
                     id,
@@ -94,9 +115,8 @@ impl DecisionRepository<'_> {
             });
         }
 
-        // `source_uid` inconnu → résolution d'identité : ECLI puis `canonical_ref`
-        // (ADR 0100). Match → on attache la provenance à la décision trouvée ;
-        // sinon → création.
+        // `source_uid` inconnu → résolution d'identité par `canonical_ref`. Match →
+        // on attache la provenance à la décision trouvée ; sinon → création.
         if let Some(existing_id) = self.resolve_identity(decision, canonical_ref).await? {
             self.apply_provenance(
                 existing_id,
@@ -134,13 +154,13 @@ impl DecisionRepository<'_> {
         })
     }
 
-    /// Applique la provenance entrante à une décision EXISTANTE `decision_id`
-    /// (ADR 0098 §3/§4), sous verrou xact sur la décision. (1) upsert de la
-    /// `decision_sources` (porte `source_fields`, lève le tombstone) ; (2)
-    /// réécrit le contenu canonique (`full_text`/métadonnées) **SSI l'entrant est
-    /// (ou devient) l'autorité** — provenance de rang max (§3) : une source de
-    /// rang inférieur attache ses méta sans toucher au texte servi (garde RGPD) ;
-    /// (3) `reconcile` (état `deleted_at` / vide).
+    /// Applique la provenance entrante à une décision EXISTANTE `decision_id`,
+    /// sous verrou xact sur la décision. (1) upsert de la `decision_sources` (porte
+    /// `source_fields`, lève le tombstone) ; (2) réécrit le contenu canonique
+    /// (`full_text`/métadonnées) **SSI l'entrant est (ou devient) l'autorité** —
+    /// provenance de rang max : une source de rang inférieur attache ses méta sans
+    /// toucher au texte servi (garde RGPD) ; (3) `reconcile` (état `deleted_at` /
+    /// vide).
     #[allow(clippy::too_many_arguments)]
     async fn apply_provenance(
         &self,
@@ -155,7 +175,7 @@ impl DecisionRepository<'_> {
         payload_format: &str,
     ) -> Result<()> {
         // Verrou par décision (relâché en fin de transaction de l'appelant) :
-        // sérialise upsert et retrait concurrents sur la même décision (§4).
+        // sérialise upsert et retrait concurrents sur la même décision.
         self.conn
             .execute("SELECT pg_advisory_xact_lock($1)", &[&decision_id])
             .await?;
@@ -168,9 +188,9 @@ impl DecisionRepository<'_> {
             source_fields,
         )
         .await?;
-        // 2) Contenu canonique : seule l'autorité (rang max, §3/§4.2) écrit
-        //    `full_text`/métadonnées. La provenance vient d'être upsertée, donc
-        //    elle entre dans le calcul de l'autorité.
+        // 2) Contenu canonique : seule l'autorité (rang max) écrit
+        //    `full_text`/métadonnées. La provenance vient d'être upsertée, donc elle
+        //    entre dans le calcul de l'autorité.
         if self.authority_source_uid(decision_id).await?.as_deref()
             == Some(decision.source_uid.as_str())
         {
@@ -200,12 +220,12 @@ impl DecisionRepository<'_> {
     }
 
     /// Réécrit les colonnes **canoniques** d'une décision depuis sa provenance
-    /// autoritaire (ADR 0098 §3) : métadonnées coalescées, `full_text` (texte de
-    /// l'autorité), identité (`ecli`/`canonical_ref`), versions. N'écrit **rien**
-    /// de spécifique à une provenance (`source_uid`/`content_checksum`/
-    /// `source_fields` vivent sur `decision_sources`). No-op sur une décision à
-    /// `extract_version` > `EXTRACT_VERSION` (ADR 0140 : un écrivain à
-    /// version V ne remplace jamais des données à version > V).
+    /// autoritaire : métadonnées coalescées, `full_text` (texte de l'autorité),
+    /// identité (`ecli`/`canonical_ref`), versions. N'écrit **rien** de spécifique à
+    /// une provenance (`source_uid`/`content_checksum`/`source_fields` vivent sur
+    /// `decision_sources`). No-op sur une décision à `extract_version` >
+    /// `EXTRACT_VERSION` : un écrivain à version V ne remplace jamais des données à
+    /// version > V.
     async fn write_canonical_content(
         &self,
         decision_id: i64,
@@ -285,17 +305,16 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Crée les lignes du référentiel `jurisdiction` manquantes (ADR 0146) —
-    /// référentiel OUVERT nourri par la donnée, contrairement à `facet_value`
-    /// (vocabulaire fermé seedé). L'entrée est keyée par `source_code` (code de
-    /// la source, ex. location Judilibre `tj75056`) ; le code canonique
-    /// (`tj_paris`, ADR 0201) est calculé à la création. Renvoie la map
-    /// `source_code` → code canonique pour `decisions.jurisdiction_code`.
-    /// Conflit sur `source_code` : la ligne existante ne bouge que si la
-    /// nouvelle est plus disante (elle apporte la ville et l'existante n'en a
-    /// pas) — un libellé source nu (« Tribunal judiciaire ») ne dégrade jamais
-    /// un label complet, et une ligne née nue guérit dès qu'une décision du
-    /// même code porte la ville (son `code`, lui, reste celui de la création).
+    /// Crée les lignes du référentiel `jurisdiction` manquantes — référentiel
+    /// OUVERT nourri par la donnée. L'entrée est keyée par `source_code` (code de la
+    /// source, ex. location Judilibre `tj75056`) ; le code canonique (`tj_paris`)
+    /// est calculé à la création. Renvoie la map `source_code` → code canonique
+    /// pour `decisions.jurisdiction_code`. Conflit sur `source_code` : la ligne
+    /// existante ne bouge que si la nouvelle est plus disante (elle apporte la ville
+    /// et l'existante n'en a pas) — un libellé source nu (« Tribunal judiciaire »)
+    /// ne dégrade jamais un label complet, et une ligne née nue guérit dès qu'une
+    /// décision du même code porte la ville (son `code`, lui, reste celui de la
+    /// création).
     pub async fn ensure_jurisdictions(
         &self,
         rows: &[JurisdictionRow],
@@ -304,21 +323,19 @@ impl DecisionRepository<'_> {
         if rows.is_empty() {
             return Ok(resolved);
         }
-        // Dédup par code en ordre TRIÉ : l'upsert verrouille ses lignes dans
-        // l'ordre du VALUES et les tient jusqu'au COMMIT du lot appelant — un
-        // ordre non déterministe entre workers reextract concurrents a produit
-        // un vrai deadlock (2026-07-05, deux lots aux codes croisés).
+        // Dédup par code en ordre TRIÉ : l'upsert verrouille ses lignes dans l'ordre
+        // du VALUES et les tient jusqu'au COMMIT du lot appelant. Un ordre non
+        // déterministe entre workers concurrents deadlocke.
         let mut by_code: std::collections::BTreeMap<&str, &JurisdictionRow> =
             std::collections::BTreeMap::new();
         for r in rows {
             by_code.entry(r.source_code.as_str()).or_insert(r);
         }
-        // Pré-filtre lecture seule : en régime établi le référentiel porte déjà
-        // tous les codes avec ville — `ON CONFLICT DO UPDATE` verrouillerait
-        // pourtant CHAQUE ligne conflictuelle (avant d'évaluer son WHERE), et
-        // les workers se sérialiseraient sur les codes chauds. On n'upserte que
-        // les codes absents ou guérissables ; la course résiduelle (deux
-        // workers découvrent le même code neuf) est absorbée par l'ON CONFLICT.
+        // Pré-filtre lecture seule : `ON CONFLICT DO UPDATE` verrouille CHAQUE ligne
+        // conflictuelle avant d'évaluer son WHERE, et les workers se sérialiseraient
+        // sur les codes chauds. On n'upserte que les codes absents ou guérissables ; la
+        // course résiduelle (deux workers découvrent le même code neuf) est absorbée
+        // par l'ON CONFLICT.
         let all_sources: Vec<&str> = by_code.keys().copied().collect();
         let existing: std::collections::HashMap<String, (String, bool)> = self
             .conn
@@ -331,10 +348,10 @@ impl DecisionRepository<'_> {
             .into_iter()
             .map(|r| (r.get(0), (r.get(1), r.get(2))))
             .collect();
-        // Codes canoniques des sources nouvelles : un code déjà porté par une
-        // AUTRE ligne est une variante de nom de la même cour (« TA de St
-        // Barthélemy » émis quand la ligne canonique dit « Saint-Barthélemy »)
-        // — on résout vers cette ligne, le PK `code` interdit une seconde.
+        // Codes canoniques des sources nouvelles : un code déjà porté par une AUTRE
+        // ligne est une variante de nom de la même cour (« TA de St Barthélemy » émis
+        // quand la ligne canonique dit « Saint-Barthélemy ») — on résout vers cette
+        // ligne, le PK `code` interdit une seconde.
         let candidates: Vec<String> = by_code
             .iter()
             .filter(|(source, _)| !existing.contains_key(**source))
@@ -418,8 +435,7 @@ impl DecisionRepository<'_> {
 
     /// Met à jour une décision dont l'id est **déjà résolu** (chemin pipeline
     /// `decision_id` connu : re-embed, backfill). Applique la provenance entrante
-    /// via [`apply_provenance`](Self::apply_provenance) (ADR 0098 §4) — comme
-    /// `upsert` côté décision existante, mais sans re-sonder l'identité.
+    /// via [`apply_provenance`](Self::apply_provenance), sans re-sonder l'identité.
     #[tracing::instrument(name = "db.update_existing", skip(self, decision, extracted), fields(db.system = "postgresql"))]
     #[allow(clippy::too_many_arguments)]
     pub async fn update_existing(
@@ -471,8 +487,8 @@ impl DecisionRepository<'_> {
             .collect();
 
         if !column_fields.is_empty() {
-            // FK jurisdiction_code : ligne référentielle garantie + code source
-            // résolu en code canonique (ADR 0201) avant l'UPDATE.
+            // FK jurisdiction_code : ligne référentielle garantie + code source résolu
+            // en code canonique avant l'UPDATE.
             let jurisdiction_codes = if column_fields.contains(&"jurisdiction_code") {
                 let juris: Vec<JurisdictionRow> =
                     extracted.jurisdiction.clone().into_iter().collect();
@@ -481,14 +497,16 @@ impl DecisionRepository<'_> {
                 Default::default()
             };
             let mut assignments: Vec<String> = Vec::with_capacity(column_fields.len() + 1);
+            let mut rhs: Vec<String> = Vec::with_capacity(column_fields.len());
             let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
             let mut idx = 1;
             for field in &column_fields {
-                if overwrite {
-                    assignments.push(format!("{field} = ${idx}"));
+                rhs.push(if overwrite {
+                    format!("${idx}")
                 } else {
-                    assignments.push(format!("{field} = COALESCE({field}, ${idx})"));
-                }
+                    format!("COALESCE({field}, ${idx})")
+                });
+                assignments.push(format!("{field} = {}", rhs[rhs.len() - 1]));
                 if *field == "jurisdiction_code" {
                     params.push(Box::new(
                         extracted
@@ -501,7 +519,13 @@ impl DecisionRepository<'_> {
                 }
                 idx += 1;
             }
-            assignments.push(format!("updated_at = ${idx}"));
+            // Le tampon suit le contenu, pas l'écriture. Les RHS s'évaluent sur la
+            // ligne d'avant l'UPDATE, la comparaison est donc bien ancien vs nouveau.
+            assignments.push(format!(
+                "updated_at = CASE WHEN ({}) IS DISTINCT FROM ({}) THEN ${idx} ELSE updated_at END",
+                column_fields.join(", "),
+                rhs.join(", "),
+            ));
             params.push(Box::new(now()));
             idx += 1;
             let id_ph = idx;
@@ -516,28 +540,58 @@ impl DecisionRepository<'_> {
             self.conn.execute(sql.as_str(), &refs).await?;
         }
 
+        // Les couches satellites vivent hors de l'UPDATE colonnes : elles datent la
+        // page elles-mêmes quand elles changent.
+        let mut satellites: Vec<i64> = Vec::new();
         if selected.contains(&LEGAL_REFS_FIELD)
             && (overwrite || extracted.citation_occurrences.is_some())
         {
-            self.replace_citations(decision_id, extracted.citation_occurrences.as_deref())
-                .await?;
+            satellites.extend(
+                self.replace_citations(decision_id, extracted.citation_occurrences.as_deref())
+                    .await?,
+            );
         }
         if selected.contains(&DECISION_LINKS_FIELD)
             && (overwrite || extracted.decision_links.is_some())
         {
-            self.replace_decision_links(decision_id, extracted.decision_links.as_deref())
-                .await?;
+            satellites.extend(
+                self.replace_decision_links(decision_id, extracted.decision_links.as_deref())
+                    .await?,
+            );
         }
         if selected.contains(&CASE_CITATIONS_FIELD)
             && (overwrite || extracted.case_citations.is_some())
         {
-            self.replace_case_citations(decision_id, extracted.case_citations.as_deref())
-                .await?;
+            satellites.extend(
+                self.replace_case_citations(decision_id, extracted.case_citations.as_deref())
+                    .await?,
+            );
         }
         if selected.contains(&PARTIES_FIELD) && (overwrite || extracted.parties.is_some()) {
-            self.replace_decision_parties(decision_id, extracted.parties.as_deref())
-                .await?;
+            satellites.extend(
+                self.replace_decision_parties(decision_id, extracted.parties.as_deref())
+                    .await?,
+            );
         }
+        self.touch_content_changed(satellites).await
+    }
+
+    /// Date du jour les pages dont une couche satellite vient de changer —
+    /// références légales, liens de chronologie, citations de jurisprudence,
+    /// acteurs. Le rendu a bougé même quand aucune colonne de `decisions` n'a été
+    /// touchée.
+    async fn touch_content_changed(&self, mut ids: Vec<i64>) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        self.conn
+            .execute(
+                "UPDATE decisions SET updated_at = $1 WHERE id = ANY($2)",
+                &[&now(), &ids],
+            )
+            .await?;
         Ok(())
     }
 
@@ -566,15 +620,14 @@ impl DecisionRepository<'_> {
             .collect();
 
         // Pas de skip-diff colonnes en lecture préalable : le skip vit DANS
-        // l'UPDATE (comparaison de tuples, cf. plus bas) — l'ancien diff
-        // relisait toutes les colonnes ré-extractibles du lot.
+        // l'UPDATE (comparaison de tuples, cf. plus bas).
         let column_items: &[(i64, ExtractedFields)] =
             if column_fields.is_empty() { &[] } else { items };
 
         if !column_items.is_empty() {
-            // FK jurisdiction_code : les lignes du référentiel doivent exister
-            // avant l'UPDATE (référentiel ouvert, ADR 0146) ; la map résout le
-            // code source vers le code canonique (ADR 0201).
+            // FK jurisdiction_code : les lignes du référentiel doivent exister avant
+            // l'UPDATE (référentiel ouvert) ; la map résout le code source vers le code
+            // canonique.
             let jurisdiction_codes = if column_fields.contains(&"jurisdiction_code") {
                 let juris: Vec<JurisdictionRow> = column_items
                     .iter()
@@ -584,7 +637,7 @@ impl DecisionRepository<'_> {
             } else {
                 Default::default()
             };
-            // Param $1 = updated_at (clause SET avant VALUES, cf. Python).
+            // Param $1 = updated_at (clause SET avant VALUES).
             let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
             params.push(Box::new(now()));
             let mut idx = 2;
@@ -633,28 +686,33 @@ impl DecisionRepository<'_> {
                     }
                 })
                 .collect();
+            let d_tuple: Vec<String> = column_fields.iter().map(|f| format!("d.{f}")).collect();
             let mut assignments: Vec<String> = Vec::with_capacity(column_fields.len() + 2);
             for (field, rhs) in column_fields.iter().zip(&rhs) {
                 assignments.push(format!("{field} = {rhs}"));
             }
-            assignments.push("updated_at = $1".to_string());
+            // `updated_at` = date du dernier changement de CONTENU, pas de la dernière
+            // écriture : même comparaison NULL-safe que le skip-tuple ci-dessous, portée
+            // sur l'affectation. Un bump d'EXTRACT_VERSION réécrit donc la ligne — le
+            // tampon de version doit monter — sans avancer la date d'une page inchangée.
+            assignments.push(format!(
+                "updated_at = CASE WHEN ({}) IS DISTINCT FROM ({}) THEN $1 ELSE d.updated_at END",
+                d_tuple.join(", "),
+                rhs.join(", "),
+            ));
 
             let cols_decl: Vec<String> = std::iter::once("id".to_string())
                 .chain(column_fields.iter().map(|f| (*f).to_string()))
                 .collect();
 
-            // Invariant : un écrivain à version V ne remplace jamais des données
-            // à version > V (révisions manuelles incluses, ADR 0140). Le tampon
-            // de version s'écrit dans le MÊME UPDATE (une seule version de
-            // ligne par passe — la table porte l'index BM25) : tous les items
-            // re-parsés sont à jour, y compris ceux dont aucun champ n'a
-            // changé (reprise du reextract, ADR 0083). Ne fait que monter.
-            // Skip in-UPDATE : une ligne DÉJÀ à la version courante dont aucune
-            // colonne ne changerait n'est pas réécrite (comparaison de tuples
-            // NULL-safe) — la passe intégrale hebdomadaire (cron `--full`)
-            // rejoue tout le fonds et ne doit churner ni lignes ni index BM25.
+            // Invariant : un écrivain à version V ne remplace jamais des données à
+            // version > V (révisions manuelles incluses). Le tampon de version s'écrit dans
+            // le MÊME UPDATE (une seule version de ligne par passe — la table porte l'index
+            // BM25) : tous les items re-parsés sont à jour, y compris ceux dont aucun champ
+            // n'a changé. Ne fait que monter.
+            // Skip in-UPDATE : une ligne DÉJÀ à la version courante dont aucune colonne ne
+            // changerait n'est pas réécrite (comparaison de tuples NULL-safe).
             params.push(Box::new(EXTRACT_VERSION));
-            let d_tuple: Vec<String> = column_fields.iter().map(|f| format!("d.{f}")).collect();
             let sql = format!(
                 "UPDATE decisions d SET {}, extract_version = ${idx} \
                  FROM (VALUES {}) AS src({}) \
@@ -672,13 +730,16 @@ impl DecisionRepository<'_> {
             self.conn.execute(sql.as_str(), &refs).await?;
         }
 
+        // Les couches satellites vivent hors de l'UPDATE colonnes : elles datent la
+        // page elles-mêmes quand elles changent.
+        let mut satellites: Vec<i64> = Vec::new();
         if selected.contains(&LEGAL_REFS_FIELD) {
             let refs_items: Vec<super::citations::CitationWriteItem> = items
                 .iter()
                 .filter(|(_, e)| overwrite || e.citation_occurrences.is_some())
                 .map(|(id, e)| (*id, e.citation_occurrences.clone()))
                 .collect();
-            self.replace_citations_bulk(&refs_items).await?;
+            satellites.extend(self.replace_citations_bulk(&refs_items).await?);
         }
         if selected.contains(&DECISION_LINKS_FIELD) {
             let link_items: Vec<super::links::DecisionLinkWriteItem> = items
@@ -686,7 +747,7 @@ impl DecisionRepository<'_> {
                 .filter(|(_, e)| overwrite || e.decision_links.is_some())
                 .map(|(id, e)| (*id, e.decision_links.clone()))
                 .collect();
-            self.replace_decision_links_bulk(&link_items).await?;
+            satellites.extend(self.replace_decision_links_bulk(&link_items).await?);
         }
         if selected.contains(&CASE_CITATIONS_FIELD) {
             let case_items: Vec<super::cases::CaseCitationWriteItem> = items
@@ -694,7 +755,7 @@ impl DecisionRepository<'_> {
                 .filter(|(_, e)| overwrite || e.case_citations.is_some())
                 .map(|(id, e)| (*id, e.case_citations.clone()))
                 .collect();
-            self.replace_case_citations_bulk(&case_items).await?;
+            satellites.extend(self.replace_case_citations_bulk(&case_items).await?);
         }
         if selected.contains(&PARTIES_FIELD) {
             let party_items: Vec<super::parties::DecisionPartyWriteItem> = items
@@ -702,13 +763,14 @@ impl DecisionRepository<'_> {
                 .filter(|(_, e)| overwrite || e.parties.is_some())
                 .map(|(id, e)| (*id, e.parties.clone()))
                 .collect();
-            self.replace_decision_parties_bulk(&party_items).await?;
+            satellites.extend(self.replace_decision_parties_bulk(&party_items).await?);
         }
+        self.touch_content_changed(satellites).await?;
 
         // Tampon de version quand aucune colonne n'est sélectionnée (run
-        // `--fields legal_references` seul) — sinon il est fusionné dans
-        // l'UPDATE colonnes ci-dessus. Ne fait que MONTER : une version
-        // supérieure (révision manuelle, ADR 0140) n'est jamais dégradée.
+        // `--fields legal_references` seul) — sinon il est fusionné dans l'UPDATE
+        // colonnes ci-dessus. Ne fait que MONTER : une version supérieure (révision
+        // manuelle) n'est jamais dégradée.
         if column_fields.is_empty() {
             let ids: Vec<i64> = items.iter().map(|(id, _)| *id).collect();
             self.conn
@@ -723,11 +785,127 @@ impl DecisionRepository<'_> {
         Ok(())
     }
 
-    /// Crée une décision (nouvelle identité, §4.2) : INSERT du canonique pur (ni
+    /// Compte, sans rien écrire, les lignes qu'un `--overwrite` réécrirait —
+    /// même source `VALUES` et même comparaison NULL-safe que le skip-tuple de
+    /// [`Self::update_extracted_fields_bulk`], en SELECT. Renvoie, aligné sur
+    /// les champs colonnes de `fields`, le nombre de lignes divergentes et
+    /// jusqu'à deux exemples `#id ancien → nouveau`.
+    ///
+    /// `jurisdiction_code` se résout en LECTURE (pas d'`ensure_jurisdictions`,
+    /// qui crée) : un `source_code` absent du référentiel compte comme
+    /// divergence vers `∅`, ce qu'une vraie passe créerait.
+    pub async fn diff_extracted_fields_bulk(
+        &self,
+        items: &[(i64, ExtractedFields)],
+        fields: &[&str],
+    ) -> Result<Vec<(String, i64, Vec<String>)>> {
+        let column_fields: Vec<&str> = fields
+            .iter()
+            .copied()
+            .filter(|f| {
+                *f != LEGAL_REFS_FIELD
+                    && *f != DECISION_LINKS_FIELD
+                    && *f != CASE_CITATIONS_FIELD
+                    && *f != PARTIES_FIELD
+            })
+            .collect();
+        if items.is_empty() || column_fields.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let jurisdiction_codes: std::collections::HashMap<String, String> =
+            if column_fields.contains(&"jurisdiction_code") {
+                let sources: Vec<String> = items
+                    .iter()
+                    .filter_map(|(_, e)| e.jurisdiction.as_ref().map(|j| j.source_code.clone()))
+                    .collect();
+                self.conn
+                    .query(
+                        "SELECT source_code, code FROM jurisdiction WHERE source_code = ANY($1)",
+                        &[&sources],
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|r| (r.get(0), r.get(1)))
+                    .collect()
+            } else {
+                Default::default()
+            };
+
+        let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+        let mut idx = 1;
+        let mut value_rows: Vec<String> = Vec::with_capacity(items.len());
+        for (row_pos, (decision_id, extracted)) in items.iter().enumerate() {
+            let mut cells: Vec<String> = Vec::with_capacity(column_fields.len() + 1);
+            if row_pos == 0 {
+                cells.push(format!("(${idx})::bigint"));
+            } else {
+                cells.push(format!("${idx}"));
+            }
+            params.push(Box::new(*decision_id));
+            idx += 1;
+            for field in &column_fields {
+                if row_pos == 0 {
+                    cells.push(format!("(${})::{}", idx, extracted_column_type(field)));
+                } else {
+                    cells.push(format!("${idx}"));
+                }
+                if *field == "jurisdiction_code" {
+                    params.push(Box::new(
+                        extracted
+                            .jurisdiction
+                            .as_ref()
+                            .and_then(|j| jurisdiction_codes.get(&j.source_code).cloned()),
+                    ));
+                } else {
+                    params.push(extracted_field_value(extracted, field));
+                }
+                idx += 1;
+            }
+            value_rows.push(format!("({})", cells.join(", ")));
+        }
+
+        let mut projections: Vec<String> = Vec::with_capacity(column_fields.len() * 2);
+        for field in &column_fields {
+            projections.push(format!(
+                "count(*) FILTER (WHERE d.{field} IS DISTINCT FROM src.{field})"
+            ));
+            projections.push(format!(
+                "(array_agg(format('#%s %s → %s', d.id, \
+                   coalesce(d.{field}::text, '∅'), coalesce(src.{field}::text, '∅'))) \
+                 FILTER (WHERE d.{field} IS DISTINCT FROM src.{field}))[1:2]"
+            ));
+        }
+        let cols_decl: Vec<String> = std::iter::once("id".to_string())
+            .chain(column_fields.iter().map(|f| (*f).to_string()))
+            .collect();
+        let sql = format!(
+            "SELECT {} FROM (VALUES {}) AS src({}) JOIN decisions d ON d.id = src.id",
+            projections.join(", "),
+            value_rows.join(","),
+            cols_decl.join(", "),
+        );
+        let refs = as_param_refs(&params);
+        let row = self.conn.query_one(sql.as_str(), &refs).await?;
+        Ok(column_fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| {
+                let samples: Option<Vec<String>> = row.get(2 * i + 1);
+                (
+                    (*field).to_string(),
+                    row.get::<_, i64>(2 * i),
+                    samples.unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Crée une décision (nouvelle identité) : INSERT du canonique pur (ni
     /// `source_uid`/`content_checksum`/`source_fields` — ils vivent sur
-    /// `decision_sources`), avec `canonical_ref` (ADR 0100), puis enregistre la
-    /// provenance (qui porte `source_fields`). Nouvelle décision → autorité
-    /// triviale, son texte est canonique.
+    /// `decision_sources`), avec `canonical_ref`, puis enregistre la provenance (qui
+    /// porte `source_fields`). Nouvelle décision → autorité triviale, son texte est
+    /// canonique.
     #[allow(clippy::too_many_arguments)]
     async fn insert_decision(
         &self,
@@ -810,6 +988,8 @@ impl DecisionRepository<'_> {
                 .await?;
             self.replace_decision_links(decision_id, e.decision_links.as_deref())
                 .await?;
+            self.replace_case_citations(decision_id, e.case_citations.as_deref())
+                .await?;
             self.replace_decision_parties(decision_id, e.parties.as_deref())
                 .await?;
         }
@@ -826,10 +1006,10 @@ impl DecisionRepository<'_> {
 
     /// Streame le texte des décisions par pagination keyset sur `id` : renvoie
     /// jusqu'à `limit` lignes `(id, full_text)` d'`id` strictement > `after_id`,
-    /// ordonnées par `id`. L'appelant boucle en avançant `after_id` au dernier
-    /// id reçu jusqu'à un batch vide. `sample_mod` ≥ 1 sous-échantillonne
+    /// ordonnées par `id`. L'appelant boucle en avançant `after_id` au dernier id
+    /// reçu jusqu'à un batch vide. `sample_mod` ≥ 1 sous-échantillonne
     /// (`id % sample_mod = 0` ; `1` = tout le corpus). Alimente le mineur de
-    /// collocations (`lj-bench mine-collocations`) — grain décision (ADR 0084).
+    /// collocations (`lj-bench mine-collocations`) — grain décision.
     #[tracing::instrument(name = "db.fetch_chunk_bodies_after", skip(self), fields(db.system = "postgresql"))]
     pub async fn fetch_chunk_bodies_after(
         &self,
@@ -853,10 +1033,10 @@ impl DecisionRepository<'_> {
     }
 }
 
-/// Code canonique d'une unité juridictionnelle (ADR 0201) : TJ/TCOM = slug de
-/// la ville (`tj_paris`, `tcom_lyon`) ; tout autre type reprend le code source
-/// tel quel (singletons `cc`/`ce`… et slugs `ca_`/`caa_`/`ta_` déjà en ville).
-/// Sans ville exploitable, repli franc sur le code source.
+/// Code canonique d'une unité juridictionnelle : TJ/TCOM = slug de la ville
+/// (`tj_paris`, `tcom_lyon`) ; tout autre type reprend le code source tel quel
+/// (singletons `cc`/`ce`… et slugs `ca_`/`caa_`/`ta_` déjà en ville). Sans ville
+/// exploitable, repli franc sur le code source.
 fn canonical_jurisdiction_code(
     jurisdiction_type: &str,
     city: Option<&str>,
@@ -907,7 +1087,6 @@ mod tests {
 
     #[test]
     fn canonical_codes_slug_tj_tcom_cities() {
-        // Spec ADR 0201, miroir de l'expression SQL de la migration 0137.
         for (city, expected) in [
             ("Paris", "tj_paris"),
             ("Saint-Étienne", "tj_saint_etienne"),
@@ -915,8 +1094,6 @@ mod tests {
             ("Châlons-en-Champagne", "tj_chalons_en_champagne"),
             ("Les Sables-d'Olonne", "tj_les_sables_d_olonne"),
             ("Saint-Denis de la Réunion", "tj_saint_denis_de_la_reunion"),
-            // ç → c : le translate SQL de la 0137 était désaligné (réparé en
-            // 0138), le miroir Rust fait foi.
             ("Besançon", "tj_besancon"),
             ("Alençon", "tj_alencon"),
             ("Montluçon", "tj_montlucon"),
@@ -935,12 +1112,10 @@ mod tests {
             ),
             "tcom_villefranche_sur_saone_tarare"
         );
-        // Sans ville : repli franc sur le code source.
         assert_eq!(
             canonical_jurisdiction_code("TJ", None, "tj75056"),
             "tj75056"
         );
-        // Hors TJ/TCOM : le code source est déjà canonique.
         assert_eq!(
             canonical_jurisdiction_code("CA", Some("Paris"), "ca_paris"),
             "ca_paris"

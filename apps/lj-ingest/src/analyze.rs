@@ -1,5 +1,4 @@
-//! Passe d'analyse sur le corpus local (port de
-//! `librejustice-store/pipelines/analyze.py`).
+//! Passe d'analyse sur le corpus local.
 //!
 //! Lit toutes les décisions sous `data/zips/**/*.zip` (+ dossiers `--extra-dir`
 //! de `*.xml`), parse chacune via `lj-core`, et produit un rapport JSON :
@@ -15,8 +14,8 @@ use lj_core::parsing::parse_xml;
 use lj_sources::zip_reader::iter_decisions;
 use serde_json::{json, Map, Value};
 
-/// Compteur ordonné façon `collections.Counter` : suit l'ordre d'insertion
-/// (première occurrence) pour casser les égalités comme CPython.
+/// Compteur ordonné : suit l'ordre d'insertion (première occurrence) pour
+/// casser les égalités.
 #[derive(Default)]
 struct Counter {
     counts: HashMap<String, i64>,
@@ -42,15 +41,13 @@ impl Counter {
         self.counts.len()
     }
 
-    /// Port de `Counter.most_common(n)` : tri par count desc, stable sur
-    /// l'ordre d'insertion. `n=None` → tout.
+    /// Tri par count desc, stable sur l'ordre d'insertion. `n=None` → tout.
     fn most_common(&self, n: Option<usize>) -> Vec<(String, i64)> {
         let mut items: Vec<(String, i64)> = self
             .order
             .iter()
             .map(|k| (k.clone(), self.counts[k]))
             .collect();
-        // stable : préserve l'ordre d'insertion à égalité
         items.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         if let Some(limit) = n {
             items.truncate(limit);
@@ -75,8 +72,8 @@ fn token_count(txt: &str) -> usize {
 
 /// Itère toutes les paires `(member_name, raw_xml)` du corpus local.
 ///
-/// Port de `_iter_corpus` : zips sous `data_dir/zips/**/*.zip` préfixés par le
-/// nom du zip, puis fichiers `*.xml` des dossiers `extra_dirs`.
+/// Zips sous `data_dir/zips/**/*.zip` préfixés par le nom du zip, puis fichiers
+/// `*.xml` des dossiers `extra_dirs`.
 fn iter_corpus(data_dir: &Path, extra_dirs: &[PathBuf]) -> Result<Vec<(String, Vec<u8>)>> {
     let mut out: Vec<(String, Vec<u8>)> = Vec::new();
     let zips_root = data_dir.join("zips");
@@ -89,7 +86,6 @@ fn iter_corpus(data_dir: &Path, extra_dirs: &[PathBuf]) -> Result<Vec<(String, V
             for (member, raw) in iter_decisions(&zip_path)
                 .with_context(|| format!("analyze: lecture zip {}", zip_path.display()))?
             {
-                // On préfixe le nom de membre par le zip pour tracer l'origine.
                 out.push((format!("{zip_name}::{member}"), raw));
             }
         }
@@ -130,15 +126,13 @@ fn walk(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Percentile (port de `_percentile`) : `values[round((n-1)*p)]` sur tri.
+/// Percentile : `values[round((n-1)*p)]` sur tri.
 fn percentile(values: &[usize], p: f64) -> usize {
     if values.is_empty() {
         return 0;
     }
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
-    // `round()` Python = arrondi banquier ; ici les indices sont entiers donc
-    // l'arrondi half-to-even tombe rarement à .5 — on suit Python via round_ties_even.
     let k = (((sorted.len() - 1) as f64) * p).round_ties_even() as usize;
     sorted[k.min(sorted.len() - 1)]
 }
@@ -157,7 +151,6 @@ fn sample_entry(decision: &lj_core::decision::Decision, texte: &str, n_tokens: u
             })
         })
         .collect();
-    // texte[:600] côté Python = 600 *caractères* (codepoints), pas octets.
     let texte_debut: String = texte.chars().take(600).collect();
     json!({
         "source_uid": decision.source_uid,
@@ -171,11 +164,9 @@ fn sample_entry(decision: &lj_core::decision::Decision, texte: &str, n_tokens: u
     })
 }
 
-/// Lance l'analyse et retourne le rapport JSON (port de `analyze.run`).
+/// Lance l'analyse et retourne le rapport JSON.
 ///
-/// `seed` est conservé pour le sampling par réservoir ; la parité bit-à-bit du
-/// RNG avec CPython (`random.Random`) n'est pas garantie (Mersenne Twister ≠
-/// PRNG Rust), mais l'algorithme et le format de sortie sont identiques.
+/// `seed` amorce le sampling par réservoir.
 pub fn run(data_dir: &Path, extra_dirs: &[PathBuf], sample: usize, seed: u64) -> Result<Value> {
     let mut rng = SmallRng::new(seed);
 
@@ -228,7 +219,6 @@ pub fn run(data_dir: &Path, extra_dirs: &[PathBuf], sample: usize, seed: u64) ->
         if sampled.len() < sample {
             sampled.push(sample_entry(&decision, &texte, n_tokens));
         } else {
-            // Python : j = rng.randint(0, total - 1), inclusif des deux bornes.
             let j = rng.randint(total - 1);
             if (j as usize) < sample {
                 sampled[j as usize] = sample_entry(&decision, &texte, n_tokens);
@@ -241,7 +231,6 @@ pub fn run(data_dir: &Path, extra_dirs: &[PathBuf], sample: usize, seed: u64) ->
     } else {
         let sum: usize = token_counts.iter().sum();
         let mean = sum as f64 / token_counts.len() as f64;
-        // round(x, 1) Python.
         Value::from((mean * 10.0).round_ties_even() / 10.0)
     };
 
@@ -269,10 +258,6 @@ pub fn run(data_dir: &Path, extra_dirs: &[PathBuf], sample: usize, seed: u64) ->
 }
 
 /// PRNG déterministe minimal (SplitMix64) pour le reservoir sampling.
-///
-/// NB : ce n'est PAS le Mersenne Twister de CPython ; le *contenu* de
-/// l'échantillon différera de Python à seed égal, mais le tirage est
-/// déterministe et reproductible côté Rust.
 struct SmallRng {
     state: u64,
 }
@@ -303,7 +288,6 @@ impl SmallRng {
 mod tests {
     use super::*;
 
-    // Spec : token_count = mots séparés par whitespace.
     #[test]
     fn token_count_words() {
         assert_eq!(token_count("le tribunal administratif de Paris"), 5);
@@ -311,24 +295,21 @@ mod tests {
         assert_eq!(token_count(""), 0);
     }
 
-    // Spec : percentile = values[round((n-1)*p)] sur tri.
     #[test]
     fn percentile_indices() {
-        let v: Vec<usize> = (1..=100).collect(); // 1..100
-        assert_eq!(percentile(&v, 0.50), 51); // round(99*0.5)=round(49.5)=50 (banker's) → v[50]=51
-        assert_eq!(percentile(&v, 0.90), 90); // round(99*0.9)=round(89.1)=89 → v[89]=90
-        assert_eq!(percentile(&v, 0.99), 99); // round(99*0.99)=round(98.01)=98 → v[98]=99
+        let v: Vec<usize> = (1..=100).collect();
+        assert_eq!(percentile(&v, 0.50), 51);
+        assert_eq!(percentile(&v, 0.90), 90);
+        assert_eq!(percentile(&v, 0.99), 99);
         assert_eq!(percentile(&[], 0.5), 0);
     }
 
-    // Spec : Counter.most_common = tri count desc, stable insertion à égalité.
     #[test]
     fn counter_most_common_order() {
         let mut c = Counter::default();
         for k in ["a", "b", "a", "c", "b", "a"] {
             c.bump(k);
         }
-        // a:3, b:2, c:1.
         assert_eq!(
             c.most_common(None),
             vec![
@@ -341,7 +322,6 @@ mod tests {
         assert_eq!(c.unique(), 3);
     }
 
-    // Spec : à égalité de count, l'ordre d'insertion est préservé.
     #[test]
     fn counter_ties_keep_insertion_order() {
         let mut c = Counter::default();

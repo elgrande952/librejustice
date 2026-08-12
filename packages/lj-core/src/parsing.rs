@@ -1,5 +1,4 @@
-//! Parsers tolérants vers le modèle `Decision`
-//! (port de `parsing/decision_input.py` XML + `parsing/judilibre_parser.py`).
+//! Parsers tolérants vers le modèle `Decision`.
 //!
 //! XML via `quick-xml` (tolérant, mode recover). JSON Judilibre via `serde_json`.
 //! Aucun I/O : les bytes/valeurs sont fournis par l'appelant (`lj-sources`).
@@ -18,27 +17,32 @@ mod ariane;
 mod cnda;
 mod dila;
 mod european;
+mod juricaf;
 pub use adde::{build_adde_source_fields, parse_adde_title, AddeCitation};
 pub use ariane::{
     analyse_body, build_ariane_source_fields, parse_ajce_html, parse_dce_html, AjceAnalysis,
     AjceEntry, AjceRubrique, DceParsed,
 };
 use cnda::source_uid_is_cnda;
-pub use cnda::{clean_ocr_markdown, parse_cnda, reflow_cnda_pdf_text, CndaParsed};
+pub use cnda::{
+    clean_ocr_markdown, cnda_solution_uid_from_source_fields, parse_cnda, reflow_cnda_pdf_text,
+    CndaParsed,
+};
 use dila::source_fields_is_dila;
 pub use dila::{build_source_fields_dila, parse_dila_doc, parse_dila_xml, DilaDoc, DilaFond};
 use european::source_uid_is_html_europe;
 pub use european::{parse_cedh, parse_cjue};
+pub use juricaf::{parse_juricaf, JuricafParsed};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// XML opendata (TA / CAA / CE) — port fidèle de decision_input.py
+// XML opendata (TA / CAA / CE)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Réparation byte-level : `<Texte_Integral></p>` orphelin → `<Texte_Integral>`.
 const BROKEN_TEXTE_INTEGRAL_OPEN: &[u8] = b"<Texte_Integral></p>";
 const FIXED_TEXTE_INTEGRAL_OPEN: &[u8] = b"<Texte_Integral>";
 
-/// Préfixes uid : D<X> (décisions), OR<X> (ordonnances). Port de `_TYPE_BY_PREFIX`.
+/// Préfixes uid : D<X> (décisions), OR<X> (ordonnances).
 const TYPE_BY_PREFIX: &[(&str, &str)] = &[
     ("DTA", "TA"),
     ("ORTA", "TA"),
@@ -48,8 +52,8 @@ const TYPE_BY_PREFIX: &[(&str, &str)] = &[
     ("ORCE", "CE"),
 ];
 
-// Patterns `_extract_sections` (ordre préservé : kind, regex). IGNORECASE
-// systématique (`re.IGNORECASE` côté Python). Le dispositif est aussi MULTILINE.
+// Patterns de sections (ordre préservé : kind, regex). IGNORECASE
+// systématique. Le dispositif est aussi MULTILINE.
 static SECTION_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     vec![
         (
@@ -72,12 +76,11 @@ static SECTION_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(||
     ]
 });
 
-/// Nom de fichier (dernier segment après `/`) — `Path(...).name`.
 fn path_name(p: &str) -> &str {
     p.rsplit('/').next().unwrap_or(p)
 }
 
-/// Port de `_classify_uid` : type de juridiction depuis le préfixe du nom uid.
+/// Type de juridiction depuis le préfixe du nom uid.
 fn classify_uid(source_uid: &str) -> Option<String> {
     let uid_name = path_name(source_uid).to_uppercase();
     TYPE_BY_PREFIX
@@ -86,8 +89,7 @@ fn classify_uid(source_uid: &str) -> Option<String> {
         .map(|(_, jur_type)| (*jur_type).to_string())
 }
 
-/// Arbre XML minimal : balise locale + enfants + texte descendant agrégé
-/// (`itertext()`). Reconstruit le sous-ensemble de lxml utilisé par le parser.
+/// Arbre XML minimal : balise locale + enfants + texte descendant agrégé.
 #[derive(Debug, Default)]
 pub struct XmlNode {
     pub tag: String,
@@ -99,7 +101,7 @@ pub struct XmlNode {
 }
 
 impl XmlNode {
-    /// `etree.find(path)` : suit un chemin `A/B/C` d'enfants directs, premier match.
+    /// Suit un chemin `A/B/C` d'enfants directs, premier match.
     pub fn find(&self, path: &str) -> Option<&XmlNode> {
         let mut current = self;
         for segment in path.split('/') {
@@ -108,12 +110,11 @@ impl XmlNode {
         Some(current)
     }
 
-    /// `_first` : premier des chemins candidats qui résout.
     fn find_first(&self, paths: &[&str]) -> Option<&XmlNode> {
         paths.iter().find_map(|p| self.find(p))
     }
 
-    /// `_text` : `itertext()` concaténé puis `.strip()` ; `None` si vide.
+    /// Texte descendant concaténé puis trimé ; `None` si vide.
     pub fn text(&self) -> Option<String> {
         let joined: String = self.text_parts.concat();
         let trimmed = joined.trim();
@@ -129,7 +130,6 @@ impl XmlNode {
     }
 }
 
-/// `_text` appliqué à un `Option<&XmlNode>` (gère le `None` amont).
 pub fn node_text(node: Option<&XmlNode>) -> Option<String> {
     node.and_then(XmlNode::text)
 }
@@ -140,12 +140,7 @@ fn local_name(qname: &[u8]) -> String {
     s.rsplit(':').next().unwrap_or(&s).to_string()
 }
 
-/// Construit l'arbre minimal depuis les events quick-xml (tolérant : pas de
-/// vérification des noms de fermeture, on dépile aussi à l'EOF). Les `text_parts`
-/// remontent vers tous les ancêtres pour reproduire `itertext()`.
-/// Lit les attributs d'un élément en `(nom local, valeur unescapée)`. Les valeurs
-/// d'attributs LEGI utiles (`@cid` = LEGITEXT) sont ASCII ; `from_utf8_lossy`
-/// suffit, comme pour les fragments de texte ailleurs dans `build_tree`.
+/// Lit les attributs d'un élément en `(nom local, valeur unescapée)`.
 fn read_attrs(e: &quick_xml::events::BytesStart) -> Vec<(String, String)> {
     e.attributes()
         .filter_map(std::result::Result::ok)
@@ -193,8 +188,6 @@ pub fn build_tree(raw: &[u8]) -> Option<XmlNode> {
                 attach(node, &mut stack, &mut root);
             }
             Ok(Event::Text(e)) => {
-                // quick-xml 0.39 a retiré BytesText::unescape : decode (encoding-aware)
-                // puis unescape des entites XML (&amp; ...), fidele a l'ancien comportement.
                 let txt = match e.decode() {
                     Ok(d) => quick_xml::escape::unescape(&d)
                         .map(|u| u.into_owned())
@@ -207,11 +200,9 @@ pub fn build_tree(raw: &[u8]) -> Option<XmlNode> {
                     }
                 }
             }
-            // quick-xml 0.40 emet les references d'entites (`&amp;`, `&#160;`,
-            // `&#39;` ...) presentes dans le contenu textuel comme des events
-            // `GeneralRef` distincts, hors des `Text` voisins. Les ignorer
-            // perdait `&` (cabinets « X & Associes »), apostrophes et NBSP —
-            // divergence vs le parsing Python qui resout toutes les entites.
+            // quick-xml émet les références d'entités (`&amp;`, `&#160;`, `&#39;` …)
+            // présentes dans le contenu textuel comme des events `GeneralRef` distincts,
+            // hors des `Text` voisins.
             Ok(Event::GeneralRef(e)) => {
                 let txt = match e.decode() {
                     Ok(content) => quick_xml::escape::unescape(&format!("&{content};"))
@@ -244,7 +235,7 @@ pub fn build_tree(raw: &[u8]) -> Option<XmlNode> {
     root
 }
 
-/// Port de `_build_metadata_header` (XML) : 3 lignes, lignes vides omises.
+/// En-tête de métadonnées (XML) : 3 lignes, lignes vides omises.
 fn build_metadata_header_xml(root: &XmlNode) -> String {
     let dossier = root.find("Dossier");
     let audience = root.find("Audience");
@@ -261,8 +252,8 @@ fn build_metadata_header_xml(root: &XmlNode) -> String {
 
 /// Assemble les 3 lignes du header XML depuis les 6 scalaires lus. Partagé par
 /// `build_metadata_header_xml` (depuis l'arbre XML) et
-/// `build_metadata_header_xml_from_fields` (depuis `source_fields`) : une seule
-/// mise en forme, donc reconstruction garantie identique (ADR 0085).
+/// `build_metadata_header_xml_from_fields` (depuis `source_fields`) : une seule mise
+/// en forme, donc reconstruction garantie identique.
 pub(crate) fn assemble_metadata_header_xml(
     nom_jur: Option<String>,
     date_lecture: Option<String>,
@@ -305,7 +296,7 @@ pub(crate) fn assemble_metadata_header_xml(
 /// `metadata_header` XML reconstruit depuis `source_fields` (cf.
 /// `build_source_fields_xml`). Lit les mêmes 6 scalaires que
 /// `build_metadata_header_xml`, mais dans le JSONB stocké `{ "Dossier": {…},
-/// "Audience": {…} }` — la sortie est identique au parse direct (gate ADR 0085).
+/// "Audience": {…} }` — la sortie est identique au parse direct.
 pub fn build_metadata_header_xml_from_fields(source_fields: &Value) -> String {
     let get = |parent: &str, key: &str| -> Option<String> {
         source_fields
@@ -324,8 +315,8 @@ pub fn build_metadata_header_xml_from_fields(source_fields: &Value) -> String {
     )
 }
 
-/// Port de `_build_visa_trim` (XML) : préfixe `preamble`/`procedure`/`visa`,
-/// tronqué paragraph-aware à `VISA_TRIM_MAX_CHARS`.
+/// Visa tronqué (XML) : préfixe `preamble`/`procedure`/`visa`, tronqué
+/// paragraph-aware à `VISA_TRIM_MAX_CHARS`.
 pub(crate) fn build_visa_trim_xml(sections: &[DecisionSection]) -> String {
     let parts: Vec<&str> = sections
         .iter()
@@ -346,7 +337,7 @@ pub(crate) fn build_visa_trim_xml(sections: &[DecisionSection]) -> String {
     }
 }
 
-/// Port de `_extract_sections` (XML). Offsets en **codepoints** (comme Python).
+/// Découpe le texte XML nettoyé en sections. Offsets en **codepoints**.
 pub(crate) fn extract_sections_xml(cleaned_text: &str) -> Vec<DecisionSection> {
     if cleaned_text.is_empty() {
         return Vec::new();
@@ -364,7 +355,6 @@ pub(crate) fn extract_sections_xml(cleaned_text: &str) -> Vec<DecisionSection> {
         return Vec::new();
     }
 
-    // Tri stable par position (Python `markers.sort(key=item[0])`).
     markers.sort_by_key(|m| m.0);
 
     // Dédup : un seul marqueur par kind, et jamais deux au même offset.
@@ -419,7 +409,6 @@ pub(crate) fn extract_sections_xml(cleaned_text: &str) -> Vec<DecisionSection> {
     sections
 }
 
-/// Recherche d'un sous-slice (`bytes.find`).
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
@@ -427,7 +416,6 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Remplace toutes les occurrences d'un sous-slice (`bytes.replace`).
 fn replace_subslice(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(haystack.len());
     let mut i = 0;
@@ -445,7 +433,6 @@ fn replace_subslice(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
 
 /// Parse un XML opendata (TA/CAA/CE) en `Decision`. Ne lève pas : consigne les
 /// anomalies dans `parse_warnings`. `archive_name` préfixe le `source_uid`.
-/// Port fidèle de `decision_input.parse`.
 pub fn parse_xml(raw: &[u8], member_name: &str, archive_name: Option<&str>) -> Decision {
     let mut warnings: Vec<String> = Vec::new();
 
@@ -498,7 +485,7 @@ pub fn parse_xml(raw: &[u8], member_name: &str, archive_name: Option<&str>) -> D
     Decision {
         source_uid,
         member_name: member_name.to_string(),
-        // L'XML opendata ne porte pas d'ECLI (ADR 0080).
+        // L'XML opendata ne porte pas d'ECLI.
         ecli: None,
         jurisdiction_source_code: dossier
             .and_then(|d| node_text(d.find_first(&["Code_Juridiction"]))),
@@ -531,17 +518,16 @@ pub fn parse_xml(raw: &[u8], member_name: &str, archive_name: Option<&str>) -> D
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Judilibre (port fidèle de judilibre_parser.py)
+// Judilibre
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Sentinelle pour `start_char` / `end_char` d'une section synthétique sans
-/// offset dans le texte (visa Judilibre). Python utilise `-1` ; côté Rust les
-/// offsets sont `usize`, on encode l'absence d'offset par `usize::MAX`.
+/// offset dans le texte (visa Judilibre). Les offsets sont `usize` : on encode
+/// l'absence d'offset par `usize::MAX`.
 pub const SECTION_NO_OFFSET: usize = usize::MAX;
 
 static TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]+>").unwrap());
 
-// `PAR\s+CES\s+MOTIFS`, IGNORECASE.
 static PAR_CES_MOTIFS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)PAR\s+CES\s+MOTIFS").unwrap());
 
@@ -571,7 +557,7 @@ pub(crate) fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
-/// Slice `[start, end)` en indices de **codepoints** (comme `s[start:end]` Python).
+/// Slice `[start, end)` en indices de **codepoints**.
 pub(crate) fn char_slice(s: &str, start: usize, end: usize) -> String {
     s.chars()
         .skip(start)
@@ -579,13 +565,12 @@ pub(crate) fn char_slice(s: &str, start: usize, end: usize) -> String {
         .collect()
 }
 
-/// Prend les `n` premiers codepoints (comme `s[:n]` Python).
 fn char_take(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
 /// Index (codepoint) de la première occurrence de `needle` dans `haystack` à
-/// partir du codepoint `from`, ou `None`. Réplique `str.find(needle, from)`.
+/// partir du codepoint `from`, ou `None`.
 fn char_find_from(haystack: &str, needle: &str, from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from.min(char_len(haystack)));
@@ -606,7 +591,6 @@ fn char_find_from(haystack: &str, needle: &str, from: usize) -> Option<usize> {
     None
 }
 
-/// `str.rfind("\n\n")` en index de codepoint.
 fn char_rfind_double_newline(s: &str) -> Option<usize> {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() < 2 {
@@ -625,7 +609,7 @@ fn char_rfind_double_newline(s: &str) -> Option<usize> {
 }
 
 /// Position d'un fragment nettoyé dans `clean_text` (recherche monotone à partir
-/// de `cursor`, repli sur recherche globale). Port de `_clean_offset`.
+/// de `cursor`, repli sur recherche globale).
 fn clean_offset(clean_text: &str, frag_clean: &str, cursor: usize) -> usize {
     let probe = char_take(frag_clean, 60);
     if let Some(pos) = char_find_from(clean_text, &probe, cursor) {
@@ -637,8 +621,8 @@ fn clean_offset(clean_text: &str, frag_clean: &str, cursor: usize) -> usize {
     cursor
 }
 
-/// Retire les balises HTML et trim. Port de `_strip_html` (`if not value` →
-/// `None` et chaîne vide traités identiquement).
+/// Retire les balises HTML et trim (`None` et chaîne vide traités
+/// identiquement).
 fn strip_html(value: Option<&str>) -> String {
     match value.filter(|v| !v.is_empty()) {
         None => String::new(),
@@ -646,8 +630,8 @@ fn strip_html(value: Option<&str>) -> String {
     }
 }
 
-/// Index de début du dispositif via marqueurs, ou `None`. Port de
-/// `_find_dispositif_start`. Renvoie un index de **codepoint**.
+/// Index de début du dispositif via marqueurs, ou `None`. Renvoie un index de
+/// **codepoint**.
 fn find_dispositif_start(text: &str) -> Option<usize> {
     if let Some(m) = PAR_CES_MOTIFS_RE.find(text) {
         return Some(byte_to_char_index(text, m.start()));
@@ -667,7 +651,7 @@ pub(crate) fn byte_to_char_index(s: &str, byte_idx: usize) -> usize {
     s[..byte_idx].chars().count()
 }
 
-/// Vocabulaire Judilibre — port de `judilibre_vocab.py`.
+/// Vocabulaire Judilibre.
 pub(crate) mod vocab {
     fn lookup<'a>(table: &[(&'a str, &'a str)], key: &str) -> Option<&'a str> {
         let lc = key.to_lowercase();
@@ -686,7 +670,7 @@ pub(crate) mod vocab {
         ("cjue", "Cour de justice de l'Union européenne"),
         ("cnda", "Cour nationale du droit d'asile"),
         // Hors nomenclature Judilibre : porté par les payloads reconstruits du
-        // backfill ArianeWeb DCE (ADR 0219).
+        // backfill ArianeWeb DCE.
         ("ce", "Conseil d'État"),
     ];
 
@@ -701,7 +685,7 @@ pub(crate) mod vocab {
         ("cedh", "CEDH"),
         ("cjue", "CJUE"),
         ("cnda", "CNDA"),
-        // Hors nomenclature Judilibre (backfill ArianeWeb DCE, ADR 0219).
+        // Hors nomenclature Judilibre (backfill ArianeWeb DCE).
         ("ce", "CE"),
     ];
 
@@ -755,7 +739,7 @@ pub(crate) mod vocab {
         ("other", "Autre"),
     ];
 
-    /// `JURISDICTION_LABELS.get(code.lower(), code)`.
+    /// Libellé de juridiction ; le code brut si inconnu.
     pub fn jurisdiction_label(code: Option<&str>) -> Option<String> {
         let code = code.filter(|c| !c.is_empty())?;
         Some(
@@ -765,19 +749,19 @@ pub(crate) mod vocab {
         )
     }
 
-    /// `JURISDICTION_TYPES.get(code.lower())` — `None` si inconnu.
+    /// Type de juridiction ; `None` si le code est inconnu.
     pub fn jurisdiction_type(code: Option<&str>) -> Option<String> {
         let code = code.filter(|c| !c.is_empty())?;
         lookup(JURISDICTION_TYPES, code).map(str::to_string)
     }
 
-    /// `CHAMBER_LABELS.get(code.lower(), code)`.
+    /// Libellé de chambre ; le code brut si inconnu.
     pub fn chamber_label(code: Option<&str>) -> Option<String> {
         let code = code.filter(|c| !c.is_empty())?;
         Some(lookup(CHAMBER_LABELS, code).unwrap_or(code).to_string())
     }
 
-    /// `FORMATION_LABELS.get(code.lower(), code.upper())`.
+    /// Libellé de formation ; le code en majuscules si inconnu.
     pub fn formation_label(code: Option<&str>) -> Option<String> {
         let code = code.filter(|c| !c.is_empty())?;
         Some(
@@ -787,13 +771,13 @@ pub(crate) mod vocab {
         )
     }
 
-    /// `TYPE_LABELS.get(code.lower(), code)`.
+    /// Libellé de type ; le code brut si inconnu.
     pub fn type_label(code: Option<&str>) -> Option<String> {
         let code = code.filter(|c| !c.is_empty())?;
         Some(lookup(TYPE_LABELS, code).unwrap_or(code).to_string())
     }
 
-    /// `SOLUTION_LABELS.get(code.lower(), code)`.
+    /// Libellé de solution ; le code brut si inconnu.
     pub fn solution_label(code: Option<&str>) -> Option<String> {
         let code = code.filter(|c| !c.is_empty())?;
         Some(lookup(SOLUTION_LABELS, code).unwrap_or(code).to_string())
@@ -802,7 +786,6 @@ pub(crate) mod vocab {
 
 // ── Accès JSON ───────────────────────────────────────────────────────────────
 
-/// `payload.get(key)` rendu comme `&str` si présent et de type chaîne.
 fn get_str<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(Value::as_str)
 }
@@ -817,8 +800,8 @@ struct Frag {
     text: String,
 }
 
-/// Assemble les sections canoniques depuis `zones` + `visa`. Port fidèle de
-/// `_build_sections`. Les offsets `zones` indexent `payload["text"]` brut.
+/// Assemble les sections canoniques depuis `zones` + `visa`. Les offsets
+/// `zones` indexent `payload["text"]` brut.
 fn build_sections(raw_text: &str, clean_text: &str, payload: &Value) -> Vec<DecisionSection> {
     if clean_text.is_empty() {
         return Vec::new();
@@ -842,7 +825,6 @@ fn build_sections(raw_text: &str, clean_text: &str, payload: &Value) -> Vec<Deci
             }
         }
     }
-    // tri stable sur la position de départ (comme Python `sort(key=f[0])`).
     raw_frags.sort_by_key(|f| f.0);
 
     // 2. Slice le brut, nettoie par fragment, recale en espace nettoyé.
@@ -912,7 +894,7 @@ fn build_sections(raw_text: &str, clean_text: &str, payload: &Value) -> Vec<Deci
                 let preamble_idx = out.iter().position(|s| s.kind == "preamble");
                 let insertion_idx = match preamble_idx {
                     Some(i) => i + 1,
-                    None => 0, // Python: preamble_idx = -1 → insertion_idx = 0.
+                    None => 0,
                 };
                 out.insert(
                     insertion_idx,
@@ -932,7 +914,6 @@ fn build_sections(raw_text: &str, clean_text: &str, payload: &Value) -> Vec<Deci
 }
 
 /// Ajoute une section `dispositif` par marqueurs si les zones n'en ont pas.
-/// Port fidèle de `_augment_dispositif_fallback`.
 fn augment_dispositif_fallback(sections: Vec<DecisionSection>, text: &str) -> Vec<DecisionSection> {
     if text.is_empty() || sections.iter().any(|s| s.kind == "dispositif") {
         return sections;
@@ -949,8 +930,8 @@ fn augment_dispositif_fallback(sections: Vec<DecisionSection>, text: &str) -> Ve
     let mut out: Vec<DecisionSection> = Vec::with_capacity(sections.len() + 1);
     for section in sections {
         // `0 <= start_char < start < end_char` — la borne synthétique du visa
-        // (SECTION_NO_OFFSET) ne peut pas satisfaire `start_char < start` car
-        // start ≤ len(text) ; on garde donc la section telle quelle, comme Python.
+        // (SECTION_NO_OFFSET) ne peut pas satisfaire `start_char < start` puisque
+        // start ≤ len(text) ; la section est gardée telle quelle.
         if section.start_char != SECTION_NO_OFFSET
             && section.start_char < start
             && start < section.end_char
@@ -979,7 +960,7 @@ fn augment_dispositif_fallback(sections: Vec<DecisionSection>, text: &str) -> Ve
     out
 }
 
-/// Header 3 lignes (ADR 0018). Port fidèle de `_build_metadata_header`.
+/// Header 3 lignes.
 fn build_metadata_header(payload: &Value) -> String {
     let jur = vocab::jurisdiction_label(get_str(payload, "jurisdiction"));
     let chamber = vocab::chamber_label(get_str(payload, "chamber"));
@@ -1024,8 +1005,7 @@ fn build_metadata_header(payload: &Value) -> String {
     lines.join("\n")
 }
 
-/// visa_trim Judilibre : préfixe `expose + moyens` paragraph-aware. Port fidèle
-/// de `_build_visa_trim`.
+/// visa_trim Judilibre : préfixe `expose + moyens` paragraph-aware.
 fn build_visa_trim(sections: &[DecisionSection]) -> String {
     let parts: Vec<&str> = sections
         .iter()
@@ -1048,13 +1028,8 @@ fn build_visa_trim(sections: &[DecisionSection]) -> String {
     }
 }
 
-/// Parse un payload JSON Judilibre (CC/CA/TJ/TCOM) en `Decision`.
-///
-/// Port fidèle de `judilibre_parser.parse`. `payload` est un objet `/decision`
-/// ou un item `/export` (même schéma). Panique si `payload` n'a pas d'`id` —
-/// réplique du `ValueError` Python (frontière de validation source unique).
-/// Thèmes Judilibre (`payload["themes"]`) : liste verbatim (matière → chaîne
-/// de mots-clés), entrées vides écartées.
+/// Thèmes Judilibre (`payload["themes"]`) : liste verbatim (matière → chaîne de
+/// mots-clés), entrées vides écartées.
 fn parse_themes(payload: &Value) -> Vec<String> {
     payload
         .get("themes")
@@ -1079,8 +1054,8 @@ pub fn parse_judilibre(payload: &Value, member_name: Option<&str>) -> Decision {
     let sections = build_sections(raw_text, &text, payload);
     let sections = augment_dispositif_fallback(sections, &text);
 
-    // `numbers` : liste propre, dédoublonnée en gardant l'ordre. Le scalaire
-    // `number` est corrompu (cf. commentaire Python).
+    // `numbers` : liste propre, dédoublonnée en gardant l'ordre — le scalaire
+    // `number` de la source n'est pas fiable.
     let mut clean_numbers: Vec<String> = Vec::new();
     if let Some(arr) = payload.get("numbers").and_then(Value::as_array) {
         for n in arr {
@@ -1152,15 +1127,15 @@ pub fn parse_judilibre(payload: &Value, member_name: Option<&str>) -> Decision {
     }
 }
 
-/// Construit `source_fields` (ADR 0085) depuis le payload JSON source et les
-/// sections déjà rebasées sur le texte nettoyé (`decision.sections`).
+/// Construit `source_fields` depuis le payload JSON source et les sections déjà
+/// rebasées sur le texte nettoyé (`decision.sections`).
 ///
 /// Décomposition quasi-bijective `source_payload ⟷ (full_text, source_fields)` :
 /// on retire `text` (stocké à part dans `full_text`) et on remplace `zones`
 /// (offsets sur le texte brut) par `sections` — `[{kind, start, end}]`, offsets
 /// rebasés sur `full_text` (codepoints du texte nettoyé). C'est l'unique
-/// transformation (invariant d'offsets) ; le reste du payload (`visa`, `themes`,
-/// `summary`, `nac`, `ecli`…) est conservé verbatim.
+/// transformation ; le reste du payload (`visa`, `themes`, `summary`, `nac`,
+/// `ecli`…) est conservé verbatim.
 ///
 /// Les sections synthétiques sans offset dans le texte (visa Judilibre,
 /// `SECTION_NO_OFFSET`) sont **exclues** : leur texte n'est pas une tranche de
@@ -1197,26 +1172,24 @@ pub fn build_source_fields(payload: &Value, sections: &[DecisionSection]) -> Val
 }
 
 /// `true` si `source_fields` provient d'un payload XML opendata : présence d'un
-/// nœud `<Dossier>`/`<Audience>` (clés spécifiques opendata, qu'un payload
-/// Judilibre JSON n'a jamais). Discriminant interne du dispatch
-/// [`Decision::from_source_fields`] (ADR 0085), déduit de la structure de
-/// `source_fields`.
+/// nœud `<Dossier>`/`<Audience>`, clés qu'un payload Judilibre JSON n'a jamais.
+/// Discriminant interne du dispatch [`Decision::from_source_fields`].
 fn source_fields_is_xml(source_fields: &Value) -> bool {
     source_fields.get("Dossier").is_some() || source_fields.get("Audience").is_some()
 }
 
 impl Decision {
-    /// Convertisseur canonique `(full_text, source_fields) → Decision` (ADR 0085),
-    /// pendant exact des `build_source_fields*` (`xml`/`dila`/HTML
-    /// CEDH-CJUE/CNDA). Chemin d'extraction LINÉAIRE unique : utilisé à l'ingest
-    /// comme en aval (re-extract, affichage). Dispatch sur le **préfixe du
-    /// `source_uid`** d'abord (discriminant stable en DB, ADR 0094/0096) pour les
-    /// fonds scrapés — `cedh/`/`cjue/` ⇒ HTML européen ; `cnda/` ⇒ CNDA —, puis sur
-    /// la **forme de `source_fields`** : `<Dossier>`/`<Audience>` ⇒ XML opendata
-    /// (TA/CAA/CE) ; `META_COMMUN`+`META_JURI` ⇒ DILA bulk (JADE/CONSTIT, fond
-    /// déduit du `source_uid` `dila-jade`/`dila-constit`) ; sinon JSON Judilibre
-    /// (CC/CA/TJ/TCOM). `source_uid` est la provenance (sert de `member_name` et
-    /// de base à `classify_uid` côté XML, au fond côté DILA).
+    /// Convertisseur canonique `(full_text, source_fields) → Decision`, pendant exact
+    /// des `build_source_fields*` (`xml`/`dila`/HTML CEDH-CJUE/CNDA). Chemin
+    /// d'extraction LINÉAIRE unique : utilisé à l'ingest comme en aval (re-extract,
+    /// affichage). Dispatch sur le **préfixe du `source_uid`** d'abord (discriminant
+    /// stable en DB) pour les fonds scrapés — `cedh/`/`cjue/` ⇒ HTML européen ;
+    /// `cnda/` ⇒ CNDA ; `juricaf/` ⇒ fond international (URN:LEX) —, puis sur la
+    /// **forme de `source_fields`** : `<Dossier>`/`<Audience>` ⇒ XML opendata
+    /// (TA/CAA/CE) ; `META_COMMUN`+`META_JURI` ⇒ DILA bulk (JADE/CONSTIT, fond déduit
+    /// du `source_uid` `dila-jade`/`dila-constit`) ; sinon JSON Judilibre
+    /// (CC/CA/TJ/TCOM). `source_uid` est la provenance (sert de `member_name` et de
+    /// base à `classify_uid` côté XML, au fond côté DILA).
     pub fn from_source_fields(
         full_text: &str,
         source_fields: &Value,
@@ -1226,6 +1199,8 @@ impl Decision {
             Decision::from_source_fields_html_europe(full_text, source_fields, source_uid)
         } else if source_uid_is_cnda(source_uid) {
             Decision::from_source_fields_cnda(full_text, source_fields, source_uid)
+        } else if source_uid.starts_with("juricaf/") {
+            juricaf::from_source_fields_juricaf(full_text, source_fields, source_uid)
         } else if source_fields_is_xml(source_fields) {
             Decision::from_source_fields_xml(full_text, source_fields, source_uid)
         } else if source_fields_is_dila(source_fields) {
@@ -1265,7 +1240,7 @@ impl Decision {
         Decision {
             source_uid: source_uid.to_string(),
             member_name: source_uid.to_string(),
-            // L'XML opendata ne porte pas d'ECLI (ADR 0080).
+            // L'XML opendata ne porte pas d'ECLI.
             ecli: None,
             jurisdiction_source_code: get("Dossier", "Code_Juridiction"),
             chamber: None,
@@ -1312,8 +1287,8 @@ impl Decision {
         let sections = build_sections(full_text, full_text, &payload);
         let sections = augment_dispositif_fallback(sections, full_text);
 
-        // `numbers` : liste propre, dédoublonnée en gardant l'ordre. Le scalaire
-        // `number` est corrompu (cf. parse_judilibre).
+        // `numbers` : liste propre, dédoublonnée en gardant l'ordre — le scalaire
+        // `number` de la source n'est pas fiable.
         let mut clean_numbers: Vec<String> = Vec::new();
         if let Some(arr) = payload.get("numbers").and_then(Value::as_array) {
             for n in arr {
@@ -1383,9 +1358,9 @@ impl Decision {
     }
 }
 
-/// `payload["contested"]` Judilibre -> [`crate::decision::AttackedRef`]
-/// (ADR 0161) : matiere brute du lien de chronologie. `None` si le champ est
-/// absent, nul, ou vide de tout discriminant.
+/// `payload["contested"]` Judilibre -> [`crate::decision::AttackedRef`] : matiere
+/// brute du lien de chronologie. `None` si le champ est absent, nul, ou vide de
+/// tout discriminant.
 fn parse_attacked(payload: &Value) -> Option<crate::decision::AttackedRef> {
     let c = payload.get("contested")?;
     if !c.is_object() {
@@ -1468,16 +1443,16 @@ pub(crate) fn xml_scalar_children(node: &XmlNode) -> serde_json::Map<String, Val
     out
 }
 
-/// `source_fields` pour un payload XML opendata (ADR 0085) : tous les scalaires
-/// (feuilles) des nœuds `<Dossier>` et `<Audience>`, groupés
-/// `{ "Dossier": {…}, "Audience": {…} }`.
+/// `source_fields` pour un payload XML opendata : tous les scalaires (feuilles)
+/// des nœuds `<Dossier>` et `<Audience>`, groupés `{ "Dossier": {…},
+/// "Audience": {…} }`.
 ///
 /// Pendant XML du `build_source_fields` JSON. Le texte intégral part dans
 /// `full_text` ; les sections et `visa_trim` se recalculent depuis `full_text`
-/// (`extract_sections_xml`), donc rien à rebaser ici. `metadata_header` (XML) ne
-/// lit que ces scalaires — d'où la conservation verbatim de **tous** les
-/// scalaires `Dossier`/`Audience` (et pas seulement les 6 lus aujourd'hui) :
-/// quasi-bijection, le payload XML est reconstructible hors texte intégral.
+/// (`extract_sections_xml`), donc rien à rebaser ici. `metadata_header` (XML) ne lit
+/// que ces scalaires — d'où la conservation verbatim de **tous** les scalaires
+/// `Dossier`/`Audience`, et pas seulement les 6 lus aujourd'hui : le payload XML
+/// reste reconstructible hors texte intégral.
 pub fn build_source_fields_xml(raw: &[u8]) -> Value {
     let root = build_tree(raw).unwrap_or_default();
     let mut obj = serde_json::Map::new();

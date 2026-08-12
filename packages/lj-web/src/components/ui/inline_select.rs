@@ -1,4 +1,4 @@
-//! `InlineSelect` (port de `ui/inline-select.tsx`). `<select>` natif compact
+//! `InlineSelect` : `<select>` natif compact
 //! controle (value + callback `on_change`).
 
 use leptos::prelude::*;

@@ -1,5 +1,5 @@
 -- 0151 — alphabet public partout (audit du 2026-07-18). Le stock
--- `legal_citation.ref_num_key` est en clés PUBLIQUES (ADR 0209) : 18,1 M de
+-- `legal_citation.ref_num_key` est en clés PUBLIQUES : 18,1 M de
 -- lignes `l…`, 14,7 M numériques ; la seule poche citable (« L. 3213-1 »)
 -- était la couche gold v1000, repliée au chargement depuis ce commit
 -- (gt_load → article_key). L'enveloppe citable `_suivants_family` (0149)

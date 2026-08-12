@@ -1,9 +1,10 @@
-//! Page `/reinitialiser-mot-de-passe` — port de `reset-password-page.tsx`.
+//! Page `/reinitialiser-mot-de-passe`.
 //!
 //! Atterrissage du lien de reinitialisation envoye par email. Securite : le
 //! formulaire n'apparait QUE sur l'evenement `PASSWORD_RECOVERY`, emis par
 //! Supabase une fois le token du lien echange (le lien prouve le controle de la
-//! boite mail). Une simple session active n'y donne pas acces.
+//! boite mail). Une simple session active n'y donne pas acces. Le token arrive
+//! en `?token_hash=` et c'est cette page qui l'echange.
 
 use leptos::prelude::*;
 use leptos_meta::{Meta, Title};
@@ -12,7 +13,7 @@ use leptos_router::components::A;
 const PASSWORD_HINT: &str =
     "Au moins 8 caractères, dont une minuscule, une majuscule et un chiffre.";
 
-/// Phase du flux (port du `useState<"verifying" | "ready" | "done">`).
+/// Phase du flux.
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Verifying,
@@ -36,10 +37,9 @@ pub fn ResetPasswordPage() -> impl IntoView {
             error.set(Some(hash_err.message));
             browser::clear_location_hash();
         }
-        // Le formulaire ne s'ouvre que sur PASSWORD_RECOVERY. L'abonnement tient
-        // un `Closure` JS (pas `Send`), incompatible avec le cleanup de l'Owner
-        // reactif (`Send + Sync`) : on `forget` comme le fait la substrate pour
-        // l'abonnement permanent d'`app.rs` (wasm mono-thread, page courte).
+        // Le formulaire ne s'ouvre que sur PASSWORD_RECOVERY. L'abonnement tient un
+        // `Closure` JS (pas `Send`), incompatible avec le cleanup de l'Owner reactif
+        // (`Send + Sync`) : on `forget` (wasm mono-thread, page courte).
         let subscription = browser::on_auth_event(move |event| {
             if event == "PASSWORD_RECOVERY" {
                 error.set(None);
@@ -47,6 +47,17 @@ pub fn ResetPasswordPage() -> impl IntoView {
             }
         });
         std::mem::forget(subscription);
+        // Apres l'abonnement : c'est cet echange qui emet PASSWORD_RECOVERY.
+        let token_hash = leptos_router::hooks::use_query_map()
+            .with_untracked(|q| q.get("token_hash"))
+            .unwrap_or_default();
+        if !token_hash.is_empty() {
+            leptos::task::spawn_local(async move {
+                if let Err(msg) = browser::verify_email_otp(&token_hash, "recovery").await {
+                    error.set(Some(msg));
+                }
+            });
+        }
     }
 
     let on_submit = move |ev: leptos::ev::SubmitEvent| {

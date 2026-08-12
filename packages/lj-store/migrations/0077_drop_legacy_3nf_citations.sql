@@ -1,5 +1,5 @@
--- ADR 0112 P5-7 : drop du modèle de citation 3NF legacy + du snap fréquentiel
--- (ADR 0079, retiré). Le modèle unifié `cited_reference`/`decision_citation`
+-- P5-7 : drop du modèle de citation 3NF legacy + du snap fréquentiel
+-- (retiré). Le modèle unifié `cited_reference`/`decision_citation`
 -- (ancrage catalogue `legal_text`/`legal_article`) est la seule source depuis le
 -- cutover P5-6 (migration 0076 : arrays facettes/filtres alimentés par les triggers
 -- decision_citation ; lj-api lit cited_reference). Le dual-write 3NF a été retiré du

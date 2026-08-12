@@ -1,23 +1,20 @@
-//! Sous-module de `parsing` (#26, découpe ADR 0066). Aucune logique changée :
-//! déplacement depuis `parsing.rs`, accès aux helpers partagés via `super`.
-
 use super::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DILA bulk (JADE / CONSTIT / CNIL) — schémas `<TEXTE_JURI_{ADMIN,CONSTIT}>` et
-// `<TEXTE_CNIL>` (ADR 0093/0185). Octets déjà réparés au bord lj-sources
-// (de-escape `&amp;nbsp;`, mojibake par sous-arbre) ; le parser reste PUR.
+// `<TEXTE_CNIL>`. Octets déjà réparés au bord lj-sources (de-escape
+// `&amp;nbsp;`, mojibake par sous-arbre) ; le parser reste PUR.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Fonds bulk DILA. Sélectionne le sous-bloc `META_JURI_*` et le routage de
-/// juridiction (ADR 0093).
+/// juridiction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DilaFond {
     /// Jurisprudence administrative (CE / CAA / TC), sous-bloc `META_JURI_ADMIN`.
     Jade,
     /// Conseil constitutionnel, sous-bloc `META_JURI_CONSTIT`.
     Constit,
-    /// Délibérations/décisions de la CNIL (ADR 0185), sous-bloc `META_CNIL`. Schéma
+    /// Délibérations/décisions de la CNIL, sous-bloc `META_CNIL`. Schéma
     /// `TEXTE_CNIL` sans `META_JURI` : date en `META_CNIL/DATE_TEXTE`, numéro en
     /// `META_CNIL/NUMERO`, pas d'ECLI. `jurisdiction_type = CNIL`.
     Cnil,
@@ -34,12 +31,12 @@ impl DilaFond {
     }
 }
 
-/// Libellé de l'émetteur CNIL (ADR 0185) : le schéma `META_CNIL` ne porte pas de
+/// Libellé de l'émetteur CNIL : le schéma `META_CNIL` ne porte pas de
 /// `JURIDICTION`, on le pose ici pour nourrir le `metadata_header`.
 const CNIL_JURIDICTION_NOM: &str = "Commission nationale de l'informatique et des libertés";
 
 /// `jurisdiction_type` JADE depuis le préfixe `ANCIEN_ID` (`JG`→CE, `J0..J7`→CAA,
-/// `JC`→TC), fallback sur le libellé `JURIDICTION` (audit `dila-jade.md`).
+/// `JC`→TC), fallback sur le libellé `JURIDICTION`.
 fn jade_jurisdiction_type(ancien_id: Option<&str>, juridiction: Option<&str>) -> Option<String> {
     if let Some(id) = ancien_id.filter(|s| !s.is_empty()) {
         // Préfixe = tout avant le premier `_` (`JG_L_2026_…`, `J1_L_2026_…`).
@@ -70,7 +67,7 @@ fn jade_jurisdiction_type(ancien_id: Option<&str>, juridiction: Option<&str>) ->
 
 /// `NUMERO` composite DILA → liste de numéros. Split sur `/` ; un préfixe `YYYY-`
 /// en tête est propagé aux tokens nus (`2026-321/322/323` → `[2026-321,
-/// 2026-322, 2026-323]`, audit `dila-constit.md`, grounding décision #4).
+/// 2026-322, 2026-323]`).
 fn parse_numero_composite(numero: &str) -> Vec<String> {
     let mut prefix: Option<String> = None;
     let mut out: Vec<String> = Vec::new();
@@ -94,8 +91,8 @@ fn parse_numero_composite(numero: &str) -> Vec<String> {
     out
 }
 
-/// `source_fields` DILA (ADR 0085), calqué sur [`build_source_fields_xml`] : tous
-/// les scalaires feuilles de `META_COMMUN` + `META_JURI` + le sous-bloc du fond,
+/// `source_fields` DILA, calqué sur [`build_source_fields_xml`] : tous les
+/// scalaires feuilles de `META_COMMUN` + `META_JURI` + le sous-bloc du fond,
 /// groupés par nœud parent, plus `SCT`/`ANA`/`CITATION_JP`/`LIEN` versés
 /// **verbatim**. Le texte intégral part dans `full_text` ; sections et
 /// `metadata_header` se recalculent sur `full_text`, rien à rebaser ici.
@@ -133,20 +130,18 @@ pub fn build_source_fields_dila(raw: &[u8], fond: DilaFond) -> Value {
     Value::Object(obj)
 }
 
-/// `true` si `source_fields` provient d'un payload DILA bulk (ADR 0093) :
-/// présence des nœuds `META_COMMUN` + `META_JURI` (calqués par
-/// [`build_source_fields_dila`], qu'aucun payload XML opendata `<Dossier>` ni
-/// JSON Judilibre n'a jamais). Discriminant de famille du dispatch
-/// [`Decision::from_source_fields`].
+/// `true` si `source_fields` provient d'un payload DILA bulk : présence des
+/// nœuds `META_COMMUN` + `META_JURI` (calqués par [`build_source_fields_dila`],
+/// qu'aucun payload XML opendata `<Dossier>` ni JSON Judilibre ne porte).
+/// Discriminant de famille du dispatch [`Decision::from_source_fields`].
 pub(crate) fn source_fields_is_dila(source_fields: &Value) -> bool {
     source_fields.get("META_COMMUN").is_some()
         && (source_fields.get("META_JURI").is_some() || source_fields.get("META_CNIL").is_some())
 }
 
-/// Fond DILA déduit du `source_uid` (pivot ADR 0093 : `dila-jade/<ID>` /
-/// `dila-constit/<ID>`). C'est le discriminant le plus sûr — il colle au préfixe
-/// `source_prefix` posé à l'ingest (`apps/lj-ingest/src/pipeline/dila.rs`), donc
-/// stable en DB. Repli sur la forme du `source_fields` (sous-bloc
+/// Fond DILA déduit du `source_uid` (`dila-jade/<ID>` / `dila-constit/<ID>`).
+/// C'est le discriminant le plus sûr — il colle au `source_prefix` posé à
+/// l'ingest, donc stable en DB. Repli sur la forme du `source_fields` (sous-bloc
 /// `META_JURI_CONSTIT` ⇒ Constit) si le préfixe est absent, puis défaut Jade.
 fn dila_fond_from_uid(source_uid: &str, source_fields: &Value) -> DilaFond {
     if source_uid.starts_with("dila-constit") {
@@ -168,14 +163,15 @@ fn dila_fond_from_uid(source_uid: &str, source_fields: &Value) -> DilaFond {
 }
 
 impl Decision {
-    /// Branche DILA bulk de [`Decision::from_source_fields`] (ADR 0093/0085) :
-    /// reconstruit une `Decision` **identique** à [`parse_dila_xml`] depuis
-    /// `(full_text, source_fields)`, sans toucher le brut. Pendant exact de
+    /// Branche DILA bulk de [`Decision::from_source_fields`] : reconstruit une
+    /// `Decision` **identique** à [`parse_dila_xml`] depuis `(full_text,
+    /// source_fields)`, sans toucher le brut. Pendant exact de
     /// [`build_source_fields_dila`] : on relit les mêmes scalaires
     /// `META_COMMUN`/`META_JURI`/sous-bloc et on recalcule
-    /// sections/`metadata_header`/`visa_trim` sur `full_text` (= `texte_integral_clean`).
-    /// `raw == clean == full_text` ; `date_mise_jour` n'est pas porté (donc `None`).
-    /// Le fond (Jade/Constit) se déduit du `source_uid` ([`dila_fond_from_uid`]).
+    /// sections/`metadata_header`/`visa_trim` sur `full_text` (=
+    /// `texte_integral_clean`). `raw == clean == full_text` ; `date_mise_jour` n'est
+    /// pas porté (donc `None`). Le fond (Jade/Constit) se déduit du `source_uid`
+    /// ([`dila_fond_from_uid`]).
     pub(crate) fn from_source_fields_dila(
         full_text: &str,
         source_fields: &Value,
@@ -194,7 +190,7 @@ impl Decision {
                 .map(str::to_string)
         };
 
-        // CNIL : date/numéro dans `META_CNIL` (pas de `META_JURI`, ADR 0185).
+        // CNIL : date/numéro dans `META_CNIL` (pas de `META_JURI`).
         let date_dec = match fond {
             DilaFond::Cnil => get("META_CNIL", "DATE_TEXTE"),
             _ => get("META_JURI", "DATE_DEC"),
@@ -285,24 +281,23 @@ impl Decision {
 }
 
 /// Issue de [`parse_dila_doc`] : un membre DILA porte soit son **texte intégral**
-/// (`BLOC_TEXTUEL/CONTENU`), soit, pour ~10 k vieux fonds JADE (CE pré-2002), une
-/// **analyse seule** (`SOMMAIRE/ANA` + `SCT`, mention aux tables) sans texte. Les
-/// deux donnent une [`Decision`] complète côté métadonnées ; elles diffèrent par
-/// l'origine du `full_text` et par leur traitement à l'ingest (#33, ADR 0105) :
-/// `Full` = upsert normal (texte canonique) ; `Analysis` = soit enrichissement
-/// `source_fields` d'une décision existante (rattachement), soit décision orpheline
-/// dont l'analyse EST le contenu cherchable (jamais d'écrasement d'un texte réel).
+/// (`BLOC_TEXTUEL/CONTENU`), soit une **analyse seule** (`SOMMAIRE/ANA` + `SCT`,
+/// mention aux tables) sans texte — vieux fonds JADE, CE pré-2002. Les deux
+/// donnent une [`Decision`] complète côté métadonnées ; elles diffèrent par
+/// l'origine du `full_text` et par leur traitement à l'ingest : `Full` = upsert
+/// normal (texte canonique) ; `Analysis` = soit enrichissement `source_fields`
+/// d'une décision existante (rattachement), soit décision orpheline dont
+/// l'analyse EST le contenu cherchable, jamais d'écrasement d'un texte réel.
 pub enum DilaDoc {
     Full(Decision),
     Analysis(Decision),
 }
 
-/// Parse un XML bulk DILA (`fond`) en [`Decision`] **à texte intégral** (ADR 0093).
-/// Pendant strict de [`parse_dila_doc`] restreint au cas `Full` : erreur franche si
-/// `CONTENU` est absent (un membre analyse-seule n'est PAS un texte). Conservé comme
-/// porte d'entrée des consommateurs qui exigent un texte réel — l'oracle de parité
-/// du banc (`lj-bench`) et les round-trips ci-dessous — pour qu'ils ne voient jamais
-/// une `Decision` au `full_text` synthétisé depuis l'analyse.
+/// Parse un XML bulk DILA (`fond`) en [`Decision`] **à texte intégral**. Pendant
+/// strict de [`parse_dila_doc`] restreint au cas `Full` : erreur franche si
+/// `CONTENU` est absent (un membre analyse-seule n'est PAS un texte). Porte
+/// d'entrée des consommateurs qui exigent un texte réel, pour qu'ils ne voient
+/// jamais une `Decision` au `full_text` synthétisé depuis l'analyse.
 pub fn parse_dila_xml(
     raw: &[u8],
     member_path: &str,
@@ -316,21 +311,21 @@ pub fn parse_dila_xml(
     }
 }
 
-/// Parse un XML bulk DILA (`fond`) en [`DilaDoc`] (ADR 0093/0105). Les octets sont
-/// supposés déjà réparés au bord (lj-sources). Lit le schéma commun
-/// `META/META_COMMUN`, `META/META_SPEC/META_JURI` et le sous-bloc
-/// `META_JURI_{ADMIN,CONSTIT}`. Si `BLOC_TEXTUEL/CONTENU` est présent et non vide →
-/// [`DilaDoc::Full`], `full_text = clean_texte(CONTENU)`. Sinon, si `SOMMAIRE`
-/// (`SCT`/`ANA`) porte du texte → [`DilaDoc::Analysis`], `full_text` = `SCT` puis
-/// `ANA` joints (mention aux tables + analyse), nettoyés et cherchables. Sections
-/// re-détectées sur le `full_text` retenu ; `member_path` préfixe la provenance.
+/// Parse un XML bulk DILA (`fond`) en [`DilaDoc`]. Les octets sont supposés déjà
+/// réparés au bord (lj-sources). Lit le schéma commun `META/META_COMMUN`,
+/// `META/META_SPEC/META_JURI` et le sous-bloc `META_JURI_{ADMIN,CONSTIT}`. Si
+/// `BLOC_TEXTUEL/CONTENU` est présent et non vide → [`DilaDoc::Full`],
+/// `full_text = clean_texte(CONTENU)`. Sinon, si `SOMMAIRE` (`SCT`/`ANA`) porte
+/// du texte → [`DilaDoc::Analysis`], `full_text` = `SCT` puis `ANA` joints
+/// (mention aux tables + analyse), nettoyés et cherchables. Sections re-détectées
+/// sur le `full_text` retenu ; `member_path` préfixe la provenance.
 ///
 /// Erreur franche [`CoreError::Xml`] si `ID` / `DATE_DEC` absents (XML malformé,
-/// frontière de validation source unique, AGENTS.md #12). `Ok(None)` si **ni**
-/// `CONTENU` **ni** `SOMMAIRE` ne portent de texte : membre sans corps, rien à
-/// ingérer — cas **nominal** du fond CNIL, dont ~64 % des entrées sont des fiches
-/// de registre (autorisations de transfert/recherche) publiées sans texte (ADR
-/// 0185). L'appelant le compte en skip, pas en erreur.
+/// frontière de validation source unique). `Ok(None)` si **ni** `CONTENU` **ni**
+/// `SOMMAIRE` ne portent de texte : membre sans corps, rien à ingérer — cas
+/// **nominal** du fond CNIL, dont une large part des entrées sont des fiches de
+/// registre (autorisations de transfert/recherche) publiées sans texte.
+/// L'appelant le compte en skip, pas en erreur.
 pub fn parse_dila_doc(
     raw: &[u8],
     member_path: &str,
@@ -348,7 +343,7 @@ pub fn parse_dila_doc(
     let id = meta_commun
         .and_then(|m| node_text(m.find_first(&["ID"])))
         .ok_or_else(|| CoreError::Xml(format!("DILA {member_path}: META_COMMUN/ID absent")))?;
-    // CNIL : date dans `META_CNIL/DATE_TEXTE` (pas de `META_JURI`, ADR 0185).
+    // CNIL : date dans `META_CNIL/DATE_TEXTE` (pas de `META_JURI`).
     let date_dec = match fond {
         DilaFond::Cnil => meta_sub.and_then(|m| node_text(m.find_first(&["DATE_TEXTE"]))),
         _ => meta_juri.and_then(|m| node_text(m.find_first(&["DATE_DEC"]))),
@@ -360,9 +355,9 @@ pub fn parse_dila_doc(
     })?;
 
     // Texte intégral si présent ; sinon repli sur l'analyse (SCT + ANA) pour les
-    // fonds analyse-seule (#33). `is_analysis` discrimine le `DilaDoc` retourné.
+    // fonds analyse-seule. `is_analysis` discrimine le `DilaDoc` retourné.
     // JADE/CONSTIT enveloppent le corps dans `<TEXTE>` ; CNIL non — `BLOC_TEXTUEL`
-    // pend directement sous `<TEXTE_CNIL>` (ADR 0185). On essaie les deux chemins.
+    // pend directement sous `<TEXTE_CNIL>`. On essaie les deux chemins.
     let contenu = root
         .find_first(&["TEXTE/BLOC_TEXTUEL/CONTENU", "BLOC_TEXTUEL/CONTENU"])
         .and_then(XmlNode::text)
@@ -384,8 +379,8 @@ pub fn parse_dila_doc(
                 .collect::<Vec<_>>()
                 .join("\n\n");
             if analysis.is_empty() {
-                // Membre sans corps (ni CONTENU ni SOMMAIRE) : nominal pour CNIL
-                // (fiches de registre sans texte, ADR 0185) → skip, pas erreur.
+                // Membre sans corps (ni CONTENU ni SOMMAIRE) : nominal pour CNIL (fiches de
+                // registre sans texte) → skip, pas erreur.
                 return Ok(None);
             }
             (analysis, true)
@@ -491,24 +486,21 @@ pub fn parse_dila_doc(
 mod tests {
     use super::*;
 
-    // ── DILA bulk (ADR 0093) ─────────────────────────────────────────────────
+    // ── DILA bulk ────────────────────────────────────────────────────────────
 
     #[test]
     fn dila_numero_composite_propagates_year_prefix() {
-        // Grounding décision #4 : `2026-321/322/323` → 3 numéros avec préfixe.
         assert_eq!(
             parse_numero_composite("2026-321/322/323"),
             vec!["2026-321", "2026-322", "2026-323"]
         );
-        // Numéro simple → liste à un élément.
         assert_eq!(parse_numero_composite("493597"), vec!["493597"]);
-        // Pas de préfixe YYYY- en tête → tokens conservés tels quels.
         assert_eq!(parse_numero_composite("96-381"), vec!["96-381"]);
     }
 
     #[test]
     fn dila_jade_jurisdiction_type_from_ancien_id() {
-        // Préfixe ANCIEN_ID (audit dila-jade.md) : JG→CE, J0..J7→CAA, JC→TC.
+        // Préfixe ANCIEN_ID : JG→CE, J0..J7→CAA, JC→TC.
         assert_eq!(
             jade_jurisdiction_type(Some("JG_L_2026_05_000000493597"), None).as_deref(),
             Some("CE")
@@ -521,7 +513,6 @@ mod tests {
             jade_jurisdiction_type(Some("JC_L_2026_000000"), None).as_deref(),
             Some("TC")
         );
-        // Fallback sur le libellé JURIDICTION quand ANCIEN_ID absent.
         assert_eq!(
             jade_jurisdiction_type(None, Some("Tribunal des Conflits")).as_deref(),
             Some("TC")
@@ -534,8 +525,8 @@ mod tests {
 
     #[test]
     fn dila_jade_maps_fields_ecli_and_sections() {
-        // Fixture JADE (audit dila-jade.md) : ECLI en META_JURI_ADMIN, ANCIEN_ID
-        // JG (CE), SOLUTION vide, FORMATION/AVOCATS dans le sous-bloc.
+        // Fixture JADE : ECLI en META_JURI_ADMIN, ANCIEN_ID JG (CE), SOLUTION vide,
+        // FORMATION/AVOCATS dans le sous-bloc.
         let xml = r#"<TEXTE_JURI_ADMIN>
 <META>
   <META_COMMUN>
@@ -587,14 +578,11 @@ mod tests {
         );
         assert_eq!(d.formation.as_deref(), Some("6ème - 5ème chambres réunies"));
         assert_eq!(d.avocat_requerant.as_deref(), Some("SCP PIWNICA & MOLINIE"));
-        // SOLUTION vide JADE → None.
         assert_eq!(d.solution, None);
-        // Sections re-détectées sur le full_text plat.
         let kinds: Vec<&str> = d.sections.iter().map(|s| s.kind.as_str()).collect();
         assert!(kinds.contains(&"visa"));
         assert!(kinds.contains(&"motivations"));
         assert!(kinds.contains(&"dispositif"));
-        // source_fields : SCT/ANA versés verbatim + sous-bloc présent.
         let sf = build_source_fields_dila(xml, DilaFond::Jade);
         assert_eq!(
             sf.get("SCT").and_then(Value::as_str),
@@ -610,8 +598,8 @@ mod tests {
 
     #[test]
     fn dila_constit_maps_ecli_numero_composite_and_type() {
-        // Fixture CONSTIT (audit dila-constit.md) : ECLI META_COMMUN, NUMERO
-        // composite, SOLUTION normalisée, sous-bloc META_JURI_CONSTIT.
+        // Fixture CONSTIT : ECLI META_COMMUN, NUMERO composite, SOLUTION normalisée,
+        // sous-bloc META_JURI_CONSTIT.
         let xml = r#"<TEXTE_JURI_CONSTIT>
 <META>
   <META_COMMUN>
@@ -653,7 +641,6 @@ mod tests {
             d.ecli.as_deref(),
             Some("ECLI:FR:CC:2026:2026.321.322.323.L")
         );
-        // NUMERO composite propagé.
         assert_eq!(
             d.numero_dossiers.as_deref(),
             Some(
@@ -666,7 +653,6 @@ mod tests {
         );
         assert_eq!(d.numero_dossier.as_deref(), Some("2026-321"));
         assert_eq!(d.solution.as_deref(), Some("Réglementaire"));
-        // CONSTIT n'a pas de FORMATION dans le sous-bloc.
         assert_eq!(d.formation, None);
         let sf = build_source_fields_dila(xml, DilaFond::Constit);
         let mjc = sf
@@ -682,13 +668,12 @@ mod tests {
 
     #[test]
     fn dila_missing_required_fields_error() {
-        // Erreur franche si ID / DATE_DEC absents (XML malformé, AGENTS.md #12).
         let no_id = r#"<TEXTE_JURI_CONSTIT><META><META_COMMUN/><META_SPEC><META_JURI><DATE_DEC>2026-01-01</DATE_DEC></META_JURI></META_SPEC></META><TEXTE><BLOC_TEXTUEL><CONTENU>x</CONTENU></BLOC_TEXTUEL></TEXTE></TEXTE_JURI_CONSTIT>"#.as_bytes();
         assert!(parse_dila_doc(no_id, "m", DilaFond::Constit).is_err());
 
-        // Membre sans corps (ni CONTENU ni SOMMAIRE) mais ID/date présents → `Ok(None)`
-        // (skip nominal, ADR 0185, fiches de registre CNIL) ; l'entrée stricte
-        // `parse_dila_xml` (oracle parité, exige un texte) le refuse toujours.
+        // Membre sans corps (ni CONTENU ni SOMMAIRE) mais ID/date présents → `Ok(None)`,
+        // skip nominal des fiches de registre CNIL ; l'entrée stricte `parse_dila_xml`,
+        // qui exige un texte, le refuse toujours.
         let empty = r#"<TEXTE_JURI_CONSTIT><META><META_COMMUN><ID>CONSTEXT1</ID></META_COMMUN><META_SPEC><META_JURI><DATE_DEC>2026-01-01</DATE_DEC></META_JURI></META_SPEC></META><TEXTE><BLOC_TEXTUEL/></TEXTE></TEXTE_JURI_CONSTIT>"#.as_bytes();
         assert!(matches!(
             parse_dila_doc(empty, "m", DilaFond::Constit),
@@ -699,14 +684,12 @@ mod tests {
 
     #[test]
     fn dila_doc_full_when_contenu_present() {
-        // CONTENU présent → DilaDoc::Full (texte intégral canonique).
         let xml = r#"<TEXTE_JURI_ADMIN><META><META_COMMUN><ID>CETATEXT1</ID></META_COMMUN><META_SPEC><META_JURI><DATE_DEC>2026-05-27</DATE_DEC><JURIDICTION>Conseil d'État</JURIDICTION><NUMERO>493597</NUMERO></META_JURI><META_JURI_ADMIN/></META_SPEC></META><TEXTE><BLOC_TEXTUEL><CONTENU>Considérant ce qui suit : motifs.</CONTENU></BLOC_TEXTUEL><SOMMAIRE><SCT>29-03-02 ENERGIE.</SCT><ANA>Une analyse.</ANA></SOMMAIRE></TEXTE></TEXTE_JURI_ADMIN>"#.as_bytes();
         match parse_dila_doc(xml, "dila-jade", DilaFond::Jade)
             .expect("parse")
             .expect("doc présent (CONTENU non vide)")
         {
             DilaDoc::Full(d) => {
-                // full_text = CONTENU (pas le SOMMAIRE), même si une analyse existe.
                 assert!(d.texte_integral_clean.contains("Considérant ce qui suit"));
                 assert!(!d.texte_integral_clean.contains("Une analyse"));
             }
@@ -716,8 +699,8 @@ mod tests {
 
     #[test]
     fn dila_doc_analysis_when_contenu_absent() {
-        // #33 : vieux fond JADE (CE pré-2002) sans BLOC_TEXTUEL — SOMMAIRE seul.
-        // → DilaDoc::Analysis, full_text = SCT + ANA joints (cherchable), métadonnées
+        // Vieux fond JADE (CE pré-2002) sans BLOC_TEXTUEL — SOMMAIRE seul →
+        // DilaDoc::Analysis, full_text = SCT + ANA joints (cherchable), métadonnées
         // pleines (juridiction CE par repli sur le libellé, date, numéro).
         let xml = r#"<TEXTE_JURI_ADMIN><META><META_COMMUN><ID>CETATEXT0000001</ID></META_COMMUN><META_SPEC><META_JURI><DATE_DEC>1995-03-10</DATE_DEC><JURIDICTION>Conseil d'État</JURIDICTION><NUMERO>123456</NUMERO></META_JURI><META_JURI_ADMIN/></META_SPEC></META><TEXTE><SOMMAIRE><SCT>26-01 PROCEDURE.</SCT><ANA>Le Conseil d'État juge que la requête est recevable.</ANA></SOMMAIRE></TEXTE></TEXTE_JURI_ADMIN>"#.as_bytes();
         match parse_dila_doc(xml, "dila-jade", DilaFond::Jade)
@@ -729,7 +712,6 @@ mod tests {
                 assert_eq!(d.jurisdiction_type.as_deref(), Some("CE"));
                 assert_eq!(d.date_lecture.as_deref(), Some("1995-03-10"));
                 assert_eq!(d.numero_dossier.as_deref(), Some("123456"));
-                // full_text = SCT puis ANA, joints et cherchables.
                 assert!(d.texte_integral_clean.contains("26-01 PROCEDURE."));
                 assert!(d
                     .texte_integral_clean
@@ -737,20 +719,18 @@ mod tests {
             }
             DilaDoc::Full(_) => panic!("attendu Analysis (CONTENU absent)"),
         }
-        // L'entrée stricte `parse_dila_xml` refuse une analyse-seule (oracle parité).
         assert!(parse_dila_xml(xml, "dila-jade", DilaFond::Jade).is_err());
     }
 
-    // ── Round-trip `from_source_fields` ⟷ `parse_dila_xml` (ADR 0085, #34) ────
+    // ── Round-trip `from_source_fields` ⟷ `parse_dila_xml` ────────────────────
     //
-    // Spec gate : reconstruire une `Decision` depuis `(full_text, source_fields)`
+    // Spec : reconstruire une `Decision` depuis `(full_text, source_fields)`
     // reproduit EXACTEMENT le parse direct du brut, hors deux champs non portés
-    // par les colonnes DB (exclusions documentées, cf. oracle extract-fields-parity) :
-    // `member_name` (provenance pure, fixé à `source_uid` par le chemin linéaire)
-    // et `texte_integral_raw` (le brut XML `<br/>` n'est pas stocké côté DILA ;
-    // seul `full_text` = clean l'est). Garantit qu'un re-embed depuis les colonnes
-    // DB ne change pas les 3 entrées du chunker (`texte_integral_clean`,
-    // `metadata_header`, `visa_trim`) ni les sections.
+    // par les colonnes DB : `member_name` (provenance pure, fixé à `source_uid`
+    // par le chemin linéaire) et `texte_integral_raw` (le brut XML `<br/>` n'est
+    // pas stocké côté DILA ; seul `full_text` = clean l'est). Garantit qu'un
+    // re-embed depuis les colonnes DB ne change pas les 3 entrées du chunker
+    // (`texte_integral_clean`, `metadata_header`, `visa_trim`) ni les sections.
 
     /// Compare `from_source_fields_dila(clean, build_source_fields_dila(xml))` au
     /// parse direct, hors `member_name` + `texte_integral_raw` — gate 0 écart.
@@ -772,8 +752,6 @@ mod tests {
             "round-trip DILA non identique au parse direct ({})",
             orig.source_uid
         );
-        // Chunker : les 3 entrées explicitement byte-à-byte (redondant mais
-        // diagnostique si l'égalité globale casse).
         assert_eq!(orig.texte_integral_clean, rebuilt.texte_integral_clean);
         assert_eq!(orig.metadata_header, rebuilt.metadata_header);
         assert_eq!(orig.visa_trim, rebuilt.visa_trim);
@@ -857,9 +835,9 @@ mod tests {
         assert_dila_round_trip(xml, "dila-constit", DilaFond::Constit);
     }
 
-    // Fixture CNIL réelle (ADR 0185, audit cnil.md) : schéma `TEXTE_CNIL` SANS
-    // `META_JURI` — date en `META_CNIL/DATE_TEXTE`, numéro en `META_CNIL/NUMERO`,
-    // pas d'ECLI. `NATURE_DELIB` = facette régulateur versée en source_fields.
+    // Fixture CNIL réelle : schéma `TEXTE_CNIL` SANS `META_JURI` — date en
+    // `META_CNIL/DATE_TEXTE`, numéro en `META_CNIL/NUMERO`, pas d'ECLI.
+    // `NATURE_DELIB` = facette régulateur versée en source_fields.
     const CNIL_XML: &[u8] = r#"<TEXTE_CNIL>
 <META>
   <META_COMMUN>
@@ -894,13 +872,9 @@ mod tests {
             d.jurisdiction_name.as_deref(),
             Some("Commission nationale de l'informatique et des libertés")
         );
-        // Date lue dans META_CNIL/DATE_TEXTE (pas de META_JURI/DATE_DEC).
         assert_eq!(d.date_lecture.as_deref(), Some("2026-02-25"));
-        // Numéro lu dans META_CNIL/NUMERO ; format régulateur (pas composite).
         assert_eq!(d.numero_dossier.as_deref(), Some("DR-2026-036"));
-        // Pas d'ECLI côté CNIL.
         assert_eq!(d.ecli, None);
-        // NATURE_DELIB (facette) versée verbatim en source_fields.
         let sf = build_source_fields_dila(CNIL_XML, DilaFond::Cnil);
         let mc = sf.get("META_CNIL").and_then(Value::as_object).unwrap();
         assert_eq!(

@@ -1,10 +1,8 @@
-//! `Button` (port de `ui/button.tsx`). CVA -> `button_classes`.
-
 use leptos::prelude::*;
 
 use crate::helpers::cn;
 
-/// Variante visuelle. Defaut : `Primary` (= `defaultVariants.variant`).
+/// Variante visuelle. Defaut : `Primary`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ButtonVariant {
     #[default]
@@ -15,7 +13,7 @@ pub enum ButtonVariant {
     Link,
 }
 
-/// Taille. Defaut : `Md` (= `defaultVariants.size`).
+/// Taille. Defaut : `Md`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ButtonSize {
     Sm,
@@ -56,7 +54,7 @@ fn size_classes(size: ButtonSize) -> &'static str {
     }
 }
 
-/// Classes complietes d'un bouton (port de `buttonVariants` + `cn(…, className)`).
+/// Classes completes d'un bouton.
 pub fn button_classes(variant: ButtonVariant, size: ButtonSize, extra: &str) -> String {
     cn([BASE, variant_classes(variant), size_classes(size), extra])
 }

@@ -1,11 +1,11 @@
-//! `SyntaxHint` (port de `syntax-hint.tsx`). Bouton « Aide à la recherche » qui
+//! `SyntaxHint` : bouton « Aide à la recherche » qui
 //! ouvre un `<dialog>` modal dont le contenu suit le moteur documenté
 //! ([`HelpCorpus`]) : décisions (modes + opérateurs booléens) ou textes
 //! (mots-clés, texte nommé, numéro d'article, filtres).
 //!
 //! `showModal()`/`close()` ne sont pas exposés par `view!` : on passe par un
 //! `NodeRef<Dialog>` + `web_sys::HtmlDialogElement` (gated hydrate). En SSR le
-//! `<dialog>` est rendu fermé (aucun JS) — parité avec le 1er rendu React.
+//! `<dialog>` est rendu fermé (aucun JS).
 
 use leptos::html;
 use leptos::prelude::*;
@@ -172,7 +172,7 @@ fn decisions_help() -> AnyView {
 }
 
 /// Corps de l'aide textes : classement par mots-clés, sans opérateurs — les
-/// trois gestes qui marchent (vérifiés sur le corpus), puis les filtres.
+/// trois gestes qui marchent, puis les filtres.
 fn textes_help() -> AnyView {
     view! {
         <section class="flex flex-col gap-2">

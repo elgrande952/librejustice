@@ -1,4 +1,4 @@
-//! `Pill` (port de `ui/pill.tsx`). Bouton bascule `aria-pressed`.
+//! `Pill` : bouton bascule `aria-pressed`.
 
 use leptos::prelude::*;
 
@@ -10,7 +10,7 @@ const ACTIVE: &str =
     "border-[var(--color-ink)] bg-[var(--color-ink)] text-[var(--color-parchment)]";
 const INACTIVE: &str = "border-[var(--color-rule)] bg-[var(--color-parchment)] text-[var(--color-ink)] hover:border-[var(--color-ink)]";
 
-/// Classes completes d'une pill selon l'etat actif (port de `cn(BASE, active ? … : …, className)`).
+/// Classes completes d'une pill selon l'etat actif.
 pub fn pill_classes(active: bool, extra: &str) -> String {
     cn([BASE, if active { ACTIVE } else { INACTIVE }, extra])
 }

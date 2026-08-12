@@ -1,4 +1,4 @@
--- ADR 0153 — la langue de rendition d'une provenance devient une colonne
+-- La langue de rendition d'une provenance devient une colonne
 -- **matérialisée** simple `decision_sources.lang`, écrite explicitement par le
 -- code d'ingest (CEDH/CJUE posent la langue ; `upsert_decision_source` la stocke).
 -- Remplace la colonne générée VIRTUAL `served_lang` d'0105 : valeur **stockée**,

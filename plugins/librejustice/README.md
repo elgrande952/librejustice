@@ -34,6 +34,8 @@ client : aucune clé à configurer.
 | Skill `recherche-jurisprudence` | trouver, vérifier et citer les décisions (deux ordres), avec lien systématique |
 | Skill `recherche-normes` | le texte applicable à date : codes FR versionnés, traités, droit UE, codes étrangers, conventions collectives, BOFiP |
 
-Le serveur MCP est aussi utilisable seul, dans tout client MCP (Le Chat,
-Perplexity, claude.ai…) en connecteur custom : URL
+Le serveur MCP est aussi utilisable seul. Sur claude.ai, il s'ajoute depuis le
+répertoire des connecteurs :
+[claude.ai/directory/connectors/librejustice](https://claude.ai/directory/connectors/librejustice).
+Ailleurs (ChatGPT, Le Chat, Perplexity…), en connecteur custom : URL
 `https://librejustice.fr/mcp`.

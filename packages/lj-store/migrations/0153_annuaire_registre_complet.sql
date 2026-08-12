@@ -1,4 +1,4 @@
--- ADR 0239 — annuaire registre complet : les colonnes annuaire vivent sur
+-- Annuaire registre complet : les colonnes annuaire vivent sur
 -- `entity` (category / ape / barreau / decision_count) ; `entity_contentieux`
 -- disparaît (un seul chemin). La dérivation de catégorie appartient au
 -- chargeur de registres (lj-ingest) — le backfill ci-dessous pose la
@@ -58,7 +58,7 @@ DROP INDEX entity_denomination_folded_idx;
 -- `decision_count` en place (HOT quand la page a du mou).
 ALTER TABLE entity SET (fillfactor = 90);
 
--- Stats O(1) : `annuaire_registre` (ADR 0233) gagne le décompte contentieux
+-- Stats O(1) : `annuaire_registre` gagne le décompte contentieux
 -- et se re-seed depuis les colonnes fraîches.
 ALTER TABLE annuaire_registre ADD COLUMN contentieux bigint NOT NULL DEFAULT 0;
 TRUNCATE annuaire_registre;

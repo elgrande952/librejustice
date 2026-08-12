@@ -1,6 +1,5 @@
 -- Migration 0040 : source des recherches (web | mcp) + décisions consultées
--- ADR : docs/adr/0053-source-activite-mcp-decisions-consultees.md
--- Étend ADR 0036 (profil local) : on attribue chaque recherche à son canal
+-- Le profil local s'étend : on attribue chaque recherche à son canal
 -- d'origine (UI web vs endpoint MCP) et on matérialise les décisions ouvertes.
 
 -- Canal d'origine de la recherche. 'web' par défaut : les lignes existantes

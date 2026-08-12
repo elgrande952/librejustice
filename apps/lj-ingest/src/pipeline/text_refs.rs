@@ -1,29 +1,23 @@
-//! Renvois et citations des corps du référentiel (ADR 0196 §5 / 0217) : UNE
-//! passe `doc_extract` sur les corps ingérés — `legal_text.body` et toutes
-//! les versions `legal_article` à corps — alimente `text_case_citation`
-//! (norme→décision) et `text_legal_citation` (norme→article, spans résolus,
-//! jamais l'auto-renvoi). Écriture par remplacement au grain
-//! `owner_text_uid` (corps + articles d'un texte fusionnés au flush) ;
-//! résolution des clés cases pendantes en fin de passe.
+//! Renvois et citations des corps du référentiel : UNE passe `doc_extract` sur
+//! les corps ingérés — `legal_text.body` et toutes les versions
+//! `legal_article` à corps — alimente `text_case_citation` (norme→décision) et
+//! `text_legal_citation` (norme→article, spans résolus, jamais l'auto-renvoi).
+//! Écriture par remplacement au grain `owner_text_uid` (corps + articles d'un
+//! texte fusionnés au flush) ; résolution des clés cases pendantes en fin de
+//! passe.
 
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
 
-use lj_store::repository::{DecisionRepository, TextCaseCitationRow, TextLegalCitationRow};
+use lj_store::repository::DecisionRepository;
 
 use crate::config::Settings;
+use lj_ingest::extract::{build_declared, owner_rows, Declared, OwnerRows};
 
-/// Versions d'articles par page keyset (émetteurs les plus nombreux : ~3,4 M
-/// de versions à corps). Le CPU d'une page part en rayon.
+/// Versions d'articles par page keyset. Le CPU d'une page part en rayon.
 const PAGE: i64 = 2_000;
-
-/// Spans extraits d'UN corps émetteur, prêts à écrire.
-struct OwnerRows {
-    cases: Vec<TextCaseCitationRow>,
-    cites: Vec<TextLegalCitationRow>,
-}
 
 /// Une extraction complète : corps monolithiques + versions d'articles →
 /// `text_case_citation` + `text_legal_citation`.
@@ -47,6 +41,16 @@ pub async fn extract_text_refs() -> Result<()> {
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
     let ctx = super::extract_ctx(&conn).await?;
+    // Oracle DILA, hydraté une fois et partagé en lecture par les workers rayon —
+    // d'où le `'static`, comme le contexte d'extraction.
+    let declared_rows = repo.declared_article_cites().await?;
+    let n_declared = declared_rows.len();
+    let declared: &'static Declared = Box::leak(Box::new(build_declared(declared_rows)));
+    tracing::info!(
+        aretes = n_declared,
+        cles = declared.len(),
+        "oracle des renvois déclarés chargé"
+    );
 
     // 1. Corps monolithiques, bufferisés par texte : un texte peut émettre
     // depuis son corps ET ses articles (BOFiP : préambule + §§) — le writer
@@ -59,7 +63,16 @@ pub async fn extract_text_refs() -> Result<()> {
         bodies
             .into_par_iter()
             .map(|(text_uid, body)| {
-                let rows = owner_rows(&body, &text_uid, None, None, ctx);
+                let rows = owner_rows(
+                    &body,
+                    &text_uid,
+                    None,
+                    None,
+                    &ctx.link,
+                    &ctx.vocab,
+                    &ctx.chrono,
+                    declared,
+                );
                 (text_uid, rows)
             })
             .collect()
@@ -98,7 +111,10 @@ pub async fn extract_text_refs() -> Result<()> {
                             &text_uid,
                             Some(num_key.clone()),
                             Some(date_debut),
-                            ctx,
+                            &ctx.link,
+                            &ctx.vocab,
+                            &ctx.chrono,
+                            declared,
                         );
                         (text_uid, num_key, date_debut, rows)
                     })
@@ -182,63 +198,4 @@ async fn write_owner(
         .await
         .map_err(|e| anyhow!("replace_text_legal_citations {text_uid}: {e}"))?;
     Ok((spans.0 + acc.cases.len(), spans.1 + acc.cites.len()))
-}
-
-/// Les deux flux d'UN corps émetteur (offsets codepoints sur le texte
-/// émetteur, convention 0143). Renvois : seulement les cibles résolues
-/// (ADR 0217), jamais l'auto-renvoi (cible = l'émetteur lui-même).
-fn owner_rows(
-    texte: &str,
-    owner_text_uid: &str,
-    owner_num_key: Option<String>,
-    owner_date_debut: Option<NaiveDate>,
-    ctx: &super::ExtractCtx,
-) -> OwnerRows {
-    let docx = lj_extract::compiled::doc_extract(texte, &ctx.vocab, &ctx.link, &ctx.chrono, None);
-    let cases = docx
-        .cases
-        .into_iter()
-        .map(|c| TextCaseCitationRow {
-            owner_num_key: owner_num_key.clone(),
-            owner_date_debut,
-            char_start: c.char_start as i32,
-            char_end: c.char_end as i32,
-            target_ref: c.target_ref,
-        })
-        .collect();
-    let cites = docx
-        .citations
-        .into_iter()
-        .filter_map(|c| {
-            let (ref_text_uid, ref_num_key) = match c.target.ref_text_uid {
-                Some(uid) => (uid, c.target.ref_num_key),
-                // Article NU dans un corps du référentiel (« en application
-                // de l'article 21-2 » dans le code civil) : la cible est le
-                // texte émetteur lui-même quand il possède l'article —
-                // renvoi interne, la convention rédactionnelle des codes.
-                // L'orphelin génitif (« du présent code », « de la loi
-                // susvisée ») n'est PAS nu : il reste écarté.
-                None => {
-                    let ak = c.article_key.filter(|_| c.bare)?;
-                    if !ctx.link.has_article(owner_text_uid, &ak) {
-                        return None;
-                    }
-                    let num = ctx.link.num_key_for(owner_text_uid, Some(&ak));
-                    (owner_text_uid.to_string(), num)
-                }
-            };
-            if ref_text_uid == owner_text_uid && ref_num_key == owner_num_key {
-                return None;
-            }
-            Some(TextLegalCitationRow {
-                owner_num_key: owner_num_key.clone(),
-                owner_date_debut,
-                char_start: c.char_start as i32,
-                char_end: c.char_end as i32,
-                ref_text_uid,
-                ref_num_key,
-            })
-        })
-        .collect();
-    OwnerRows { cases, cites }
 }

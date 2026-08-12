@@ -1,4 +1,4 @@
--- Migration 0052 — Arrays légaux dénormalisés au grain décision (ADR 0084).
+-- Migration 0052 — Arrays légaux dénormalisés au grain décision.
 --
 -- ``legal_instruments`` / ``legal_article_composite`` (données par-décision,
 -- aujourd'hui répliquées sur chaque chunk pour le filtre ``chunks_bm25``)
@@ -6,12 +6,12 @@
 -- ``decisions_bm25`` (jambes BM25 body + titre au grain décision, migration
 -- 0053). Les colonnes chunk homonymes restent en place — la jambe ANN filtre
 -- toujours au scan chunk (VectorChord exige le filtre local, pas de join).
--- Résolution canonique COALESCE identique à la sync chunk (ADR 0079, 0049).
+-- Résolution canonique COALESCE identique à la sync chunk (0049).
 --
 -- Le backfill est set-based et tourne AVANT le build de ``decisions_bm25``
 -- (0053) : l'UPDATE massif n'a aucune maintenance d'index BM25 à porter
--- (leçon 0047/0048). ⚠️ N'appliquer qu'une fois le backfill ``full_text``
--- terminé (étape 1 ADR 0084) : l'UPDATE touche ``decisions`` et entrerait
+-- (leçon 0047/0048). N'appliquer qu'une fois le backfill ``full_text``
+-- terminé (étape 1) : l'UPDATE touche ``decisions`` et entrerait
 -- sinon en concurrence de verrous avec la boucle de backfill.
 
 -- =====================================================================

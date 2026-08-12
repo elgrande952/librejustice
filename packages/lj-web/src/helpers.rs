@@ -1,18 +1,13 @@
 //! Helpers de composition + formatters d'affichage.
 //!
-//! - `cn()` : port de `lib/utils.ts` (concat de classes Tailwind statiques).
-//! - formatters : port de `lib/format.ts` (juridiction, score, comptes, dates
-//!   FR). Logique pure (pas d'I/O) ; les libelles longs viennent des enums DTO.
+//! - `cn()` : concat de classes Tailwind statiques.
+//! - formatters : juridiction, score, comptes, dates FR. Logique pure (pas
+//!   d'I/O) ; les libelles longs viennent des enums DTO.
 
 use lj_dtos::JurisdictionType;
 
-/// Concatene des fragments de classes Tailwind : trim, drop des vides, join sur
-/// un espace.
-///
-/// On NE porte PAS `tailwind-merge` : les classes des templates lj-web sont
-/// statiques (pas de conflit a deduper a l'execution). Ajouter un dedup serait
-/// de la complexite gratuite (regle repo #11). Si une variante conditionnelle
-/// introduit un jour un vrai conflit utility, le resoudre a la source.
+/// Concatene des fragments de classes Tailwind : trim, drop des vides, join sur un
+/// espace.
 pub fn cn<'a, I: IntoIterator<Item = &'a str>>(classes: I) -> String {
     classes
         .into_iter()
@@ -22,8 +17,7 @@ pub fn cn<'a, I: IntoIterator<Item = &'a str>>(classes: I) -> String {
         .join(" ")
 }
 
-/// Libelle long d'un ordre de juridiction (port de `JURISDICTION_TYPE_LABELS` /
-/// `formatJuridiction`).
+/// Libelle long d'un ordre de juridiction.
 pub fn format_juridiction(jur: JurisdictionType) -> &'static str {
     match jur {
         JurisdictionType::Ta => "Tribunal administratif",
@@ -43,7 +37,6 @@ pub fn format_juridiction(jur: JurisdictionType) -> &'static str {
 }
 
 /// Nom de juridiction nettoye, ou `None` si vide apres normalisation.
-/// Port de `sanitizeJurisdictionName` (suppression chambre / juge des referes).
 fn sanitize_jurisdiction_name(value: Option<&str>) -> Option<String> {
     let normalized = value.map(str::trim).filter(|s| !s.is_empty())?;
     // `\s+,` -> `,` : recolle une virgule precedee d'espaces.
@@ -134,7 +127,7 @@ fn strip_trailing_refere(s: &str) -> &str {
 }
 
 /// Nom affichable pour une decision : nom de juridiction nettoye, sinon libelle
-/// long du type. Port de `formatDecisionJurisdiction`.
+/// long du type.
 pub fn format_decision_jurisdiction(jur: JurisdictionType, name: Option<&str>) -> String {
     sanitize_jurisdiction_name(name).unwrap_or_else(|| format_juridiction(jur).to_string())
 }
@@ -154,15 +147,15 @@ pub fn split_entity_uid(uid: &str) -> (&str, &str) {
     uid.split_once(':').unwrap_or(("", uid))
 }
 
-/// Score formate a 3 decimales. Port de `formatScore`.
+/// Score formate a 3 decimales.
 pub fn format_score(score: f64) -> String {
     format!("{score:.3}")
 }
 
-/// Plafond d'affichage du nombre de resultats (port de `RESULTS_CAP`).
+/// Plafond d'affichage du nombre de resultats.
 const RESULTS_CAP: i64 = 400;
 
-/// Libelle FR du nombre de resultats. Port de `formatResultsCount`.
+/// Libelle FR du nombre de resultats.
 pub fn format_results_count(total: i64) -> String {
     match total {
         0 => "Aucun résultat".to_string(),
@@ -182,7 +175,7 @@ pub fn format_results_count_exact(total: i64) -> String {
     }
 }
 
-/// Encode un terme de requete pour le query string (parite `encodeURIComponent`).
+/// Encode un terme de requete pour le query string.
 pub fn encode_query(query: &str) -> String {
     let mut out = String::with_capacity(query.len());
     for b in query.bytes() {
@@ -225,10 +218,8 @@ pub fn group_thousands(n: i64) -> String {
 }
 
 /// Nombre de pages de pagination (plafonne par `RESULTS_CAP` et `max_pages`).
-/// Port de `totalPages`.
 pub fn total_pages(total: i64, limit: i64, max_pages: i64) -> i64 {
     let capped = total.min(RESULTS_CAP);
-    // ceil(capped / limit) sans `div_ceil` (instable sur cette toolchain).
     let pages = (capped + limit - 1) / limit;
     pages.min(max_pages)
 }
@@ -249,13 +240,12 @@ const MONTHS_FR: [&str; 12] = [
     "décembre",
 ];
 
-/// Numéro d'article en graphie française : la forme compacte LEGI colle le
-/// préfixe de partie au numéral (« L1142-1 », « R123-4 », « D45 ») et la clé
-/// publique le plie en minuscules (« l1142-1 », ADR 0209) ; la convention des
-/// juristes l'écrit « L. 1142-1 ». Seul un préfixe lettre unique L/R/D/A
-/// directement suivi d'un chiffre est réécrit — les autres formes (numéraux
-/// nus, « LO119 », étoilés « R*011 », libellés « Annexe V ») passent telles
-/// quelles.
+/// Numéro d'article en graphie française : la forme compacte LEGI colle le préfixe
+/// de partie au numéral (« L1142-1 », « R123-4 », « D45 ») et la clé publique le
+/// plie en minuscules (« l1142-1 ») ; la convention des juristes l'écrit
+/// « L. 1142-1 ». Seul un préfixe lettre unique L/R/D/A directement suivi d'un
+/// chiffre est réécrit — les autres formes (numéraux nus, « LO119 », étoilés
+/// « R*011 », libellés « Annexe V ») passent telles quelles.
 pub fn format_article_num(num: &str) -> String {
     let mut chars = num.chars();
     match (chars.next(), chars.next()) {
@@ -268,9 +258,8 @@ pub fn format_article_num(num: &str) -> String {
     }
 }
 
-/// Formate une date ISO `YYYY-MM-DD` en `j mois aaaa` (FR). Port de
-/// `formatIsoDate` : `None`/vide -> `—` ; valeur non parsable -> renvoyee telle
-/// quelle.
+/// Formate une date ISO `YYYY-MM-DD` en `j mois aaaa` (FR) : `None`/vide -> `—` ;
+/// valeur non parsable -> renvoyee telle quelle.
 pub fn format_iso_date(value: Option<&str>) -> String {
     let Some(value) = value.map(str::trim).filter(|s| !s.is_empty()) else {
         return "—".to_string();
@@ -307,7 +296,6 @@ mod tests {
         assert_eq!(format_article_num("R123-4"), "R. 123-4");
         assert_eq!(format_article_num("D45"), "D. 45");
         assert_eq!(format_article_num("A412-1"), "A. 412-1");
-        // Formes hors périmètre : inchangées.
         assert_eq!(format_article_num("1240"), "1240");
         assert_eq!(format_article_num("LO119"), "LO119");
         assert_eq!(format_article_num("R*011"), "R*011");

@@ -1,16 +1,16 @@
-//! Parse pur des analyses AJCE ArianeWeb (ADR 0204 ; savoir source ADR 0095).
+//! Parse pur des analyses AJCE ArianeWeb.
 //!
 //! L'HTML plein (déjà décodé latin-1 + `0x19` au bord `lj-sources`) alterne des
 //! segments séparés par `<hr>` : en-tête (n° dossier, niveau Lebon, date de
-//! lecture), puis paires bloc-rubrique (code PCJA + libellés + titre analytique)
-//! / bloc-sommaire (paragraphe doctrinal). Deux époques cohabitent :
+//! lecture), puis paires bloc-rubrique (code PCJA + libellés + titre analytique) /
+//! bloc-sommaire (paragraphe doctrinal). Deux époques cohabitent :
 //! - 1976 : libellé de rubrique mono-ligne MAJUSCULES (`ALGERIE - CONTENTIEUX`),
 //!   sommaire **répété à l'identique** sous chaque rubrique partagée ;
 //! - récent : libellé multi-lignes à tiret final (`Procédure-⏎ Jugements-…`),
 //!   renvois `(1) Cf. …` en queue du dernier sommaire.
 //!
 //! Sortie : la structure [`AjceAnalysis`] et la composition du bundle
-//! `source_fields` ADR 0204 (`commentaires[]`).
+//! `source_fields` (`commentaires[]`).
 
 use std::sync::LazyLock;
 
@@ -101,9 +101,9 @@ pub fn parse_ajce_html(html: &str) -> AjceAnalysis {
                 sommaire_idx: None,
             });
         } else {
-            // Bloc sommaire : les paragraphes de renvois `(1) Cf. …` (en queue
-            // du dernier sommaire) sont extraits ligne à ligne, le reste forme
-            // le paragraphe doctrinal (dédupliqué byte-à-byte, audit ADR 0095).
+            // Bloc sommaire : les paragraphes de renvois `(1) Cf. …` (en queue du
+            // dernier sommaire) sont extraits ligne à ligne, le reste forme le
+            // paragraphe doctrinal, dédupliqué byte-à-byte.
             let mut body_paras: Vec<String> = Vec::new();
             for p in paras {
                 if RENVOI.is_match(&p[0]) {
@@ -212,7 +212,7 @@ pub fn analyse_body(a: &AjceAnalysis) -> String {
     groups.join("\n\n")
 }
 
-/// Décision `AW_DCE` parsée (backfill ADR 0219) : en-tête + corps texte.
+/// Décision `AW_DCE` parsée : en-tête + corps texte.
 #[derive(Debug)]
 pub struct DceParsed {
     /// N°s de dossier de l'en-tête (`N° 412849, 412895` → vec).
@@ -280,11 +280,10 @@ pub struct AjceEntry {
     pub date: Option<String>,
 }
 
-/// `source_fields` de la ligne `decision_sources` ArianeWeb (ADR 0204) : une
-/// entrée `commentaires[]` par analyse, plus `{"kind":"conclusions"}` si le
-/// graphe de fratrie confirme des conclusions. Les clés de rattachement
-/// (dossier, date) restent dans le bundle : le lien CRP est composé au rendu
-/// depuis ces champs.
+/// `source_fields` de la ligne `decision_sources` ArianeWeb : une entrée
+/// `commentaires[]` par analyse, plus `{"kind":"conclusions"}` si le graphe de
+/// fratrie confirme des conclusions. Les clés de rattachement (dossier, date)
+/// restent dans le bundle : le lien CRP est composé au rendu depuis ces champs.
 pub fn build_ariane_source_fields(
     dossier: &str,
     date_lecture: &str,
@@ -367,8 +366,6 @@ mod tests {
         assert_eq!(a.dossier.as_deref(), Some("96402"));
         assert_eq!(a.rubriques.len(), 2);
         assert_eq!(a.rubriques[0].label, "ALGERIE - CONTENTIEUX");
-        // Sommaire byte-identique sous les deux rubriques → une seule copie,
-        // les deux rubriques pointent dessus.
         assert_eq!(a.sommaires, vec!["Sommaire unique répété."]);
         assert_eq!(a.rubriques[0].sommaire_idx, Some(0));
         assert_eq!(a.rubriques[1].sommaire_idx, Some(0));
@@ -380,8 +377,7 @@ mod tests {
     /// seule information de la fiche, le corps reste vide.
     const CLASSEMENT_SEUL: &str = "<html> <body style=\"font-size: 16px;\"><strong>Conseil d'État</strong><br><br><strong>N° 99545<br></strong>Non publié au recueil Lebon<br><br><strong>Lecture du vendredi 22 octobre 1993<br></strong><hr><br>14-06-01 : COMMERCE, INDUSTRIE, INTERVENTION ECONOMIQUE DE LA PUISSANCE PUBLIQUE - ORGANISATION PROFESSIONNELLE DES ACTIVITES ECONOMIQUES - CHAMBRES DE COMMERCE ET D'INDUSTRIE<br><br><br><br><br><hr><br><br><br><hr><br>33-02-06-02 : ETABLISSEMENTS PUBLICS - REGIME JURIDIQUE - PERSONNEL - STATUT<br><br><br><br><br><hr><br><br><br></body> </html>";
 
-    /// En-tête réel de la décision AW_DCE n° 62362 (CE 221186, 17 mai 2002) —
-    /// vérifié live 2026-07-12.
+    /// En-tête réel de la décision AW_DCE n° 62362 (CE 221186, 17 mai 2002).
     const DCE: &str = "<html> <body style=\"font-size: 16px;\"><strong>Conseil d'État</strong><br><br><strong>N° 221186</strong><br><strong>ECLI:FR:CESSR:2002:221186.20020517</strong><br>Mentionné au tables du recueil Lebon<br><span style=\"float: right\"><strong>Section du Contentieux</strong></span><br>M. Stirn, président<br><br><strong>Lecture du 17 mai 2002</strong><div align=\"center\"><strong>REPUBLIQUE FRANCAISE</strong></div><br>Vu la requête, enregistrée le 18 mai 2000…</body> </html>";
 
     #[test]
@@ -400,7 +396,6 @@ mod tests {
             .body
             .contains("Vu la requête, enregistrée le 18 mai 2000…"));
         assert!(d.body.starts_with("Conseil d'État"));
-        // Le `<div>` de centrage vaut saut de ligne : pas de collage.
         assert!(!d.body.contains("2002REPUBLIQUE"));
     }
 
@@ -445,7 +440,7 @@ mod tests {
         assert_eq!(commentaires.len(), 2);
         assert_eq!(commentaires[0]["kind"], "analyse");
         assert_eq!(commentaires[0]["meta"]["codes_pcja"][0], "05-03");
-        // Conclusions = existence seule : aucun autre champ (ADR 0204).
+        // Conclusions = existence seule : aucun autre champ.
         assert_eq!(commentaires[1], json!({ "kind": "conclusions" }));
         assert_eq!(sf["dossier"], "96402");
     }

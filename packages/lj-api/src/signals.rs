@@ -1,4 +1,4 @@
-//! Pondération RRF dynamique — port de `signals.py` (ADR 0032).
+//! Pondération RRF dynamique.
 //!
 //! La fusion RRF a 3 jambes (BM25 body, ANN, BM25 titre). On part d'une base à
 //! parité `BASE = (title=1.0, bm25=1.0, ann=1.0)` puis on applique des
@@ -19,14 +19,11 @@ use regex::Regex;
 /// Longueur considérée pour les centroïdes / la matrice pairwise.
 pub const TOP_K: usize = 50;
 
-/// Seuils issus de la calibration empirique (FINDINGS.md).
+/// Seuils issus de la calibration empirique.
 const D_CENTROIDS_THRESHOLD: f64 = 0.06;
 const PAIR_MU_THRESHOLD: f64 = 0.18;
 
 /// `\b[LRD]\.?\s*\d+(?:[-]\d+)+` matche L 531-1, R. 222-1, D.521-2… (IGNORECASE).
-///
-/// `regex` n'a pas de `\b` côté Unicode identique à Python re, mais sur ces
-/// motifs ASCII (lettre + chiffres) le comportement est équivalent.
 static ARTICLE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b[LRD]\.?\s*\d+(?:-\d+)+").unwrap());
 
@@ -37,10 +34,10 @@ static ARTICLE_RE: LazyLock<Regex> =
 ///   - TA / CAA / CE `2202166` (6-8 chiffres contigus)
 static DOCKET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"\b\d{2}-\d{2}\.\d{3,4}\b", // CC ancien : 07-11.687, 19-23.664
-        r"|\b\d{2}-\d{4,5}\b",       // CC nouveau : 19-23664
-        r"|\b\d{2}/\d{5}\b",         // CA / TJ : 23/01001
-        r"|\b\d{6,8}\b",             // TA / CAA / CE : 2202166
+        r"\b\d{2}-\d{2}\.\d{3,4}\b",
+        r"|\b\d{2}-\d{4,5}\b",
+        r"|\b\d{2}/\d{5}\b",
+        r"|\b\d{6,8}\b",
     ))
     .unwrap()
 });
@@ -94,8 +91,7 @@ pub fn has_date_reference(query: &str) -> bool {
 
 /// Distance cosinus (1 − cos) entre les centroïdes des deux jeux d'embeddings.
 ///
-/// `ann_emb` / `bm25_emb` sont des lignes (un vecteur par chunk). Vide → 0.0,
-/// fidèle au `ann_emb.size == 0` Python.
+/// `ann_emb` / `bm25_emb` sont des lignes (un vecteur par chunk). Vide → 0.0.
 pub fn compute_d_centroids(ann_emb: &[Vec<f32>], bm25_emb: &[Vec<f32>]) -> f64 {
     if ann_emb.is_empty() || bm25_emb.is_empty() {
         return 0.0;
@@ -178,7 +174,6 @@ pub fn compute_weights(query: &str, ann_emb: &[Vec<f32>], bm25_emb: &[Vec<f32>])
     }
 
     if has_docket_reference(query) {
-        // 6.0 plutôt que 3.0 : le body BM25 noyait sinon le titre.
         w = w.scale(6.0, 1.0, 1.0);
     }
 
@@ -230,7 +225,6 @@ mod tests {
 
     #[test]
     fn docket_and_date_cumulate() {
-        // « Cour de cassation 22 novembre 2000 » → date ×1.5 ; pas de docket ici.
         let w = compute_weights("Cour de cassation 22 novembre 2000", &[], &[]);
         assert_eq!(w.title, 1.5);
     }
@@ -243,8 +237,6 @@ mod tests {
 
     #[test]
     fn boost_ann_when_centroids_diverge_and_ann_tight() {
-        // ann tight (vecteurs quasi colinéaires → pair_mu petit), bm25 ailleurs
-        // (centroïdes éloignés → d_cent grand).
         let ann = vec![vec![1.0f32, 0.0, 0.0], vec![1.0, 0.01, 0.0]];
         let bm25 = vec![vec![0.0f32, 1.0, 0.0], vec![0.0, 1.0, 0.0]];
         let w = compute_weights("question naturelle", &ann, &bm25);
@@ -252,11 +244,6 @@ mod tests {
         assert_eq!(w.ann, 2.5);
     }
 
-    // Parité détection de signaux ↔ oracle Python (apps/api signals.py). GT figée
-    // dans tests/fixtures/oracle/signals_detect.json depuis `has_article_reference`/
-    // `has_docket_reference`/`has_date_reference`. Batterie large des formats gap-prone
-    // (articles L/R/D ± point ± espace, dockets CC ancien/nouveau + CA/TJ + admin,
-    // dates FR jour/mois/an + mois/an + ISO, négatifs).
     #[derive(serde::Deserialize)]
     struct SigCase {
         query: String,
@@ -291,12 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn centroid_and_pair_mu_match_numpy_oracle() {
-        // Valeurs figées depuis numpy (oracle) sur des embeddings exactement
-        // représentables → verrouille la formule (1−cos des centroïdes ; 1−moyenne
-        // des sim cosinus du triangle supérieur). Tolérance 1e-6 : numpy calcule en
-        // float32 (les embeddings le sont), Rust upcaste en f64 → micro-écart ~2e-9,
-        // très en deçà de la résolution qui influerait sur les seuils de pondération.
+    fn centroid_and_pair_mu_match_frozen_values() {
         let ann = vec![
             vec![1.0f32, 0.0, 0.0, 0.0],
             vec![0.5, 0.5, 0.0, 0.0],
@@ -307,13 +289,6 @@ mod tests {
         assert!((compute_pair_mu(&ann) - 0.5285954773426056).abs() < 1e-6);
     }
 
-    // Parité de la composition complète des poids ↔ oracle Python (apps/api
-    // signals.compute_weights). Couvre toute la matrice : aucun signal, article
-    // (×0.2/×1.5, exclut boost_ann), docket (×6.0), date (×1.5), cumuls
-    // docket+date (×9.0) et article+docket+date, plus la géométrie embeddings
-    // (boost_ann ann×2.5/bm25×0.4 quand centroïdes divergent ET ann resserré ;
-    // ignoré si article présent OU centroïdes confondus). GT figée dans
-    // tests/fixtures/oracle/signals_weights.json.
     #[derive(serde::Deserialize)]
     struct WeightCase {
         name: String,
@@ -335,8 +310,6 @@ mod tests {
         let fix: WeightFixture = serde_json::from_str(raw).expect("fixture signals_weights");
         for c in &fix.cases {
             let w = compute_weights(&c.query, &c.ann_emb, &c.bm25_emb);
-            // Mêmes opérations IEEE f64 dans le même ordre des deux côtés : on
-            // attend l'égalité au bit près, ε de garde contre toute dérive.
             assert!(
                 (w.title - c.title).abs() < 1e-12,
                 "{} title {} != {}",

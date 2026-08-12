@@ -1,4 +1,4 @@
-//! `Input` (port de `ui/input.tsx`). Wrapper `div` (focus-within + invalid) +
+//! `Input` : wrapper `div` (focus-within + invalid) +
 //! `<input>` interne, slots `leading`/`trailing` optionnels.
 //!
 //! Le wrapper porte l'etat focus/invalid ; l'`<input>` interne est la cible des

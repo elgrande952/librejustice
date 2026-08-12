@@ -1,4 +1,4 @@
--- Citations de jurisprudence (ADR 0165) : « la décision D cite la décision C
+-- Citations de jurisprudence : « la décision D cite la décision C
 -- à la position S », jumelle de `legal_citation` pour le span (offsets
 -- codepoints, convention 0143 : token identifiant) et de `decision_links`
 -- pour la cible. `target_ref` = clé pendante par famille (`cc|1823954`,

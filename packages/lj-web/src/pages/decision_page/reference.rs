@@ -1,5 +1,4 @@
-//! Références d'une décision (titre complet / abrégé / nom de fichier). Port de
-//! `apps/web/src/lib/decision-reference.ts`. Pur.
+//! Références d'une décision (titre complet / abrégé / nom de fichier).
 
 use lj_dtos::DecisionDetail;
 
@@ -7,7 +6,6 @@ use crate::helpers::{
     format_decision_jurisdiction, format_iso_date, format_short_decision_jurisdiction,
 };
 
-/// Parties de référence d'une décision. Port de `DecisionReferenceParts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionReferenceParts {
     pub full: String,
@@ -16,13 +14,12 @@ pub struct DecisionReferenceParts {
     pub filename: String,
 }
 
-/// Construit les références. Port de `buildDecisionReferences` :
-/// - `full` = `detail.title` (titre canonique servi par l'API, **avec** siège) ;
-/// - `heading` = `[juridiction complète, date FR, n°]` **sans** siège — titre du
-///   topbar (le siège figure déjà dans le bloc métadonnées, ADR 0170) ;
+/// Construit les références :
+/// - `full` = `detail.title` (titre canonique servi par l'API, avec siège) ;
+/// - `heading` = `[juridiction complète, date FR, n°]` sans siège ;
 /// - `short`/`filename` = `[juridiction abrégée, date FR, n° dossier]` ;
-///   `filename` remplace le `/` des n° RG judiciaires (« 25/01119 ») par `_`
-///   — interdit dans un nom de fichier.
+///   `filename` remplace le `/` des n° RG judiciaires (« 25/01119 ») par `_`,
+///   interdit dans un nom de fichier.
 pub fn build_decision_references(detail: &DecisionDetail) -> DecisionReferenceParts {
     let date = detail
         .date_lecture
@@ -58,12 +55,10 @@ pub fn build_decision_references(detail: &DecisionDetail) -> DecisionReferencePa
     }
 }
 
-/// Normalise un texte de sélection en **préservant les sauts de paragraphe** :
+/// Normalise un texte de sélection en préservant les sauts de paragraphe :
 /// espaces et tabulations intra-ligne réduits à une espace, chaque ligne trimée,
 /// lignes vides de tête/queue supprimées, runs de lignes vides réduits à une
-/// seule (séparateur de paragraphe). `Selection.toString()` insère un `\n` entre
-/// blocs `<p>` ; les écraser collait tous les paragraphes sur une ligne (port
-/// enrichi de `normalizeSelectionText`, qui aplatissait tout `\s+`).
+/// seule.
 pub fn normalize_selection_text(text: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut pending_blank = false;
@@ -82,14 +77,12 @@ pub fn normalize_selection_text(text: &str) -> String {
     lines.join("\n")
 }
 
-/// Aplatit la sélection sur une seule ligne (tout `\s+` → une espace) : pour la
-/// requête de recherche, où les retours de ligne n'ont pas de sens.
+/// Aplatit la sélection sur une seule ligne (tout `\s+` → une espace).
 pub fn flatten_selection_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `"<texte> (<référence>)"`, paragraphes du texte préservés. Port enrichi de
-/// `formatSelectionWithReference`.
+/// `"<texte> (<référence>)"`, paragraphes du texte préservés.
 pub fn format_selection_with_reference(text: &str, reference: &str) -> String {
     format!("{} ({reference})", normalize_selection_text(text))
 }
@@ -100,7 +93,6 @@ mod tests {
 
     #[test]
     fn normalize_preserves_paragraph_breaks() {
-        // Sélection multi-paragraphes telle que `Selection.toString()` la rend.
         assert_eq!(
             normalize_selection_text("Premier paragraphe.\n\nSecond paragraphe."),
             "Premier paragraphe.\n\nSecond paragraphe."

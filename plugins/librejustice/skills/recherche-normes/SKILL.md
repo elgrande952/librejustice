@@ -30,9 +30,10 @@ is missing from your session, connect it first:
    1968](https://librejustice.fr/texte/…)` — the `url` verbatim).
 2. **Date before text.** Identify the legally relevant date first —
    the attacked decision, the facts, the contract — pass it as
-   `date`, and say which version you quote (its validity window is in
-   the response). The version in force today is the wrong one for
-   most litigation.
+   `date` (both `get_legal_text` and `search_legal_texts` take it;
+   the search then matches the versions valid at that date), and say
+   which version you quote (its validity window is in the response).
+   The version in force today is the wrong one for most litigation.
 3. **Name texts by their official name.** The `code` filter resolves
    slugs and exact official names, not usual names — « CEDH » and
    « Convention européenne des droits de l'homme » fail where
@@ -56,7 +57,9 @@ provision.
    is two.
 2. **Text known, article unknown** — `search_legal_texts` with the
    `code` filter (slug or exact name) and a descriptive French query
-   on the subject. Within one named text, ranking is reliable.
+   on the subject. Within one named text, ranking is reliable. When
+   the relevant date is known, pass `date` here too: hits are the
+   versions valid at that date, not today's.
 3. **Text unknown** — descriptive query plus the `jurisdiction`
    filter (`FR`, `UE`, `INTL`, or an ISO country code `SN`, `DZ`,
    `BE`…), then read `facets.code` to see which texts concentrate the

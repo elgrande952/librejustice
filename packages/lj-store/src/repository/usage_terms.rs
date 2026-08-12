@@ -1,7 +1,8 @@
-//! Champ `usage_terms` (ADR 0248) : matérialisation des sacs de n-grammes des
-//! contextes de citation sur `legal_article`, par le job `lj-ingest
-//! usage-terms`. Le pool vit en table temporaire — toutes les méthodes doivent
-//! s'exécuter sur la même connexion (une instance de repository).
+//! Champ `usage_terms` : matérialisation des sacs de n-grammes des contextes de
+//! citation sur `legal_article`, par le job `lj-ingest usage-terms`. Le pool
+//! d'identités est retourné à l'appelant, qui répartit les batches sur plusieurs
+//! connexions (workers) — le coût est dominé par la lecture TOAST des
+//! `full_text` échantillonnés, donc I/O-bound et parallélisable.
 
 use super::DecisionRepository;
 use crate::error::Result;
@@ -17,53 +18,86 @@ impl DecisionRepository<'_> {
         Ok(n)
     }
 
-    /// Pool des identités citées ≥ `min_citations` fois, découpé en `chunks`
-    /// paquets par hash. Table temporaire liée à la connexion courante.
-    /// `legal_citation` au grain décision (spans jsonb, ADR 0247) : élément
-    /// positionnel `[char_start, char_end, ref_text_uid, ref_num_key, suivants]`.
-    pub async fn usage_terms_build_pool(&self, chunks: i32, min_citations: i64) -> Result<i64> {
-        self.conn
-            .execute("DROP TABLE IF EXISTS pg_temp.usage_terms_pool", &[])
-            .await?;
-        self.conn
-            .execute(
-                "CREATE TEMP TABLE usage_terms_pool AS
-                 SELECT el->>2 AS uid, el->>3 AS num,
-                        (abs(hashtext((el->>2) || '/' || (el->>3))) % $1::int) AS chunk
-                 FROM legal_citation lc, jsonb_array_elements(lc.spans) el
-                 WHERE el->>3 IS NOT NULL
-                 GROUP BY 1, 2
-                 HAVING count(*) >= $2",
-                &[&chunks, &min_citations],
-            )
-            .await?;
-        let row = self
-            .conn
-            .query_one("SELECT count(*) FROM pg_temp.usage_terms_pool", &[])
-            .await?;
-        Ok(row.get(0))
+    /// Pool des identités citées ≥ `min_citations` fois, trié `(uid, num)` — ordre
+    /// déterministe, le découpage en chunks vit chez l'appelant. `legal_citation` au
+    /// grain décision (spans jsonb) : élément positionnel `[char_start, char_end,
+    /// ref_text_uid, ref_num_key, suivants]`.
+    ///
+    /// Le scan complet de `legal_citation` dépasse le `statement_timeout` du pool
+    /// (30 s) : levé localement dans une transaction dédiée (même pattern que
+    /// `iter_entities_for_sitemap`).
+    pub async fn usage_terms_pool(&self, min_citations: i64) -> Result<Vec<(String, String)>> {
+        self.conn.batch_execute("BEGIN").await?;
+        let result: Result<Vec<(String, String)>> = async {
+            self.conn
+                .batch_execute("SET LOCAL statement_timeout = 0")
+                .await?;
+            let rows = self
+                .conn
+                .query(
+                    "SELECT el->>2 AS uid, el->>3 AS num
+                     FROM legal_citation lc, jsonb_array_elements(lc.spans) el
+                     WHERE el->>3 IS NOT NULL
+                     GROUP BY 1, 2
+                     HAVING count(*) >= $1
+                     ORDER BY 1, 2",
+                    &[&min_citations],
+                )
+                .await?;
+            Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+        }
+        .await;
+        match &result {
+            Ok(_) => self.conn.batch_execute("COMMIT").await?,
+            Err(_) => {
+                let _ = self.conn.batch_execute("ROLLBACK").await;
+            }
+        }
+        result
     }
 
-    /// Matérialise les sacs d'un chunk du pool : ≤300 contextes de citation
-    /// (±200 chars autour des spans, tirage déterministe par hash du
-    /// `decision_id` — reproductible, sans biais temporel ; mesuré : le bruit
-    /// de tirage passe de ±0,034 nDCG à ±0,006 entre 100 et 300 contextes),
-    /// n-grammes uni+bi (bigrammes joints `_`), seuil df ≥ max(2, 3 % des
-    /// contextes), tf log-compressé min(⌈2·log₂(df+1)⌉, 24) (répétition du
-    /// gramme — la table est faite pour BM25 ; la compression préserve l'ordre
-    /// d'importance réel là où un cap dur l'aplatit, à taille de sac égale).
-    /// Ne garde que les identités qui ont une version VIGUEUR.
-    pub async fn usage_terms_fill_chunk(&self, chunk: i32) -> Result<u64> {
+    /// Matérialise les sacs d'un batch d'identités (arrays parallèles
+    /// `uids`/`nums`) : ≤ 300 contextes de citation (±200 chars autour des spans,
+    /// tirage déterministe par hash du `decision_id` — reproductible, sans biais
+    /// temporel), n-grammes uni+bi (bigrammes joints `_`), seuil df ≥ max(2, 3 % des
+    /// contextes), tf log-compressé min(⌈2·log₂(df+1)⌉, 24). Ne garde que les
+    /// identités qui ont une version VIGUEUR.
+    ///
+    /// Un batch prend plusieurs minutes sur le corpus de prod (lecture TOAST des
+    /// `full_text`) et dépasse le `statement_timeout` du pool (30 s) : levé
+    /// localement dans une transaction dédiée. Batch hebdo du cron, pas de chemin
+    /// requête utilisateur.
+    pub async fn usage_terms_fill_batch(&self, uids: &[String], nums: &[String]) -> Result<u64> {
+        self.conn.batch_execute("BEGIN").await?;
+        let result = self.fill_batch_inner(uids, nums).await;
+        match &result {
+            Ok(_) => self.conn.batch_execute("COMMIT").await?,
+            Err(_) => {
+                let _ = self.conn.batch_execute("ROLLBACK").await;
+            }
+        }
+        result
+    }
+
+    async fn fill_batch_inner(&self, uids: &[String], nums: &[String]) -> Result<u64> {
+        self.conn
+            .batch_execute("SET LOCAL statement_timeout = 0")
+            .await?;
+        let (valid_a, norm_a) = (
+            super::referential::article_valid_now("a"),
+            super::referential::article_is_norm("a"),
+        );
         let n = self
             .conn
             .execute(
-                r#"
+                &format!(
+                    r#"
                 WITH ctx AS (
                   SELECT p.uid, p.num,
                          row_number() OVER (PARTITION BY p.uid, p.num) AS rn,
                          lower(substr(d.full_text, greatest(1, (c.el->>0)::int - 200), 200) || ' ' ||
                                substr(d.full_text, (c.el->>1)::int + 1, 200)) AS t
-                  FROM pg_temp.usage_terms_pool p
+                  FROM unnest($1::text[], $2::text[]) AS p(uid, num)
                   CROSS JOIN LATERAL (
                     SELECT lc.decision_id, el.el
                     FROM legal_citation lc
@@ -74,7 +108,7 @@ impl DecisionRepository<'_> {
                     ORDER BY hashtext(lc.decision_id::text), el.ord
                     LIMIT 300) c
                   JOIN decisions d ON d.id = c.decision_id
-                  WHERE p.chunk = $1 AND d.full_text IS NOT NULL
+                  WHERE d.full_text IS NOT NULL
                 ),
                 nctx AS (SELECT uid, num, count(*) AS n FROM ctx GROUP BY 1, 2),
                 words AS (
@@ -108,9 +142,10 @@ impl DecisionRepository<'_> {
                 SELECT b.uid, b.num, b.bag FROM bags b
                 WHERE EXISTS (SELECT 1 FROM legal_article a
                               WHERE a.text_uid = b.uid AND a.num_key = b.num
-                                AND a.status = 'VIGUEUR')
-                "#,
-                &[&chunk],
+                                AND {valid_a} AND {norm_a})
+                "#
+                ),
+                &[&uids, &nums],
             )
             .await?;
         Ok(n)

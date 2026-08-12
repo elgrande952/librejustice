@@ -1,14 +1,13 @@
-//! Parse structuré de la formation (ADR 0170) : décompose les champs SOURCE
-//! (code chambre CC, chambre de bandeau Judilibre, formation greffe
-//! Judilibre/DILA) en quatre axes — position de la chambre (display canonique
-//! recomposé), spécialisation (`chamber:*`), type de formation
-//! (`formation:*`), rôle (`office:*` / `procedure:*`).
+//! Parse structuré de la formation : décompose les champs SOURCE (code chambre
+//! CC, chambre de bandeau Judilibre, formation greffe Judilibre/DILA) en quatre
+//! axes — position de la chambre (display canonique recomposé), spécialisation
+//! (`chamber:*`), type de formation (`formation:*`), rôle (`office:*` /
+//! `procedure:*`).
 //!
-//! de référence 0157 §4 : vocabulaire fermé, comparaisons pliées
-//! (`compiled::fold_stable`), une poignée de regex génériques de position —
-//! jamais de regex par entrée. Résidu de greffe illisible (jours d'audience
-//! TCOM, noms de magistrats TA, « Affaire courante »…) = tous axes `None`,
-//! assumé.
+//! Vocabulaire fermé, comparaisons pliées (`compiled::fold_stable`), une poignée
+//! de regex génériques de position — jamais de regex par entrée. Résidu de
+//! greffe illisible (jours d'audience TCOM, noms de magistrats TA, « Affaire
+//! courante »…) = tous axes `None`.
 
 use std::sync::OnceLock;
 
@@ -18,7 +17,7 @@ use crate::compiled::fold_stable;
 
 /// Axes structurés d'une formation. Les uids sont des valeurs complètes de
 /// `facet_value` (FK) ; `chamber_position` est l'unique forme affichable,
-/// recomposée — jamais la chaîne source.
+/// recomposée.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FormationAxes {
     pub chamber_position: Option<String>,
@@ -107,8 +106,7 @@ pub const FORMATION_SEED: &[(&str, &str)] = &[
     ("formation:SPECIALISEE", "Formation spécialisée"),
 ];
 
-/// Offices nouveaux portés par ce parse (les autres `office:*` existent déjà,
-/// ADR 0163). Même contrat de seed.
+/// Offices nouveaux portés par ce parse. Même contrat de seed.
 pub const OFFICE_SEED_EXTRA: &[(&str, &str)] = &[
     ("office:JUGE_REFERES", "Juge des référés"),
     (
@@ -163,9 +161,8 @@ enum Position {
     ChambresReunies(Vec<u32>),
 }
 
-/// Ordinal français plein texte : « 1re », « 2e » … (pas d'exposant Unicode —
-/// la même forme alimente `search_title`/BM25, les requêtes utilisateur
-/// s'écrivent « 2e chambre »).
+/// Ordinal français plein texte : « 1re », « 2e »… sans exposant Unicode — la
+/// même forme alimente `search_title`/BM25.
 fn ordinal(n: u32) -> String {
     if n == 1 {
         "1re".to_string()
@@ -275,9 +272,9 @@ struct PositionPatterns {
     nombres: Regex,
 }
 
-/// Suffixe ordinal OBLIGATOIRE (« 1ère », « 2eme », « 3e », « 2° ») : un
-/// chiffre nu devant un mot-clé appartient souvent au mot-clé précédent
-/// (« chambre 2 section 1 » : « 2 section » n'est PAS la 2e section).
+/// Suffixe ordinal OBLIGATOIRE (« 1ère », « 2eme », « 3e », « 2° ») : un chiffre
+/// nu devant un mot-clé appartient au mot-clé précédent (« chambre 2 section 1 »
+/// : « 2 section » n'est PAS la 2e section).
 const ORD_SUFFIX_REQ: &str = r"(?:ere|eme|e|re|er|nde|°)";
 const ORD_SUFFIX: &str = r"(?:ere|eme|e|re|er|nde|°)?";
 /// Alias numérotables (« civil2 », « 2e civ ») ; les chambres LETTRÉES
@@ -291,9 +288,7 @@ fn position_patterns() -> &'static PositionPatterns {
     P.get_or_init(|| PositionPatterns {
         // Liste de sous-sections réunies, tous séparateurs de greffe : « 2 / 6
         // ssr », « 1ère - 6ème ssr », « 8ème et 3ème sous-sections réunies »,
-        // « 7 8 9 ssr », « 3ème - 8ème - 9ème - 10ème ssr », « 1 / 2
-        // sous-sections reunies ». Les numéros sortent de la capture par
-        // `nombres`.
+        // « 7 8 9 ssr », « 1 / 2 sous-sections reunies ».
         ssr_liste: Regex::new(&format!(
             r"\b(\d{{1,2}}\s*{ORD_SUFFIX}(?:\s*(?:et|[-/,]|\s)\s*\d{{1,2}}\s*{ORD_SUFFIX})*)\s*(?:ssr\b|sous[- ]sections?\s+reunies)"
         ))
@@ -304,9 +299,7 @@ fn position_patterns() -> &'static PositionPatterns {
             r"\b(\d{{1,2}}\s*{ORD_SUFFIX}(?:\s*(?:et|[-/,])\s*\d{{1,2}}\s*{ORD_SUFFIX})+)\s*chambres\s+reunies"
         ))
         .unwrap(),
-        // « sous-sections réunies » sans numéros.
         ss_reunies_sans_numero: Regex::new(r"\bsous[- ]sections?\s+reunies").unwrap(),
-        // « 2ème sous-section ».
         sous_section: Regex::new(&format!(
             r"\b(\d{{1,2}})\s*{ORD_SUFFIX}\s*sous[- ]section\b"
         ))
@@ -318,10 +311,10 @@ fn position_patterns() -> &'static PositionPatterns {
             r"\bpole[\s.]*n?°?\s*0*(\d{{1,2}})(?:\D{{1,15}}?{CHAMBRE_ALIAS}[\s.]*n?°?\s*0*(\d{{1,2}}))?"
         ))
         .unwrap(),
-        // TCOM « chambre 2-5 », CA « chambre civile 1-6 », « Ch civ. 1-4 »,
-        // « Ch.protection sociale 4-7 » (jusqu'à deux mots interposés, points
-        // de greffe tolérés), lettre de section (« chambre 4-8a ») ou suffixe
-        // matière deux lettres (« Chambre 1-5DP ») collés.
+        // TCOM « chambre 2-5 », CA « chambre civile 1-6 », « Ch.protection
+        // sociale 4-7 » : jusqu'à deux mots interposés, points de greffe tolérés,
+        // lettre de section (« chambre 4-8a ») ou suffixe matière (« Chambre 1-5DP »)
+        // collés.
         chamber_composee: Regex::new(&format!(
             r"\b{CHAMBRE_MOT_SEUL}(?:[\s.]+[a-z']+){{0,2}}[\s.]*0*(\d{{1,2}})\s*-\s*0*(\d{{1,2}})(?:[a-h]|[a-z]{{2}})?\b"
         ))
@@ -332,21 +325,17 @@ fn position_patterns() -> &'static PositionPatterns {
         ))
         .unwrap(),
         // « chambre 04 », « chambre n° 2 », « ch. 1 », « civil2 »,
-        // « chambre-1 » (tiret de jonction — la composée « 2-5 » passe
-        // avant), lettre de section collée tolérée (« Ch 9b » ; e = ordinal
-        // et h = heure exclus).
+        // « chambre-1 » (tiret de jonction — la composée « 2-5 » passe avant),
+        // lettre de section collée tolérée (« Ch 9b » ; e = ordinal, h = heure).
         chamber_num: Regex::new(&format!(
             r"\b{CHAMBRE_ALIAS}[\s.\-]*n?°?\s*0*(\d{{1,2}})[a-dfg]?\b"
         ))
         .unwrap(),
-        // « 13CH JCP civil » — numéro collé au mot chambre.
         chamber_collee: Regex::new(r"\b0*(\d{1,2})(?:chambre|chbre|ch)\b").unwrap(),
-        // « premiere chambre », « troisieme chambre ».
         chamber_mot: Regex::new(&format!(
             r"\b(premiere|seconde|deuxieme|troisieme|quatrieme|cinquieme|sixieme|septieme|huitieme|neuvieme|dixieme|onzieme|douzieme)\s+{CHAMBRE_ALIAS}\b"
         ))
         .unwrap(),
-        // « chambre b » (chambres lettrées de CA).
         chamber_lettre: Regex::new(&format!(r"\b{CHAMBRE_MOT_SEUL}\s+([a-h])\b")).unwrap(),
         // « Chambre 9 - B », « Pôle 4 - chambre 9 - A », « Chambre 1 A » —
         // lettre de section derrière le numéro de chambre. Séparateur REQUIS :
@@ -361,8 +350,7 @@ fn position_patterns() -> &'static PositionPatterns {
             r"\b{CHAMBRE_MOT_SEUL}[\s.]*n?°?\s*0*\d{{1,2}}([a-dfg])\b"
         ))
         .unwrap(),
-        // « 1re chambre B », « 8e chambre C » — lettre derrière le mot
-        // chambre d'une position ordinale.
+        // « 1re chambre B », « 8e chambre C ».
         chamber_ord_lettre: Regex::new(&format!(
             r"\b0*\d{{1,2}}\s*{ORD_SUFFIX_REQ}\s*{CHAMBRE_MOT_SEUL}(?:\s*[-.]\s*|\s+)([a-h])(?:[^a-z0-9']|$)"
         ))
@@ -376,7 +364,6 @@ fn position_patterns() -> &'static PositionPatterns {
         section_num: Regex::new(r"\bsect(?:ion)?[\s.]*n?°?\s*0*(\d{1,2})\b").unwrap(),
         // « S1 » (seulement adossé à une chambre).
         section_courte: Regex::new(r"\bs\s*0*(\d{1,2})\b").unwrap(),
-        // « Chambre sociale section B », « 2ème chambre sect. A ».
         section_lettre: Regex::new(r"\bsect(?:ion)?[\s.]+([a-h])(?:[^a-z0-9']|$)").unwrap(),
         // « Chambre 4-8a » — lettre de section collée à la composée.
         composee_lettre: Regex::new(r"\b\d{1,2}\s*-\s*\d{1,2}([a-h])\b").unwrap(),
@@ -460,7 +447,6 @@ fn parse_position(folded: &str) -> Option<Position> {
         .or_else(|| p.chamber_collee.captures(folded))
         .and_then(|c| {
             let n: u32 = c[1].parse().ok()?;
-            // « Chambre 0 » / « Chambre 00 » : placeholder de greffe.
             (n > 0).then(|| (n, c.get(0).unwrap().start()))
         })
         .or_else(|| {
@@ -970,7 +956,7 @@ struct PositionState {
 /// fois TOUTES les parts lues — l'adjectif de spécialisation peut venir d'une
 /// autre part que la position (« 1ère Chambre » greffe + « chambre civile »
 /// bandeau → « 1re chambre civile »). Retourne `true` si la part a produit au
-/// moins un signal (statut de couverture).
+/// moins un signal.
 fn parse_part(part: &str, axes: &mut FormationAxes, state: &mut PositionState) -> bool {
     let folded_raw = fold_stable(part);
     // Forme lexicale : séparateurs de greffe normalisés en espaces (le tiret
@@ -988,8 +974,7 @@ fn parse_part(part: &str, axes: &mut FormationAxes, state: &mut PositionState) -
 
     // Chambre CC nommée (label institutionnel verbatim). Si une position est
     // déjà posée par une part antérieure, seul l'apport d'axes compte — le
-    // display verbatim céderait la position (« 1re chambre » + « chambre
-    // sociale » bandeau).
+    // display verbatim céderait la position.
     if let Some(cc) = cc_by_label(&folded) {
         if axes.chamber_position.is_none() && axes.chamber_uid.is_none() && state.position.is_none()
         {
@@ -1088,8 +1073,6 @@ fn parse_part(part: &str, axes: &mut FormationAxes, state: &mut PositionState) -
                 .is_match(&folded_raw)
             && axes.formation_uid.is_none()
         {
-            // Sous-sections réunies sans numéros : formation seule, pas de
-            // position.
             axes.formation_uid = Some("formation:SSR");
         }
         // Ordinal suffixé isolé porté par une spécialisation (« 2EME
@@ -1150,15 +1133,11 @@ fn parse_part(part: &str, axes: &mut FormationAxes, state: &mut PositionState) -
     hit
 }
 
-/// Compose le display de chambre une fois toutes les parts fusionnées :
-/// position structurelle (adjectivée par la spécialisation — « 1re chambre
-/// civile »), sinon label référentiel de la spécialisation seule ; la section
-/// lettrée se suffixe (« Chambre sociale, section B », « 1re section D »).
 /// Offices à juge unique par régime : le juge des référés (L. 511-2 CJA,
-/// art. 484 CPC) et le magistrat désigné statuent seuls — l'office implique
-/// la composition quand rien d'autre ne l'a posée. Exception CA : une chambre
-/// NUMÉROTÉE de référés y juge l'APPEL des ordonnances en collégiale —
-/// l'implication ne vaut que sans position de chambre (service des référés,
+/// art. 484 CPC) et le magistrat désigné statuent seuls — l'office implique la
+/// composition quand rien d'autre ne l'a posée. Exception CA : une chambre
+/// NUMÉROTÉE de référés y juge l'APPEL des ordonnances en collégiale,
+/// l'implication ne vaut donc que sans position de chambre (service des référés,
 /// premier président).
 fn imply_single_judge(jurisdiction_type: Option<&str>, axes: &mut FormationAxes) {
     if axes.formation_uid.is_none()
@@ -1172,7 +1151,7 @@ fn imply_single_judge(jurisdiction_type: Option<&str>, axes: &mut FormationAxes)
     }
     // Le référé est une voie (`procedure:REFERE_*`), pas un office : la surface
     // greffe « référés » implique la composition juge unique ci-dessus mais
-    // ne sort jamais en `office_uid` (gold : 0 JUGE_REFERES sur 2 964).
+    // ne sort jamais en `office_uid`.
     if axes.office_uid == Some("office:JUGE_REFERES") {
         axes.office_uid = None;
     }
@@ -1294,7 +1273,7 @@ fn strip_rnsm(part: &str) -> String {
         .replace("rnsm", "")
 }
 
-/// Statut de couverture d'un parse pour la sonde (ADR 0170 étape 1).
+/// Statut de couverture d'un parse pour la sonde.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseStatus {
     /// Toutes les parts ont produit au moins un signal.
@@ -1307,7 +1286,6 @@ pub enum ParseStatus {
 
 /// Entrée sonde / conversion GT : la colonne COMPOSÉE historique
 /// (`formation_or_chamber`), re-séparée sur le tiret cadratin de jointure.
-/// La production ne passe jamais par ici — elle lit les champs source.
 pub fn parse_composed(jurisdiction_type: &str, composed: &str) -> (FormationAxes, ParseStatus) {
     let parts: Vec<&str> = if composed.contains(" — ") {
         composed.split(" — ").collect()
@@ -1370,9 +1348,6 @@ mod tests {
 
     #[test]
     fn juge_des_referes_implique_juge_unique() {
-        // Le juge des référés statue seul (L. 511-2 CJA) : la surface pose la
-        // composition quand rien d'autre ne l'a donnée — mais le référé est
-        // une voie, pas un office (jamais de `office:JUGE_REFERES` en sortie).
         let axes = parse_formation(Some("CAA"), None, None, None, Some("Juge des référés"));
         assert_eq!(axes.office_uid, None);
         assert_eq!(axes.formation_uid, Some("formation:JUGE_UNIQUE"));
@@ -1380,18 +1355,11 @@ mod tests {
 
     #[test]
     fn ca_chamber_numerotee_de_referes_reste_collegiale() {
-        // CA : la chambre NUMÉROTÉE de référés juge l'appel des ordonnances
-        // en collégiale — pas d'implication juge unique quand une position
-        // de chambre est posée.
         let axes = parse_formation(Some("CA"), None, Some("Chambre 1-11 référés"), None, None);
         assert_eq!(axes.office_uid, None);
         assert_eq!(axes.formation_uid, None);
-        // Service des référés sans position : premier président / délégué,
-        // statuant seul.
         let axes2 = parse_formation(Some("CA"), None, Some("Service des Référés"), None, None);
         assert_eq!(axes2.formation_uid, Some("formation:JUGE_UNIQUE"));
-        // TJ : le référé de première instance est toujours à juge seul,
-        // position ou pas (« Référés 2ème Section »).
         let axes3 = parse_formation(Some("TJ"), None, Some("REFERES 2ème Section"), None, None);
         assert_eq!(axes3.formation_uid, Some("formation:JUGE_UNIQUE"));
     }
@@ -1411,8 +1379,6 @@ mod tests {
 
     #[test]
     fn suffixe_r222_13_vaut_juge_unique() {
-        // « - R. 222-13 » (CJA : magistrat statuant seul) sous sa forme
-        // lexicale normalisée (points/tirets → espaces).
         let axes = parse_formation(
             Some("TA"),
             None,
@@ -1425,8 +1391,6 @@ mod tests {
 
     #[test]
     fn bandeau_adjective_le_champ_greffe() {
-        // Greffe : position seule ; bandeau : spécialisation seule. La fusion
-        // adjectivise la position et pose le badge.
         let axes = parse_formation(
             Some("CA"),
             None,
@@ -1440,8 +1404,6 @@ mod tests {
 
     #[test]
     fn bandeau_ne_deloge_pas_la_position_du_greffe() {
-        // Bandeau à label CC verbatim (« chambre sociale ») : il apporte le
-        // badge, pas son display — la position greffe reste le siège.
         let axes = parse_formation(
             Some("CA"),
             None,
@@ -1455,14 +1417,11 @@ mod tests {
 
     #[test]
     fn chamber_et_section_numerotees_sans_confusion() {
-        // Le chiffre de la chambre devant le mot « section » ne vaut pas
-        // numéro de section (bug « chambre 2 section 1 » → 2/2).
         let axes = composed("CA", "Chambre 2 section 1");
         assert_eq!(
             axes.chamber_position.as_deref(),
             Some("2e chambre, 1re section")
         );
-        // Ordre source TA : la section contient les chambres.
         let axes = composed("TA", "4e section - 1re chambre");
         assert_eq!(
             axes.chamber_position.as_deref(),
@@ -1473,7 +1432,6 @@ mod tests {
             axes.chamber_position.as_deref(),
             Some("18e chambre, 1re section")
         );
-        // Section abrégée.
         let axes = composed("CA", "Chambre sociale-2ème sect");
         assert_eq!(
             axes.chamber_position.as_deref(),
@@ -1513,8 +1471,6 @@ mod tests {
 
     #[test]
     fn office_consomme_son_span() {
-        // « section du contentieux » consommé par l'office ne vote plus la
-        // formation SECTION.
         let axes = composed("CE", "President de la section du contentieux");
         assert_eq!(
             axes.office_uid,
@@ -1535,61 +1491,48 @@ mod tests {
 
     #[test]
     fn lexique_gate_titres() {
-        // Point après l'alias (« Ch. 3 »), ordinal en degré (« 2° »).
         let axes = composed("TJ", "Ch. 3 cab. 5");
         assert_eq!(axes.chamber_position.as_deref(), Some("3e chambre"));
         let axes = composed("CA", "2° chambre");
         assert_eq!(axes.chamber_position.as_deref(), Some("2e chambre"));
-        // « civil2 » : alias civil numéroté.
         let axes = composed("TJ", "TJ - civil2");
         assert_eq!(axes.chamber_position.as_deref(), Some("2e chambre"));
-        // Chambre composée avec adjectif interposé.
         let axes = composed("CA", "Chambre civile 1-6");
         assert_eq!(axes.chamber_position.as_deref(), Some("Chambre 1-6"));
-        // Juge-commissaire → procédures collectives (tiret lexical).
         let axes = composed("TCOM", "Juge-commissaire");
         assert_eq!(axes.chamber_uid, Some("chamber:PROCEDURES_COLLECTIVES"));
-        // Juge unique par régime : ≤ 10 000 €, R222-13.
         let axes = composed("TJ", "CTX gal inf/= 10 000€");
         assert_eq!(axes.formation_uid, Some("formation:JUGE_UNIQUE"));
         let axes = composed("TA", "R222-13 (JU 2)");
         assert_eq!(axes.formation_uid, Some("formation:JUGE_UNIQUE"));
-        // Plénière en chaîne entière (CAA).
         let axes = composed("CAA", "Pleniere");
         assert_eq!(axes.formation_uid, Some("formation:PLENIERE"));
     }
 
     #[test]
     fn correctifs_gate_finaux() {
-        // Abréviation JU de greffe TA.
         let axes = composed("TA", "10ème chambre (JU)");
         assert_eq!(axes.chamber_position.as_deref(), Some("10e chambre"));
         assert_eq!(axes.formation_uid, Some("formation:JUGE_UNIQUE"));
-        // Composée à lettre de section collée.
         let axes = composed("TCOM", "Chambre 4-8a");
         assert_eq!(
             axes.chamber_position.as_deref(),
             Some("Chambre 4-8, section A")
         );
-        // Tiret de jonction alias-numéro.
         let axes = composed("CA", "Chambre-1 civile et com.");
         assert_eq!(axes.chamber_position.as_deref(), Some("1re chambre civile"));
         assert_eq!(axes.chamber_uid, Some("chamber:CIVILE"));
-        // Ordinal suffixé isolé porté par la spécialisation.
         let axes = composed("TJ", "2EME protection sociale");
         assert_eq!(
             axes.chamber_position.as_deref(),
             Some("2e chambre — protection sociale")
         );
         assert_eq!(axes.chamber_uid, Some("chamber:PROTECTION_SOCIALE"));
-        // Label-chambre : composition directe, pas d'em-dash.
         let axes = composed("TJ", "3ème chambre famille");
         assert_eq!(
             axes.chamber_position.as_deref(),
             Some("3e chambre de la famille")
         );
-        // Siège du juge des référés à régime juge unique : la composition
-        // sort, l'office reste vide (le référé est une voie).
         let axes = composed("TJ", "Chamb. référés(sup 10000)");
         assert_eq!(axes.office_uid, None);
         assert_eq!(axes.formation_uid, Some("formation:JUGE_UNIQUE"));
@@ -1598,12 +1541,10 @@ mod tests {
 
     #[test]
     fn correctifs_gate_v27() {
-        // Chambre zéro = placeholder de greffe, pas une position.
         let axes = composed("TJ", "Chambre 0 referes");
         assert_eq!(axes.chamber_position, None);
         assert_eq!(axes.formation_uid, Some("formation:JUGE_UNIQUE"));
         assert_eq!(composed("TCOM", "Chambre 00").chamber_position, None);
-        // Composée à alias pointé / spécialisation interposée (Aix).
         let axes = composed("CA", "Ch civ. 1-4 copropriété");
         assert_eq!(axes.chamber_position.as_deref(), Some("Chambre 1-4"));
         assert_eq!(axes.chamber_uid, Some("chamber:CIVILE"));
@@ -1612,11 +1553,9 @@ mod tests {
             axes.chamber_position.as_deref(),
             Some("Chambre 4-7 — protection sociale")
         );
-        // Numéro collé au mot chambre.
         let axes = composed("TJ", "13CH JCP civil");
         assert_eq!(axes.chamber_position.as_deref(), Some("13e chambre civile"));
         assert_eq!(axes.office_uid, Some("office:JCP"));
-        // Lettre de section derrière le numéro / mot chambre.
         let axes = composed("CA", "Pôle 4 - chambre 9 - B");
         assert_eq!(
             axes.chamber_position.as_deref(),
@@ -1632,11 +1571,8 @@ mod tests {
             axes.chamber_position.as_deref(),
             Some("1re chambre, section B")
         );
-        // La chambre lettrée seule reste une chambre, pas une section.
         let axes = composed("CA", "Chambre B");
         assert_eq!(axes.chamber_position.as_deref(), Some("Chambre B"));
-        // Spécialisation famille/filiation lettrée ; l'apostrophe ne fait
-        // pas section (« baux d'habitation »).
         let axes = composed("TJ", "Ch. de la filiation G");
         assert_eq!(
             axes.chamber_position.as_deref(),
@@ -1644,13 +1580,11 @@ mod tests {
         );
         let axes = composed("TJ", "Jcp-baux d'habitation");
         assert_eq!(axes.chamber_position.as_deref(), Some("Chambre des baux"));
-        // L'ordinal « e » collé au chiffre n'est pas une lettre de section.
         let axes = composed("CA", "1re chambre 2e section");
         assert_eq!(
             axes.chamber_position.as_deref(),
             Some("1re chambre, 2e section")
         );
-        // Lettre collée au numéro de chambre (hors e/h).
         let axes = composed("TA", "Ch 9b magistrat statuant seul");
         assert_eq!(
             axes.chamber_position.as_deref(),
@@ -1662,7 +1596,6 @@ mod tests {
             axes.chamber_position.as_deref(),
             Some("5e chambre, section B")
         );
-        // Suffixe matière deux lettres collé à la composée.
         let axes = composed("CA", "Chambre 1-5DP");
         assert_eq!(axes.chamber_position.as_deref(), Some("Chambre 1-5"));
     }
@@ -1702,14 +1635,12 @@ mod tests {
             Some("3e chambre, section E")
         );
 
-        // Ordinal de section + lettre : suffixe sans virgule.
         let axes = composed("TJ", "1ERE SECTION D");
         assert_eq!(axes.chamber_position.as_deref(), Some("1re section D"));
     }
 
     #[test]
     fn bandeau_position_seulement_si_greffe_muet() {
-        // Greffe muet (résidu) : la position du bandeau prend le relais.
         let axes = parse_formation(
             Some("CA"),
             None,
@@ -1721,7 +1652,6 @@ mod tests {
             axes.chamber_position.as_deref(),
             Some("Pôle 1 — 11e chambre")
         );
-        // Greffe parlant sans position : la position du bandeau est ignorée.
         let axes = parse_formation(
             Some("TJ"),
             None,
@@ -1894,8 +1824,6 @@ mod tests {
 
     #[test]
     fn referes_sans_office() {
-        // La surface « référés » implique le juge unique sans jamais poser
-        // d'office : le référé est une voie.
         let caa = composed("CAA", "Juge des référés");
         assert_eq!(caa.office_uid, None);
         assert_eq!(caa.formation_uid, Some("formation:JUGE_UNIQUE"));

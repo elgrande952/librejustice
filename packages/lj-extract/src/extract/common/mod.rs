@@ -1,4 +1,4 @@
-//! Helpers partagés des extracteurs (port FIDÈLE de `extract/common.py`).
+//! Helpers partagés des extracteurs.
 //!
 //! PUR : aucun I/O au runtime. Le chemin `crate::extract::common::X` reste
 //! stable : `mod.rs` réexporte chaque helper depuis son sous-module thématique.
@@ -6,30 +6,24 @@
 //! ## Note sur les regex
 //!
 //! `regex` (crate) ne supporte ni lookahead `(?=…)` ni lookbehind `(?<=…)`.
-//! Le Python `re` en abuse. Stratégie de portage :
-//! - lookbehind/lookahead sur des classes simples (`(?<=\d)…(?=\d)`) → réécrits
-//!   en groupes capturants + replacement (`$1-$2`) : strictement équivalent ;
+//! Substitutions :
+//! - lookbehind/lookahead sur des classes simples (`(?<=\d)…(?=\d)`) → groupes
+//!   capturants + replacement (`$1-$2`) : strictement équivalent ;
 //! - lookahead de borne en fin de motif (`…(?=\s*[,;.])`) → capture gloutonne
 //!   contrôlée + coupe programmatique (`normalize_instrument`) ;
-//! - négations de lookahead sur l'identifiant d'article (`_RE_ARTICLE_CORE`) →
-//!   parcours caractère par caractère reproduisant la sémantique.
-//!
-//! Les grosses regex de CITATION (`_RE_ART_CITATION`, `_RE_ARTICLES_CITATION`,
-//! `_RE_VU_ARTICLE`, `_RE_CHAINED_ARTICLE_CITATION`) ne sont *pas* portées ici :
-//! elles ne sont pas appelées par `common.py` (elles vivent dans
-//! `opendata.py` / `judilibre.py`, hors périmètre de cet agent) et dépendent
-//! de lookahead non triviaux. Voir `unresolved` du rapport.
+//! - négations de lookahead sur l'identifiant d'article → parcours caractère
+//!   par caractère reproduisant la sémantique. Voir `unresolved` du rapport.
 
 mod articles;
 mod counsel;
 mod dates;
 pub(crate) use dates::parse_french_date;
 mod instruments;
-/// Signaux structurés d'une clé de citation (ADR 0144) — fonction pure de la
-/// chaîne, substrat des règles du résolveur (DatedAct/EuNum/ForeignCode…).
+/// Signaux structurés d'une clé de citation — fonction pure de la chaîne,
+/// substrat des règles du résolveur (DatedAct/EuNum/ForeignCode…).
 pub mod key_signals;
-// Primitives texte promues dans `lj-core` (partagées avec `aliases` côté serve,
-// ADR 0123) ; re-exportées ici pour que `super::text::X` des sous-modules résolve.
+// Primitives texte promues dans `lj-core` (partagées avec `aliases` côté
+// serve) ; re-exportées ici pour que `super::text::X` des sous-modules résolve.
 pub(crate) use lj_core::text;
 
 pub use articles::normalize_article;

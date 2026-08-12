@@ -1,10 +1,10 @@
 //! Dédup des listes NER (avocats, cabinets, parties) — les valeurs restent
-//! des tranches VERBATIM du texte (ADR 0157), seule la redondance se réduit.
+//! des tranches VERBATIM du texte, seule la redondance se réduit.
 
 use std::collections::HashMap;
 
-/// `_unique_nonempty`. À doublons (clé casse-insensible), la variante la
-/// mieux cassée remplace celle déjà retenue (cf. [`better_cased`]) : les deux
+/// À doublons (clé casse-insensible), la variante la mieux cassée remplace
+/// celle déjà retenue (cf. [`better_cased`]) : les deux
 /// sont des tranches verbatim (en-tête parties « Jean DUVAL » vs corps
 /// « Jean Duval »), mais la casse mixte porte l'information que les
 /// capitales ont détruite.
@@ -103,12 +103,10 @@ fn has_placeholder(value: &str) -> bool {
     false
 }
 
-/// École « noms anonymisés » (2026-07-19) — PERSONNE : un nom dont le
-/// patronyme (n'importe quel composant) est un placeholder ne s'émet pas ;
-/// le prénom réel ne le sauve pas (« Bruno Y... »). Jamais résolvable (pas
-/// de résolution CNB sur un prénom), aucune valeur produit. La mention reste
-/// extraite en interne (attribution des côtés) — le filtre ne vit qu'à
-/// l'émission.
+/// PERSONNE : un nom dont le patronyme (n'importe quel composant) est un
+/// placeholder ne s'émet pas ; le prénom réel ne le sauve pas (« Bruno Y... »),
+/// et rien n'est résolvable sur un prénom. La mention reste extraite en interne
+/// pour l'attribution des côtés — le filtre ne vit qu'à l'émission.
 pub(crate) fn is_anonymized_person(value: &str) -> bool {
     has_placeholder(value)
 }
@@ -144,9 +142,9 @@ const FIRM_NOISE: &[&str] = &[
     "&",
 ];
 
-/// École « noms anonymisés » — CABINET : ne s'émet pas SEULEMENT si
-/// tout-placeholder (« SCP F... N... G... », « A... D'AVOCATS ») ; un token
-/// identifiant réel le sauve (« SELARL FONTENEAU - B... - MARCHAND »).
+/// CABINET : ne s'émet pas SEULEMENT si tout-placeholder (« SCP F... N... G... »,
+/// « A... D'AVOCATS ») ; un token identifiant réel le sauve (« SELARL FONTENEAU -
+/// B... - MARCHAND »).
 pub(crate) fn is_anonymized_firm(value: &str) -> bool {
     if !has_placeholder(value) {
         return false;
@@ -180,8 +178,6 @@ mod tests {
         assert_eq!(unique_nonempty(&[]), None);
     }
 
-    // Spec : école « noms anonymisés » (2026-07-19) — personne au patronyme
-    // placeholder = pas d'émission, le prénom réel ne sauve pas.
     #[test]
     fn anonymized_person_placeholder_patronyme() {
         for v in [
@@ -203,8 +199,6 @@ mod tests {
         }
     }
 
-    // Spec : cabinet filtré SEULEMENT si tout-placeholder — un token
-    // identifiant réel le sauve.
     #[test]
     fn anonymized_firm_tout_placeholder_seulement() {
         for v in ["SCP F... N... G...", "A... D'AVOCATS", "SCP Z...-A..."] {
@@ -223,8 +217,6 @@ mod tests {
 
     #[test]
     fn unique_nonempty_prefers_mixed_case_over_all_caps() {
-        // En-tête parties en capitales puis corps en casse mixte : la tranche
-        // mixte remplace la CAPS (position conservée), jamais l'inverse.
         let out = unique_nonempty(&[
             "Jean DUVAL".to_string(),
             "Martin".to_string(),

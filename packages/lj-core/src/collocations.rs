@@ -2,21 +2,19 @@
 //! **stopword interne** (`code de la route`, `tribunal de commerce`,
 //! `indemnité d'éviction`…), miné offline contre le corpus puis embarqué.
 //!
-//! Sert à la jambe BM25 body : `phrase_combo_parse` segmentait la requête en
-//! coupant à chaque stopword (`content_chunks`), ce qui tranche pile au milieu
-//! des collocations (« tribunal · commerce », « route · excès »…) et phrase des
-//! fragments-déchet à fréquence nulle au lieu de la vraie collocation à dizaines
-//! de milliers d'occurrences. Le gazetteer reconnaît ces spans et les phrase
-//! tels quels (cf. note 2026-06-12 sur le split-au-stopword).
+//! Sert à la jambe BM25 body : segmenter la requête à chaque stopword tranche au
+//! milieu des collocations (« tribunal · commerce », « route · excès »…) et
+//! phrase des fragments à fréquence nulle. Le gazetteer reconnaît ces spans et
+//! les phrase tels quels.
 //!
 //! Ce ne sont **pas** des entités nommées : un NER les raterait. C'est de la
 //! terminologie — d'où un lexique miné, pas un modèle.
 //!
-//! Le lexique est produit par `lj-bench mine-collocations` (qui foldé le corpus
-//! via [`crate::body_tok`], le MÊME tokenizer qu'à la query → pas de drift), et
-//! écrit dans `data/collocations_fr.json`. Le matcher charge ce lexique, en
-//! construit un automate Aho-Corasick et reconnaît les spans dans une requête
-//! déjà tokenisée/foldée.
+//! Le lexique est produit par `lj-bench mine-collocations` (qui folde le corpus
+//! via [`crate::body_tok`], le MÊME tokenizer qu'à la query) et écrit dans
+//! `data/collocations_fr.json`. Le matcher charge ce lexique, en construit un
+//! automate Aho-Corasick et reconnaît les spans dans une requête déjà
+//! tokenisée/foldée.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -168,12 +166,7 @@ mod tests {
 
     #[test]
     fn embedded_lexicon_loads_and_recognizes_stable_collocation() {
-        // Le lexique embarqué se charge, l'automate se construit, et une
-        // collocation à df énorme (présente dans tout lexique réel) est reconnue
-        // sur les 3 tokens — garde aussi la parité de fold lexique ↔ query.
         assert!(lexicon_len() > 0, "lexique embarqué non vide");
-        // Requête = la collocation seule (3 tokens) : aucun span plus long
-        // possible, donc l'assertion ne dépend pas du reste du lexique.
         assert_eq!(
             collocation_spans(&toks("tribunal de commerce")),
             vec![(0, 3)]

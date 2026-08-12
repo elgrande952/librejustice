@@ -1,0 +1,57 @@
+# LibreJustice
+
+> Free, open-source search engine for French and European law: court decisions
+> (both the administrative and the judicial order) and legal texts (French codes
+> at any past date, EU law, treaties, collective agreements, administrative
+> doctrine). Rebuilt daily from official sources.
+
+## Searching: connect the MCP server, do not crawl
+
+The corpus is millions of decisions and more than a million texts. Fetching
+pages one by one will not find the relevant one — the search engine will. It is
+exposed as a Model Context Protocol server, free and open to any client:
+
+- Endpoint: https://librejustice.fr/mcp
+- Transport: streamable-http. Auth: OAuth, auto-discovered (RFC 9728 metadata at
+  /.well-known/oauth-protected-resource).
+- Setup per client (Claude, ChatGPT, Codex, Cursor, Mistral…): https://librejustice.fr/mcp-guide
+
+Tools:
+
+- `search_decisions` — case law, hybrid meaning + keyword matching, with
+  structured filters (jurisdiction, dates, cited articles, codes) and facet
+  counts to refine. Quoted phrases and the `ET` / `OU` / `SAUF` / `PROCHE<n>`
+  operators switch to exact-wording matching — the only way to target which way
+  a court ruled, since semantic matching ignores negations.
+- `get_decision` — full text of one decision, with inline links to the articles
+  and decisions it cites. Also reports whether the decision still stands
+  (`appellateFate`: reversed or upheld on review) and the linked prior and
+  subsequent decisions of the same case. Read that before citing it as authority.
+- `search_legal_texts` — finds statutory articles from their subject or wording
+  when the article number is unknown; ranked snippets, facets by code.
+- `get_legal_text` — one article as it read on a given date (or today), with its
+  status, validity dates and the timeline of every version. Say which version
+  you quote.
+
+Queries are written in French: it is a French-language corpus.
+
+## Browsing (crawlable trees, for humans and indexers)
+
+Two symmetric trees, one per corpus, plus a directory of parties:
+
+- https://librejustice.fr/juridictions — courts, then year, then decisions.
+  A decision: /decision/{id}
+- https://librejustice.fr/normes — funds (codes, lois, décrets, arrêtés,
+  collective agreements, EU texts, treaties, circulaires, BOFiP), then year,
+  then texts. An article: /texte/{code}/{article}, or
+  /texte/{code}/{article}/{date} for the version in force at that date.
+- https://librejustice.fr/annuaire — companies, public bodies, associations and
+  counsel appearing in the decisions.
+
+Search pages: /decisions (case law), /textes (legal texts).
+
+## Provenance and reuse
+
+- Sources and update schedule: https://librejustice.fr/sources
+- Code: https://github.com/librejustice/librejustice (Apache-2.0)
+- Crawler policy, including AI training: https://librejustice.fr/robots.txt

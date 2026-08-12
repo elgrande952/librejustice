@@ -18,7 +18,7 @@ use std::path::Path;
 // Manifest opendata
 // ----------------------------------------------------------------------------
 
-/// Entrée opendata (port du dataclass `Entry`).
+/// Entrée opendata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub juridiction: String,
@@ -55,7 +55,7 @@ pub(super) fn default_status() -> String {
 // Manifest Judilibre
 // ----------------------------------------------------------------------------
 
-/// État d'avancement d'un `(juridiction, mois)` (port de `MonthState`).
+/// État d'avancement d'un `(juridiction, mois)`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MonthState {
     #[serde(default)]
@@ -78,7 +78,7 @@ pub struct MonthState {
     pub ingested_lines: Option<i64>,
 }
 
-/// État d'avancement d'une juridiction (port de `JurState`).
+/// État d'avancement d'une juridiction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JurState {
     pub jurisdiction: String,
@@ -224,7 +224,7 @@ impl Manifest {
 }
 
 /// Parse une entrée `jurisdictions[jur]`, en migrant l'ancien format au passage
-/// (port de `_parse_jur_state` : ancien format sans `months`).
+/// (ancien format sans `months`).
 fn parse_jur_state(jur: &str, raw: &Value) -> JurState {
     let total_decisions = raw
         .get("total_decisions")
@@ -251,7 +251,7 @@ fn parse_jur_state(jur: &str, raw: &Value) -> JurState {
 }
 
 /// `min` des watermarks legacy per-jur (`history_watermark` /
-/// `watermark_update_date`), port de la migration `Manifest.load`.
+/// `watermark_update_date`).
 fn legacy_min_watermark(obj: &serde_json::Map<String, Value>) -> Option<String> {
     let jurs = obj.get("jurisdictions")?.as_object()?;
     jurs.values()

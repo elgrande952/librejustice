@@ -1,22 +1,22 @@
 //! Endpoints OAuth 2.1 (Authorization Code + PKCE S256 + DCR) pour l'accès MCP.
 //!
-//! Port de `apps/api/.../oauth.py`. Spec MCP « Authorization » (2025-03-26),
-//! requise par Claude.ai Custom Connectors et ChatGPT Connectors :
+//! Spec MCP « Authorization » (2025-03-26), requise par Claude.ai Custom
+//! Connectors et ChatGPT Connectors :
 //!
 //! - Authorization Code + PKCE S256 (RFC 6749 / 7636)
 //! - Dynamic Client Registration (RFC 7591) — `POST /oauth/register`
+//! - Token Revocation (RFC 7009) — `POST /oauth/revoke`
 //! - Authorization Server Metadata (RFC 8414) — `/.well-known/oauth-authorization-server`
 //! - Protected Resource Metadata (RFC 9728) — `/.well-known/oauth-protected-resource`
 //!
 //! Clients publics uniquement : pas de `client_secret`, la sécurité repose sur
-//! PKCE. Les helpers crypto (base64url, SHA-256, tokens aléatoires) sont
-//! implémentés localement pour rester sur les deps déclarées du crate.
+//! PKCE.
 
 use crate::auth::RequiredUser;
 use crate::error::{validation, ApiError, Result};
 use crate::state::AppState;
 use axum::extract::{Form, Query, State};
-use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -24,7 +24,7 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-// ── DTOs (parité avec les modèles Pydantic d'`oauth.py`) ────────────────────
+// ── DTOs ────────────────────────────────────────────────────────────────────
 
 /// RFC 7591 §2 — métadonnées client envoyées par Claude.ai / ChatGPT.
 #[derive(Debug, Deserialize)]
@@ -54,10 +54,8 @@ pub struct RegisterResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeQuery {
-    // Paramètres requis côté FastAPI (`Query(...)` sans défaut) : un manquant →
-    // 422 de validation, AVANT les contrôles métier 400. On les capture en
-    // `Option` pour rendre ce 422 explicite plutôt que le rejet 400 de
-    // l'extracteur `Query`.
+    // Paramètres requis : un manquant → 422 de validation, avant les contrôles
+    // métier 400. Capturés en `Option` pour rendre ce 422 explicite.
     pub response_type: Option<String>,
     pub client_id: Option<String>,
     pub redirect_uri: Option<String>,
@@ -83,10 +81,9 @@ pub struct ApproveRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct TokenForm {
-    // Champs `Form()` requis côté FastAPI : un manquant → 422 de validation
-    // (`{type:"missing", loc:["body", <champ>]}`), pas le rejet 422 par défaut
-    // de l'extracteur `Form`. On les capture en `Option` pour reproduire ce
-    // corps Pydantic à la main, dans l'ordre de déclaration FastAPI.
+    // Champs de formulaire requis : un manquant → 422 de validation
+    // (`{type:"missing", loc:["body", <champ>]}`). Capturés en `Option` pour
+    // construire ce corps à la main.
     #[serde(default)]
     pub grant_type: Option<String>,
     #[serde(default)]
@@ -111,28 +108,69 @@ pub struct TokenResponse {
     pub refresh_token: String,
 }
 
+/// RFC 7009 §2.1 — corps de `POST /oauth/revoke`. Seul `token` est lu ;
+/// `token_type_hint` est un champ non déclaré, donc écarté par serde (cf.
+/// [`revoke`]).
+#[derive(Debug, Deserialize)]
+pub struct RevokeForm {
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
 // ── Routeur OAuth (préfixe `/oauth`) ────────────────────────────────────────
 
-/// Routes `/oauth/{register,authorize,approve,token}` (parité avec le
-/// `APIRouter(prefix="/oauth")` Python).
+/// Routes `/oauth/{register,authorize,approve,token,revoke}`.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/oauth/register", post(register))
         .route("/oauth/authorize", get(authorize))
         .route("/oauth/approve", post(approve))
         .route("/oauth/token", post(token))
+        .route("/oauth/revoke", post(revoke))
+        .layer(axum::middleware::from_fn(step_span))
+}
+
+/// Pose un span par étape OAuth franchie, sur le modèle de `pageview_span`.
+///
+/// Ni `client_id` ni jeton : l'étape se compte, elle ne se relie à personne.
+/// Ce que ça donne, et rien de plus : à quelle étape ça casse, avec quel
+/// statut, et combien de fois.
+async fn step_span(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let step = req
+        .uri()
+        .path()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let response = next.run(req).await;
+    let _span = tracing::info_span!(
+        "oauth_step",
+        librejustice.oauth.step = %step,
+        librejustice.oauth.status = response.status().as_u16(),
+    )
+    .entered();
+    response
 }
 
 /// Routes de discovery `/.well-known/*` (RFC 8414 + RFC 9728 + MCP 2025-03-26).
 ///
-/// Servies à la racine (cf. `main.py`) car publiées dans la discovery /
-/// consommées par les clients externes. Les deux chemins
-/// `oauth-protected-resource` servent le même document (RFC 9728 + variante
-/// avec composant de path exigée par Claude.ai).
+/// Servies à la racine car publiées dans la discovery / consommées par les
+/// clients externes. Trois chemins servent le **même** document
+/// `oauth-protected-resource` : la forme RFC 9728 nue, la forme à composant de
+/// path (`/.well-known/…/mcp`) exigée par Claude.ai, et la forme préfixée par
+/// la ressource (`/mcp/.well-known/…`) que d'autres clients tentent d'abord.
 pub fn well_known_router() -> Router<AppState> {
     Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
+            get(oauth_as_metadata),
+        )
+        .route(
+            "/mcp/.well-known/oauth-authorization-server",
             get(oauth_as_metadata),
         )
         .route(
@@ -141,6 +179,10 @@ pub fn well_known_router() -> Router<AppState> {
         )
         .route(
             "/.well-known/oauth-protected-resource/mcp",
+            get(oauth_protected_resource_metadata),
+        )
+        .route(
+            "/mcp/.well-known/oauth-protected-resource",
             get(oauth_protected_resource_metadata),
         )
         .route(
@@ -178,13 +220,37 @@ async fn glama_manifest(State(state): State<AppState>) -> Response {
 
 // ── Handlers ────────────────────────────────────────────────────────────────
 
+/// `redirect_uri` acceptable à l'enregistrement : HTTPS partout, HTTP seulement
+/// sur la boucle locale.
+///
+/// Compare un host parsé, jamais un préfixe de chaîne :
+/// `http://localhost.attaquant.tld/cb` n'est pas la boucle locale. Tout ce qui
+/// est loopback est admis, pas seulement `127.0.0.1` — un client natif qui
+/// écoute sur `127.0.0.2` est aussi légitimement hors réseau.
+fn is_allowed_redirect_uri(uri: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(uri) else {
+        return false;
+    };
+    let Some(host) = parsed.host() else {
+        return false;
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => match host {
+            url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+            url::Host::Ipv4(addr) => addr.is_loopback(),
+            url::Host::Ipv6(addr) => addr.is_loopback(),
+        },
+        _ => false,
+    }
+}
+
 /// RFC 7591 — Dynamic Client Registration (public client only, PKCE-protected).
 async fn register(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
 ) -> Result<Response> {
-    // Contrainte Pydantic `redirect_uris: Field(min_length=1, max_length=10)` →
-    // 422 (et non 400) côté FastAPI quand la liste est vide ou > 10.
+    // `redirect_uris` : longueur 1 à 10, sinon 422 (et non 400).
     if body.redirect_uris.is_empty() {
         return Err(ApiError::Unprocessable(validation::too_short(
             &["body", "redirect_uris"],
@@ -202,10 +268,7 @@ async fn register(
         )));
     }
     for uri in &body.redirect_uris {
-        if !(uri.starts_with("https://")
-            || uri.starts_with("http://localhost")
-            || uri.starts_with("http://127.0.0.1"))
-        {
+        if !is_allowed_redirect_uri(uri) {
             return Err(ApiError::BadRequest("invalid_redirect_uri".into()));
         }
     }
@@ -239,9 +302,9 @@ async fn authorize(
     State(state): State<AppState>,
     Query(q): Query<AuthorizeQuery>,
 ) -> Result<Response> {
-    // Paramètres requis manquants → 422 (validation FastAPI), avant tout 400
-    // métier. Ordre de déclaration FastAPI : response_type, client_id,
-    // redirect_uri, code_challenge (un seul rapporté à la fois côté `Query`).
+    // Paramètres requis manquants → 422, avant tout 400 métier. Ordre :
+    // response_type, client_id, redirect_uri, code_challenge (un seul rapporté
+    // à la fois).
     let missing = |f: &'static str| ApiError::Unprocessable(validation::missing(&["query", f]));
     let response_type = q.response_type.ok_or_else(|| missing("response_type"))?;
     let client_id = q.client_id.ok_or_else(|| missing("client_id"))?;
@@ -333,8 +396,8 @@ async fn token(State(state): State<AppState>, Form(body): Form<TokenForm>) -> Re
 /// Grant `authorization_code` : échange un code (+ PKCE S256) contre une paire
 /// access token (30 j) + refresh token (90 j).
 async fn token_authorization_code(state: &AppState, body: TokenForm) -> Result<Response> {
-    // Champs `Form()` requis, dans l'ordre de déclaration FastAPI : un manquant
-    // → 422 `{type:"missing", loc:["body", <champ>]}` (un seul rapporté).
+    // Champs de formulaire requis, dans l'ordre : un manquant → 422
+    // `{type:"missing", loc:["body", <champ>]}` (un seul rapporté).
     let missing = |f: &'static str| ApiError::Unprocessable(validation::missing(&["body", f]));
     let code = body.code.ok_or_else(|| missing("code"))?;
     let code_verifier = body.code_verifier.ok_or_else(|| missing("code_verifier"))?;
@@ -364,7 +427,6 @@ async fn token_authorization_code(state: &AppState, body: TokenForm) -> Result<R
         return Err(ApiError::BadRequest("redirect_uri_mismatch".into()));
     }
 
-    // Validation PKCE S256 : base64url(sha256(verifier)) sans padding.
     let computed = base64_url_no_pad(&sha256(code_verifier.as_bytes()));
     if computed != code_challenge {
         return Err(ApiError::BadRequest("invalid_code_verifier".into()));
@@ -379,8 +441,8 @@ async fn token_authorization_code(state: &AppState, body: TokenForm) -> Result<R
 }
 
 /// Grant `refresh_token` (RFC 6749 §6) avec **rotation** : consomme l'ancien
-/// refresh token et en émet un neuf, pour un client public (pas de secret, la
-/// rotation est la contre-mesure OAuth 2.1 contre le rejeu d'un token volé).
+/// refresh token et en émet un neuf. Pour un client public, la rotation est la
+/// contre-mesure OAuth 2.1 contre le rejeu d'un token volé.
 async fn token_refresh(state: &AppState, body: TokenForm) -> Result<Response> {
     let missing = |f: &'static str| ApiError::Unprocessable(validation::missing(&["body", f]));
     let refresh_token = body.refresh_token.ok_or_else(|| missing("refresh_token"))?;
@@ -388,13 +450,15 @@ async fn token_refresh(state: &AppState, body: TokenForm) -> Result<Response> {
 
     // Rotation atomique : le DELETE ... RETURNING consomme le token (rejeu
     // impossible) et ne rend une ligne que s'il était valide et non expiré.
+    let digest = sha256(refresh_token.as_bytes());
+    let digest: &[u8] = &digest;
     let conn = pool_conn(state).await?;
     let row = conn
         .query_opt(
             "DELETE FROM mcp_refresh_tokens \
-             WHERE refresh_token = $1 AND client_id = $2 AND expires_at > now() \
+             WHERE refresh_token_sha256 = $1 AND client_id = $2 AND expires_at > now() \
              RETURNING user_id, client_id",
-            &[&refresh_token, &client_id],
+            &[&digest, &client_id],
         )
         .await
         .map_err(store_err)?;
@@ -421,17 +485,24 @@ async fn issue_token_pair(
     let access_expires = Utc::now() + Duration::days(30);
     let refresh_expires = Utc::now() + Duration::days(90);
 
+    // Seule l'empreinte est persistée : le clair ne quitte cette fonction que dans
+    // la réponse au client.
+    let access_digest = sha256(access_token.as_bytes());
+    let access_digest: &[u8] = &access_digest;
+    let refresh_digest = sha256(refresh_token.as_bytes());
+    let refresh_digest: &[u8] = &refresh_digest;
+
     conn.execute(
-        "INSERT INTO mcp_tokens (access_token, user_id, client_id, expires_at) \
+        "INSERT INTO mcp_tokens (access_token_sha256, user_id, client_id, expires_at) \
          VALUES ($1, $2, $3, $4)",
-        &[&access_token, &user_id, &client_id, &access_expires],
+        &[&access_digest, &user_id, &client_id, &access_expires],
     )
     .await
     .map_err(store_err)?;
     conn.execute(
-        "INSERT INTO mcp_refresh_tokens (refresh_token, user_id, client_id, expires_at) \
+        "INSERT INTO mcp_refresh_tokens (refresh_token_sha256, user_id, client_id, expires_at) \
          VALUES ($1, $2, $3, $4)",
-        &[&refresh_token, &user_id, &client_id, &refresh_expires],
+        &[&refresh_digest, &user_id, &client_id, &refresh_expires],
     )
     .await
     .map_err(store_err)?;
@@ -444,31 +515,66 @@ async fn issue_token_pair(
     })
 }
 
-async fn oauth_as_metadata(
-    State(state): State<AppState>,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Json<serde_json::Value> {
-    let base = request_base_url(&uri, &headers, &state.settings.public_base_url);
+/// RFC 7009 — `POST /oauth/revoke` : le porteur d'un jeton le rend.
+///
+/// Corps `application/x-www-form-urlencoded`. `token_type_hint` est optionnel
+/// et sans effet : la suppression vise les deux tables. Un `token` absent est
+/// une requête invalide → 400 `invalid_request` (RFC 6749 §5.2).
+///
+/// **`token` présent ⇒ 200 à corps vide**, y compris inconnu, expiré ou
+/// informe : RFC 7009 §2.2 interdit de renseigner l'appelant sur l'existence du
+/// jeton. Aucune authentification de client : nos clients sont publics, la
+/// connaissance du jeton est le seul justificatif qu'ils puissent produire.
+///
+/// La comparaison porte sur l'empreinte SHA-256. Rien ne lie en base un access
+/// token à son refresh token : on rend le jeton présenté, pas son jumeau.
+async fn revoke(State(state): State<AppState>, Form(body): Form<RevokeForm>) -> Result<Response> {
+    let Some(token) = body.token else {
+        return Err(ApiError::BadRequest("invalid_request".into()));
+    };
+
+    let digest = sha256(token.as_bytes());
+    let digest: &[u8] = &digest;
+    let conn = pool_conn(&state).await?;
+    conn.execute(
+        "DELETE FROM mcp_tokens WHERE access_token_sha256 = $1",
+        &[&digest],
+    )
+    .await
+    .map_err(store_err)?;
+    conn.execute(
+        "DELETE FROM mcp_refresh_tokens WHERE refresh_token_sha256 = $1",
+        &[&digest],
+    )
+    .await
+    .map_err(store_err)?;
+
+    Ok(StatusCode::OK.into_response())
+}
+
+async fn oauth_as_metadata(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let base = public_base(&state);
     Json(json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
         "registration_endpoint": format!("{base}/oauth/register"),
+        "revocation_endpoint": format!("{base}/oauth/revoke"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
+        // Annoncé explicitement : le défaut de la RFC 8414 en l'absence du champ est
+        // `client_secret_basic`, que nos clients publics ne peuvent pas produire.
+        "revocation_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": ["mcp"],
     }))
 }
 
 async fn oauth_protected_resource_metadata(
     State(state): State<AppState>,
-    uri: Uri,
-    headers: HeaderMap,
 ) -> Json<serde_json::Value> {
-    let base = request_base_url(&uri, &headers, &state.settings.public_base_url);
+    let base = public_base(&state);
     Json(json!({
         "resource": format!("{base}/mcp"),
         "authorization_servers": [base],
@@ -477,44 +583,20 @@ async fn oauth_protected_resource_metadata(
     }))
 }
 
-/// Base URL (`scheme://host`) dérivée de la requête entrante, pour les URLs
-/// publiées dans la discovery OAuth (parité `_request_base_url` de `main.py`).
+/// Base URL publiée dans la discovery OAuth et le challenge MCP, sans `/` final.
 ///
-/// Derrière le reverse-proxy (Caddy, ADR 0042) elles doivent refléter l'hôte
-/// vu par le client, pas la valeur configurée (port/hôte backend ≠ public) :
+/// Vaut `public_base_url` et rien d'autre : la dériver de la requête entrante
+/// (`X-Forwarded-Proto` / `X-Forwarded-Host`, sinon `Host`) laisserait le
+/// client dicter les URLs que nos propres documents de discovery annoncent.
 ///
-/// - schéma : `X-Forwarded-Proto` si présent, sinon le schéma de l'URI (origin-form
-///   HTTP/1 → absent → `http`, comme `request.url.scheme` côté uvicorn) ;
-/// - hôte : `X-Forwarded-Host` si présent, sinon l'en-tête `Host`.
-///
-/// Ces en-têtes ne sont fiables que derrière un proxy de confiance (le mandat
-/// l'assume — Caddy les pose). Sans hôte, on retombe sur `fallback`
-/// (`public_base_url`). Toujours sans `/` final.
-pub(crate) fn request_base_url(uri: &Uri, headers: &HeaderMap, fallback: &str) -> String {
-    let first_token = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    };
-    let scheme = first_token("x-forwarded-proto")
-        .or_else(|| uri.scheme_str())
-        .unwrap_or("http");
-    let host = first_token("x-forwarded-host").or_else(|| {
-        headers
-            .get(axum::http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    });
-    match host {
-        Some(host) => format!("{scheme}://{host}")
-            .trim_end_matches('/')
-            .to_string(),
-        None => fallback.trim_end_matches('/').to_string(),
-    }
+/// En dev local, l'hôte se pose donc en config —
+/// `LIBREJUSTICE_API_PUBLIC_BASE_URL=http://localhost:3000`.
+fn public_base(state: &AppState) -> String {
+    state
+        .settings
+        .public_base_url
+        .trim_end_matches('/')
+        .to_string()
 }
 
 // ── Helpers DB ──────────────────────────────────────────────────────────────
@@ -528,11 +610,10 @@ async fn pool_conn(state: &AppState) -> Result<deadpool_postgres::Object> {
 }
 
 fn store_err(e: deadpool_postgres::tokio_postgres::Error) -> ApiError {
-    ApiError::Internal(format!("db: {e}"))
+    ApiError::Internal(format!("db: {}", lj_store::error::pg_detail(&e)))
 }
 
-/// Le `redirect_uri` est-il enregistré pour ce `client_id` ? (parité avec
-/// `_redirect_uri_allowed`).
+/// Le `redirect_uri` est-il enregistré pour ce `client_id` ?
 async fn redirect_uri_allowed(
     state: &AppState,
     client_id: &str,
@@ -554,9 +635,6 @@ async fn redirect_uri_allowed(
 // ── Crypto / encodage (sans dépendance externe) ─────────────────────────────
 
 /// Encode des octets en base64url **sans padding** (RFC 4648 §5).
-///
-/// Équivalent de `base64.urlsafe_b64encode(...).rstrip(b"=")` (PKCE) et de la
-/// sérialisation de `secrets.token_urlsafe`.
 fn base64_url_no_pad(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -577,24 +655,24 @@ fn base64_url_no_pad(data: &[u8]) -> String {
     out
 }
 
-/// Token aléatoire URL-safe (parité avec `secrets.token_urlsafe(n)` : `n`
-/// octets de hasard cryptographique encodés en base64url sans padding).
+/// Token aléatoire URL-safe : `n` octets de hasard cryptographique encodés en
+/// base64url sans padding.
 fn token_urlsafe(n_bytes: usize) -> String {
     base64_url_no_pad(&random_bytes(n_bytes))
 }
 
 /// Octets aléatoires d'origine OS via `getrandom` (syscall `getrandom(2)` sous
 /// Linux) — pas de file descriptor, pas de read bloquant sur le thread async.
-/// Panique si la source d'entropie de l'OS échoue : un secret OAuth ne doit
-/// jamais être dérivé d'un fallback non cryptographique.
+/// Panique si la source d'entropie de l'OS échoue.
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     getrandom::fill(&mut buf).expect("getrandom OS entropy");
     buf
 }
 
-/// SHA-256 (FIPS 180-4) en Rust pur — pour la vérification PKCE S256.
-fn sha256(data: &[u8]) -> [u8; 32] {
+/// SHA-256 (FIPS 180-4) en Rust pur — vérification PKCE S256 et empreinte des
+/// jetons.
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -686,10 +764,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Encode `application/x-www-form-urlencoded` (RFC 3986, espace → `%20` comme
-/// `urllib.parse.urlencode` avec `quote_via` par défaut `quote_plus`… mais
-/// Python `urlencode` utilise `quote_plus` → espace devient `+`). On reproduit
-/// `quote_plus`.
+/// Encode `application/x-www-form-urlencoded` : espace → `+` (`quote_plus`).
 fn form_urlencode(pairs: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (i, (k, v)) in pairs.iter().enumerate() {
@@ -727,6 +802,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn redirect_uri_http_hors_boucle_locale_est_refuse() {
+        for uri in [
+            "http://localhost.attaquant.tld/cb",
+            "http://127.0.0.1.attaquant.tld/cb",
+            "http://localhost@attaquant.tld/cb",
+            "http://attaquant.tld/cb",
+            "http://[::1].attaquant.tld/cb",
+        ] {
+            assert!(!is_allowed_redirect_uri(uri), "doit refuser {uri}");
+        }
+    }
+
+    #[test]
+    fn redirect_uri_boucle_locale_en_clair_est_admise() {
+        for uri in [
+            "http://localhost/cb",
+            "http://localhost:1234/cb",
+            "http://LocalHost:1234/cb",
+            "http://127.0.0.1/cb",
+            "http://127.0.0.1:8080/cb",
+            "http://127.0.0.2:8080/cb",
+            "http://[::1]:8080/cb",
+        ] {
+            assert!(is_allowed_redirect_uri(uri), "doit admettre {uri}");
+        }
+    }
+
+    #[test]
+    fn redirect_uri_https_partout_autres_schemas_refuses() {
+        assert!(is_allowed_redirect_uri("https://client.example/cb"));
+        assert!(!is_allowed_redirect_uri("https://"));
+        // `url` normalise l'autorité vide en prenant le 1er segment pour host :
+        // `http:///cb` a donc pour host `cb`, qui n'est pas la boucle locale.
+        assert!(!is_allowed_redirect_uri("http:///cb"));
+        for uri in [
+            "app://callback",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "ftp://client.example/cb",
+            "pas-une-url",
+        ] {
+            assert!(!is_allowed_redirect_uri(uri), "doit refuser {uri}");
+        }
+    }
+
+    #[test]
     fn sha256_known_vectors() {
         // Vecteurs FIPS 180-4 standards.
         assert_eq!(
@@ -741,12 +862,10 @@ mod tests {
 
     #[test]
     fn base64_url_no_pad_matches_rfc4648() {
-        // "foobar" → Zm9vYmFy (pas de padding ici), "foo" → Zm9v, "fo" → Zm8.
         assert_eq!(base64_url_no_pad(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64_url_no_pad(b"foo"), "Zm9v");
         assert_eq!(base64_url_no_pad(b"fo"), "Zm8");
         assert_eq!(base64_url_no_pad(b"f"), "Zg");
-        // URL-safe alphabet : '-' et '_' à la place de '+' et '/'.
         assert_eq!(base64_url_no_pad(&[0xfb, 0xff, 0xfe]), "-__-");
     }
 
@@ -774,66 +893,10 @@ mod tests {
         assert!(t
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
-        // Deux tirages diffèrent (entropie OS).
         assert_ne!(t, token_urlsafe(32));
     }
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        for (k, v) in pairs {
-            h.insert(
-                axum::http::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                v.parse().unwrap(),
-            );
-        }
-        h
-    }
-
-    #[test]
-    fn base_url_prefers_forwarded_then_host_then_fallback() {
-        let uri: Uri = "/.well-known/oauth-authorization-server".parse().unwrap();
-        // X-Forwarded-* gagnent (cas reverse-proxy Caddy).
-        assert_eq!(
-            request_base_url(
-                &uri,
-                &headers(&[
-                    ("X-Forwarded-Proto", "https"),
-                    ("X-Forwarded-Host", "librejustice.fr"),
-                    ("Host", "127.0.0.1:8301"),
-                ]),
-                "https://fallback.example",
-            ),
-            "https://librejustice.fr"
-        );
-        // Sans forwarded : schéma `http` (URI origin-form) + en-tête Host.
-        assert_eq!(
-            request_base_url(
-                &uri,
-                &headers(&[("Host", "127.0.0.1:8301")]),
-                "https://fallback.example",
-            ),
-            "http://127.0.0.1:8301"
-        );
-        // Plusieurs valeurs forwarded : on garde la première, trimée.
-        assert_eq!(
-            request_base_url(
-                &uri,
-                &headers(&[
-                    ("X-Forwarded-Proto", "https, http"),
-                    ("X-Forwarded-Host", "a.example , b.example"),
-                ]),
-                "https://fallback.example",
-            ),
-            "https://a.example"
-        );
-        // Aucun hôte disponible → fallback configuré (sans `/` final).
-        assert_eq!(
-            request_base_url(&uri, &HeaderMap::new(), "https://fallback.example/"),
-            "https://fallback.example"
-        );
     }
 }

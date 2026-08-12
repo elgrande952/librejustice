@@ -1,9 +1,9 @@
 accord créant l'espace économique européen		EU/EEE
 accord eee		EU/EEE
 accord eee)		EU/EEE
-accord franco-algérien du 27 décembre 1968		JORFTEXT000000694290
-accord franco-marocain du 9 octobre 1987		JORFTEXT000000546208
-accord franco-tunisien du 17 mars 1988		JORFTEXT000000701093
+accord franco-algérien du 27 décembre 1968		INTL/ACCORD-FR-DZ-1968
+accord franco-marocain du 9 octobre 1987		INTL/ACCORD-FR-MA-1987
+accord franco-tunisien du 17 mars 1988		INTL/ACCORD-FR-TN-1988
 accord sur l'eee		EU/EEE
 accord sur l'espace économique européen		EU/EEE
 accord sur l'espace économique européen (eee)		EU/EEE
@@ -58,7 +58,6 @@ arrêté du 17 mars 2011 relatif à la lutte contre le plum pox virus, agent cau
 arrêté du 17 novembre 2020 relatif aux caractéristiques techniques et modalités de réalisation des travaux et prestations		JORFTEXT000042532442
 arrêté du 17 octobre 2016 fixant le programme et les modalités de l'examen d'accès au centre régional de formation professionnelle d'avocats		JORFTEXT000033253563
 arrêté du 18 juin 1991 modifié relatif à la mise en place et à l'organisation du contrôle technique des véhicules		JORFTEXT000000171443
-arrêté du 18 juin 1991 relatif à la mise en place et à l'organisation du contrôle technique des véhicules		JORFTEXT000000171443
 arrêté du 18 juin 1991 relatif à la mise en place et à l'organisation du contrôle technique des véhicules		JORFTEXT000000171443
 arrêté du 18 mars 1981 relatif aux primes et indemnités du personnel relevant du livre ix du code de la santé publique		JORFTEXT000000859693
 arrêté du 18 octobre 2005 portant organisation de la formation initiale du premier grade du corps d'encadrement et d'application de la police nationale		JORFTEXT000000448186
@@ -139,17 +138,18 @@ arrêté du 8 septembre 2009 portant approbation du cahier des clauses administr
 arrêté du 9 décembre 2010 relatif à l'attribution de ristournes sur la cotisation ou d'avances ou de subventions ou à l'imposition de cotisations supplémentaires en matière d'accidents du travail ou de maladies professionnelles		JORFTEXT000023233628
 arrêté du 9 février 2009 relatif aux modalités d'immatriculation des véhicules		JORFTEXT000020237165
 arrêté du 9 novembre 2011 relatif aux conditions d'établissement et de transmission des avis rendus		JORFTEXT000024941117
-bgb		gesetze-im-internet.de/bgb
-bürgerlichen gesetzbuche		gesetze-im-internet.de/bgb
-bürgerlichen gesetzbuches		gesetze-im-internet.de/bgb
-bürgerliches gesetzbuch		gesetze-im-internet.de/bgb
+bgb		DE/CODE-CIVIL-BGB
+bürgerlichen gesetzbuche		DE/CODE-CIVIL-BGB
+bürgerlichen gesetzbuches		DE/CODE-CIVIL-BGB
+bürgerliches gesetzbuch		DE/CODE-CIVIL-BGB
 c pc		LEGITEXT000006070716
 c.p.c		LEGITEXT000006070716
-cedh		JORFTEXT000000886019
-cesdh		JORFTEXT000000886019
+cedh		INTL/CEDH
+cesdh		INTL/CEDH
 ceseda		LEGITEXT000006070158
 cgi		LEGITEXT000006069577
-charte de l'environnement		JORFTEXT000000790249
+charte de l'environnement		FR/CHARTE-ENVIRONNEMENT-2004
+charte de l'environnement de 2004		FR/CHARTE-ENVIRONNEMENT-2004
 charte de l'union européenne		EU/CHARTER
 charte des droit fondamentaux de l'union européenne		EU/CHARTER
 charte des droits de l'union européenne		EU/CHARTER
@@ -228,15 +228,16 @@ charte sociale européenne révisée le 3 mai 1996		INTL/CSE-REV
 charte sociale européenne révisée ratifiée		INTL/CSE-REV
 charte sociale européenne)		INTL/CSE-REV
 charte sociale européennes		INTL/CSE-REV
+circulaire du 28 novembre 2012		cir_44486
 cja		LEGITEXT000006070933
-cmr		JORFTEXT000000877942
+cmr		INTL/CONVENTION-CONTRAT-TRANSPORT-INTERNATIONAL-MARCHANDISES-1956
 code (code de l'entrée et du séjour des étrangers et du droit d'asile)		LEGITEXT000006070158
-code algerien de la nationalite -		african/code-de-la-nationalite-algerienne-dz
-code algérien de la famille		jafbase/docMaghreb/Algeriecode_famille.pdf
-code algérien de la nationalité		african/code-de-la-nationalite-algerienne-dz
-code algérien des familles		jafbase/docMaghreb/Algeriecode_famille.pdf
+code algerien de la nationalite -		DZ/CODE-NATIONALITE
+code algérien de la famille		DZ/CODE-FAMILLE
+code algérien de la nationalité		DZ/CODE-NATIONALITE
+code algérien des familles		DZ/CODE-FAMILLE
 code b de procédure pénale		LEGITEXT000006071154
-code belge des sociétés		belgian/code-des-societes-belge
+code belge des sociétés		BE/CODE-SOCIETES
 code ce procédure civile		LEGITEXT000006070716
 code cie l'entrée et du séjour des etrangers et du droit d'asile		LEGITEXT000006070158
 code civi		LEGITEXT000006070721
@@ -245,26 +246,26 @@ code civi1		LEGITEXT000006070721
 code civiel		LEGITEXT000006070721
 code civii		LEGITEXT000006070721
 code civiil		LEGITEXT000006070721
-code civil algérien		clr.africanchildforum.org/DZA-code-civil-75-58
-code civil de la fédération de russie		zakonrf.info/gk
-code civil guinéen avant sa		jafbase/docAfrique/Guinee/Code-civil-de-2019.pdf
-code civil guinéen ce		jafbase/docAfrique/Guinee/Code-civil-de-2019.pdf
-code civil guinéen cependant		jafbase/docAfrique/Guinee/Code-civil-de-2019.pdf
-code civil guinéen concernant la déchéance de l'autorité parentale		jafbase/docAfrique/Guinee/Code-civil-de-2019.pdf
-code civil guinéen définissant le domicile comme le lieu de la demeure habituelle d'une personne et celui du centre de ses intérêts		jafbase/docAfrique/Guinee/Code-civil-de-2019.pdf
-code civil guinéen et des dispositions du ii de l'article 16 de la loi du 23 mars 2019 de programmation et de réforme		jafbase/docAfrique/Guinee/Code-civil-de-2019.pdf
-code civil guinéen relatif aux actes de l'état civil		jafbase/docAfrique/Guinee/Code-civil-de-2019.pdf
-code civil guinéen éclairé		jafbase/docAfrique/Guinee/Code-civil-de-2019.pdf
-code civil haïtien		foreign/code-civil-haitien-ht
-code civil italien)		brocardi.it/codice-civile
-code civil local		gesetze-im-internet.de/bgb
-code civil marocain		rabat.eregulations.org/MAR-DOC-1913
-code civil suisse des obligations		fedlex/eli/cc/27/317_321_377
-code civil égyptien sur la question de la détermination du statut juridique d'une société étrangère		foreign/code-civil-egyptien-eg
-code civile égyptien		foreign/code-civil-egyptien-eg
+code civil algérien		DZ/CODE-CIVIL
+code civil de la fédération de russie		RU/CODE-CIVIL
+code civil guinéen avant sa		GN/CODE-CIVIL
+code civil guinéen ce		GN/CODE-CIVIL
+code civil guinéen cependant		GN/CODE-CIVIL
+code civil guinéen concernant la déchéance de l'autorité parentale		GN/CODE-CIVIL
+code civil guinéen définissant le domicile comme le lieu de la demeure habituelle d'une personne et celui du centre de ses intérêts		GN/CODE-CIVIL
+code civil guinéen et des dispositions du ii de l'article 16 de la loi du 23 mars 2019 de programmation et de réforme		GN/CODE-CIVIL
+code civil guinéen relatif aux actes de l'état civil		GN/CODE-CIVIL
+code civil guinéen éclairé		GN/CODE-CIVIL
+code civil haïtien		HT/CODE-CIVIL
+code civil italien)		IT/CODE-CIVIL
+code civil local		DE/CODE-CIVIL-BGB
+code civil marocain		MA/CODE-OBLIGATIONS-CONTRATS-DOC
+code civil suisse des obligations		CH/CODE-OBLIGATIONS
+code civil égyptien sur la question de la détermination du statut juridique d'une société étrangère		EG/CODE-CIVIL
+code civile égyptien		EG/CODE-CIVIL
 code civiol		LEGITEXT000006070721
 code civit		LEGITEXT000006070721
-code comorien de la famille		jafbase/docAfrique/Comores/code de la famille comorien.pdf
+code comorien de la famille		KM/CODE-FAMILLE
 code cénéral des impôts'		LEGITEXT000006069577
 code d e procédure pénale		LEGITEXT000006071154
 code d el'entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
@@ -285,7 +286,7 @@ code de 1°entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000
 code de b procédure pénale		LEGITEXT000006071154
 code de commercce		LEGITEXT000005634379
 code de commercre		LEGITEXT000005634379
-code de droit économique		belgian/code-de-droit-economique
+code de droit économique		BE/CODE-DROIT-ECONOMIQUE
 code de i'entrée et du séjour des étrangers		LEGITEXT000006070158
 code de i'entrée et du séjour des étrangers et du droit d'asiie (ceseda)		LEGITEXT000006070158
 code de i'entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
@@ -396,7 +397,7 @@ code de l'entrée te du séjour des étrangers et du droit d'asile		LEGITEXT0000
 code de l'entrée tet du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
 code de l'entée et du séjour des étrangers et du droit d'asile depuis		LEGITEXT000006070158
 code de l'entére et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
-code de l'état civil ivoirien		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
+code de l'état civil ivoirien		CI/LOI-64-374-ETAT-CIVIL
 code de l'étranger et du séjour des étrangers		LEGITEXT000006070158
 code de l'étranger et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
 code de l4entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
@@ -421,39 +422,38 @@ code de la construction te de l'habitation		LEGITEXT000006074096
 code de la construction)		LEGITEXT000006074096
 code de la constructionet de l'habitation		LEGITEXT000006074096
 code de la constructions		LEGITEXT000006074096
-code de la famille (rd congo)		jafbase/docAfrique/Congos/RDC Congo code famille 1987.pdf
-code de la famille algérienne		jafbase/docMaghreb/Algeriecode_famille.pdf
-code de la famille béninois		jafbase/docAfrique/Benin/Benin_Family_Code.pdf
-code de la famille comorien du 3 juin 2005		jafbase/docAfrique/Comores/code de la famille comorien.pdf
-code de la famille comorien)		jafbase/docAfrique/Comores/code de la famille comorien.pdf
-code de la famille comorienne		jafbase/docAfrique/Comores/code de la famille comorien.pdf
-code de la famille congolais		jafbase/docAfrique/Congos/RDC Congo code famille 1987.pdf
-code de la famille de la république centrafricaine		jafbase/docAfrique/Centrafrique/code de la famille.pdf
-code de la famille de la république du congo		jafbase/docAfrique/Congos/Brazzaville code famille 1984.pdf
-code de la famille de la république démocratique du congo		jafbase/docAfrique/Congos/RDC Congo code famille 1987.pdf
-code de la famille des comores		jafbase/docAfrique/Comores/code de la famille comorien.pdf
-code de la famille du maroc		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille du royaume du maroc		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille du sénégal		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code de la famille marocain de		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille marocain dit		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille marocain entre		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille marocain le divorce		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille marocain le divorce d'entre les époux		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille marocain le divorce de		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille marocain promulgué		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille marocain tel		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille marocaine		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code de la famille sénégalais (pièce 3 du ministère public)		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code de la famille sénégalais et rédigé sous la forme usitée		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code de la famille sénégalais issu de la loi n° 72-61 du 12 juin 1972		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code de la famille sénégalais issu de la loi n° 72-61 du 12 juin1972		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code de la famille sénégalais issue de la loi n° 72-61 du 12 juin 1972		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code de la famille sénégalais établie		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code de la famille sénégalaise		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
+code de la famille (rd congo)		CD/CODE-FAMILLE
+code de la famille algérienne		DZ/CODE-FAMILLE
+code de la famille béninois		BJ/CODE-PERSONNES-FAMILLE
+code de la famille comorien du 3 juin 2005		KM/CODE-FAMILLE
+code de la famille comorien)		KM/CODE-FAMILLE
+code de la famille comorienne		KM/CODE-FAMILLE
+code de la famille de la république centrafricaine		CF/CODE-FAMILLE-LOI-N-97-013
+code de la famille de la république du congo		CG/CODE-FAMILLE
+code de la famille de la république démocratique du congo		CD/CODE-FAMILLE
+code de la famille des comores		KM/CODE-FAMILLE
+code de la famille du maroc		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille du royaume du maroc		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille du sénégal		SN/CODE-FAMILLE
+code de la famille marocain de		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille marocain dit		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille marocain entre		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille marocain le divorce		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille marocain le divorce d'entre les époux		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille marocain le divorce de		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille marocain promulgué		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille marocain tel		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille marocaine		MA/CODE-FAMILLE-MOUDAWANA-2004
+code de la famille sénégalais (pièce 3 du ministère public)		SN/CODE-FAMILLE
+code de la famille sénégalais et rédigé sous la forme usitée		SN/CODE-FAMILLE
+code de la famille sénégalais issu de la loi n° 72-61 du 12 juin 1972		SN/CODE-FAMILLE
+code de la famille sénégalais issu de la loi n° 72-61 du 12 juin1972		SN/CODE-FAMILLE
+code de la famille sénégalais issue de la loi n° 72-61 du 12 juin 1972		SN/CODE-FAMILLE
+code de la famille sénégalais établie		SN/CODE-FAMILLE
+code de la famille sénégalaise		SN/CODE-FAMILLE
 code de la justice administrative		LEGITEXT000006070933
-code de la nationalite algerienne		african/code-de-la-nationalite-algerienne-dz
-code de la parenté malien		jafbase/docAfrique/Mali/Code_des_Personnes_et_de_la_Famille nouveau.pdf
+code de la nationalite algerienne		DZ/CODE-NATIONALITE
+code de la parenté malien		ML/CODE-PERSONNES-FAMILLE
 code de la santé public précité		LEGITEXT000006072665
 code de la santé public)		LEGITEXT000006072665
 code de la santé publiq ue		LEGITEXT000006072665
@@ -502,26 +502,26 @@ code de procédure civiel		LEGITEXT000006070716
 code de procédure civiie		LEGITEXT000006070716
 code de procédure civiile		LEGITEXT000006070716
 code de procédure civil		LEGITEXT000006070716
-code de procédure civil guinéen		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civil guinéen (voir pièce du mp n° 10)		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civil guinéen fixent le délai d'appel		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civil guinéen ni de désignation du représentant du ministère public		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civil italien		brocardi.it/codice-di-procedura-civile
-code de procédure civil malien		sgg-mali.ml/CPCCS-1999-maj2009
-code de procédure civil marocain		african/code-de-procedure-civile-marocain-ma
-code de procédure civile algérien		jafbase/docMaghreb/algerie code procedure.pdf
-code de procédure civile camerounais		african/code-procedure-civile-commerciale-camerounais-cm
-code de procédure civile de la république démocratique du congo		african/code-procedure-civile-congolais-rdc-cd
-code de procédure civile et administrative algérien		jafbase/docMaghreb/algerie code procedure.pdf
-code de procédure civile et commerciale camerounais		african/code-procedure-civile-commerciale-camerounais-cm
-code de procédure civile et économique guinéen		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civile guinéen		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civile guinéen visant cette exigence		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civile malien		sgg-mali.ml/CPCCS-1999-maj2009
-code de procédure civile économique et administrative guinéen		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civile économique et administrative guinéen aux termes		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civile économique guinéen		a-mla.org/GIN-CPCEA-1998-D98-100
-code de procédure civile, économique et administrative guinéen		a-mla.org/GIN-CPCEA-1998-D98-100
+code de procédure civil guinéen		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civil guinéen (voir pièce du mp n° 10)		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civil guinéen fixent le délai d'appel		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civil guinéen ni de désignation du représentant du ministère public		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civil italien		IT/CODE-PROCEDURE-CIVILE
+code de procédure civil malien		ML/CODE-PROCEDURE-CIVILE-COMMERCIALE-SOCIALE
+code de procédure civil marocain		MA/CODE-PROCEDURE-CIVILE
+code de procédure civile algérien		DZ/CODE-PROCEDURE-CIVILE-ADMINISTRATIVE
+code de procédure civile camerounais		CM/CODE-PROCEDURE-CIVILE-COMMERCIALE
+code de procédure civile de la république démocratique du congo		CD/CODE-PROCEDURE-CIVILE
+code de procédure civile et administrative algérien		DZ/CODE-PROCEDURE-CIVILE-ADMINISTRATIVE
+code de procédure civile et commerciale camerounais		CM/CODE-PROCEDURE-CIVILE-COMMERCIALE
+code de procédure civile et économique guinéen		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civile guinéen		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civile guinéen visant cette exigence		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civile malien		ML/CODE-PROCEDURE-CIVILE-COMMERCIALE-SOCIALE
+code de procédure civile économique et administrative guinéen		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civile économique et administrative guinéen aux termes		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civile économique guinéen		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code de procédure civile, économique et administrative guinéen		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
 code de procédure civille		LEGITEXT000006070716
 code de procédure civilme		LEGITEXT000006070716
 code de procédure civle		LEGITEXT000006070716
@@ -541,11 +541,11 @@ code del'entrée et du séjour des étrangers et du droit d'asile		LEGITEXT00000
 code deprocédure civile		LEGITEXT000006070716
 code deprocédure civile)		LEGITEXT000006070716
 code deprocédure pénale		LEGITEXT000006071154
-code des impôts de la nouvelle calédonie		NC/CODE-IMPOTS
-code des impôts de la nouvelle-calédonie suivants		NC/CODE-IMPOTS
-code des impôts de nouvelle calédonie		NC/CODE-IMPOTS
-code des impôts de nouvelle-calédonie		NC/CODE-IMPOTS
-code des impôts du territoire de nouvelle-calédonie		NC/CODE-IMPOTS
+code des impôts de la nouvelle calédonie		FR-NC/CODE-IMPOTS
+code des impôts de la nouvelle-calédonie suivants		FR-NC/CODE-IMPOTS
+code des impôts de nouvelle calédonie		FR-NC/CODE-IMPOTS
+code des impôts de nouvelle-calédonie		FR-NC/CODE-IMPOTS
+code des impôts du territoire de nouvelle-calédonie		FR-NC/CODE-IMPOTS
 code des marchés financiers		LEGITEXT000006072026
 code des marchés publics		LEGITEXT000005627819
 code des marchés publics (édition 2006)		LEGITEXT000005627819
@@ -561,33 +561,33 @@ code des marchés publics issu du décret n° 2006-975 du 1er août 2006		LEGITE
 code des marchés publics issue du décret n° 2001-210 du 7 mars 2001		LEGITEXT000006069564
 code des marchés publics résultant du décret du 7 mars 2001		LEGITEXT000006069564
 code des marchés publics)		LEGITEXT000005627819
-code des obligation suisse		fedlex/eli/cc/27/317_321_377
-code des obligation suisses		fedlex/eli/cc/27/317_321_377
-code des obligations		fedlex/eli/cc/27/317_321_377
-code des obligations (co)		fedlex/eli/cc/27/317_321_377
-code des obligations (co) suisse		fedlex/eli/cc/27/317_321_377
-code des obligations et des contrats marocains		rabat.eregulations.org/MAR-DOC-1913
-code des obligations suisse		fedlex/eli/cc/27/317_321_377
-code des obligations suisses		fedlex/eli/cc/27/317_321_377
-code des obligations)		fedlex/eli/cc/27/317_321_377
-code des personnes et de la famille du mali		jafbase/docAfrique/Mali/Code_des_Personnes_et_de_la_Famille nouveau.pdf
-code des sociétés		belgian/code-des-societes-belge
-code des sociétés belges		belgian/code-des-societes-belge
+code des obligation suisse		CH/CODE-OBLIGATIONS
+code des obligation suisses		CH/CODE-OBLIGATIONS
+code des obligations		CH/CODE-OBLIGATIONS
+code des obligations (co)		CH/CODE-OBLIGATIONS
+code des obligations (co) suisse		CH/CODE-OBLIGATIONS
+code des obligations et des contrats marocains		MA/CODE-OBLIGATIONS-CONTRATS-DOC
+code des obligations suisse		CH/CODE-OBLIGATIONS
+code des obligations suisses		CH/CODE-OBLIGATIONS
+code des obligations)		CH/CODE-OBLIGATIONS
+code des personnes et de la famille du mali		ML/CODE-PERSONNES-FAMILLE
+code des sociétés		BE/CODE-SOCIETES
+code des sociétés belges		BE/CODE-SOCIETES
 code des étrangers et du droit d'asile		LEGITEXT000006070158
 code des étrangers et du droit d'asile (ceseda)		LEGITEXT000006070158
 code des étrangers et du séjour et du droit d'asile		LEGITEXT000006070158
 code du code de justice administrative		LEGITEXT000006070933
 code du code de l'entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
 code du code de l'entrée et du séjour des étrangers et du droit d'asile et du 1		LEGITEXT000006070158
-code du code de la famille marocain		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
+code du code de la famille marocain		MA/CODE-FAMILLE-MOUDAWANA-2004
 code du code de la sécurité sociale		LEGITEXT000006073189
 code du code de procédure civile		LEGITEXT000006070716
 code du code de procédure pénale		LEGITEXT000006071154
 code du commerce		LEGITEXT000005634379
 code du droit d'entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
 code du droit d'entrée et du séjour des étrangers et du droit d'asile (ceseda)		LEGITEXT000006070158
-code du procédure civile guinéen cité		a-mla.org/GIN-CPCEA-1998-D98-100
-code du statut personnel tunisien)		jafbase/docMaghreb/TunisieStatutpersonnel.PDF
+code du procédure civile guinéen cité		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code du statut personnel tunisien)		TN/CODE-STATUT-PERSONNEL
 code du séjour de l'entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
 code du séjour de l'étranger et du droit d'asile		LEGITEXT000006070158
 code du séjour des étrangers et du droit de l'asile		LEGITEXT000006070158
@@ -611,7 +611,7 @@ code genera des impots		LEGITEXT000006069577
 code generak des impots		LEGITEXT000006069577
 code genral des impots		LEGITEXT000006069577
 code gnéral des impôts		LEGITEXT000006069577
-code guinéen de l'enfant		african/code-de-l-enfant-guineen-gn
+code guinéen de l'enfant		GN/CODE-ENFANT
 code génaral des impôts		LEGITEXT000006069577
 code génral des impôts		LEGITEXT000006069577
 code généal des impôts		LEGITEXT000006069577
@@ -628,43 +628,43 @@ code général es impôts		LEGITEXT000006069577
 code généraldes impôts		LEGITEXT000006069577
 code générale des impôts		LEGITEXT000006069577
 code générale des impôts)		LEGITEXT000006069577
-code italien de procédure civile		brocardi.it/codice-di-procedura-civile
-code judiciaire		belgian/code-judiciaire
-code judiciaire belge de 1967		belgian/code-judiciaire
-code judiciaire de 1967		belgian/code-judiciaire
-code judiciaire)		belgian/code-judiciaire
+code italien de procédure civile		IT/CODE-PROCEDURE-CIVILE
+code judiciaire		BE/CODE-JUDICIAIRE
+code judiciaire belge de 1967		BE/CODE-JUDICIAIRE
+code judiciaire de 1967		BE/CODE-JUDICIAIRE
+code judiciaire)		BE/CODE-JUDICIAIRE
 code l'entrée de l'entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
 code l'entrée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
 code l'entée et du séjour des étrangers et du droit d'asile		LEGITEXT000006070158
-code la famille marocain		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code la famille marocain de		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code la famille sénégalais		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code la famille sénégalais et des formes usitées		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code libanais des obligations et contrats		foreign/code-obligations-contrats-libanais-lb
-code libanais des obligations et des contrats		foreign/code-obligations-contrats-libanais-lb
-code malien des personnes		jafbase/docAfrique/Mali/Code_des_Personnes_et_de_la_Famille nouveau.pdf
-code marocain de la famille		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-code marocain de la famille le divorce de		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
+code la famille marocain		MA/CODE-FAMILLE-MOUDAWANA-2004
+code la famille marocain de		MA/CODE-FAMILLE-MOUDAWANA-2004
+code la famille sénégalais		SN/CODE-FAMILLE
+code la famille sénégalais et des formes usitées		SN/CODE-FAMILLE
+code libanais des obligations et contrats		LB/CODE-OBLIGATIONS-CONTRATS
+code libanais des obligations et des contrats		LB/CODE-OBLIGATIONS-CONTRATS
+code malien des personnes		ML/CODE-PERSONNES-FAMILLE
+code marocain de la famille		MA/CODE-FAMILLE-MOUDAWANA-2004
+code marocain de la famille le divorce de		MA/CODE-FAMILLE-MOUDAWANA-2004
 code pena		LEGITEXT000006070719
-code penal belge		belgian/code-penal-belge
+code penal belge		BE/CODE-PENAL
 code procédure civil		LEGITEXT000006070716
 code procédure civil)		LEGITEXT000006070716
 code procédure civile		LEGITEXT000006070716
-code procédure civile guinéen		a-mla.org/GIN-CPCEA-1998-D98-100
-code procédure civile malien		sgg-mali.ml/CPCCS-1999-maj2009
+code procédure civile guinéen		GN/CODE-PROCEDURE-CIVILE-ECONOMIQUE-ADMINISTRATIVE
+code procédure civile malien		ML/CODE-PROCEDURE-CIVILE-COMMERCIALE-SOCIALE
 code procédure pénal		LEGITEXT000006071154
-code pénal algérien		policehumanrightsresources.org/DZA-code-penal-1966
-code pénal algérien (ordonnance 66-156 du 8 juin 1966)		policehumanrightsresources.org/DZA-code-penal-1966
-code pénal applicable camerounais		african/code-penal-camerounais-cm
+code pénal algérien		DZ/CODE-PENAL-1966
+code pénal algérien (ordonnance 66-156 du 8 juin 1966)		DZ/CODE-PENAL-1966
+code pénal applicable camerounais		CM/CODE-PENAL
 code relatif à l'entrée et au séjour des étrangers et au droit d'asile		LEGITEXT000006070158
-code relatif à l'état civil sénégalais		african/code-etat-civil-senegalais-sn
+code relatif à l'état civil sénégalais		SN/CODE-ETAT-CIVIL
 code rural		LEGITEXT000006071367
-code suisse		fedlex/eli/cc/27/317_321_377
-code suisse des obligations		fedlex/eli/cc/27/317_321_377
-code sénégalais de la famille		jafbase/docAfrique/Senegal/CODE_FAMILLE sénégal 2018.pdf
-code territorial des impôts de la nouvelle-calédonie		NC/CODE-IMPOTS
-code territorial des impôts de nouvelle-calédonie		NC/CODE-IMPOTS
-code tunisien d'incitations aux investissements		cmf.tn/TN-code-incitations-investissements-93-120
+code suisse		CH/CODE-OBLIGATIONS
+code suisse des obligations		CH/CODE-OBLIGATIONS
+code sénégalais de la famille		SN/CODE-FAMILLE
+code territorial des impôts de la nouvelle-calédonie		FR-NC/CODE-IMPOTS
+code territorial des impôts de nouvelle-calédonie		FR-NC/CODE-IMPOTS
+code tunisien d'incitations aux investissements		TN/CODE-INCITATIONS-INVESTISSEMENTS
 code éde procédure pénale		LEGITEXT000006071154
 code énéral des impôts		LEGITEXT000006069577
 codede procedure penale		LEGITEXT000006071154
@@ -673,30 +673,30 @@ codede procédure pénale		LEGITEXT000006071154
 codegeneral des impots		LEGITEXT000006069577
 codegénéral des impôts		LEGITEXT000006069577
 constitution		JORFTEXT000000571356
-constitution belge du 7 février 1831		mjp.univ-perp.fr/be1994
-constitution belge)		mjp.univ-perp.fr/be1994
-constitution bulgare de 1991		mjp.univ-perp.fr/bg1991
+constitution belge du 7 février 1831		BE/CONSTITUTION-1994
+constitution belge)		BE/CONSTITUTION-1994
+constitution bulgare de 1991		BG/CONSTITUTION-1991
 constitution de 1946		JORFTEXT000000868390
-constitution de la fédération de russie		mjp.univ-perp.fr/ru1993
-constitution de la roumanie		mjp.univ-perp.fr/ro2003
-constitution de la république de bulgarie		mjp.univ-perp.fr/bg1991
-constitution de la république de pologne		mjp.univ-perp.fr/pl1997
-constitution de la république hellénique		mjp.univ-perp.fr/gr2019
-constitution de la république italienne		cdpc.univ-tln.fr/constit_italie_2022
-constitution de la république portugaise		parlamento.pt/CRP-7e-revision-2005
+constitution de la fédération de russie		RU/CONSTITUTION-1993
+constitution de la roumanie		RO/CONSTITUTION-2003
+constitution de la république de bulgarie		BG/CONSTITUTION-1991
+constitution de la république de pologne		PL/CONSTITUTION-1997
+constitution de la république hellénique		GR/CONSTITUTION-2019
+constitution de la république italienne		IT/CONSTITUTION-1947
+constitution de la république portugaise		PT/CONSTITUTION-1976
 constitution du 4 octobre 1958		JORFTEXT000000571356
-constitution espagnole)		mjp.univ-perp.fr/es1978
-constitution fédérale)		fedlex/eli/cc/1999/404
-constitution hellénique		mjp.univ-perp.fr/gr2019
-constitution hellénique)		mjp.univ-perp.fr/gr2019
-constitution italienne (34)		cdpc.univ-tln.fr/constit_italie_2022
-constitution polonaise de 1997		mjp.univ-perp.fr/pl1997
-constitution portugaise du 2 avril 1976		parlamento.pt/CRP-7e-revision-2005
-constitution portugaise)		parlamento.pt/CRP-7e-revision-2005
-constitution roumaine)		mjp.univ-perp.fr/ro2003
-constitution suisse		fedlex/eli/cc/1999/404
+constitution espagnole)		ES/CONSTITUTION-1978
+constitution fédérale)		CH/CONSTITUTION-FEDERALE
+constitution hellénique		GR/CONSTITUTION-2019
+constitution hellénique)		GR/CONSTITUTION-2019
+constitution italienne (34)		IT/CONSTITUTION-1947
+constitution polonaise de 1997		PL/CONSTITUTION-1997
+constitution portugaise du 2 avril 1976		PT/CONSTITUTION-1976
+constitution portugaise)		PT/CONSTITUTION-1976
+constitution roumaine)		RO/CONSTITUTION-2003
+constitution suisse		CH/CONSTITUTION-FEDERALE
 constitution)		JORFTEXT000000571356
-convention cmr		JORFTEXT000000877942
+convention cmr		INTL/CONVENTION-CONTRAT-TRANSPORT-INTERNATIONAL-MARCHANDISES-1956
 convention collective de l'immobilier		KALICONT000005635413
 convention collective de la banque		KALICONT000005635692
 convention collective des banques		KALICONT000005635692
@@ -746,7 +746,7 @@ convention collective nationale du personnel des organismes de sécurité social
 convention collective nationale du sport		KALICONT000017577652
 convention collective syntec		KALICONT000005635173
 convention collective syntec)		KALICONT000005635173
-convention contre la torture et autres peines ou traitements cruels, inhumains ou dégradants		JORFTEXT000000696345
+convention contre la torture et autres peines ou traitements cruels, inhumains ou dégradants		INTL/CONVENTION-CONTRE-TORTURE-AUTRES-PEINES-1984
 convention d'application de l'accord de schengen		EU/CAAS
 convention d'application de l'accord de schengen du 14 juin 1985		EU/CAAS
 convention d'application de l'accord de schengen du 19 juin 1990		EU/CAAS
@@ -755,53 +755,53 @@ convention de bruxelles de 1968		EU/CONV-BXL-1968
 convention de bruxelles de 1968 concernant la compétence judiciaire et l'exécution des décisions		EU/CONV-BXL-1968
 convention de bruxelles du 27 septembre 1968		EU/CONV-BXL-1968
 convention de bruxelles du 27 septembre 1968 concernant la compétence judiciaire et l'exécution des décisions en matière civile et commerciale		EU/CONV-BXL-1968
-convention de genève		JORFTEXT000000886512
-convention de la haye du 13 janvier 2000		JORFTEXT000020020490
-convention de la haye du 25 octobre 1980		JORFTEXT000000520694
-convention de lugano du 16 septembre 1988		JORFTEXT000000538497
-convention de lugano du 26 septembre 1988		JORFTEXT000000538497
-convention de new york du 26 janvier 1990		JORFTEXT000000716856
-convention de rome du 19 juin 1980		JORFTEXT000000536055
+convention de genève		INTL/CONV-GENEVE-1951
+convention de la haye du 13 janvier 2000		INTL/CONVENTION-PROTECTION-INTERNATIONALE-ADULTES-HAYE-2008
+convention de la haye du 25 octobre 1980		INTL/CONVENTION-ASPECTS-CIVILS-ENLEVEMENT-INTERNATIONAL-1980
+convention de lugano du 16 septembre 1988		INTL/CONVENTION-COMPETENCE-JUDICIAIRE-EXECUTION-DECISIONS-1992
+convention de lugano du 26 septembre 1988		INTL/CONVENTION-COMPETENCE-JUDICIAIRE-EXECUTION-DECISIONS-1992
+convention de new york du 26 janvier 1990		INTL/CIDE
+convention de rome du 19 juin 1980		INTL/CONVENTION-LOI-APPLICABLE-OBLIGATIONS-CONTRACTUELLES-1980
 convention de schengen		EU/CAAS
-convention de vienne		JORFTEXT000000703898
-convention de vienne du 11 avril 1980		JORFTEXT000000703898
-convention de vienne sur la vente internationale de marchandises		JORFTEXT000000703898
-convention de vienne sur les contrats de vente internationale de marchandises		JORFTEXT000000703898
-convention des nations unies contre la torture		JORFTEXT000000696345
-convention des nations unies sur les contrats de vente internationale de marchandises		JORFTEXT000000703898
-convention du 26 janvier 1990		JORFTEXT000000716856
+convention de vienne		INTL/CONVENTION-NATIONS-UNIES-CONTRATS-VENTE-1980
+convention de vienne du 11 avril 1980		INTL/CONVENTION-NATIONS-UNIES-CONTRATS-VENTE-1980
+convention de vienne sur la vente internationale de marchandises		INTL/CONVENTION-NATIONS-UNIES-CONTRATS-VENTE-1980
+convention de vienne sur les contrats de vente internationale de marchandises		INTL/CONVENTION-NATIONS-UNIES-CONTRATS-VENTE-1980
+convention des nations unies contre la torture		INTL/CONVENTION-CONTRE-TORTURE-AUTRES-PEINES-1984
+convention des nations unies sur les contrats de vente internationale de marchandises		INTL/CONVENTION-NATIONS-UNIES-CONTRATS-VENTE-1980
+convention du 26 janvier 1990		INTL/CIDE
 convention du 27 septembre 1968		EU/CONV-BXL-1968
 convention du 27 septembre 1968 concernant la compétence judiciaire et l' exécution des décisions		EU/CONV-BXL-1968
 convention du 27 septembre 1968 concernant la compétence judiciaire et l'exécution des décisions		EU/CONV-BXL-1968
-convention européenne d'extradition		JORFTEXT000000704420
-convention européenne de sauvegarde des droits de l'homme		JORFTEXT000000886019
-convention européenne de sauvegarde des droits de l'homme et des libertés fondamentales		JORFTEXT000000886019
-convention européenne des droits de l'homme		JORFTEXT000000886019
-convention européenne des droits de l'homme et des libertés fondamentales		JORFTEXT000000886019
-convention for the protection of human rights and fundamental freedoms		JORFTEXT000000886019
-convention internationale de new-york du 26 janvier 1990		JORFTEXT000000716856
-convention internationale des droits de l'enfant		JORFTEXT000000716856
-convention internationale du travail n° 158		JORFTEXT000000349885
-convention internationale relative aux droits de l'enfant		JORFTEXT000000716856
-convention n° 108 du conseil de l'europe		JORFTEXT000000682057
-convention n° 158 de l'organisation internationale du travail		JORFTEXT000000349885
-convention n°108 du conseil de l'europe		JORFTEXT000000682057
-convention n°158 de l'organisation internationale du travail		JORFTEXT000000349885
-convention relative aux droits de l'enfant		JORFTEXT000000716856
-convention sur la loi applicable aux obligations contractuelles		JORFTEXT000000536055
-convention sur la protection internationale des adultes de la haye conclue le 13/01/2000		JORFTEXT000020020490
+convention européenne d'extradition		INTL/CONVENTION-EUROPEENNE-EXTRADITION-PARIS-1957
+convention européenne de sauvegarde des droits de l'homme		INTL/CEDH
+convention européenne de sauvegarde des droits de l'homme et des libertés fondamentales		INTL/CEDH
+convention européenne des droits de l'homme		INTL/CEDH
+convention européenne des droits de l'homme et des libertés fondamentales		INTL/CEDH
+convention for the protection of human rights and fundamental freedoms		INTL/CEDH
+convention internationale de new-york du 26 janvier 1990		INTL/CIDE
+convention internationale des droits de l'enfant		INTL/CIDE
+convention internationale du travail n° 158		INTL/CONVENTION-INTERNATIONALE-TRAVAIL-158-CESSATION-1990
+convention internationale relative aux droits de l'enfant		INTL/CIDE
+convention n° 108 du conseil de l'europe		INTL/CONV-108
+convention n° 158 de l'organisation internationale du travail		INTL/CONVENTION-INTERNATIONALE-TRAVAIL-158-CESSATION-1990
+convention n°108 du conseil de l'europe		INTL/CONV-108
+convention n°158 de l'organisation internationale du travail		INTL/CONVENTION-INTERNATIONALE-TRAVAIL-158-CESSATION-1990
+convention relative aux droits de l'enfant		INTL/CIDE
+convention sur la loi applicable aux obligations contractuelles		INTL/CONVENTION-LOI-APPLICABLE-OBLIGATIONS-CONTRACTUELLES-1980
+convention sur la protection internationale des adultes de la haye conclue le 13/01/2000		INTL/CONVENTION-PROTECTION-INTERNATIONALE-ADULTES-HAYE-2008
 cpc		LEGITEXT000006070716
 cpce		LEGITEXT000025024948
 cpp		LEGITEXT000006071154
 css		LEGITEXT000006073189
-cvim		JORFTEXT000000703898
+cvim		INTL/CONVENTION-NATIONS-UNIES-CONTRATS-VENTE-1980
 directive 2001/83		EU/DIR/2001-83
 directive 2001/83 figurent sous le titre ii de		EU/DIR/2001-83
 directive 2001/83 habilite la commission à publier		EU/DIR/2001-83
 directive 2001/83 précise		EU/DIR/2001-83
 directive 2001/83)		EU/DIR/2001-83
 directive 2001/83/ce		EU/DIR/2001-83
-directive 2002/83/ce)		JORFTEXT000000340882
+directive 2002/83/ce)		EU/DIR/83-2002
 directive 2003/87		EU/DIR/2003-87
 directive 2003/87 agissant comme lex specialis		EU/DIR/2003-87
 directive 2003/87 contient		EU/DIR/2003-87
@@ -1003,10 +1003,10 @@ directive 2014/59 a		EU/DIR/2014-59
 directive 2014/59)		EU/DIR/2014-59
 directive 2014/59/ue du 15 mai 2014		EU/DIR/2014-59
 directive 2014/59/ue du parlement européen et du conseil du 15 mai 2014		EU/DIR/2014-59
-directive 89/391/cee)		JORFTEXT000000333571
-directive 93/13		JORFTEXT000000884491
-directive 95/46/ce)		JORFTEXT000000697074
-directive 97/66/ce)		JORFTEXT000000704475
+directive 89/391/cee)		EU/DIR/391-1989
+directive 93/13		EU/DIR/13-1993
+directive 95/46/ce)		EU/DIR/46-1995
+directive 97/66/ce)		EU/DIR/66-1997
 directive accueil 2013/33/ue		EU/DIR/2013-33
 directive communautaire 2008/115/ce		EU/DIR/2008-115
 directive communautaire n° 2008/115/ce		EU/DIR/2008-115
@@ -1046,7 +1046,7 @@ déclaration des droits de l'homme de 1789		JORFTEXT000000697056
 déclaration des droits de l'homme et du citoyen		JORFTEXT000000697056
 déclaration des droits de l'homme et du citoyen de 1789		JORFTEXT000000697056
 déclaration des droits de l'homme et du citoyen du 26 août 1789		JORFTEXT000000697056
-déclaration universelle des droits de l'homme		JORFTEXT000000878537
+déclaration universelle des droits de l'homme		INTL/DECLARATION-UNIVERSELLE-DROITS-HOMME-1948
 décret du 10 décembre 1999 relatif aux sapeurs-pompiers volontaires		JORFTEXT000000397767
 décret du 10 juin 1985 relatif à l'hygiène et à la sécurité du travail		JORFTEXT000000700869
 décret du 10 mai 2021 relatif aux comités sociaux territoriaux des collectivités territoriales et de leurs établissements publics		JORFTEXT000043492190
@@ -1293,17 +1293,17 @@ livre desprocédures fiscales		LEGITEXT000006069583
 livre lpf (livre procédures fiscales)		LEGITEXT000006069583
 loi 10 juillet 1991		JORFTEXT000000537611
 loi 9 juillet 1991		JORFTEXT000000172847
-loi algérienne de nationalité		african/code-de-la-nationalite-algerienne-dz
-loi camerounaise n° 68 lf-2 du 11 juin 1968		african/code-de-la-nationalite-camerounaise-cm
-loi comorienne 84-10 du 15 mai 1984		african/code-de-l-etat-civil-comorien-km
-loi comorienne du 15 mai 1984		african/code-de-l-etat-civil-comorien-km
-loi comorienne du 3 juin 2005		jafbase/docAfrique/Comores/code de la famille comorien.pdf
-loi comorienne n° 05-008/au du 3 juin 2005		jafbase/docAfrique/Comores/code de la famille comorien.pdf
-loi comorienne sur l'état civil		african/code-de-l-etat-civil-comorien-km
-loi congolaise du 1er aout 1987		jafbase/docAfrique/Congos/RDC Congo code famille 1987.pdf
-loi congolaise précitée du 1er août 1987		jafbase/docAfrique/Congos/RDC Congo code famille 1987.pdf
-loi de 1961 sur l'état civil malgache		african/code-de-l-etat-civil-malgache-mg
-loi de procédure pénale égyptienne		foreign/code-procedure-penale-egyptien-eg
+loi algérienne de nationalité		DZ/CODE-NATIONALITE
+loi camerounaise n° 68 lf-2 du 11 juin 1968		CM/CODE-NATIONALITE
+loi comorienne 84-10 du 15 mai 1984		KM/CODE-ETAT-CIVIL
+loi comorienne du 15 mai 1984		KM/CODE-ETAT-CIVIL
+loi comorienne du 3 juin 2005		KM/CODE-FAMILLE
+loi comorienne n° 05-008/au du 3 juin 2005		KM/CODE-FAMILLE
+loi comorienne sur l'état civil		KM/CODE-ETAT-CIVIL
+loi congolaise du 1er aout 1987		CD/CODE-FAMILLE
+loi congolaise précitée du 1er août 1987		CD/CODE-FAMILLE
+loi de 1961 sur l'état civil malgache		MG/CODE-ETAT-CIVIL
+loi de procédure pénale égyptienne		EG/CODE-PROCEDURE-PENALE
 loi des 2-17 mars 1791)		LEGITEXT000006071106
 loi du 10 décembre 2003 modifiant la loi n° 52-893 du 25 juillet 1952 relative au droit d'asile		JORFTEXT000000611789
 loi du 10 février 2000 relative à la modernisation et au développement du service public de l'électricité		JORFTEXT000000750321
@@ -1605,87 +1605,87 @@ loi du 9 juillet 2004 relative aux communications électroniques et aux services
 loi du 9 mars 2004 portant adaptation de la justice aux évolutions de la criminalité		JORFTEXT000000249995
 loi du 9 novembre 2010 portant réforme des retraites		JORFTEXT000023022127
 loi du10 juillet 1991		JORFTEXT000000537611
-loi fédérale complétant le code civil suisse		fedlex/eli/cc/27/317_321_377
-loi fédérale du 30 mars 1911 complétant le code civil suisse		fedlex/eli/cc/27/317_321_377
-loi fédérale pour la poursuite pour dettes et la faillite		fedlex/eli/cc/11/529_488_529
-loi fédérale suisse du 18 décembre 1987 sur le droit international privé		fedlex/eli/cc/1988/1776_1776_1776
-loi fédérale suisse du 6 octobre 2000		fedlex/eli/cc/2002/510
-loi fédérale suisse du 6 octobre 2000 (loi sur la partie générale des assurances sociales)		fedlex/eli/cc/2002/510
-loi fédérale suisse du 6 octobre 2000 sur la partie générale du droit des assurances sociales		fedlex/eli/cc/2002/510
-loi fédérale suisse du 6 octobre 2000 sur la partie générale du droit des assurances sociales (lpga)		fedlex/eli/cc/2002/510
-loi fédérale suisse sur la partie générale des assurances sociales du 6 octobre 2000		fedlex/eli/cc/2002/510
-loi fédérale suisse sur la poursuite pour dettes et la faillite		fedlex/eli/cc/11/529_488_529
-loi fédérale sur la partie générale des assurances sociales (lpga		fedlex/eli/cc/2002/510
-loi fédérale sur la partie générale du droit des assurances sociales		fedlex/eli/cc/2002/510
-loi fédérale sur la partie générale du droit des assurances sociales (du 6 octobre 2000		fedlex/eli/cc/2002/510
-loi fédérale sur la partie générale du droit des assurances sociales (lpga)		fedlex/eli/cc/2002/510
-loi fédérale sur la partie générale du droit des assurances sociales)		fedlex/eli/cc/2002/510
-loi fédérale sur la poursuite		fedlex/eli/cc/11/529_488_529
-loi fédérale sur la poursuite pour dettes et la faillite		fedlex/eli/cc/11/529_488_529
-loi fédérale sur le droit international privé		fedlex/eli/cc/1988/1776_1776_1776
-loi fédérale sur le droit international privé du 18 décembre 1987		fedlex/eli/cc/1988/1776_1776_1776
-loi fédérale sur le droit international privé)		fedlex/eli/cc/1988/1776_1776_1776
-loi fédérale sur le droit international suisse		fedlex/eli/cc/1988/1776_1776_1776
-loi ivoirienne 64-377 du 7 octobre 1964		african/loi-paternite-filiation-ivoirienne-64-377-ci
-loi ivoirienne n °64-377 du 7 octobre 1964		african/loi-paternite-filiation-ivoirienne-64-377-ci
-loi ivoirienne numéro 64-377 du 7 octobre 1964		african/loi-paternite-filiation-ivoirienne-64-377-ci
-loi ivoirienne n° 2019-572 du 27 juin 2019 invoqué ferait obstacle à ce		jafbase/docAfrique/CotedIvoire/Loi_ivoirienne_du_26juin2019_relative_à_la_minorité.pdf
-loi ivoirienne n° 64-374		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi ivoirienne n° 64-374 de l'état civil datant du 7 octobre 1964		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi ivoirienne n° 64-374 du 7 octobre 1964		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi ivoirienne n° 64-374 du 7 octobre 1964 l'exige		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi ivoirienne n° 64-374 du 7 octobre 1964, relative à l'état civil		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi ivoirienne n° 64-374 du 7 octobre 1984		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi ivoirienne n°64-374 du 7 octobre 1964		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi ivoirienne sur l'état civil n° 64-374 du 7 octobre 1964		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi ivoirienne sur la minorité du 26 juin 2019		jafbase/docAfrique/CotedIvoire/Loi_ivoirienne_du_26juin2019_relative_à_la_minorité.pdf
-loi malgache de 1961		african/code-de-l-etat-civil-malgache-mg
-loi malgache du 9 octobre 1961		african/code-de-l-etat-civil-malgache-mg
-loi malgache n° 2007-022		jafbase/docAfrique/Madagascar/LoiMariage.pdf
-loi malgache n° 2018-027		cnlegis.gov.mg/L2018-027
-loi malgache n° 63-022 du 20 novembre 1963		african/loi-filiation-malgache-mg
-loi malienne du 16 mars 1987		african/loi-etat-civil-malienne-87-27-ml
-loi malienne du 30 décembre 2011		jafbase/docAfrique/Mali/Code_des_Personnes_et_de_la_Famille nouveau.pdf
-loi malienne n° 87-27 du 16 mars 1987		african/loi-etat-civil-malienne-87-27-ml
-loi malienne n° 87-27 du 16 mars 1987 régissant l'état civil		african/loi-etat-civil-malienne-87-27-ml
-loi malienne n° 87-27 régissant l'état civil		african/loi-etat-civil-malienne-87-27-ml
-loi marocaine n° 15-01		african/loi-kafala-marocaine-15-01-ma
-loi marocaine sur l'état civil n° 37-99		african/code-de-l-etat-civil-marocain-ma
-loi mauritanienne du 12 janvier 2011		african/code-de-l-etat-civil-mauritanien-2011-mr
-loi mauritanienne du 13 juin 1961		african/code-de-la-nationalite-mauritanienne-mr
-loi mauritanienne n° 2011-003		african/code-de-l-etat-civil-mauritanien-2011-mr
+loi fédérale complétant le code civil suisse		CH/CODE-OBLIGATIONS
+loi fédérale du 30 mars 1911 complétant le code civil suisse		CH/CODE-OBLIGATIONS
+loi fédérale pour la poursuite pour dettes et la faillite		CH/LOI-POURSUITE-DETTES-FAILLITE-LP
+loi fédérale suisse du 18 décembre 1987 sur le droit international privé		CH/LOI-DROIT-INTERNATIONAL-PRIVE-LDIP
+loi fédérale suisse du 6 octobre 2000		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale suisse du 6 octobre 2000 (loi sur la partie générale des assurances sociales)		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale suisse du 6 octobre 2000 sur la partie générale du droit des assurances sociales		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale suisse du 6 octobre 2000 sur la partie générale du droit des assurances sociales (lpga)		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale suisse sur la partie générale des assurances sociales du 6 octobre 2000		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale suisse sur la poursuite pour dettes et la faillite		CH/LOI-POURSUITE-DETTES-FAILLITE-LP
+loi fédérale sur la partie générale des assurances sociales (lpga		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale sur la partie générale du droit des assurances sociales		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale sur la partie générale du droit des assurances sociales (du 6 octobre 2000		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale sur la partie générale du droit des assurances sociales (lpga)		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale sur la partie générale du droit des assurances sociales)		CH/LOI-PARTIE-GENERALE-ASSURANCES-SOCIALES-LPGA
+loi fédérale sur la poursuite		CH/LOI-POURSUITE-DETTES-FAILLITE-LP
+loi fédérale sur la poursuite pour dettes et la faillite		CH/LOI-POURSUITE-DETTES-FAILLITE-LP
+loi fédérale sur le droit international privé		CH/LOI-DROIT-INTERNATIONAL-PRIVE-LDIP
+loi fédérale sur le droit international privé du 18 décembre 1987		CH/LOI-DROIT-INTERNATIONAL-PRIVE-LDIP
+loi fédérale sur le droit international privé)		CH/LOI-DROIT-INTERNATIONAL-PRIVE-LDIP
+loi fédérale sur le droit international suisse		CH/LOI-DROIT-INTERNATIONAL-PRIVE-LDIP
+loi ivoirienne 64-377 du 7 octobre 1964		CI/LOI-PATERNITE-FILIATION-64-377
+loi ivoirienne n °64-377 du 7 octobre 1964		CI/LOI-PATERNITE-FILIATION-64-377
+loi ivoirienne numéro 64-377 du 7 octobre 1964		CI/LOI-PATERNITE-FILIATION-64-377
+loi ivoirienne n° 2019-572 du 27 juin 2019 invoqué ferait obstacle à ce		CI/LOI-2019-572-MINORITE
+loi ivoirienne n° 64-374		CI/LOI-64-374-ETAT-CIVIL
+loi ivoirienne n° 64-374 de l'état civil datant du 7 octobre 1964		CI/LOI-64-374-ETAT-CIVIL
+loi ivoirienne n° 64-374 du 7 octobre 1964		CI/LOI-64-374-ETAT-CIVIL
+loi ivoirienne n° 64-374 du 7 octobre 1964 l'exige		CI/LOI-64-374-ETAT-CIVIL
+loi ivoirienne n° 64-374 du 7 octobre 1964, relative à l'état civil		CI/LOI-64-374-ETAT-CIVIL
+loi ivoirienne n° 64-374 du 7 octobre 1984		CI/LOI-64-374-ETAT-CIVIL
+loi ivoirienne n°64-374 du 7 octobre 1964		CI/LOI-64-374-ETAT-CIVIL
+loi ivoirienne sur l'état civil n° 64-374 du 7 octobre 1964		CI/LOI-64-374-ETAT-CIVIL
+loi ivoirienne sur la minorité du 26 juin 2019		CI/LOI-2019-572-MINORITE
+loi malgache de 1961		MG/CODE-ETAT-CIVIL
+loi malgache du 9 octobre 1961		MG/CODE-ETAT-CIVIL
+loi malgache n° 2007-022		MG/LOI-2007-022-MARIAGE-REGIMES-MATRIMONIAUX
+loi malgache n° 2018-027		MG/LOI-2018-027-ETAT-CIVIL
+loi malgache n° 63-022 du 20 novembre 1963		MG/LOI-FILIATION
+loi malienne du 16 mars 1987		ML/LOI-ETAT-CIVIL-87-27
+loi malienne du 30 décembre 2011		ML/CODE-PERSONNES-FAMILLE
+loi malienne n° 87-27 du 16 mars 1987		ML/LOI-ETAT-CIVIL-87-27
+loi malienne n° 87-27 du 16 mars 1987 régissant l'état civil		ML/LOI-ETAT-CIVIL-87-27
+loi malienne n° 87-27 régissant l'état civil		ML/LOI-ETAT-CIVIL-87-27
+loi marocaine n° 15-01		MA/LOI-KAFALA-15-01
+loi marocaine sur l'état civil n° 37-99		MA/CODE-ETAT-CIVIL
+loi mauritanienne du 12 janvier 2011		MR/CODE-ETAT-CIVIL-2011
+loi mauritanienne du 13 juin 1961		MR/CODE-NATIONALITE
+loi mauritanienne n° 2011-003		MR/CODE-ETAT-CIVIL-2011
 loi modifiée n° 83-634 du 13 juillet 1983 portant droits et obligations des fonctionnaires		JORFTEXT000000504704
 loi modifiée n° 84-16 du 11 janvier 1984 portant dispositions statutaires relatives à la fonction publique de l'etat		JORFTEXT000000501099
 loi modifiée n° 84-16 du 11 janvier 1984 portant dispositions statutaires relatives à la fonction publique de l'état		JORFTEXT000000501099
 loi modifiée n° 84-53 du 26 janvier 1984 portant dispositions statutaires de la fonction publique territoriale		JORFTEXT000000320434
 loi modifiée n° 86-33 du 9 janvier 1986 portant dispositions statutaires relatives à la fonction publique hospitalière		JORFTEXT000000512459
-loi n° 1957-3 tunisienne du 1er août 1957 réglementant l'état civil		african/code-de-l-etat-civil-tunisien-tn
-loi n° 1961-112		african/code-de-la-nationalite-mauritanienne-mr
-loi n° 1961/112		african/code-de-la-nationalite-mauritanienne-mr
-loi n° 68 lf2 du11 juin 1968		african/code-de-la-nationalite-camerounaise-cm
-loi n° 70-03 portant code de la famille marocain		jafbase/docMaghreb/MarocCodeFam-oct2005.pdf
-loi sur l'état civil ivoirien		jafbase/docAfrique/CotedIvoire/Cote-dIvoire-état civil.pdf
-loi sur la nationalité congolaise du 12 novembre 2004		african/loi-nationalite-congolaise-rdc-cd
+loi n° 1957-3 tunisienne du 1er août 1957 réglementant l'état civil		TN/CODE-ETAT-CIVIL
+loi n° 1961-112		MR/CODE-NATIONALITE
+loi n° 1961/112		MR/CODE-NATIONALITE
+loi n° 68 lf2 du11 juin 1968		CM/CODE-NATIONALITE
+loi n° 70-03 portant code de la famille marocain		MA/CODE-FAMILLE-MOUDAWANA-2004
+loi sur l'état civil ivoirien		CI/LOI-64-374-ETAT-CIVIL
+loi sur la nationalité congolaise du 12 novembre 2004		CD/LOI-NATIONALITE
 loi susvisée du 10 juillet 1991		JORFTEXT000000537611
-loi sénégalaise n° 61-55 du 23 juin 1961		african/code-etat-civil-senegalais-sn
-loi tunisienne 1957-003 du 1er août 1957		african/code-de-l-etat-civil-tunisien-tn
-loi tunisienne 1957-3 du 1er août 1957		african/code-de-l-etat-civil-tunisien-tn
-loi tunisienne du 1er août 1957		african/code-de-l-etat-civil-tunisien-tn
-loi tunisienne du 30 juillet 1957		african/code-de-l-etat-civil-tunisien-tn
-loi tunisienne n° 1957-3 réglementant l'état civil		african/code-de-l-etat-civil-tunisien-tn
-loi tunisienne n° 57-3 du 1er août 1957		african/code-de-l-etat-civil-tunisien-tn
-loi tunisienne sur l'état civil		african/code-de-l-etat-civil-tunisien-tn
+loi sénégalaise n° 61-55 du 23 juin 1961		SN/CODE-ETAT-CIVIL
+loi tunisienne 1957-003 du 1er août 1957		TN/CODE-ETAT-CIVIL
+loi tunisienne 1957-3 du 1er août 1957		TN/CODE-ETAT-CIVIL
+loi tunisienne du 1er août 1957		TN/CODE-ETAT-CIVIL
+loi tunisienne du 30 juillet 1957		TN/CODE-ETAT-CIVIL
+loi tunisienne n° 1957-3 réglementant l'état civil		TN/CODE-ETAT-CIVIL
+loi tunisienne n° 57-3 du 1er août 1957		TN/CODE-ETAT-CIVIL
+loi tunisienne sur l'état civil		TN/CODE-ETAT-CIVIL
 nouveau code de procédure civile		LEGITEXT000006070716
 nouveaucode de procédure civile		LEGITEXT000006070716
-ordonnance camerounaise 81-02 du 29 juin 1981		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-ordonnance camerounaise du 29 juin 1981		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-ordonnance camerounaise no 81-02 du 29 juin 1981		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-ordonnance camerounaise n° 2 du 29 juin 1981		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-ordonnance camerounaise n° 81-002 du 29 juin 1981 portant organisation de l'état civil		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-ordonnance camerounaise n° 81-02 du 29 juin 1981		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-ordonnance camerounaise n° 81/002 du 29 juin 1981		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-ordonnance camerounaise n° 81/02 du 29 juin 1981		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-ordonnance camerounaise n° 81/022 du 29 juin 1981		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
+ordonnance camerounaise 81-02 du 29 juin 1981		CM/ORDONNANCE-81-02-ETAT-CIVIL
+ordonnance camerounaise du 29 juin 1981		CM/ORDONNANCE-81-02-ETAT-CIVIL
+ordonnance camerounaise no 81-02 du 29 juin 1981		CM/ORDONNANCE-81-02-ETAT-CIVIL
+ordonnance camerounaise n° 2 du 29 juin 1981		CM/ORDONNANCE-81-02-ETAT-CIVIL
+ordonnance camerounaise n° 81-002 du 29 juin 1981 portant organisation de l'état civil		CM/ORDONNANCE-81-02-ETAT-CIVIL
+ordonnance camerounaise n° 81-02 du 29 juin 1981		CM/ORDONNANCE-81-02-ETAT-CIVIL
+ordonnance camerounaise n° 81/002 du 29 juin 1981		CM/ORDONNANCE-81-02-ETAT-CIVIL
+ordonnance camerounaise n° 81/02 du 29 juin 1981		CM/ORDONNANCE-81-02-ETAT-CIVIL
+ordonnance camerounaise n° 81/022 du 29 juin 1981		CM/ORDONNANCE-81-02-ETAT-CIVIL
 ordonnance du 1 juillet 2004 relative aux associations syndicales de propriétaires		JORFTEXT000000623191
 ordonnance du 10 février 2016		JORFTEXT000032004939
 ordonnance du 10 février 2016)		JORFTEXT000032003979
@@ -1694,7 +1694,7 @@ ordonnance du 13 avril 2022 relative à la déontologie et à la discipline des 
 ordonnance du 13 mai 2020)		JORFTEXT000041876437
 ordonnance du 16 octobre 1958)		JORFTEXT000000517358
 ordonnance du 17 juin 2004 sur les contrats de partenariat		JORFTEXT000000438720
-ordonnance du 19 février 1970)		who.int/cpcd/DZA-ordonnance-70-20-etat-civil
+ordonnance du 19 février 1970)		DZ/CODE-ETAT-CIVIL
 ordonnance du 19 septembre 1945 portant institution de l'ordre des experts-comptables et réglementant le titre et la profession d'expert-comptable		JORFTEXT000000698851
 ordonnance du 1er décembre 1986		JORFTEXT000000333548
 ordonnance du 1er décembre 1986)		JORFTEXT000000333548
@@ -1735,10 +1735,10 @@ ordonnance du 7 novembre 1958)		JORFTEXT000000705065
 ordonnance du 8 décembre 2005 relative aux échanges électroniques entre les usagers et les autorités administratives et entre les autorités administratives		JORFTEXT000000636232
 ordonnance du 8 juillet 1998 portant actualisation et adaptation des règles relatives aux garanties de recouvrement et à la procédure contentieuse en matière d'impôts en polynésie française		JORFTEXT000000572590
 ordonnance du 8 mars 2000)		JORFTEXT000000399226
-ordonnance n° 81-02		cvuc-uccc.com/CMR-ordonnance-81-02-etat-civil
-pacte international des droits civils et politiques		JORFTEXT000000517071
-pacte international relatif aux droits civils et politiques		JORFTEXT000000517071
-pacte international relatif aux droits civiques et politiques		JORFTEXT000000517071
+ordonnance n° 81-02		CM/ORDONNANCE-81-02-ETAT-CIVIL
+pacte international des droits civils et politiques		INTL/PACTE-INTERNATIONAL-DROITS-CIVILS-POLITIQUES-1966
+pacte international relatif aux droits civils et politiques		INTL/PACTE-INTERNATIONAL-DROITS-CIVILS-POLITIQUES-1966
+pacte international relatif aux droits civiques et politiques		INTL/PACTE-INTERNATIONAL-DROITS-CIVILS-POLITIQUES-1966
 premier protocole		INTL/CEDH-P1
 premier protocole additionnel		INTL/CEDH-P1
 protocole additionnel n° 4		INTL/CEDH-P4
@@ -1765,6 +1765,9 @@ protocole n° 7 à la convention européenne de sauvegarde des droits de l'homme
 protocole n° 7)		INTL/CEDH-P7
 protocole sur le statut de la cour de justice		EU/STATUT-CJUE
 protocole sur le statut de la cour de justice de l'union européenne		EU/STATUT-CJUE
+préambule de 1946		FR/PREAMBULE-1946
+préambule de la constitution de 1946		FR/PREAMBULE-1946
+préambule de la constitution du 27 octobre 1946		FR/PREAMBULE-1946
 rgpd		EU/REG/2016-679
 règlement ( ce ) 261/2004		EU/REG/261-2004
 règlement ( cee ) n 1408/71 ( 1 )		EU/REG/1408-71
@@ -2444,9 +2447,9 @@ statut de la cour de justice de l'union européenne)		EU/STATUT-CJUE
 statut de la cour de justice de la communauté économique européenne		EU/STATUT-CJUE
 statut de la cour de justice des communautés européennes		EU/STATUT-CJUE
 statut de la cour de l'union européenne		EU/STATUT-CJUE
-statut de la cour internationale de justice		JORFTEXT000000669825
-statut de la cour pénale internationale		JORFTEXT000000413362
-statut de rome		JORFTEXT000000413362
+statut de la cour internationale de justice		INTL/CHARTE-NATIONS-UNIES-CONTENANT-STATUT-1945
+statut de la cour pénale internationale		INTL/CONVENTION-STATUT-COUR-PENALE-INTERNATIONALE-1998
+statut de rome		INTL/CONVENTION-STATUT-COUR-PENALE-INTERNATIONALE-1998
 statut des fonctionnaires de communautés européennes		EU/REG/STATUT-FP
 statut des fonctionnaires de l'union européenne		EU/REG/STATUT-FP
 statut des fonctionnaires de la communauté européenne		EU/REG/STATUT-FP
@@ -2457,7 +2460,7 @@ statut des fonctionnaires des communautés		EU/REG/STATUT-FP
 statut des fonctionnaires des communautés européennes		EU/REG/STATUT-FP
 statut des fonctionnaires des communautés européennes (ci-après		EU/REG/STATUT-FP
 statut des fonctionnaires des communautés européennes (ci-après le statut)		EU/REG/STATUT-FP
-statut personnel tunisien		jafbase/docMaghreb/TunisieStatutpersonnel.PDF
+statut personnel tunisien		TN/CODE-STATUT-PERSONNEL
 tfue		EU/TFUE
 traité (devenu article 10 ce)		EU/TFUE
 traité (devenu article 226 ce)		EU/TFUE

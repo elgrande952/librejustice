@@ -1,4 +1,4 @@
--- ADR 0144 — citations « trois grains, un lien par grain ».
+-- Citations « trois grains, un lien par grain ».
 --
 -- Grain 1 : l'occurrence (`legal_citation`, recréée MINCE) — immuable, ne
 -- porte JAMAIS d'état de résolution. Grain 2 : la clé (`citation_key`) —

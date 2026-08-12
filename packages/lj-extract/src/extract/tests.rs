@@ -1,6 +1,5 @@
-// Tests figés (spec) des extracteurs unifiés — cas tirés du comportement
-// Python historique (opendata.py / judilibre.py), portés sur les fonctions
-// plates de `extract`.
+// Tests figés (spec) des extracteurs unifiés, sur les fonctions plates de
+// `extract`.
 
 use crate::extract::{
     docket_numbers_scanned, extract_date_lecture, extract_docket_numbers,
@@ -117,7 +116,7 @@ fn jurisdiction_name_ta_title_cases_place() {
         extract_jurisdiction_name(&d).as_deref(),
         Some("Tribunal administratif de Amiens")
     );
-    // Apostrophe perdue par le greffe (866 décisions prod « de d Amiens »).
+    // Apostrophe perdue par le greffe.
     d.jurisdiction_name = Some("Tribunal Administratif d Amiens".to_string());
     assert_eq!(
         extract_jurisdiction_name(&d).as_deref(),
@@ -228,9 +227,8 @@ fn solution_rejet_maps_directly() {
 
 #[test]
 fn solution_cc_rnsm_stays_rejet() {
-    // RNSM (art. 1014 CPC) : dispositif « REJETTE », formule de clôture
-    // « Ainsi décidé… prononcé par le président » — reste REJET, pas
-    // IRRECEVABILITE (tranché par l'utilisateur, audit GT 2026-06-06).
+    // RNSM (art. 1014 CPC) : dispositif « REJETTE », formule de clôture « Ainsi
+    // décidé… prononcé par le président » — reste REJET, pas IRRECEVABILITE.
     let mut d = decision("CC");
     d.solution = Some("rejet".into());
     d.texte_integral_clean = "REJETTE le pourvoi. Ainsi décidé par la Cour de cassation, \
@@ -285,8 +283,8 @@ fn solution_admin_rejet_prefix() {
     let mut d = decision("TA");
     d.solution = Some("Rejet".to_string());
     assert_eq!(extract_solution(&d).as_deref(), Some("solution:REJET"));
-    // école gold : ordre admin au dispositif VERBATIM — un acte annulé est
-    // une ANNULATION, jamais une « satisfaction » du requérant
+    // Ordre admin : dispositif VERBATIM — un acte annulé est une ANNULATION,
+    // jamais une « satisfaction » du requérant.
     d.solution = Some("Annulation".to_string());
     assert_eq!(extract_solution(&d).as_deref(), Some("solution:ANNULATION"));
     d.solution = Some("Désistement".to_string());

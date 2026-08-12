@@ -1,5 +1,6 @@
 {
   "name": "librejustice",
+  "description": "Recherche juridique française : le connecteur MCP LibreJustice (jurisprudence des deux ordres, codes et textes applicables à date) et ses skills.",
   "owner": {
     "name": "LibreJustice"
   },

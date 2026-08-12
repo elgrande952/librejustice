@@ -1,4 +1,4 @@
-//! Downloader EUR-Lex (CJUE) — I/O réseau au bord lj-sources (ADR 0094).
+//! Downloader EUR-Lex (CJUE) — I/O réseau au bord lj-sources.
 //!
 //! Deux endpoints publics sans auth :
 //! - SPARQL `publications.europa.eu/webapi/rdf/sparql` — métadonnées CDM, borné
@@ -6,9 +6,8 @@
 //!   `JUDG`/`ORDER`/`OPIN_AG` du secteur 6 (`STRSTARTS(celex,"6")`), `DISTINCT`
 //!   sur le CELEX (la liste brute est multipliée par `resource-type`).
 //! - resource `publications.europa.eu/resource/celex/{CELEX}` en **cascade
-//!   d'`Accept`** (`application/xhtml+xml` puis `text/html` ; mono-`Accept` perd
-//!   des arrêts en 404 silencieux). Texte FR par `Accept-Language: fra`, strippé
-//!   au bord par [`crate::html_strip::strip_html`].
+//!   d'`Accept`** (`application/xhtml+xml` puis `text/html`). Texte FR par
+//!   `Accept-Language: fra`, strippé au bord par [`crate::html_strip::strip_html`].
 //!
 //! Parsing métier dans `lj-core`. Throttle de courtoisie (~0,3 s), watermark par
 //! fond façon [`crate::dila::DilaManifest`].
@@ -16,6 +15,7 @@
 use crate::error::{Result, SourceError};
 use crate::html_strip::strip_html;
 use chrono::Utc;
+use regex::Regex;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use serde::{Deserialize, Serialize};
@@ -32,23 +32,21 @@ pub const RESOURCE_BASE_URL: &str = "https://publications.europa.eu/resource/cel
 pub const USER_AGENT: &str = "librejustice-cjue/0.1 (+https://github.com/)";
 /// Throttle de courtoisie entre fetchs.
 pub const THROTTLE: Duration = Duration::from_millis(300);
-/// Tentatives sur les 5xx/429 transitoires d'EUR-Lex (Cellar/SPARQL surchargé
-/// renvoie épisodiquement 502/503/504) avant d'abandonner. Backoff géométrique
-/// `THROTTLE << attempt`. Sans ça, un coup de chaleur Cellar dégrade en masse les
-/// décisions au « repli minimum ecli+date » (prédicats CDM perdus).
+/// Tentatives sur les 5xx/429 transitoires d'EUR-Lex avant d'abandonner. Backoff
+/// géométrique `THROTTLE << attempt`.
 const CJUE_RETRIES: u32 = 4;
 /// Page SPARQL (sous le cap OFFSET 10 000 par année).
 pub const PAGE_SIZE: usize = 1000;
-/// Cascade d'`Accept` du resource endpoint (xhtml d'abord — l'arrêt n'est servi
-/// qu'en xhtml dans certains cas, 404 silencieux en text/html).
+/// Cascade d'`Accept` du resource endpoint : certains arrêts ne sont servis qu'en
+/// xhtml, `text/html` répondant alors 404.
 pub const ACCEPT_CASCADE: [&str; 2] = ["application/xhtml+xml", "text/html"];
 
 use crate::state_paths::CJUE_DIR;
 
-/// Liste blanche des prédicats CDM riches retenus en `source_fields` (audit
-/// `cjue.md` §Champs). [`map_predicates`] réduit les URI d'autorité à leur code
-/// (`…/authority/<set>/<code>` → `<code>`), garde les littéraux verbatim et les
-/// URI cellar (juge/AG/citation) brutes.
+/// Liste blanche des prédicats CDM riches retenus en `source_fields`.
+/// [`map_predicates`] réduit les URI d'autorité à leur code
+/// (`…/authority/<set>/<code>` → `<code>`), garde les littéraux verbatim et les URI
+/// cellar (juge/AG/citation) brutes.
 const RICH_PREDICATES: &[&str] = &[
     "resource_legal_type",
     "case-law_has_type_procedure_concept_type_procedure",
@@ -95,9 +93,8 @@ SELECT DISTINCT ?celex ?date ?ecli WHERE {{\n\
 
 /// Tous les triplets `?p ?o` du work d'un CELEX donné — le dump CDM complet
 /// (subject-matter, juge rapporteur / AG / formation, `work_cites_work`,
-/// `interpretes_resource_legal`, procédure, pays de renvoi…). C'est la mine de
-/// richesse (audit `cjue.md` §Champs) que la liste paginée ne fournit pas. Le
-/// work est désigné par son `resource_legal_id_celex`.
+/// `interpretes_resource_legal`, procédure, pays de renvoi…), que la liste paginée
+/// ne fournit pas. Le work est désigné par son `resource_legal_id_celex`.
 fn work_describe_sparql(celex: &str) -> String {
     format!(
         "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
@@ -108,8 +105,29 @@ SELECT ?p ?o WHERE {{\n\
     )
 }
 
-/// Requête titre-FR + date d'un acte législatif par CELEX (ADR 0138). Le titre FR
-/// officiel porte le numéro année/séquence en tête → ré-apparié par 3ter.
+/// Plafond du delta consolidations : une réponse pleine signale un watermark trop
+/// ancien — l'appelant bascule en balayage intégral.
+pub const CONSOLIDATIONS_LIMIT: usize = 10_000;
+
+/// Delta des consolidations parues : CELEX des works consolidés
+/// (`cdm:act_consolidated_date` présent) créés dans CELLAR depuis `since`
+/// (AAAA-MM-JJ, inclusif). C'est `cdm:work_date_creation` qui trace la
+/// **parution** — la date d'applicabilité du suffixe CELEX peut la précéder de
+/// plusieurs mois.
+fn consolidations_since_sparql(since: &str) -> String {
+    format!(
+        "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
+SELECT DISTINCT ?celex WHERE {{\n\
+  ?w cdm:act_consolidated_date ?vdate .\n\
+  ?w cdm:work_date_creation ?created .\n\
+  FILTER(?created >= \"{since}\"^^<http://www.w3.org/2001/XMLSchema#date>)\n\
+  ?w cdm:resource_legal_id_celex ?celex .\n\
+}}\nLIMIT {CONSOLIDATIONS_LIMIT}"
+    )
+}
+
+/// Requête titre-FR + date d'un acte législatif par CELEX. Le titre FR officiel
+/// porte le numéro année/séquence en tête.
 fn legislation_meta_sparql(celex: &str) -> String {
     format!(
         "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
@@ -125,7 +143,7 @@ SELECT ?title ?date WHERE {{\n\
     )
 }
 
-/// Client EUR-Lex (reqwest async + TracingMiddleware, comme `judilibre.rs`).
+/// Client EUR-Lex (reqwest async + TracingMiddleware).
 pub struct CjueClient {
     sparql_url: String,
     resource_base: String,
@@ -144,14 +162,13 @@ impl CjueClient {
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
                 .connect_timeout(Duration::from_secs(15))
-                // Timeout par requête BORNÉ : sans lui une connexion morte/half-open
-                // sur le chemin hôte↔EUR-Lex laisse `send().await` attendre à l'infini
-                // (process en sleep, chaîne cron `&&` gelée en silence — incident
-                // 2026-06-17). Au-delà, la requête erreur et `get_with_retry` réessaie.
+                // Timeout par requête BORNÉ : une connexion morte ou half-open laisserait
+                // `send().await` attendre indéfiniment. Au-delà, la requête erreur et
+                // `get_with_retry` réessaie.
                 .timeout(Duration::from_secs(120))
-                // Pas de réutilisation de connexion : fetchs séquentiels (aucun gain
-                // keepalive) et une connexion poolée réutilisée finit par se figer sur
-                // ce chemin réseau — chaque tentative repart donc sur une connexion neuve.
+                // Pas de réutilisation de connexion : les fetchs sont séquentiels et une connexion
+                // poolée finit par se figer sur ce chemin réseau — chaque tentative repart donc
+                // sur une connexion neuve.
                 .pool_max_idle_per_host(0)
                 .build()
                 .expect("reqwest client build"),
@@ -168,8 +185,7 @@ impl CjueClient {
     /// GET avec retry borné sur les 5xx/429 transitoires (backoff `THROTTLE <<
     /// attempt`). Renvoie `(status, text)` du dernier essai ; ne lit le corps qu'au
     /// dernier essai (ou sur statut non transitoire). L'interprétation
-    /// (200/404/406/erreur) reste à l'appelant — seuls les transitoires sont
-    /// réessayés ici, pas masqués.
+    /// (200/404/406/erreur) reste à l'appelant.
     async fn get_with_retry(
         &self,
         url: &str,
@@ -188,8 +204,8 @@ impl CjueClient {
             }
             let resp = match req.send().await {
                 Ok(resp) => resp,
-                // Erreur d'envoi (timeout, connexion coupée/morte) = transitoire :
-                // on réessaie sur une connexion neuve tant qu'il reste des tentatives.
+                // Erreur d'envoi (timeout, connexion coupée) = transitoire : on réessaie sur une
+                // connexion neuve tant qu'il reste des tentatives.
                 Err(e) if attempt + 1 < CJUE_RETRIES => {
                     tracing::warn!(what, attempt, error = %e, "requête eur-lex échouée (envoi/timeout), retry");
                     continue;
@@ -232,13 +248,12 @@ impl CjueClient {
         Ok(sonic_rs::from_str(&text)?)
     }
 
-    /// Texte d'un CELEX, **FR-prioritaire avec repli EN** (ADR 0120, supersede le
-    /// FR-only de 0094). Pour chaque langue (`fra` puis `eng`), cascade d'`Accept`
-    /// (xhtml puis html). Renvoie `Ok(Some((texte, lang)))` dès qu'une rendition
-    /// 200 est servie (`lang` = code obtenu, tracé sur la décision) ; `Ok(None)` si
-    /// ni FR ni EN n'est disponible (404/406/3xx partout → SKIP, l'affaire n'est pas
-    /// publiée dans une de nos deux langues). Une autre erreur HTTP remonte
-    /// franchement (#12).
+    /// Texte d'un CELEX, **FR-prioritaire avec repli EN**. Pour chaque langue (`fra`
+    /// puis `eng`), cascade d'`Accept` (xhtml puis html). Renvoie `Ok(Some((texte,
+    /// lang)))` dès qu'une rendition 200 est servie (`lang` = code obtenu, tracé sur la
+    /// décision) ; `Ok(None)` si ni FR ni EN n'est disponible (404/406/3xx partout →
+    /// SKIP, l'affaire n'est pas publiée dans une de nos deux langues). Une autre
+    /// erreur HTTP remonte franchement.
     pub async fn resource_text(&self, celex: &str) -> Result<Option<(String, &'static str)>> {
         let url = format!("{}/{celex}", self.resource_base);
         for lang in ["fra", "eng"] {
@@ -257,13 +272,10 @@ impl CjueClient {
                     return Ok(Some((strip_html(&text), lang)));
                 }
                 last_status = status;
-                // 404/406 = pas de rendition dans cette langue pour cet `Accept`.
-                // 3xx (notamment 300 Multiple Choices) = EUR-Lex ne sert pas une
-                // représentation unique pour ce CELEX : indisponibilité de contenu,
-                // pas une erreur de notre côté. Dans les deux cas on poursuit (cascade
-                // d'`Accept` puis langue suivante) — un CELEX problématique ne doit
-                // pas aborter un bootstrap de 60 ans. Tout autre statut (4xx
-                // auth/bad-request, etc.) reste une erreur franche (#12).
+                // 404/406 = pas de rendition dans cette langue pour cet `Accept`. 3xx (notamment
+                // 300 Multiple Choices) = EUR-Lex ne sert pas une représentation unique pour ce
+                // CELEX. Dans les deux cas on poursuit : cascade d'`Accept` puis langue suivante.
+                // Tout autre statut (4xx auth/bad-request…) reste une erreur franche.
                 let skippable = status == 404 || status == 406 || (300..400).contains(&status);
                 if !skippable {
                     return Err(SourceError::Invalid(format!(
@@ -280,16 +292,12 @@ impl CjueClient {
                 );
             }
         }
-        // Ni FR ni EN disponible (404/406/3xx partout) : SKIP.
         Ok(None)
     }
 
     /// Prédicats CDM riches d'un work par CELEX (SPARQL `?p ?o`), mappés en
-    /// `source_fields` lisibles via [`map_predicates`]. C'est la mine de richesse
-    /// de l'audit (subject-matter, juge/AG/formation, `work_cites_work`,
-    /// `interpretes_resource_legal`, procédure, pays de renvoi…). Une réponse
-    /// non-200 remonte franchement (#12) — l'appelant logue et retombe sur le
-    /// minimum `{ecli, date}` plutôt que de masquer l'échec.
+    /// `source_fields` lisibles via [`map_predicates`]. Une réponse non-200 remonte
+    /// franchement — l'appelant logue et retombe sur le minimum `{ecli, date}`.
     pub async fn fetch_work_predicates(&self, celex: &str) -> Result<Value> {
         let query = work_describe_sparql(celex);
         let params: [(&str, String); 2] = [
@@ -315,11 +323,11 @@ impl CjueClient {
         Ok(map_predicates(&raw))
     }
 
-    /// Métadonnées FR d'un acte législatif UE par CELEX (ADR 0138) : titre officiel
-    /// français + date du document. `Ok(None)` si le CELEX n'existe pas ou n'a pas de
-    /// titre FR (→ SKIP à l'ingestion). Le titre porte le numéro année/séquence en tête
+    /// Métadonnées FR d'un acte législatif UE par CELEX : titre officiel français +
+    /// date du document. `Ok(None)` si le CELEX n'existe pas ou n'a pas de titre FR (→
+    /// SKIP à l'ingestion). Le titre porte le numéro année/séquence en tête
     /// (« Règlement (UE) 2016/679 … », « Sixième directive 77/388/CEE … ») — la forme
-    /// exacte que la passe de résolution 3ter ré-apparie contre `legal_text.title`.
+    /// exacte que la passe de résolution ré-apparie contre `legal_text.title`.
     pub async fn legislation_meta_fr(
         &self,
         celex: &str,
@@ -360,6 +368,182 @@ impl CjueClient {
             .map(str::to_string);
         Ok(Some((title.to_string(), date)))
     }
+
+    // ————— Formex CELLAR (fond eu-law synchronisé) —————
+
+    /// Consolidations parues dans CELLAR depuis `since` (AAAA-MM-JJ, inclusif), tout
+    /// corpus UE confondu — l'appelant intersecte avec son registre. Une réponse à
+    /// [`CONSOLIDATIONS_LIMIT`] lignes signale un watermark trop ancien : basculer en
+    /// balayage intégral.
+    pub async fn consolidations_since(&self, since: &str) -> Result<Vec<ConsolidatedRef>> {
+        let query = consolidations_since_sparql(since);
+        let params: [(&str, String); 2] = [
+            ("query", query),
+            ("format", "application/sparql-results+json".to_string()),
+        ];
+        let (status, text) = self
+            .get_with_retry(
+                &self.sparql_url,
+                &params,
+                "application/sparql-results+json",
+                None,
+                "sparql consolidations",
+            )
+            .await?;
+        if status != 200 {
+            return Err(SourceError::Invalid(format!(
+                "eur-lex sparql consolidations statut {status}: {}",
+                text.chars().take(200).collect::<String>()
+            )));
+        }
+        let raw: Value = sonic_rs::from_str(&text)?;
+        Ok(parse_consolidations(&raw))
+    }
+
+    /// Dates (`AAAAMMJJ`, triées, dédupliquées) des versions consolidées d'un acte,
+    /// lues dans sa notice branch. `Accept-Language` est **obligatoire** sur cette
+    /// route : sans lui CELLAR répond 400. Acte sans notice (404/406/3xx) ou jamais
+    /// consolidé → liste vide.
+    pub async fn consolidated_versions(&self, celex: &str) -> Result<Vec<String>> {
+        let url = format!("{}/{celex}", self.resource_base);
+        let (status, text) = self
+            .get_with_retry(
+                &url,
+                &[],
+                "application/xml;notice=branch",
+                Some("fra"),
+                &format!("cellar notice branch {celex}"),
+            )
+            .await?;
+        if status == 404 || status == 406 || (300..400).contains(&status) {
+            return Ok(Vec::new());
+        }
+        if status != 200 {
+            return Err(SourceError::Invalid(format!(
+                "cellar notice branch {celex} statut {status}"
+            )));
+        }
+        // Série consolidée `0{corps}-{AAAAMMJJ}` (le CELEX de base troque son
+        // secteur `3` contre `0`).
+        let Some(body) = celex.get(1..).filter(|b| !b.is_empty()) else {
+            return Err(SourceError::Invalid(format!("celex invalide: {celex:?}")));
+        };
+        let re = Regex::new(&format!("0{}-([0-9]{{8}})", regex::escape(body)))
+            .expect("regex série consolidée");
+        let mut versions: Vec<String> = re.captures_iter(&text).map(|c| c[1].to_string()).collect();
+        versions.sort();
+        versions.dedup();
+        Ok(versions)
+    }
+
+    /// Formex 4 FR d'un CELEX (de base, ou consolidé `0{corps}-{AAAAMMJJ}`) :
+    /// la manifestation `.FRA.fmx4` est un RDF qui liste les items cellar
+    /// `DOC_n` ; chaque item est du Formex nu **ou un ZIP** (actes à figures).
+    /// Rend le document-acte (`<ACT>`/`<CONS.ACT>`, celui qui porte le plus
+    /// d'`<ARTICLE>` — les volumes d'annexes n'en portent pas) ; `Ok(None)` si
+    /// la manifestation n'existe pas (acte pré-Formex, directive modificative).
+    pub async fn formex_act_fr(&self, celex: &str) -> Result<Option<String>> {
+        let url = format!("{}/{celex}.FRA.fmx4", self.resource_base);
+        let (status, rdf) = self
+            .get_with_retry(
+                &url,
+                &[],
+                "*/*",
+                Some("fra"),
+                &format!("cellar fmx4 {celex}"),
+            )
+            .await?;
+        if status == 404 || status == 406 || (300..400).contains(&status) {
+            return Ok(None);
+        }
+        if status != 200 {
+            return Err(SourceError::Invalid(format!(
+                "cellar fmx4 {celex} statut {status}"
+            )));
+        }
+        let re = Regex::new(
+            r#"rdf:about="(https?://publications\.europa\.eu/resource/cellar/[^"]+/DOC_\d+)""#,
+        )
+        .expect("regex items cellar");
+        let mut docs: Vec<String> = re.captures_iter(&rdf).map(|c| c[1].to_string()).collect();
+        docs.sort();
+        docs.dedup();
+
+        let act_root = Regex::new(r"<(CONS\.ACT|ACT)[\s>]").expect("regex racine acte");
+        let mut best: Option<(usize, String)> = None;
+        for doc in &docs {
+            let (status, bytes) = self
+                .get_bytes_with_retry(doc, &format!("cellar item {doc}"))
+                .await?;
+            if status != 200 {
+                tracing::warn!(celex, doc, status, "item cellar non servi, ignoré");
+                continue;
+            }
+            let bodies = if bytes.starts_with(b"PK") {
+                zip_xml_members(&bytes)?
+            } else {
+                vec![String::from_utf8_lossy(&bytes).into_owned()]
+            };
+            for body in bodies {
+                if !act_root.is_match(&body) {
+                    continue;
+                }
+                let n = body.matches("<ARTICLE").count();
+                if n > 0 && best.as_ref().is_none_or(|(bn, _)| n > *bn) {
+                    best = Some((n, body));
+                }
+            }
+        }
+        Ok(best.map(|(_, b)| b))
+    }
+
+    /// GET binaire avec le même retry borné que [`Self::get_with_retry`] — les
+    /// items cellar `DOC_n` peuvent être des ZIP, `resp.text()` les corromprait.
+    async fn get_bytes_with_retry(&self, url: &str, what: &str) -> Result<(u16, Vec<u8>)> {
+        for attempt in 0..CJUE_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(THROTTLE * (1 << attempt)).await;
+            }
+            let req = self
+                .client
+                .get(url)
+                .header("accept", "*/*")
+                .header("accept-language", "fra");
+            let resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) if attempt + 1 < CJUE_RETRIES => {
+                    tracing::warn!(what, attempt, error = %e, "requête cellar échouée (envoi/timeout), retry");
+                    continue;
+                }
+                Err(e) => return Err(SourceError::Invalid(format!("requête {what}: {e}"))),
+            };
+            let status = resp.status().as_u16();
+            let transient = status == 429 || (500..600).contains(&status);
+            if transient && attempt + 1 < CJUE_RETRIES {
+                continue;
+            }
+            let bytes = resp.bytes().await?;
+            return Ok((status, bytes.to_vec()));
+        }
+        unreachable!("get_bytes_with_retry: la dernière itération retourne toujours")
+    }
+}
+
+/// Membres `.xml` d'un ZIP cellar en mémoire (acte + enveloppe `doc.xml` ;
+/// les figures TIFF sont ignorées).
+fn zip_xml_members(bytes: &[u8]) -> Result<Vec<String>> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+    let mut out = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if entry.is_dir() || !entry.name().to_lowercase().ends_with(".xml") {
+            continue;
+        }
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut raw)?;
+        out.push(String::from_utf8_lossy(&raw).into_owned());
+    }
+    Ok(out)
 }
 
 impl Default for CjueClient {
@@ -368,8 +552,7 @@ impl Default for CjueClient {
     }
 }
 
-/// Une ligne SPARQL : CELEX (PK) + date + ECLI optionnel (jamais dérivé du
-/// CELEX, décision #3).
+/// Une ligne SPARQL : CELEX (PK) + date + ECLI optionnel, jamais dérivé du CELEX.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CjueResult {
     pub celex: String,
@@ -378,8 +561,8 @@ pub struct CjueResult {
 }
 
 /// Parse une réponse SPARQL JSON results en lignes dédupliquées par CELEX (la
-/// liste brute multiplie un work par `resource-type` — décision #4 / audit).
-/// Préserve l'ordre d'apparition.
+/// liste brute multiplie un work par `resource-type`). Préserve l'ordre
+/// d'apparition.
 pub fn parse_sparql(resp: &Value) -> Vec<CjueResult> {
     let mut out = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -418,12 +601,10 @@ fn predicate_local_name(uri: &str) -> &str {
 
 /// Code d'autorité d'une URI EUR-Lex : queue d'un `…/authority/<set>/<code>`
 /// (`…/subject-matter/IMMI` → `IMMI`, `…/formjug/CHAMB_GD_C` → `CHAMB_GD_C`,
-/// `…/fd_100/PREJ` → `PREJ`). Les URI cellar (juge, AG, citation) n'ont pas de
-/// code lisible : on garde l'URI brute (résolution nom/CELEX hors-ligne
-/// impossible — décision audit : URI brute si non résolvable).
+/// `…/fd_100/PREJ` → `PREJ`). Les URI cellar (juge, AG, citation) n'ont pas de code
+/// lisible : on garde l'URI brute.
 fn authority_code_or_uri(uri: &str) -> String {
     if let Some(rest) = uri.split("/authority/").nth(1) {
-        // `<set>/<code>` → `<code>` (dernier segment).
         if let Some(code) = rest.rsplit('/').next() {
             return code.to_string();
         }
@@ -431,12 +612,11 @@ fn authority_code_or_uri(uri: &str) -> String {
     uri.to_string()
 }
 
-/// Mappe le dump SPARQL `?p ?o` d'un work en `source_fields` lisibles (audit
-/// `cjue.md` §Champs). Ne retient que les prédicats riches de [`RICH_PREDICATES`],
-/// la clé est le nom local du prédicat. Les valeurs URI d'autorité sont réduites
-/// à leur code (`IMMI`, `CHAMB_GD_C`…), les littéraux gardés verbatim, les URI
-/// cellar (juge/AG/citation) gardées brutes (non résolvables hors-ligne). Une clé
-/// à valeur unique sort scalaire, multi-valuée sort en tableau JSON (ordre
+/// Mappe le dump SPARQL `?p ?o` d'un work en `source_fields` lisibles. Ne retient
+/// que les prédicats riches de [`RICH_PREDICATES`], la clé est le nom local du
+/// prédicat. Les valeurs URI d'autorité sont réduites à leur code (`IMMI`,
+/// `CHAMB_GD_C`…), les littéraux gardés verbatim, les URI cellar gardées brutes.
+/// Une clé à valeur unique sort scalaire, multi-valuée sort en tableau JSON (ordre
 /// d'apparition, doublons retirés).
 pub fn map_predicates(resp: &Value) -> Value {
     use serde_json::{Map, Value as J};
@@ -481,12 +661,10 @@ pub fn map_predicates(resp: &Value) -> Value {
     J::Object(out)
 }
 
-/// Extrait la bannière « objet » doctrinale d'un arrêt/ordonnance CJUE : le bloc
-/// de mots-clés entre guillemets français (`« Renvoi préjudiciel – … »`) qui
-/// suit l'en-tête (`ARRÊT DE LA COUR (…) <date>`). C'est l'équivalent d'un
-/// abstract officiel FR (audit `cjue.md` §CHAMPS NON RENDUS) — **pas** `<title>`
-/// (vide ou égal au CELEX). Opère sur le texte déjà strippé. `None` si aucun bloc
-/// `«…»` n'est présent.
+/// Extrait la bannière « objet » doctrinale d'un arrêt/ordonnance CJUE : le bloc de
+/// mots-clés entre guillemets français (`« Renvoi préjudiciel – … »`) qui suit
+/// l'en-tête (`ARRÊT DE LA COUR (…) <date>`). Opère sur le texte déjà strippé.
+/// `None` si aucun bloc `«…»` n'est présent.
 pub fn extract_objet(body_text: &str) -> Option<String> {
     let start = body_text.find('«')?;
     let after = &body_text[start + '«'.len_utf8()..];
@@ -497,6 +675,99 @@ pub fn extract_objet(body_text: &str) -> Option<String> {
     } else {
         Some(objet.to_string())
     }
+}
+
+/// CELEX consolidé décomposé : corps (`2020R0761`) + version (`AAAAMMJJ`).
+/// Le corps s'apparie au CELEX de base par `celex_base[1..]`, secteur ignoré.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsolidatedRef {
+    pub body: String,
+    pub version: String,
+}
+
+/// `02020R0761-20260501` → corps + version. `None` si la forme n'est pas celle
+/// d'une série consolidée secteur 0 (`0{corps}-{AAAAMMJJ}`).
+pub fn parse_consolidated_celex(celex: &str) -> Option<ConsolidatedRef> {
+    let (head, version) = celex.split_once('-')?;
+    if !celex.starts_with('0')
+        || head.len() < 2
+        || version.len() != 8
+        || !version.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(ConsolidatedRef {
+        body: head[1..].to_string(),
+        version: version.to_string(),
+    })
+}
+
+/// Parse la réponse SPARQL du delta consolidations en refs dédupliquées
+/// (ordre d'apparition ; lignes hors forme consolidée ignorées).
+pub fn parse_consolidations(resp: &Value) -> Vec<ConsolidatedRef> {
+    let mut out: Vec<ConsolidatedRef> = Vec::new();
+    let Some(bindings) = resp["results"]["bindings"].as_array() else {
+        return out;
+    };
+    for b in bindings {
+        let Some(r) = b["celex"]["value"]
+            .as_str()
+            .and_then(parse_consolidated_celex)
+        else {
+            continue;
+        };
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    out
+}
+
+/// Manifeste eu-law : watermark du delta consolidations + versions futures
+/// pré-publiées en attente d'échéance, par CELEX de base.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EuLawManifest {
+    /// Borne inclusive (AAAA-MM-JJ) de la prochaine requête delta ; absente au
+    /// bootstrap → balayage intégral.
+    #[serde(default)]
+    pub last_delta_date: Option<String>,
+    /// Versions à date future (`AAAAMMJJ`) annoncées par la notice d'un acte,
+    /// re-sondées à échéance puis remplacées par ce que la notice du jour dit.
+    #[serde(default)]
+    pub pending: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub fetched_at: Option<String>,
+}
+
+impl EuLawManifest {
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(path)?;
+        serde_json::from_str(&raw)
+            .map_err(|e| SourceError::Invalid(format!("manifest eu-law illisible: {e}")))
+    }
+
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        self.fetched_at = Some(Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string());
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| SourceError::Invalid(format!("manifest eu-law non sérialisable: {e}")))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+}
+
+/// Chemin du manifeste eu-law sous `data_dir` (`<data_dir>/eu_law/manifest.json`).
+pub fn eu_law_manifest_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir
+        .join(crate::state_paths::EU_LAW_DIR)
+        .join("manifest.json")
 }
 
 /// Watermark CJUE par fond : dernière année dont la liste a été drainée.
@@ -573,7 +844,6 @@ mod tests {
 
     #[test]
     fn parse_sparql_dedups_by_celex_preserving_order() {
-        // Un work ressort N fois (une par resource-type) — décision #4.
         let resp = json!({
             "results": { "bindings": [
                 { "celex": { "value": "62020CJ0560" },
@@ -588,7 +858,6 @@ mod tests {
         let rows = parse_sparql(&resp);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].celex, "62020CJ0560");
-        // ECLI pris verbatim, jamais dérivé du CELEX (décision #3).
         assert_eq!(rows[0].ecli.as_deref(), Some("ECLI:EU:C:2024:96"));
         assert_eq!(rows[0].date.as_deref(), Some("2024-01-30"));
         assert_eq!(rows[1].celex, "62023CO0614");
@@ -628,23 +897,18 @@ mod tests {
 
     #[test]
     fn map_predicates_fixture_readable_keys_codes_and_multivalue() {
-        // Fixture style sparql_predicates.json : dump `?p ?o` du work
-        // 62020CJ0560 (extrait des prédicats riches réels, audit cjue.md §Champs).
         let cdm = "http://publications.europa.eu/ontology/cdm#";
         let auth = "http://publications.europa.eu/resource/authority";
         let cellar = "http://publications.europa.eu/resource/cellar";
         let resp = json!({
             "results": { "bindings": [
-                // Bruit hors RICH_PREDICATES : ignoré.
                 pred(&format!("{cdm}work_version"), "literal", "definitive"),
                 pred(
                     "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
                     "uri",
                     &format!("{cdm}judgement"),
                 ),
-                // Type d'acte (littéral verbatim).
                 pred(&format!("{cdm}resource_legal_type"), "literal", "CJ"),
-                // Procédure (URI autorité → code).
                 pred(
                     &format!("{cdm}case-law_has_type_procedure_concept_type_procedure"),
                     "uri",
@@ -655,7 +919,6 @@ mod tests {
                     "uri",
                     &format!("{auth}/procjur/REFER_PREL"),
                 ),
-                // Matière multi-valuée (URI autorité → codes, tableau).
                 pred(
                     &format!("{cdm}resource_legal_is_about_subject-matter"),
                     "uri",
@@ -666,7 +929,6 @@ mod tests {
                     "uri",
                     &format!("{auth}/subject-matter/ELSJ"),
                 ),
-                // Formation, juge rapporteur (cellar brute), AG, conclusions.
                 pred(
                     &format!("{cdm}case-law_delivered_by_court-formation"),
                     "uri",
@@ -677,19 +939,16 @@ mod tests {
                     "uri",
                     &format!("{cellar}/6bc92600-f3ca-4c3d-b588-d733c0128593"),
                 ),
-                // Pays de renvoi.
                 pred(
                     &format!("{cdm}case-law_originates_in_country"),
                     "uri",
                     &format!("{auth}/country/AUT"),
                 ),
-                // Langue de procédure.
                 pred(
                     &format!("{cdm}case-law_uses_procedure_language"),
                     "uri",
                     &format!("{auth}/language/DEU"),
                 ),
-                // Graphe de citations (cellar brute, dédup d'un doublon).
                 pred(
                     &format!("{cdm}work_cites_work"),
                     "uri",
@@ -705,20 +964,17 @@ mod tests {
                     "uri",
                     &format!("{cellar}/d00948e0-b542-40be-beed-422a7fc3548e"),
                 ),
-                // Texte UE interprété (cellar brute).
                 pred(
                     &format!("{cdm}case-law_interpretes_resource_legal"),
                     "uri",
                     &format!("{cellar}/b81af559-84bd-45b3-9d0e-c3f70a22516e"),
                 ),
-                // Flag publication Recueil + doctrine (littéraux).
                 pred(&format!("{cdm}case-law_published_in_erecueil"), "literal", "1"),
                 pred(
                     &format!("{cdm}case-law_article_journal_related"),
                     "literal",
                     "1. Gazin, Fabienne: Immigration …, Europe 2024, nº 3",
                 ),
-                // Décision nationale d'origine (littéral, espaces collapsés).
                 pred(
                     &format!("{cdm}case-law_national-judgement"),
                     "literal",
@@ -730,13 +986,10 @@ mod tests {
         let m = map_predicates(&resp);
         let obj = m.as_object().expect("objet");
 
-        // Bruit hors liste blanche absent.
         assert!(!obj.contains_key("work_version"));
         assert!(!obj.contains_key("type"));
 
-        // Littéral verbatim.
         assert_eq!(m["resource_legal_type"], json!("CJ"));
-        // URI autorité → code.
         assert_eq!(
             m["case-law_has_type_procedure_concept_type_procedure"],
             json!("PREJ")
@@ -748,17 +1001,14 @@ mod tests {
         );
         assert_eq!(m["case-law_originates_in_country"], json!("AUT"));
         assert_eq!(m["case-law_uses_procedure_language"], json!("DEU"));
-        // Multi-valué → tableau, ordre préservé.
         assert_eq!(
             m["resource_legal_is_about_subject-matter"],
             json!(["IMMI", "ELSJ"])
         );
-        // Cellar non résolvable → URI brute conservée.
         assert_eq!(
             m["case-law_delivered_by_judge"],
             json!("http://publications.europa.eu/resource/cellar/6bc92600-f3ca-4c3d-b588-d733c0128593")
         );
-        // work_cites_work : doublon retiré → 2 URI brutes.
         assert_eq!(
             m["work_cites_work"],
             json!([
@@ -771,7 +1021,6 @@ mod tests {
             json!("http://publications.europa.eu/resource/cellar/b81af559-84bd-45b3-9d0e-c3f70a22516e")
         );
         assert_eq!(m["case-law_published_in_erecueil"], json!("1"));
-        // Littéral trimé (espaces de bord).
         assert_eq!(
             m["case-law_national-judgement"],
             json!("Verwaltungsgericht Wien, Beschluss vom 25/09/2020")
@@ -785,15 +1034,12 @@ mod tests {
 
     #[test]
     fn extract_objet_from_real_header() {
-        // En-tête réel strippé de 62020CJ0560 (audit : `<title>` = CELEX, inutile ;
-        // l'objet est la bannière `«…»`).
         let body = "62020CJ0560 ARRÊT DE LA COUR (grande chambre) 30 janvier 2024 ( *1 ) \
 « Renvoi préjudiciel – Politique relative à l'immigration – Directive 2003/86/CE – \
 Notion de \u{201c}mineur non accompagné\u{201d} » Dans l'affaire C-560/20, ayant pour objet …";
         let objet = extract_objet(body).expect("objet présent");
         assert!(objet.starts_with("Renvoi préjudiciel – Politique"));
         assert!(objet.contains("Directive 2003/86/CE"));
-        // Le bloc s'arrête au guillemet fermant : pas de « Dans l'affaire ».
         assert!(!objet.contains("Dans l'affaire"));
     }
 
@@ -812,6 +1058,58 @@ Notion de \u{201c}mineur non accompagné\u{201d} » Dans l'affaire C-560/20, aya
         m.save(&path).unwrap();
         let reloaded = CjueManifest::load(&path).unwrap();
         assert_eq!(reloaded.last_year_done, Some(2024));
+        assert!(reloaded.fetched_at.is_some());
+    }
+
+    #[test]
+    fn consolidations_sparql_filters_on_creation_date_and_caps() {
+        let q = consolidations_since_sparql("2026-08-01");
+        assert!(q.contains("cdm:work_date_creation ?created"));
+        assert!(q.contains("?created >= \"2026-08-01\"^^"));
+        assert!(q.contains("cdm:act_consolidated_date"));
+        assert!(q.contains(&format!("LIMIT {CONSOLIDATIONS_LIMIT}")));
+        assert!(q.contains("DISTINCT"));
+    }
+
+    #[test]
+    fn parse_consolidated_celex_splits_body_and_version() {
+        let r = parse_consolidated_celex("02020R0761-20260501").expect("forme consolidée");
+        assert_eq!(r.body, "2020R0761");
+        assert_eq!(r.version, "20260501");
+        assert_eq!(parse_consolidated_celex("32020R0761"), None);
+        assert_eq!(parse_consolidated_celex("02020R0761-2026"), None);
+        assert_eq!(parse_consolidated_celex("62020CJ0560"), None);
+    }
+
+    #[test]
+    fn parse_consolidations_dedups_and_skips_malformed() {
+        let resp = json!({
+            "results": { "bindings": [
+                { "celex": { "value": "02020R0761-20260501" } },
+                { "celex": { "value": "02020R0761-20260501" } },
+                { "celex": { "value": "32006L0112" } },
+                { "celex": { "value": "02004R0273-20260918" } },
+            ]}
+        });
+        let refs = parse_consolidations(&resp);
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].body, "2020R0761");
+        assert_eq!(refs[1].version, "20260918");
+    }
+
+    #[test]
+    fn eu_law_manifest_roundtrip_with_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = eu_law_manifest_path(dir.path());
+        let mut m = EuLawManifest::load(&path).unwrap();
+        assert_eq!(m.last_delta_date, None);
+        m.last_delta_date = Some("2026-08-08".to_string());
+        m.pending
+            .insert("32004R0273".to_string(), vec!["20260918".to_string()]);
+        m.save(&path).unwrap();
+        let reloaded = EuLawManifest::load(&path).unwrap();
+        assert_eq!(reloaded.last_delta_date.as_deref(), Some("2026-08-08"));
+        assert_eq!(reloaded.pending["32004R0273"], vec!["20260918"]);
         assert!(reloaded.fetched_at.is_some());
     }
 }

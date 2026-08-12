@@ -1,20 +1,20 @@
 //! ArianeWeb (Conseil d'État, moteur Sinequa `engine2`) — commentaires
-//! institutionnels des décisions CE (ADR 0204 ; savoir source ADR 0095) :
-//! analyses AJCE (sommaires doctrinaux) + existence des conclusions CRP.
+//! institutionnels des décisions CE : analyses AJCE (sommaires doctrinaux) +
+//! existence des conclusions CRP.
 //!
 //! Deux canaux, sans auth :
 //! - `xsearch?type=json` filtré `SourceStr4=<FOND>&SourceInt1=<année>` et paginé
-//!   par `PageNumber` (20 hits/page servis par le serveur — vérifié live
-//!   2026-07-11 ; `PageSize`/`SkipCount` sont ignorés). L'année d'un hit est
-//!   celle de la **date de lecture** de la décision parente : analyses et
-//!   conclusions d'une même décision tombent dans la même tranche annuelle.
+//!   par `PageNumber` (20 hits/page servis par le serveur ; `PageSize`/`SkipCount`
+//!   sont ignorés). L'année d'un hit est celle de la date de lecture de la
+//!   décision parente : analyses et conclusions d'une même décision tombent dans
+//!   la même tranche annuelle.
 //! - `downloadFilePagePlugin` pour l'HTML plein d'une analyse AJCE (le hit JSON
 //!   ne porte que les titres analytiques tronqués à 1 544 car. ; les sommaires
-//!   complets ne sont que dans l'HTML). L'`Id` garde son pipe **non URL-encodé**.
+//!   complets ne sont que dans l'HTML). L'`Id` garde son pipe non URL-encodé.
 //!
-//! Frontière d'encodage (#12) : HTML décodé ici en latin-1 (le header HTTP dit
-//! vrai pour l'HTML) + nettoyage du `0x19` (apostrophe Windows-1252 mal mappée).
-//! Le PDF CRP n'est jamais téléchargé : l'ADR 0204 ne stocke que l'existence.
+//! Frontière d'encodage : HTML décodé ici en latin-1 (le header HTTP dit vrai
+//! pour l'HTML) + nettoyage du `0x19` (apostrophe Windows-1252 mal mappée). Le
+//! PDF CRP n'est jamais téléchargé : seule son existence est stockée.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,9 +63,7 @@ pub struct ArianeSearchPage {
     pub documents: Vec<ArianeHit>,
 }
 
-/// Hit `xsearch` — sous-ensemble des champs `SourceStrN`/`SourceCsvN` utiles au
-/// bundle ADR 0204 (l'inventaire complet vit dans l'audit
-/// `docs/working-notes/data-audit/arianeweb.md`).
+/// Hit `xsearch` — sous-ensemble des champs `SourceStrN`/`SourceCsvN` utilisés.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArianeHit {
     /// `/Ariane_Web/<FOND>/|<NNNNNN>` — id interne ArianeWeb du document.
@@ -94,7 +92,7 @@ pub struct ArianeHit {
     #[serde(rename = "SourceStr8", default)]
     pub niveau: Option<String>,
     /// ECLI de la décision parente — segment formation variable selon l'époque,
-    /// jamais une clé de jointure (ADR 0095).
+    /// jamais une clé de jointure.
     #[serde(rename = "SourceStr30", default)]
     pub ecli_parent: Option<String>,
 }
@@ -117,7 +115,7 @@ impl ArianeHit {
 
     /// Numéro `AW_CRP` des conclusions sœurs, si le graphe en confirme une
     /// (`SourceCsv7`, repli `SourceCsv2`) — condition d'émission de l'entrée
-    /// `kind: "conclusions"` (ADR 0204 : jamais de lien aveugle).
+    /// `kind: "conclusions"`, jamais de lien aveugle.
     pub fn crp_num(&self) -> Option<u32> {
         if let Some(n) = self.crp.as_deref().and_then(id_num) {
             return Some(n);
@@ -254,7 +252,7 @@ fn ajce_cache_path(cache_dir: &Path, num: u32) -> PathBuf {
 }
 
 /// HTML plein d'une décision `AW_DCE` (cache disque shardé, comme
-/// [`ajce_html_cached`]). Backfill borné ADR 0219 — pas un canal de flux.
+/// [`ajce_html_cached`]). Backfill borné, pas un canal de flux.
 pub fn dce_html_cached(
     client: &reqwest::blocking::Client,
     cache_dir: &Path,
@@ -316,7 +314,6 @@ mod tests {
         .unwrap();
         assert_eq!(hit.num().unwrap(), 172708);
         assert_eq!(hit.parent_dce_num(), Some(240377));
-        // CRP confirmée par le graphe de fratrie même sans `SourceCsv7`.
         assert_eq!(hit.crp_num(), Some(7628));
         assert_eq!(hit.date_iso(), Some("2022-06-20"));
         assert_eq!(hit.pcja(), vec!["54-06-05-11", "60-04-02-01"]);

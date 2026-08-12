@@ -1,4 +1,4 @@
-//! Page `/profil` — port de `profile-page.tsx`.
+//! Page `/profil`.
 //!
 //! Sous `AuthGuard`. Profil charge en pur client (token Supabase en localStorage,
 //! absent au SSR). Edition du nom affiche, reglages de theme, suppression de
@@ -15,7 +15,7 @@ use crate::auth::AuthGuard;
 use crate::components::profile::ThemeSettings;
 use crate::components::ui::Skeleton;
 
-/// Mot a saisir pour confirmer la suppression (port de `DELETE_CONFIRM_WORD`).
+/// Mot a saisir pour confirmer la suppression.
 const DELETE_CONFIRM_WORD: &str = "SUPPRIMER";
 
 #[component]
@@ -53,7 +53,7 @@ fn ProfileView() -> impl IntoView {
     });
 
     let display_name = RwSignal::new(String::new());
-    // Etats de la mutation « update me » (port de `updateMe.is*`).
+    // Etats de la mutation « update me ».
     let update_pending = RwSignal::new(false);
     let update_error = RwSignal::new(None::<String>);
     let update_success = RwSignal::new(false);

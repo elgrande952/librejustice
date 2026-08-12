@@ -1,4 +1,4 @@
-//! Sélection du backend d'embedding côté API (port de `embedder.build_embedder`).
+//! Sélection du backend d'embedding côté API.
 //!
 //! L'embedder est partagé pour toute la durée du process : pas de coût d'init
 //! par requête (Cloudflare ouvre un pool HTTP `reqwest`, vLLM est un simple
@@ -13,13 +13,11 @@ use std::sync::atomic::AtomicBool;
 /// Construit l'embedder de requête selon `settings.embed_backend`
 /// (`dummy` / `openai-http` / `cloudflare` / `auto`).
 ///
-/// Port de `build_embedder` (Python). Les conditions `ValueError` du Python
-/// (creds manquantes pour `openai-http`/`cloudflare`/`auto`) deviennent des
-/// `panic!` — la signature est infaillible et l'embedder est construit une
-/// fois au démarrage : une config invalide doit faire échouer le boot, pas une
-/// requête.
+/// Creds manquantes (`openai-http`/`cloudflare`/`auto`) ⇒ `panic!` : la
+/// signature est infaillible et l'embedder est construit une fois au démarrage,
+/// une config invalide doit faire échouer le boot, pas une requête.
 ///
-/// Mode `auto` (ADR 0221) : vLLM (OpenAI-HTTP) à l'URL résolue (`embed_url` ou
+/// Mode `auto` : vLLM (OpenAI-HTTP) à l'URL résolue (`embed_url` ou
 /// `http://localhost:8400/v1/embeddings`) primaire, repli Cloudflare Workers AI
 /// en disjoncteur binaire (`degraded`). Les creds Cloudflare sont requises car
 /// elles servent au repli.
@@ -54,8 +52,8 @@ pub fn build_query_embedder(settings: &Settings) -> AnyEmbedder {
             ))
         }
         "auto" => {
-            // Parité Python : `auto` valide les creds Cloudflare (fallback)
-            // avant de construire le backend vLLM primaire.
+            // `auto` valide les creds Cloudflare (fallback) avant de construire
+            // le backend vLLM primaire.
             let (account_id, token) = require_cloudflare(
                 settings,
                 "embed_backend=auto nécessite \
@@ -83,8 +81,7 @@ pub fn build_query_embedder(settings: &Settings) -> AnyEmbedder {
     }
 }
 
-/// Retourne `(account_id, backend_token)` ou `panic!` avec `msg` si l'un manque
-/// (parité avec les `ValueError` Python pour `cloudflare`/`auto`).
+/// Retourne `(account_id, backend_token)` ou `panic!` avec `msg` si l'un manque.
 fn require_cloudflare<'a>(settings: &'a Settings, msg: &str) -> (&'a str, &'a str) {
     match (
         settings.cloudflare_account_id.as_deref(),

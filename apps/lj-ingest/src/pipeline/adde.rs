@@ -1,7 +1,7 @@
-//! ADDE (`adde-association.org`) → commentaires doctrine web (ADR 0204, plan
-//! généralisé) : une analyse de l'ADDE = un **lien sortant** `kind: "note"`
-//! rattaché à la ou aux décisions qu'elle commente. Premier canal doctrine web
-//! (réutilisable pour GISTI et d'autres éditeurs…).
+//! ADDE (`adde-association.org`) → commentaires doctrine web : une analyse de
+//! l'ADDE = un **lien sortant** `kind: "note"` rattaché à la ou aux décisions
+//! qu'elle commente. Premier canal doctrine web, réutilisable pour d'autres
+//! éditeurs.
 //!
 //! Déroulé : énumération REST des posts catégorie *jurisprudence* → parse pur
 //! de la citation du titre (juridiction, date, n°s de dossier) → résolution par
@@ -9,8 +9,8 @@
 //! adde/<slug>#<public_id>` (une ligne par (article × décision) : une décision
 //! jointe matchée par plusieurs n° ne donne qu'une ligne, et deux décisions
 //! homonymes sur (n°, date) gardent chacune la leur). Aucun corps stocké —
-//! seulement le lien. Idempotence (#7) par checksum du bundle. Volume faible :
-//! pas de manifeste ni de cache.
+//! seulement le lien. Idempotence par checksum du bundle. Volume faible : pas de
+//! manifeste ni de cache.
 
 use std::collections::HashSet;
 

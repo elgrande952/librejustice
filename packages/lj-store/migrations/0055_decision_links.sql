@@ -1,4 +1,4 @@
--- Migration 0055 — Graphe de citations décision↔décision (ADR 0089).
+-- Migration 0055 — Graphe de citations décision↔décision.
 --
 -- Table de liens compacte : une arête = (src, kind, cible), la cible étant
 -- ``dst_decision_id`` quand résolue (entier vers ``decisions``), sinon
@@ -6,8 +6,8 @@
 -- de référence dupliqué : le texte de la cible vit dans sa propre ligne
 -- ``decisions`` quand elle est en corpus, sinon ``dst_key`` porte la clé brute.
 --
--- ``kind`` SMALLINT : enum ``DecisionLinkKind`` (lj-dtos, source de vérité,
--- règle #3). Codes croissants sans migration de données.
+-- ``kind`` SMALLINT : enum ``DecisionLinkKind`` (lj-dtos, source de vérité).
+-- Codes croissants sans migration de données.
 --
 -- Identité naturelle de l'arête = son tuple (pas de ``id`` BIGSERIAL) :
 -- contrainte UNIQUE NULLS NOT DISTINCT pour que la clé discrimine sur
@@ -42,7 +42,7 @@ CREATE INDEX idx_decision_links_dst_key ON decision_links (dst_key)
     WHERE dst_decision_id IS NULL;
 
 -- ``decisions.links_version`` : version du pipeline d'extraction de liens
--- (constante ``LINKS_VERSION``, mécanique d'``extract_version`` ADR 0083). Le
+-- (constante ``LINKS_VERSION``, mécanique d'``extract_version``). Le
 -- backfill ne re-parse que les décisions dont la version diffère
 -- (``WHERE links_version IS DISTINCT FROM LINKS_VERSION``) — reprise après
 -- interruption incluse. NULL = jamais passée par le backfill de liens.

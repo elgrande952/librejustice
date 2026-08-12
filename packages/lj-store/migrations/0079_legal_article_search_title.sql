@@ -1,4 +1,4 @@
--- Migration 0079 — Titre formé par article + index BM25 titre-primaire (ADR 0114).
+-- Migration 0079 — Titre formé par article + index BM25 titre-primaire.
 --
 -- La recherche dans les textes se fait *principalement par le titre* : nom du
 -- code + numéro d'article (« code civil 1242 », « code de commerce L145-16-2 »).
@@ -25,10 +25,10 @@
 -- Tokenizer regex `[\p{L}\p{N}-]+` + ascii_folding + stopwords FR, comme 0078.
 -- Pas de stemmer : il s'applique avant l'ascii_folding et casse les requêtes
 -- sans accent (« responsabilite » ≠ « responsabilité ») sans livrer un folding
--- morphologique fiable — net négatif mesuré (cf. working-notes). Le rappel
+-- morphologique fiable — net négatif mesuré. Le rappel
 -- morphologique passera par la table d'alias/thésaurus, pas le tokenizer.
 --
--- ⚠️ ADD COLUMN générée STORED + backfill (3 M lignes) + rebuild BM25 réécrivent
+-- ADD COLUMN générée STORED + backfill (3 M lignes) + rebuild BM25 réécrivent
 -- la table sous ACCESS EXCLUSIVE (les pages /loi lisent `legal_article`) :
 -- appliquer en fenêtre de maintenance.
 

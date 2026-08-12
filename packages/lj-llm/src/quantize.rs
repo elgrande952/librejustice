@@ -1,4 +1,4 @@
-//! Quantisation / sérialisation de vecteurs (port de `embedding/quantize.py`).
+//! Quantisation / sérialisation de vecteurs.
 //!
 //! Format cible : littéral JSON `[v1,…,vN]` à 6 décimales, vecteurs
 //! L2-normalisés. Sert aux casts SQL `::vector` / `quantize_to_rabitq8`.
@@ -9,10 +9,6 @@ use ndarray::Array1;
 pub const EMBEDDING_DIM: usize = 1024;
 
 /// `v / ‖v‖₂` en f32 ; renvoie `v` inchangé si la norme est sous `eps`.
-///
-/// Port fidèle de `l2_normalize` (Python) : la norme est calculée en f32
-/// (comme `numpy.linalg.norm` sur un array float32) puis le vecteur est divisé
-/// élément par élément. Vecteur nul (norme `< eps`) renvoyé inchangé.
 pub fn l2_normalize(v: &Array1<f32>, eps: f32) -> Array1<f32> {
     let norm = norm_f32(v);
     if norm < eps {
@@ -21,17 +17,14 @@ pub fn l2_normalize(v: &Array1<f32>, eps: f32) -> Array1<f32> {
     v.mapv(|x| x / norm)
 }
 
-/// `‖v‖₂` calculée en f32 (sum of squares puis racine), comme numpy float32.
+/// `‖v‖₂` calculée en f32 (sum of squares puis racine).
 fn norm_f32(v: &Array1<f32>) -> f32 {
     let sumsq: f32 = v.iter().map(|x| x * x).sum();
     sumsq.sqrt()
 }
 
-/// Sérialise un vecteur 1D en littéral JSON (`[v1,…,vN]`, 6 décimales) pour les
-/// casts SQL `::vector` / `quantize_to_rabitq8`. Contrôle la dimension.
-///
-/// Port de `to_vector_json` : `f"{x:.6f}"` côté Python ↔ `{:.6}` formaté à
-/// 6 décimales fixes côté Rust.
+/// Sérialise un vecteur 1D en littéral JSON (`[v1,…,vN]`, 6 décimales fixes) pour
+/// les casts SQL `::vector` / `quantize_to_rabitq8`. Contrôle la dimension.
 pub fn to_vector_json(v: &Array1<f32>, dim: usize) -> Result<String> {
     if v.len() != dim {
         return Err(EmbedError::Invalid(format!(
@@ -65,7 +58,6 @@ mod tests {
     fn l2_normalize_unit_vector() {
         let v = array![3.0_f32, 4.0];
         let n = l2_normalize(&v, 1e-12);
-        // 3-4-5 triangle → [0.6, 0.8].
         assert!((n[0] - 0.6).abs() < 1e-6);
         assert!((n[1] - 0.8).abs() < 1e-6);
         let norm: f32 = n.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -81,7 +73,6 @@ mod tests {
 
     #[test]
     fn to_vector_json_format() {
-        // 6 décimales fixes, séparées par des virgules, entre crochets.
         let v = array![0.5_f32, -0.25, 1.0];
         let s = to_vector_json(&v, 3).unwrap();
         assert_eq!(s, "[0.500000,-0.250000,1.000000]");
@@ -100,12 +91,11 @@ mod tests {
         assert_eq!(s, "[0.600000,0.800000]");
     }
 
-    // Parité du format `to_vector_json` ↔ oracle Python (`f"{x:.6f}"`). Ce littéral
-    // alimente directement les casts SQL `::vector` / `quantize_to_rabitq8` : un
-    // écart d'arrondi décale la quantisation. Cas gap-prone figés depuis l'oracle :
-    // demi-pas (round-half-even), zéro négatif, minuscules arrondis à ±0.000000,
-    // troncature f32 visible (123.456789 → 123.456787). GT figée dans
-    // tests/fixtures/oracle/quantize_vector_json.json.
+    // Format de `to_vector_json`. Ce littéral alimente directement les casts SQL
+    // `::vector` / `quantize_to_rabitq8` : un écart d'arrondi décale la
+    // quantisation. Cas figés : demi-pas (round-half-even), zéro négatif, minuscules
+    // arrondis à ±0.000000, troncature f32 visible (123.456789 → 123.456787). GT
+    // dans tests/fixtures/oracle/quantize_vector_json.json.
     #[derive(serde::Deserialize)]
     struct VecCase {
         name: String,

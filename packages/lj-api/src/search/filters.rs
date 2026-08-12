@@ -1,9 +1,8 @@
 //! Filtres SQL (pre-filter facettes scalaires + filtres tableau tantivy/SQL).
 //!
-//! Depuis l'ADR 0146, les filtres référentiels (solution, voie, office,
-//! domaine, instance, publication, juridiction fine) ciblent les colonnes
-//! `_uid`/`jurisdiction_code` de `decisions` — plus les colonnes TEXT
-//! ancien-monde. Côté jambe ANN (`decision_chunks`, qui ne porte pas ces
+//! Les filtres référentiels (solution, voie, office, domaine, instance,
+//! publication, juridiction fine) ciblent les colonnes `_uid`/`jurisdiction_code`
+//! de `decisions`. Côté jambe ANN (`decision_chunks`, qui ne porte pas ces
 //! colonnes), ils passent par un `EXISTS` sur `decisions`.
 
 use serde_json::Value;
@@ -24,6 +23,13 @@ pub(crate) fn as_refs(params: &Params) -> Vec<&(dyn ToSql + Sync)> {
 
 fn jt_codes(types: &[JurisdictionType]) -> Vec<String> {
     types.iter().map(|t| jt_to_str(*t).to_string()).collect()
+}
+
+/// Un tableau de filtre vide n'est pas un filtre : `= ANY('{}')` ne matche rien,
+/// donc `{"jurisdiction_type": []}` rendrait zéro résultat sans erreur.
+/// [`nonempty`] pose la même règle pour les filtres de chaînes.
+fn present<T>(v: &Option<Vec<T>>) -> Option<&[T]> {
+    v.as_deref().filter(|s| !s.is_empty())
 }
 
 pub(crate) fn jt_to_str(t: JurisdictionType) -> &'static str {
@@ -59,9 +65,9 @@ fn enum_uids<T: serde::Serialize>(prefix: &str, vs: &[T]) -> Vec<String> {
         .collect()
 }
 
-/// Expansion domaine (ADR 0146 §2) : une racine sélectionnée matche elle-même
-/// et toutes ses feuilles (codes préfixés `<RACINE>_` dans `Domain::ALL`) ;
-/// une racine sans feuille (FISCAL, EUROPEEN…) ou une feuille matche elle seule.
+/// Expansion domaine : une racine sélectionnée matche elle-même et toutes ses
+/// feuilles (codes préfixés `<RACINE>_` dans `Domain::ALL`) ; une racine sans
+/// feuille (FISCAL, EUROPEEN…) ou une feuille matche elle seule.
 fn legal_domain_uids(selected: &[Domain]) -> Vec<String> {
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for d in selected {
@@ -79,7 +85,7 @@ fn legal_domain_uids(selected: &[Domain]) -> Vec<String> {
 }
 
 /// Ajoute une clause `sql` (avec `$?` substitué par le prochain placeholder) +
-/// son param. Mutation explicite pour éviter un emprunt long de `clauses`.
+/// son param.
 fn add_clause(
     clauses: &mut Vec<String>,
     params: &mut Params,
@@ -117,7 +123,7 @@ pub(crate) fn build_facet_filter(
     };
     let mut clauses: Vec<String> = Vec::new();
     // Colonnes présentes sur les deux tables (dénormalisées côté chunks).
-    if let Some(types) = &req.jurisdiction_type {
+    if let Some(types) = present(&req.jurisdiction_type) {
         add_clause(
             &mut clauses,
             params,
@@ -136,14 +142,10 @@ pub(crate) fn build_facet_filter(
                 Box::new(values),
             );
         }
-        // Portée (ADR 0167) : `publication_codes` est dénormalisée sur les deux
-        // tables — clause directe sur l'alias local (le détour `EXISTS fd` payait
-        // un lookup `decisions` par candidat du prefilter ANN). Côté jambes BM25
-        // (`Tantivy`), le filtre est composé DANS le `@@@` par
-        // [`build_array_filter_queries`] : le `&&` SQL y devenait un
-        // `heap_filter` — et sa négation un `must_not` évalué sur tout l'index
-        // (3,2 s vs 1,1 s mesurés sur la requête à 4 mots, 2026-07-06).
-        if let Some(v) = &req.significance {
+        // Portée : `publication_codes` est dénormalisée sur les deux tables — clause
+        // directe sur l'alias local. Côté jambes BM25 (`Tantivy`), le filtre est composé
+        // DANS le `@@@` par [`build_array_filter_queries`].
+        if let Some(v) = present(&req.significance) {
             if let Some(clause) = significance_clause(alias, v) {
                 clauses.push(clause);
             }
@@ -167,13 +169,13 @@ pub(crate) fn build_facet_filter(
             Box::new(d.clone()),
         );
     }
-    // Colonnes référentielles (ADR 0146), sur `decisions` uniquement.
+    // Colonnes référentielles, sur `decisions` uniquement.
     let mut ref_clauses: Vec<String> = Vec::new();
     let ref_alias = match table {
         FilterTable::Decisions => "d",
         FilterTable::Chunks => "fd",
     };
-    if let Some(v) = &req.solution {
+    if let Some(v) = present(&req.solution) {
         add_clause(
             &mut ref_clauses,
             params,
@@ -182,7 +184,7 @@ pub(crate) fn build_facet_filter(
             Box::new(enum_uids("solution", v)),
         );
     }
-    if let Some(v) = &req.procedure {
+    if let Some(v) = present(&req.procedure) {
         add_clause(
             &mut ref_clauses,
             params,
@@ -191,7 +193,7 @@ pub(crate) fn build_facet_filter(
             Box::new(enum_uids("procedure", v)),
         );
     }
-    if let Some(v) = &req.office {
+    if let Some(v) = present(&req.office) {
         add_clause(
             &mut ref_clauses,
             params,
@@ -200,7 +202,7 @@ pub(crate) fn build_facet_filter(
             Box::new(enum_uids("office", v)),
         );
     }
-    if let Some(v) = &req.legal_domain {
+    if let Some(v) = present(&req.legal_domain) {
         add_clause(
             &mut ref_clauses,
             params,
@@ -218,7 +220,7 @@ pub(crate) fn build_facet_filter(
             Box::new(v),
         );
     }
-    // Chambre (ADR 0172) : catégorie contrôlée uniforme, suffixes → `chamber:*`.
+    // Chambre : catégorie contrôlée uniforme, suffixes → `chamber:*`.
     if let Some(v) = nonempty(&req.chamber) {
         add_clause(
             &mut ref_clauses,
@@ -274,7 +276,7 @@ fn significance_sql_array(groups: &[&str]) -> String {
 
 /// `term_set` tantivy d'un groupe de portée sur `publication_codes` (champ
 /// `pdb.literal` de `decisions_bm25` : termes exacts, pas de lowercasing —
-/// parité `&&` vérifiée en prod, `r`≠`R`, `C+` intact).
+/// `r`≠`R`, `C+` intact).
 fn significance_term_set(groups: &[&str]) -> String {
     let terms: Vec<String> = groups
         .iter()
@@ -289,9 +291,8 @@ fn significance_term_set(groups: &[&str]) -> String {
 }
 
 /// Filtre `portee` composé dans le `@@@` des jambes BM25 (mêmes sémantiques
-/// rang-le-plus-fort que [`significance_clause`], mais en requêtes tantivy indexées :
-/// la négation passe par un `must_not` sur l'index inversé au lieu d'un
-/// `heap_filter` sur tout le corpus). `None` si la sélection est vide.
+/// rang-le-plus-fort que [`significance_clause`], mais en requêtes tantivy
+/// indexées). `None` si la sélection est vide.
 fn significance_tantivy(selected: &[lj_dtos::Significance]) -> Option<String> {
     use lj_dtos::Significance;
     let majeure = || significance_term_set(&["majeure"]);
@@ -330,9 +331,8 @@ fn significance_tantivy(selected: &[lj_dtos::Significance]) -> Option<String> {
     }
 }
 
-/// Clause `portee` (ADR 0167) : sémantique **rang le plus fort** — une décision
-/// `{b,r}` est majeure, pas importante ; un simple `&&` par groupe la
-/// compterait deux fois. Chaque groupe matche son overlap MOINS les groupes
+/// Clause `portee` : sémantique rang le plus fort — une décision `{b,r}` est
+/// majeure, pas importante. Chaque groupe matche son overlap MOINS les groupes
 /// plus forts ; `INDETERMINEE` = aucun code classant. Sélections OR-ées.
 /// `None` si la sélection est vide (aucune contrainte).
 fn significance_clause(alias: &str, selected: &[lj_dtos::Significance]) -> Option<String> {
@@ -367,13 +367,11 @@ fn significance_clause(alias: &str, selected: &[lj_dtos::Significance]) -> Optio
 /// Sort des filtres tableau (`legal_instrument`, `legal_article` composite)
 /// dans `build_facet_filter`.
 ///
-/// - Jambes BM25 (`@@@` sur `decisions_bm25`) : `Tantivy` — le `&&` SQL sur un
-///   fast field multi-valeurs est évalué par scan de colonne (~40 s mesurés sur
-///   `chunks_bm25` v2) là où le term/term_set passe par l'index inversé
-///   (~0,15 s). Les filtres sont composés dans la requête via
+/// - Jambes BM25 (`@@@` sur `decisions_bm25`) : `Tantivy` — le term/term_set
+///   passe par l'index inversé. Les filtres sont composés dans la requête via
 ///   [`compose_tantivy_query`].
 /// - Jambe ANN (pas de `@@@`) : `AsSql` — `&&` évalué par le prefilter
-///   VectorChord sur le heap, comme avant.
+///   VectorChord sur le heap.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArrayFilters {
     AsSql,
@@ -455,22 +453,45 @@ mod tests {
 
     #[test]
     fn domaine_root_expands_to_leaves() {
-        // CIVIL (racine à feuilles) : elle-même + ses 15 feuilles, rien d'autre.
         let uids = legal_domain_uids(&[Domain::Civil]);
         assert!(uids.contains(&"legal_domain:CIVIL".to_string()));
         assert!(uids.contains(&"legal_domain:CIVIL_DROIT_LOCATIF".to_string()));
         assert_eq!(uids.len(), 16);
         assert!(uids.iter().all(|u| u.starts_with("legal_domain:CIVIL")));
-        // FISCAL (racine sans feuille) : elle seule.
         assert_eq!(
             legal_domain_uids(&[Domain::Fiscal]),
             vec!["legal_domain:FISCAL".to_string()]
         );
-        // Une feuille : elle seule.
         assert_eq!(
             legal_domain_uids(&[Domain::SocialDroitTravail]),
             vec!["legal_domain:SOCIAL_DROIT_TRAVAIL".to_string()]
         );
+    }
+
+    #[test]
+    fn empty_filter_arrays_are_no_filter_at_all() {
+        let req: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "jurisdictionType": [],
+            "solution": [],
+            "procedure": [],
+            "office": [],
+            "legalDomain": [],
+            "significance": [],
+            "jurisdictionCode": [],
+        }))
+        .unwrap();
+        let mut params: Params = Vec::new();
+        let mut idx = 1usize;
+        let frag = build_facet_filter(
+            &req,
+            &mut idx,
+            &mut params,
+            ArrayFilters::AsSql,
+            FilterTable::Decisions,
+        );
+        assert!(frag.is_empty(), "{frag}");
+        assert!(params.is_empty());
     }
 
     #[test]
@@ -480,9 +501,7 @@ mod tests {
             "significance": ["IMPORTANTE", "INDETERMINEE"],
         }))
         .unwrap();
-        // Jambes BM25 : composé DANS le `@@@` (index inversé), absent du
-        // fragment SQL — le `&&`/`NOT &&` en SQL y devenait un heap_filter
-        // plein-corpus (3,2 s vs 1,1 s mesurés, 2026-07-06).
+        // Jambes BM25 : composé DANS le `@@@` (index inversé), absent du fragment SQL.
         let mut params: Params = Vec::new();
         let mut idx = 1usize;
         let frag = build_facet_filter(
@@ -496,8 +515,6 @@ mod tests {
         let queries = build_array_filter_queries(&req, &mut idx, &mut params);
         assert_eq!(queries.len(), 1);
         let q = &queries[0];
-        // Importante = must importante, must_not majeure ; indéterminée =
-        // all() must_not tout code classant ; sélections OR-ées par `should`.
         assert!(q.contains("paradedb.term('publication_codes', 'b')"));
         assert!(q.contains("must_not => ARRAY[paradedb.term_set(terms => ARRAY[paradedb.term('publication_codes', 'r'), paradedb.term('publication_codes', 'A')])]"));
         assert!(q.contains("paradedb.all()"));

@@ -13,17 +13,16 @@ use lj_store::repository::DecisionRepository;
 
 use crate::config::Settings;
 
-use super::batch::{drain_batch, drain_batch_in_txn};
+use super::batch::{drain_batch, drain_batch_in_txn, run_stream};
 use super::embed::{build_embedder, build_vllm_strict};
 use super::files::{collect_jsonl_gz, collect_zip_paths, read_jsonl_gz_lines};
 use super::prepare::{classify_judilibre, classify_xml};
-use super::{Candidate, IngestCounts, IngestMode, BATCH_SIZE};
+use super::{Candidate, IngestCounts, IngestMode};
 
 /// Ingère les archives opendata d'un dossier (XML → DB).
 ///
-/// Port de `pipelines/ingest.py` + `cli._ingest_opendata_conseil_etat` : itère
-/// les `*.zip` sous `data_dir`, parse chaque XML, triage idempotent par batch,
-/// chunk + extract + (embed) + upsert. `data_dir` est le dossier des ZIPs
+/// Itère les `*.zip` sous `data_dir`, parse chaque XML, triage idempotent par
+/// batch, chunk + extract + (embed) + upsert. `data_dir` est le dossier des ZIPs
 /// (`<cache>/opendata_conseil_etat/zips/...` ou un chemin explicite).
 pub async fn ingest_opendata(
     data_dir: &Path,
@@ -37,6 +36,9 @@ pub async fn ingest_opendata(
     lj_store::migrator::apply_migrations(&conn)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
+    // Connexion dédiée aux écritures : la phase amont du lot suivant (lecture
+    // seule) recouvre l'écriture du lot courant.
+    let write_conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
 
     let embedder = if with_embeddings {
         Some(build_embedder(&settings).await?)
@@ -50,9 +52,9 @@ pub async fn ingest_opendata(
         return Ok(());
     }
 
-    // Manifeste downloader : fast-skip des ZIPs déjà entièrement ingérés (port
-    // de `cli._ingest_opendata_conseil_etat`). Sans manifeste (chemin explicite
-    // hors `<cache>/opendata_conseil_etat`), aucun skip — full scan.
+    // Manifeste downloader : fast-skip des ZIPs déjà entièrement ingérés. Sans
+    // manifeste (chemin explicite hors `<cache>/opendata_conseil_etat`), aucun
+    // skip — full scan.
     let manifest_path = data_dir.join("manifest.json");
     let mut manifest = Manifest::load(&manifest_path).map_err(|e| anyhow!("manifest: {e}"))?;
     let key_by_path: HashMap<PathBuf, String> = manifest
@@ -67,9 +69,8 @@ pub async fn ingest_opendata(
         let manifest_key = key_by_path.get(zip_path);
 
         // Fast skip : ZIP déjà entièrement ingéré selon le manifeste (taille
-        // identique au download). Évite d'ouvrir le ZIP et de hasher les membres.
-        // `fully_ingested` est invalidé par le downloader à chaque re-download.
-        // Mode ALL : on bypasse le fast-skip (re-traitement total forcé).
+        // identique au download). `fully_ingested` est invalidé par le downloader à
+        // chaque re-download. Mode ALL : le fast-skip est bypassé.
         if let Some(entry) = manifest_key
             .filter(|_| mode != IngestMode::All)
             .and_then(|k| manifest.entries.get(k))
@@ -87,6 +88,7 @@ pub async fn ingest_opendata(
 
         let zip_counts = drain_zip(
             &conn,
+            &write_conn,
             embedder.as_ref(),
             zip_path,
             None,
@@ -106,8 +108,7 @@ pub async fn ingest_opendata(
         );
         total.merge(&zip_counts);
 
-        // Marque le ZIP entièrement ingéré dans le manifeste — écrit
-        // immédiatement pour survivre à un arrêt en cours de run.
+        // Marque le ZIP entièrement ingéré dans le manifeste, écrit immédiatement.
         if zip_counts.errors == 0 {
             if let Some(entry) = manifest_key.and_then(|k| manifest.entries.get_mut(k)) {
                 entry.fully_ingested = true;
@@ -135,13 +136,12 @@ pub async fn ingest_opendata(
 }
 
 /// Lit un ZIP opendata, classe chaque membre XML, filtre éventuellement par
-/// `only` (set de `source_uid` cibles), draine par batch. Cœur partagé par
-/// [`ingest_opendata`] (sans filtre) et [`reingest_stale_opendata`] (ciblé).
-/// `only = Some(set)` ne retient que les candidats dont le `source_uid`
-/// (`{zip}/{member}`) est dans `set` — les autres membres du ZIP sont parsés puis
-/// jetés (aucun chunk/embed).
+/// `only` (set de `source_uid` cibles), draine par batch. `only = Some(set)` ne
+/// retient que les candidats dont le `source_uid` (`{zip}/{member}`) est dans
+/// `set` — les autres membres du ZIP sont parsés puis jetés.
 async fn drain_zip<E: Embedder>(
     conn: &Connection,
+    write_conn: &Connection,
     embedder: Option<&E>,
     zip_path: &Path,
     only: Option<&std::collections::HashSet<String>>,
@@ -157,58 +157,43 @@ async fn drain_zip<E: Embedder>(
     let members = lj_sources::zip_reader::iter_decisions(zip_path)
         .map_err(|e| anyhow!("lecture {}: {e}", zip_path.display()))?;
 
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut zip_counts = IngestCounts::default();
-
-    for (member, raw) in members {
-        if raw.is_empty() {
-            zip_counts.skipped += 1;
-            zip_counts.empty_skipped += 1;
-            continue;
-        }
-        match classify_xml(raw, &member, &archive_name) {
-            Some(cand) => {
-                if only.is_none_or(|s| s.contains(&cand.decision.source_uid)) {
-                    candidates.push(cand);
+    run_stream(
+        conn,
+        write_conn,
+        embedder,
+        with_embeddings,
+        mode,
+        |tx| async move {
+            let mut counts = IngestCounts::default();
+            for (member, raw) in members {
+                if raw.is_empty() {
+                    counts.skipped += 1;
+                    counts.empty_skipped += 1;
+                    continue;
+                }
+                match classify_xml(raw, &member, &archive_name) {
+                    Some(cand) => {
+                        if only.is_none_or(|s| s.contains(&cand.decision.source_uid))
+                            && tx.send(cand).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    None => counts.errors += 1,
                 }
             }
-            None => zip_counts.errors += 1,
-        }
-        if candidates.len() >= BATCH_SIZE {
-            let batch = std::mem::take(&mut candidates);
-            drain_batch(
-                conn,
-                embedder,
-                batch,
-                with_embeddings,
-                mode,
-                &mut zip_counts,
-            )
-            .await?;
-        }
-    }
-    if !candidates.is_empty() {
-        drain_batch(
-            conn,
-            embedder,
-            candidates,
-            with_embeddings,
-            mode,
-            &mut zip_counts,
-        )
-        .await?;
-    }
-    Ok(zip_counts)
+            Ok(counts)
+        },
+    )
+    .await
 }
 
 /// Re-ingest **ciblé** des décisions opendata dont l'autorité a basculé sur
-/// opendata (rang 55 généré, ADR 0109) mais dont le `full_text` reste figé sur la
-/// provenance rang 50 (jade/constit/cedh/cjue/cnda) qui gagnait quand opendata
-/// valait 40 — ~61,7k décisions CAA/CE. Re-parse leur payload opendata depuis les
-/// ZIPs (seuls ceux contenant une cible sont ouverts ; le `source_uid` porte le
-/// nom du ZIP) en [`IngestMode::All`] : re-chunk + re-embed (vLLM **strict**,
-/// jamais Cloudflare — op de maintenance, même classe que le re-split #29) +
-/// réécriture du `full_text` canonique sur le texte opendata.
+/// opendata mais dont le `full_text` reste figé sur une provenance de rang
+/// inférieur. Re-parse leur payload opendata depuis les ZIPs (seuls ceux
+/// contenant une cible sont ouverts ; le `source_uid` porte le nom du ZIP) en
+/// [`IngestMode::All`] : re-chunk + re-embed (vLLM **strict**) + réécriture du
+/// `full_text` canonique sur le texte opendata.
 pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -217,6 +202,7 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
     lj_store::migrator::apply_migrations(&conn)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
+    let write_conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
 
     let targets: std::collections::HashSet<String> = DecisionRepository::new(&conn)
         .opendata_source_uids_stale_authority()
@@ -228,8 +214,8 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // ZIPs contenant ≥1 cible : `source_uid` = `{zip}/{member}` → préfixe = nom du
-    // ZIP. On n'ouvre que ceux-là (évite de parser tout le corpus opendata).
+    // ZIPs contenant ≥1 cible : `source_uid` = `{zip}/{member}` → préfixe = nom
+    // du ZIP. On n'ouvre que ceux-là.
     let target_zips: std::collections::HashSet<&str> =
         targets.iter().filter_map(|u| u.split('/').next()).collect();
     let zip_paths: Vec<PathBuf> = collect_zip_paths(data_dir)?
@@ -241,8 +227,7 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
         })
         .collect();
 
-    // Re-embed maintenance : vLLM strict, erreur franche si injoignable (pas de
-    // repli Cloudflare payant — règle projet).
+    // Re-embed maintenance : vLLM strict, erreur franche si injoignable.
     let embedder = build_vllm_strict(&settings).await?;
 
     tracing::info!(
@@ -254,6 +239,7 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
     for zip_path in &zip_paths {
         let zip_counts = drain_zip(
             &conn,
+            &write_conn,
             Some(&embedder),
             zip_path,
             Some(&targets),
@@ -284,9 +270,8 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
 
 /// Ingère les archives Judilibre d'un dossier (JSON → DB).
 ///
-/// Port de `pipelines/ingest_judilibre.py` + `cli._ingest_judilibre` : itère les
-/// `*/*.jsonl.gz` sous `data_dir`, parse chaque ligne JSON, même triage/chunk/
-/// embed/upsert que l'opendata.
+/// Itère les `*/*.jsonl.gz` sous `data_dir`, parse chaque ligne JSON, même
+/// triage/chunk/embed/upsert que l'opendata.
 pub async fn ingest_judilibre(
     data_dir: &Path,
     with_embeddings: bool,
@@ -303,8 +288,9 @@ pub async fn ingest_judilibre(
     // Propage les suppressions Judilibre (`tombstones.jsonl`) vers la base avant
     // tout ingest : une décision retirée par la Cour de cassation doit cesser
     // d'être servie même si le manifeste fast-skip court-circuite la boucle
-    // d'ingest (ADR 0087).
+    // d'ingest.
     crate::tombstones::prune_tombstones(data_dir, &DecisionRepository::new(&conn)).await?;
+    let write_conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
 
     let embedder = if with_embeddings {
         Some(build_embedder(&settings).await?)
@@ -318,9 +304,8 @@ pub async fn ingest_judilibre(
         return Ok(());
     }
 
-    // Manifeste downloader : fast-skip + resume incrémental (port de
-    // `cli._ingest_judilibre`). Mapping fichier → MonthState : `<jur>/<key>.jsonl.gz`
-    // (`key` = YYYYMM ou `archive`).
+    // Manifeste downloader : fast-skip + resume incrémental. Mapping fichier →
+    // MonthState : `<jur>/<key>.jsonl.gz` (`key` = YYYYMM ou `archive`).
     let manifest_path = data_dir.join("manifest.json");
     let mut manifest = Manifest::load(&manifest_path).map_err(|e| anyhow!("manifest: {e}"))?;
 
@@ -340,7 +325,7 @@ pub async fn ingest_judilibre(
             .trim_end_matches(".jsonl.gz")
             .to_string();
         let file_size = path.metadata()?.len();
-        // Mode ALL : on ignore le manifeste (ni fast-skip ni resume), re-scan total.
+        // Mode ALL : le manifeste est ignoré (ni fast-skip ni resume), re-scan total.
         let month_state = manifest
             .jurisdictions
             .get(&jur)
@@ -348,8 +333,6 @@ pub async fn ingest_judilibre(
             .filter(|_| mode != IngestMode::All);
 
         // Fast skip : `.jsonl.gz` non modifié (taille identique) et déjà ingéré.
-        // Évite d'ouvrir et de hasher chaque ligne — gain massif sur des Go
-        // déjà ingérés.
         if let Some(state) = month_state {
             if state.fully_ingested
                 && (!with_embeddings || state.embeddings_complete)
@@ -361,10 +344,10 @@ pub async fn ingest_judilibre(
             }
         }
 
-        // Resume incrémental : si on a déjà ingéré N lignes de ce fichier, on
-        // saute les N premières avant tout parse/hash/triage (le `.jsonl.gz`
-        // étant append-only, l'offset par lignes est stable). Embeddings requis
-        // mais incomplets sur le préfixe → full scan pour ré-embedder.
+        // Resume incrémental : si N lignes de ce fichier sont déjà ingérées, on
+        // saute les N premières avant tout parse/hash/triage (le `.jsonl.gz` étant
+        // append-only, l'offset par lignes est stable). Embeddings requis mais
+        // incomplets sur le préfixe → full scan pour ré-embedder.
         let skip_first_lines = match month_state {
             Some(state) if !with_embeddings || state.embeddings_complete => {
                 state.ingested_lines.unwrap_or(0).max(0) as usize
@@ -382,45 +365,36 @@ pub async fn ingest_judilibre(
                 "ingest_judilibre_resume"
             );
         }
-        let mut candidates: Vec<Candidate> = Vec::new();
-        let mut file_counts = IngestCounts::default();
-
-        for line in lines.into_iter().skip(skip_first_lines) {
-            if line.is_empty() {
-                continue;
-            }
-            match classify_judilibre(line) {
-                Ok(Some(cand)) => candidates.push(cand),
-                Ok(None) => file_counts.errors += 1,
-                Err(e) => {
-                    tracing::error!(source = %path.display(), error = %e, "parse Judilibre échec");
-                    file_counts.errors += 1;
+        let source = path.display().to_string();
+        let file_counts = run_stream(
+            &conn,
+            &write_conn,
+            embedder.as_ref(),
+            with_embeddings,
+            mode,
+            |tx| async move {
+                let mut counts = IngestCounts::default();
+                for line in lines.into_iter().skip(skip_first_lines) {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    match classify_judilibre(line) {
+                        Ok(Some(cand)) => {
+                            if tx.send(cand).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => counts.errors += 1,
+                        Err(e) => {
+                            tracing::error!(source = %source, error = %e, "parse Judilibre échec");
+                            counts.errors += 1;
+                        }
+                    }
                 }
-            }
-            if candidates.len() >= BATCH_SIZE {
-                let batch = std::mem::take(&mut candidates);
-                drain_batch(
-                    &conn,
-                    embedder.as_ref(),
-                    batch,
-                    with_embeddings,
-                    mode,
-                    &mut file_counts,
-                )
-                .await?;
-            }
-        }
-        if !candidates.is_empty() {
-            drain_batch(
-                &conn,
-                embedder.as_ref(),
-                candidates,
-                with_embeddings,
-                mode,
-                &mut file_counts,
-            )
-            .await?;
-        }
+                Ok(counts)
+            },
+        )
+        .await?;
 
         tracing::info!(
             source = %path.display(),
@@ -433,8 +407,7 @@ pub async fn ingest_judilibre(
         );
         total.merge(&file_counts);
 
-        // Marque le mois entièrement ingéré dans le manifeste — écrit
-        // immédiatement pour survivre à un arrêt en cours de run.
+        // Marque le mois entièrement ingéré dans le manifeste, écrit immédiatement.
         if file_counts.errors == 0 {
             if let Some(state) = manifest
                 .jurisdictions
@@ -469,12 +442,11 @@ pub async fn ingest_judilibre(
 
 /// Re-fetch ciblé de décisions Judilibre par id (`/decision`) puis ingest.
 ///
-/// Répare une poignée de décisions désynchronisées (ex. résurrection : supprimée
-/// puis re-créée côté Judilibre, ADR 0087) **sans reculer le `history_watermark`
-/// global** — qui re-traiterait des dizaines de milliers de transactions pour
-/// quelques décisions. Réutilise le chemin d'ingest normal (parse → chunk →
-/// extract → upsert), idempotent par `content_checksum` (`MissingHash` : un id
-/// déjà à jour est skippé).
+/// Répare une poignée de décisions désynchronisées (ex. résurrection :
+/// supprimée puis re-créée côté Judilibre) **sans reculer le
+/// `history_watermark` global**. Réutilise le chemin d'ingest normal (parse →
+/// chunk → extract → upsert), idempotent par `content_checksum` (`MissingHash` :
+/// un id déjà à jour est skippé).
 pub async fn refetch_judilibre(
     client: &JudilibreClient,
     ids: &[String],
@@ -488,8 +460,8 @@ pub async fn refetch_judilibre(
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
 
-    // Re-fetch de maintenance : re-embed vLLM local **strict**, jamais Cloudflare
-    // (coût ; même classe que le re-split #29). Erreur franche si vLLM injoignable.
+    // Re-fetch de maintenance : re-embed vLLM local **strict**, erreur franche si
+    // vLLM injoignable.
     let embedder = if with_embeddings {
         Some(build_vllm_strict(&settings).await?)
     } else {
@@ -533,15 +505,12 @@ pub async fn refetch_judilibre(
     Ok(())
 }
 
-/// Re-fetch ciblé de quelques décisions Judilibre par ObjectId puis ré-ingest sur
-/// une **connexion et un embedder fournis** (réutilisé par le re-split #29 :
-/// chaque provenance scindée a déjà été re-pointée vers sa nouvelle décision, le
-/// contenu doit y atterrir). [`IngestMode::All`] : UPDATE complet inconditionnel
-/// — le triage résout l'id par `source_uid` (qui pointe désormais la décision
-/// scindée). `require_embeddings = true` : re-chunk + re-embed ciblé (vLLM local,
-/// l'embedder est construit hors Cloudflare par l'appelant). Renvoie une erreur si
-/// **aucune** décision n'a été reconnue (toutes disparues côté Judilibre) — le
-/// re-split traite ce cas en sautant le groupe.
+/// Re-fetch ciblé de quelques décisions Judilibre par ObjectId puis ré-ingest
+/// sur une **connexion et un embedder fournis**. [`IngestMode::All`] : UPDATE
+/// complet inconditionnel — le triage résout l'id par `source_uid`.
+/// `require_embeddings = true` : re-chunk + re-embed ciblé (vLLM local,
+/// l'embedder est construit par l'appelant). Renvoie une erreur si **aucune**
+/// décision n'a été reconnue.
 pub(super) async fn refetch_into<E: Embedder>(
     conn: &Connection,
     client: &JudilibreClient,

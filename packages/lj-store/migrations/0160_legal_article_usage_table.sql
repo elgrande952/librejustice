@@ -1,4 +1,4 @@
--- ADR 0248 (correctif de la 0159) : le champ usage_terms dans
+-- Correctif de la 0159 : le champ usage_terms dans
 -- legal_article_bm25 fausse la normalisation de longueur BM25 — Tantivy
 -- calcule l'avgdl du champ sur TOUS les docs du segment (2,2 M, presque tous
 -- vides) et écrase les gros sacs organiques. Le signal d'usage vit dans une

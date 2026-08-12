@@ -1,16 +1,13 @@
-//! Hover card de prévisualisation des références (ADR 0168) : au survol d'un
-//! lien d'article de code (`/texte/{code}/{num}`) ou de décision
-//! (`/decision/{id}`), un panneau flottant montre le contenu pointé sans
-//! naviguer — gabarit  (recon 2026-07-02, shots 14/15).
+//! Hover card de prévisualisation des références : au survol d'un lien
+//! d'article de code (`/texte/{code}/{num}`) ou de décision (`/decision/{id}`),
+//! un panneau flottant montre le contenu pointé sans naviguer.
 //!
 //! PHRASING CONTENT uniquement (`<span>`) : les déclencheurs vivent dans des
 //! `<p>` (corps de décision) — un `<div>` fermerait le paragraphe au parse
-//! HTML (même contrainte que `CiteMenu`). Panneau en `position: fixed` mesuré
-//! à l'ouverture (même doctrine que `FilterDropdown`), collé au lien via un
-//! pont transparent de 6 px (pas de zone morte à traverser), basculé
-//! au-dessus quand la place manque. Îlot client : fetch dès le `mouseenter`,
-//! ouverture différée (150 ms), fermeture différée (150 ms — le pointeur peut
-//! rejoindre le panneau) ; endpoints déjà cachés CDN. Rien au SSR ni au
+//! HTML. Panneau en `position: fixed` mesuré à l'ouverture, collé au lien via un
+//! pont transparent de 6 px, basculé au-dessus quand la place manque. Îlot
+//! client : fetch dès le `mouseenter`, ouverture différée (150 ms), fermeture
+//! différée (150 ms, le pointeur peut rejoindre le panneau). Rien au SSR ni au
 //! tactile (pas de `mouseenter`).
 
 use leptos::prelude::*;
@@ -38,9 +35,9 @@ pub enum PreviewKind {
 
 /// Cible de prévisualisation d'un `href` interne : `/texte/{code}/{num}` →
 /// article (version à `at_date` si fournie), `/texte/{code}/{num}/{date}` →
-/// article à la date **portée par le lien** (renvoi Chronolégi, ADR 0217 — elle
-/// prime sur le contexte hôte), `/decision/{id}` → décision. Les autres formes
-/// (`/texte/{code}` nu) n'ont pas de carte.
+/// article à la date portée par le lien, qui prime sur le contexte hôte ;
+/// `/decision/{id}` → décision. Les autres formes (`/texte/{code}` nu) n'ont pas
+/// de carte.
 pub fn preview_kind(href: &str, at_date: Option<&str>) -> Option<PreviewKind> {
     if let Some(id) = href.strip_prefix("/decision/") {
         return (!id.is_empty() && !id.contains('/'))
@@ -84,10 +81,19 @@ enum PreviewData {
 #[component]
 pub fn HoverPreview(kind: PreviewKind, children: Children) -> impl IntoView {
     let open = RwSignal::new(false);
-    // Style de position du panneau (fixed, mesuré à l'ouverture).
-    let style = RwSignal::new(String::new());
+    // Style de position du panneau (fixed, mesuré à l'ouverture). Avant mesure
+    // il est déjà hors du flux : monté mais fermé, un panneau `static` occuperait
+    // sa place en ligne dans le `<p>` hôte — `visibility:hidden` masque sans
+    // libérer la place.
+    let style = RwSignal::new("position:fixed; top:0; left:0;".to_string());
     let data = RwSignal::new(None::<PreviewData>);
     let anchor = NodeRef::<leptos::html::Span>::new();
+    // Monté dès le premier survol, puis gardé (masqué par `.lj-panel`) : c'est
+    // ce qui permet d'animer la fermeture, un panneau démonté n'ayant plus de
+    // frames à jouer. Posé au `mouseenter`, 150 ms avant l'ouverture : le nœud
+    // existe donc à l'état fermé pendant une frame au moins, et la première carte
+    // s'ouvre avec sa transition.
+    let mounted = RwSignal::new(false);
 
     #[cfg(feature = "hydrate")]
     let (on_enter, on_leave) = {
@@ -101,8 +107,8 @@ pub fn HoverPreview(kind: PreviewKind, children: Children) -> impl IntoView {
         // faux sur échec (nouvelle tentative au survol suivant).
         let loading = StoredValue::new(false);
 
-        // Fetch dès l'ENTRÉE (pas à l'ouverture) : le payload arrive pendant le
-        // délai d'intention — la carte s'ouvre pleine, sans flash « Chargement… ».
+        // Fetch dès l'entrée, pas à l'ouverture : le payload arrive pendant le
+        // délai d'intention, la carte s'ouvre pleine.
         let do_fetch = move || {
             if data.get_untracked().is_some() || loading.get_value() {
                 return;
@@ -150,11 +156,10 @@ pub fn HoverPreview(kind: PreviewKind, children: Children) -> impl IntoView {
                 let left = rect.left().min(win_w - PANEL_W - 8.0).max(8.0);
                 let below = win_h - rect.bottom();
                 // Sous le lien si la place suffit (ou dépasse celle du dessus),
-                // au-dessus sinon (ancrage `bottom`, le panneau pousse vers le
-                // haut). Le wrapper est COLLÉ au lien : l'écart visuel de 6 px
-                // est un padding transparent qui porte les handlers — pas de
-                // zone morte entre lien et panneau, le pointeur peut la
-                // traverser à n'importe quelle vitesse.
+                // au-dessus sinon (ancrage `bottom`, le panneau pousse vers le haut). Le
+                // wrapper est collé au lien : l'écart visuel de 6 px est un padding
+                // transparent qui porte les handlers, traversable par le pointeur à
+                // n'importe quelle vitesse.
                 let pos = if below >= 320.0 || below >= rect.top() {
                     format!("top:{}px; padding-top:6px;", rect.bottom())
                 } else {
@@ -170,6 +175,7 @@ pub fn HoverPreview(kind: PreviewKind, children: Children) -> impl IntoView {
                 h.clear();
                 close_timer.set_value(None);
             }
+            mounted.set(true);
             do_fetch();
             if open.get_untracked() || open_timer.get_value().is_some() {
                 return;
@@ -216,19 +222,21 @@ pub fn HoverPreview(kind: PreviewKind, children: Children) -> impl IntoView {
     view! {
         <span node_ref=anchor on:mouseenter=on_enter on:mouseleave=on_leave>
             {children()}
-            <Show when=move || open.get()>
-                // Le wrapper (pont transparent inclus) garde les handlers : y
-                // entrer annule la fermeture différée (contenu scrollable
-                // atteignable au pointeur).
-                // `data-hover-card` : la toolbar de sélection du corps de
-                // décision ignore les sélections nées dans cet îlot (il est
-                // rendu DANS l'`<article>` observé — cf. `selection.js`).
+            <Show when=move || mounted.get()>
+                // Le wrapper (pont transparent inclus) garde les handlers : y entrer
+                // annule la fermeture différée, le contenu scrollable reste atteignable au
+                // pointeur. Il porte aussi `.lj-panel` : fermé, son `pointer-events:none`
+                // retire le pont du chemin du pointeur, qui resterait sinon posé sur le
+                // texte sous chaque lien déjà survolé.
+                // `data-hover-card` : la toolbar de sélection du corps de décision ignore
+                // les sélections nées dans cet îlot, rendu dans l'`<article>` observé.
                 <span
                     data-hover-card=""
+                    data-open=move || open.get().then_some("true")
                     style=move || style.get()
                     on:mouseenter=on_enter
                     on:mouseleave=on_leave
-                    class="z-50 block w-96 max-w-[calc(100vw-16px)]"
+                    class="lj-panel z-50 block w-96 max-w-[calc(100vw-16px)]"
                 >
                     <span class="block rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] p-4 text-left shadow-lg">
                         {move || card_view(data.get())}
@@ -323,7 +331,6 @@ mod tests {
             preview_kind("/texte/code-civil/1728", None),
             Some(PreviewKind::Article { date: None, .. })
         ));
-        // Href daté (ADR 0217) : la date du lien prime sur celle du contexte.
         assert!(matches!(
             preview_kind("/texte/code-civil/1728/2016-10-01", Some("2015-06-04")),
             Some(PreviewKind::Article { date: Some(d), .. }) if d == "2016-10-01"
@@ -336,7 +343,6 @@ mod tests {
 
     #[test]
     fn preview_kind_rejects_other_shapes() {
-        // Mention nue d'un texte, segments surnuméraires, id vide, autres routes.
         assert!(preview_kind("/texte/code-civil", None).is_none());
         assert!(preview_kind("/texte/code-civil/1728/2016-10-01/x", None).is_none());
         assert!(preview_kind("/decision/", None).is_none());

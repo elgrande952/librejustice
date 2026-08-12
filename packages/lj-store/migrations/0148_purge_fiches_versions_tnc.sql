@@ -1,17 +1,17 @@
--- 0148 — Purge des fiches TNC ancrées sur un id de version (ADR 0225).
+-- 0148 — Purge des fiches TNC ancrées sur un id de version.
 --
 -- Depuis que la DILA versionne les textes non codifiés, `META_COMMUN/ID` d'un
 -- TEXTE_VERSION LEGI est un id de VERSION (`LEGITEXT…`) distinct du CID
 -- chronique (`JORFTEXT…`) sur lequel s'ancrent les articles et la TOC. Le
 -- pipeline créait donc une fiche-coquille par version (sans articles ni
 -- corps) pendant que les articles vivaient sous le CID, sans fiche. Le parser
--- est ré-ancré sur le CID (ADR 0225) ; on purge ici les coquilles —
+-- est ré-ancré sur le CID ; on purge ici les coquilles —
 -- `backfill-textes` recrée les fiches manquantes keyées CID.
 
 -- La FK `text_legal_citation.ref_text_uid → legal_text` (CASCADE, 0147)
 -- n'avait pas d'index côté référent : chaque ligne supprimée de `legal_text`
--- coûtait un seq scan des ~3 M citations (le piège de la règle #2, cf.
--- l'incident 0145). Indispensable AVANT le DELETE de masse ci-dessous.
+-- coûtait un seq scan des ~3 M citations. Indispensable AVANT le DELETE de
+-- masse ci-dessous.
 CREATE INDEX IF NOT EXISTS idx_tlc_ref ON text_legal_citation (ref_text_uid);
 
 -- Liens du graphe dont l'owner est une coquille (arêtes de niveau texte

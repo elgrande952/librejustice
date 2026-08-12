@@ -1,13 +1,14 @@
-//! `SearchSubmit` (port de `search-submit.tsx`). Split button « Rechercher » +
-//! toggle Mode IA (icône sparkles SVG inline — pas d'emoji, qui sort en tofu sans
-//! police emoji). En IA, les deux moitiés passent au bordeaux d'accent
-//! (rerank LLM + résumés auto, ADR 0041).
+//! `SearchSubmit` : split button « Rechercher » + toggle Mode IA (icône sparkles
+//! SVG inline — pas d'emoji, qui sort en tofu sans police emoji). En IA, les deux
+//! moitiés passent au bordeaux d'accent. Le toggle gouverne le **reclassement
+//! LLM** seul ; la vue par défaut des cartes suit le mode de recherche résolu, pas
+//! ce toggle.
 
 use leptos::prelude::*;
 
 use crate::helpers::cn;
 
-/// Taille du bouton (port de la prop `size`).
+/// Taille du bouton.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitSize {
     Md,
@@ -19,8 +20,8 @@ pub fn SearchSubmit(
     #[prop(into)] ai_mode: Signal<bool>,
     #[prop(into)] on_toggle: Callback<bool>,
     size: SubmitSize,
-    /// Affiche la moitié toggle IA (rerank + résumés = corpus décisions ; la
-    /// source textes n'a pas de mode IA).
+    /// Affiche la moitié toggle IA (reclassement = corpus décisions ; la source
+    /// textes n'a pas de mode IA).
     #[prop(into, default = Signal::derive(|| true))]
     show_ai: Signal<bool>,
 ) -> impl IntoView {
@@ -66,19 +67,19 @@ pub fn SearchSubmit(
         height_cls,
     ]);
 
-    // Masquage IA par `display:none` inline et non `<Show>` : la structure DOM
-    // reste identique SSR ↔ client (un `<Show>` ici panique l'hydratation des
-    // pages SSR qui montent SearchSubmit, ex. la landing). Style inline plutôt
-    // que classe `hidden` : les closures `class` réactives écrasent
-    // `class:hidden`, et la classe perd la spécificité contre `inline-flex`.
+    // Masquage IA par `display:none` inline et non `<Show>` : la structure DOM reste
+    // identique SSR ↔ client (un `<Show>` ici panique l'hydratation des pages SSR
+    // qui montent SearchSubmit). Style inline plutôt que classe `hidden` : les
+    // closures `class` réactives écrasent `class:hidden`, et la classe perd la
+    // spécificité contre `inline-flex`.
     let ai_display = move || if show_ai.get() { "" } else { "none" };
     let submit_class = move || cn([base_side, submit_pad_cls, on_cls(), "whitespace-nowrap"]);
     let toggle_class = move || cn([base_side, toggle_pad_cls, toggle_cls()]);
     let title = move || {
         if ai_mode.get() {
-            "Mode IA activé : résultats reclassés et résumés affichés automatiquement. Cliquer pour désactiver."
+            "Mode IA activé : les résultats sont reclassés par un LLM. Sans effet sur une recherche à opérateurs (ET, OU, \"phrase\", PROCHE5) ou triée par date. Cliquer pour désactiver."
         } else {
-            "Activer le mode IA : reclasse les résultats par un LLM et pré-charge le résumé de chaque décision."
+            "Activer le mode IA : reclasse les résultats par un LLM. Sans effet sur une recherche à opérateurs ou triée par date."
         }
     };
     let sparkles_class = move || {
@@ -125,9 +126,8 @@ pub fn SearchSubmit(
     }
 }
 
-/// Étoile à quatre branches (sparkle) en SVG inline — icône du Mode IA. Remplace
-/// l'emoji `✨` (rendu non garanti, tofu sans police emoji). `fill=currentColor`
-/// pour hériter la couleur de texte du contexte (parchment / accent-foreground).
+/// Étoile à quatre branches (sparkle) en SVG inline — icône du Mode IA.
+/// `fill=currentColor` pour hériter la couleur de texte du contexte.
 #[component]
 fn Sparkle(#[prop(into)] class: String) -> impl IntoView {
     view! {

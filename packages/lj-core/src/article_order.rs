@@ -47,12 +47,10 @@ pub fn num_key_sort_key(num_key: &str) -> (u8, Vec<u64>, String) {
 type Key = (u8, Vec<u64>, String);
 
 /// Trie `entries` dans l'ordre de lecture d'un code sans `position` : les
-/// divisions (préfixes du `title_path`, segments « > ») sont ordonnées par la
-/// clé **médiane** de leurs articles, les articles d'une division par leur
-/// propre clé. La médiane rend l'ordre robuste aux numérotations aberrantes —
-/// dans le CJA, les articles « L. 77-10-… » du Livre VII trient numériquement
-/// avant « L. 111-1 », et un ordre au premier-arrivé (ou au min) plaçait le
-/// Livre VII avant le Livre Ier.
+/// divisions (préfixes du `title_path`, segments « > ») sont ordonnées par la clé
+/// **médiane** de leurs articles, les articles d'une division par leur propre clé.
+/// La médiane rend l'ordre robuste aux numérotations aberrantes — dans le CJA, les
+/// articles « L. 77-10-… » du Livre VII trient numériquement avant « L. 111-1 ».
 pub fn sort_reading_order<T>(
     entries: &mut [T],
     num_key: impl Fn(&T) -> &str,
@@ -107,6 +105,28 @@ pub fn sort_reading_order<T>(
     });
 }
 
+/// Ordre de lecture d'un texte entier, règle complète : quand la source fournit
+/// des `position`, elles priment (`NULLS LAST`, départage par la clé naturelle) ;
+/// quand elle n'en fournit aucune — le cas de tous les codes LEGI — l'ordre est
+/// celui des divisions par clé médiane. Unique définition de l'ordre du corpus :
+/// c'est elle que `refresh_reading_ranks` matérialise dans
+/// `legal_article.reading_rank`.
+pub fn sort_text_reading_order<T>(
+    entries: &mut [T],
+    num_key: impl Fn(&T) -> &str,
+    title_path: impl Fn(&T) -> Option<&str>,
+    position: impl Fn(&T) -> Option<i32>,
+) {
+    if entries.iter().all(|e| position(e).is_none()) {
+        sort_reading_order(entries, num_key, title_path);
+    } else {
+        entries.sort_by_cached_key(|e| {
+            let p = position(e);
+            (p.is_none(), p, num_key_sort_key(num_key(e)))
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,9 +156,6 @@ mod tests {
 
     #[test]
     fn reading_order_places_divisions_by_median() {
-        // CJA réel : « L. 77-10-3 » (Livre VII) trie numériquement avant
-        // « L. 111-1 » (Livre Ier) — la médiane du Livre VII (~7xx) le remet à
-        // sa place, après les Livres I à VI.
         let mut entries = vec![
             (
                 "L. 77-10-3",
@@ -171,9 +188,35 @@ mod tests {
     }
 
     #[test]
+    fn text_reading_order_prefers_source_positions() {
+        let mut entries = vec![
+            ("L. 77-10-3", Some("Livre VII"), None),
+            ("L. 111-1", Some("Livre Ier"), Some(2)),
+            ("L. 1", Some("Titre préliminaire"), Some(1)),
+        ];
+        sort_text_reading_order(&mut entries, |e| e.0, |e| e.1, |e| e.2);
+        assert_eq!(
+            entries.iter().map(|e| e.0).collect::<Vec<_>>(),
+            vec!["L. 1", "L. 111-1", "L. 77-10-3"]
+        );
+    }
+
+    #[test]
+    fn text_reading_order_falls_back_to_medians_without_positions() {
+        let mut entries = vec![
+            ("L. 77-10-3", Some("Partie législative > Livre VII"), None),
+            ("L. 111-1", Some("Partie législative > Livre Ier"), None),
+            ("L. 711-1", Some("Partie législative > Livre VII"), None),
+        ];
+        sort_text_reading_order(&mut entries, |e| e.0, |e| e.1, |e| e.2);
+        assert_eq!(
+            entries.iter().map(|e| e.0).collect::<Vec<_>>(),
+            vec!["L. 111-1", "L. 77-10-3", "L. 711-1"]
+        );
+    }
+
+    #[test]
     fn starred_prefixes_keep_their_part() {
-        // « R*. 011 » : le préfixe alphabétique est « R », l'étoile est ignorée
-        // par le rang — l'article reste dans la partie réglementaire.
         let (rank, _, _) = num_key_sort_key("R*. 011");
         assert_eq!(rank, 3);
     }

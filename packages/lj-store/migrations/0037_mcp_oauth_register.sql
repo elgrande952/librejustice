@@ -1,5 +1,5 @@
 -- Migration 0037 : adapte mcp_clients à RFC 7591 (Dynamic Client Registration)
--- ADR 0037 : OAuth 2.1 + DCR pour Claude.ai / ChatGPT custom connectors
+-- OAuth 2.1 + DCR pour Claude.ai / ChatGPT custom connectors
 
 -- Plusieurs redirect_uris par client (Claude.ai et ChatGPT en déclarent un seul,
 -- mais la spec RFC 7591 attend un tableau). On (re)crée la table proprement —

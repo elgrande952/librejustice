@@ -23,7 +23,6 @@ fn source_fields_drops_text_rebases_zones_keeps_rest() {
     let sections = vec![sec("expose", 0, 4), sec("dispositif", 4, 13)];
     let sf = build_source_fields(&payload, &sections);
     let obj = sf.as_object().expect("objet");
-    // text → full_text ; zones → sections rebasées.
     assert!(!obj.contains_key("text"));
     assert!(!obj.contains_key("zones"));
     assert_eq!(
@@ -33,7 +32,6 @@ fn source_fields_drops_text_rebases_zones_keeps_rest() {
             { "kind": "dispositif", "start": 4, "end": 13 },
         ])
     );
-    // reste verbatim.
     assert_eq!(obj.get("themes").unwrap(), &json!(["responsabilité"]));
     assert_eq!(obj.get("nac").unwrap(), &json!("12A"));
     assert!(obj.contains_key("visa"));
@@ -41,12 +39,10 @@ fn source_fields_drops_text_rebases_zones_keeps_rest() {
 
 #[test]
 fn from_source_fields_json_round_trips_sections() {
-    // Invariant chemin linéaire (#26, ADR 0085) : payload → build_source_fields
-    // → Decision::from_source_fields doit reproduire le parse direct
+    // Invariant chemin linéaire : payload → `build_source_fields` →
+    // `Decision::from_source_fields` doit reproduire le parse direct
     // (texte/sections/scalaires). Texte ASCII propre (clean_texte = identité) →
-    // offsets `zones` bruts == offsets `sections` nettoyés, ce qui isole la
-    // logique d'inversion `sections → zones` (la parité raw≠clean est couverte
-    // par l'oracle extract-fields-parity sur corpus, pas un test unitaire).
+    // offsets `zones` bruts == offsets `sections` nettoyés.
     let full_text = "alpha beta gamma";
     let payload = json!({
         "id": "CCASS_1",
@@ -66,7 +62,6 @@ fn from_source_fields_json_round_trips_sections() {
     assert_eq!(new.texte_integral_clean, orig.texte_integral_clean);
     assert_eq!(new.ecli, orig.ecli);
     assert_eq!(new.solution, orig.solution);
-    // Sections reproduites (visa synthétique comprise, reformée depuis `visa`).
     assert_eq!(new.sections, orig.sections);
     let kinds: Vec<&str> = new.sections.iter().map(|s| s.kind.as_str()).collect();
     assert!(kinds.contains(&"visa"));
@@ -76,10 +71,9 @@ fn from_source_fields_json_round_trips_sections() {
 
 #[test]
 fn from_source_fields_xml_round_trips_decision_scalars() {
-    // Invariant chemin linéaire XML (#26, ADR 0085) : XML → (full_text,
-    // source_fields) → Decision::from_source_fields reproduit les scalaires
-    // (entrée des extractors facettes) + le même texte nettoyé + les mêmes
-    // sections que le parse direct. `&amp;` exerce l'échappement source.
+    // Invariant chemin linéaire XML : XML → (full_text, source_fields) →
+    // `Decision::from_source_fields` reproduit les scalaires, le même texte nettoyé et
+    // les mêmes sections que le parse direct. `&amp;` exerce l'échappement source.
     let xml = r#"<Document>
 <Dossier>
 <Code_Juridiction>TA34</Code_Juridiction>
@@ -103,7 +97,6 @@ fn from_source_fields_xml_round_trips_decision_scalars() {
     let sf = build_source_fields_xml(xml);
     let new = Decision::from_source_fields(&orig.texte_integral_clean, &sf, "DTA_1");
 
-    // Scalaires (entrée des extractors facettes) identiques.
     assert_eq!(new.jurisdiction_source_code, orig.jurisdiction_source_code);
     assert_eq!(new.chamber, orig.chamber);
     assert_eq!(new.jurisdiction_name, orig.jurisdiction_name);
@@ -116,7 +109,6 @@ fn from_source_fields_xml_round_trips_decision_scalars() {
     assert_eq!(new.numero_role, orig.numero_role);
     assert_eq!(new.formation, orig.formation);
     assert_eq!(new.date_audience, orig.date_audience);
-    // Texte nettoyé stable (clean_texte idempotent) + sections identiques.
     assert_eq!(new.texte_integral_clean, orig.texte_integral_clean);
     assert_eq!(new.metadata_header, orig.metadata_header);
     assert_eq!(new.sections, orig.sections);
@@ -124,9 +116,8 @@ fn from_source_fields_xml_round_trips_decision_scalars() {
 
 #[test]
 fn from_source_fields_dispatches_on_source_fields_shape() {
-    // Discriminant ADR 0085 : `source_fields` XML porte `<Dossier>`/`<Audience>`
-    // (jamais présents en JSON Judilibre) → branche XML ; sinon JSON. Un mauvais
-    // branchement = corruption silencieuse, d'où ce test.
+    // Discriminant : `source_fields` XML porte `<Dossier>`/`<Audience>` (jamais
+    // présents en JSON Judilibre) → branche XML ; sinon JSON.
     let xml = r#"<Document>
 <Dossier>
 <Nom_Juridiction>Tribunal administratif de Lyon</Nom_Juridiction>
@@ -161,11 +152,9 @@ fn from_source_fields_dispatches_on_source_fields_shape() {
     );
     assert_eq!(json_new.sections, json_orig.sections);
 
-    // Familles scrapées (#37) : le préfixe du `source_uid` route AVANT la forme
-    // de `source_fields` (les colonnes HUDOC `appno`/`ecli` n'ont aucun
-    // discriminant XML/DILA → tomberaient sinon dans la branche JSON). Le préfixe
-    // `cedh/` route vers le parseur dédié — `jurisdiction_type = CEDH`, pas le repli
-    // JSON (`None`).
+    // Familles scrapées : le préfixe du `source_uid` route AVANT la forme de
+    // `source_fields` — les colonnes HUDOC `appno`/`ecli` n'ont aucun discriminant
+    // XML/DILA. Le préfixe `cedh/` route vers le parseur dédié.
     let cedh_columns = json!({ "appno": "1/20", "ecli": "ECLI:CE:ECHR:2026:X" });
     let cedh_body = "Considérant ce qui suit : motifs. PAR CES MOTIFS, la Cour décide.";
     let cedh_sf = build_source_fields(&cedh_columns, &[]);
@@ -176,8 +165,8 @@ fn from_source_fields_dispatches_on_source_fields_shape() {
 
 #[test]
 fn source_fields_excludes_synthetic_visa_section() {
-    // La section visa synthétique (SECTION_NO_OFFSET) n'indexe pas full_text
-    // → exclue ; reconstruite au rendu depuis source_fields["visa"].
+    // La section visa synthétique (SECTION_NO_OFFSET) n'indexe pas full_text →
+    // exclue ; reconstruite au rendu depuis source_fields["visa"].
     let payload = json!({ "text": "x", "visa": [{ "title": "T" }] });
     let sections = vec![
         sec("visa", SECTION_NO_OFFSET, SECTION_NO_OFFSET),
@@ -207,9 +196,8 @@ fn source_fields_no_sections_key_when_no_real_offsets() {
     assert!(!sf.as_object().unwrap().contains_key("sections"));
 }
 
-/// Reconstruit une section depuis le triplet stocké `{kind,start,end}` —
-/// son texte est la tranche de `full_text` (gate ADR 0085 : pas de texte de
-/// section stocké).
+/// Reconstruit une section depuis le triplet stocké `{kind,start,end}` — son texte
+/// est la tranche de `full_text`, aucun texte de section n'est stocké.
 fn section_from_stored(full_text: &str, v: &Value) -> DecisionSection {
     let start = v.get("start").and_then(Value::as_u64).unwrap() as usize;
     let end = v.get("end").and_then(Value::as_u64).unwrap() as usize;
@@ -222,11 +210,11 @@ fn section_from_stored(full_text: &str, v: &Value) -> DecisionSection {
     }
 }
 
-/// CERTIFICATION (ADR 0085) : sur les payloads JSON réels, l'entrée du
-/// chunker (`metadata_header` + `visa_trim` + `texte_integral_clean`)
-/// reconstruite depuis `(full_text, source_fields)` est **identique** à
-/// celle produite par le parse direct du payload. Gate par
-/// `LJ_VERIFY_PAYLOADS=<jsonl>` (inerte en CI). Un texte par ligne JSON.
+/// CERTIFICATION : sur les payloads JSON réels, l'entrée du chunker
+/// (`metadata_header` + `visa_trim` + `texte_integral_clean`) reconstruite depuis
+/// `(full_text, source_fields)` est **identique** à celle produite par le parse
+/// direct du payload. Gate par `LJ_VERIFY_PAYLOADS=<jsonl>`. Un texte par ligne
+/// JSON.
 #[test]
 fn chunker_input_reconstructible_from_full_text_and_source_fields() {
     let Ok(path) = std::env::var("LJ_VERIFY_PAYLOADS") else {
@@ -251,14 +239,13 @@ fn chunker_input_reconstructible_from_full_text_and_source_fields() {
         let full_text = &d.texte_integral_clean;
         let sf = build_source_fields(&payload, &d.sections);
 
-        // 1. metadata_header reconstruit depuis source_fields (mêmes clés
-        //    sources, text/zones n'y entrent pas).
+        // 1. metadata_header reconstruit depuis source_fields.
         if build_metadata_header(&sf) != d.metadata_header {
             mh_bad += 1;
         }
 
-        // 2. visa_trim reconstruit depuis les sections stockées (texte =
-        //    tranche de full_text).
+        // 2. visa_trim reconstruit depuis les sections stockées (texte = tranche de
+        //    full_text).
         let recon: Vec<DecisionSection> = sf
             .get("sections")
             .and_then(Value::as_array)
@@ -281,8 +268,8 @@ fn chunker_input_reconstructible_from_full_text_and_source_fields() {
             }
         }
 
-        // 3. invariant racine : section.text == char_slice(full_text, …)
-        //    pour expose/moyens (les seules lues par build_visa_trim).
+        // 3. invariant racine : section.text == char_slice(full_text, …) pour
+        //    expose/moyens.
         for s in d
             .sections
             .iter()
@@ -334,12 +321,10 @@ fn source_fields_xml_groups_dossier_audience_scalars() {
     );
     assert_eq!(dossier.get("Type_Recours").unwrap(), "Plein contentieux");
     assert_eq!(dossier.get("Solution").unwrap(), "Rejet");
-    // Identification est une feuille ici → captée comme scalaire.
     assert_eq!(dossier.get("Identification").unwrap(), "Sous-arbre");
     let audience = sf.get("Audience").and_then(Value::as_object).unwrap();
     assert_eq!(audience.get("Date_Audience").unwrap(), "2022-04-15");
     assert_eq!(audience.get("Formation_Jugement").unwrap(), "3e chambre");
-    // Le texte intégral ne fuit pas dans source_fields (→ full_text).
     assert!(sf.get("Decision").is_none());
 }
 
@@ -364,10 +349,10 @@ fn metadata_header_xml_reconstructs_from_source_fields() {
     assert!(direct.contains("CAA de Nantes | 2023-01-12"));
 }
 
-/// CERTIFICATION XML (ADR 0085) : pendant de la certif JSON pour les payloads
-/// opendata. Sur des XML réels (dossier `LJ_VERIFY_XML_DIR`, *.xml), l'entrée
-/// chunker reconstruite depuis `(full_text, source_fields_xml)` est identique
-/// au parse direct : `metadata_header` via `build_metadata_header_xml_from_fields`,
+/// CERTIFICATION XML : pendant de la certif JSON pour les payloads opendata. Sur
+/// des XML réels (dossier `LJ_VERIFY_XML_DIR`, *.xml), l'entrée chunker
+/// reconstruite depuis `(full_text, source_fields_xml)` est identique au parse
+/// direct : `metadata_header` via `build_metadata_header_xml_from_fields`,
 /// `visa_trim` via `extract_sections_xml(full_text)` (recalcul, pas de stockage).
 #[test]
 fn xml_chunker_input_reconstructible_from_full_text_and_source_fields() {
@@ -423,9 +408,8 @@ fn xml_chunker_input_reconstructible_from_full_text_and_source_fields() {
 
 #[test]
 fn xml_general_entity_refs_are_resolved_in_text() {
-    // quick-xml 0.40 emet `&amp;` / `&#160;` / `&#39;` comme events GeneralRef
-    // distincts ; le parser doit les resoudre comme lxml cote Python.
-    // Source reelle ORCA_24NT03363 : « SARL BONDIGUEL &amp; ASSOCIES ».
+    // quick-xml émet `&amp;` / `&#160;` / `&#39;` comme events GeneralRef distincts ;
+    // le parser doit les résoudre.
     let xml = b"<Document><Dossier>\
 <Nom_Juridiction>TA</Nom_Juridiction>\
 <Avocat_Requerant>SARL BONDIGUEL &amp; ASSOCIES</Avocat_Requerant>\
@@ -436,7 +420,6 @@ fn xml_general_entity_refs_are_resolved_in_text() {
         Some("SARL BONDIGUEL & ASSOCIES")
     );
 
-    // Refs numeriques : &#160; (NBSP) et &#39; (apostrophe) recolles au texte.
     let xml2 = b"<Document><Dossier>\
 <Nom_Juridiction>Conseil&#160;d&#39;Etat</Nom_Juridiction>\
 </Dossier></Document>";
@@ -452,7 +435,6 @@ fn vocab_known_and_fallback() {
         vocab::jurisdiction_label(Some("CC")).as_deref(),
         Some("Cour de cassation")
     );
-    // inconnu → renvoyé tel quel (pas .lower()).
     assert_eq!(
         vocab::jurisdiction_label(Some("XYZ")).as_deref(),
         Some("XYZ")
@@ -460,11 +442,9 @@ fn vocab_known_and_fallback() {
     assert_eq!(vocab::jurisdiction_label(None), None);
     assert_eq!(vocab::jurisdiction_label(Some("")), None);
 
-    // type inconnu → None (pas de fallback).
     assert_eq!(vocab::jurisdiction_type(Some("zzz")), None);
     assert_eq!(vocab::jurisdiction_type(Some("tj")).as_deref(), Some("TJ"));
 
-    // formation inconnue → upper().
     assert_eq!(
         vocab::formation_label(Some("fs")).as_deref(),
         Some("Formation de section")
@@ -564,13 +544,12 @@ fn parse_basic_identity_and_numbers() {
     let d = parse_judilibre(&payload, None);
 
     assert_eq!(d.source_uid, "judilibre/abc123");
-    assert_eq!(d.member_name, "abc123"); // member_name None → decision_id
+    assert_eq!(d.member_name, "abc123");
     assert_eq!(d.jurisdiction_source_code, None);
     assert_eq!(d.chamber.as_deref(), Some("soc"));
     assert_eq!(d.jurisdiction_name.as_deref(), Some("Cour de cassation"));
     assert_eq!(d.jurisdiction_type.as_deref(), Some("CC"));
     assert_eq!(d.jurisdiction_location.as_deref(), Some("cc"));
-    // dédoublonnage + trim, ordre préservé.
     assert_eq!(
         d.numero_dossiers.as_deref(),
         Some(&["22-18.339".to_string(), "21-10.000".to_string()][..])
@@ -582,7 +561,6 @@ fn parse_basic_identity_and_numbers() {
     assert_eq!(d.type_recours.as_deref(), Some("Arrêt"));
     assert_eq!(d.solution.as_deref(), Some("Cassation"));
     assert_eq!(d.publication_codes, vec!["b".to_string(), "r".to_string()]);
-    // champs XML-only nuls côté Judilibre.
     assert_eq!(d.numero_role, None);
     assert_eq!(d.date_audience, None);
     assert_eq!(d.type_decision, None);
@@ -612,7 +590,6 @@ fn parse_without_id_panics() {
 
 #[test]
 fn sections_from_zones_and_visa() {
-    // raw_text simple sans HTML : clean_texte ≈ identité (collapse espaces).
     let raw = "Exposé du litige ici. Les moyens du pourvoi sont exposés. Motifs de la Cour.";
     let payload = json!({
         "id": "z1",
@@ -629,7 +606,6 @@ fn sections_from_zones_and_visa() {
     });
     let d = parse_judilibre(&payload, None);
 
-    // visa présent en tête (pas de preamble → insertion_idx 0).
     assert_eq!(d.sections[0].kind, "visa");
     assert_eq!(d.sections[0].start_char, SECTION_NO_OFFSET);
     assert_eq!(
@@ -642,14 +618,12 @@ fn sections_from_zones_and_visa() {
     assert!(kinds.contains(&"moyens"));
     assert!(kinds.contains(&"motivations"));
 
-    // visa_trim = expose + moyens joints par \n\n.
     assert!(d.visa_trim.contains("Exposé du litige"));
     assert!(d.visa_trim.contains("moyens du pourvoi"));
 }
 
 #[test]
 fn dispositif_fallback_on_par_ces_motifs() {
-    // Pas de zone dispositif : fallback par marqueur « PAR CES MOTIFS ».
     let raw = "Exposé du litige détaillé ici. PAR CES MOTIFS, la Cour REJETTE le pourvoi.";
     let payload = json!({
         "id": "f1",
@@ -673,7 +647,6 @@ fn no_dispositif_fallback_when_zone_present() {
         "zones": { "dispositif": [{ "start": 7, "end": 30 }] },
     });
     let d = parse_judilibre(&payload, None);
-    // une seule section dispositif (celle de la zone), pas de doublon fallback.
     let count = d.sections.iter().filter(|s| s.kind == "dispositif").count();
     assert_eq!(count, 1);
 }
@@ -765,7 +738,6 @@ fn xml_broken_texte_integral_open_is_repaired() {
 
 #[test]
 fn xml_itertext_aggregates_nested_text() {
-    // <br/> imbriqué : itertext() doit recoller les morceaux.
     let xml = b"<Document><Dossier><Nom_Juridiction>Conseil <br/>d'Etat</Nom_Juridiction></Dossier></Document>";
     let d = parse_xml(xml, "DCE_1.xml", None);
     assert_eq!(d.jurisdiction_name.as_deref(), Some("Conseil d'Etat"));
@@ -776,9 +748,7 @@ fn xml_extract_sections_partitions_text() {
     let cleaned = "En-tete introductif.\n\nVu : les pieces.\n\nConsidérant ce qui suit : motifs.\n\nDECIDE :\n\nArticle 1.";
     let sections = extract_sections_xml(cleaned);
     let kinds: Vec<&str> = sections.iter().map(|s| s.kind.as_str()).collect();
-    // preamble (intro) puis visa, motivations, dispositif dans l'ordre.
     assert_eq!(kinds, vec!["preamble", "visa", "motivations", "dispositif"]);
     assert_eq!(sections[0].start_char, 0);
-    // offsets en codepoints : la dernière section finit au total de chars.
     assert_eq!(sections.last().unwrap().end_char, char_len(cleaned));
 }

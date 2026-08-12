@@ -1,21 +1,18 @@
-//! Parsing de l'état URL en `SearchRequest` (port de `loaders.ts` +
-//! `queries/search.ts`) et couche de fetch (leptos-fetch).
+//! Parsing de l'état URL en `SearchRequest` et couche de fetch (leptos-fetch).
 //!
 //! `MAX_PAGES = 10`, `SEARCH_LIMIT = 10`, `offset = (page - 1) * limit`.
-//! Les enums sont parsés en filtrant les valeurs invalides (parité
-//! `parseEnumAll`). Module privé de la tranche (rattaché via `#[path]`).
+//! Les enums sont parsés en filtrant les valeurs invalides. Module privé de la
+//! tranche (rattaché via `#[path]`).
 
 use leptos_router::params::ParamsMap;
 use lj_dtos::{
     Domain, JurisdictionType, Office, SearchMode, SearchRequest, Significance, Solution, SortOrder,
 };
 
-/// Cap de pagination (parité `MAX_PAGES`).
 pub const MAX_PAGES: u32 = 10;
-/// Taille de page (parité `SEARCH_LIMIT`).
 pub const SEARCH_LIMIT: u32 = 10;
 
-/// Clé de cache stable (parité `searchKeys.list`) : query + filtres + page. Sert
+/// Clé de cache stable : query + filtres + page. Sert
 /// de clé leptos-fetch ; deux navigations vers la même recherche partagent
 /// l'entrée.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -28,15 +25,15 @@ pub struct SearchKey {
     pub office: Vec<String>,
     /// Codes du référentiel `jurisdiction` (`tj76351`, `ca_paris`, …).
     pub jurisdiction_code: Vec<String>,
-    /// Chambres (catégorie contrôlée, suffixes `chamber:*`, ADR 0172).
+    /// Chambres (catégorie contrôlée, suffixes `chamber:*`).
     pub chamber: Vec<String>,
-    /// Domaines de référence (suffixes `legal_domain:*`, racines ou feuilles).
+    /// Domaines du référentiel de place (suffixes `legal_domain:*`, racines ou feuilles).
     pub legal_domain: Vec<String>,
     /// Solutions (suffixes `solution:*`).
     pub solution: Vec<String>,
     pub legal_instrument: Vec<String>,
     pub legal_article: Vec<String>,
-    /// Portées jurisprudentielles (suffixes `significance:*`, ADR 0167).
+    /// Portées jurisprudentielles (suffixes `significance:*`).
     pub significance: Vec<String>,
     /// Niveaux de publication (suffixes `publication:*`).
     pub publication: Vec<String>,
@@ -46,7 +43,6 @@ pub struct SearchKey {
     pub ai_mode: bool,
 }
 
-/// `true` si `YYYY-MM-DD` (parité `_isoDate`).
 fn is_iso_date(v: &str) -> bool {
     let b = v.as_bytes();
     v.len() == 10
@@ -65,7 +61,7 @@ fn get_all(map: &ParamsMap, key: &str) -> Vec<String> {
     map.get_all(key).unwrap_or_default()
 }
 
-/// Page 1-based, défaut 1, cap `MAX_PAGES` (parité loader).
+/// Page 1-based, défaut 1, cap `MAX_PAGES`.
 pub fn parse_page(map: &ParamsMap) -> u32 {
     let raw = map.get("page").and_then(|s| s.parse::<u32>().ok());
     match raw {
@@ -74,7 +70,6 @@ pub fn parse_page(map: &ParamsMap) -> u32 {
     }
 }
 
-/// Construit la clé de recherche depuis le query map.
 pub fn key_from_map(map: &ParamsMap) -> SearchKey {
     let date = |k: &str| map.get(k).filter(|v| is_iso_date(v));
     SearchKey {
@@ -96,11 +91,11 @@ pub fn key_from_map(map: &ParamsMap) -> SearchKey {
         date_from: date("dateFrom"),
         date_to: date("dateTo"),
         sort: parse_sort(map.get("sort").as_deref()),
-        ai_mode: super::ai_mode::is_ai_mode_param(map.get("aiMode").as_deref()),
+        ai_mode: super::ai_mode::ai_mode_from_param(map.get("aiMode").as_deref()),
     }
 }
 
-/// `relevance` | `date_desc` | `date_asc` (défaut `relevance`). Port de `parseSort`.
+/// `relevance` | `date_desc` | `date_asc` (défaut `relevance`).
 fn parse_sort(raw: Option<&str>) -> String {
     match raw {
         Some("date_desc") => "date_desc".to_string(),
@@ -129,8 +124,6 @@ fn non_empty(v: &[String]) -> Option<Vec<String>> {
     }
 }
 
-/// Construit le `SearchRequest` (limit/offset + filtres). Port de
-/// `searchQueryOptions`.
 pub fn request_from_key(key: &SearchKey) -> SearchRequest {
     let offset = (key.page - 1) * SEARCH_LIMIT;
     let sort = match key.sort.as_str() {

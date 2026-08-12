@@ -1,33 +1,22 @@
-//! Surlignage de snippets — port natif de `snippets.py`, **sans index inversé**.
+//! Surlignage de snippets, **sans index inversé**.
 //!
 //! On réplique 1-pour-1 le tokenizer ParadeDB (regex `[\p{L}\p{N}-]+` +
 //! ascii_folding + lowercase + stopwords FR optionnels) via le `TextAnalyzer` de
-//! tantivy (version EPINGLEE `=0.26.0`, le core exact wrappé par py-tantivy 0.26),
-//! puis on porte la sélection « best fragment » de tantivy (`search_fragments` +
-//! `select_best_fragment_combination` de `snippet/mod.rs`) sur des tokens
-//! **précalculés**. Aucun `Index`/`writer`/`commit`/segment : un index in-RAM
-//! squelette (bâti UNE fois pour le process, cf. [`ENGINE`]) sert seulement à
-//! construire le `QueryParser` (parsing de la requête comme tantivy le ferait) ;
-//! le `doc_freq` — pour le score `1/(1+df)` par terme
-//! — est compté à la main sur les mêmes tokens. On tokenise chaque doc UNE fois
-//! et on ne paie jamais la sérialisation d'un index inversé (poste dominant :
-//! ~12 ms de `commit` par appel, indépendant du volume — cf. docs/working-notes).
-//!
-//! Résiduel de parité connu (cosmétique) : quand le meilleur fragment est le
-//! TOUT PREMIER du texte, py-tantivy l'étend jusqu'à l'offset 0 (inclut les
-//! caractères non-tokens de tête, p.ex. `\n\n`) là où notre port démarre au
-//! premier token. Le contenu marqué est identique ; seul le bord gauche de la
-//! fenêtre differe — cf. docs/working-notes/2026-06-05_api-parity-rust-vs-python.md.
+//! tantivy (version EPINGLEE `=0.26.0`), puis on porte la sélection « best
+//! fragment » de tantivy (`search_fragments` + `select_best_fragment_combination`
+//! de `snippet/mod.rs`) sur des tokens **précalculés**. Aucun
+//! `Index`/`writer`/`commit`/segment : un index in-RAM squelette (bâti UNE fois
+//! pour le process, cf. [`ENGINE`]) sert seulement à construire le `QueryParser` ;
+//! le `doc_freq`, pour le score `1/(1+df)` par terme, est compté à la main sur les
+//! mêmes tokens.
 //!
 //! Le HTML `<mark>` est reconstruit à la main (ranges en octets UTF-8) pour ne
-//! PAS échapper les entités HTML — comme `_to_mark_html` côté Python : le
-//! consommateur React rend chaque fragment comme text node, donc un échappement
-//! façon `Snippet::to_html` (qui appelle `encode_minimal`) afficherait des
-//! entités littérales. L'XSS est géré par React.
+//! PAS échapper les entités HTML : le consommateur rend chaque fragment comme
+//! text node.
 //!
 //! Les configs ``SNIPPET_TOKENIZER`` sont la source de vérité ; elles doivent
 //! rester synchronisées avec le ``CREATE INDEX ... USING bm25`` de
-//! ``decisions_bm25`` (champs ``full_text`` + ``search_title``, ADR 0084).
+//! ``decisions_bm25`` (champs ``full_text`` + ``search_title``).
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -42,13 +31,13 @@ use tantivy::tokenizer::{
 };
 use tantivy::{Index, Score, Term};
 
-/// Budget de caractères par défaut d'un snippet (= `_DEFAULT_MAX_CHARS`).
+/// Budget de caractères par défaut d'un snippet.
 pub const DEFAULT_MAX_CHARS: usize = 500;
 
 /// Pattern du tokenizer ParadeDB répliqué (= `TokenizerConfig.pattern`).
 const TOKENIZER_PATTERN: &str = r"[\p{L}\p{N}-]+";
 
-/// Nom du tokenizer custom enregistré dans l'index (= `"t"` côté Python).
+/// Nom du tokenizer custom enregistré dans l'index.
 const TOKENIZER_NAME: &str = "t";
 
 /// Tokenizer ParadeDB répliqué : pattern Unicode `[\p{L}\p{N}-]+`,
@@ -65,19 +54,18 @@ pub struct TokenizerConfig {
 
 /// Tokenizer unique pour les snippets (full_text et titre). Stopwords FR pour que
 /// la sélection de fragment centre la fenêtre sur les termes content — pas « de ».
-/// Même esprit que l'index DB ``decisions_bm25`` (stopwords FR + ``["a", "à"]``,
-/// ADR 0084) ; seul écart : la liste custom ``["a", "à"]`` n'est pas portée ici
-/// (l'API `StopWordFilter` de tantivy ne prend que la langue) — acceptable : le
-/// snippet est un rendu visuel, pas un signal de ranking.
+/// Même esprit que l'index DB ``decisions_bm25`` ; seul écart : la liste custom
+/// ``["a", "à"]`` n'est pas portée ici, l'API `StopWordFilter` de tantivy ne
+/// prenant que la langue.
 pub const SNIPPET_TOKENIZER: TokenizerConfig = TokenizerConfig {
     ascii_folding: true,
     use_french_stopwords: true,
 };
 
-/// Construit le `TextAnalyzer` répliquant le tokenizer ParadeDB (= `_build_analyzer`).
+/// Construit le `TextAnalyzer` répliquant le tokenizer ParadeDB.
 ///
-/// Ordre des filtres calqué sur Python : regex → ascii_fold → lowercase →
-/// stopword. Tantivy applique les filtres dans l'ordre d'ajout.
+/// Ordre des filtres : regex → ascii_fold → lowercase → stopword. Tantivy
+/// applique les filtres dans l'ordre d'ajout.
 fn build_analyzer(cfg: TokenizerConfig) -> TextAnalyzer {
     let tokenizer =
         RegexTokenizer::new(TOKENIZER_PATTERN).expect("pattern regex tokenizer ParadeDB valide");
@@ -94,12 +82,10 @@ fn build_analyzer(cfg: TokenizerConfig) -> TextAnalyzer {
     builder.build()
 }
 
-/// Composants tantivy partagés, construits UNE fois pour tout le process. Évite
-/// de reconstruire par appel un index in-RAM squelette + un `QueryParser` + de
-/// recompiler la regex Unicode du tokenizer (~0,5 ms de coût fixe par appel,
-/// mesuré release sur 2 cœurs). `parse_query`/`token_stream` ne mutent rien de
-/// partagé : le parser se prête par `&`, l'analyzer se clone (clone d'`Arc` sur
-/// la regex compilée — bien moins cher que `RegexTokenizer::new`).
+/// Composants tantivy partagés, construits UNE fois pour tout le process : index
+/// in-RAM squelette, `QueryParser`, regex Unicode du tokenizer compilée.
+/// `parse_query`/`token_stream` ne mutent rien de partagé : le parser se prête par
+/// `&`, l'analyzer se clone (clone d'`Arc` sur la regex compilée).
 struct SnippetEngine {
     parser: QueryParser,
     /// Prototype à cloner par appel (le `token_stream` exige `&mut`).
@@ -118,10 +104,8 @@ static ENGINE: LazyLock<SnippetEngine> = LazyLock::new(|| {
             TextFieldIndexing::default()
                 .set_tokenizer(TOKENIZER_NAME)
                 // Positions nécessaires : `parse_query` REJETTE une phrase multi-mots
-                // (`"Nicolas Berkouk"`) si le champ n'indexe pas les positions →
-                // `highlight` retournerait `{}` (aucun `<mark>`). L'index est un
-                // squelette sans doc ; enregistrer les positions ne coûte rien et
-                // laisse le parser accepter les phrases (le vrai bm25 les indexe aussi).
+                // (`"Nicolas Berkouk"`) si le champ n'indexe pas les positions. L'index est un
+                // squelette sans doc.
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         ),
     );
@@ -139,12 +123,12 @@ static ENGINE: LazyLock<SnippetEngine> = LazyLock::new(|| {
     }
 });
 
-/// Reconstruit le HTML `<mark>` d'un fragment + ses ranges surlignés (= `_to_mark_html`).
+/// Reconstruit le HTML `<mark>` d'un fragment + ses ranges surlignés.
 ///
 /// `highlighted` est en **octets UTF-8** relatifs à `fragment` : on slice
 /// directement les bytes pour que les accents (``considère``, ``Île``…) ne
 /// décalent pas les marks. Pas d'échappement HTML : le fragment est rendu comme
-/// text node côté React. Les ranges sont disjoints (un token = un mark), donc un
+/// text node côté client. Les ranges sont disjoints (un token = un mark), donc un
 /// simple tri suffit — pas de fusion d'intervalles.
 fn to_mark_html(fragment: &str, highlighted: &[Range<usize>]) -> String {
     let mut ranges: Vec<(usize, usize)> = highlighted.iter().map(|r| (r.start, r.end)).collect();
@@ -174,8 +158,6 @@ pub fn highlight(docs: &[(i64, String)], query: &str, max_chars: usize) -> HashM
         return HashMap::new();
     }
 
-    // Parser partagé (cf. [`ENGINE`]) : on parse la requête comme tantivy le
-    // ferait, sans reconstruire d'index ni recompiler le tokenizer par appel.
     let parsed = match ENGINE.parser.parse_query(query) {
         Ok(q) => q,
         // Query invalide pour le tokenizer (ex. uniquement des stopwords).
@@ -190,9 +172,8 @@ pub fn highlight(docs: &[(i64, String)], query: &str, max_chars: usize) -> HashM
         }
     });
 
-    // UNE tokenisation par doc, conservée : elle sert au comptage du `doc_freq`
-    // PUIS à la sélection de fragment (le tokenizer regex est le poste dominant —
-    // on évite la double passe). Clone du prototype partagé (cheap vs recompile).
+    // UNE tokenisation par doc, conservée : elle sert au comptage du `doc_freq` PUIS
+    // à la sélection de fragment. Clone du prototype partagé.
     let mut analyzer = ENGINE.analyzer.clone();
     let doc_tokens: Vec<Vec<Token>> = docs
         .iter()
@@ -207,8 +188,8 @@ pub fn highlight(docs: &[(i64, String)], query: &str, max_chars: usize) -> HashM
         .collect();
 
     // `doc_freq` maison → score `1/(1+df)` par terme (formule exacte de
-    // `SnippetGenerator::create`). Le tokenizer ayant déjà lowercasé/foldé, le
-    // texte des tokens est directement comparable au `term_str` de la requête.
+    // `SnippetGenerator::create`). Le tokenizer ayant déjà lowercasé/foldé, le texte
+    // des tokens est directement comparable au `term_str` de la requête.
     let mut terms_text: BTreeMap<String, Score> = BTreeMap::new();
     for term in query_terms {
         let term_value = term.value();
@@ -227,8 +208,8 @@ pub fn highlight(docs: &[(i64, String)], query: &str, max_chars: usize) -> HashM
         return HashMap::new();
     }
 
-    // Sélection best-fragment sur les tokens précalculés. Un doc sans match (aucun
-    // fragment) est absent du retour → l'appelant fallback sur le texte brut.
+    // Sélection best-fragment sur les tokens précalculés. Un doc sans match est
+    // absent du retour : l'appelant fallback sur le texte brut.
     let mut out = HashMap::new();
     for ((doc_id, text), tokens) in docs.iter().zip(&doc_tokens) {
         let fragments = search_fragments(tokens, &terms_text, max_chars);
@@ -348,9 +329,6 @@ mod tests {
 
     #[test]
     fn multi_word_phrase_query_highlights_each_term() {
-        // Régression : une phrase entre guillemets de ≥2 mots (`"Nicolas Berkouk"`)
-        // doit surligner ses termes. Avec un champ sans positions, `parse_query`
-        // rejetait la phrase → `{}` → aucun `<mark>` (bug prod 2026-07-09).
         let docs = vec![(1i64, "La cour considère le moyen sérieux".to_string())];
         let out = highlight(&docs, "\"considère sérieux\"", DEFAULT_MAX_CHARS);
         let html = out.get(&1).expect("phrase multi-mots doit surligner");
@@ -369,13 +347,9 @@ mod tests {
         );
     }
 
-    // Parité snippets tantivy ↔ oracle Python (apps/api snippets.py `highlight`).
-    // GT figée dans tests/fixtures/oracle/snippets.json : sélection best-fragment,
-    // fenêtrage, `<mark>` non échappé, folding d'accents, tokens composés, absence
-    // sur non-match, query stopword-only → {}, multi-doc. Les cas sont conçus avec
-    // le match HORS offset 0 pour éviter le résiduel cosmétique « premier
-    // fragment » documenté (bord gauche de fenêtre). Verrouille le rendu HTML
-    // byte-à-byte sans Postgres ni scan BM25.
+    // Snippets tantivy. GT figée dans tests/fixtures/oracle/snippets.json :
+    // sélection best-fragment, fenêtrage, `<mark>` non échappé, folding d'accents,
+    // tokens composés, absence sur non-match, query stopword-only → {}, multi-doc.
     #[derive(serde::Deserialize)]
     struct SnippetCase {
         name: String,

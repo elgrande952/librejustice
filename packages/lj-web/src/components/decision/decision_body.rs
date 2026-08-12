@@ -1,5 +1,5 @@
 //! Corps structuré de la décision (sections + paragraphes) + toolbar flottante
-//! de sélection de texte. Port de `decision-body.tsx`.
+//! de sélection de texte.
 //!
 //! La géométrie de la sélection (`window.getSelection`, `Range`, `DomRect`),
 //! non exposée par les features web-sys du crate, passe par le shim JS
@@ -35,7 +35,7 @@ pub fn DecisionBody(detail: DecisionDetail, sections: Vec<RenderSection>) -> imp
 
     let references = StoredValue::new(build_decision_references(&detail));
     // Date de lecture propagée aux hover cards d'articles : elles servent la
-    // version en vigueur à la date de la décision (ADR 0168).
+    // version en vigueur à la date de la décision.
     let at_date = detail.date_lecture.clone();
     let article_ref = NodeRef::<leptos::html::Article>::new();
     let selection_state: RwSignal<Option<SelState>> = RwSignal::new(None);
@@ -57,7 +57,7 @@ pub fn DecisionBody(detail: DecisionDetail, sections: Vec<RenderSection>) -> imp
 
         // L'observateur et son `Closure` tiennent des handles JS (pas `Send`) :
         // gardés dans des slots `LocalStorage`, l'observateur précédent est
-        // déconnecté à chaque passage (port du cleanup des 3 listeners).
+        // déconnecté à chaque passage.
         let disconnect_slot: StoredValue<Option<JsValue>, leptos::reactive::owner::LocalStorage> =
             StoredValue::new_local(None);
         let closure_slot: StoredValue<
@@ -73,8 +73,7 @@ pub fn DecisionBody(detail: DecisionDetail, sections: Vec<RenderSection>) -> imp
             let Some(node) = article_ref.get() else {
                 return;
             };
-            // Normalisation côté Rust (l'oracle normalise avant d'agir) :
-            // texte vide après normalisation → None.
+            // Normalisation côté Rust : texte vide après normalisation → None.
             let closure = Closure::new(move |text: JsValue, top: f64, left: f64| {
                 let next = text.as_string().and_then(|raw| {
                     let text = normalize_selection_text(&raw);
@@ -101,7 +100,7 @@ pub fn DecisionBody(detail: DecisionDetail, sections: Vec<RenderSection>) -> imp
             // Cible d'ancre : `scroll-mt-20` (scroll-margin-top 80px) décale
             // l'atterrissage du jump natif #hash sous la top-bar sticky.
             // Chaque paragraphe est rendu avec ses citations cliquables (overlay
-            // composé server-side, ADR 0134) ; spans vides ⇒ texte brut.
+            // composé server-side) ; spans vides ⇒ texte brut.
             let at_date = at_date.clone();
             let paragraphs_view = paragraphs
                 .into_iter()
@@ -231,7 +230,7 @@ fn ToolbarButton(
     }
 }
 
-/// Vide la sélection courante (port de `removeAllRanges`).
+/// Vide la sélection courante.
 #[cfg(feature = "hydrate")]
 fn clear_selection() {
     use wasm_bindgen::prelude::*;

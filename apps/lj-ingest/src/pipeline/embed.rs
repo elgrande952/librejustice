@@ -16,14 +16,13 @@ use crate::config::Settings;
 
 use super::{PreparedDecision, WriteMode};
 
-/// Construit l'embedder documentaire selon `settings.embed_backend` (port de
-/// `cli._build_embedder`). `none` doit être filtré par l'appelant (le pipeline
-/// n'instancie pas d'embedder dans ce cas).
+/// Construit l'embedder documentaire selon `settings.embed_backend`. `none` doit
+/// être filtré par l'appelant : le pipeline n'instancie pas d'embedder dans ce
+/// cas.
 ///
 /// `auto` sonde vLLM (`embed_url`) : joignable → `openai-http` (GPU local,
-/// gratuit) ; sinon repli sur Cloudflare Workers AI (avec cap neurons). Le cap
-/// `ingest_neuron_budget` s'applique sur tout chemin Cloudflare (explicite ou
-/// repli `auto`).
+/// gratuit) ; sinon repli sur Cloudflare Workers AI. Le cap
+/// `ingest_neuron_budget` s'applique sur tout chemin Cloudflare.
 pub(super) async fn build_embedder(settings: &Settings) -> Result<AnyEmbedder> {
     match settings.embed_backend.as_str() {
         "none" => Err(anyhow!(
@@ -32,18 +31,7 @@ pub(super) async fn build_embedder(settings: &Settings) -> Result<AnyEmbedder> {
         "dummy" => Ok(AnyEmbedder::Dummy(DummyEmbedder::default())),
         "openai-http" => Ok(build_openai_http(settings)),
         "cloudflare" => build_cloudflare(settings),
-        "auto" => {
-            if probe_vllm(settings).await {
-                tracing::info!(url = %settings.embed_url, "backend=auto : vLLM joignable → openai-http");
-                Ok(build_openai_http(settings))
-            } else {
-                tracing::warn!(
-                    url = %settings.embed_url,
-                    "backend=auto : vLLM injoignable → repli Cloudflare Workers AI"
-                );
-                build_cloudflare(settings)
-            }
-        }
+        "auto" => build_auto(settings).await,
         other => Err(anyhow!(
             "backend inconnu : {other:?}. Choix : none | dummy | openai-http | cloudflare | auto"
         )),
@@ -51,11 +39,8 @@ pub(super) async fn build_embedder(settings: &Settings) -> Result<AnyEmbedder> {
 }
 
 /// Embedder « par défaut » des sources qui embeddent à l'ingest : `None` si
-/// `embed_backend == "none"` (ingest sans vecteurs, explicite), sinon construit
-/// l'embedder du backend configuré (`auto` → vLLM/Cloudflare). Les nouvelles
-/// sources (DILA, CEDH, CJUE, ArianeWeb, CNDA) l'utilisent → embeddings par
-/// défaut, sans flag (un chunk sans embedding est inutile à la recherche
-/// vectorielle). Renvoie `(embedder, require_embeddings)`.
+/// `embed_backend == "none"`, sinon l'embedder du backend configuré (`auto` →
+/// vLLM/Cloudflare). Renvoie `(embedder, require_embeddings)`.
 pub(super) async fn build_embedder_opt(settings: &Settings) -> Result<(Option<AnyEmbedder>, bool)> {
     if settings.embed_backend == "none" {
         return Ok((None, false));
@@ -64,10 +49,9 @@ pub(super) async fn build_embedder_opt(settings: &Settings) -> Result<(Option<An
 }
 
 /// Embedder vLLM **strict**, jamais de repli Cloudflare : pour les ops de
-/// maintenance (re-embed ciblé #39) qui ne doivent JAMAIS basculer sur un backend
-/// payant (règle projet : embeddings via vLLM local uniquement). Probe vLLM et
-/// erreur franche s'il est injoignable (contrairement à `backend=auto` qui
-/// retombe sur Cloudflare). `dummy` accepté (tests) ; `cloudflare` refusé.
+/// maintenance qui ne doivent jamais basculer sur un backend payant. Probe vLLM et
+/// erreur franche s'il est injoignable. `dummy` accepté (tests) ; `cloudflare`
+/// refusé.
 pub(super) async fn build_vllm_strict(settings: &Settings) -> Result<AnyEmbedder> {
     match settings.embed_backend.as_str() {
         "dummy" => Ok(AnyEmbedder::Dummy(DummyEmbedder::default())),
@@ -96,6 +80,47 @@ fn build_openai_http(settings: &Settings) -> AnyEmbedder {
     ))
 }
 
+/// Backend `auto` : disjoncteur vLLM ↔ Cloudflare, pas une sonde unique au
+/// démarrage.
+///
+/// [`AnyEmbedder::Auto`] latch `degraded` au premier échec vLLM, sert la requête
+/// par Cloudflare, puis fait courir les deux backends jusqu'à ce que vLLM regagne
+/// — ré-armement automatique. Le cap neurons de `Settings` s'applique au volet
+/// Cloudflare.
+///
+/// Sans identifiants Cloudflare il n'y a pas de repli possible : on garde vLLM
+/// seul plutôt que d'échouer au démarrage.
+async fn build_auto(settings: &Settings) -> Result<AnyEmbedder> {
+    let (Some(account_id), Some(token)) = (
+        settings.cloudflare_account_id.clone(),
+        settings.cloudflare_backend_token.clone(),
+    ) else {
+        tracing::warn!(
+            url = %settings.embed_url,
+            "backend=auto sans identifiants Cloudflare : vLLM seul, aucun repli"
+        );
+        return Ok(build_openai_http(settings));
+    };
+    tracing::info!(
+        url = %settings.embed_url,
+        "backend=auto : disjoncteur vLLM ↔ Cloudflare armé"
+    );
+    Ok(AnyEmbedder::Auto {
+        vllm: OpenAIHttpEmbedder::new(
+            settings.embed_url.clone(),
+            settings.embed_api_key.clone(),
+            String::new(),
+        ),
+        cloudflare: CloudflareWorkersAIEmbedder::new(
+            account_id,
+            token,
+            CloudflareWorkersAIEmbedder::DEFAULT_MODEL,
+        )
+        .with_neuron_budget(settings.ingest_neuron_budget),
+        degraded: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
 /// Embedder Cloudflare Workers AI, avec cap neurons issu de `Settings`.
 fn build_cloudflare(settings: &Settings) -> Result<AnyEmbedder> {
     let account_id = settings
@@ -117,8 +142,8 @@ fn build_cloudflare(settings: &Settings) -> Result<AnyEmbedder> {
 
 /// Sonde la disponibilité de vLLM : GET `…/v1/models` (dérivé de `embed_url`),
 /// timeout court. Un 2xx ⇒ backend local utilisable. Toute erreur (réseau,
-/// timeout, statut non-2xx) ⇒ `false` (repli). N'embarque aucun retry : le repli
-/// Cloudflare est la stratégie de robustesse, pas une re-tentative locale.
+/// timeout, statut non-2xx) ⇒ `false`. Aucun retry : le repli Cloudflare est la
+/// stratégie de robustesse.
 async fn probe_vllm(settings: &Settings) -> bool {
     let base = settings
         .embed_url
@@ -133,9 +158,14 @@ async fn probe_vllm(settings: &Settings) -> bool {
     matches!(req.send().await, Ok(resp) if resp.status().is_success())
 }
 
-/// Construit le `BulkDecisionWrite` à partir d'un préparé + embeddings optionnels
-/// (port de `_to_bulk_write`).
-fn to_bulk_write(
+/// Décision embarquée : préparée + vecteurs de ses chunks (`None` sans
+/// embedder). Forme intermédiaire entre l'embed et l'extraction.
+pub(super) type EmbeddedDecision = (PreparedDecision, Option<Vec<Vec<f32>>>);
+
+/// Construit le `BulkDecisionWrite` à partir d'un préparé + embeddings
+/// optionnels. Appelé après [`super::prepare::extract_write`] :
+/// `prepared.extracted` est rempli à ce stade.
+pub(super) fn to_bulk_write(
     prepared: PreparedDecision,
     embeddings: Option<Vec<Vec<f32>>>,
 ) -> BulkDecisionWrite {
@@ -161,8 +191,8 @@ fn to_bulk_write(
         })
         .collect();
 
-    // `canonical_ref` (ADR 0100) calculé à l'ingest, passé à l'upsert : lj-store
-    // ne tire plus l'extracteur (ADR 0123 §3).
+    // `canonical_ref` calculé à l'ingest, passé à l'upsert : lj-store ne tire plus
+    // l'extracteur.
     let canonical_ref = lj_ingest::extract::canonical_ref(&prepared.decision);
 
     BulkDecisionWrite {
@@ -188,7 +218,7 @@ fn to_bulk_write(
 const QWEN_TOKENIZER_JSON: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/qwen3_embedding_tokenizer.json"));
 
-/// Tokenizer partagé, chargé une fois (port de `get_tokenizer`, `@lru_cache`).
+/// Tokenizer partagé, chargé une fois.
 /// Mode BPE exact : budget en tokens réels → `embedding_text` garanti ≤ `k`.
 pub(super) fn get_tokenizer() -> &'static Tokenizer {
     static TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
@@ -197,7 +227,7 @@ pub(super) fn get_tokenizer() -> &'static Tokenizer {
     })
 }
 
-/// Re-chunke un batch en mode BPE exact (port de `_rechunk_bpe`).
+/// Re-chunke un batch en mode BPE exact.
 ///
 /// Appelé quand l'embedder rejette un chunk trop long (sous-estimation du mode
 /// char). Le tokenizer Qwen donne le budget token exact → `embedding_text`
@@ -230,17 +260,18 @@ fn rechunk_bpe(
     Ok(out)
 }
 
-/// Embed les chunks d'un batch préparé (port de `_embed_writes`).
+/// Embed les chunks d'un batch préparé.
 ///
 /// Aplatit tous les textes de chunk, appelle `embed_passages`, redécoupe par
-/// décision. Sans embedder → tous les embeddings à `None`.
-pub(super) async fn embed_writes<E: Embedder>(
+/// décision. Sans embedder → tous les embeddings à `None`. L'assemblage en
+/// `BulkDecisionWrite` n'arrive qu'après l'extraction ([`to_bulk_write`]).
+pub(super) async fn embed_prepared<E: Embedder>(
     embedder: Option<&E>,
     writes: Vec<PreparedDecision>,
     chunk_tokens: usize,
-) -> Result<Vec<BulkDecisionWrite>> {
+) -> Result<Vec<EmbeddedDecision>> {
     let Some(embedder) = embedder else {
-        return Ok(writes.into_iter().map(|w| to_bulk_write(w, None)).collect());
+        return Ok(writes.into_iter().map(|w| (w, None)).collect());
     };
 
     let mut writes = writes;
@@ -249,14 +280,13 @@ pub(super) async fn embed_writes<E: Embedder>(
         .flat_map(|w| w.chunks.iter().map(|c| c.embedding_text()))
         .collect();
     if flat_texts.is_empty() {
-        return Ok(writes.into_iter().map(|w| to_bulk_write(w, None)).collect());
+        return Ok(writes.into_iter().map(|w| (w, None)).collect());
     }
 
     // Le chunk nominal est en mode char (heuristique chars/token) : il peut
     // sous-estimer sur un texte dense et produire un chunk > 8192 tokens, que
     // l'embedder rejette. On re-chunke alors le batch en BPE exact (budget token
-    // réel, plus d'overflow) et on ré-essaie une fois (port de `_embed_writes` +
-    // `_rechunk_bpe`, Python ; tokenisation exacte offline, ADR 0010).
+    // réel) et on ré-essaie une fois.
     let vecs = match embedder.embed_passages(&flat_texts).await {
         Ok(v) => v,
         Err(EmbedError::InputTooLong) => {
@@ -286,7 +316,7 @@ pub(super) async fn embed_writes<E: Embedder>(
             embeds.push(vecs.row(offset + i).to_vec());
         }
         offset += count;
-        out.push(to_bulk_write(write, Some(embeds)));
+        out.push((write, Some(embeds)));
     }
     Ok(out)
 }
@@ -296,9 +326,8 @@ mod tests {
     use super::*;
     use crate::chunking::{DEFAULT_CHUNK_TOKENS, DEFAULT_OVERLAP_MAX, DEFAULT_OVERLAP_MIN};
 
-    /// Spec : en mode BPE exact, `embedding_text` d'aucun chunk ne dépasse le
-    /// budget token K. Invariant qui rend correct le re-chunk de secours
-    /// (`rechunk_bpe`) déclenché sur overflow embedder.
+    /// En mode BPE exact, `embedding_text` d'aucun chunk ne dépasse le budget
+    /// token K — invariant qui rend correct le re-chunk de secours (`rechunk_bpe`).
     #[test]
     fn bpe_rechunk_keeps_embedding_text_within_budget() {
         let tok = get_tokenizer();

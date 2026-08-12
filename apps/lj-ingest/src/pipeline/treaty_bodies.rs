@@ -1,22 +1,20 @@
 //! Corps des fiches JORF sans articles (`TRAITE`, `AVIS`, `DECISION`,
 //! `ACCORD_FONCTION_PUBLIQUE`) et accords interprofessionnels (`TI`, KALI)
-//! depuis les blocs sans numéro des stocks bulk locaux (ADR 0223).
+//! depuis les blocs sans numéro des stocks bulk locaux.
 //!
 //! Cibles : fiches sans `legal_article` ni corps réel (`empty_legal_text_uids`).
 //! Le contenu est déjà sur le disque (stocks `Freemium_*_global` du cache) : la
 //! passe streame les stocks, assemble chaque texte dans l'ordre du document et
-//! pose `legal_text.body`. UPDATE ciblé, jamais de création (même contrat que
-//! la passe circulaires, ADR 0222).
+//! pose `legal_text.body`. UPDATE ciblé, jamais de création.
 //!
 //! - **JORF** : ordre = `STRUCT/LIEN_ART` du `texte/struct` (les ids `JORFARTI`
 //!   ne suivent pas l'ordre de lecture) ; blocs = `BLOC_TEXTUEL` des articles
 //!   du cid. Les labels (« Art. 1er. - », « A N N E X E I ») vivent dans le
 //!   texte même. Un texte à STRUCT vide est pré-numérisation (contenu en
-//!   fac-similé JO seulement) : compté `no_content`, track différé (ADR 0223 §4).
+//!   fac-similé JO seulement) : compté `no_content`.
 //! - **KALI** : ordre = `LIEN_TXT` du conteneur (texte de base puis attachés)
-//!   puis id `KALIARTI` croissant — l'ordre exact vivrait dans les `KALISCTA`,
-//!   une indirection de plus pour un gain nul (les ids d'un même texte suivent
-//!   le document). Le titre de section (`TM`) est préposé à chaque changement :
+//!   puis id `KALIARTI` croissant — les ids d'un même texte suivent le
+//!   document. Le titre de section (`TM`) est préposé à chaque changement :
 //!   c'est le seul endroit où vit le libellé (« Préambule », « Chapitre Ier »…).
 
 use std::collections::{HashMap, HashSet};
@@ -49,9 +47,8 @@ pub async fn backfill_treaty_bodies() -> Result<()> {
     let repo = DecisionRepository::new(&conn);
 
     // TRAITE + les natures JORF dont le corps vit dans un article
-    // `TYPE=AUTONOME` sans `NUM` que l'ingest saute (audit fiches nues du
-    // 2026-07-19 : AVIS, DECISION, ACCORD_FONCTION_PUBLIQUE — 47 fiches,
-    // toutes `JORFTEXT*`). Même assemblage : le parseur JORF rend tous les
+    // `TYPE=AUTONOME` sans `NUM` que l'ingest saute (AVIS, DECISION,
+    // ACCORD_FONCTION_PUBLIQUE). Même assemblage : le parseur JORF rend tous les
     // blocs, numérotés ou non.
     let mut jorf_targets: HashSet<String> = HashSet::new();
     for nature in ["TRAITE", "AVIS", "DECISION", "ACCORD_FONCTION_PUBLIQUE"] {
@@ -351,9 +348,6 @@ fn assemble_ti(blocks: &[TiBlock]) -> String {
 mod tests {
     use super::*;
 
-    // Spec ADR 0223 : l'ordre du corps est celui du struct, pas celui des ids
-    // (les JORFARTI ne suivent pas l'ordre de lecture) ; les blocs hors struct
-    // suivent, par id croissant.
     #[test]
     fn assemble_follows_struct_order_then_leftover_ids() {
         let order = vec![
@@ -382,9 +376,6 @@ mod tests {
         assert_eq!(assemble_ordered(None, &blocks), "a\n\nb");
     }
 
-    // Spec ADR 0223 : le titre de section KALI est préposé une fois par
-    // section (c'est le seul endroit où vit le libellé), l'ordre est
-    // (rang du texte au sommaire, id d'article).
     #[test]
     fn assemble_ti_prepends_section_titles_once() {
         let blocks = vec![

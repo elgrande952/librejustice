@@ -1,4 +1,4 @@
-//! Erreurs des libs pures (thiserror). Pas de `unwrap()` en chemin non-test.
+//! Erreurs des libs pures (thiserror).
 
 use thiserror::Error;
 

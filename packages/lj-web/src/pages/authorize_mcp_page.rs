@@ -1,4 +1,4 @@
-//! Page `/authorize-mcp` — port de `authorize-mcp-page.tsx`.
+//! Page `/authorize-mcp`.
 //!
 //! Callback OAuth client-only : ecran de consentement qui echange une session
 //! Supabase contre un code d'autorisation aupres de `/oauth/approve`, puis
@@ -18,6 +18,24 @@ pub fn AuthorizeMcpPage() -> impl IntoView {
     // est lu dans la vue (affichage du consentement) ; les trois autres ne sont
     // lus/ecrits que dans les chemins hydrate (Effect + on_approve/on_deny).
     let client_id = RwSignal::new(String::new());
+
+    // Lien de secours du rendu SSR : `/connexion?next=<url courante>`, calculé
+    // sans JS. La page est un maillon d'un flux OAuth externe — si le bundle ne
+    // charge pas, l'utilisateur garde un chemin praticable.
+    let login_href = {
+        let location = leptos_router::hooks::use_location();
+        let path = location.pathname.get_untracked();
+        let search = location.search.get_untracked();
+        let self_url = if search.is_empty() {
+            path
+        } else {
+            format!("{path}?{search}")
+        };
+        format!(
+            "/connexion?next={}",
+            leptos_router::location::Url::escape(&self_url)
+        )
+    };
     #[cfg(feature = "hydrate")]
     let redirect_uri = RwSignal::new(String::new());
     #[cfg(feature = "hydrate")]
@@ -129,21 +147,25 @@ pub fn AuthorizeMcpPage() -> impl IntoView {
         <Meta name="robots" content="noindex" />
         <Show
             when=move || has_session.get()
-            fallback=|| {
+            fallback=move || {
+                let login_href = login_href.clone();
                 view! {
-                    <div
-                        aria-hidden="true"
-                        class="mx-auto flex max-w-sm flex-col gap-8 px-4 py-16"
-                    >
-                        <div class="flex flex-col gap-2">
-                            <div class="h-7 w-2/3 animate-pulse rounded-sm bg-[var(--color-vellum)]"></div>
-                            <div class="h-4 w-full animate-pulse rounded-sm bg-[var(--color-vellum)]"></div>
-                        </div>
-                        <div class="h-24 w-full animate-pulse rounded-md bg-[var(--color-vellum)]"></div>
-                        <div class="flex flex-col gap-3">
-                            <div class="h-11 w-full animate-pulse rounded-md bg-[var(--color-vellum)]"></div>
-                            <div class="h-11 w-full animate-pulse rounded-md bg-[var(--color-vellum)]"></div>
-                        </div>
+                    <div class="mx-auto flex max-w-sm flex-col gap-6 px-4 py-16">
+                        <h1 class="font-sans text-2xl text-[var(--color-ink)]">
+                            "Autoriser l'accès MCP"
+                        </h1>
+                        <p class="text-sm text-[var(--color-ink-muted)]">
+                            "Une application demande l'accès en lecture à LibreJustice en votre nom. Vérification de votre session…"
+                        </p>
+                        <a
+                            href=login_href
+                            class="rounded-md border border-[var(--color-rule)] px-4 py-2.5 text-center text-sm text-[var(--color-ink-muted)] transition-colors hover:text-[var(--color-ink)]"
+                        >
+                            "Se connecter pour continuer"
+                        </a>
+                        <p class="text-xs text-[var(--color-ink-subtle)]">
+                            "Si cet écran ne change pas, votre navigateur n'a pas pu charger l'application. Rechargez la page en forçant le rafraîchissement : Ctrl+Maj+R, ou Cmd+Maj+R sur Mac."
+                        </p>
                     </div>
                 }
             }
@@ -197,10 +219,10 @@ pub fn AuthorizeMcpPage() -> impl IntoView {
     }
 }
 
-/// Base des endpoints montes a la racine (`/oauth/*`). Port de `rootBaseUrl()`.
+/// Base des endpoints montes a la racine (`/oauth/*`).
 /// Cote client = origine courante (chaine vide -> chemins relatifs same-origin).
 /// La page ne fetch QUE cote client (consentement OAuth), donc seule la branche
-/// `hydrate` existe — pas de branche SSR morte (regle « pas de code defensif »).
+/// `hydrate` existe.
 #[cfg(feature = "hydrate")]
 fn root_base_url() -> String {
     String::new()

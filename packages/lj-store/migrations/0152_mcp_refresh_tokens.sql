@@ -1,4 +1,4 @@
--- Migration 0152 : refresh tokens OAuth pour l'accès MCP (rotation, ADR 0235)
+-- Migration 0152 : refresh tokens OAuth pour l'accès MCP (rotation)
 -- Les access tokens (mcp_tokens, 0010) durent 30 j ; sans refresh token, la
 -- connexion ChatGPT / Claude meurt en silence à expiration et exige un
 -- re-consentement manuel. On ajoute des refresh tokens (90 j) rotés à chaque

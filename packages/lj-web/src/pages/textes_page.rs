@@ -1,24 +1,32 @@
-//! Page de recherche de textes `/textes` (lois et règlements, ADR 0114) —
-//! page distincte de `/decisions` : le corpus articles est servi par un moteur
-//! BM25 seul, avec ses propres filtres ; aucune recherche transverse.
+//! Page de recherche de textes `/textes` (lois et règlements) — page distincte
+//! de `/decisions` : le corpus articles est servi par un moteur BM25 seul, avec
+//! ses propres filtres ; aucune recherche transverse.
 //!
-//! Rendue côté client comme `/decisions` (ADR 0063) : route non indexée,
-//! mêmes îlots interactifs (barre, dropdowns). `<Title>` dynamique reflétant
-//! la requête `q` de l'URL ; hérite de la description racine.
+//! Rendue côté client comme `/decisions` : route non indexée, mêmes îlots
+//! interactifs (barre, dropdowns). `<Title>` dynamique reflétant la requête `q`
+//! de l'URL ; hérite de la description racine.
 
 use leptos::prelude::*;
 use leptos_meta::Title;
 use leptos_router::hooks::use_query_map;
 
 use crate::components::client_only::ClientOnly;
+use crate::components::layout::{CONTENT_COL, GRID_3COL, SHELL};
 use crate::components::search::compact_search::DraftQuery;
 use crate::components::search::TextesView;
 
 #[component]
 pub fn TextesPage() -> impl IntoView {
     let query_map = use_query_map();
+    // `leptos_meta` garde cette clôture dans un contexte de durée de vie
+    // applicative et la réévalue APRÈS le démontage de la route, pour restaurer
+    // le titre — `query_map`, propriété de la route, est alors déjà libéré. Un
+    // `get()` y panique ; `try_get` rend `None` et on sert le titre nu.
     let title = move || {
-        let q = query_map.get().get("q").unwrap_or_default();
+        let q = query_map
+            .try_get()
+            .and_then(|params| params.get("q"))
+            .unwrap_or_default();
         let q = q.trim();
         if q.is_empty() {
             "Textes - LibreJustice".to_string()
@@ -43,11 +51,11 @@ pub fn TextesPage() -> impl IntoView {
 #[component]
 fn TextesPageSkeleton() -> impl IntoView {
     view! {
-        <div class="mx-auto w-full max-w-[92rem] px-4 py-8 sm:px-6 lg:px-8">
+        <div class=SHELL>
             <h1 class="sr-only">"Recherche de textes"</h1>
-            <div class="grid grid-cols-1 gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12">
+            <div class=GRID_3COL>
                 <div class="hidden lg:block"></div>
-                <div class="flex w-full min-w-0 max-w-3xl flex-col gap-6">
+                <div class=CONTENT_COL>
                     <div class="h-12 w-full animate-pulse rounded-lg bg-[var(--color-rule)]/40"></div>
                     <div class="flex flex-col gap-4">
                         {(0..4)
@@ -74,7 +82,7 @@ fn TextesPageBody() -> impl IntoView {
     )));
 
     view! {
-        <div class="mx-auto w-full max-w-[92rem] px-4 py-8 sm:px-6 lg:px-8">
+        <div class=SHELL>
             <h1 class="sr-only">"Recherche de textes"</h1>
             <TextesView />
         </div>

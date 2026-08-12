@@ -1,19 +1,13 @@
-//! Lecture des décisions (détail, sections, similaires) — port de
-//! `decisions.py`.
-//!
-//! Hydration du détail (méta DB + `Decision` reconstruite depuis
-//! `(full_text, source_fields)` — ADR 0085, sans payload brut — + sections
-//! repliées depuis la structure autoritative du parser), voisins sémantiques
-//! (ANN top-k sur les embeddings des chunks bord).
+//! Lecture des décisions (détail, sections, similaires).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use lj_core::decision::Decision;
 use lj_core::truecase;
 use lj_dtos::{
     CitationSpan, CitationTarget, DecisionDetail, DecisionPreview, DecisionSection,
     DecisionSourceXml, FacetTag, JurisdictionType, LegalRefArticle, LegalReference,
-    SimilarDecisionHit,
+    SimilarDecisionHit, SimilarDecisionsResponse,
 };
 
 use tracing::instrument;
@@ -22,12 +16,26 @@ use crate::error::{ApiError, Result};
 use crate::referential::{referential, Referential};
 use crate::state::AppState;
 
-/// Facteur d'élargissement de la fenêtre ANN interne (parité avec
-/// `_SIMILAR_INNER_LIMIT_FACTOR`).
+/// Facteur d'élargissement de la fenêtre ANN interne.
 const SIMILAR_INNER_LIMIT_FACTOR: i64 = 24;
 
-/// Titres de sommaire canoniques par `kind` — uniformise l'affichage quel que
-/// soit le marqueur source (ADR 0046). Port de `_SECTION_LABELS`.
+/// Sur-fetch du volet espèce : absorbe les exclusions avant troncature à `limit`.
+const ESPECE_OVERFETCH_FACTOR: i64 = 3;
+
+/// Probes vchordrq de la jambe KNN pré-filtrée portée notable.
+const PRINCIPE_KNN_PROBES: u32 = 100;
+
+/// Codes de publication « portée notable » = MAJEURE ∪ IMPORTANTE.
+const NOTABLE_CODES: [&str; 8] = ["r", "A", "b", "l", "c", "B", "C+", "R"];
+
+/// Jambe IDF : nombre max de termes article retenus sur la décision source.
+const IDF_MAX_RARE_TERMS: i64 = 8;
+
+/// Jambe IDF : df au-delà duquel un article est trop cité pour signer la
+/// question de droit.
+const IDF_RARE_DF_CAP: i64 = 100_000;
+
+/// Titres de sommaire canoniques par `kind`.
 fn section_label(kind: &str) -> Option<&'static str> {
     match kind {
         "preamble" => Some("Introduction"),
@@ -41,12 +49,7 @@ fn section_label(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// Paragraphes du corps : lignes non vides du texte nettoyé (port de
-/// `_decision_paragraphs`).
-///
-/// `pub` : le banc de parité re-extract (#18) compare la sortie de rendu
-/// reconstruite vs payload, pas le `Decision.sections` brut (trop strict —
-/// insensible au tri/±1 char que ce rendu absorbe).
+/// Paragraphes du corps : lignes non vides du texte nettoyé.
 pub fn decision_paragraphs(decision: &Decision) -> Vec<String> {
     decision
         .texte_integral_clean
@@ -58,14 +61,12 @@ pub fn decision_paragraphs(decision: &Decision) -> Vec<String> {
 }
 
 /// Plage globale `[start, end)` (codepoints sur `texte_integral_clean` =
-/// `decisions.full_text`, ADR 0125 §2) de chaque paragraphe rendu, alignée
-/// index-à-index sur [`decision_paragraphs`].
+/// `decisions.full_text`) de chaque paragraphe rendu, alignée index-à-index sur
+/// [`decision_paragraphs`].
 ///
-/// Réplique l'avance par curseur de [`sections_from_decision`] : chaque paragraphe
-/// (ligne *trimmée*) est localisé via [`find_char`] depuis le curseur, sa plage
-/// couvre `[pos, pos + nb_codepoints)`. Introuvable ⇒ plage dégénérée `(cursor,
-/// cursor)` (aucun span ne s'y rattache). C'est l'ancrage qui mappe les spans de
-/// citation globaux vers les offsets locaux au paragraphe.
+/// Chaque paragraphe (ligne trimmée) est localisé via [`find_char`] depuis le
+/// curseur, sa plage couvre `[pos, pos + nb_codepoints)`. Introuvable ⇒ plage
+/// dégénérée `(cursor, cursor)`, à laquelle aucun span ne se rattache.
 fn paragraph_global_ranges(decision: &Decision) -> Vec<(usize, usize)> {
     let text = &decision.texte_integral_clean;
     let mut cursor = 0usize;
@@ -83,7 +84,6 @@ fn paragraph_global_ranges(decision: &Decision) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Méta source brute pour `DecisionSourceXml` (port de `_decision_source_meta`).
 fn decision_source_meta(decision: &Decision) -> DecisionSourceXml {
     DecisionSourceXml {
         nom_jurisdiction_type: decision.jurisdiction_name.clone(),
@@ -96,18 +96,13 @@ fn decision_source_meta(decision: &Decision) -> DecisionSourceXml {
 }
 
 /// Replie la structure autoritative (`decision.sections`) en blocs de
-/// paragraphes pour le sommaire/corps front (ADR 0046 / 0048). Port fidèle de
-/// `sections_from_decision`.
+/// paragraphes pour le sommaire/corps front.
 ///
 /// Chaque paragraphe est rattaché — par ses offsets char — à la section
 /// canonique qui le couvre, en partition stricte. Les paragraphes sont émis
-/// dans l'ordre du texte ; on ne fusionne que les runs consécutifs de même
-/// `kind`. `None` quand aucune section autoritative (`start_char >= 0`)
+/// dans l'ordre du texte ; seuls les runs consécutifs de même `kind` sont
+/// fusionnés. `None` quand aucune section autoritative (`start_char >= 0`)
 /// n'existe.
-///
-/// `pub` : exposé au banc de parité re-extract (#18) comme oracle de rendu (les
-/// bornes sont triées par `start_char` et l'affectation se fait par position →
-/// ce rendu absorbe les réordonnancements et décalages ±1 char des bornes brutes).
 pub fn sections_from_decision(
     decision: &Decision,
     citations: &[GlobalCitation],
@@ -116,11 +111,6 @@ pub fn sections_from_decision(
     let mut bounds: Vec<(usize, usize, &str, &str)> = decision
         .sections
         .iter()
-        // En Python `start_char >= 0` exclut les sections synthétiques hors
-        // corps (visa Judilibre marqué start_char < 0). Côté Rust `start_char`
-        // est `usize` : ces sections synthétiques sont représentées
-        // différemment dans le port lj-core (cf. parsing). On garde donc toutes
-        // les sections — le filtre `>= 0` est trivialement vrai pour un usize.
         .map(|s| (s.start_char, s.end_char, s.kind.as_str(), s.label.as_str()))
         .collect();
     bounds.sort_by_key(|b| b.0);
@@ -129,7 +119,6 @@ pub fn sections_from_decision(
         return None;
     }
 
-    // section_for(pos) : dernier bound dont start_char <= pos (bounds trié).
     let section_for = |pos: usize| -> (&str, String) {
         let mut chosen = &bounds[0];
         for bound in &bounds {
@@ -147,8 +136,7 @@ pub fn sections_from_decision(
     };
 
     let mut out: Vec<DecisionSection> = Vec::new();
-    // Plages globales alignées sur `out[i].paragraphs[j]` (regroupées comme les
-    // sections), pour mapper ensuite les spans de citation globaux → locaux.
+    // Plages globales alignées sur `out[i].paragraphs[j]`.
     let mut out_ranges: Vec<Vec<(usize, usize)>> = Vec::new();
     let mut seen_kinds: HashMap<String, usize> = HashMap::new();
 
@@ -189,9 +177,6 @@ pub fn sections_from_decision(
         return None;
     }
 
-    // Attache les spans de citation cliquables, paragraphe par paragraphe, depuis
-    // les plages globales calculées ci-dessus. Vide quand aucune citation ne
-    // tombe dans le paragraphe (sérialisé omis si tous vides).
     for (section, ranges) in out.iter_mut().zip(&out_ranges) {
         let spans: Vec<Vec<CitationSpan>> = ranges
             .iter()
@@ -206,9 +191,9 @@ pub fn sections_from_decision(
 }
 
 /// Une citation globale prête à projeter : `[global_start, global_end)` en
-/// codepoints sur `texte_integral_clean` (= `decisions.full_text`, ADR 0125 §2)
-/// et ses cibles résolues (une seule pour une mention simple ; toutes les
-/// bornes + intermédiaires pour une plage fusionnée).
+/// codepoints sur `texte_integral_clean` (= `decisions.full_text`) et ses cibles
+/// résolues (une seule pour une mention simple ; toutes les bornes +
+/// intermédiaires pour une plage fusionnée).
 #[derive(Debug, Clone)]
 pub struct GlobalCitation {
     pub start: usize,
@@ -216,9 +201,7 @@ pub struct GlobalCitation {
     pub targets: Vec<CitationTarget>,
 }
 
-/// Une mention liée brute (une ligne `legal_citation` résolue) : matière du
-/// rendu (`href`) et de la détection de plage (`text_uid` + `num_key` +
-/// adjacence dans le texte).
+/// Une mention liée brute : une ligne `legal_citation` résolue.
 struct RawCite {
     start: usize,
     end: usize,
@@ -227,15 +210,14 @@ struct RawCite {
     num_key: Option<String>,
     href: String,
     label: String,
-    /// Span « N et suivants » (ADR 0226) : la cible est la famille TOC de
-    /// l'ancre — résolue à l'assemblage, menu comme les plages.
+    /// Span « N et suivants » : la cible est la famille TOC de l'ancre, résolue à
+    /// l'assemblage.
     suivants: bool,
 }
 
 /// Deux mentions adjacentes forment-elles une plage d'articles
 /// (« L. 225-1 à L. 225-9 ») ? Bornes du MÊME texte, toutes deux à article,
-/// séparées du seul mot « à » (ADR 0143 §6 : la capture pose une ligne par
-/// borne écrite ; la plage est reconstituée ici, à la résolution).
+/// séparées du seul mot « à ».
 fn is_article_range(a: &RawCite, b: &RawCite, text: &[char]) -> bool {
     a.num_key.is_some()
         && b.num_key.is_some()
@@ -252,7 +234,7 @@ fn is_article_range(a: &RawCite, b: &RawCite, text: &[char]) -> bool {
 /// entiers croissants (« L. 225-1 » / « L. 225-9 » → `("L. 225", 1, 9)` ;
 /// « 102 » / « 108 » → `("", 102, 108)`). Bornes à suffixe non numérique
 /// (« 50 sexies B à H ») ou radicaux différents → `None`, la plage reste aux
-/// bornes. Cap à 50 : une plage géante n'est pas un menu.
+/// bornes. Cap à 50.
 fn range_stem(num1: &str, num2: &str) -> Option<(String, u32, u32)> {
     fn split(num: &str) -> (&str, Option<u32>) {
         match num.rfind(['-', ' ']) {
@@ -268,8 +250,8 @@ fn range_stem(num1: &str, num2: &str) -> Option<(String, u32, u32)> {
 
 /// Clés candidates des articles intermédiaires d'une plage : les entiers
 /// stricts entre les bornes (`exact`) et les sous-articles insérés de chaque
-/// pas (`like`, « L. 225-3-1 » ; le pas de la borne basse inclus — inséré
-/// APRÈS elle, donc dans la plage — pas celui de la borne haute).
+/// pas (`like`, « L. 225-3-1 » ; le pas de la borne basse est inclus, pas celui
+/// de la borne haute).
 fn range_candidate_keys(stem: &str, k1: u32, k2: u32) -> (Vec<String>, Vec<String>) {
     let key = |k: u32| {
         if stem.is_empty() {
@@ -285,27 +267,20 @@ fn range_candidate_keys(stem: &str, k1: u32, k2: u32) -> (Vec<String>, Vec<Strin
 
 /// Projette les citations globales tombant dans `[pstart, pend)` en spans LOCAUX
 /// au paragraphe (offsets ramenés à `pstart`), demi-ouverts. Une citation n'est
-/// retenue que si elle est **entièrement contenue** dans le paragraphe (les
-/// mentions sont des slices d'une ligne — jamais à cheval sur deux paragraphes).
+/// retenue que si elle est entièrement contenue dans le paragraphe.
 ///
-/// Chevauchement entre mentions → **fusion** en leur enveloppe avec **union des
-/// cibles** (dédup par `(href, label)`), jamais de drop : une citation
-/// multi-articles partage un seul span mais vise N articles → le front rend un
-/// lien simple pour 1 cible, un menu déroulant pour ≥2 (ADR 0125). Les spans
-/// rendus sont triés par début, disjoints.
+/// Chevauchement entre mentions → fusion en leur enveloppe avec union des
+/// cibles (dédup par `(href, label)`) : un span pour N cibles, que le front rend
+/// en lien simple pour 1 cible et en menu déroulant pour ≥ 2. Les spans rendus
+/// sont triés par début, disjoints.
 fn spans_for_range(citations: &[GlobalCitation], pstart: usize, pend: usize) -> Vec<CitationSpan> {
-    // Candidats locaux : contenus dans le paragraphe, non vides.
     let mut cands: Vec<(usize, usize, &GlobalCitation)> = citations
         .iter()
         .filter(|c| c.start >= pstart && c.end <= pend && c.end > c.start)
         .map(|c| (c.start - pstart, c.end - pstart, c))
         .collect();
-    // Tri par début (puis fin) → fusion des chevauchements en un seul balayage.
     cands.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-    // Tout candidat qui chevauche le cluster courant (trié par début, donc seul le
-    // dernier cluster peut chevaucher) étend l'enveloppe et **ajoute ses cibles** —
-    // aucune n'est perdue. Deux mentions disjointes restent deux spans.
     let mut kept: Vec<CitationSpan> = Vec::new();
     for (ls, le, c) in cands {
         match kept.last_mut() {
@@ -328,8 +303,7 @@ fn spans_for_range(citations: &[GlobalCitation], pstart: usize, pend: usize) -> 
 }
 
 /// Spans cliquables alignés sur [`decision_paragraphs`] (corps plat, sans
-/// sections autoritatives). Renvoie `Vec` vide si aucune citation ne tombe dans
-/// aucun paragraphe (le DTO omet alors le champ).
+/// sections autoritatives).
 fn flat_paragraph_spans(
     decision: &Decision,
     citations: &[GlobalCitation],
@@ -346,10 +320,8 @@ fn flat_paragraph_spans(
 }
 
 /// Indice (en codepoints) de la première occurrence de `needle` dans `haystack`
-/// à partir de `from_char` — réplique `str.find(needle, start)` de Python (qui
-/// indexe en codepoints, pas en octets).
+/// à partir de `from_char`.
 fn find_char(haystack: &str, needle: &str, from_char: usize) -> Option<usize> {
-    // Octet de départ correspondant au codepoint `from_char`.
     let byte_start = haystack
         .char_indices()
         .nth(from_char)
@@ -357,21 +329,18 @@ fn find_char(haystack: &str, needle: &str, from_char: usize) -> Option<usize> {
         .unwrap_or(haystack.len());
     let slice = &haystack[byte_start..];
     let byte_off = slice.find(needle)?;
-    // Convertit l'offset octet (dans `slice`) en offset codepoint absolu.
     let char_off = slice[..byte_off].chars().count();
     Some(from_char + char_off)
 }
 
 /// Une référence brute lue de la DB : `(instrument, slug résolu, [(num affiché,
-/// ref_num_key résolu)])`. Le `slug`/`num_key` portent la FK de citation résolue à
-/// l'ingest (ADR 0123 §2) ; `None` = non ancré au catalogue (pas de lien).
+/// ref_num_key résolu)])`. `None` = non ancré au catalogue, donc pas de lien.
 type RawLegalRef = (String, Option<String>, Vec<(String, Option<String>)>);
 
-/// Construit les `LegalReference` exposées. Les citations procédurales ne sont
-/// plus dans le stock (ADR 0211) — rien à masquer en sortie.
+/// Construit les `LegalReference` exposées.
 ///
 /// Un instrument cité sans article précis est conservé tel quel. Le `slug` et le
-/// `numKey` résolus (ADR 0123 §2) sont propagés au DTO pour bâtir les liens
+/// `numKey` résolus sont propagés au DTO pour bâtir les liens
 /// `/texte/{slug}/{numKey}` sans re-slugifier côté front. `None` si la liste
 /// résultante est vide.
 fn parse_legal_refs(raw: &[RawLegalRef]) -> Option<Vec<LegalReference>> {
@@ -380,10 +349,6 @@ fn parse_legal_refs(raw: &[RawLegalRef]) -> Option<Vec<LegalReference>> {
     }
     let mut refs: Vec<LegalReference> = Vec::new();
     for (instrument, slug, original) in raw {
-        // Citations non résolues (pas de `slug` catalogue : free text « règlement
-        // intérieur », codes non catalogués) → exclues de la liste « Textes cités ».
-        // On n'expose que les références ancrées à un texte enregistré (décision
-        // opérateur 2026-06-30). Capture inchangée (le farming de recall s'en sert).
         if slug.is_none() {
             continue;
         }
@@ -409,8 +374,6 @@ fn parse_legal_refs(raw: &[RawLegalRef]) -> Option<Vec<LegalReference>> {
     }
 }
 
-/// Valide le code `jurisdiction_type` issu de la DB et le convertit en
-/// [`JurisdictionType`] (parité avec le garde Python `if jur_type not in (...)`).
 fn parse_jur_type(raw: &str) -> Result<JurisdictionType> {
     match raw {
         "TA" => Ok(JurisdictionType::Ta),
@@ -438,8 +401,8 @@ fn opt_tag(uid: &Option<String>, refs: &Referential) -> Option<FacetTag> {
 }
 
 /// Projette `themes` depuis `source_fields` : casefold + déduplication
-/// ordre-stable, entrées vides retirées (ADR 0090). Scalaire au lieu de liste,
-/// ou clé absente ⇒ `Vec` vide.
+/// ordre-stable, entrées vides retirées. Scalaire au lieu de liste, ou clé
+/// absente ⇒ `Vec` vide.
 fn project_themes(source_fields: &serde_json::Value) -> Vec<String> {
     let Some(arr) = source_fields.get("themes").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -452,7 +415,6 @@ fn project_themes(source_fields: &serde_json::Value) -> Vec<String> {
         if theme.is_empty() {
             continue;
         }
-        // Casefold ⇒ clé de dédup ; on garde la première forme rencontrée.
         if seen.insert(theme.to_lowercase()) {
             out.push(theme.to_string());
         }
@@ -461,7 +423,7 @@ fn project_themes(source_fields: &serde_json::Value) -> Vec<String> {
 }
 
 /// Projette `nac` depuis `source_fields` : le littéral chaîne `"null"` et la
-/// chaîne vide → `None` ; code brut sinon (ADR 0090, pas de table code→libellé).
+/// chaîne vide → `None` ; code brut sinon.
 fn project_nac(source_fields: &serde_json::Value) -> Option<String> {
     let s = source_fields.get("nac")?.as_str()?.trim();
     if s.is_empty() || s == "null" {
@@ -471,8 +433,7 @@ fn project_nac(source_fields: &serde_json::Value) -> Option<String> {
 }
 
 /// Triplet hydraté depuis la `Decision` reconstruite : paragraphes, sections,
-/// méta XML. Aliasé pour le retour du `spawn_blocking` de parse (clippy
-/// `type_complexity`).
+/// méta XML.
 type ParsedPayload = (
     Vec<String>,
     Vec<Vec<CitationSpan>>,
@@ -481,22 +442,10 @@ type ParsedPayload = (
 );
 
 /// Détail complet d'une décision par `public_id` (paragraphes, sections, refs).
-///
-/// Port de `fetch_decision` : une requête méta + `(full_text, source_fields)`,
-/// une requête de ré-agrégation des références légales par instrument, puis
-/// hydration du corps depuis la `Decision` reconstruite (ADR 0085 — plus de
-/// payload brut dégzippé).
-///
-/// Span DB nommé (`db.system="postgresql"`) pour le drill-down `/decision` du
-/// cockpit Tempo ; `state` (pool non-`Debug`) est exclu de l'enregistrement.
 #[instrument(skip(state), fields(db.system = "postgresql", public_id = %public_id))]
 pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionDetail> {
     let refs = referential(state).await?;
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
 
     let row = conn
         .query_opt(
@@ -531,7 +480,7 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                 SELECT source_fields, source
                 FROM decision_sources
                 WHERE decision_id = d.id AND deleted_at IS NULL
-                ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, id ASC
+                ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC
                 LIMIT 1
             ) ds ON true
             LEFT JOIN LATERAL (
@@ -591,19 +540,11 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
     let web_notes: Option<serde_json::Value> = row.get(23);
 
     let jur_type = parse_jur_type(&jur_type_raw)?;
-    // Nom de juridiction résolu depuis le référentiel `jurisdiction` (ADR 0146) —
-    // le label vit en donnée, plus dans une colonne texte libre.
     let jurisdiction_name = jurisdiction_code
         .as_deref()
         .and_then(|c| refs.jurisdiction(c))
         .map(|j| j.label.clone());
 
-    // Références légales par instrument depuis la relation du domaine
-    // (`legal_citation`, ADR 0145 M4). Seules les citations liées apparaissent
-    // (ref_text_uid NOT NULL — même doctrine que l'overlay : on ne liste pas ce
-    // qui ne mène nulle part). Libellé = titre catalogue ; articles = les
-    // `ref_num_key` distincts (clé canonique du lien `/texte/{slug}/{numKey}`,
-    // qui sert aussi de libellé).
     let ref_rows = conn
         .query(
             "
@@ -624,15 +565,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         )
         .await?;
 
-    // Spans cliquables (ADR 0125 / 0145 / 0247) : un élément du blob `spans` =
-    // une mention (codepoints sur `decisions.full_text`, convention 0143). PK
-    // scan, une table ; le JOIN `legal_text` fournit slug (href) et titre
-    // (libellé).
-    //
-    // **INNER JOIN sur `legal_text` (ref_text_uid lié)** : on n'overlaye QUE
-    // les citations ancrées à un texte enregistré. Les références non liées
-    // (`ref_text_uid` NULL) ne sont PAS surlignées dans le corps — on ne
-    // souligne pas ce qui ne mène nulle part (décision opérateur 2026-06-30).
     let span_rows = conn
         .query(
             "
@@ -642,8 +574,9 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                    lt.slug,
                    el->>3 AS ref_num_key,
                    lt.title AS label,
-                   EXISTS (SELECT 1 FROM legal_article a
-                           WHERE a.text_uid = lt.text_uid) AS has_articles,
+                   (EXISTS (SELECT 1 FROM legal_article a
+                            WHERE a.text_uid = lt.text_uid)
+                    OR coalesce(length(lt.body), 0) > 0) AS readable,
                    (el->>4)::bool AS suivants
             FROM legal_citation lc
             CROSS JOIN LATERAL jsonb_array_elements(lc.spans) AS el
@@ -654,10 +587,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         )
         .await?;
 
-    // Citations de jurisprudence (ADR 0165) : une ligne `case_citation`
-    // RÉSOLUE = un span cliquable vers la décision citée. Même doctrine que
-    // l'INNER JOIN ci-dessus : une clé pendante (`target_decision_id` NULL)
-    // n'est pas décorée du tout.
     let case_rows = conn
         .query(
             "
@@ -684,17 +613,13 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
             let slug: Option<String> = r.get(3);
             let num_key: Option<String> = r.get(4);
             let label: String = r.get(5);
-            let has_articles: bool = r.get(6);
+            let readable: bool = r.get(6);
             let suivants: bool = r.get(7);
             let slug = slug?;
             let num_key = num_key.filter(|k| !k.is_empty());
-            // Article ciblé → /texte/{slug}/{numKey}. Mention nue → /texte/{slug}
-            // seulement si le texte a ≥ 1 article en base (ADR 0162 §4). Pas de
-            // lien = pas de rendu du tout (mort du pointillé, décision
-            // opérateur 2026-07-05) : on ne décore pas ce qui ne mène nulle part.
             let href = match num_key.as_deref() {
                 Some(k) => format!("/texte/{slug}/{k}"),
-                None if has_articles => format!("/texte/{slug}"),
+                None if readable => format!("/texte/{slug}"),
                 None => return None,
             };
             Some(RawCite {
@@ -713,18 +638,16 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
 
     let text_chars: Vec<char> = full_text.as_deref().unwrap_or_default().chars().collect();
 
-    // Plages d'articles (« L. 225-1 à L. 225-9 ») : la capture pose une ligne
-    // par borne écrite (ADR 0143 §6) ; ici on reconstitue LA plage — un span de
-    // borne à borne — et on résout les articles intermédiaires contre le
-    // catalogue.
+    // Plages d'articles (« L. 225-1 à L. 225-9 ») : la capture pose une ligne par
+    // borne écrite ; la plage — un span de borne à borne — est reconstituée ici, et
+    // ses articles intermédiaires résolus contre le catalogue.
     let single = |c: &RawCite| CitationTarget {
         href: Some(c.href.clone()),
         label: c.label.clone(),
     };
     let mut citations: Vec<GlobalCitation> = Vec::with_capacity(raw.len());
-    // Membres des plages recollées (bornes + intermédiaires), par `text_uid` :
-    // ils rejoignent la liste « Références juridiques » du texte cité, pour que
-    // l'en-tête montre la même chose que le corps.
+    // Membres des plages recollées (bornes + intermédiaires), par `text_uid` : ils
+    // rejoignent la liste « Références juridiques » du texte cité.
     let mut range_members: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     let mut it = raw.into_iter().peekable();
@@ -733,12 +656,11 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
             .peek()
             .is_some_and(|b| is_article_range(&a, b, &text_chars));
         if !ranged {
-            // « N et suivants » (ADR 0226) : la famille TOC de l'ancre en
-            // menu, comme une plage — `_suivants_family_keys` porte la
-            // sémantique (section unique, VIGUEUR, cap 20 ; NULL sinon,
-            // l'ancre reste alors un lien simple). Les clés publiques de la
-            // famille repassent en numéro d'affichage (`legal_article.num`)
-            // pour parler la même forme que les plages.
+            // « N et suivants » : la famille TOC de l'ancre en menu, comme une plage.
+            // `_suivants_family_keys` porte la sémantique (section unique, arête en vigueur
+            // à la date de lecture de la décision, cap 20 ; NULL sinon, l'ancre reste alors
+            // un lien simple). Les clés publiques de la famille repassent en numéro
+            // d'affichage (`legal_article.num`).
             let family: Vec<String> = match (a.suivants, a.num_key.as_deref()) {
                 (true, Some(nk)) => conn
                     .query(
@@ -747,11 +669,17 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                                  (SELECT la.num FROM legal_article la
                                   WHERE la.text_uid = $1 AND la.num_key = t.k
                                   ORDER BY la.date_debut DESC LIMIT 1), t.k)
-                        FROM unnest(_suivants_family_keys($1, $2))
+                        FROM unnest(_suivants_family_keys($1, $2,
+                                 (SELECT coalesce(d.date_lecture, CURRENT_DATE)
+                                  FROM decisions d WHERE d.id = $3)))
                              WITH ORDINALITY AS t(k, ord)
                         ORDER BY t.ord
                         ",
-                        &[&a.text_uid, &lj_core::article_key::article_key(nk)],
+                        &[
+                            &a.text_uid,
+                            &lj_core::article_key::article_key(nk),
+                            &decision_id,
+                        ],
                     )
                     .await?
                     .iter()
@@ -767,8 +695,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                 family
                     .iter()
                     .map(|nk| CitationTarget {
-                        // Libellé en numéro d'affichage, lien dans l'alphabet
-                        // public (ADR 0209) — la route ne connaît que lui.
                         href: Some(format!(
                             "/texte/{}/{}",
                             a.slug,
@@ -787,8 +713,8 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         }
         let b = it.next().expect("peek a garanti un suivant");
         // Intermédiaires = clés numériquement entre les bornes ET existantes au
-        // catalogue (sous-articles insérés compris, « L. 225-3-1 »). Bornes non
-        // énumérables (« 50 sexies B à H ») → la plage garde ses deux bornes.
+        // catalogue, sous-articles insérés compris. Bornes non énumérables
+        // (« 50 sexies B à H ») → la plage garde ses deux bornes.
         let mut inter: Vec<String> = Vec::new();
         if let Some((stem, k1, k2)) = range_stem(
             a.num_key.as_deref().expect("gardé par is_article_range"),
@@ -807,8 +733,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                 .iter()
                 .map(|r| r.get::<_, String>(0))
                 .collect();
-            // Ordre de lecture : pas numérique, puis la clé (les sous-articles
-            // d'un pas suivent leur article).
             inter.sort_by_key(|nk| {
                 let tail = nk.strip_prefix(&stem).unwrap_or(nk);
                 let k: u32 = tail
@@ -820,9 +744,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                 (k, nk.clone())
             });
         }
-        // Dans le menu d'une plage, chaque ligne s'identifie par son numéro
-        // en forme d'affichage (le titre du texte est déjà porté par la
-        // phrase autour du span).
         let bound = |c: &RawCite| CitationTarget {
             href: Some(c.href.clone()),
             label: format!(
@@ -850,8 +771,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         });
     }
 
-    // Spans jurisprudence : libellé = identité de la décision citée
-    // (juridiction du référentiel, date, n°), href = sa page.
     for r in &case_rows {
         let start: i32 = r.get(0);
         let end: i32 = r.get(1);
@@ -893,7 +812,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                 num_keys.sort();
                 num_keys.dedup();
             }
-            // Libellé en forme d'affichage, lien en alphabet public (ADR 0209).
             let articles: Vec<(String, Option<String>)> = num_keys
                 .into_iter()
                 .map(|k| {
@@ -905,12 +823,9 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         })
         .collect();
 
-    // Chronologie de l'affaire (ADR 0161/0169) : décisions atteignables par les
-    // liens appel/pourvoi/renvoi RÉSOLUS, traversés dans les deux sens (la
-    // marche non orientée remonte les renvois après cassation : CE → CAA →
-    // CE → CAA). Les liens pendants (cible hors base) ne produisent pas
-    // d'étape — on ne liste pas ce qui ne mène nulle part. Profondeur bornée
-    // à 8 (les chaînes réelles font ≤ 4-5 étapes ; l'UNION coupe les cycles).
+    // Chronologie de l'affaire : décisions atteignables par les liens
+    // appel/pourvoi/renvoi résolus, traversés dans les deux sens. Profondeur bornée
+    // à 8 ; l'UNION coupe les cycles.
     let chrono_rows = conn
         .query(
             "
@@ -943,8 +858,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         )
         .await?;
 
-    // Arêtes de la chaîne : la nature du lien (appel / pourvoi / renvoi) entre
-    // chaque paire de décisions —  ne montre pas cette information.
     let chrono_edges = if chrono_rows.len() >= 2 {
         let ids: Vec<i64> = chrono_rows.iter().map(|r| r.get::<_, i64>(5)).collect();
         conn.query(
@@ -962,14 +875,10 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         Vec::new()
     };
 
-    // Les requêtes sont faites : on rend la connexion au pool AVANT le parse
-    // offloadé (qui ne touche plus la DB). Sinon la connexion resterait checkout
-    // pendant tout le `.await` du `spawn_blocking` (~10-60 ms pour une grosse
-    // décision), gaspillant une place du pool sous charge concurrente.
+    // La connexion est rendue au pool avant le parse offloadé, qui ne touche plus
+    // la DB.
     drop(conn);
 
-    // Une chaîne se montre à partir de deux décisions : seule dans sa
-    // « chaîne », la décision courante n'a pas de chronologie.
     let chronology: Vec<lj_dtos::ChronologyEntry> = if chrono_rows.len() >= 2 {
         let edges: std::collections::HashMap<(String, String), String> = chrono_edges
             .iter()
@@ -1002,8 +911,7 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                 }
             })
             .collect();
-        // Le lien porte du plus récent vers la décision qu'il attaque : posé
-        // sur l'étape du haut quand la paire adjacente est directement liée.
+        // Le lien porte du plus récent vers la décision qu'il attaque.
         for i in 0..entries.len() - 1 {
             entries[i].link = edges
                 .get(&(entries[i].id.clone(), entries[i + 1].id.clone()))
@@ -1014,21 +922,15 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         Vec::new()
     };
 
-    // Projection méta (ADR 0090) : lecture pure depuis `source_fields`, unique
-    // frontière de validation de ces champs (#12). `source_fields` est un JSONB
-    // hétérogène par source : forme inattendue ⇒ champ vide, jamais d'erreur.
+    // `source_fields` est un JSONB hétérogène par source : forme inattendue ⇒
+    // champ vide, jamais d'erreur.
     let (themes, nac) = match source_fields.as_ref() {
         Some(sf) => (project_themes(sf), project_nac(sf)),
         None => (Vec::new(), None),
     };
 
-    // Reconstruction `(full_text, source_fields)` → `Decision` (ADR 0085) puis
-    // dérivation paragraphes/sections = CPU-bloquant. Offload sur
-    // `spawn_blocking` (même convention que `highlight` dans search.rs) : le
-    // runtime `current_thread` (contrainte SSR Leptos, ADR 0061) sérialiserait
-    // sinon les requêtes en vol pendant le parse sur l'unique thread async. La
-    // `Decision` reconstruite est byte-identique au parse du payload brut (banc
-    // de parité #20, gate banc #18).
+    // Reconstruction `(full_text, source_fields)` → `Decision` puis dérivation
+    // paragraphes/sections : CPU-bloquant, donc offloadé sur `spawn_blocking`.
     let (paragraphs, paragraph_spans, sections, source_xml) =
         if let (Some(full_text), Some(source_fields)) = (full_text, source_fields) {
             let pid = public_id.to_string();
@@ -1036,14 +938,13 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                 let decision = Decision::from_source_fields(&full_text, &source_fields, &pid);
                 let mut paragraphs = decision_paragraphs(&decision);
                 let mut sections = sections_from_decision(&decision, &citations);
-                // Spans alignés sur le corps plat (repli front sans sections). Les
-                // offsets sont en codepoints sur le texte original ; truecase
-                // (length-preserving en codepoints) ne les invalide pas.
+                // Spans alignés sur le corps plat (repli front sans sections). Les offsets
+                // sont en codepoints sur le texte original, et truecase préserve la
+                // longueur en codepoints.
                 let flat_spans = flat_paragraph_spans(&decision, &citations);
-                // Vieilles décisions intégralement en MAJUSCULES (surtout Cassation) :
-                // recasse déterministe pour l'affichage uniquement. Appliquée APRÈS
-                // l'assignation des sections (qui matche les paragraphes par offsets
-                // sur le texte source original). N'altère ni le stocké ni l'index BM25.
+                // Décisions intégralement en MAJUSCULES : recasse déterministe pour
+                // l'affichage seulement, appliquée APRÈS l'assignation des sections, qui
+                // matche les paragraphes par offsets sur le texte source.
                 if truecase::is_caps_lock(&decision.texte_integral_clean) {
                     for p in &mut paragraphs {
                         *p = truecase::truecase(p);
@@ -1056,10 +957,6 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                         }
                     }
                 }
-                // Python : `source_xml=DecisionSourceXml(**payload_meta) if
-                // payload_meta else None`. `payload_meta` n'est falsy que s'il est
-                // vide ; dès qu'un payload est parsé le dict est construit (truthy
-                // même tout-None) → on émet la méta systématiquement.
                 (
                     paragraphs,
                     flat_spans,
@@ -1077,8 +974,8 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
 
     let docket_numbers = docket_numbers_raw.filter(|d| !d.is_empty());
 
-    // Titre canonique (ADR 0170) : siège recomposé depuis les axes structurés,
-    // même composition que `search_title` à l'ingest.
+    // Siège recomposé depuis les axes structurés, même composition que
+    // `search_title` à l'ingest.
     let jur_display = crate::titles::decision_jurisdiction(
         refs.jurisdiction_type_label(&jur_type_raw)
             .unwrap_or(&jur_type_raw),
@@ -1146,8 +1043,8 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
 }
 
 /// Commentaires doctrine web (`source_fields.commentaires[]` des fournisseurs
-/// autres qu'ArianeWeb : ADDE, plus tard GISTI…) → DTO. Entrées `note`
-/// auto-suffisantes (le lien est stocké tel quel — pas de composition).
+/// autres qu'ArianeWeb) → DTO. Entrées `note` auto-suffisantes : le lien est
+/// stocké tel quel.
 fn notes_from_web_bundle(notes: &serde_json::Value) -> Vec<lj_dtos::Commentaire> {
     notes
         .as_array()
@@ -1190,10 +1087,9 @@ fn judilibre_filetype_label(t: &str) -> Option<&'static str> {
     })
 }
 
-/// Documents liés Judilibre (`files[]`, Licence Ouverte 2.0) → commentaires
-/// `note` : rapports, avis, communiqués, notes explicatives de la Cour de
-/// cassation. Lien direct vers le PDF public (`rawUrl`). Les graphiques et la
-/// décision annotée (`datt_*`) sont écartés — ce ne sont pas des commentaires.
+/// Documents liés Judilibre (`files[]`) → commentaires `note` : rapports, avis,
+/// communiqués, notes explicatives. Lien direct vers le PDF public (`rawUrl`).
+/// Les graphiques et la décision annotée (`datt_*`) sont écartés.
 fn notes_from_judilibre_files(files: &serde_json::Value) -> Vec<lj_dtos::Commentaire> {
     files
         .as_array()
@@ -1220,10 +1116,10 @@ fn notes_from_judilibre_files(files: &serde_json::Value) -> Vec<lj_dtos::Comment
         .unwrap_or_default()
 }
 
-/// Bundle `commentaires[]` ArianeWeb (ADR 0204) → DTO. Les analyses se
-/// déplient sur place ; l'entrée `conclusions` (existence seule en base)
-/// devient une ligne-lien composée ici — **seul endroit** à corriger si le
-/// Conseil d'État change son schéma d'URL.
+/// Bundle `commentaires[]` ArianeWeb → DTO. Les analyses se déplient sur place ;
+/// l'entrée `conclusions` (existence seule en base) devient une ligne-lien
+/// composée ici — seul endroit à corriger si le Conseil d'État change son schéma
+/// d'URL.
 fn commentaires_from_bundle(bundle: &serde_json::Value) -> Vec<lj_dtos::Commentaire> {
     let dossier = bundle["dossier"].as_str();
     let date = bundle["date_lecture"].as_str();
@@ -1275,17 +1171,12 @@ fn commentaires_from_bundle(bundle: &serde_json::Value) -> Vec<lj_dtos::Commenta
         .unwrap_or_default()
 }
 
-/// Prévisualisation légère d'une décision par `public_id` (hover card des
-/// liens de jurisprudence, ADR 0168) : identité + solution + codes de
-/// publication + résumé — le corps n'est jamais lu.
+/// Prévisualisation légère d'une décision par `public_id` : identité + solution
+/// + codes de publication + résumé, sans lire le corps.
 #[instrument(skip(state), fields(db.system = "postgresql", public_id = %public_id))]
 pub async fn decision_preview(state: &AppState, public_id: &str) -> Result<DecisionPreview> {
     let refs = referential(state).await?;
-    let conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+    let conn = state.pool.get().await?;
 
     let row = conn
         .query_opt(
@@ -1360,42 +1251,191 @@ pub async fn decision_preview(state: &AppState, public_id: &str) -> Result<Decis
     })
 }
 
-/// Décisions similaires (ANN top-k sur l'embedding des chunks bord) pour un
-/// `public_id`. Port de `fetch_similar_decisions`.
+/// Décisions similaires en deux volets pour un `public_id` :
 ///
-/// Le `title_html` du DTO Rust est construit via [`decision_title`] (le DTO
-/// Python expose les champs bruts et le front calcule le titre ; ici le contrat
-/// `SimilarDecisionHit` ne porte qu'`id`/`title_html`/`score`).
+/// - **principe** (référence, similaires sur le fond) : décisions de portée
+///   notable par trois signaux fusionnés — citations sortantes résolues
+///   (`case_citation`), articles rares partagés pondérés IDF, KNN pré-filtré
+///   portée notable.
+/// - **espèce** (similaires en fait) : ANN top-k sur les embeddings des chunks
+///   bord, en excluant les hits principe et la chronologie de l'affaire
+///   (`decision_links`, déjà affichée sur la page).
 ///
-/// `probes` provient de `settings.vchord_probes` (paramètre `SET LOCAL
-/// vchordrq.probes`).
-///
-/// Span DB nommé (`db.system="postgresql"`) pour le drill-down Tempo.
+/// Les trois jambes partent en parallèle sur des connexions distinctes du pool ;
+/// `limit` s'applique à chaque volet.
 #[instrument(skip(state), fields(db.system = "postgresql", public_id = %public_id))]
 pub async fn similar_decisions(
     state: &AppState,
     public_id: &str,
     limit: u32,
-) -> Result<Vec<SimilarDecisionHit>> {
-    let limit_i64 = limit as i64;
-    let inner_limit = (limit_i64 * SIMILAR_INNER_LIMIT_FACTOR).max(limit_i64 + 1);
-    let probes = state.settings.vchord_probes;
+) -> Result<SimilarDecisionsResponse> {
+    let limit = limit as usize;
 
-    // `inner_limit`/`outer_limit` injectés en littéraux (parité avec
-    // `sql.Literal`) ; `probes` idem pour `SET LOCAL`.
+    let (source_id, meta) = similar_source_meta(state, public_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+
+    let legs = similar_legs(state, source_id, limit).await?;
+
+    let abstained = similar_principe_gated(&meta);
+    let principe_ids = if abstained {
+        Vec::new()
+    } else {
+        assemble_principe(&legs.direct, &legs.idf, &legs.principe_knn, limit)
+    };
+    let excluded: HashSet<i64> = principe_ids
+        .iter()
+        .chain(legs.chronology.iter())
+        .copied()
+        .collect();
+    let espece_ids: Vec<i64> = if similar_espece_gated(&meta) {
+        Vec::new()
+    } else {
+        legs.espece_knn
+            .into_iter()
+            .filter(|id| !excluded.contains(id))
+            .take(limit)
+            .collect()
+    };
+
+    let mut by_id = hydrate_similar_hits(
+        state,
+        &principe_ids
+            .iter()
+            .chain(espece_ids.iter())
+            .copied()
+            .collect::<Vec<i64>>(),
+    )
+    .await?;
+    let collect = |ids: &[i64], by_id: &mut HashMap<i64, SimilarDecisionHit>| {
+        ids.iter().filter_map(|id| by_id.remove(id)).collect()
+    };
+    Ok(SimilarDecisionsResponse {
+        decision_id: public_id.to_string(),
+        principe: collect(&principe_ids, &mut by_id),
+        espece: collect(&espece_ids, &mut by_id),
+        abstained,
+    })
+}
+
+/// Au-delà de cette taille, un rejet CC citant le 1014 est un arrêt mixte motivé
+/// (moyens réels + un moyen 1014), pas un rejet non spécialement motivé.
+const GATE_1014_MAX_CHARS: i32 = 3_500;
+/// Terme d'inversion `lj_cit_terms` de l'art. 1014 du code de procédure
+/// civile (rejet non spécialement motivé).
+const CPC_1014_TERM: &str = "LEGITEXT000006070716|1014";
+
+/// Métadonnées de la décision-source pilotant l'abstention des volets
+/// similaires.
+pub struct SimilarSourceMeta {
+    pub jurisdiction_type: String,
+    pub solution_uid: Option<String>,
+    pub text_chars: i32,
+    pub cites_1014: bool,
+}
+
+/// Volet principe muet : la source ne tranche aucune question de droit —
+/// désistement, non-lieu à statuer, ou rejet CC non spécialement motivé
+/// (art. 1014 CPC, texte court).
+pub fn similar_principe_gated(meta: &SimilarSourceMeta) -> bool {
+    match meta.solution_uid.as_deref() {
+        Some("solution:DESISTEMENT") | Some("solution:NON_LIEU_A_STATUER") => true,
+        Some("solution:REJET") => {
+            meta.jurisdiction_type == "CC"
+                && meta.cites_1014
+                && meta.text_chars < GATE_1014_MAX_CHARS
+        }
+        _ => false,
+    }
+}
+
+/// Volet espèce muet : les voisines d'un désistement sont des donné-acte en
+/// série sans valeur d'usage. Les non-lieux gardent leur volet.
+pub fn similar_espece_gated(meta: &SimilarSourceMeta) -> bool {
+    meta.solution_uid.as_deref() == Some("solution:DESISTEMENT")
+}
+
+/// Résout une décision par `public_id` : id interne + métadonnées du gate.
+pub async fn similar_source_meta(
+    state: &AppState,
+    public_id: &str,
+) -> Result<Option<(i64, SimilarSourceMeta)>> {
+    let conn = state.pool.get().await?;
+    let row = conn
+        .query_opt(
+            "
+            SELECT d.id, d.jurisdiction_type, d.solution_uid,
+                   coalesce(length(d.full_text), 0),
+                   EXISTS (
+                     SELECT 1 FROM legal_citation lc
+                     WHERE lc.decision_id = d.id
+                       AND public.lj_cit_terms(lc.spans) @> ARRAY[$2::text]
+                   )
+            FROM decisions d WHERE d.public_id = $1
+            ",
+            &[&public_id, &CPC_1014_TERM],
+        )
+        .await?;
+    Ok(row.map(|r| {
+        (
+            r.get(0),
+            SimilarSourceMeta {
+                jurisdiction_type: r.get(1),
+                solution_uid: r.get(2),
+                text_chars: r.get(3),
+                cites_1014: r.get(4),
+            },
+        )
+    }))
+}
+
+/// Jambes brutes des deux volets, avant assemblage et hydratation.
+pub struct SimilarLegs {
+    /// Cibles résolues des citations sortantes, portée notable.
+    pub direct: Vec<i64>,
+    /// Décisions notables citant les mêmes articles rares, rang IDF.
+    pub idf: Vec<i64>,
+    /// Chronologie `decision_links` de l'affaire (exclue du volet espèce).
+    pub chronology: Vec<i64>,
+    /// KNN pré-filtré portée notable.
+    pub principe_knn: Vec<i64>,
+    /// KNN générique sur-fetché (volet espèce, avant exclusions).
+    pub espece_knn: Vec<i64>,
+}
+
+/// Calcule les cinq jambes en parallèle sur des connexions distinctes du pool.
+pub async fn similar_legs(state: &AppState, source_id: i64, limit: usize) -> Result<SimilarLegs> {
+    let (espece_knn, principe_knn, graph) = tokio::try_join!(
+        espece_knn_leg(state, source_id, limit),
+        principe_knn_leg(state, source_id, limit),
+        graph_legs(state, source_id, limit),
+    )?;
+    Ok(SimilarLegs {
+        direct: graph.direct,
+        idf: graph.idf,
+        chronology: graph.chronology,
+        principe_knn,
+        espece_knn,
+    })
+}
+
+/// Jambe espèce : ANN top-k générique sur les embeddings des chunks bord
+/// (premier + dernier, max-pool par décision), sur-fetchée pour absorber les
+/// exclusions.
+async fn espece_knn_leg(state: &AppState, source_id: i64, limit: usize) -> Result<Vec<i64>> {
+    let outer_limit = (limit as i64) * ESPECE_OVERFETCH_FACTOR;
+    let inner_limit = (limit as i64) * SIMILAR_INNER_LIMIT_FACTOR;
     let query = format!(
         "
         WITH source AS (
-          SELECT decision_id, embedding
+          SELECT embedding
           FROM (
             SELECT
-              c.decision_id,
               c.embedding,
               row_number() OVER (ORDER BY c.chunk_index) AS rn_first,
               row_number() OVER (ORDER BY c.chunk_index DESC) AS rn_last
-            FROM decisions d
-            JOIN decision_chunks c ON c.decision_id = d.id
-            WHERE d.public_id = $1
+            FROM decision_chunks c
+            WHERE c.decision_id = $1
               AND c.embedding IS NOT NULL
           ) ordered
           WHERE rn_first = 1 OR rn_last = 1
@@ -1411,75 +1451,251 @@ pub async fn similar_decisions(
               c.embedding <=> src.embedding AS distance
             FROM decision_chunks c
             WHERE c.embedding IS NOT NULL
-              AND c.decision_id <> src.decision_id
+              AND c.decision_id <> $1
             ORDER BY distance
             LIMIT {inner_limit}
           ) cand ON TRUE
-        ),
-        ranked AS (
-          SELECT n.decision_id, MAX(n.score) AS score
-          FROM neighbors n
-          GROUP BY n.decision_id
-          ORDER BY score DESC
-          LIMIT {outer_limit}
         )
-        SELECT
-          d.public_id,
-          d.jurisdiction_type,
-          d.jurisdiction_code,
-          r.score,
-          d.date_lecture::text,
-          d.docket_numbers,
-          d.solution_uid,
-          d.procedure_uid,
-          d.office_uid,
-          d.publication_codes,
-          d.summary
-        FROM ranked r
-        JOIN decisions d ON d.id = r.decision_id
-        ORDER BY r.score DESC, d.date_lecture DESC NULLS LAST, d.public_id
+        SELECT n.decision_id
+        FROM neighbors n
+        GROUP BY n.decision_id
+        ORDER BY MAX(n.score) DESC, n.decision_id
+        LIMIT {outer_limit}
         ",
-        inner_limit = inner_limit,
-        outer_limit = limit_i64,
     );
+    knn_query(state, &query, source_id, state.settings.vchord_probes).await
+}
 
-    let mut conn = state
-        .pool
-        .get()
-        .await
-        .map_err(|e| ApiError::Internal(format!("checkout connexion: {e}")))?;
+/// Jambe principe KNN : même ANN, pré-filtrée portée notable *dans* le scan —
+/// le filtre join force vchordrq à continuer en ordre de distance jusqu'à
+/// remplir le LIMIT.
+async fn principe_knn_leg(state: &AppState, source_id: i64, limit: usize) -> Result<Vec<i64>> {
+    let limit = limit as i64;
+    let query = format!(
+        "
+        WITH source AS (
+          SELECT embedding
+          FROM (
+            SELECT
+              c.embedding,
+              row_number() OVER (ORDER BY c.chunk_index) AS rn_first,
+              row_number() OVER (ORDER BY c.chunk_index DESC) AS rn_last
+            FROM decision_chunks c
+            WHERE c.decision_id = $1
+              AND c.embedding IS NOT NULL
+          ) ordered
+          WHERE rn_first = 1 OR rn_last = 1
+        ),
+        neighbors AS MATERIALIZED (
+          SELECT
+            cand.decision_id,
+            1 - cand.distance AS score
+          FROM source src
+          JOIN LATERAL (
+            SELECT
+              c.decision_id,
+              c.embedding <=> src.embedding AS distance
+            FROM decision_chunks c
+            JOIN decisions dn ON dn.id = c.decision_id
+            WHERE c.embedding IS NOT NULL
+              AND c.decision_id <> $1
+              AND dn.publication_codes && '{{{notable}}}'::text[]
+            ORDER BY distance
+            LIMIT {limit}
+          ) cand ON TRUE
+        )
+        SELECT n.decision_id
+        FROM neighbors n
+        GROUP BY n.decision_id
+        ORDER BY MAX(n.score) DESC, n.decision_id
+        LIMIT {limit}
+        ",
+        notable = NOTABLE_CODES.join(","),
+    );
+    knn_query(state, &query, source_id, PRINCIPE_KNN_PROBES).await
+}
 
-    let rows = {
-        let tx = conn.transaction().await?;
-        tx.batch_execute(&format!("SET LOCAL vchordrq.probes = {probes}"))
-            .await?;
-        let rows = tx.query(&query, &[&public_id]).await?;
-        // Lecture seule : commit (parité avec le `with conn.transaction()`).
-        tx.commit().await?;
-        rows
-    };
+/// Exécute une requête ANN (`$1` = decision_id source, une colonne
+/// `decision_id`) sous `SET LOCAL vchordrq.probes`.
+async fn knn_query(state: &AppState, query: &str, source_id: i64, probes: u32) -> Result<Vec<i64>> {
+    let mut conn = state.pool.get().await?;
+    let tx = conn.transaction().await?;
+    tx.batch_execute(&format!("SET LOCAL vchordrq.probes = {probes}"))
+        .await?;
+    let rows = tx.query(query, &[&source_id]).await?;
+    tx.commit().await?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
 
-    if rows.is_empty() {
-        // Distinguer 404 (décision absente) de « pas de voisins ».
-        let exists = conn
-            .query_opt(
-                "SELECT 1 FROM decisions WHERE public_id = $1",
-                &[&public_id],
+/// Signaux du graphe de citations pour le volet principe, plus la chronologie
+/// de l'affaire à exclure du volet espèce.
+struct GraphLegs {
+    /// Cibles résolues des citations sortantes, portée notable — majeures
+    /// d'abord, puis les plus récentes.
+    direct: Vec<i64>,
+    /// Décisions notables citant les mêmes articles rares, rang IDF.
+    idf: Vec<i64>,
+    /// Décisions de la chronologie `decision_links`.
+    chronology: Vec<i64>,
+}
+
+async fn graph_legs(state: &AppState, source_id: i64, limit: usize) -> Result<GraphLegs> {
+    let limit = limit as i64;
+    let notable: Vec<&str> = NOTABLE_CODES.to_vec();
+    let majeure = vec!["r", "A"];
+    let conn = state.pool.get().await?;
+
+    let direct_rows = conn
+        .query(
+            "
+            SELECT t.id
+            FROM case_citation cc
+            JOIN decisions t ON t.id = cc.target_decision_id
+            WHERE cc.decision_id = $1
+              AND t.publication_codes && $2
+            GROUP BY t.id
+            ORDER BY bool_or(t.publication_codes && $3) DESC,
+                     MAX(t.date_lecture) DESC NULLS LAST, t.id
+            LIMIT $4
+            ",
+            &[&source_id, &notable, &majeure, &limit],
+        )
+        .await?;
+
+    // Articles rares partagés : termes article de la source (`text_uid|num_key`),
+    // gardés sous le cap de rareté, inversés par le GIN `legal_citation_terms_idx`
+    // vers les décisions notables, score Σ ln(N/df) avec N = estimation planner.
+    let idf_query = format!(
+        "
+        WITH terms AS (
+          SELECT DISTINCT t
+          FROM legal_citation lc, unnest(public.lj_cit_terms(lc.spans)) AS t
+          WHERE lc.decision_id = $1 AND position('|' in t) > 0
+        ),
+        rare AS (
+          SELECT t.t, s.decision_count
+          FROM terms t
+          JOIN citing_decision_counts s ON s.cited_term = t.t
+          WHERE s.decision_count < {IDF_RARE_DF_CAP}
+          ORDER BY s.decision_count ASC
+          LIMIT {IDF_MAX_RARE_TERMS}
+        )
+        SELECT lc2.decision_id
+        FROM rare r
+        JOIN legal_citation lc2 ON public.lj_cit_terms(lc2.spans) @> ARRAY[r.t]
+        JOIN decisions d2 ON d2.id = lc2.decision_id
+        WHERE d2.publication_codes && $2
+          AND lc2.decision_id <> $1
+        GROUP BY lc2.decision_id
+        ORDER BY sum(ln(
+                     (SELECT greatest(reltuples, 1)::float8 FROM pg_class
+                      WHERE oid = 'decisions'::regclass)
+                     / r.decision_count::float8
+                 )) DESC,
+                 lc2.decision_id
+        LIMIT $3
+        ",
+    );
+    let idf_rows = conn
+        .query(&idf_query, &[&source_id, &notable, &limit])
+        .await?;
+
+    let chrono_rows = conn
+        .query(
+            "
+            WITH RECURSIVE chain(id, depth) AS (
+                SELECT $1::bigint, 0
+                UNION
+                SELECT CASE WHEN dl.decision_id = c.id THEN dl.target_decision_id
+                            ELSE dl.decision_id END,
+                       c.depth + 1
+                FROM chain c
+                JOIN decision_links dl
+                  ON dl.target_decision_id IS NOT NULL
+                 AND (dl.decision_id = c.id OR dl.target_decision_id = c.id)
+                WHERE c.depth < 8
             )
-            .await?;
-        if exists.is_none() {
-            return Err(ApiError::NotFound);
+            SELECT DISTINCT id FROM chain WHERE id <> $1
+            ",
+            &[&source_id],
+        )
+        .await?;
+
+    Ok(GraphLegs {
+        direct: direct_rows.iter().map(|r| r.get(0)).collect(),
+        idf: idf_rows.iter().map(|r| r.get(0)).collect(),
+        chronology: chrono_rows.iter().map(|r| r.get(0)).collect(),
+    })
+}
+
+/// Assemble le volet principe : citations directes d'abord, puis les hits en
+/// accord IDF ∩ KNN, puis entrelacement alterné IDF/KNN.
+pub fn assemble_principe(direct: &[i64], idf: &[i64], knn: &[i64], limit: usize) -> Vec<i64> {
+    let knn_set: HashSet<i64> = knn.iter().copied().collect();
+    let accord = idf.iter().copied().filter(|id| knn_set.contains(id));
+
+    let mut interleaved = Vec::with_capacity(idf.len() + knn.len());
+    let (mut it_idf, mut it_knn) = (idf.iter().copied(), knn.iter().copied());
+    loop {
+        let (a, b) = (it_idf.next(), it_knn.next());
+        if a.is_none() && b.is_none() {
+            break;
         }
-        return Ok(Vec::new());
+        interleaved.extend(a);
+        interleaved.extend(b);
     }
 
+    let mut seen = HashSet::new();
+    direct
+        .iter()
+        .copied()
+        .chain(accord)
+        .chain(interleaved)
+        .filter(|id| seen.insert(*id))
+        .take(limit)
+        .collect()
+}
+
+/// Hydrate les cartes des deux volets en une requête, indexées par id interne ;
+/// l'appelant rétablit l'ordre d'assemblage.
+async fn hydrate_similar_hits(
+    state: &AppState,
+    ids: &[i64],
+) -> Result<HashMap<i64, SimilarDecisionHit>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let conn = state.pool.get().await?;
+    let rows = conn
+        .query(
+            "
+            SELECT
+              d.id,
+              d.public_id,
+              d.jurisdiction_type,
+              d.jurisdiction_code,
+              d.date_lecture::text,
+              d.docket_numbers,
+              d.solution_uid,
+              d.procedure_uid,
+              d.office_uid,
+              d.publication_codes,
+              d.summary
+            FROM decisions d
+            WHERE d.id = ANY($1)
+            ",
+            &[&ids],
+        )
+        .await?;
+    drop(conn);
+
     let refs = referential(state).await?;
-    let mut hits = Vec::with_capacity(rows.len());
+    let mut hits = HashMap::with_capacity(rows.len());
     for row in &rows {
-        let id: String = row.get(0);
-        let jur_type_raw: String = row.get(1);
-        let jurisdiction_code: Option<String> = row.get(2);
-        let score: f64 = row.get(3);
+        let internal_id: i64 = row.get(0);
+        let id: String = row.get(1);
+        let jur_type_raw: String = row.get(2);
+        let jurisdiction_code: Option<String> = row.get(3);
         let date_lecture: Option<String> = row.get(4);
         let docket_numbers: Option<Vec<String>> = row.get(5);
         let docket_numbers = docket_numbers.filter(|d| !d.is_empty());
@@ -1489,22 +1705,24 @@ pub async fn similar_decisions(
         let publication_codes: Option<Vec<String>> = row.get(9);
         let summary: Option<String> = row.get(10);
 
-        hits.push(SimilarDecisionHit {
-            id,
-            jurisdiction_type: parse_enum_str(&jur_type_raw).unwrap_or(JurisdictionType::Ta),
-            jurisdiction_name: jurisdiction_code
-                .as_deref()
-                .and_then(|c| refs.jurisdiction(c))
-                .map(|j| j.label.clone()),
-            score,
-            date_lecture,
-            docket_numbers,
-            solution: opt_tag(&solution_uid, &refs),
-            procedure: opt_tag(&procedure_uid, &refs),
-            office: opt_tag(&office_uid, &refs),
-            publication_codes: publication_codes.unwrap_or_default(),
-            summary,
-        });
+        hits.insert(
+            internal_id,
+            SimilarDecisionHit {
+                id,
+                jurisdiction_type: parse_enum_str(&jur_type_raw).unwrap_or(JurisdictionType::Ta),
+                jurisdiction_name: jurisdiction_code
+                    .as_deref()
+                    .and_then(|c| refs.jurisdiction(c))
+                    .map(|j| j.label.clone()),
+                date_lecture,
+                docket_numbers,
+                solution: opt_tag(&solution_uid, &refs),
+                procedure: opt_tag(&procedure_uid, &refs),
+                office: opt_tag(&office_uid, &refs),
+                publication_codes: publication_codes.unwrap_or_default(),
+                summary,
+            },
+        );
     }
     Ok(hits)
 }
@@ -1518,8 +1736,73 @@ fn parse_enum_str<T: for<'de> serde::Deserialize<'de>>(code: &str) -> Option<T> 
 mod tests {
     use super::*;
 
-    /// Raccourci de construction d'une `RawLegalRef` pour les tests : `(num,
-    /// num_key)` posés à l'identique (forme déjà canonique).
+    #[test]
+    fn assemble_principe_direct_puis_accord_puis_entrelacement() {
+        let out = assemble_principe(&[1], &[2, 3, 4], &[3, 5, 6], 6);
+        assert_eq!(out, vec![1, 3, 2, 5, 4, 6]);
+    }
+
+    #[test]
+    fn assemble_principe_cap_et_dedup_direct() {
+        let out = assemble_principe(&[2], &[2, 3], &[4, 5], 3);
+        assert_eq!(out, vec![2, 4, 3]);
+    }
+
+    fn gate_meta(
+        jt: &str,
+        solution: Option<&str>,
+        chars: i32,
+        cites_1014: bool,
+    ) -> SimilarSourceMeta {
+        SimilarSourceMeta {
+            jurisdiction_type: jt.to_string(),
+            solution_uid: solution.map(str::to_string),
+            text_chars: chars,
+            cites_1014,
+        }
+    }
+
+    #[test]
+    fn gate_desistement_coupe_les_deux_volets() {
+        let m = gate_meta("TA", Some("solution:DESISTEMENT"), 2_500, false);
+        assert!(similar_principe_gated(&m));
+        assert!(similar_espece_gated(&m));
+    }
+
+    #[test]
+    fn gate_non_lieu_coupe_le_principe_seul() {
+        let m = gate_meta("TA", Some("solution:NON_LIEU_A_STATUER"), 2_500, false);
+        assert!(similar_principe_gated(&m));
+        assert!(!similar_espece_gated(&m));
+    }
+
+    #[test]
+    fn gate_rejet_1014_court_cc_seulement() {
+        let m = gate_meta("CC", Some("solution:REJET"), 2_406, true);
+        assert!(similar_principe_gated(&m));
+        assert!(!similar_principe_gated(&gate_meta(
+            "CC",
+            Some("solution:REJET"),
+            8_249,
+            true
+        )));
+        assert!(!similar_principe_gated(&gate_meta(
+            "TA",
+            Some("solution:REJET"),
+            1_964,
+            false
+        )));
+        assert!(!similar_principe_gated(&gate_meta(
+            "CE", None, 2_047, false
+        )));
+    }
+
+    #[test]
+    fn assemble_principe_jambes_vides() {
+        assert_eq!(assemble_principe(&[], &[], &[7, 8], 4), vec![7, 8]);
+        assert!(assemble_principe(&[], &[], &[], 4).is_empty());
+    }
+
     fn raw_ref(instrument: &str, slug: Option<&str>, articles: &[&str]) -> RawLegalRef {
         (
             instrument.to_string(),
@@ -1533,7 +1816,6 @@ mod tests {
 
     #[test]
     fn parse_legal_refs_keeps_instrument_without_articles() {
-        // Instrument cité sans article précis : conservé tel quel.
         let raw = vec![raw_ref("Code du travail", Some("code-du-travail"), &[])];
         let refs = parse_legal_refs(&raw).expect("ref conservée");
         assert_eq!(refs[0].instrument, "Code du travail");
@@ -1547,8 +1829,6 @@ mod tests {
 
     #[test]
     fn parse_legal_refs_drops_unresolved_free_text() {
-        // Citation non résolue (slug None : free text « règlement intérieur ») →
-        // exclue ; seule la référence ancrée au catalogue survit.
         let raw = vec![
             raw_ref("Règlement intérieur", None, &["12"]),
             raw_ref("Code civil", Some("code-civil"), &["1240"]),
@@ -1556,22 +1836,18 @@ mod tests {
         let refs = parse_legal_refs(&raw).expect("la ref résolue survit");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].instrument, "Code civil");
-        // Que des non-résolues → liste vide → None.
         let only_unresolved = vec![raw_ref("Règlement intérieur", None, &["12"])];
         assert!(parse_legal_refs(&only_unresolved).is_none());
     }
 
     #[test]
     fn find_char_indexes_in_codepoints() {
-        // Texte avec un caractère multi-octets avant la cible.
         let text = "café au lait, motivations: rejet";
-        // « motivations » commence après « café au lait, » (codepoints).
         let pos = find_char(text, "motivations", 0).unwrap();
         assert_eq!(
             text.chars().skip(pos).take(11).collect::<String>(),
             "motivations"
         );
-        // Recherche à partir d'un curseur au-delà : introuvable.
         assert!(find_char(text, "café", 5).is_none());
     }
 
@@ -1582,12 +1858,10 @@ mod tests {
         assert_eq!(section_label("inconnu"), None);
     }
 
-    // ── Spans de citation cliquables (ADR 0125 / 0134) ───────────────────────
+    // ── Spans de citation cliquables ──────────────────────────────────────────
 
     use lj_core::decision::DecisionSection as CoreSection;
 
-    /// `Decision` minimale pour les tests de mapping : seuls `texte_integral_clean`
-    /// et `sections` (offsets codepoints) portent l'information utile.
     fn mk_decision(clean: &str, sections: Vec<CoreSection>) -> Decision {
         Decision {
             source_uid: String::new(),
@@ -1648,22 +1922,16 @@ mod tests {
 
     #[test]
     fn range_detection_bounds_du_meme_texte_separees_de_a() {
-        // « les articles L. 225-1 à L. 225-9 du code » : deux bornes du même
-        // texte, à article, séparées du seul mot « à » → plage (le handler les
-        // fusionne en un span pleine-plage et résout les intermédiaires).
         let text: Vec<char> = "les articles L. 225-1 à L. 225-9 du code".chars().collect();
         assert_eq!(text[13..21].iter().collect::<String>(), "L. 225-1");
         assert_eq!(text[24..32].iter().collect::<String>(), "L. 225-9");
         let a = raw(13, 21, "LEGITEXT000006074228", Some("L. 225-1"));
         let b = raw(24, 32, "LEGITEXT000006074228", Some("L. 225-9"));
         assert!(is_article_range(&a, &b, &text));
-        // Textes différents → pas une plage.
         let autre = raw(24, 32, "LEGITEXT000006070933", Some("L. 225-9"));
         assert!(!is_article_range(&a, &autre, &text));
-        // Mention nue (sans numéro d'article) → pas une plage.
         let nue = raw(24, 32, "LEGITEXT000006074228", None);
         assert!(!is_article_range(&a, &nue, &text));
-        // Interstice ≠ « à » (« et ») → pas une plage.
         let text_et: Vec<char> = "les articles L. 225-1 et L. 225-9 du code"
             .chars()
             .collect();
@@ -1676,18 +1944,15 @@ mod tests {
 
     #[test]
     fn range_stem_enumerable_ou_non() {
-        // Bornes énumérables : même radical, pas entiers.
         assert_eq!(
             range_stem("L. 225-1", "L. 225-9"),
             Some(("L. 225".to_string(), 1, 9))
         );
         assert_eq!(range_stem("102", "108"), Some((String::new(), 102, 108)));
-        // Radicaux différents, suffixe lettré, ordre inversé, plage géante → None.
         assert_eq!(range_stem("L. 225-1", "L. 226-3"), None);
         assert_eq!(range_stem("50 sexies B", "H"), None);
         assert_eq!(range_stem("L. 225-9", "L. 225-1"), None);
         assert_eq!(range_stem("1", "300"), None);
-        // Clés candidates : entiers stricts + sous-articles du pas bas inclus.
         let (exact, like) = range_candidate_keys("L. 225", 1, 4);
         assert_eq!(exact, vec!["L. 225-2", "L. 225-3"]);
         assert_eq!(like, vec!["L. 225-1-%", "L. 225-2-%", "L. 225-3-%"]);
@@ -1695,25 +1960,16 @@ mod tests {
 
     #[test]
     fn global_offset_maps_to_correct_paragraph_local_offset_with_multibyte() {
-        // Deux paragraphes ; « é » (2 octets, 1 codepoint) avant et dans la cible.
-        // P0 = "Considérant l'article 1240" (0..26 codepoints)
-        // séparateur "\n" en codepoint 26
-        // P1 = "Décision rendue, voir 1241." (27..54)
         let clean = "Considérant l'article 1240\nDécision rendue, voir 1241.";
-        // Vérifie les offsets codepoints qu'on vise.
         let p0_start = clean.chars().position(|c| c == 'C').unwrap();
         assert_eq!(p0_start, 0);
         let n_p0 = "Considérant l'article 1240".chars().count();
-        // « 1240 » global = derniers 4 codepoints de P0.
         let g_start = n_p0 - 4;
         let g_end = n_p0;
 
         let decision = mk_decision(clean, Vec::new());
-        // Spans renvoyés section par section : une seule section (aucune fournie ⇒
-        // None). On teste directement les plages globales + spans_for_range.
         let ranges = paragraph_global_ranges(&decision);
         assert_eq!(ranges.len(), 2);
-        // P0 occupe [0, n_p0) ; le span global tombe dedans → local [n_p0-4, n_p0).
         let (p0s, p0e) = ranges[0];
         assert_eq!((p0s, p0e), (0, n_p0));
         let spans0 = spans_for_range(
@@ -1727,7 +1983,6 @@ mod tests {
             clean.chars().skip(g_start).take(4).collect::<String>(),
             "1240"
         );
-        // P1 n'inclut PAS ce span (hors de sa plage).
         let (p1s, p1e) = ranges[1];
         let spans1 = spans_for_range(&[cite(g_start, g_end, None)], p1s, p1e);
         assert!(spans1.is_empty());
@@ -1735,24 +1990,17 @@ mod tests {
 
     #[test]
     fn overlapping_spans_merge_and_union_targets() {
-        // Paragraphe [0, 40). Deux citations qui se chevauchent → UNE région
-        // (enveloppe 10..30) portant les DEUX cibles (menu déroulant côté front) :
-        // aucune n'est droppée, contrairement à l'ancien longest-win.
         let short = cite(12, 20, Some("/texte/x/court"));
         let long = cite(10, 30, Some("/texte/x/long"));
         let spans = spans_for_range(&[short, long], 0, 40);
         assert_eq!(spans.len(), 1);
         assert_eq!((spans[0].start, spans[0].end), (10, 30));
-        // Ordre = apparition (tri par début) : long (10) puis court (12).
         let hrefs: Vec<_> = spans[0].targets.iter().map(|t| t.href.as_deref()).collect();
         assert_eq!(hrefs, vec![Some("/texte/x/long"), Some("/texte/x/court")]);
     }
 
     #[test]
     fn coextensive_multi_article_yields_one_span_multi_target() {
-        // « articles 1382, 1383 et 1384 du code civil » : N lignes legal_citation au
-        // MÊME span → une région, N cibles (menu). C'est le cas que l'ancien
-        // longest-win réduisait à un seul lien.
         let mk = |href: &str, label: &str| GlobalCitation {
             start: 5,
             end: 40,
@@ -1765,7 +2013,7 @@ mod tests {
             mk("/texte/code-civil/1382", "1382"),
             mk("/texte/code-civil/1383", "1383"),
             mk("/texte/code-civil/1384", "1384"),
-            mk("/texte/code-civil/1382", "1382"), // doublon exact → dédupliqué
+            mk("/texte/code-civil/1382", "1382"),
         ];
         let spans = spans_for_range(&cites, 0, 60);
         assert_eq!(spans.len(), 1);
@@ -1779,21 +2027,19 @@ mod tests {
 
     #[test]
     fn disjoint_spans_kept_and_sorted_by_start() {
-        // Deux citations disjointes (résolue + non résolue) → deux spans, triés.
         let a = cite(20, 24, Some("/texte/x/2"));
         let b = cite(5, 9, None);
         let spans = spans_for_range(&[a, b], 0, 40);
         assert_eq!(spans.len(), 2);
         assert_eq!((spans[0].start, spans[0].end), (5, 9));
         assert_eq!(spans[0].targets.len(), 1);
-        assert!(spans[0].targets[0].href.is_none()); // la projection est agnostique au href
+        assert!(spans[0].targets[0].href.is_none());
         assert_eq!((spans[1].start, spans[1].end), (20, 24));
         assert_eq!(spans[1].targets[0].href.as_deref(), Some("/texte/x/2"));
     }
 
     #[test]
     fn multi_occurrence_yields_one_span_per_mention() {
-        // Une même citation mentionnée deux fois dans le paragraphe → deux spans.
         let m1 = cite(3, 7, Some("/texte/x/9"));
         let m2 = cite(15, 19, Some("/texte/x/9"));
         let spans = spans_for_range(&[m1, m2], 0, 30);
@@ -1804,10 +2050,8 @@ mod tests {
 
     #[test]
     fn span_outside_paragraph_is_ignored() {
-        // Span entièrement hors de la plage du paragraphe → aucun span.
         let spans = spans_for_range(&[cite(100, 110, Some("/texte/x/1"))], 0, 40);
         assert!(spans.is_empty());
-        // Span à cheval sur la borne (non entièrement contenu) → ignoré.
         let spans = spans_for_range(&[cite(38, 45, Some("/texte/x/1"))], 0, 40);
         assert!(spans.is_empty());
     }

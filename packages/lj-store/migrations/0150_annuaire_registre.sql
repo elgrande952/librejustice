@@ -1,4 +1,4 @@
--- ADR 0233 — double décompte de l'annuaire : total du registre par catégorie.
+-- Double décompte de l'annuaire : total du registre par catégorie.
 --
 -- `entity_contentieux` (0132) ne compte que les entités avec ≥ 1 décision
 -- liée ; affiché seul, ce chiffre fait passer les registres pour minuscules

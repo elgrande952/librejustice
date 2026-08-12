@@ -1,11 +1,11 @@
--- ADR 0127 — autorité « FR-prioritaire » : départage des provenances de même
+-- Autorité « FR-prioritaire » : départage des provenances de même
 -- `source_rank` par langue servie, AVANT l'`id` (ordre d'ingest). Sans cela, la
 -- rendition EN d'une décision multilingue ingérée en premier (HUDOC publie un
 -- `itemid` par langue → un `source_uid` par langue, même `source_rank`) reste
 -- l'autorité quand le FR arrive ensuite : `ORDER BY source_rank DESC, id ASC`
 -- est aveugle à la langue, l'EN garde le plus petit `id` et le `full_text` gravé
 -- ne se re-dérive jamais (reconcile ne touche pas au texte). Conséquence : on
--- sert l'EN alors qu'on a le FR — l'inverse de l'intention FR-prioritaire d'ADR 0120.
+-- sert l'EN alors qu'on a le FR — l'inverse de l'intention FR-prioritaire.
 --
 -- `lang_rank` factorise la définition de « FR » en un seul endroit (CEDH :
 -- `languageisocode = 'FRE'` ; CJUE : `resource_obtained_language = 'fra'`), à

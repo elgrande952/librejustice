@@ -1,22 +1,21 @@
-//! Trait commun des embedders (port de `embedding/base.py`).
+//! Trait commun des embedders.
 
-use crate::error::Result;
+use crate::error::{EmbedError, Result};
 use ndarray::Array2;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Dimension cible des embeddings.
 pub const EMBEDDING_DIM: usize = 1024;
 
-/// Instruction Qwen3 asymétrique pour les requêtes (port fidèle de
-/// `LEGAL_QUERY_INSTRUCTION`, Python). Doit rester identique octet-pour-octet :
-/// elle entre dans le texte effectivement embedé et donc dans la parité.
+/// Instruction Qwen3 asymétrique pour les requêtes. Doit rester identique
+/// octet-pour-octet : elle entre dans le texte effectivement embedé.
 pub const LEGAL_QUERY_INSTRUCTION: &str =
     "Given a French-language legal question, retrieve passages from \
 French court decisions that best answer it.";
 
 /// Préfixe une requête de l'instruction (format Qwen3-Embedding asymétrique).
 ///
-/// Port de `format_query` : `f"Instruct: {instruction}\nQuery: {text}"`.
+/// Forme : `Instruct: {instruction}\nQuery: {text}`.
 pub fn format_query(text: &str, instruction: &str) -> String {
     format!("Instruct: {instruction}\nQuery: {text}")
 }
@@ -37,11 +36,10 @@ pub enum AnyEmbedder {
     Cloudflare(crate::cloudflare::CloudflareWorkersAIEmbedder),
     OpenAiHttp(crate::openai_http::OpenAIHttpEmbedder),
     /// vLLM (OpenAI-HTTP) primaire, repli Cloudflare Workers AI en disjoncteur
-    /// binaire (ADR 0221). `degraded=false` : vLLM seul. À son premier échec
-    /// (typiquement le `connect_timeout` quand la machine vLLM est éteinte) on
-    /// latch `degraded=true` ; chaque requête lance alors vLLM et Cloudflare en
-    /// même temps, le premier qui répond gagne — un succès vLLM ré-arme
-    /// `degraded=false`.
+    /// binaire. `degraded=false` : vLLM seul. À son premier échec (typiquement le
+    /// `connect_timeout` quand la machine vLLM est éteinte) on latch `degraded=true` ;
+    /// chaque requête lance alors vLLM et Cloudflare en même temps, le premier qui
+    /// répond gagne — un succès vLLM ré-arme `degraded=false`.
     Auto {
         vllm: crate::openai_http::OpenAIHttpEmbedder,
         cloudflare: crate::cloudflare::CloudflareWorkersAIEmbedder,
@@ -49,16 +47,15 @@ pub enum AnyEmbedder {
     },
 }
 
-/// Disjoncteur du mode `auto` (ADR 0221), factorisé entre passages et requêtes
-/// via deux fabriques de futures (une par backend), ré-appelables (`Fn`).
+/// Disjoncteur du mode `auto`, factorisé entre passages et requêtes via deux
+/// fabriques de futures (une par backend), ré-appelables (`Fn`).
 ///
-/// `degraded=false` : vLLM seul. Son premier échec latch `degraded=true` et sert
-/// la requête courante via Cloudflare (le seul appel qui « attend » vLLM — borné
-/// par son `connect_timeout`). `degraded=true` : vLLM et Cloudflare sont lancés
-/// **en même temps**, `tokio::select!` renvoie le premier qui répond. Cloudflare
-/// répond vite donc l'utilisateur n'attend jamais l'échec de vLLM ; le vLLM
-/// concurrent est la sonde de reprise — dès qu'il regagne la course (vLLM local
-/// bat Cloudflare quand il est up), on ré-arme `degraded=false`.
+/// `degraded=false` : vLLM seul. Son premier échec latch `degraded=true` et sert la
+/// requête courante via Cloudflare (le seul appel qui « attend » vLLM — borné par
+/// son `connect_timeout`). `degraded=true` : vLLM et Cloudflare sont lancés **en
+/// même temps**, `tokio::select!` renvoie le premier qui répond ; le vLLM concurrent
+/// est la sonde de reprise — dès qu'il regagne la course, on ré-arme
+/// `degraded=false`.
 async fn auto_embed<VF, CF, VFut, CFut>(
     degraded: &AtomicBool,
     vllm: VF,
@@ -73,6 +70,7 @@ where
     if !degraded.load(Ordering::Relaxed) {
         match vllm().await {
             Ok(r) => return Ok(r),
+            Err(exc) if is_request_fault(&exc) => return Err(exc),
             Err(exc) => {
                 degraded.store(true, Ordering::Relaxed);
                 tracing::warn!(error = %exc, "vllm KO → dégradé, repli Cloudflare");
@@ -87,10 +85,28 @@ where
                 tracing::info!("vllm a regagné la course → mode nominal réarmé");
                 Ok(v)
             }
+            Err(exc) if is_request_fault(&exc) => Err(exc),
             Err(_) => cloudflare().await,
         },
         r = cloudflare() => r,
     }
+}
+
+/// L'erreur porte-t-elle sur la **requête** plutôt que sur la santé du backend ?
+///
+/// Le disjoncteur n'a de sens que pour l'indisponibilité : machine éteinte,
+/// connexion refusée, timeout. Un refus qui dit « cette entrée-là est invalide »
+/// n'apprend rien sur le backend — le second backend la refusera pareil — et le
+/// latch qu'il provoquerait dégraderait tout le run.
+///
+/// `InputTooLong` en est un : le chunk char-heuristique peut dépasser 8192 tokens
+/// sur un texte dense. `embed_prepared` sait le rattraper (re-chunk BPE exact puis
+/// retry), mais seulement si l'erreur lui **parvient**.
+fn is_request_fault(err: &EmbedError) -> bool {
+    matches!(
+        err,
+        EmbedError::InputTooLong | EmbedError::Invalid(_) | EmbedError::TokenBudgetExceeded { .. }
+    )
 }
 
 impl Embedder for AnyEmbedder {
@@ -136,14 +152,8 @@ impl Embedder for AnyEmbedder {
 
 /// Embedder déterministe par hachage (tests / mode hors-ligne).
 ///
-/// Port de `DummyEmbedder` : produit un vecteur gaussien déterministe par texte,
-/// L2-normalisé. ATTENTION parité : le Python s'appuie sur
-/// `numpy.random.default_rng(seed).standard_normal(dim)` (PCG64 + Ziggurat),
-/// non reproductible sans répliquer l'implémentation interne de numpy. Cette
-/// version utilise un PRNG splitmix64 + Box-Muller, déterministe et
-/// auto-cohérent côté Rust, mais **non identique octet-pour-octet** aux
-/// vecteurs Python. Le dummy n'est utilisé qu'en tests/CI ; aucune parité
-/// numérique n'est attendue pour ce backend (cf. notes).
+/// Produit un vecteur gaussien déterministe par texte, L2-normalisé (PRNG
+/// splitmix64 + Box-Muller). Utilisé en tests / hors-ligne uniquement.
 #[derive(Debug, Clone, Copy)]
 pub struct DummyEmbedder {
     pub dim: usize,
@@ -162,7 +172,6 @@ impl DummyEmbedder {
         for (i, text) in texts.iter().enumerate() {
             let seed = seed_from_text(text);
             let mut rng = SplitMix64::new(seed);
-            // Tirage gaussien déterministe (Box-Muller).
             let mut v: Vec<f32> = (0..dim).map(|_| rng.next_gaussian() as f32).collect();
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 0.0 {
@@ -187,8 +196,8 @@ impl Embedder for DummyEmbedder {
     }
 }
 
-/// Graine 64 bits dérivée du texte (FNV-1a 64). Substitut dependency-free du
-/// `sha256(text)[:8]` Python — déterministe, pas équivalent cryptographiquement.
+/// Graine 64 bits dérivée du texte (FNV-1a 64) : déterministe, pas
+/// cryptographique.
 fn seed_from_text(text: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -249,7 +258,6 @@ mod tests {
 
     #[test]
     fn format_query_shape() {
-        // Port exact de format_query (Python).
         let q = format_query("ma question", "instruction X");
         assert_eq!(q, "Instruct: instruction X\nQuery: ma question");
     }

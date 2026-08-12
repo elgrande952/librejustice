@@ -1,6 +1,5 @@
-//! Éléments partagés par l'annuaire des entités (ADR 0192) : catégories,
-//! chargements de données, rail latéral des catégories et rendu d'une ligne
-//! d'entité.
+//! Éléments partagés par l'annuaire des entités : catégories, chargements de
+//! données, rail latéral des catégories et rendu d'une ligne d'entité.
 //!
 //! Les fetchers passent par [`ApiClient`] (transport aiguillé par cible, comme
 //! la fiche entité) : in-process `lj_api::entities` au SSR, HTTP
@@ -151,8 +150,8 @@ const SEARCH_LIMIT: u32 = 25;
 /// Entités par page de listing (offset-based, parité fiche entité).
 pub const PAGE_SIZE: i64 = 20;
 /// Pages max d'un listing — contrat de `/entities/directory`
-/// (`ENTITY_DIRECTORY_MAX_DEPTH` = 10 000 lignes côté API, ADR 0239) : la
-/// pagination s'arrête là, la recherche par préfixe couvre la traîne.
+/// (`ENTITY_DIRECTORY_MAX_DEPTH` = 10 000 lignes côté API) : la pagination
+/// s'arrête là, la recherche par préfixe couvre la traîne.
 pub const MAX_PAGES: i64 = 10_000 / PAGE_SIZE;
 /// Longueur minimale d'une recherche (codepoints) — contrat de
 /// `/entities/search` (`ENTITY_SEARCH_MIN_QUERY` côté API).

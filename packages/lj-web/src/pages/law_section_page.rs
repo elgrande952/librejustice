@@ -1,29 +1,59 @@
-//! Page `/texte/{code}/section/{cid}` (LawSectionPage, ADR 0207) : vue-lecture
-//! d'une division d'un texte au gabarit Légifrance `section_lc` — articles
-//! rendus à la suite avec intertitres, fil d'Ariane des divisions englobantes,
-//! rail « Dans cette division », navigation bloc précédent/suivant, masquage
-//! des articles abrogés. Contenu bloquant SSR (SEO), `Cache-Control` selon le
-//! statut, calqué sur [`crate::pages::law_code_page`].
+//! Page `/texte/{code}/section/{cid}` (LawSectionPage) : vue-lecture d'une
+//! division d'un texte au gabarit Légifrance `section_lc` — articles rendus à
+//! la suite avec intertitres, fil d'Ariane des divisions englobantes, plan
+//! « Dans cette division », décisions citant la division, divisions voisines.
+//! Contenu bloquant SSR (SEO), `Cache-Control` selon le statut, calqué sur
+//! [`crate::pages::law_code_page`].
+//!
+//! Gabarit trois colonnes commun aux pages document, monté par
+//! [`DecisionLayout`] : gauche = s'y repérer dans le temps et dans le plan,
+//! centre = la division et ce qui la cite, droite = les rebonds du corpus.
 
 use leptos::either::Either;
 use leptos::prelude::*;
 use leptos_meta::{Link, Meta, Title};
 use leptos_router::components::A;
-use lj_dtos::{LawSectionItem, LawSectionRef, LawSectionResponse};
+use lj_dtos::{LawSectionItem, LawSectionRef, LawSectionResponse, TopCitedArticle};
 
+use crate::components::decision::DecisionLayout;
+use crate::components::layout::SHELL;
+use crate::components::own_page_description;
 use crate::helpers::format_article_num;
-use crate::pages::law_page::data::{chrono_date, fetch_section, section_key, sendable, PageError};
+use crate::pages::law_page::cited_by::{
+    decisions_href, section as cited_by_section, CitedBySubject, CitedText,
+};
+use crate::pages::law_page::data::{
+    chrono_date, fetch_section, fetch_section_citing, section_key, sendable, CitingResult,
+    PageError,
+};
+use crate::pages::law_page::top_cited::top_cited_block;
 use crate::pages::law_page::{rail_block, rail_item, status_label, ChronoDatePicker};
+
+/// Articles portés par le « voir tout » de la division : la facette
+/// `legalArticle` prend une valeur par article, et une URL n'en porte pas deux
+/// mille — un Livre en compte autant. Même borne que l'agrégation servie par
+/// l'API (`legi::section_citing`).
+const FACET_VALUES: usize = 20;
 
 #[component]
 pub fn LawSectionPage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) :
+    // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
+    own_page_description();
+
     let key = section_key();
-    // Datée par `?date=` (Chronolégi, ADR 0193 §5) : sous-arbre et corps à la
-    // date demandée, sinon en vigueur.
+    // Datée par `?date=` (Chronolégi) : sous-arbre et corps à la date demandée,
+    // sinon en vigueur.
     let date = chrono_date();
     let section = Resource::new_blocking(
         move || (key.get(), date.get()),
         |((code, cid), date)| sendable(fetch_section(code, cid, date)),
+    );
+    // Décisions citant la division : non bloquantes, streamées sous la lecture —
+    // la date choisit la composition du sous-arbre agrégé.
+    let citing = Resource::new(
+        move || (key.get(), date.get()),
+        |((code, cid), date)| sendable(fetch_section_citing(code, cid, date)),
     );
 
     view! {
@@ -33,7 +63,9 @@ pub fn LawSectionPage() -> impl IntoView {
                     Ok(section) => {
                         set_cache_control(200);
                         Either::Left(
-                            view! { <LawSectionLoaded section=section date=date.get() /> },
+                            view! {
+                                <LawSectionLoaded section=section citing=citing date=date.get() />
+                            },
                         )
                     }
                     Err(err) => {
@@ -92,7 +124,7 @@ fn SectionError(err: PageError) -> impl IntoView {
 fn SectionSkeleton() -> impl IntoView {
     use crate::components::ui::Skeleton;
     view! {
-        <div class="mx-auto flex w-full max-w-[92rem] flex-1 flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
+        <div class=format!("{SHELL} flex flex-1 flex-col gap-6")>
             <Skeleton class="h-4 w-1/3" />
             <Skeleton class="h-9 w-2/3" />
             <Skeleton class="h-4 w-full" />
@@ -104,6 +136,7 @@ fn SectionSkeleton() -> impl IntoView {
 #[component]
 fn LawSectionLoaded(
     section: LawSectionResponse,
+    citing: Resource<CitingResult>,
     /// Date de consultation Chronolégi (`?date=`), propagée aux liens.
     #[prop(optional_no_strip)]
     date: Option<String>,
@@ -145,36 +178,93 @@ fn LawSectionLoaded(
         &section.ancestors,
         date.as_deref(),
     );
-    let rail = division_rail(&section.items);
-    let footer = nav_footer(&code, section.prev, section.next, date.as_deref());
-    let picker = view! {
-        <ChronoDatePicker
-            base=format!("/texte/{}/section/{}", section.code, section.cid)
-            date=Signal::derive({
-                let date = date.clone();
-                move || date.clone()
-            })
-        />
-    };
+    let footer = nav_footer(
+        &code,
+        section.prev.clone(),
+        section.next.clone(),
+        date.as_deref(),
+    );
+    let neighbors = neighbor_rail(&code, section.prev, section.next, date.as_deref());
 
     let hide_abroges = RwSignal::new(false);
-    let toggle = (abroges > 0).then(|| {
-        view! {
-            <button
-                type="button"
-                on:click=move |_| hide_abroges.update(|v| *v = !*v)
-                class="inline-flex items-center gap-1 rounded-md border border-[var(--color-rule)] px-2.5 py-1 text-xs text-[var(--color-ink-subtle)] transition-colors hover:border-[var(--color-ink)] hover:text-[var(--color-ink)]"
-            >
-                {move || {
-                    if hide_abroges.get() {
-                        "Afficher les articles abrogés"
-                    } else {
-                        "Masquer les articles abrogés"
-                    }
-                }}
-            </button>
+    // Contenu de la gouttière gauche, rendu deux fois (voir plus bas) : la
+    // closure le rebâtit, une vue ne se rend pas à deux endroits.
+    let rail_content = {
+        let base = format!("/texte/{}/section/{}", section.code, section.cid);
+        let date = date.clone();
+        let items = section.items.clone();
+        move || {
+            let picker = view! {
+                <ChronoDatePicker
+                    base=base.clone()
+                    date=Signal::derive({
+                        let date = date.clone();
+                        move || date.clone()
+                    })
+                />
+            };
+            let toggle = (abroges > 0).then(|| {
+                view! {
+                    <button
+                        type="button"
+                        on:click=move |_| hide_abroges.update(|v| *v = !*v)
+                        class="inline-flex items-center gap-1 rounded-md border border-[var(--color-rule)] px-2.5 py-1 text-xs text-[var(--color-ink-subtle)] transition-colors hover:border-[var(--color-ink)] hover:text-[var(--color-ink)]"
+                    >
+                        {move || {
+                            if hide_abroges.get() {
+                                "Afficher les articles abrogés"
+                            } else {
+                                "Masquer les articles abrogés"
+                            }
+                        }}
+                    </button>
+                }
+            });
+            view! {
+                {picker}
+                {division_rail(&items)}
+                {toggle}
+            }
         }
-    });
+    };
+
+    // « Cité par » au centre : décisions citantes de tout le sous-arbre, puis
+    // textes citants agrégés au grain du texte. Le « voir tout » compose la
+    // facette `legalArticle` sur les articles de tête, le repli plein-texte prend
+    // le titre de la division.
+    let subject = CitedBySubject {
+        name: "cette division",
+        all_href: decisions_href(
+            "legalArticle",
+            facet_values(&code, &section.items, &section.top_cited),
+        ),
+        search_href: decisions_href("q", [section.title.clone()]),
+    };
+    let citing_texts: Vec<CitedText> = section
+        .citing_texts
+        .into_iter()
+        .map(CitedText::from)
+        .collect();
+    // Articles de la division en ordre de lecture, pour que chaque ligne de
+    // décision dise par quel article elle entre : l'API ne renvoie que les clés
+    // canoniques, les numéros affichables sont dans la vue-lecture.
+    let read_order = StoredValue::new(reading_articles(&section.items));
+    let cited_by = view! {
+        <Suspense fallback=move || {
+            view! {
+                <p class="text-sm text-[var(--color-ink-subtle)]">"Chargement des décisions…"</p>
+            }
+        }>
+            {move || {
+                let subject = subject.clone();
+                let texts = citing_texts.clone();
+                Suspend::new(async move {
+                    cited_by_section(citing.await, texts, &subject, &read_order.get_value())
+                })
+            }}
+        </Suspense>
+    };
+    let top_cited = top_cited_block(&code, section.top_cited);
 
     let items = section
         .items
@@ -182,47 +272,90 @@ fn LawSectionLoaded(
         .map(|item| section_item_view(item, &code, date.as_deref()))
         .collect_view();
     let reading = view! {
-        <div
-            class="flex max-w-3xl flex-col"
-            class:abroges-masques=move || hide_abroges.get()
-        >
+        <div class="flex flex-col" class:abroges-masques=move || hide_abroges.get()>
             {items}
         </div>
     };
 
+    // Rail gauche : la dimension temporelle, le plan local, puis l'action de
+    // lecture. Scrollable indépendamment — le plan d'un Livre dépasse la
+    // fenêtre.
+    let toc = view! {
+        <div class="flex flex-col gap-6 lg:sticky lg:top-20 lg:max-h-[calc(100vh-6rem)] lg:self-start lg:overflow-y-auto">
+            {rail_content()}
+        </div>
+    }
+    .into_any();
     let main = view! {
-        <div class="flex w-full min-w-0 max-w-3xl flex-col gap-6">
+        <div class="flex flex-col gap-6">
+            {breadcrumb}
             <header class="flex flex-col gap-3">
                 <h1 class="font-sans text-2xl text-[var(--color-ink)] sm:text-3xl">
                     {section.title}
                 </h1>
-                <p class="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm text-[var(--color-ink-subtle)]">
-                    <span>{compte}</span>
-                    {toggle}
-                </p>
-                {picker}
+                <p class="text-sm text-[var(--color-ink-subtle)]">{compte}</p>
             </header>
+            // Sous `lg`, `DecisionLayout` efface les deux gouttières : le rail
+            // gauche est ré-injecté ici, plan avant le corps, comme la page
+            // décision ré-injecte son sommaire.
+            <div class="flex flex-col gap-6 lg:hidden">{rail_content()}</div>
             {reading}
+            {cited_by}
             {footer}
         </div>
-    };
+    }
+    .into_any();
+    let similar = view! {
+        <aside
+            aria-label="Articles et divisions liés"
+            class="flex flex-col gap-6 lg:sticky lg:top-20 lg:self-start"
+        >
+            {top_cited}
+            {neighbors}
+        </aside>
+    }
+    .into_any();
 
     view! {
         <Title text=page_title />
         <Meta name="description" content=description />
         <Link rel="canonical" href=url />
-
-        <div class="mx-auto flex w-full max-w-[92rem] flex-1 flex-col gap-6 px-4 py-8 sm:px-6 lg:px-8">
-            {breadcrumb}
-            // Gabarit commun /decisions · /textes · /decision : gouttière 240px
-            // toujours présente (vide sans rail) — le contenu tombe au même x que
-            // sur les autres pages.
-            <div class="grid items-start gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12">
-                <div class="hidden lg:block">{rail}</div>
-                {main}
-            </div>
-        </div>
+        <DecisionLayout toc=toc main=main similar=similar />
     }
+}
+
+/// Articles de la division en ordre de lecture, `(clé canonique, numéro
+/// affichable)` : la table dans laquelle une ligne de décision citante résout
+/// les articles qu'elle vise.
+fn reading_articles(items: &[LawSectionItem]) -> Vec<(String, String)> {
+    items
+        .iter()
+        .filter(|i| i.kind == "article")
+        .filter_map(|i| {
+            let num_key = i.num_key.clone()?;
+            Some((num_key, format_article_num(&i.label)))
+        })
+        .collect()
+}
+
+/// Valeurs de la facette `legalArticle` du « voir tout » : les articles les plus
+/// cités d'abord, complétés dans l'ordre du document, bornées à
+/// [`FACET_VALUES`].
+fn facet_values(code: &str, items: &[LawSectionItem], top: &[TopCitedArticle]) -> Vec<String> {
+    let doc_order = items
+        .iter()
+        .filter(|i| i.kind == "article")
+        .filter_map(|i| i.num_key.as_deref());
+    let mut keys: Vec<&str> = Vec::with_capacity(FACET_VALUES);
+    for key in top.iter().map(|a| a.num_key.as_str()).chain(doc_order) {
+        if keys.len() == FACET_VALUES {
+            break;
+        }
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys.into_iter().map(|k| format!("{code}|{k}")).collect()
 }
 
 /// Fil d'Ariane : code → divisions englobantes (chacune vers sa vue-lecture).
@@ -266,35 +399,45 @@ fn breadcrumb(
     .into_any()
 }
 
-/// Rail sticky « Dans cette division » : les sous-divisions de premier niveau,
-/// ancrées `#{cid}`. Masqué s'il n'y en a pas au moins deux.
+/// Rail « Dans cette division » : le plan local — les **enfants directs** de la
+/// division, sous-divisions (ancre `#{cid}`) et articles (ancre
+/// `#art-{num_key}`, portée par les `<article>` de la vue-lecture). Une division
+/// qui ne porte que des articles a donc un plan, elle aussi. Rien à lister ⇒ pas
+/// de rail.
+///
+/// Le plan s'arrête au premier niveau : le sous-arbre entier d'une grosse
+/// division est un dump, pas un plan.
 fn division_rail(items: &[LawSectionItem]) -> Option<AnyView> {
-    let entries: Vec<AnyView> = items
-        .iter()
-        .filter(|i| i.kind == "section" && i.depth == 1)
-        .map(|i| {
-            let href = format!("#{}", i.cid.clone().unwrap_or_default());
-            let body = view! {
-                <a
-                    href=href
-                    class="block text-sm leading-snug text-[var(--color-accent)] no-underline hover:underline"
-                >
-                    {i.label.clone()}
-                </a>
-            }
-            .into_any();
-            rail_item(false, body)
-        })
-        .collect();
-    if entries.len() < 2 {
+    let mut entries: Vec<AnyView> = Vec::new();
+    for item in items {
+        if item.depth != 1 {
+            continue;
+        }
+        let (href, label, cls) = if item.kind == "section" {
+            (
+                format!("#{}", item.cid.clone().unwrap_or_default()),
+                item.label.clone(),
+                "block text-sm leading-snug text-[var(--color-accent)] no-underline hover:underline",
+            )
+        } else {
+            let Some(num_key) = item.num_key.as_deref() else {
+                continue;
+            };
+            (
+                format!("#art-{num_key}"),
+                format!("Article {}", format_article_num(&item.label)),
+                "block text-xs leading-snug text-[var(--color-ink-muted)] no-underline hover:text-[var(--color-accent)] hover:underline",
+            )
+        };
+        let body = view! { <a href=href class=cls>{label}</a> }.into_any();
+        entries.push(rail_item(false, body));
+    }
+    if entries.is_empty() {
         return None;
     }
     Some(
         view! {
-            <nav
-                aria-label="Dans cette division"
-                class="hidden lg:sticky lg:top-20 lg:block lg:self-start"
-            >
+            <nav aria-label="Dans cette division">
                 {rail_block("Dans cette division", entries)}
             </nav>
         }
@@ -302,8 +445,39 @@ fn division_rail(items: &[LawSectionItem]) -> Option<AnyView> {
     )
 }
 
-/// Navigation bloc précédent / bloc suivant en pied de lecture — l'ordre de
-/// lecture du texte, hors sous-arbre de la division courante.
+/// Colonne droite : les divisions voisines en ordre de lecture, hors sous-arbre
+/// de la division courante — la piste droite ne porte que des rebonds. Aucune
+/// voisine ⇒ pas de bloc.
+fn neighbor_rail(
+    code: &str,
+    prev: Option<LawSectionRef>,
+    next: Option<LawSectionRef>,
+    date: Option<&str>,
+) -> AnyView {
+    if prev.is_none() && next.is_none() {
+        return ().into_any();
+    }
+    let q = date.map(|d| format!("?date={d}")).unwrap_or_default();
+    let cards: Vec<AnyView> = [
+        prev.map(|t| neighbor_card(code, t, "← Bloc précédent", &q, STACKED)),
+        next.map(|t| neighbor_card(code, t, "Bloc suivant →", &q, STACKED)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    view! {
+        <div class="flex flex-col gap-2">
+            <h2 class="font-sans text-base text-[var(--color-ink)]">"Divisions voisines"</h2>
+            <div class="flex flex-col gap-3">{cards}</div>
+        </div>
+    }
+    .into_any()
+}
+
+/// Navigation bloc précédent / bloc suivant en pied de lecture, mobile
+/// uniquement — sur desktop la piste droite porte les divisions voisines, mais
+/// sous `lg` les gouttières disparaissent (même patron que les articles voisins
+/// de la page article).
 fn nav_footer(
     code: &str,
     prev: Option<LawSectionRef>,
@@ -314,41 +488,54 @@ fn nav_footer(
         return ().into_any();
     }
     let q = date.map(|d| format!("?date={d}")).unwrap_or_default();
-    let card = |target: Option<LawSectionRef>, eyebrow: &'static str, right: bool| {
-        let Some(t) = target else {
-            return view! { <span class="flex-1" /> }.into_any();
+    let card =
+        |target: Option<LawSectionRef>, eyebrow: &'static str, layout: &'static str| match target {
+            Some(t) => neighbor_card(code, t, eyebrow, &q, layout),
+            None => view! { <span class="flex-1" /> }.into_any(),
         };
-        let href = format!("/texte/{code}/section/{}{q}", t.cid);
-        let align = if right {
-            "items-end text-right"
-        } else {
-            "items-start text-left"
-        };
-        view! {
-            <A
-                href=href
-                attr:class=format!(
-                    "group flex flex-1 flex-col gap-1 rounded-md border border-[var(--color-rule)] px-4 py-3 no-underline transition-colors hover:border-[var(--color-ink)] {align}",
-                )
-            >
-                <span class="text-xs uppercase tracking-[0.14em] text-[var(--color-ink-subtle)]">
-                    {eyebrow}
-                </span>
-                <span class="line-clamp-2 text-sm leading-snug text-[var(--color-ink)] group-hover:text-[var(--color-accent)]">
-                    {t.label}
-                </span>
-            </A>
-        }
-        .into_any()
-    };
     view! {
         <nav
             aria-label="Divisions voisines"
-            class="mt-4 flex max-w-3xl flex-col gap-3 border-t border-[var(--color-rule)] pt-6 sm:flex-row"
+            class="mt-4 flex flex-col gap-3 border-t border-[var(--color-rule)] pt-6 sm:flex-row lg:hidden"
         >
-            {card(prev, "← Bloc précédent", false)}
-            {card(next, "Bloc suivant →", true)}
+            {card(prev, "← Bloc précédent", PAIRED_LEFT)}
+            {card(next, "Bloc suivant →", PAIRED_RIGHT)}
         </nav>
+    }
+    .into_any()
+}
+
+/// Cartes voisines empilées, une par ligne (rail droit).
+const STACKED: &str = "items-start text-left";
+/// Cartes voisines côte à côte, largeur partagée (pied de lecture) : le bloc
+/// précédent à gauche, le suivant aligné à droite.
+const PAIRED_LEFT: &str = "flex-1 items-start text-left";
+const PAIRED_RIGHT: &str = "flex-1 items-end text-right";
+
+/// Carte de rebond vers une division voisine : œillard puis libellé, la
+/// grammaire bordée des rebonds. `layout` place la carte dans son conteneur.
+fn neighbor_card(
+    code: &str,
+    target: LawSectionRef,
+    eyebrow: &'static str,
+    q: &str,
+    layout: &'static str,
+) -> AnyView {
+    let href = format!("/texte/{code}/section/{}{q}", target.cid);
+    view! {
+        <A
+            href=href
+            attr:class=format!(
+                "group flex flex-col gap-1 rounded-md border border-[var(--color-rule)] px-4 py-3 no-underline transition-colors hover:border-[var(--color-ink)] {layout}",
+            )
+        >
+            <span class="text-xs uppercase tracking-[0.14em] text-[var(--color-ink-subtle)]">
+                {eyebrow}
+            </span>
+            <span class="line-clamp-2 text-sm leading-snug text-[var(--color-ink)] group-hover:text-[var(--color-accent)]">
+                {target.label}
+            </span>
+        </A>
     }
     .into_any()
 }

@@ -1,10 +1,10 @@
-//! Téléchargement HTTP générique d'un document (PDF/HTML) au bord I/O (#1).
+//! Téléchargement HTTP générique d'un document (PDF/HTML) au bord I/O.
 //!
-//! Utilisé par le track d'ingest des corps d'accords/traités (ADR 0109 Addendum) :
-//! le texte des accords/conventions vit hors du bulk JORF (PDF born-digital
-//! consolidés, pages HTML, XHTML EUR-Lex). Frontière I/O unique : les octets bruts
-//! repartent vers l'extraction texte plat (`pdf::extract_pdf_text` /
-//! `html_strip::strip_html`) puis le segmenteur pur de `lj-core`.
+//! Utilisé par le track d'ingest des corps d'accords/traités : le texte des
+//! accords/conventions vit hors du bulk JORF (PDF born-digital consolidés, pages
+//! HTML, XHTML EUR-Lex). Frontière I/O unique : les octets bruts repartent vers
+//! l'extraction texte plat (`pdf::extract_pdf_text` / `html_strip::strip_html`)
+//! puis le segmenteur pur de `lj-core`.
 
 use crate::error::{Result, SourceError};
 

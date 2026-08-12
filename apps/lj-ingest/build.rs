@@ -1,7 +1,6 @@
 //! Télécharge le tokenizer Qwen3-Embedding-0.6B au build dans `OUT_DIR` (~11 Mo,
 //! jamais committé) pour `include_bytes!` dans `lj-ingest` — seul binaire qui
-//! re-chunke en BPE exact. Aucune I/O réseau au runtime, aucune lib partagée
-//! polluée.
+//! re-chunke en BPE exact. Aucune I/O réseau au runtime.
 
 use std::path::PathBuf;
 use std::process::Command;

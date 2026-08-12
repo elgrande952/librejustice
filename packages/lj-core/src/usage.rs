@@ -1,4 +1,4 @@
-//! Signal d'usage des citations (ADR 0248) : normalisation partagée entre le
+//! Signal d'usage des citations : normalisation partagée entre le
 //! prédicat de recherche (grammes de la requête) et le job `lj-ingest
 //! usage-terms` (sacs) — les deux côtés doivent produire les mêmes tokens
 //! pour que l'index `legal_article_usage_bm25` matche.
@@ -32,8 +32,7 @@ pub fn usage_grams(text: &str) -> String {
 /// porteur de chiffre — « L442-1 », « article 145 du CPC ») et
 /// navigationnelles (« code … ») visent une entité exacte déjà servie par les
 /// clauses titre / la jambe conteneurs — le signal d'usage n'y apporte que du
-/// bruit de co-citation. Validée au banc (parité exacte sur 10 GT
-/// référence/nav, working-note 2026-07-20).
+/// bruit de co-citation.
 pub fn usage_reference_or_nav_query(query: &str) -> bool {
     let q = query.trim().to_lowercase();
     q.split_whitespace()

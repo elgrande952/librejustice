@@ -1,10 +1,11 @@
-//! `lj-sources` — I/O sources (port de `librejustice-core/sources`).
+//! `lj-sources` — I/O sources.
 //!
 //! Client Judilibre (reqwest), downloader incrémental + ZIP opendata, lecteur
 //! d'archives ZIP. Aucune logique de parsing métier ici : les bytes/JSON bruts
 //! sont remis aux parsers de `lj-core`.
 
 pub mod adde;
+pub mod annonces;
 pub mod ariane;
 pub mod bofip;
 pub mod cedh;

@@ -1,11 +1,9 @@
-//! Extraction d'articles normalisés à partir du texte nettoyé
-//! (port de `articles.py`). Helper pur conservé pour les tests/offline.
-//! Volet CITATIONS (ADR 0116) — hors périmètre du scan de marqueurs ADR 0157.
+//! Extraction d'articles normalisés à partir du texte nettoyé. Helper pur
+//! conservé pour les tests/offline.
 //!
-//! Reprend 1:1 le pipeline regex de `parsing/normalizer.py` (`_ART_RE` +
-//! `_norm_suffix`) : on capture la mention brute (`m.group(0)`) pour l'affichage
-//! et on dérive un `article_norm` minuscule, déterministe. Dédup sur
-//! `article_norm` (première occurrence gagne).
+//! On capture la mention brute pour l'affichage et on dérive un `article_norm`
+//! minuscule, déterministe. Dédup sur `article_norm` (première occurrence
+//! gagne).
 
 use std::sync::OnceLock;
 
@@ -21,7 +19,7 @@ pub struct Article {
     pub raw_mention: String,
 }
 
-/// Mapping libellé → code canonique (port de `_CODE_MAP`). Ordonné du plus long
+/// Mapping libellé → code canonique. Ordonné du plus long
 /// au plus court pour éviter qu'un libellé long soit avalé par `code`.
 const CODE_MAP: &[(&str, &str)] = &[
     (
@@ -56,9 +54,8 @@ const CODE_MAP: &[(&str, &str)] = &[
     ("cja", "CJA"),
 ];
 
-/// `_ART_RE` : préfixe L/R/D/A, point optionnellement espacé, numéro (≥ 2
-/// chiffres) avec tirets `-`/`‑` (insécable), suffixe `du <code>` optionnel.
-/// `(?i)` = `re.IGNORECASE` côté Python.
+/// Préfixe L/R/D/A, point optionnellement espacé, numéro (≥ 2 chiffres) avec
+/// tirets `-`/`‑` (insécable), suffixe `du <code>` optionnel.
 fn art_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -87,12 +84,11 @@ fn strip_accents(s: &str) -> String {
         .collect()
 }
 
-/// Associe un libellé libre (« code de la santé publique ») à un sigle canonique
-/// (port de `_norm_suffix`). Normalise casse/accents/apostrophes/espaces puis
-/// cherche le préfixe le plus long de la table.
+/// Associe un libellé libre (« code de la santé publique ») à un sigle
+/// canonique. Normalise casse/accents/apostrophes/espaces puis cherche le
+/// préfixe le plus long de la table.
 fn norm_suffix(raw_suffix: &str) -> Option<&'static str> {
     let lowered = strip_accents(&raw_suffix.to_lowercase());
-    // re.sub(r"[’'`]", " ", s) puis collapse espaces.
     let replaced: String = lowered
         .chars()
         .map(|c| {
@@ -113,7 +109,7 @@ fn norm_suffix(raw_suffix: &str) -> Option<&'static str> {
     None
 }
 
-/// `re.sub(r"\s+", " ", s)` — collapse toute suite de blancs en un espace.
+/// Collapse toute suite de blancs en un espace.
 fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_ws = false;

@@ -20,6 +20,10 @@ jsonpath "$.token_endpoint" exists
 jsonpath "$.token_endpoint" endsWith "/oauth/token"
 jsonpath "$.registration_endpoint" exists
 jsonpath "$.registration_endpoint" endsWith "/oauth/register"
+jsonpath "$.revocation_endpoint" exists
+jsonpath "$.revocation_endpoint" endsWith "/oauth/revoke"
+jsonpath "$.revocation_endpoint_auth_methods_supported" count == 1
+jsonpath "$.revocation_endpoint_auth_methods_supported[0]" == "none"
 jsonpath "$.response_types_supported" isCollection
 jsonpath "$.response_types_supported" count == 1
 jsonpath "$.response_types_supported[0]" == "code"
@@ -62,6 +66,28 @@ jsonpath "$.resource" endsWith "/mcp"
 jsonpath "$.authorization_servers" count == 1
 jsonpath "$.scopes_supported[0]" == "mcp"
 jsonpath "$.bearer_methods_supported[0]" == "header"
+
+# -----------------------------------------------------------------------------
+# 3bis. Discovery préfixée par la ressource — `/mcp/.well-known/*`.
+#       Forme tentée en premier par Perplexity-MCP et aisec-registry.
+#       Mêmes documents que les chemins racine.
+# -----------------------------------------------------------------------------
+GET {{base}}/mcp/.well-known/oauth-protected-resource
+HTTP 200
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.resource" endsWith "/mcp"
+jsonpath "$.authorization_servers" count == 1
+jsonpath "$.scopes_supported[0]" == "mcp"
+jsonpath "$.bearer_methods_supported[0]" == "header"
+
+GET {{base}}/mcp/.well-known/oauth-authorization-server
+HTTP 200
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.token_endpoint" endsWith "/oauth/token"
+jsonpath "$.registration_endpoint" endsWith "/oauth/register"
+jsonpath "$.grant_types_supported" count == 2
 
 # -----------------------------------------------------------------------------
 # 4. POST /oauth/register — minimal valid body (RFC 7591 DCR)
@@ -219,6 +245,39 @@ Content-Type: application/json
   "redirect_uri": "https://claude.ai/cb"
 }
 HTTP 401
+
+# -----------------------------------------------------------------------------
+# 8. POST /oauth/revoke — form-urlencoded; RFC 7009. Public client, no client
+#    auth: holding the token IS the credential.
+# -----------------------------------------------------------------------------
+# 8a. unknown token -> 200 with EMPTY body (RFC 7009 2.2: the response must not
+#     tell the caller whether the token existed).
+POST {{base}}/oauth/revoke
+Content-Type: application/x-www-form-urlencoded
+[FormParams]
+token: nonexistent_access_token_value
+HTTP 200
+[Asserts]
+bytes count == 0
+
+# 8b. malformed token + token_type_hint (accepted and ignored) -> 200 empty
+POST {{base}}/oauth/revoke
+Content-Type: application/x-www-form-urlencoded
+[FormParams]
+token: not-a-token !!
+token_type_hint: refresh_token
+HTTP 200
+[Asserts]
+bytes count == 0
+
+# 8c. missing token -> 400 invalid_request (RFC 6749 5.2)
+POST {{base}}/oauth/revoke
+Content-Type: application/x-www-form-urlencoded
+[FormParams]
+token_type_hint: access_token
+HTTP 400
+[Asserts]
+jsonpath "$.detail" == "invalid_request"
 
 # --- AUTHED assertions (runner injects {{token}}) ---------------------------
 # With a valid Supabase bearer token AND a registered client whose redirect_uri

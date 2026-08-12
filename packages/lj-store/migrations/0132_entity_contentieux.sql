@@ -1,4 +1,4 @@
--- ADR 0192 — annuaire des entités avec contentieux.
+-- Annuaire des entités avec contentieux.
 --
 -- Table de stats matérialisée : une ligne par entité de registre ayant AU
 -- MOINS une décision liée (`decision_party.entity_uid`), dénormalisée avec

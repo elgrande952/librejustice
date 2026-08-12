@@ -1,6 +1,5 @@
-//! Kit de composants « Mon activite » — port de `activity-ui.tsx`. Memes classes
-//! Tailwind, meme structure DOM. Composants partages par les trois panneaux
-//! (recherches / lectures / signets).
+//! Kit de composants « Mon activite ». Composants partages par les trois
+//! panneaux (recherches / lectures / signets).
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -22,7 +21,7 @@ pub fn ActivityShell(
     children: Children,
     #[prop(optional)] aside: Option<AnyView>,
 ) -> impl IntoView {
-    // Chemin courant pour styler l'onglet actif (port de `NavLink isActive`).
+    // Chemin courant pour styler l'onglet actif.
     let pathname = {
         #[cfg(feature = "hydrate")]
         {
@@ -156,7 +155,7 @@ pub fn PanelToolbar(
 
 /// Skeleton d'une liste d'activite : barre d'outils + cartes placeholder.
 /// Calque la forme de `PanelToolbar` + `CardList`/`ActivityCard` pendant la
-/// verification de session puis le chargement de la liste — jamais de zone vide.
+/// verification de session puis le chargement de la liste.
 #[component]
 pub fn ActivityListSkeleton() -> impl IntoView {
     view! {
@@ -314,8 +313,7 @@ pub fn InfiniteSentinel(
 
         // L'observateur et sa fn de deconnexion tiennent des handles JS (pas
         // `Send`) : on les garde dans des slots `LocalStorage` et on deconnecte
-        // l'observateur precedent a chaque passage (port du `disconnect()` du
-        // cleanup React). `on_cleanup` est inutilisable (exige `Send + Sync`).
+        // l'observateur precedent a chaque passage.
         let on_reach = std::rc::Rc::new(on_reach);
         let disconnect_slot: StoredValue<Option<JsValue>, leptos::reactive::owner::LocalStorage> =
             StoredValue::new_local(None);
@@ -324,7 +322,6 @@ pub fn InfiniteSentinel(
             leptos::reactive::owner::LocalStorage,
         > = StoredValue::new_local(None);
         Effect::new(move |_| {
-            // Deconnecte l'observateur du passage precedent.
             if let Some(prev) = disconnect_slot.try_update_value(Option::take).flatten() {
                 if let Ok(f) = prev.dyn_into::<js_sys::Function>() {
                     let _ = f.call0(&JsValue::NULL);
@@ -384,10 +381,9 @@ fn CloseIcon() -> impl IntoView {
     }
 }
 
-/// Temps relatif compact FR (« il y a 5 min », « il y a 3 j »). Port de
-/// `relativeTime`. `now`/parse via `js_sys::Date` (cote client) ; au SSR la
-/// coquille est inerte (ces listes ne sont rendues qu'apres hydratation), on
-/// renvoie la chaine ISO brute.
+/// Temps relatif compact FR (« il y a 5 min », « il y a 3 j »). `now`/parse via
+/// `js_sys::Date`, cote client ; au SSR la coquille est inerte et on renvoie la
+/// chaine ISO brute.
 pub fn relative_time(iso: &str) -> String {
     #[cfg(feature = "hydrate")]
     {

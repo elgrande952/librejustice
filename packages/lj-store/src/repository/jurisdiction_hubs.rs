@@ -1,6 +1,5 @@
-//! Hubs juridiction (ADR 0253) : catalogue agrégé, années couvertes par une
-//! juridiction, page de décisions d'une année — les chemins de crawl SSR
-//! `/juridictions` → `/juridiction/{code}` → `/juridiction/{code}/{annee}`.
+//! Hubs juridiction : catalogue agrégé, années couvertes par une juridiction,
+//! page de décisions d'une année.
 
 use super::types::{HubDecisionRow, JurisdictionHubRow};
 use super::DecisionRepository;
@@ -8,9 +7,7 @@ use crate::error::Result;
 
 impl DecisionRepository<'_> {
     /// Catalogue des juridictions avec volume de décisions actives
-    /// (`/juridictions`). Agrégat sur l'index `(jurisdiction_code,
-    /// date_lecture)` (migration 0164) ; servi derrière le cache référentiel
-    /// 12 h de `lj-api` — le seq du GROUP BY reste ponctuel.
+    /// (`/juridictions`).
     #[tracing::instrument(name = "db.jurisdiction_catalogue", skip(self), fields(db.system = "postgresql"))]
     pub async fn jurisdiction_catalogue(&self) -> Result<Vec<JurisdictionHubRow>> {
         let rows = self
@@ -37,8 +34,7 @@ impl DecisionRepository<'_> {
     }
 
     /// Années couvertes par une juridiction, avec compteur, plus récente en
-    /// tête (`/juridiction/{code}`). Vide si le code est inconnu — le route
-    /// handler en fait un 404.
+    /// tête (`/juridiction/{code}`). Vide si le code est inconnu.
     #[tracing::instrument(name = "db.jurisdiction_years", skip(self), fields(db.system = "postgresql"))]
     pub async fn jurisdiction_years(&self, code: &str) -> Result<Vec<(i32, i64)>> {
         let rows = self
@@ -55,10 +51,8 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Couples `(code, années)` pour la section `juridictions` des sitemaps
-    /// (ADR 0253) : un hub par code + une URL par année, années récentes en
-    /// tête. Le join sur `jurisdiction` garantit que chaque URL émise a une
-    /// page (le hub 404 sur un code hors référentiel).
+    /// Couples `(code, années)` pour la section `juridictions` des sitemaps :
+    /// un hub par code + une URL par année, années récentes en tête.
     #[tracing::instrument(name = "db.iter_jurisdiction_hubs_for_sitemap", skip(self), fields(db.system = "postgresql"))]
     pub async fn iter_jurisdiction_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<i32>)>> {
         let rows = self

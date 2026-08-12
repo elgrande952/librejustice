@@ -1,5 +1,4 @@
-//! Composants « Mon activite » (STUBS). A remplir par l'agent de la tranche
-//! Profil/Activite : port de `apps/web/src/components/activity/activity-ui.tsx`.
+//! Composants « Mon activite ».
 
 pub mod activity_ui;
 

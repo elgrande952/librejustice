@@ -5,8 +5,8 @@ edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
 
-# Binaire de déploiement unique (ADR 0061) : API + MCP + SSR Leptos + assets +
-# TLS dans un seul process axum. Dépend de `lj-api` (lib) ET `lj-web` (lib, ssr) ;
+# Binaire de déploiement unique : API, MCP, SSR Leptos et assets dans un seul
+# process axum. Dépend de `lj-api` (lib) ET `lj-web` (lib, ssr) ;
 # `lj-api` ne dépend pas de `lj-web` → aucun cycle.
 [[bin]]
 name = "lj-server"
@@ -14,15 +14,27 @@ path = "src/main.rs"
 
 [dependencies]
 lj-api = { workspace = true }
+lj-core = { workspace = true }
 lj-web = { workspace = true, features = ["ssr"] }
 lj-store = { workspace = true }
 
 leptos = { workspace = true, features = ["ssr"] }
 leptos_axum = { workspace = true, features = ["default"] }
+any_spawner = { workspace = true }
 
 axum = { workspace = true }
 axum-server = { workspace = true }
+# Span serveur des pages SSR : même layer que le routeur API (lj-api).
+axum-tracing-opentelemetry = { workspace = true }
+# `Frame` / `SizeHint` du corps de réponse : axum ne réexporte que le trait
+# (`axum::body::HttpBody`), pas les types de sa signature.
+http-body = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tower = { workspace = true }
+tracing-subscriber = { workspace = true }

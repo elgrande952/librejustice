@@ -1,16 +1,15 @@
-//! Downloader HUDOC (CEDH) — I/O réseau au bord lj-sources (ADR 0094).
+//! Downloader HUDOC (CEDH) — I/O réseau au bord lj-sources.
 //!
 //! API publique sans auth sur `hudoc.echr.coe.int`, deux endpoints :
-//! - liste `GET /app/query/results` — `sort` **obligatoire** (sinon 404), `length`
+//! - liste `GET /app/query/results` — `sort` obligatoire (sinon 404), `length`
 //!   cappé <500, fenêtre globale 10 000 → partition par année
-//!   (`kpdate:[YYYY-01-01T00:00:00.0Z TO …]`). Filtre bilingue FR-prioritaire
-//!   (ADR 0120, supersede le FR-only de 0094) : `contentsitename=ECHR AND NOT
-//!   (doctype=PR OR HFCOMOLD OR HECOMOLD) AND (languageisocode="FRE" OR
-//!   languageisocode="ENG")`. HUDOC publie un document par version linguistique :
-//!   l'orchestrateur regroupe par affaire et retient la version FR si elle existe,
-//!   sinon EN (les affaires EN-only — beaucoup d'irrecevabilités/comité — entrent
-//!   ainsi dans le corpus). `select` = CSV des colonnes voulues (projection
-//!   serveur, sérialisation creuse : seules les clés non vides reviennent).
+//!   (`kpdate:[YYYY-01-01T00:00:00.0Z TO …]`). Filtre bilingue FR-prioritaire :
+//!   `contentsitename=ECHR AND NOT (doctype=PR OR HFCOMOLD OR HECOMOLD) AND
+//!   (languageisocode="FRE" OR languageisocode="ENG")`. HUDOC publie un document
+//!   par version linguistique : l'orchestrateur regroupe par affaire et retient
+//!   la version FR si elle existe, sinon EN. `select` = CSV des colonnes voulues
+//!   (projection serveur, sérialisation creuse : seules les clés non vides
+//!   reviennent).
 //! - corps `GET /app/conversion/docx/html/body?...&id={itemid}` → HTML (DOCX
 //!   converti), strippé en texte au bord par [`crate::html_strip::strip_html`].
 //!
@@ -41,13 +40,11 @@ pub const THROTTLE: Duration = Duration::from_millis(250);
 const CEDH_BODY_RETRIES: u32 = 4;
 /// `length` par page (cappé <500 côté serveur).
 pub const PAGE_SIZE: usize = 200;
-/// Colonnes projetées dans `select` — séparées par **virgule** (CSV). HUDOC a
-/// cessé d'honorer le séparateur `;` : avec `;`, le `select` est ignoré et chaque
-/// résultat ne renvoie que `{rank}` (aucun `itemid` → `parse_results` jette tout →
-/// 0 décision ingérée). Avec `,`, l'API renvoie le jeu de colonnes complet. Les
-/// valeurs internes multi-items (`appno`, `documentcollectionid2`…) gardent, elles,
-/// leur `;` propre dans la réponse — c'est uniquement le séparateur de `select` qui
-/// est passé en virgule.
+/// Colonnes projetées dans `select`, séparées par virgule (CSV). HUDOC
+/// n'honore pas le séparateur `;` : le `select` est alors ignoré et chaque
+/// résultat ne renvoie que `{rank}`, sans `itemid`. Les valeurs internes
+/// multi-items (`appno`, `documentcollectionid2`…) gardent, elles, leur `;`
+/// propre dans la réponse.
 pub const SELECT_COLUMNS: &str = "itemid,docname,appno,extractedappno,ecli,kpdate,judgementdate,\
 decisiondate,introductiondate,doctype,typedescription,documentcollectionid2,article,violation,\
 nonviolation,conclusion,importance,respondent,originatingbody_name,separateopinion,kpthesaurus,\
@@ -55,10 +52,9 @@ scl,sclappnos,externalsources,languageisocode";
 
 use crate::state_paths::CEDH_DIR;
 
-/// Filtre HUDOC bilingue FR-prioritaire (ADR 0120, supersede le FR-only de 0094),
-/// borné à une année par `kpdate:[…]` (grounding #4 : `NOT (doctype=PR OR HFCOMOLD
-/// OR HECOMOLD)`). On ramène FR **et** EN ; l'orchestrateur regroupe par affaire et
-/// préfère la version FR (cf. [`super`]).
+/// Filtre HUDOC bilingue FR-prioritaire, borné à une année par `kpdate:[…]`
+/// (`NOT (doctype=PR OR HFCOMOLD OR HECOMOLD)`). On ramène FR et EN ;
+/// l'orchestrateur regroupe par affaire et préfère la version FR (cf. [`super`]).
 fn year_query(year: i32) -> String {
     format!(
         "contentsitename=ECHR AND (NOT (doctype=PR OR doctype=HFCOMOLD OR doctype=HECOMOLD)) \
@@ -149,14 +145,13 @@ impl CedhClient {
     }
 
     /// Corps texte d'un document (`itemid`) : DOCX converti en HTML, strippé en
-    /// texte. **Corps 0 octet ≠ texte vide** (décision #5 : lag de conversion) —
-    /// le strip d'un corps vide rend une chaîne vide, l'ingest diffère alors la
-    /// décision (re-fetch au prochain run).
+    /// texte. Corps 0 octet ≠ texte vide (lag de conversion) — le strip d'un corps
+    /// vide rend une chaîne vide, l'ingest diffère alors la décision (re-fetch au
+    /// prochain run).
     pub async fn body_text(&self, itemid: &str) -> Result<String> {
-        // Cache disque : un corps déjà tiré est relu sans réseau (ni throttle).
-        // On ne cache QUE les 200 (corps réel) : les 204/vides ne sont pas mis en
-        // cache pour respecter le lag de conversion (un arrêt récent 204 peut gagner
-        // son corps plus tard), donc leur absence de fichier = re-fetch au run suivant.
+        // Cache disque : un corps déjà tiré est relu sans réseau (ni throttle). On
+        // ne cache que les 200 : un 204 (lag de conversion) peut gagner son corps plus
+        // tard, son absence de fichier vaut re-fetch au run suivant.
         if let Some(path) = self.body_cache_path(itemid) {
             if path.exists() {
                 return Ok(strip_html(&fs::read_to_string(&path)?));
@@ -170,15 +165,15 @@ impl CedhClient {
             ("logEvent", "False".to_string()),
         ];
         // HUDOC renvoie épisodiquement des 5xx de passerelle (502/503/504) et des
-        // 429 sous charge : transitoires, PAS structurels. Un seul tuait tout le
-        // bootstrap (cas réel : body 001-63180 → 502 → crash à l'année 1998). On
-        // retente avec backoff ; si le transitoire persiste, on diffère (corps vide
-        // → skip → re-fetch au prochain sync), même philosophie que le 204.
+        // 429 sous charge, transitoires. On retente avec backoff ; si le transitoire
+        // persiste, on diffère (corps vide → skip → re-fetch au prochain sync), même
+        // philosophie que le 204.
         let mut last_status = 0u16;
         for attempt in 0..CEDH_BODY_RETRIES {
-            if attempt > 0 {
-                tokio::time::sleep(THROTTLE * (1 << attempt)).await;
-            }
+            // Throttle de courtoisie au réseau seul : payé ici, après le cache — un hit
+            // disque ne dort pas. `<< attempt` = backoff des retries (250 ms, 500 ms, 1 s,
+            // 2 s).
+            tokio::time::sleep(THROTTLE * (1 << attempt)).await;
             let resp = self
                 .client
                 .get(&url)
@@ -190,9 +185,8 @@ impl CedhClient {
             let status = resp.status().as_u16();
             last_status = status;
             // 204 No Content = corps DOCX pas encore converti (lag, surtout arrêts de
-            // comité récents) : ce n'est PAS une erreur fatale mais le cas « corps vide
-            // → re-fetch différé » de la décision #5. On rend une chaîne vide et
-            // l'ingest diffère la décision (skip), comme pour un corps 0 octet.
+            // comité récents) : on rend une chaîne vide et l'ingest diffère la décision
+            // (skip), comme pour un corps 0 octet.
             if status == 204 {
                 return Ok(String::new());
             }
@@ -208,15 +202,14 @@ impl CedhClient {
                 }
                 return Ok(strip_html(&raw));
             }
-            // 429 / 5xx = transitoire → on retente. Tout autre code (4xx hors 429)
-            // est structurel → erreur franche immédiate.
+            // 429 / 5xx = transitoire → on retente. Tout autre code est structurel →
+            // erreur franche immédiate.
             if status != 429 && !(500..600).contains(&status) {
                 return Err(SourceError::Invalid(format!(
                     "hudoc body statut {status} {itemid}"
                 )));
             }
         }
-        // Transitoire persistant après retries : on diffère (skip), comme un 204.
         tracing::warn!(
             itemid,
             status = last_status,
@@ -234,7 +227,7 @@ impl Default for CedhClient {
 
 /// Une ligne `results` extraite : `itemid` (PK, jamais vide) + colonnes brutes.
 /// `language` = `languageisocode` projeté (`"FRE"`/`"ENG"`, vide si absent) — clé
-/// du choix FR-prioritaire au regroupement par affaire (ADR 0120).
+/// du choix FR-prioritaire au regroupement par affaire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CedhResult {
     pub itemid: String,
@@ -244,8 +237,13 @@ pub struct CedhResult {
 }
 
 /// Parse une réponse `results` HUDOC en lignes exploitables (drop des lignes
-/// sans `itemid` — PK obligatoire, décision #2). `resultcount` rendu à part pour
-/// que l'orchestrateur sache quand il a tout vu (fenêtre 10 000 par année).
+/// sans `itemid`, PK obligatoire). `resultcount` rendu à part pour que
+/// l'orchestrateur sache quand il a tout vu (fenêtre 10 000 par année).
+///
+/// Le champ `rank` (score de pertinence du moteur de recherche HUDOC, hors
+/// `select`, injecté dans chaque résultat) est retiré des colonnes : il varie
+/// à chaque publication dans la fenêtre d'année et empoisonnerait le checksum
+/// d'idempotence.
 pub fn parse_results(resp: &Value) -> (u64, Vec<CedhResult>) {
     let resultcount = resp["resultcount"].as_u64().unwrap_or(0);
     let mut out = Vec::new();
@@ -258,6 +256,10 @@ pub fn parse_results(resp: &Value) -> (u64, Vec<CedhResult>) {
             if itemid.is_empty() {
                 continue;
             }
+            let mut columns = columns.clone();
+            if let Some(obj) = columns.as_object_mut() {
+                obj.remove("rank");
+            }
             out.push(CedhResult {
                 itemid: itemid.to_string(),
                 doctype: columns["doctype"].as_str().unwrap_or("").to_string(),
@@ -265,7 +267,7 @@ pub fn parse_results(resp: &Value) -> (u64, Vec<CedhResult>) {
                     .as_str()
                     .unwrap_or("")
                     .to_string(),
-                columns: columns.clone(),
+                columns,
             });
         }
     }
@@ -327,7 +329,6 @@ mod tests {
     #[test]
     fn year_query_bounds_and_filters() {
         let q = year_query(2024);
-        // Bilingue FR-prioritaire (ADR 0120) : FR **et** EN ramenés, regroupés en aval.
         assert!(q.contains("languageisocode=\"FRE\" OR languageisocode=\"ENG\""));
         assert!(q.contains("NOT (doctype=PR OR doctype=HFCOMOLD OR doctype=HECOMOLD)"));
         assert!(q.contains("kpdate:[2024-01-01T00:00:00.0Z TO 2024-12-31T23:59:59.0Z]"));
@@ -356,8 +357,20 @@ mod tests {
         assert_eq!(rows[0].language, "FRE");
         assert_eq!(rows[0].columns["appno"].as_str(), Some("1234/16"));
         assert_eq!(rows[1].doctype, "CLINF");
-        // `languageisocode` absent → chaîne vide (sérialisation creuse HUDOC).
         assert_eq!(rows[1].language, "");
+    }
+
+    #[test]
+    fn parse_results_strips_volatile_rank() {
+        let resp = json!({
+            "resultcount": 1,
+            "results": [
+                { "columns": { "itemid": "001-1", "doctype": "HFJUD", "rank": 1.79255 } },
+            ]
+        });
+        let (_, rows) = parse_results(&resp);
+        assert!(rows[0].columns.get("rank").is_none());
+        assert_eq!(rows[0].columns["itemid"].as_str(), Some("001-1"));
     }
 
     #[test]

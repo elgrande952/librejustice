@@ -1,18 +1,16 @@
-//! Analyse **read-only** des faux merges judilibre (#29 / ADR 0100).
+//! Analyse read-only des faux merges judilibre.
 //!
 //! La dédup historique a fusionné des décisions distinctes partageant un RG sans
-//! `location` (cause des faux merges, ADR 0100 §2). `fuse_cluster` re-pointe les
-//! `decision_sources` des doublons vers le canonique puis supprime les lignes
-//! `decisions` doublons : une décision faussement fusionnée porte donc ≥2
-//! `decision_sources` actifs, chacun gardant son `source_fields`.
+//! `location`. `fuse_cluster` re-pointe les `decision_sources` des doublons vers
+//! le canonique puis supprime les lignes `decisions` doublons : une décision
+//! faussement fusionnée porte donc ≥2 `decision_sources` actifs, chacun gardant
+//! son `source_fields`.
 //!
-//! Cette passe **ne touche rien** : elle recalcule `canonical_ref` (ADR 0100) par
-//! provenance depuis `(source_fields, source_uid)` — full_text vide, les
-//! discriminants (type, location, RG, date) vivent dans les champs structurés —
-//! et classe chaque décision multi-provenance. Objectif : mesurer l'ampleur réelle
-//! avant tout re-split (écriture prod, étape distincte gatée). Penché **100 %
-//! spécificité** : une provenance sans clé exploitable (`None`) rend le verdict
-//! `Ambiguous` (jamais scindée).
+//! Cette passe ne touche rien : elle recalcule `canonical_ref` par provenance
+//! depuis `(source_fields, source_uid)` — full_text vide, les discriminants
+//! (type, location, RG, date) vivent dans les champs structurés — et classe
+//! chaque décision multi-provenance. Penchée 100 % spécificité : une provenance
+//! sans clé exploitable (`None`) rend le verdict `Ambiguous`.
 
 use anyhow::{anyhow, Result};
 use std::collections::BTreeSet;
@@ -26,20 +24,20 @@ use crate::config::Settings;
 /// Verdict d'une décision multi-provenance.
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
-    /// Toutes les provenances portent la **même** `canonical_ref` → fusion
-    /// légitime (ex. Cass abrégé Bulletin + intégrale partagent la clé).
+    /// Toutes les provenances portent la même `canonical_ref` → fusion légitime
+    /// (ex. Cass abrégé Bulletin + intégrale partagent la clé).
     Legit,
     /// ≥2 `canonical_ref` distinctes, toutes renseignées → décisions différentes
     /// faussement fusionnées. `groups` = nombre de décisions distinctes à
     /// reconstituer.
     FalseMerge { groups: usize },
     /// Au moins une provenance sans clé exploitable (`None`) → on ne peut pas
-    /// certifier la séparation. Conservateur : jamais scindée (#12, spécificité).
+    /// certifier la séparation. Jamais scindée.
     Ambiguous,
 }
 
-/// Classe une décision d'après les `canonical_ref` (ADR 0100) recalculés de ses
-/// provenances. Penché 100 % spécificité : tout `None` ⇒ `Ambiguous`.
+/// Classe une décision d'après les `canonical_ref` recalculés de ses provenances.
+/// Penché 100 % spécificité : tout `None` ⇒ `Ambiguous`.
 fn classify(refs: &[Option<String>]) -> Verdict {
     if refs.iter().any(Option::is_none) {
         return Verdict::Ambiguous;
@@ -52,11 +50,10 @@ fn classify(refs: &[Option<String>]) -> Verdict {
     }
 }
 
-/// `canonical_ref` (ADR 0100) d'une provenance judilibre, reconstruite depuis
-/// `(source_fields, source_uid)` avec full_text vide (les discriminants d'identité
-/// sont dans les champs structurés ; le full_text du membre supprimé est perdu et
-/// inutile ici). `None` si la juridiction n'est pas routée ou si les briques
-/// fiables manquent.
+/// `canonical_ref` d'une provenance judilibre, reconstruite depuis
+/// `(source_fields, source_uid)` avec full_text vide (les discriminants
+/// d'identité sont dans les champs structurés). `None` si la juridiction n'est
+/// pas routée ou si les briques fiables manquent.
 fn provenance_canonical_ref(source_fields: &Value, source_uid: &str) -> Option<String> {
     let decision = Decision::from_source_fields("", source_fields, source_uid);
     lj_extract::extract::routed(&decision).ok()?;
@@ -79,7 +76,6 @@ pub async fn analyze_false_merges() -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    // Agrégats sur ~3M lignes par batch : on lève la borne API (statement_timeout).
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
@@ -143,7 +139,7 @@ pub async fn analyze_false_merges() -> Result<()> {
         );
     }
 
-    println!("\n=== analyze-false-merges (read-only, #29 / ADR 0100) ===");
+    println!("\n=== analyze-false-merges (read-only) ===");
     println!(
         "décisions multi-provenances tout-judilibre : {}",
         stats.decisions
@@ -181,7 +177,6 @@ mod tests {
 
     #[test]
     fn all_same_key_is_legit() {
-        // Cass abrégé + intégrale : même clé → fusion légitime.
         assert_eq!(
             classify(&[s("cc|611|2020-01-15"), s("cc|611|2020-01-15")]),
             Verdict::Legit
@@ -190,7 +185,6 @@ mod tests {
 
     #[test]
     fn distinct_keys_is_false_merge() {
-        // Même RG, tribunaux différents (location) → décisions distinctes.
         let v = classify(&[
             s("tj|tj80021|26/00051|2026-01-20"),
             s("tj|tj75011|26/00051|2026-01-20"),
@@ -210,7 +204,6 @@ mod tests {
 
     #[test]
     fn any_none_is_ambiguous_never_split() {
-        // Spécificité 100 % : une provenance sans clé → jamais scindée.
         assert_eq!(
             classify(&[s("tj|tj80021|26/00051|2026-01-20"), None]),
             Verdict::Ambiguous

@@ -1,13 +1,11 @@
-//! Moteur d'extraction des citations (ADR 0158, remplace le volet 1 de
-//! l'ADR 0156) : l'automate ne porte plus le catalogue — seulement les FORMES
-//! structurelles de citation (ancres de nature « code/loi/convention… »,
-//! « article(s) », connecteurs d'anaphore) et les alias embarqués. Chaque
-//! ancre positionne un LEXER sur un petit span qui borne la mention ; le span
-//! est ensuite SNAPPÉ sur le catalogue (titres exacts pliés, index du linker)
-//! et le lien est délégué à [`link_citation`] (Voie B, alias, traités,
-//! gazetteer : la même autorité que toujours).
+//! Moteur d'extraction des citations. L'automate porte les FORMES structurelles
+//! de citation (ancres de nature « code/loi/convention… », « article(s) »,
+//! connecteurs d'anaphore) et les alias embarqués ; chaque ancre positionne un
+//! LEXER sur un petit span qui borne la mention, le span est SNAPPÉ sur le
+//! catalogue (titres exacts pliés, index du linker) et le lien est délégué à
+//! [`link_citation`].
 //!
-//! Deux phases strictement séparées (architecture « KV-cache ») :
+//! Deux phases strictement séparées :
 //!
 //! 1. **scan** — automate Aho-Corasick leftmost-longest (petit, statique) sur
 //!    texte plié longueur-stable + lexers positionnés par classe d'ancre +
@@ -18,9 +16,8 @@
 //!    l'article au catalogue, résolution des articles nus par UNICITÉ
 //!    (index inversé `num_key` → textes ∩ instruments du document).
 //!
-//! PUR (règle #1) : opère sur un [`LinkSnapshot`] et des [`CatalogText`]
-//! hydratés par l'appelant. Chiffré au banc unifié (`lj-bench extract
-//! --engine compiled`).
+//! PUR : opère sur un [`LinkSnapshot`] et des [`CatalogText`] hydratés par
+//! l'appelant.
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, OnceLock};
@@ -37,22 +34,16 @@ use crate::extract::{normalize_article, normalize_instrument};
 use crate::link::{link_citation_analyzed, KeyAnalysis};
 use crate::link::{CatalogText, Forum, LinkSnapshot, LinkTarget};
 
-// Pliage longueur-stable : vit dans `lj_core::text` (partagé recognizer /
-// chargeur de registres / recherche annuaire) ; ré-export crate-local
-// uniquement — les consommateurs externes passent par `lj-core`.
 pub(crate) use lj_core::text::{fold_char, fold_stable};
 
 /// `fold_stable(s).starts_with(prefix)` sans allouer — `prefix` déjà plié.
-/// Boucles chaudes du compose (anaphores : nature × antécédents).
 fn starts_with_folded(s: &str, prefix: &str) -> bool {
     let mut it = s.chars().map(fold_char);
     prefix.chars().all(|pc| it.next() == Some(pc))
 }
 
 /// Pliage canonique de comparaison : `fold_stable` + espaces réduits à un.
-/// C'est la forme des clés de `full_titles`/`code_titles` ET des candidats du
-/// walker (mots re-joints par espace simple) — les titres multi-lignes du
-/// texte s'apparient donc quel que soit leur blanc d'origine.
+/// Forme des clés de `full_titles` / `code_titles` et des candidats du walker.
 fn canon_fold(s: &str) -> String {
     fold_stable(s)
         .split_whitespace()
@@ -83,23 +74,20 @@ enum Anchor {
     ArtWord,
     /// Connecteur d'anaphore (« du même », « dudit », « précité »…).
     SameConn,
-    /// Référence BOFiP « BOI-IR-BASE-10-10 » (ADR 0196) : le code EST
-    /// l'identité — il égale le `text_uid` catalogue (alias direct du
-    /// snapshot). Majuscules exigées dans l'original.
+    /// Référence BOFiP « BOI-IR-BASE-10-10 » : le code EST l'identité — il égale
+    /// le `text_uid` catalogue. Majuscules exigées dans l'original.
     Boi,
-    /// Citation de jurisprudence (ADR 0165) : juridiction, « pourvoi »,
-    /// « affaire », « RG »… — le lexer borne le span au token identifiant et
-    /// dérive la clé pendante par famille. Flux séparé (`CompiledCase`),
-    /// jamais composé avec les instruments.
+    /// Citation de jurisprudence : juridiction, « pourvoi », « affaire », « RG »…
+    /// — le lexer borne le span au token identifiant et dérive la clé pendante par
+    /// famille. Flux séparé (`CompiledCase`), jamais composé avec les instruments.
     Case,
 }
 
 #[derive(Clone, Copy)]
 enum Pat {
-    /// Alias embarqué (link_aliases.tsv, instrument_aliases) : la surface
-    /// pliée EST la clé de linking. `sigle` = surface courte (≤ 6 chars)
-    /// exigée TOUT EN MAJUSCULES dans l'original (« du CPC » oui, « le cpc »
-    /// prose non).
+    /// Alias embarqué (link_aliases.tsv, instrument_aliases) : la surface pliée
+    /// EST la clé de linking. `sigle` = surface courte (≤ 6 chars) exigée TOUT EN
+    /// MAJUSCULES dans l'original.
     Alias {
         is_code: bool,
         sigle: bool,
@@ -107,14 +95,12 @@ enum Pat {
     Anchor(Anchor),
 }
 
-/// Rôle(s) d'un motif du flux unifié (ADR 0160) : une surface peut être à la
-/// fois ancre/alias citations ET marqueur structurel — LE MÊME token porte
-/// les deux rôles, chaque composeur filtre les siens. `mk_len` > 0 quand le
-/// rôle marqueur vient de la clôture par préfixe : la surface du marqueur
-/// est le préfixe de cette longueur (en octets pliés), et le gate
-/// (`marker_token`) s'applique à SES frontières — un alias OCR tronqué en
-/// plein mot (« code de l'entree et du sejour des etr ») ne doit pas tuer
-/// le signal porté par son préfixe sain.
+/// Rôle(s) d'un motif du flux unifié : une surface peut être à la fois
+/// ancre/alias citations ET marqueur structurel — le même token porte les deux
+/// rôles, chaque composeur filtre les siens. `mk_len` > 0 quand le rôle
+/// marqueur vient de la clôture par préfixe : la surface du marqueur est le
+/// préfixe de cette longueur (en octets pliés), et le gate (`marker_token`)
+/// s'applique à SES frontières.
 #[derive(Clone, Copy)]
 struct Roles {
     cite: Option<Pat>,
@@ -162,26 +148,16 @@ const ANCHORS: &[(&str, Anchor)] = &[
     ("ses articles", Anchor::SameConn),
     ("precite", Anchor::SameConn),
     ("precitee", Anchor::SameConn),
-    // Citations de jurisprudence (ADR 0165). « cedh » reste un ALIAS (la
-    // Convention) : la cour se désambiguïse dans le bras Alias par le n° de
-    // requête aval. « arret » porte aussi le rôle marqueur `Mk::Stop`
-    // (fusion des rôles dans `fused()`, comme « ordonnance »).
     ("pourvoi", Anchor::Case),
     ("pourvois", Anchor::Case),
     ("cass.", Anchor::Case),
     ("cass", Anchor::Case),
-    // Graphies collées « Cass.com., 14 oct. 2014 » : la frontière droite
-    // alphanumérique de l'ancre « cass. » les rejetterait.
     ("cass.com.", Anchor::Case),
     ("cass.civ.", Anchor::Case),
     ("cass.soc.", Anchor::Case),
     ("cass.crim.", Anchor::Case),
     ("cassation", Anchor::Case),
     ("cour de cassation", Anchor::Case),
-    // Chambres de la Cour de cassation citées seules (« Civ. 1ère, 27 février
-    // 2013, n° 11-25536 », « Soc. 21 septembre 2011 ») : gate MAJUSCULE
-    // initiale dans `lex_case` (la prose minuscule — « c. com. », le code —
-    // ne sonde pas), la forme du pourvoi discrimine ensuite.
     ("civ.", Anchor::Case),
     ("civ", Anchor::Case),
     ("soc.", Anchor::Case),
@@ -190,22 +166,15 @@ const ANCHORS: &[(&str, Anchor)] = &[
     ("crim.", Anchor::Case),
     ("ass. plen.", Anchor::Case),
     ("conseil d'etat", Anchor::Case),
-    // « CE Ass., 12 janv. 1968, n° 70951 » : gate MAJUSCULES (sinon pronom).
     ("ce", Anchor::Case),
     ("conseil constitutionnel", Anchor::Case),
     ("cons. const.", Anchor::Case),
     ("cour europeenne des droits de l'homme", Anchor::Case),
     ("cjue", Anchor::Case),
     ("cjce", Anchor::Case),
-    // « TUE, 6 juillet 2022, T-250/21 » — gate 3 MAJUSCULES dans lex_case
-    // (« tué » plié donne la même surface).
     ("tue", Anchor::Case),
-    // « la Cour de justice (23 décembre 2009, …, C-45/08) » — leftmost-longest
-    // préfère les formes longues UE ; la CJR ne déclenche rien (préfixe de
-    // rôle C-/T-/F- exigé en fenêtre).
     ("cour de justice", Anchor::Case),
     ("cour de justice de l'union europeenne", Anchor::Case),
-    // Graphie OCR fréquente : « 1' » pour « l' ».
     ("cour de justice de 1'union europeenne", Anchor::Case),
     ("cour de justice des communautes europeennes", Anchor::Case),
     ("affaire", Anchor::Case),
@@ -213,29 +182,18 @@ const ANCHORS: &[(&str, Anchor)] = &[
     ("aff.", Anchor::Case),
     ("arret", Anchor::Case),
     ("arrets", Anchor::Case),
-    // Fond administratif (chaîne procédurale, ADR 0165 amendé) : « Par un
-    // jugement n° 1901563 du 15 février 2023, le tribunal administratif de
-    // Nantes… » — la juridiction se sonde en amont ET en aval du numéro.
     ("jugement", Anchor::Case),
     ("jugements", Anchor::Case),
     ("requete", Anchor::Case),
     ("requetes", Anchor::Case),
     ("rg", Anchor::Case),
-    // Graphies du sigle RG et formes épelées (« R.G. 2013F00251 »,
-    // « Rôle N° 16/03071 », « enrôlée au répertoire général sous le
-    // n° 18/00064 ») : gate MAJUSCULE pour les sigles/en-têtes.
     ("r.g.", Anchor::Case),
     ("r.g", Anchor::Case),
     ("r. g", Anchor::Case),
     ("role", Anchor::Case),
     ("repertoire general", Anchor::Case),
-    // « CA Paris, 14 nov. 2019, n° 18/04366 » — MAJUSCULES exigées (« ça »,
-    // chiffre d'affaires) + marqueur n° et slashnum en sonde.
     ("ca", Anchor::Case),
-    // « DÉCISION DÉFÉRÉE : 21/00287 » (bandeau CA sans « RG »).
     ("deferee", Anchor::Case),
-    // « décision attaquée …, enregistrée sous le no 20/00325 », « procédures
-    // enrôlées sous les numéros 18/02640 et 18/02641 ».
     ("enregistre", Anchor::Case),
     ("enregistree", Anchor::Case),
     ("enregistres", Anchor::Case),
@@ -259,15 +217,13 @@ pub struct CompiledVocab {
     /// `num_key` → uids porteurs — résolution des articles nus par unicité.
     by_num_key: FxHashMap<String, Vec<String>>,
     /// Cache INTER-décisions de `link_citation_analyzed` — fonction pure de
-    /// `(instrument, text_key, article_key)` sur le snapshot du run (le vocab
-    /// est construit par snapshot, le cache ne peut pas fuir entre runs). Les
-    /// mêmes clés se répètent massivement dans le corpus (« code civil »,
-    /// L. 761-1 CJA…) : le linking devient un hit de table après chauffe.
+    /// `(instrument, text_key, article_key, owner_iso)` sur le snapshot du run.
     link_cache: std::sync::RwLock<FxHashMap<LinkCacheKey, LinkTarget>>,
 }
 
-/// Clé du cache de link inter-décisions : `(instrument, text_key, article_key)`.
-type LinkCacheKey = (String, String, Option<String>);
+/// Clé du cache de link inter-décisions : `(instrument, text_key,
+/// article_key, owner_iso)`. Le for du corps émetteur fait partie de la clé.
+type LinkCacheKey = (String, String, Option<String>, Option<String>);
 
 /// Mots trop génériques pour être des surfaces d'alias seules (les ancres les
 /// portent déjà, avec lexer).
@@ -292,15 +248,10 @@ const GENERIC_BARE: &[&str] = &[
     "decision",
 ];
 
-/// Surfaces jamais citées comme textes : « Conseil d'Etat » = la juridiction
-/// (l'entrée JORF homonyme du catalogue est du bruit), « accord collectif » =
-/// l'accord d'espèce d'une entreprise, « loi du pays » nue = la catégorie
-/// d'acte (ou le DIP : « la loi du pays avec lequel… »).
 const BLOCKED_SURFACES: &[&str] = &["conseil d'etat", "accord collectif", "loi du pays"];
 
 /// Articles au sens jurisprudentiel univoque, cités nus dans toutes les
-/// juridictions judiciaires (« condamne X au titre de l'article 700 ») :
-/// frais irrépétibles et distraction des dépens du Code de procédure civile.
+/// juridictions judiciaires (« condamne X au titre de l'article 700 »).
 const CANON_BARE_ARTICLES: &[(&str, &str)] = &[
     ("700", "LEGITEXT000006070716"),
     ("699", "LEGITEXT000006070716"),
@@ -308,9 +259,8 @@ const CANON_BARE_ARTICLES: &[(&str, &str)] = &[
 
 /// Automate FUSIONNÉ (statique, un par process) : ancres + alias embarqués
 /// (citations) + marqueurs structurels (`crate::scan`). UN flux de tokens à
-/// discipline de consommation unique (ADR 0160) : une passe leftmost-longest
-/// non chevauchante, un motif = un token porteur de son (ses) rôle(s) —
-/// les surfaces communes aux deux sous-systèmes portent les deux rôles.
+/// discipline de consommation unique : une passe leftmost-longest non
+/// chevauchante, un motif = un token porteur de son (ses) rôle(s).
 struct Fused {
     ac: aho_corasick::AhoCorasick,
     roles: Vec<Roles>,
@@ -338,11 +288,6 @@ fn fused() -> &'static Fused {
                 || GENERIC_BARE.contains(&f.as_str())
                 || BLOCKED_SURFACES.contains(&f.as_str())
                 || idx.contains_key(&f)
-                // Forme datée NUE (« loi du 10 juillet 1991 ») : l'ancre
-                // datée la lexe déjà — un pattern la figerait et tronquerait
-                // les titres épelés complets (« loi du 10 juillet 1991
-                // relative à l'aide juridique », rule 4). L'alias n'apporte
-                // que la résolution de la clé.
                 || RE_BARE_DATED_ALIAS.is_match(&f)
             {
                 return;
@@ -368,8 +313,6 @@ fn fused() -> &'static Fused {
         let (mk_surfaces, mk_kinds) = crate::scan::marker_patterns();
         for (s, k) in mk_surfaces.iter().zip(&mk_kinds) {
             match idx.get(s.as_str()) {
-                // Surface commune (autre sous-système ou doublon marqueur) :
-                // le même token porte les deux rôles, premier arrivé gagne.
                 Some(&i) => {
                     if roles[i].marker.is_none() {
                         roles[i].marker = Some(*k);
@@ -386,12 +329,9 @@ fn fused() -> &'static Fused {
                 }
             }
         }
-        // Clôture de rôles par préfixe : un motif citations qu'un marqueur
-        // préfixe à la frontière de mot (alias CESEDA ⊃ marqueur ProcImmig
-        // « code de l'entrée et du séjour ») porte AUSSI ce rôle marqueur —
-        // le leftmost-longest ne fait pas disparaître un signal dont la
-        // surface est présente. Le gate (`marker_token`) s'applique au token
-        // entier, en aval.
+        // Clôture de rôles par préfixe : un motif citations qu'un marqueur préfixe à
+        // la frontière de mot porte AUSSI ce rôle marqueur. Le gate (`marker_token`)
+        // s'applique au token entier, en aval.
         let mk_prefix: FxHashMap<&str, crate::scan::Mk> = mk_surfaces
             .iter()
             .zip(&mk_kinds)
@@ -417,8 +357,6 @@ fn fused() -> &'static Fused {
         }
         let ac = aho_corasick::AhoCorasick::builder()
             .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-            // Vocabulaire petit et statique : le DFA (~8 ns/octet) est
-            // toujours le bon choix — l'heuristique laisserait un NFA.
             .kind(Some(aho_corasick::AhoCorasickKind::DFA))
             .build(&patterns)
             .expect("automate fusionné marqueurs + citations");
@@ -428,7 +366,7 @@ fn fused() -> &'static Fused {
 
 impl CompiledVocab {
     /// Bâtit les index de snap catalogue (titres, articles) — l'automate est
-    /// STATIQUE ([`fused`]), plus aucune donnée catalogue dedans (ADR 0158).
+    /// STATIQUE ([`fused`]).
     pub fn build(texts: &[CatalogText], snap: &LinkSnapshot) -> Self {
         let mut full_titles: FxHashMap<String, String> = FxHashMap::default();
         let mut code_titles: FxHashMap<String, String> = FxHashMap::default();
@@ -455,9 +393,7 @@ impl CompiledVocab {
                     .push(uid.to_string());
             }
         }
-        // Triés pour le test d'appartenance par dichotomie : les num_keys nus
-        // (« 1 », « 700 ») portent des dizaines de milliers d'uids — la
-        // règle 5 intersecte avec les uids du document, jamais l'inverse.
+        // Triés pour le test d'appartenance par dichotomie.
         for v in by_num_key.values_mut() {
             v.sort_unstable();
             v.dedup();
@@ -487,12 +423,10 @@ impl CompiledVocab {
 /// Un token typé et positionné (offsets en CHARS du texte original).
 enum Tok {
     /// Mention d'instrument, bornée par son lexer. `weak` = mention purement
-    /// structurelle sans identité chiffrée ni snap catalogue : n'émet un span
-    /// que résolue. `treaty_short` = forme conventionnelle non datée,
-    /// candidate à l'anaphore de préfixe (« la Convention de Vienne » après
-    /// la forme longue datée). `nested` = mention imbriquée dans une autre
-    /// (« protocole n° 16 À LA CONVENTION … ») : antécédent d'anaphore
-    /// valide, jamais de span propre.
+    /// structurelle sans identité chiffrée ni snap catalogue : n'émet un span que
+    /// résolue. `treaty_short` = forme conventionnelle non datée, candidate à
+    /// l'anaphore de préfixe. `nested` = mention imbriquée dans une autre :
+    /// antécédent d'anaphore valide, jamais de span propre.
     Instr {
         s: usize,
         e: usize,
@@ -520,13 +454,11 @@ fn tok_start(t: &Tok) -> usize {
     }
 }
 
-/// Longueur maximale d'une mention lexée (garde anti-sur-capture, même borne
-/// que `MAX_INSTRUMENT_LEN` côté normalisation).
+/// Longueur maximale d'une mention lexée.
 const MAX_SPAN: usize = 250;
 
-/// Mots de prose qui n'apparaissent jamais À L'INTÉRIEUR d'un nom
-/// d'instrument cité : bornes du walker (port de la borne droite legacy
-/// `citation_rhs`, adaptée au texte plié — « à » ⇒ « a » n'est PAS une borne,
+/// Mots de prose qui n'apparaissent jamais À L'INTÉRIEUR d'un nom d'instrument
+/// cité : bornes du walker, sur texte plié (« à » ⇒ « a » n'est PAS une borne,
 /// seule la forme « a ete » l'est).
 const WALK_STOP: &[&str] = &[
     "que",
@@ -591,8 +523,7 @@ const WALK_STOP: &[&str] = &[
     "ayant",
 ];
 
-/// Mots pendants coupés en fin de span (connecteurs, participes d'apparat) :
-/// un nom d'instrument ne finit jamais dessus.
+/// Mots pendants coupés en fin de span (connecteurs, participes d'apparat).
 const TRAIL_TRIM: &[&str] = &[
     "de",
     "du",
@@ -631,8 +562,7 @@ const TRAIL_TRIM: &[&str] = &[
     "susvisee",
 ];
 
-/// Mots de nature : un « et » qui les introduit ferme la mention en cours
-/// (« la convention … et l'accord franco-tunisien » = DEUX mentions).
+/// Mots de nature : un « et » qui les introduit ferme la mention en cours.
 const NATURE_WORDS: &[&str] = &[
     "code",
     "loi",
@@ -665,8 +595,6 @@ fn is_stop_word(w: &str, next: Option<&str>) -> bool {
     {
         return true;
     }
-    // « à » plié en « a » : connecteur légitime (« faite a la haye »), borne
-    // seulement en tête d'auxiliaire (« a ete signee »).
     w == "a" && next == Some("ete")
 }
 
@@ -713,9 +641,7 @@ struct Mention {
 }
 
 /// Gentilé étranger APRÈS la mention (« code civil suisse ») : étend la
-/// surface — `link_citation` résout en code étranger (règle 8) au lieu de
-/// mislinker le code français homonyme. Renvoie la nouvelle fin de span si
-/// extension.
+/// surface. Renvoie la nouvelle fin de span si extension.
 fn gentile_ext(folded: &str, be: usize) -> Option<usize> {
     let tail = &folded[be..];
     let next_word: String = tail
@@ -740,11 +666,7 @@ fn span_surface(chars: &[char], byte2char: &[usize], bs: usize, be: usize) -> St
     chars[byte2char[bs]..byte2char[be]].iter().collect()
 }
 
-/// `normalize_instrument` mémoïsé par span plié — les mêmes mentions
-/// reviennent des dizaines de fois par document.
-/// Cache statique de [`normalize_instrument`] : fonction PURE de la surface
-/// (chaîne de replaces + regex, chère), aux surfaces massivement répétées dans
-/// le corpus (« code civil », « code de procédure civile »…).
+/// `normalize_instrument` mémoïsé par span plié : fonction PURE de la surface.
 static NORM_KEYS: OnceLock<std::sync::RwLock<FxHashMap<String, String>>> = OnceLock::new();
 
 fn norm_key(memo: &mut FxHashMap<String, String>, folded_span: &str, surface: &str) -> String {
@@ -829,7 +751,6 @@ fn lex_code(
     let hit = longest_title_end(&vocab.code_titles, folded, bs, be, skip);
     if let Some((e, tk)) = hit {
         if let Some(e2) = gentile_ext(folded, e) {
-            // clé recalculée par l'appelant (normalize) : droit étranger.
             return Some((
                 Mention {
                     e: e2,
@@ -852,9 +773,6 @@ fn lex_code(
             true,
         ));
     }
-    // Chaîne structurelle : code hors catalogue (« code de la famille
-    // congolais ») ou graphie dégradée — la clé snape via `snap_code_name`
-    // dans la normalisation, le lien via la règle 8 (codes étrangers).
     let words = walk_words(folded, be);
     let mut end = be;
     for (i, (ws, we)) in words.iter().enumerate() {
@@ -881,7 +799,6 @@ fn lex_code(
             break;
         }
         end = *we;
-        // le gentilé clôt l'identité (« code pénal iranien réprime… »).
         if FOREIGN_NATIONALITY_STEMS.iter().any(|st| w.starts_with(st)) {
             break;
         }
@@ -902,8 +819,6 @@ fn lex_code(
 /// Acte FR daté/numéroté : qualificatifs d'identité, n°, date, puis extension
 /// éventuelle au titre catalogue épelé verbatim (queue officielle).
 fn lex_dated(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> Option<Mention> {
-    // Préfiltre : l'identité (n° ou date) porte un chiffre à portée — la
-    // « loi » de prose ne paie pas trois sondes regex.
     if !case_window(folded, be, 40)
         .bytes()
         .any(|b| b.is_ascii_digit())
@@ -915,10 +830,6 @@ fn lex_dated(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> Optio
         pos += m.end();
     }
     let mut has_id = false;
-    // NOR entre la nature et le n°/la date (« circulaire NOR JUSK1140023C du
-    // 14 avril 2011 », graphie collée « NORINTK1207286C » incluse) : une
-    // identité à lui seul — l'acte se résout par l'index nor du snapshot même
-    // sans date à portée (« la circulaire NOR INTK1229185C du ministre… »).
     if let Some(e) = lex_nor_at(folded, pos) {
         pos = e;
         has_id = true;
@@ -931,16 +842,11 @@ fn lex_dated(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> Optio
         pos += m.end();
         has_id = true;
     }
-    // NOR en queue, après la date (« circulaire du 28 octobre 1997 NOR :
-    // INTK9700174C », parenthésé ou nu).
     if has_id {
         if let Some(e) = lex_nor_at(folded, pos) {
             pos = e;
         }
     }
-    // Extension au titre épelé verbatim : seulement derrière une identité
-    // chiffrée — tout titre catalogue d'acte daté porte n°/date, une mention
-    // nue (« la loi permet… ») ne peut pas matcher, on s'épargne le walk.
     if has_id {
         if let Some((e, tk)) = longest_title_end(&vocab.full_titles, folded, bs, be, 0) {
             if e > pos {
@@ -964,10 +870,9 @@ fn lex_dated(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> Optio
 }
 
 /// Token NOR à `pos` : « nor jusk1140023c », « nor : intk9700174c »,
-/// « norintk1207286c » (graphie collée), « (nor : devp1134619c) ». Retourne
-/// la fin (fermante incluse si l'ouvrante a été consommée), frontière franche
-/// exigée. La forme 4 lettres + 7 chiffres + 1 lettre est assez rigide pour
-/// se passer du contrôle de casse original.
+/// « norintk1207286c » (graphie collée), « (nor : devp1134619c) ». Retourne la
+/// fin (fermante incluse si l'ouvrante a été consommée), frontière franche
+/// exigée.
 fn lex_nor_at(folded: &str, pos: usize) -> Option<usize> {
     let m = RE_LEX_NOR.captures(&folded[pos..])?;
     let mut end = pos + m.get(0).expect("match complet").end();
@@ -996,7 +901,6 @@ enum EuLex {
 }
 
 fn lex_eu(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> EuLex {
-    // Préfiltre : le slashnum porte des chiffres à portée courte.
     let eu_id = case_window(folded, be, 48)
         .bytes()
         .any(|b| b.is_ascii_digit())
@@ -1023,11 +927,6 @@ fn lex_eu(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> EuLex {
             treaty_short: false,
         });
     }
-    // Acte dérivé cité par DATE sans numéro (« règlement (UE) du 17 décembre
-    // 2013 établissant les règles relatives aux paiements directs ») : la
-    // mention s'étend à la date puis à la queue de titre, mêmes bornes de
-    // prose que le conventionnel — la résolution départage par tokens dans
-    // l'index (nature, date) du catalogue (règle 5bis).
     if matches!(&folded[bs..be], "reglement" | "directive") {
         if let Some(m) = RE_LEX_EU_DATED.find(&folded[be..]) {
             let mut end = be + m.end();
@@ -1039,9 +938,6 @@ fn lex_eu(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> EuLex {
                 end = we;
             }
             let end = trim_trailing(folded, be + m.end(), end);
-            // weak : la forme « règlement du <date> » couvre aussi des
-            // règlements FR hors catalogue (copropriété, PLU) — la mention
-            // n'émet de span propre que résolue.
             return EuLex::Instr(Mention {
                 e: end,
                 text_key: String::new(),
@@ -1051,7 +947,6 @@ fn lex_eu(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> EuLex {
             });
         }
     }
-    // Anaphore nue : « du règlement, » / « de la directive ; ».
     let word = &folded[bs..be];
     let head = folded[..bs].trim_end();
     let bare_conn = (word == "reglement" && head.ends_with(" du"))
@@ -1061,7 +956,6 @@ fn lex_eu(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> EuLex {
             .trim_start()
             .starts_with([',', '.', ';', ':', ')'])
     {
-        // position du connecteur (« du » / « de la »).
         let conn = if word == "reglement" { "du" } else { "de la" };
         return EuLex::Same(head.len() - conn.len());
     }
@@ -1082,21 +976,14 @@ fn lex_treaty(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> Opti
         if is_stop_word(w, next) {
             break;
         }
-        // « … et l'accord franco-tunisien » / « … et l'article 12 » /
-        // « … et 12 » : une nouvelle mention ou une énumération commence.
         let bare = w.trim_start_matches("l'").trim_start_matches("d'");
         if matches!(prev, "et" | "ou")
             && (NATURE_WORDS.contains(&bare)
                 || matches!(bare, "article" | "articles")
                 || bare.starts_with(|c: char| c.is_ascii_digit()))
         {
-            break; // l'« et » traînant tombe au trim
+            break;
         }
-        // « la déclaration annuelle prévue à l'article 97 du CGI » : un mot
-        // d'article en pleine marche = la mention est finie (les 7 titres
-        // catalogue qui en portent un ne sont jamais cités par titre épelé) —
-        // sans quoi le numéral avalé rend « citable » une mention de prose et
-        // son span absorbe l'ancre de l'instrument légitime.
         if matches!(bare, "article" | "articles" | "art.") {
             break;
         }
@@ -1114,7 +1001,7 @@ fn lex_treaty(vocab: &CompiledVocab, folded: &str, bs: usize, be: usize) -> Opti
         _ => end,
     };
     if end <= be {
-        return None; // mention nue (« la convention ») : générique.
+        return None;
     }
     let text_key = title_hit
         .filter(|(e, _)| *e == end)
@@ -1156,13 +1043,12 @@ fn lex_constitution(
     })
 }
 
-// ── citations de jurisprudence (ADR 0165) ───────────────────────────────────
+// ── citations de jurisprudence ──────────────────────────────────────────────
 
 /// Citation de jurisprudence : span borné au token identifiant (« n°
-/// [18-23.954] », « [C-561/19] », « RG n° [21/04532] », convention ADR 0143)
-/// et clé pendante par famille, alignée sur la grammaire `identity.rs` mais
-/// SANS date obligatoire — `cc|1823954`, `ce|412412`, `constit|2020-800`,
-/// `cjue|c-561/19`, `cedh|30010/10`, `rg|{jurisdiction_code}|21/04532`.
+/// [18-23.954] », « [C-561/19] », « RG n° [21/04532] ») et clé pendante par
+/// famille — `cc|1823954`, `ce|412412`, `constit|2020-800`, `cjue|c-561/19`,
+/// `cedh|30010/10`, `rg|{jurisdiction_code}|21/04532`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledCase {
     pub char_start: usize,
@@ -1193,14 +1079,10 @@ fn push_case(
     });
 }
 
-/// Lexer positionné des citations de jurisprudence : famille par surface
-/// d'ancre, 0..n spans émis (énumérations « pourvois n° X et Y »). Flux
-/// séparé du flux instruments — aucune interaction avec `compose()`.
-/// Référence BOFiP (ADR 0196) : « BOI-IR-BASE-10-10 », segments
-/// lettres/chiffres après « BOI- ». Majuscules exigées dans l'original
-/// (le repli casse rend « boi » indistinguable d'un fragment OCR) ; la clé
-/// émise est le code remonté en majuscules — il égale le `text_uid` BOFiP du
-/// catalogue, résolu par alias direct du snapshot.
+/// Référence BOFiP « BOI-IR-BASE-10-10 » : segments lettres/chiffres après
+/// « BOI- ». Majuscules exigées dans l'original ; la clé émise est le code
+/// remonté en majuscules — il égale le `text_uid` BOFiP du catalogue, résolu
+/// par alias direct du snapshot.
 fn lex_boi(
     folded: &str,
     chars: &[char],
@@ -1213,8 +1095,6 @@ fn lex_boi(
         return None;
     }
     let end = be + m.end();
-    // Frontière franche : un segment tronqué par la borne du quantificateur
-    // en plein mot n'est pas un code.
     if end < folded.len() && folded.as_bytes()[end].is_ascii_alphanumeric() {
         return None;
     }
@@ -1224,9 +1104,6 @@ fn lex_boi(
     {
         return None;
     }
-    // Version datée citée (« BOI-IF-AUT-60-20140311 ») : le suffixe
-    // AAAAMMJJ n'existe pas dans les uids du snapshot vivant — la clé le
-    // rabote (le span garde la forme complète).
     let mut key = folded[bs..end].to_uppercase();
     if let Some(m) = RE_LEX_BOI_DATED.find(&key) {
         key.truncate(m.start());
@@ -1253,34 +1130,20 @@ fn lex_case(
     be: usize,
     out: &mut Vec<CompiledCase>,
 ) {
-    // Gate MAJUSCULE initiale sur l'original : sigles et chambres seulement
-    // (« Civ. 1ère » cite, « la civilisation » non ; « CE » cite, « ce » non).
     let upper = |n: usize| {
         let ci = byte2char[bs];
         chars[ci..].iter().take(n).all(|c| c.is_uppercase())
     };
     match &folded[bs..be] {
-        // « pourvoi n° 18-23.954 » : le n° suit l'ancre.
         "pourvoi" | "pourvois" => case_cc(folded, byte2char, be, out, true),
-        // « Cass. 3e civ., 16 mars 2022, n° 18-23.954 », « sur renvoi après
-        // cassation par arrêt en date du 29 juin 2017 (16-13.988) » : chambre
-        // et date s'intercalent — sonde de fenêtre, la forme du pourvoi
-        // discrimine.
-        // « Cass Com 22/05/2013 P no11-24812 », « cass soc 2 mars 2011
-        // n°08-44977 » : « cass » sans point n'est pas un mot français, pas
-        // de gate de casse.
         "cass." | "cass" | "cassation" | "cour de cassation" | "cass.com." | "cass.civ."
         | "cass.soc." | "cass.crim." => case_cc(folded, byte2char, be, out, false),
-        // Chambre citée seule : « Civ. 1ère, 27 février 2013, n° 11-25536 »,
-        // « Soc. 21 septembre 2011, n° 10-15.011 » — MAJUSCULE exigée
-        // (« c. com. » est le code de commerce, pas la chambre commerciale).
         "civ." | "civ" | "soc." | "soc" | "com." | "crim." | "ass. plen." => {
             if upper(1) {
                 case_cc(folded, byte2char, be, out, false);
             }
         }
         "conseil d'etat" => case_ce(folded, byte2char, bs, be, out),
-        // « CE Ass., 12 janv. 1968, n° 70951 » : abréviation en MAJUSCULES.
         "ce" => {
             if upper(2) {
                 case_ce(folded, byte2char, bs, be, out);
@@ -1291,9 +1154,6 @@ fn lex_case(
         "cour europeenne des droits de l'homme" => {
             case_cedh(folded, byte2char, be, out, false);
         }
-        // « requête n° 30010/10 » : le format à barre oblique est CEDH — les
-        // requêtes admin (7 chiffres nus) ne matchent pas. « La requête en
-        // référé n° 502527 » est un référé CE.
         "requete" | "requetes" => {
             if !case_cedh(folded, byte2char, be, out, true) {
                 let win = case_window(folded, be, 40);
@@ -1306,12 +1166,7 @@ fn lex_case(
                 }
             }
         }
-        // « aff. C-561/19 », « affaire 6/64 » (slashnum nu toléré derrière
-        // l'ancre affaire uniquement), « dans l'affaire 26604/16 Waldner »
-        // (n° de requête CEDH, 4-5 chiffres avant la barre).
         "affaire" | "affaires" | "aff." => case_cjue_aff(folded, chars, byte2char, be, out),
-        // « l'arrêt de la CJUE du 6 octobre 2021, C-561/19 » : le préfixe
-        // C-/T-/F- est exigé en fenêtre (un slashnum nu serait un acte UE).
         "cjue"
         | "cjce"
         | "cour de justice"
@@ -1320,23 +1175,12 @@ fn lex_case(
         | "cour de justice des communautes europeennes" => {
             case_cjue_window(folded, chars, byte2char, be, out);
         }
-        // « TUE, 6 juillet 2022, T-250/21 » : MAJUSCULES exigées (« tué »
-        // plié donne la même surface).
         "tue" => {
             if upper(3) {
                 case_cjue_window(folded, chars, byte2char, be, out);
             }
         }
-        // « arrêt » sonde toutes les cours qu'il peut introduire : CJUE
-        // (préfixe exigé), CC (« arrêts du 18 février 2015 n°13-27104 »),
-        // CEDH (« son arrêt n° 29217/12, Tarakhel » — 4-5 chiffres avant la
-        // barre, disjoint des RG à préfixe court), CAA (« Par un arrêt
-        // n° 20NT01234 …, la cour administrative d'appel de Nantes »). Les
-        // formes sont mutuellement exclusives.
         "arret" | "arrets" => {
-            // Préfiltre : toutes les formes citées portent un chiffre à
-            // portée de fenêtre — « l'arrêt attaqué » de prose n'a pas à
-            // payer six sondes regex.
             if case_window(folded, be, 60)
                 .bytes()
                 .any(|b| b.is_ascii_digit())
@@ -1349,28 +1193,18 @@ fn lex_case(
                 case_arret_ord(folded, chars, byte2char, be, out);
             }
         }
-        // Chaîne procédurale du fond administratif : « Par un jugement
-        // n° 1901563 du 15 février 2023, le tribunal administratif de
-        // Nantes… » (ADR 0165 amendé — la chaîne est incluse).
         "jugement" | "jugements" => {
             case_admin(folded, chars, byte2char, chrono, bs, be, out);
         }
-        // « rg » n'est pas un mot français : pas de gate de casse (les
-        // bandeaux minuscules « rg no 13/00109 » citent aussi).
         "rg" | "r.g." | "r.g" | "r. g" => {
             case_rg(folded, chars, byte2char, chrono, bs, be, out);
         }
-        // « Rôle N° 16/03071 » (bandeau CA) : MAJUSCULE exigée (sinon prose).
         "role" => {
             if upper(1) {
                 case_rg(folded, chars, byte2char, chrono, bs, be, out);
             }
         }
-        // « enrôlée au répertoire général sous le n° 18/00064 » : forme
-        // épelée, minuscule légitime.
         "repertoire general" => case_rg(folded, chars, byte2char, chrono, bs, be, out),
-        // « CA [Localité 8], 14 nov. 2019, n°18/04366 » : MAJUSCULES exigées
-        // (« ça », chiffre d'affaires).
         "ca" => {
             if upper(2) {
                 case_ca_sigle(folded, chars, byte2char, chrono, bs, be, out);
@@ -1396,7 +1230,7 @@ fn cut_by_window(folded: &str, be: usize, win: &str, end: usize) -> bool {
 }
 
 /// Clé pourvoi : chiffres seuls (« 18-23.954 » → `cc|1823954`), même
-/// normalisation que la sonde de résolution (93,7 % unique au corpus).
+/// normalisation que la sonde de résolution.
 fn cc_key(num: &str) -> String {
     let digits: String = num.chars().filter(char::is_ascii_digit).collect();
     format!("cc|{digits}")
@@ -1409,9 +1243,6 @@ fn case_cc(
     out: &mut Vec<CompiledCase>,
     anchored: bool,
 ) {
-    // Fenêtre longue : les énumérations à dates (« n 01-17122 ; 27 mars 2007,
-    // n 05-14491 ; … ») dépassent 100 octets — la forme stricte du pourvoi
-    // rend la distance sûre.
     let win = case_window(folded, be, if anchored { 120 } else { 200 });
     let re = if anchored {
         &RE_CASE_POURVOI
@@ -1430,8 +1261,6 @@ fn case_cc(
             be + g.end(),
             cc_key(g.as_str()),
         );
-        // Énumération : « pourvois n° 18-23.954 et 18-23.955 », plages
-        // « n° T 00-44.843 au n° W 00-44.846 ».
         let mut pos = g.end();
         while let Some(c) = RE_CASE_POURVOI_NEXT.captures(&win[pos..]) {
             let g = c.get(1).expect("groupe pourvoi");
@@ -1444,10 +1273,6 @@ fn case_cc(
         }
         return;
     }
-    // Repli CE : le pourvoi ADMINISTRATIF porte un n° de requête 5-6 chiffres
-    // (« statuant sur les pourvois n° 476000 … et n° 476009 », « pourvu en
-    // cassation sous le n° 500109 ») — collé à l'ancre pour ne pas ramasser
-    // un n° lointain de la fenêtre.
     let ce_probe = if anchored {
         RE_CASE_CE_WIN
             .captures(win)
@@ -1493,9 +1318,6 @@ fn push_ce_enum(
 }
 
 fn case_ce(folded: &str, byte2char: &[usize], bs: usize, be: usize, out: &mut Vec<CompiledCase>) {
-    // Sonde ARRIÈRE : « Par une décision n° 432537 du 8 janvier 2020, le
-    // Conseil d'Etat… » — dernière mention décision/ordonnance/arrêt n° en
-    // amont, invalidée si une AUTRE juridiction s'intercale.
     let mut ws = bs.saturating_sub(160);
     while !folded.is_char_boundary(ws) {
         ws += 1;
@@ -1503,7 +1325,6 @@ fn case_ce(folded: &str, byte2char: &[usize], bs: usize, be: usize, out: &mut Ve
     let up = &folded[ws..bs];
     if let Some(c) = RE_CASE_CE_BACK.captures_iter(up).last() {
         let g = c.get(1).expect("groupe n° CE");
-        // Énumération vers l'avant DANS l'amont (« nos 431188, 431348, … »).
         let mut nums = vec![(g.start(), g.end())];
         let mut pos = g.end();
         while let Some(c) = RE_CASE_CE_NEXT.captures(&up[pos..]) {
@@ -1519,7 +1340,6 @@ fn case_ce(folded: &str, byte2char: &[usize], bs: usize, be: usize, out: &mut Ve
             }
         }
     }
-    // Fenêtre AVANT : « Conseil d'État … n° 70951 », « sous le numéro 470194 ».
     let win = case_window(folded, be, 100);
     let Some(c) = RE_CASE_CE_WIN.captures(win) else {
         return;
@@ -1539,15 +1359,13 @@ fn case_constit(
     out: &mut Vec<CompiledCase>,
     anchored: bool,
 ) {
-    // Sonde ARRIÈRE : « la décision n°2021-823 du Conseil constitutionnel » —
-    // gatée « décision », collée à l'ancre.
     let mut ws = bs.saturating_sub(80);
     while !folded.is_char_boundary(ws) {
         ws += 1;
     }
     if let Some(c) = RE_CASE_CONSTIT_BACK.captures(&folded[ws..bs]) {
         let g = c.get(1).expect("groupe n° constit");
-        // Clé sans le suffixe DC/QPC (les `docket_numbers` CONSTIT sont nus).
+        // Clé sans le suffixe DC/QPC : les `docket_numbers` CONSTIT sont nus.
         let key = format!("constit|{}", g.as_str());
         push_case(out, byte2char, ws + g.start(), ws + g.end(), key);
     }
@@ -1566,7 +1384,6 @@ fn case_constit(
         be + g.end(),
         format!("constit|{}", g.as_str()),
     );
-    // Énumération : « n° 2016-554 QPC du 22 juillet 2016, n° 2016-610 QPC ».
     let mut pos = g.end();
     while let Some(c) = RE_CASE_CONSTIT_NEXT.captures(&win[pos..]) {
         let g = c.get(1).expect("groupe n° constit");
@@ -1603,7 +1420,6 @@ fn case_cedh(
         return false;
     }
     push_cedh(out, byte2char, be + g.start(), be + g.end(), g.as_str());
-    // Énumération : « n°15670/18 et 43115/18 M. A et autres c/ Croatie ».
     let mut pos = g.end();
     while let Some(c) = RE_CASE_CEDH_NEXT.captures(&win[pos..]) {
         let g = c.get(1).expect("groupe requête CEDH");
@@ -1623,10 +1439,7 @@ fn push_cedh(out: &mut Vec<CompiledCase>, byte2char: &[usize], s: usize, e: usiz
 }
 
 /// « son arrêt n° 29217/12, Tarakhel c./ Suisse » : requête CEDH derrière
-/// « arrêt » — 4-5 chiffres avant la barre, n° exigé. Un premier groupe
-/// année (« ARRÊT AU FOND DU 25 MARS 2011 N° 2011/183 ») est l'ordinal d'un
-/// arrêt CA : clé nue `rg||`. Un « règlement/directive n° 2988/95 » dans la
-/// fenêtre n'est pas une requête.
+/// « arrêt » — 4-5 chiffres avant la barre, n° exigé.
 fn case_cedh_arret(
     folded: &str,
     chars: &[char],
@@ -1685,8 +1498,6 @@ fn case_cjue_aff(
 ) {
     let win = case_window(folded, be, 260);
     let Some(c) = RE_CASE_AFF.captures(win) else {
-        // « l'affaire déjà citée C-210/13 Glaxosmithkline » : le n° n'est pas
-        // collé à l'ancre — la sonde de fenêtre (préfixe exigé) prend le relais.
         cjue_scan(folded, chars, byte2char, be, win, 0, out);
         return;
     };
@@ -1694,15 +1505,11 @@ fn case_cjue_aff(
     let (first, second) = n.as_str().split_once('/').expect("slashnum");
     let (s, e, key) = match c.get(1) {
         Some(p) => (p.start(), n.end(), cjue_key(Some(p.as_str()), n.as_str())),
-        // Slashnum nu : 4-5 chiffres avant la barre = requête CEDH
-        // (« l'affaire 26604/16 Waldner c. France »), sinon rôle CJCE nu.
         None if first.trim().len() >= 4 => {
             push_cedh(out, byte2char, be + n.start(), be + n.end(), n.as_str());
             cjue_scan(folded, chars, byte2char, be, win, n.end(), out);
             return;
         }
-        // Second membre à 5+ chiffres (« l'affaire 09/ 01106 ») : un rôle
-        // judiciaire, pas une affaire UE — clé nue `rg||`.
         None if second.trim().len() >= 5 => {
             let num = rg_num_key(chars, byte2char, be + n.start(), be + n.end());
             push_case(
@@ -1731,11 +1538,9 @@ fn case_cjue_window(
     cjue_scan(folded, chars, byte2char, be, win, 0, out);
 }
 
-/// Balaye la fenêtre : numéros PRÉFIXÉS où qu'ils soient (noms d'affaires et
-/// dates s'intercalent — « C-166/13 Sophie Mukarubega du 5 novembre 2014 et
-/// C-249/13 »), plage à membre nu héritant du préfixe (« C-338/11 à
-/// 347/11 »). Le préfixe séparé par espace seul exige la MAJUSCULE
-/// (« C 434/15 » cite, une lettre de prose non).
+/// Balaye la fenêtre : numéros PRÉFIXÉS où qu'ils soient, plage à membre nu
+/// héritant du préfixe (« C-338/11 à 347/11 »). Le préfixe séparé par espace
+/// seul exige la MAJUSCULE.
 fn cjue_scan(
     folded: &str,
     chars: &[char],
@@ -1754,8 +1559,6 @@ fn cjue_scan(
             pos += n.end();
             continue;
         }
-        // « Pourvoi n° T 17-21.405 » : la lettre de série + le début du n° de
-        // pourvoi miment un rôle CJUE à tiret — la queue « .405 » trahit.
         if pourvoi_tail(folded, off + pos + n.end()) {
             pos += n.end();
             continue;
@@ -1773,8 +1576,6 @@ fn cjue_scan(
         );
         let prefix = p.as_str().to_string();
         pos += n.end();
-        // « C-338/11 à 347/11 », « C-131/13, 163/13 et 164/13 » : membres nus
-        // d'énumération, préfixe hérité.
         while let Some(c) = RE_CASE_CJUE_RANGE.captures(&win[pos..]) {
             let n = c.get(1).expect("slashnum");
             if pourvoi_tail(folded, off + pos + n.end()) {
@@ -1810,12 +1611,10 @@ fn rg_num_key(chars: &[char], byte2char: &[usize], abs_s: usize, abs_e: usize) -
         .collect()
 }
 
-/// Code référentiel de la juridiction au voisinage d'un RG : DERNIÈRE forme
-/// en amont, sinon PREMIÈRE en aval. `want` restreint au type attendu
-/// (jugement 7 chiffres = TA, arrêt AAXX99999 = CAA). Sans `want`, la forme
-/// la plus proche DÉCIDE : si sa ville ne mappe pas (CPH avant septembre,
-/// ville anonymisée), pas de code — jamais la forme suivante (règle #12 :
-/// pas de clé bancale).
+/// Code référentiel de la juridiction au voisinage d'un RG : DERNIÈRE forme en
+/// amont, sinon PREMIÈRE en aval. `want` restreint au type attendu (jugement
+/// 7 chiffres = TA, arrêt AAXX99999 = CAA). Sans `want`, la forme la plus
+/// proche DÉCIDE : si sa ville ne mappe pas, pas de code.
 fn rg_jurisdiction(
     folded: &str,
     chrono: &crate::chrono::ChronoSnapshot,
@@ -1852,8 +1651,6 @@ fn rg_jurisdiction(
                 continue;
             }
         }
-        // Ville = plus long préfixe de mots qui mappe au référentiel (les
-        // noms composés d'abord : « aix en provence » avant « aix »).
         let region = crate::identity::normalize_component(&folded[off + g.start()..off + g.end()]);
         let words: Vec<&str> = region.split_whitespace().collect();
         for k in (1..=words.len().min(6)).rev() {
@@ -1866,7 +1663,6 @@ fn rg_jurisdiction(
                 });
             }
         }
-        // Sans `want`, la forme la plus proche décide, mappée ou pas.
         want?;
     }
     None
@@ -1884,9 +1680,7 @@ fn upstream(folded: &str, bs: usize, len: usize) -> usize {
 /// « RG n° 21/04532 », « Rôle N° 16/03071 », « enregistré au répertoire
 /// général sous le n° 11/00094 » : n° en aval de l'ancre, juridiction au
 /// voisinage mappée au référentiel via [`crate::chrono::ChronoSnapshot`].
-/// Sans juridiction, clé nue `rg||NUM` — jamais résolue (un RG nu vaut 5,87
-/// cibles au corpus), mais décorée quand la GT ou une juridiction future la
-/// résorbe.
+/// Sans juridiction, clé nue `rg||NUM` — jamais résolue.
 fn case_rg(
     folded: &str,
     chars: &[char],
@@ -1923,8 +1717,6 @@ fn rg_emit(
     if cut_by_window(folded, be, win, g.end()) {
         return;
     }
-    // « pourvoi enregistré sous le numéro M 19-25.248 » : la forme POINT
-    // aval est un n° de pourvoi Cassation — l'ancre cc le capture, pas RG.
     if folded[be + g.end()..].starts_with('.')
         && folded[be + g.end() + 1..]
             .bytes()
@@ -1933,14 +1725,9 @@ fn rg_emit(
     {
         return;
     }
-    // « N° RG 22/01114 - N° Portalis DBVF… » : bandeau des dossiers JOINTS de
-    // la décision elle-même (absents des métadonnées, donc hors filtre
-    // propre-en-tête du pont).
     if case_window(folded, be + g.end(), 60).contains("portalis") {
         return;
     }
-    // « Vu la requête … enregistrée sous le N°RG 25/04461 » : le n° de la
-    // requête EN COURS (JLD rétention), pas une citation.
     let ws = upstream(folded, bs, 160);
     if RE_CASE_RG_OWN.is_match(&folded[ws..bs]) {
         return;
@@ -1950,10 +1737,6 @@ fn rg_emit(
         .unwrap_or_default();
     let num = rg_canon(rg_num_key(chars, byte2char, be + g.start(), be + g.end()));
     let fam = fond_family(&code);
-    // Clé nue SANS barre (« jugement n° 2101423 » d'un TA que le voisinage
-    // n'identifie pas, « enrôlée sous le n° 2023F01128 » de l'instance en
-    // cours) : jamais résolue et hors familles de l'oracle — pas de ligne.
-    // La forme rôle « 21/04532 » reste émise, décorable un jour.
     if code.is_empty() && !num.contains('/') {
         return;
     }
@@ -1964,7 +1747,6 @@ fn rg_emit(
         be + g.end(),
         format!("{fam}|{code}|{num}"),
     );
-    // Énumération : « n° RG 15/10319, 15/10407, 15/10488 et 15/10492 ».
     let mut pos = g.end();
     while let Some(c) = RE_CASE_RG_NEXT.captures(&win[pos..]) {
         let g = c.get(1).expect("groupe RG");
@@ -1989,9 +1771,9 @@ fn rg_emit(
 }
 
 /// Famille de la clé d'un jugement du fond selon le `jurisdiction_code` : `af`
-/// (fond administratif TA/CAA, ADR 0165 [af]) pour `ta_*`/`caa*`, `rg` (fond
-/// judiciaire) sinon — dont code vide → `rg||NUM` nue (jamais résolue). Le
-/// sigle `tass_` (judiciaire) ne matche pas `ta_`.
+/// (fond administratif TA/CAA) pour `ta_*`/`caa*`, `rg` (fond judiciaire)
+/// sinon — dont code vide → `rg||NUM` nue. Le sigle `tass_` (judiciaire) ne
+/// matche pas `ta_`.
 fn fond_family(code: &str) -> &'static str {
     if code.starts_with("ta_") || code.starts_with("caa") {
         "af"
@@ -2078,8 +1860,6 @@ fn case_arret_ord(
     be: usize,
     out: &mut Vec<CompiledCase>,
 ) {
-    // Bandeau d'en-tête (« ARRÊT AU FOND DU 25 MARS 2011 N°2011/916 » en
-    // tête de page) : l'ordinal de LA décision, pas une citation.
     if be < 1200 {
         return;
     }
@@ -2135,8 +1915,8 @@ fn case_ce_arret(
 
 /// Chaîne procédurale du fond administratif : « Par un jugement n° 1901563 du
 /// 15 février 2023, le tribunal administratif de Nantes… » (clé
-/// `af|ta_nantes|1901563`, ADR 0165 [af]), « Par un arrêt n° 20NT01234 …, la
-/// cour administrative d'appel de Nantes » (`af|caa_nantes|20NT01234`), « Jugement
+/// `af|ta_nantes|1901563`), « Par un arrêt n° 20NT01234 …, la cour
+/// administrative d'appel de Nantes » (`af|caa_nantes|20NT01234`), « Jugement
 /// (N° 14/00048) rendu … par le tribunal de grande instance de X ».
 fn case_admin(
     folded: &str,
@@ -2172,7 +1952,6 @@ fn case_admin(
         .unwrap_or_default();
         let fam = fond_family(&code);
         let num = rg_num_key(chars, byte2char, be + g.start(), be + g.end());
-        // Même règle que `rg_emit` : clé nue sans barre = pas de ligne.
         if code.is_empty() && !num.contains('/') {
             return;
         }
@@ -2183,7 +1962,6 @@ fn case_admin(
             be + g.end(),
             format!("{fam}|{code}|{num}"),
         );
-        // « Par deux jugements n° 2202850 et n° 2202851 du 16 mars 2023 ».
         let mut pos = g.end();
         while let Some(c) = re_next.captures(&win[pos..]) {
             let g = c.get(1).expect("groupe n° admin");
@@ -2202,11 +1980,6 @@ fn case_admin(
         }
         return;
     }
-    // « Jugement (N° 14/00048) rendu le … par le tribunal de grande instance
-    // de X », « l'arrêt n° 98/795 rendu le 13 mars 2018 par la cour d'appel
-    // de Limoges » : forme RG judiciaire, marqueur n° strict. L'ordinal
-    // année/n° d'un bandeau (« ARRÊT N°2022/522 ») reste à `case_arret_ord`
-    // (clé nue) — un code de juridiction ici serait un mislink.
     if let Some(c) = RE_CASE_ADMIN_RG.captures(win) {
         let g = c.get(1).expect("groupe RG");
         if g.as_str().split(['/', '-']).next().is_some_and(|first| {
@@ -2220,9 +1993,8 @@ fn case_admin(
 
 /// Anaphore depuis un connecteur : nature après le connecteur (« du même
 /// code »), ou nature AVANT un « précité » (« du code précité »). Retourne
-/// (début, nature, fin couverte) — la fin couverte inclut le mot de nature
-/// qui suit le connecteur : il appartient à l'anaphore, l'ancre qu'il porte
-/// (« code », « loi »…) ne doit pas re-lexer une mention parasite.
+/// (début, nature, fin couverte) — la fin couverte inclut le mot de nature qui
+/// suit le connecteur.
 fn lex_same(folded: &str, bs: usize, be: usize) -> Option<(usize, String, usize)> {
     match &folded[bs..be] {
         "son article" | "ses articles" => Some((bs, String::new(), be)),
@@ -2244,14 +2016,11 @@ fn lex_same(folded: &str, bs: usize, be: usize) -> Option<(usize, String, usize)
 /// Scan : UNE passe de l'automate FUSIONNÉ + lexers positionnés. Produit le
 /// flux citations ([`Tok`]) et, si demandé, le flux marqueurs (`marks`).
 ///
-/// Discipline de consommation UNIQUE (ADR 0160) : un curseur (`tok_pos`),
-/// leftmost-longest — un motif = un token porteur de son (ses) rôle(s),
-/// chaque composeur filtre les siens. Un match à frontière de mot GAUCHE
-/// violée (« a sa » au travers de « l·a SA·S ») n'est PAS un token : il ne
-/// consomme rien — c'est de la tokenisation, pas un gate. Les gates de
-/// légitimité ([`crate::scan::marker_token`], frontière droite + repli
-/// d'ancre) sont des filtres AVAL : ils rejettent le token, jamais la
-/// consommation.
+/// Discipline de consommation UNIQUE : un curseur (`tok_pos`),
+/// leftmost-longest — un motif = un token porteur de son (ses) rôle(s), chaque
+/// composeur filtre les siens. Les gates de légitimité
+/// ([`crate::scan::marker_token`], frontière droite + repli d'ancre) sont des
+/// filtres AVAL : ils rejettent le token, jamais la consommation.
 fn scan_all(
     vocab: Option<&CompiledVocab>,
     chrono: Option<&crate::chrono::ChronoSnapshot>,
@@ -2265,19 +2034,11 @@ fn scan_all(
     let bytes = folded.as_bytes();
 
     // Phase 1 : la passe automate — chaque match distribué vers ses rôles.
-    // Les tokens sans rôle citations vont AUSSI au dispatcher : un marqueur
-    // composite peut porter une ancre en préfixe (« code de l'entrée et du
-    // séjour » → ancre « code ») ou en suffixe (« vu l'article » → tête
-    // d'énumération) — le dispatcher la re-dérive, la consommation ne bouge pas.
     let mut cit_matches: Vec<(usize, usize, Option<Pat>)> = Vec::new();
     let mut tok_pos = 0usize;
     let mut pos = 0usize;
     while let Some(m) = f.ac.find(&folded[pos..]) {
         let (bs, be) = (pos + m.start(), pos + m.end());
-        // Reprise APRÈS le token accepté : tout match qui démarre dedans
-        // serait rejeté par le curseur (`bs < tok_pos`) — le rescanner serait
-        // du travail automate pur et perdu. Un match rejeté ne consomme
-        // rien : la reprise à bs+1 laisse sa fenêtre aux motifs internes.
         if bs < tok_pos {
             pos = tok_pos.max(bs + folded[bs..].chars().next().map_or(1, |c| c.len_utf8()));
             continue;
@@ -2290,8 +2051,6 @@ fn scan_all(
         tok_pos = be;
         let roles = f.roles[m.pattern().as_usize()];
         if let (Some(kind), Some(marks)) = (roles.marker, marks.as_deref_mut()) {
-            // Rôle hérité par clôture de préfixe : la surface du marqueur est
-            // le préfixe `mk_len` — le gate s'applique à SES frontières.
             let mk_be = if roles.mk_len > 0 {
                 bs + roles.mk_len
             } else {
@@ -2336,10 +2095,6 @@ fn scan_all(
         } else {
             text_key
         };
-        // Article préfixé NU devant le génitif, sans le mot « article »
-        // (bandeau JLD : « L. 742-1 et suivants du Code de l'entrée… ») :
-        // token d'article écrit — rattaché en aval par l'adjacence génitive
-        // standard, la mention est consommée comme d'habitude.
         let mut hs = bs.saturating_sub(48);
         while !folded.is_char_boundary(hs) {
             hs += 1;
@@ -2371,9 +2126,6 @@ fn scan_all(
         true
     };
 
-    // Repli d'ancre : le leftmost-longest peut préférer un alias d'OCR dégradé
-    // (« code civi » pour « code civil ») qui échoue ensuite à la frontière de
-    // mot — l'ancre qui préfixe la position reprend la main.
     let anchor_at = |bs: usize| -> Option<(usize, Pat)> {
         ANCHORS
             .iter()
@@ -2392,10 +2144,6 @@ fn scan_all(
             continue;
         }
         if pat.is_none() {
-            // Token sans rôle citations (marqueur composite) : re-dériver
-            // l'ancre qu'il porte. En suffixe (« vu l'article ») → tête
-            // d'énumération ; en préfixe (« code de l'entrée et du séjour »)
-            // → l'ancre reprend la main avec SA borne.
             for w in ["articles", "article"] {
                 if folded[bs..be].ends_with(w)
                     && (be - w.len() == bs || !bytes[be - w.len() - 1].is_ascii_alphanumeric())
@@ -2404,9 +2152,6 @@ fn scan_all(
                     break;
                 }
             }
-            // Ancre Case en SUFFIXE d'un marqueur du scan (« joint les
-            // pourvois », « décision déférée ») : le marqueur consomme le
-            // token, l'ancre garde son dispatch.
             if be >= bytes.len() || !bytes[be].is_ascii_alphanumeric() {
                 if let Some((s, _)) = ANCHORS
                     .iter()
@@ -2434,17 +2179,10 @@ fn scan_all(
         }
         match pat.expect("rôle citations dérivé ci-dessus") {
             Pat::Alias { is_code, sigle } => {
-                // « CEDH, 3 octobre 2014, req. n° 30010/10 » : le sigle
-                // désigne ici la COUR — le n° de requête aval l'atteste ;
-                // sinon c'est l'alias de la Convention (token multi-rôles,
-                // ADR 0165).
                 if &folded[bs..be] == "cedh" && case_cedh(folded, byte2char, be, cases, false) {
                     continue;
                 }
                 if bs < last_instr_end {
-                    // Alias conventionnel imbriqué (« protocole n° 16 à la
-                    // convention européenne de sauvegarde… ») : antécédent
-                    // d'anaphore sans span propre — miroir du cas ancre.
                     let head = folded[..bs].trim_end();
                     if !is_code && !sigle && (head.ends_with(" a la") || head.ends_with(" a l'")) {
                         toks.push(Tok::Instr {
@@ -2459,9 +2197,6 @@ fn scan_all(
                     }
                     continue;
                 }
-                // Sigle en minuscules : collision possible avec un mot de
-                // prose (« tue » le verbe) — mais seulement en deçà de 4
-                // chars (« du ceseda », « la cedh » sont univoques).
                 if sigle
                     && be - bs < 4
                     && chars[byte2char[bs]..byte2char[be]]
@@ -2473,9 +2208,6 @@ fn scan_all(
                 let mut end = be;
                 let mut tk = folded[bs..be].to_string();
                 let mut icode = is_code;
-                // Un alias de code (« code de justice », graphie dégradée du
-                // TSV) peut masquer le titre complet au leftmost-longest : le
-                // snap catalogue reprend la borne exacte quand il va plus loin.
                 if is_code {
                     if let Some((abe, _)) = anchor_at(bs) {
                         if let Some((m2, true)) = lex_code(vocab, folded, bs, abe) {
@@ -2487,9 +2219,6 @@ fn scan_all(
                         }
                     }
                 }
-                // Alias de droit dérivé UE (« règlement (UE) n° 1215/2012 ») :
-                // le span s'étend à l'identité écrite complète — institutions
-                // et date (ADR 0143 §2) — la clé de linking reste l'alias.
                 if !is_code {
                     if let Some(nat_len) = ["reglement", "directive", "decision"]
                         .iter()
@@ -2531,10 +2260,6 @@ fn scan_all(
                         nature,
                     });
                     last_instr_end = last_instr_end.max(covered);
-                    // Le possessif embarque le mot « article(s) » (« et
-                    // notamment ses articles L. 821-1 ») : son match a
-                    // consommé l'ancre ArtWord interne — rouvrir
-                    // l'énumération sur sa fin.
                     if folded[bs..be].ends_with("article") || folded[bs..be].ends_with("articles") {
                         artwords.push((bs, be));
                     }
@@ -2542,10 +2267,6 @@ fn scan_all(
             }
             Pat::Anchor(class) => {
                 if bs < last_instr_end {
-                    // Mention conventionnelle IMBRIQUÉE (« protocole n° 16 à
-                    // la convention européenne de sauvegarde… ») : la
-                    // convention interne est l'antécédent des anaphores « de
-                    // la convention » en aval — token sans span propre.
                     if matches!(class, Anchor::Treaty) {
                         let head = folded[..bs].trim_end();
                         if head.ends_with(" a la") || head.ends_with(" a l'") {
@@ -2573,14 +2294,17 @@ fn scan_all(
                             && matches!(&folded[bs..be], "code" | "livre")
                             && folded[..bs].trim_end().ends_with(" du")
                         {
-                            // « il résulte de l'article R. 411-5 du code
-                            // qu'elle… » : le « code » nu génitif est une
-                            // anaphore du dernier code cité.
-                            let head = folded[..bs].trim_end();
-                            toks.push(Tok::Same {
-                                s: byte2char[head.len() - 2],
-                                nature: folded[bs..be].to_string(),
-                            });
+                            let rest = folded[be..].trim_start();
+                            let named = ["de ", "du ", "des ", "d'"]
+                                .iter()
+                                .any(|c| rest.starts_with(c));
+                            if !named {
+                                let head = folded[..bs].trim_end();
+                                toks.push(Tok::Same {
+                                    s: byte2char[head.len() - 2],
+                                    nature: folded[bs..be].to_string(),
+                                });
+                            }
                         }
                         lexed
                     }
@@ -2588,16 +2312,8 @@ fn scan_all(
                         let mut lexed = lex_dated(vocab, folded, bs, be);
                         if &folded[bs..be] == "ordonnance" {
                             if lexed.is_none() {
-                                // « l'ordonnance Glaxosmithkline C-210/13 » :
-                                // pas d'instrument daté FR — le préfixe de
-                                // rôle CJUE en fenêtre désambiguïse (0165).
                                 case_cjue_window(folded, chars, byte2char, be, cases);
                             }
-                            // Un n° NU 5-7 chiffres n'est jamais un instrument
-                            // (les ordonnances-lois portent un tiret d'année) :
-                            // c'est une ordonnance CE (« n° 468345 ») ou TA
-                            // (7 chiffres) / judiciaire (RG) via case_admin —
-                            // la mention sans titre de lex_dated s'efface.
                             if lexed.as_ref().is_none_or(|m| m.text_key.is_empty()) {
                                 let before = cases.len();
                                 case_admin(folded, chars, byte2char, chrono, bs, be, cases);
@@ -2632,9 +2348,6 @@ fn scan_all(
                             None
                         }
                         EuLex::None => {
-                            // « décision n° 2020-800 DC » : ni slashnum UE ni
-                            // anaphore — le suffixe DC/QPC désambiguïse vers
-                            // le Conseil constitutionnel (ADR 0165).
                             if &folded[bs..be] == "decision" {
                                 case_constit(folded, byte2char, bs, be, cases, true);
                             }
@@ -2644,8 +2357,6 @@ fn scan_all(
                     Anchor::Treaty => {
                         let lexed = lex_treaty(vocab, folded, bs, be);
                         if lexed.is_none() {
-                            // Anaphore nue « …articles 2 et 14 de la
-                            // convention, » — miroir de l'anaphore UE nue.
                             let word = &folded[bs..be];
                             let head = folded[..bs].trim_end();
                             let conn = match word {
@@ -2695,10 +2406,6 @@ fn scan_all(
         }
     }
 
-    // Titre officiel citant des articles (« arrêté … et avis mentionnés aux
-    // articles R. 313-22 … du CESEDA ») : le walker de titre a consommé
-    // l'ancre « articles » — une mention dont la surface FINIT sur le mot
-    // « article(s) » ré-ouvre une énumération.
     for (&s, &e) in &instr_spans {
         for w in ["articles", "article"] {
             if folded[s..e].ends_with(w)
@@ -2710,25 +2417,17 @@ fn scan_all(
         }
     }
 
-    // Énumérations d'articles : à partir de chaque « article(s) », consommer
-    // les numéraux — l'énumération TRAVERSE les instruments (« articles 329 du
-    // CPC et 1382 du Code civil »).
+    // Énumérations d'articles : à partir de chaque « article(s) », consommer les
+    // numéraux — l'énumération TRAVERSE les instruments.
     for &(aws, awe) in &artwords {
         let mut pos = awe;
         while let Some(sep) = RE_SEP.find(&folded[pos..]) {
             let mut numpos = pos + sep.end();
-            // Ordinal arabe de subdivision derrière le numéral (« l'article
-            // L. 1142-1-1, 1°, du code de la santé publique ») : jamais un
-            // article — la marche l'enjambe et repart du séparateur (génitif
-            // ou item suivant), comme le paragraphe romain.
             if let Some(m) = RE_ARABIC_PARA.find(&folded[numpos..]) {
                 pos = numpos + m.end();
                 continue;
             }
             if RE_NUM.captures(&folded[numpos..]).is_none() {
-                // Article NOMMÉ (« l'article préliminaire du code de
-                // procédure pénale », « …, préliminaire, 231 et 593 du CPP ») :
-                // token d'article à part entière, la marche continue derrière.
                 if let Some(m) = RE_NAMED_ART.find(&folded[numpos..]) {
                     let (nbs, nbe) = (numpos + m.start(), numpos + m.end());
                     let surface: String = chars[byte2char[nbs]..byte2char[nbe]].iter().collect();
@@ -2744,19 +2443,9 @@ fn scan_all(
                     pos = nbe;
                     continue;
                 }
-                // Paragraphe romain de subdivision entre le numéral et son
-                // génitif (« L. 1142-1, I, du code de la santé publique ») :
-                // la marche l'enjambe avant de sonder le génitif.
                 if let Some(m) = RE_ROMAN_PARA.find(&folded[numpos..]) {
                     numpos += m.end();
                 }
-                // « du <instrument> et <numéral> » : saute la mention et
-                // reprend derrière si un numéral suit. Même enjambement pour
-                // le qualificatif d'état du texte qui embarque un acte daté
-                // (« 232, dans leur rédaction antérieure à la loi n° 2004-439
-                // du 26 mai 2004 et 893, 894 du Code civil ») et pour
-                // l'instrument ITEM de liste, sans génitif (« …, Livre des
-                // procédures fiscales, 174, 591 … »).
                 let probe = &folded[numpos..];
                 let jump = ["du ", "de la ", "de l'", "des ", "de l' "]
                     .iter()
@@ -2782,10 +2471,6 @@ fn scan_all(
                                 numpos = cand;
                             }
                         }
-                        // Queue de titre non capturée derrière la mention
-                        // (« 37 de la loi du 10 juillet 1991 relative à
-                        // l'aide juridique et L. 761-1 du CJA ») : borne
-                        // courte, chaque « et » de la queue est sondé.
                         if RE_NUM.captures(&folded[numpos..]).is_none() {
                             if let Some(t) = RE_TITLE_TAIL.find(&folded[iend..]) {
                                 let tail_start = iend + t.end();
@@ -2813,11 +2498,6 @@ fn scan_all(
             };
             let full = c.get(0).unwrap();
             let (bs, mut be) = (numpos + full.start(), numpos + full.end());
-            // Suffixe-lettre fiscal (« 164 B », « L. 16 A », « 163 quinquies
-            // C ») : une lettre seule, MAJUSCULE dans l'original (le plié la
-            // met en bas de casse), hors « I » (paragraphe romain), non suivie
-            // de « . »/« ' » (sinon c'est le préfixe L./R. de l'article
-            // suivant d'une énumération).
             if be + 1 < bytes.len()
                 && bytes[be] == b' '
                 && bytes[be + 1].is_ascii_lowercase()
@@ -2829,22 +2509,16 @@ fn scan_all(
                         && bytes[be + 2] != b'\''))
             {
                 be += 2;
-                // Ordinal latin APRÈS la lettre (« 1394 B bis »,
-                // « 1518 A quinquies »).
                 if let Some(m) = RE_NUM_ORDINAL.find(&folded[be..]) {
                     be += m.end();
                 }
             }
-            if be < bytes.len() && bytes[be].is_ascii_alphanumeric() {
-                // « L. 4121-1et L. 4121-2 » : l'espace avalé par l'OCR — le
-                // connecteur collé reste un séparateur, le span s'arrête au
-                // numéral.
-                if !(folded[be..].starts_with("et ") || folded[be..].starts_with("ou ")) {
-                    break;
-                }
+            if be < bytes.len()
+                && bytes[be].is_ascii_alphanumeric()
+                && !(folded[be..].starts_with("et ") || folded[be..].starts_with("ou "))
+            {
+                break;
             }
-            // « Article 2 : » / « Article 1er – » = dispositif de LA décision ;
-            // « (article 2) » = renvoi parenthésé au dispositif d'un jugement.
             let after = folded[be..].trim_start();
             let paren_self_ref = aws > 0 && bytes[aws - 1] == b'(' && after.starts_with(')');
             if after.starts_with(':') || after.starts_with('–') || paren_self_ref {
@@ -2866,17 +2540,11 @@ fn scan_all(
     }
 
     toks.sort_by_key(tok_start);
-    // Une énumération pontée (« , du premier alinéa de l'article X ») et le
-    // mot « article » ponté lexent le MÊME numéral : dédup exacte.
     toks.dedup_by(|a, b| match (a, b) {
         (Tok::Art { s: s1, e: e1, .. }, Tok::Art { s: s2, e: e2, .. }) => s1 == s2 && e1 == e2,
         _ => false,
     });
 
-    // Citations de jurisprudence : deux ancres peuvent sonder le même token
-    // (« la Cour de cassation (pourvoi n° 19-12.345) ») — tri par position,
-    // première émission gagne, zéro chevauchement (PK (decision_id,
-    // char_start) et asserts du store en aval).
     cases.sort_by_key(|c| c.char_start);
     let mut prev_end = 0usize;
     cases.retain(|c| {
@@ -2902,26 +2570,23 @@ pub struct CompiledCitation {
     pub text_key: String,
     pub article_key: Option<String>,
     pub target: LinkTarget,
-    /// La mention porte la locution « et suivants » (ADR 0226) : le span la
-    /// couvre, la cible désigne une famille d'articles à partir de l'ancre.
+    /// La mention porte la locution « et suivants » : le span la couvre, la cible
+    /// désigne une famille d'articles à partir de l'ancre.
     pub suivants: bool,
-    /// Article NU (cible None par construction) : aucun instrument rattaché
-    /// ni tenté — ni génitif (l'orphelin est exclu), ni anaphore, ni
-    /// antécédent, ni unicité, ni canon. Sert l'auto-résolution des corps du
-    /// référentiel vers leur propre texte (ADR 0217).
+    /// Article NU (cible None par construction) : aucun instrument rattaché ni
+    /// tenté — ni génitif, ni anaphore, ni antécédent, ni unicité, ni canon.
     pub bare: bool,
 }
 
 /// Préparation d'un document pour les scans automate : texte original en
-/// chars, texte plié (`fold_stable`, 1:1 char-stable) et tables
-/// byte(plié) ↔ char(original). Proportionnelle au texte — construite UNE
-/// fois par document et partagée entre les automates (vocabulaire citations
-/// ici, marqueurs `crate::scan`).
+/// chars, texte plié (`fold_stable`, 1:1 char-stable) et tables byte(plié) ↔
+/// char(original). Construite UNE fois par document et partagée entre les
+/// automates (vocabulaire citations ici, marqueurs `crate::scan`).
 ///
-/// `chars` mappe chaque blanc (`\n`, `\t`, nbsp…) vers l'espace simple, 1:1
-/// comme `fold_stable` : les composeurs testent `' '` uniformément, les
-/// tranches verbatim sortent mono-ligne, et les offsets restent ceux du
-/// texte d'entrée (aucun collapse, aucun trim).
+/// `chars` mappe chaque blanc (saut de ligne, tabulation, nbsp…) vers l'espace
+/// simple, 1:1 comme `fold_stable` : les composeurs testent l'espace
+/// uniformément, les tranches verbatim sortent mono-ligne, et les offsets
+/// restent ceux du texte d'entrée.
 pub struct Norm {
     pub chars: Vec<char>,
     pub folded: String,
@@ -2969,8 +2634,8 @@ pub fn extract_citations(
     extract_citations_norm(&Norm::new(text), vocab, snap, forum)
 }
 
-/// Variante à préparation fournie : le pipeline par-document (`DocExtract`)
-/// construit un [`Norm`] et le partage entre les moteurs.
+/// Variante à préparation fournie : l'appelant construit un [`Norm`] et le
+/// partage entre les moteurs.
 pub fn extract_citations_norm(
     norm: &Norm,
     vocab: &CompiledVocab,
@@ -2994,6 +2659,7 @@ pub fn extract_citations_norm(
         vocab,
         snap,
         forum,
+        None,
     )
 }
 
@@ -3014,13 +2680,11 @@ pub(crate) fn scan_marks(norm: &Norm) -> Vec<crate::scan::PTok> {
 }
 
 /// Extraction par-document unifiée : UN [`Norm`], UNE passe de l'automate
-/// fusionné → les deux flux de tokens, puis la composition citations. C'est
-/// LE chemin du bridge ingest (ADR 0156 étape 11) — les entrées par-champ
-/// re-scannent et ne servent qu'aux bancs.
+/// fusionné → les deux flux de tokens, puis la composition citations.
 pub struct DocExtract {
     pub scan: crate::scan::DocScan,
     pub citations: Vec<CompiledCitation>,
-    /// Citations de jurisprudence (ADR 0165) — flux séparé, jamais composé.
+    /// Citations de jurisprudence — flux séparé, jamais composé.
     pub cases: Vec<CompiledCase>,
 }
 
@@ -3030,6 +2694,7 @@ pub fn doc_extract(
     snap: &LinkSnapshot,
     chrono: &crate::chrono::ChronoSnapshot,
     forum: Option<Forum>,
+    owner_text_uid: Option<&str>,
 ) -> DocExtract {
     let norm = Norm::new(text);
     let mut marks = Vec::new();
@@ -3051,6 +2716,7 @@ pub fn doc_extract(
         vocab,
         snap,
         forum,
+        owner_text_uid,
     );
     DocExtract {
         scan: crate::scan::docscan_from_parts(norm, marks),
@@ -3061,14 +2727,13 @@ pub fn doc_extract(
 
 /// Le texte entre un numéral d'article et l'instrument suivant est-il un
 /// connecteur génitif (« du », « de la », « , du même »…) ? C'est LA condition
-/// de légitimité du rattachement-suivant — sans elle, « l'article L. 742-3 ou
-/// d'une requête … du règlement (UE) » rattacherait au mauvais texte.
+/// de légitimité du rattachement-suivant.
 fn genitive_gap(gap: &str) -> bool {
     // QUAL = qualificatif de subdivision entre le numéral et l'instrument :
-    // « alinéa 2 », « paragraphe 1 », « point 2 », « (1) », « (ANCIEN) »,
-    // chiffre nu (« 39, 2, de la Convention »). Deux formes de gap : avec
-    // connecteur (« (1) du code ») ou qualificatif seul devant un sigle
-    // (« 107, paragraphe 1, TFUE »).
+    // « alinéa 2 », « paragraphe 1 », « point 2 », « (1) », « (ANCIEN) », chiffre
+    // nu (« 39, 2, de la Convention »). Deux formes de gap : avec connecteur
+    // (« (1) du code ») ou qualificatif seul devant un sigle (« 107,
+    // paragraphe 1, TFUE »).
     static RE_GAP: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r"(?x)^(?:
@@ -3093,8 +2758,6 @@ fn genitive_gap(gap: &str) -> bool {
         )
         .unwrap()
     });
-    // « du » avalé par l'OCR (« l'article 700 code de procédure civile ») :
-    // l'adjacence pure vaut génitif.
     if gap.chars().count() <= 3 && gap.chars().all(|c| c == ' ' || c == ',') {
         return true;
     }
@@ -3102,19 +2765,15 @@ fn genitive_gap(gap: &str) -> bool {
 }
 
 /// N° d'acte à millésime-tiret 4 chiffres (« n° 2020-1733 ») : la marque des
-/// actes RÉGLEMENTAIRES — un n° nu (« ordonnance n° 2103963 ») est un numéro
-/// de dossier (TA/CE), un n° court (« arrêté n° 23-033 ») un ordinal
-/// préfectoral.
+/// actes RÉGLEMENTAIRES.
 static RE_ACT_NORM_NUM: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"n\s*[°oº][\s.]*\d{4}\s*-\s*\d").unwrap());
-/// NOR embarqué dans le span : la marque d'un acte ministériel PUBLIÉ — un
-/// acte individuel/local n'en porte jamais.
+/// NOR embarqué dans le span : la marque d'un acte ministériel PUBLIÉ.
 static RE_ACT_NOR_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\bnor\s*:?\s*[a-z]{4}\d{7}[a-z]\b").unwrap());
 /// Queue de titre normative d'un acte daté (« arrêté du 27 décembre 2016
 /// relatif aux conditions… », « portant application de… ») — sondée derrière
-/// la mention ET dans la mention (le snap catalogue peut avoir avalé le
-/// titre entier).
+/// la mention ET dans la mention.
 static RE_ACT_NORM_TAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^\s*,?\s*(?:portant|relati(?:f|ve)s?|fixant|modifiant|completant|instituant|autorisant|approuvant|pris(?:e)?\s+(?:pour|en)|susvise|precite)\b",
@@ -3144,27 +2803,22 @@ static RE_ACT_NORM_SUBJ: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-/// Identité DATE-SEULE directement derrière la nature (« du 8 février
-/// 2022 », « n° 23-033 du 30 janvier 2023 », « d'appel du 4 juillet 2017 ») —
-/// un titre nominal (« déclaration des droits de l'homme ») ne matche pas.
+/// Identité DATE-SEULE directement derrière la nature (« du 8 février 2022 »,
+/// « n° 23-033 du 30 janvier 2023 », « d'appel du 4 juillet 2017 »).
 static RE_ACT_DATE_IDENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:\s+(?:n\s*[°oº]\s*\S+|en\s+date|d'appel|de\s+refere))*\s+(?:du|des)\s+\d")
         .unwrap()
 });
 
 /// Acte daté INDIVIDUEL (arrêté préfectoral, ordonnance du juge, délibération
-/// locale, déclaration d'appel, convention entre parties, l'acte attaqué…) :
-/// hors périmètre citations — « pas de ligne du tout » (doctrine gold). Un
-/// acte de ces natures à identité date-seule n'émet que sur signal
-/// RÉGLEMENTAIRE : n° à millésime, queue de titre officielle, contexte
-/// normatif amont/aval, ou position de visa (« Vu l'… », « ; - l'… ; »).
+/// locale, déclaration d'appel, convention entre parties, acte attaqué…) :
+/// hors périmètre citations. Un acte de ces natures à identité date-seule
+/// n'émet que sur signal RÉGLEMENTAIRE : n° à millésime, queue de titre
+/// officielle, contexte normatif amont/aval, ou position de visa (« Vu l'… »,
+/// « ; - l'… ; »).
 fn dated_individual_act(folded: &str, bs: usize, be: usize, resolved: bool) -> bool {
     let m = &folded[bs..be];
     let nature = &m[..m.find(' ').unwrap_or(m.len())];
-    // Arrêté/ordonnance… : gate y compris RÉSOLU (le snap nature+date sur un
-    // homonyme du catalogue ne fait pas foi). Conventionnel contractuel
-    // (« la convention du 26 avril 1991 a été résiliée ») : non résolu
-    // seulement — un traité daté résolu est légitime.
     let gate = match nature {
         "arrete" | "ordonnance" | "deliberation" | "circulaire" => true,
         "declaration" | "convention" | "accord" => !resolved,
@@ -3184,7 +2838,7 @@ fn dated_individual_act(folded: &str, bs: usize, be: usize, resolved: bool) -> b
     let head = folded[..bs].trim_end();
     let head = head
         .strip_suffix("l'")
-        .or_else(|| head.strip_suffix("1'")) // OCR
+        .or_else(|| head.strip_suffix("1'"))
         .or_else(|| head.strip_suffix("la"))
         .or_else(|| head.strip_suffix("le"))
         .unwrap_or(head)
@@ -3196,9 +2850,6 @@ fn dated_individual_act(folded: &str, bs: usize, be: usize, resolved: bool) -> b
     if RE_ACT_NORM_HEAD.is_match(&head[hs..]) {
         return false;
     }
-    // Visa : item de liste (« Vu … ; - l'arrêté du 2 juillet 1982 ; ») —
-    // mention close par ponctuation, pas une phrase de moyen (« - l'arrêté
-    // du 8 février 2022 méconnaît… »).
     let visa_head = head.ends_with(" vu") || head == "vu" || head.ends_with('-');
     let after_punct = folded[be..]
         .trim_start()
@@ -3207,10 +2858,8 @@ fn dated_individual_act(folded: &str, bs: usize, be: usize, resolved: bool) -> b
 }
 
 /// Intervalles de quote textuelle (« Aux termes de l'article X du CODE :
-/// "…" ») en offsets chars. Ouvrante = guillemet précédé d'un « : » (la
-/// convention des textes reproduits dans les décisions) ; les paires
-/// ambiguës sans deux-points sont ignorées. Un article cité DANS la quote
-/// appartient au texte quoté (cf. règle 3bis du compose).
+/// "…" ») en offsets chars. Ouvrante = guillemet précédé d'un « : » ; les
+/// paires ambiguës sans deux-points sont ignorées.
 fn quote_spans(chars: &[char]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -3258,21 +2907,59 @@ fn instr_keys<'a>(t: &'a Tok, chars: &[char]) -> Option<(String, &'a str, bool)>
     Some((surface, text_key.as_str(), *is_code))
 }
 
-/// Résolution mémoïsée par document : l'analyse de clé ([`KeyAnalysis`],
-/// pliages + cascade `key_signals`) se calcule une fois par `text_key` — la
-/// même clé résout des dizaines d'articles distincts — et la cible une fois
-/// par (text_key, article_key).
+/// Clé d'appariement de l'adoption intra-document d'une forme datée nue : pli
+/// stable + qualificatif de circulaire raboté.
+fn dated_adoption_key(text_key: &str) -> String {
+    fold_stable(
+        &crate::link::strip_circulaire_qualifier(text_key).unwrap_or_else(|| text_key.to_string()),
+    )
+}
+
+/// « la circulaire du 28 novembre 2012 relative aux conditions d'examen… » :
+/// mention datée NUE (le lexer borne à la date), queue-objet dans le texte
+/// après la mention — auteur (« du ministre de l'intérieur ») enjambé,
+/// connecteur explicite exigé. Départage via
+/// [`LinkSnapshot::circulaire_by_object_tail`].
+fn circ_tail_target(
+    t: &Tok,
+    folded: &str,
+    char2byte: &[usize],
+    snap: &LinkSnapshot,
+) -> Option<String> {
+    let Tok::Instr { s, e, .. } = t else {
+        return None;
+    };
+    let mention = &folded[char2byte[*s]..char2byte[*e]];
+    let mention = crate::link::strip_circulaire_qualifier(mention)
+        .map_or(std::borrow::Cow::Borrowed(mention), std::borrow::Cow::Owned);
+    if !mention.starts_with("circulaire du ") || !RE_BARE_DATED_ALIAS.is_match(&mention) {
+        return None;
+    }
+    let date = crate::link::first_date(&mention)?;
+    let win = case_window(folded, char2byte[*e], 200);
+    let tail = RE_CIRC_DOC_TAIL
+        .captures(win)?
+        .get(1)
+        .expect("groupe queue")
+        .as_str();
+    snap.circulaire_by_object_tail(date, tail)
+}
+
+/// Résolution mémoïsée par document : l'analyse de clé ([`KeyAnalysis`]) se
+/// calcule une fois par `text_key`, la cible une fois par (text_key,
+/// article_key).
 struct Resolver<'a> {
     snap: &'a LinkSnapshot,
     vocab: &'a CompiledVocab,
+    /// For du corps émetteur — constant sur tout le document.
+    owner_iso: Option<&'a str>,
     analyses: FxHashMap<String, std::sync::Arc<KeyAnalysis>>,
     memo: FxHashMap<(String, Option<String>), LinkTarget>,
 }
 
-/// Cache statique des [`KeyAnalysis`] : fonction PURE de `text_key`
-/// (pliages + cascade `key_signals`, aucun snapshot) — partageable entre
-/// runs, docs et threads. Les text_keys du corpus forment un vocabulaire
-/// fermé de fait.
+/// Cache statique des [`KeyAnalysis`] : fonction PURE de `text_key` (pliages +
+/// cascade `key_signals`, aucun snapshot) — partageable entre runs, docs et
+/// threads.
 static KEY_ANALYSES: std::sync::OnceLock<
     std::sync::RwLock<FxHashMap<String, std::sync::Arc<KeyAnalysis>>>,
 > = std::sync::OnceLock::new();
@@ -3305,19 +2992,24 @@ impl Resolver<'_> {
         if let Some(t) = self.memo.get(&k) {
             return t.clone();
         }
-        // Cache inter-décisions (clé EXACTE, instrument inclus) : le memo
-        // per-doc au-dessus garde la sémantique intra-document inchangée.
         let gk = (
             instrument.to_string(),
             text_key.to_string(),
             ak.map(str::to_string),
+            self.owner_iso.map(str::to_string),
         );
         if let Some(t) = self.vocab.link_cache.read().unwrap().get(&gk) {
             self.memo.insert(k, t.clone());
             return t.clone();
         }
         self.analysis(text_key);
-        let target = link_citation_analyzed(self.snap, instrument, &self.analyses[text_key], ak);
+        let target = link_citation_analyzed(
+            self.snap,
+            instrument,
+            &self.analyses[text_key],
+            ak,
+            self.owner_iso,
+        );
         self.memo.insert(k, target.clone());
         self.vocab
             .link_cache
@@ -3332,6 +3024,7 @@ impl Resolver<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compose(
     toks: &[Tok],
     chars: &[char],
@@ -3340,41 +3033,78 @@ fn compose(
     vocab: &CompiledVocab,
     snap: &LinkSnapshot,
     forum: Option<Forum>,
+    owner_text_uid: Option<&str>,
 ) -> Vec<CompiledCitation> {
     let mut resolver = Resolver {
         snap,
         vocab,
+        owner_iso: owner_text_uid.and_then(|u| snap.foreign_iso(u)),
         analyses: FxHashMap::default(),
         memo: FxHashMap::default(),
     };
 
-    // Registre document : uids des instruments résolus (unicité des articles
-    // nus) — le « sur-exploiter » du KV-cache.
+    // Registre document : uids des instruments résolus, pour l'unicité des
+    // articles nus.
     let mut doc_uids: FxHashSet<String> = FxHashSet::default();
     let mut instr_resolved: FxHashMap<usize, (String, String, Option<String>)> =
         FxHashMap::default();
     for (i, t) in toks.iter().enumerate() {
         if let Some((surface, tk, _)) = instr_keys(t, chars) {
-            let target = resolver.resolve(&surface, tk, None);
+            let mut target = resolver.resolve(&surface, tk, None);
+            if target.ref_text_uid.is_none() {
+                if let Some(uid) = circ_tail_target(t, folded, char2byte, snap) {
+                    target = LinkTarget {
+                        ref_text_uid: Some(uid),
+                        ref_num_key: None,
+                    };
+                }
+            }
             if let Some(uid) = &target.ref_text_uid {
                 doc_uids.insert(uid.clone());
             }
             instr_resolved.insert(i, (surface, tk.to_string(), target.ref_text_uid));
         }
     }
-    // Anaphore de préfixe : « la Convention de Vienne » (forme courte non
-    // datée, non résolue) adopte la forme datée résolue du même document dont
-    // elle est le préfixe — cible unique exigée, sinon elle reste morte.
+    let mut dated_tk_uid: FxHashMap<String, Option<String>> = FxHashMap::default();
+    for (_, tk, uid) in instr_resolved.values() {
+        let Some(uid) = uid else { continue };
+        let ftk = dated_adoption_key(tk);
+        if !RE_BARE_DATED_ALIAS.is_match(&ftk) {
+            continue;
+        }
+        match dated_tk_uid.entry(ftk) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Some(uid.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if e.get().as_deref() != Some(uid) {
+                    e.insert(None);
+                }
+            }
+        }
+    }
+    for (i, t) in toks.iter().enumerate() {
+        if !matches!(t, Tok::Instr { .. }) {
+            continue;
+        }
+        let Some((_, tk, None)) = instr_resolved.get(&i).cloned() else {
+            continue;
+        };
+        if let Some(Some(uid)) = dated_tk_uid.get(&dated_adoption_key(&tk)) {
+            let uid = uid.clone();
+            doc_uids.insert(uid.clone());
+            if let Some(entry) = instr_resolved.get_mut(&i) {
+                entry.2 = Some(uid);
+            }
+        }
+    }
     let full_forms: Vec<(String, String, String)> = instr_resolved
         .values()
         .filter_map(|(surface, tk, uid)| Some((fold_stable(surface), tk.clone(), uid.clone()?)))
         .collect();
     for (i, t) in toks.iter().enumerate() {
         let Tok::Instr {
-            s,
-            e,
-            treaty_short: true,
-            ..
+            s, e, treaty_short, ..
         } = t
         else {
             continue;
@@ -3386,7 +3116,11 @@ fn compose(
             continue;
         }
         let surface: String = chars[*s..*e].iter().collect();
-        let prefix = format!("{} ", fold_stable(&surface));
+        let folded = fold_stable(&surface);
+        if !*treaty_short && !RE_BARE_DATED_ALIAS.is_match(&folded) {
+            continue;
+        }
+        let prefix = format!("{folded} ");
         let mut hits = full_forms.iter().filter(|(f, _, _)| f.starts_with(&prefix));
         if let Some((_, tk, uid)) = hits.next() {
             if hits.all(|(_, _, u)| u == uid) {
@@ -3400,9 +3134,9 @@ fn compose(
     let quotes = quote_spans(chars);
 
     // Adjacence génitive précalculée pour TOUS les Art, puis héritage
-    // d'énumération EN ARRIÈRE : « articles L. 521-1 et L. 521-2 du CESEDA »
-    // — seul le dernier item touche le génitif, les précédents en héritent
-    // quand seuls des Art les séparent et qu'ils sont contigus (≤ 30 chars).
+    // d'énumération EN ARRIÈRE : seul le dernier item touche le génitif, les
+    // précédents en héritent quand seuls des Art les séparent et qu'ils sont
+    // contigus (≤ 30 chars).
     let mut adj: FxHashMap<usize, usize> = FxHashMap::default();
     for (i, t) in toks.iter().enumerate() {
         let Tok::Art { e, .. } = t else { continue };
@@ -3432,13 +3166,14 @@ fn compose(
             continue;
         }
         let Some(&target) = adj.get(&k) else { continue };
-        // Entre les deux articles : rien que des articles — ou UN acte daté
-        // embarqué par un qualificatif de rédaction (« 232, dans leur
-        // rédaction antérieure à la loi n° 2004-439 du 26 mai 2004 et
-        // 893 … du Code civil ») : l'énumération l'enjambe, l'héritage aussi.
-        let (Tok::Art { e, .. }, Tok::Art { s, .. }) = (&toks[i], &toks[k]) else {
+        let (Tok::Art { e, num_key: hk, .. }, Tok::Art { s, .. }) = (&toks[i], &toks[k]) else {
             unreachable!()
         };
+        if owner_text_uid.is_some_and(|u| snap.has_article(u, hk))
+            && RE_COORD_ART.is_match(&folded[char2byte[*e]..char2byte[*s]])
+        {
+            continue;
+        }
         let mut gap_from = *e;
         let mut chain = true;
         for t in &toks[i + 1..k] {
@@ -3458,29 +3193,55 @@ fn compose(
                 }
             }
         }
-        // ≤ 40 : la reprise génitive la plus longue pontée par RE_SEP
-        // (« , du premier alinéa de l'article ») fait 33 chars.
         if chain && s.saturating_sub(gap_from) <= 40 {
             adj.insert(i, target);
         }
     }
 
+    // Génitif orphelin : test textuel (partagé avec l'émission) + héritage
+    // d'énumération EN ARRIÈRE, symétrique de `adj`. Une anaphore qui suit ne
+    // propage pas : chaque item la résout à son compte.
+    let orphan_after = |e: usize| {
+        let rest = &folded[char2byte[e]..];
+        RE_ORPHAN.is_match(rest)
+            || RE_ZONE_STEP
+                .captures(rest)
+                .is_some_and(|c| !matches!(&c[1], "ou" | "ni" | "et"))
+    };
+    let mut orphan_heads: FxHashSet<usize> = FxHashSet::default();
+    for w in art_idx.windows(2).rev() {
+        let (i, k) = (w[0], w[1]);
+        if adj.contains_key(&i) || adj.contains_key(&k) {
+            continue;
+        }
+        let (Tok::Art { e, .. }, Tok::Art { s, e: ke, .. }) = (&toks[i], &toks[k]) else {
+            unreachable!()
+        };
+        let k_orphan = orphan_heads.contains(&k)
+            || (orphan_after(*ke)
+                && !toks[k..]
+                    .iter()
+                    .take_while(|t2| tok_start(t2) <= ke + 60)
+                    .any(|t2| matches!(t2, Tok::Same { .. })));
+        if k_orphan
+            && s.saturating_sub(*e) <= 40
+            && toks[i + 1..k].iter().all(|t| matches!(t, Tok::Art { .. }))
+        {
+            orphan_heads.insert(i);
+        }
+    }
+
     // Consommation des mentions par les articles adjacents — dérivée d'`adj`
-    // AVANT toute émission : une mention consommée par ≥ 1 article (complément
-    // génitif d'une locution, simple ou énumération) n'émet pas de span propre
-    // (ADR 0166). Une mention TÊTE reste émise (« Vu le CJA et notamment ses
-    // articles L. 761-1 » : le possessif résout en arrière hors `adj`).
+    // AVANT toute émission : une mention consommée par ≥ 1 article n'émet pas de
+    // span propre. Une mention TÊTE reste émise.
     let mut consumed: FxHashMap<usize, u32> = FxHashMap::default();
     for &j in adj.values() {
         if instr_resolved.contains_key(&j) {
             *consumed.entry(j).or_insert(0) += 1;
         }
     }
-    // Spans d'instrument qui ÉMETTRONT : les tokens d'article intérieurs à
-    // l'un d'eux appartiennent au titre (« arrêté … pris en application de
-    // l'article 238-0 A du CGI ») — consommés par la mention, jamais émis en
-    // span propre. Les spans sortent disjoints PAR CONSTRUCTION (ADR 0160
-    // §3) ; l'assert d'écriture du store reste l'unique frontière.
+    // Spans d'instrument qui ÉMETTRONT : les tokens d'article intérieurs à l'un
+    // d'eux appartiennent au titre et ne sont jamais émis en span propre.
     let instr_emits: Vec<(usize, usize)> = toks
         .iter()
         .enumerate()
@@ -3498,11 +3259,9 @@ fn compose(
             if uid.is_none() && (*weak || !resolver.citable(tk)) {
                 return None;
             }
-            // Y compris RÉSOLU : « Par un arrêté du 14 février 2025, le
-            // préfet… » snappe par nature+date sur un homonyme du catalogue —
-            // l'identité date-seule de ces natures ne fait pas foi hors
-            // signal réglementaire.
-            if dated_individual_act(folded, char2byte[*s], char2byte[*e], uid.is_some()) {
+            if dated_individual_act(folded, char2byte[*s], char2byte[*e], uid.is_some())
+                && !snap.has_text_alias(tk)
+            {
                 return None;
             }
             Some((*s, *e))
@@ -3522,14 +3281,9 @@ fn compose(
             }
             continue;
         };
-        // Token d'article intérieur à une mention qui émettra son propre span
-        // (titre officiel citant un article : « arrêté pris en application de
-        // l'article 238-0 A ») : consommé par le titre — ADR 0160 §3.
         if instr_emits.iter().any(|&(is, ie)| *s >= is && *s < ie) {
             continue;
         }
-        // `num_key` = `normalize_article(surface)` posé au lex (seul
-        // producteur de `Tok::Art`, jamais vide) — pas de recalcul.
         let ak = Some(num_key.clone());
 
         // 2. Anaphore collée (« R. 57-1 du même livre ») — porte la nature.
@@ -3554,28 +3308,23 @@ fn compose(
         let mut resolved: Option<(String, String)> = None; // (surface, text_key)
         let mut adjacent = false;
         // 1. Instrument SUIVANT génitivement adjacent (« L. 761-1 du CJA »),
-        //    héritage d'énumération inclus. L'adjacence est AUTORITAIRE :
-        //    l'article appartient syntaxiquement à cet instrument — si sa
-        //    résolution échoue, on n'invente pas une autre cible.
+        //    héritage d'énumération inclus. L'adjacence est AUTORITAIRE : l'article
+        //    appartient syntaxiquement à cet instrument.
         if let Some(&j) = adj.get(&i) {
             if let Some((surface, tk, _)) = instr_resolved.get(&j) {
                 resolved = Some((surface.clone(), tk.clone()));
             }
             adjacent = true;
         }
-        // 3. Anaphore → mention PRÉCÉDENTE la plus proche dont la clé porte
-        //    la nature citée (« du même livre » → « livre des procédures
-        //    fiscales ») ET qui possède l'article au catalogue.
+        // 3. Anaphore → mention PRÉCÉDENTE la plus proche dont la clé porte la
+        //    nature citée (« du même livre » → « livre des procédures fiscales ») ET
+        //    qui possède l'article au catalogue.
         if resolved.is_none() && !adjacent {
             if let Some(nat) = same_nat {
                 for j in (0..i).rev() {
                     let Some((surface, tk, uid)) = instr_resolved.get(&j) else {
                         continue;
                     };
-                    // Possessif sans nature (« ses articles L. 821-1 ») : le
-                    // référent est l'instrument IMMÉDIATEMENT amont — sans
-                    // borne, le walk saute un contrat/une mention non résolue
-                    // et mislink au premier code lointain porteur du numéro.
                     if nat.is_empty() {
                         let Tok::Instr { e: ie, .. } = &toks[j] else {
                             continue;
@@ -3587,8 +3336,6 @@ fn compose(
                     if nat != "texte" && !starts_with_folded(tk, nat) {
                         continue;
                     }
-                    // Article au catalogue, OU structure inconnue (traités
-                    // JORF sans lignes article) : la nature explicite suffit.
                     if uid
                         .as_deref()
                         .is_some_and(|u| snap.has_article(u, num_key) || !snap.has_article_info(u))
@@ -3599,12 +3346,9 @@ fn compose(
                 }
             }
         }
-        // 3bis. Article DANS une quote : il appartient au texte quoté — le
-        //       cadre (« Aux termes de l'article X du CODE : "…" ») prime sur
-        //       l'antécédent (souvent un règlement cité dans la quote
-        //       précédente) et sur l'unicité (le doc visait aussi le CJA).
-        //       Cadre = dernière citation d'article émise ≤ 120 chars avant
-        //       l'ouvrante, instrument résolu.
+        // 3bis. Article DANS une quote : il appartient au texte quoté — le cadre
+        //       prime sur l'antécédent et sur l'unicité. Cadre = dernière citation
+        //       d'article émise ≤ 120 chars avant l'ouvrante, instrument résolu.
         let mut direct_target: Option<LinkTarget> = None;
         if resolved.is_none() && !adjacent {
             if let Some(&(qs, _)) = quotes.iter().find(|(qs, qe)| *s > *qs && *e < *qe) {
@@ -3628,14 +3372,11 @@ fn compose(
                 }
             }
         }
-        // 3ter. Génitif de FORUM (parent implicite par juridiction) : « 69,
-        //       paragraphe 2, du règlement de procédure, toute partie… » dans
-        //       un arrêt CJUE, « 44 § 2 de la Convention. » dans un arrêt
-        //       CEDH — la nature nue n'est pas une mention reconnue, mais la
-        //       juridiction qui parle identifie son texte propre. Nature NUE
-        //       exigée (ponctuation ou coordination derrière — « de la
-        //       convention d'indemnisation » ne matche pas) ; article validé
-        //       au catalogue quand la structure de la cible est connue.
+        // 3ter. Génitif de FORUM (parent implicite par juridiction) : la nature nue
+        //       n'est pas une mention reconnue, mais la juridiction qui parle
+        //       identifie son texte propre. Nature NUE exigée (ponctuation ou
+        //       coordination derrière) ; article validé au catalogue quand la
+        //       structure de la cible est connue.
         if resolved.is_none() && !adjacent && direct_target.is_none() {
             if let Some(f) = forum {
                 let rest = &folded[char2byte[*e]..];
@@ -3655,20 +3396,26 @@ fn compose(
                 }
             }
         }
-        // Génitif ORPHELIN : « l'article 82 du code de la famille congolais »
-        // — un connecteur suit mais aucun instrument n'a été reconnu.
-        // L'article appartient syntaxiquement à cet inconnu : deviner par
-        // antécédent/unicité serait un mislink garanti (congolais → code
-        // civil FR). On émet le span sans cible. Le désignateur de zone
-        // d'urbanisme est enjambé (« 3 UA du POS » : article du règlement
-        // local, hors catalogue), coordinations exclues.
-        let orphan = resolved.is_none() && !adjacent && {
-            let rest = &folded[char2byte[*e]..];
-            RE_ORPHAN.is_match(rest)
-                || RE_ZONE_STEP
-                    .captures(rest)
-                    .is_some_and(|c| !matches!(&c[1], "ou" | "ni" | "et"))
-        };
+        // Génitif ORPHELIN : un connecteur suit mais aucun instrument n'a été
+        // reconnu. L'article appartient syntaxiquement à cet inconnu : le span sort
+        // sans cible, les têtes d'énumération héritent (`orphan_heads`).
+        let orphan =
+            resolved.is_none() && !adjacent && (orphan_heads.contains(&i) || orphan_after(*e));
+
+        // 3ter. Désignation DÉICTIQUE du porteur (« … 33, 50, 51, 53, 69 et 91 du
+        //       présent Code ») : le génitif ne pointe pas un instrument inconnu, il
+        //       nomme le document qui parle. Réservée aux corps du référentiel.
+        if orphan && direct_target.is_none() {
+            if let Some(uid) = owner_text_uid
+                .filter(|u| snap.has_article(u, num_key))
+                .filter(|_| RE_SELF_GEN.is_match(&folded[char2byte[*e]..]))
+            {
+                direct_target = Some(LinkTarget {
+                    ref_text_uid: Some(uid.to_string()),
+                    ref_num_key: snap.num_key_for(uid, Some(num_key)),
+                });
+            }
+        }
 
         // 4. Antécédent proche (article nu en prose) — validé catalogue.
         if resolved.is_none() && !adjacent && !orphan {
@@ -3682,17 +3429,15 @@ fn compose(
             }
         }
         // 5. Unicité : porteurs catalogue de l'article ∩ instruments du doc.
-        //    À égalité (≥ 2 porteurs cités), départage par la citation
-        //    RÉSOLUE la plus proche en amont dont la cible est candidate —
-        //    blocs d'articles reproduits (« - Article L212-8- " … ») : le
-        //    code du travail introduit le bloc, le code rural cité ailleurs
-        //    porte aussi ces clés ; chaque article résolu ancre le suivant.
-        //    Clés PRÉFIXÉES seulement (L./R./D./A.) : un numéral nu
-        //    (« 1382 ») vit dans trop de textes (civil/CPC, codes étrangers)
-        //    pour que la proximité soit un signal.
-        if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() {
-            // L'index inversé du catalogue est en clé publique (ADR 0209) ;
-            // la clé citée reste en forme `normalize_article`.
+        //    À égalité (≥ 2 porteurs cités), départage par la citation RÉSOLUE la
+        //    plus proche en amont dont la cible est candidate. Clés PRÉFIXÉES
+        //    seulement (L./R./D./A.).
+        //    Corps du référentiel : le texte PORTEUR revendique ses propres numéraux
+        //    nus (« régie par les dispositions des articles 1049 à 1055 » dans le
+        //    CPC = le CPC) ; l'unicité s'abstient alors, l'auto-résolution tranche en
+        //    aval sur le porteur.
+        let owner_claims = owner_text_uid.is_some_and(|u| snap.has_article(u, num_key));
+        if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() && !owner_claims {
             let public_key = lj_core::article_key::article_key(num_key);
             if let Some(cands) = vocab.by_num_key.get(&public_key) {
                 let prefixed = num_key.len() > 3
@@ -3702,9 +3447,6 @@ fn compose(
                 let uid = match (inter.next(), inter.next()) {
                     (Some(uid), None) => Some(uid.as_str()),
                     (Some(_), Some(_)) if prefixed => {
-                        // Un SEUL candidat présent dans la fenêtre : deux
-                        // porteurs cités à portée (CESEDA + code du travail
-                        // autour d'un « L. 435-1 » nu) = ambigu, on s'abstient.
                         let mut in_window = out
                             .iter()
                             .rev()
@@ -3726,10 +3468,9 @@ fn compose(
                 }
             }
         }
-        // 5bis. Consistance de document : le même numéral déjà RÉSOLU en
-        //       amont (« l'article 1648 précité », re-mention d'un article de
-        //       traité sans structure) — adopté si TOUTES les résolutions
-        //       antérieures de ce num_key visent la même cible.
+        // 5bis. Consistance de document : le même numéral déjà RÉSOLU en amont —
+        //       adopté si TOUTES les résolutions antérieures de ce num_key visent la
+        //       même cible.
         if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() {
             let mut prior = out
                 .iter()
@@ -3740,19 +3481,13 @@ fn compose(
                 }
             }
         }
-        // 6. Antécédent NON VALIDABLE : le catalogue ne connaît aucun article
-        //    de la cible (traités JORF sans structure — Convention de Rome,
-        //    CVIM) ; l'existence n'étant pas réfutable, l'antécédent serré
-        //    (≤ 600) est accepté une fois l'unicité épuisée.
+        // 6. Antécédent NON VALIDABLE : le catalogue ne connaît aucun article de la
+        //    cible (traités JORF sans structure) ; l'existence n'étant pas réfutable,
+        //    l'antécédent serré (≤ 600) est accepté une fois l'unicité épuisée.
         if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() {
             if let Some(j) = last_instr {
                 if let Some((surface, tk, Some(uid))) = instr_resolved.get(&j) {
                     let dist = s.saturating_sub(tok_start(&toks[j]));
-                    // Natures conventionnelles + droit dérivé UE : une LOI
-                    // sans structure connue est une loi de ratification/modif
-                    // — les articles voisins ne sont pas les siens ; un
-                    // règlement/une directive cités en antécédent serré sont
-                    // le texte quoté.
                     let treaty_like = [
                         "convention",
                         "traite",
@@ -3770,13 +3505,10 @@ fn compose(
                 }
             }
         }
-        // 6ter. Article nu de STYLE Convention dans une décision CEDH :
-        //       « Art. 13 - lack of any effective remedy » des annexes
-        //       anglaises, « l'article 5 § 3 » de la prose — la Cour cite son
-        //       propre texte. Style exigé (marqueur abrégé « art. » ou « § »
-        //       derrière : les têtes de citation du droit interne — « Article
-        //       26 » d'une loi turque reproduite — ne matchent pas) ; article
-        //       validé au catalogue (la CESDH porte ses 59 articles).
+        // 6ter. Article nu de STYLE Convention dans une décision CEDH (« Art. 13 -
+        //       lack of any effective remedy », « l'article 5 § 3 ») : la Cour cite
+        //       son propre texte. Style exigé (marqueur abrégé « art. » ou « § »
+        //       derrière) ; article validé au catalogue.
         if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() {
             if let Some(uid) =
                 (forum == Some(Forum::Cedh)).then(|| snap.forum_default(Forum::Cedh, "convention"))
@@ -3794,9 +3526,9 @@ fn compose(
                 }
             }
         }
-        // 7. Canon jurisprudentiel : « l'article 700 » nu = frais irrépétibles
-        //    du CPC, « 699 » = distraction des dépens — cités sans instrument
-        //    dans TOUTES les juridictions judiciaires, jamais un autre texte.
+        // 7. Canon jurisprudentiel : « l'article 700 » nu = frais irrépétibles du
+        //    CPC, « 699 » = distraction des dépens — cités sans instrument dans
+        //    TOUTES les juridictions judiciaires.
         if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() {
             if let Some(uid) = CANON_BARE_ARTICLES
                 .iter()
@@ -3809,10 +3541,8 @@ fn compose(
             }
         }
 
-        // Article NU : aucun instrument rattaché NI TENTÉ — pas de génitif
-        // (l'orphelin appartient syntaxiquement à son inconnu), pas
-        // d'anaphore/antécédent/unicité/canon. Les corps du référentiel s'en
-        // servent pour l'auto-résolution vers le texte émetteur (ADR 0217).
+        // Article NU : aucun instrument rattaché NI TENTÉ — pas de génitif, pas
+        // d'anaphore/antécédent/unicité/canon.
         let bare = resolved.is_none() && !adjacent && !orphan && direct_target.is_none();
         let (instrument, text_key, target) = match (resolved, direct_target) {
             (Some((surface, tk)), _) => {
@@ -3822,8 +3552,8 @@ fn compose(
             (None, Some(t)) => (String::new(), String::new(), t),
             (None, None) => (String::new(), String::new(), LinkTarget::default()),
         };
-        // ADR 0226 : la locution « et suivants » qui suit le numéro entre
-        // dans le span et pose le signal `suivants` — la cible reste l'ancre.
+        // La locution « et suivants » qui suit le numéro entre dans le span et pose
+        // le signal `suivants` — la cible reste l'ancre.
         let ext = suivants_extension(chars, *e);
         out.push(CompiledCitation {
             char_start: *s,
@@ -3839,9 +3569,8 @@ fn compose(
     }
 
     // Mentions d'instrument : span propre sauf si consommée par ≥ 1 article
-    // adjacent (ADR 0166 — génitif simple ou énumération). Les mentions faibles
-    // (structurelles sans identité chiffrée ni snap catalogue) et les actes
-    // non citables (arrêté préfectoral, acte local) n'émettent que résolues.
+    // adjacent (génitif simple ou énumération). Les mentions faibles et les actes
+    // non citables n'émettent que résolues.
     for (i, t) in toks.iter().enumerate() {
         if let Tok::Instr {
             s, e, weak, nested, ..
@@ -3861,12 +3590,20 @@ fn compose(
                     continue;
                 }
             }
-            // Y compris résolu (snap nature+date sur homonyme) : l'acte
-            // individuel n'émet pas — miroir du filtre `instr_emits`.
-            if dated_individual_act(folded, char2byte[*s], char2byte[*e], uid.is_some()) {
+            if dated_individual_act(folded, char2byte[*s], char2byte[*e], uid.is_some())
+                && !snap.has_text_alias(tk)
+            {
                 continue;
             }
-            let target = resolver.resolve(surface, tk, None);
+            let mut target = resolver.resolve(surface, tk, None);
+            if target.ref_text_uid.is_none() {
+                if let Some(uid) = uid {
+                    target = LinkTarget {
+                        ref_text_uid: Some(uid.clone()),
+                        ref_num_key: None,
+                    };
+                }
+            }
             out.push(CompiledCitation {
                 char_start: *s,
                 char_end: *e,
@@ -3880,25 +3617,20 @@ fn compose(
             });
         }
     }
-    // Les spans sortent disjoints PAR CONSTRUCTION (consommation dérivée
-    // d'`adj` + tokens d'article intérieurs aux mentions émettrices écartés,
-    // ADR 0160 §3) ; l'assert d'écriture du store (spans triés sans
-    // chevauchement, PK `(decision_id, char_start)`) reste l'unique frontière.
     out.sort_by_key(|c| c.char_start);
     out
 }
 
-/// Locution « et suivants » immédiatement après un numéro d'article (ADR
-/// 0226) : accord féminin (« dispositions 1373 et suivantes »), abréviation
-/// « et s. », virgule OCR (« , et suivants »). Le char qui borne le mot
-/// (groupe non capturé) n'entre jamais dans le span.
+/// Locution « et suivants » immédiatement après un numéro d'article : accord
+/// féminin (« dispositions 1373 et suivantes »), abréviation « et s. »,
+/// virgule OCR (« , et suivants »). Le char qui borne le mot (groupe non
+/// capturé) n'entre jamais dans le span.
 static RE_ART_SUIVANTS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^([,\s]{1,3}et\s+(?:suivant(?:e?s)?|s\.))(?:[^\p{L}\p{N}]|$)").unwrap()
 });
 
 /// Longueur (en chars) de l'extension « et suivants » à partir de `e` — 0 si
-/// le numéro n'est pas suivi de la locution. Sonde bon marché : préfiltre sur
-/// le char de jonction, fenêtre bornée.
+/// le numéro n'est pas suivi de la locution.
 fn suivants_extension(chars: &[char], e: usize) -> usize {
     if !matches!(chars.get(e), Some(&(' ' | ','))) {
         return 0;
@@ -3920,7 +3652,7 @@ static RE_LEX_DATED_QUAL: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 /// Numéro d'acte FR : préfixé « n°/no » (numéro libre) ou nu (forme NN-NNN
-/// exigée — « loi 2004-575 » oui, « loi 1901 » prose non).
+/// exigée).
 static RE_LEX_NUM: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s+(?:n\s*[°oº]\s*\.?\s*[\w./-]*\d[\w./-]*|\d+-\d[\w./-]*)").unwrap()
 });
@@ -3962,7 +3694,7 @@ static RE_LEX_EU: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// Identité UE DATÉE sans numéro — « règlement (UE) du 17 décembre 2013 »,
 /// « règlement du Conseil, du 21 décembre 1992 » : sigle et institutions
-/// optionnels, la date obligatoire (voir la branche datée de `lex_eu`).
+/// optionnels, la date obligatoire.
 static RE_LEX_EU_DATED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?x)^
@@ -3972,14 +3704,11 @@ static RE_LEX_EU_DATED: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-// Citations de jurisprudence (ADR 0165). Le span émis = le groupe 1 (token
-// identifiant, convention 0143) ; la lettre de série Cassation (« n° B
-// 19-12.345 ») reste hors span comme hors clé.
-//
 // Forme du n° de pourvoi (7 chiffres) et ses graphies réelles : point absent
 // (« 11-25536 »), espace après le point (« 06-41. 614 »), virgule
 // (« 02-14,799 »), second tiret (« 09-72-219 »), tiret initial absent
-// (« 0430.583 »), point déplacé (« 08-215.47 »).
+// (« 0430.583 »), point déplacé (« 08-215.47 »). Le span émis est le
+// groupe 1 ; la lettre de série Cassation reste hors span comme hors clé.
 const CC_NUM: &str = r"(?:\d{2}[-.]\s?\d{2}[-.,]?\s?\d{3}|\d{4}\.\d{3}|\d{2}-\d{3}\.\d{2})";
 /// Marqueur de numéro : « n° », « n°s », « no », « n » nu (la forme stricte
 /// du pourvoi discrimine), « RG : » (bandeaux d'en-tête), parenthèse ouvrante
@@ -3999,7 +3728,7 @@ static RE_CASE_POURVOI: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 /// Pourvoi en fenêtre (« Cass. 3e civ., 16 mars 2022, n° 18-23.954 ») : un
-/// marqueur est exigé, la forme du pourvoi discrimine du reste de la prose.
+/// marqueur est exigé.
 static RE_CASE_POURVOI_WIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"{CC_MARK}\s*(?:[a-z]\s*)?({CC_NUM})\b")).unwrap());
 /// Maillon d'énumération : « et 18-23.955 », « au n° W 00-44.846 » (plage),
@@ -4013,7 +3742,7 @@ static RE_CASE_POURVOI_NEXT: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 /// N° de requête CE : 5-6 chiffres nus derrière « n° » / « nos » / « sous le
-/// numéro » — jamais sans le contexte CE (l'ancre), un `\d{6}` nu est du bruit.
+/// numéro » — jamais sans le contexte CE (l'ancre).
 static RE_CASE_CE_WIN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:sous\s+le\s+)?(?:n\s*[°oº]\s*s?|numeros?)\s*[:.]?\s*(\d{5,6})\b").unwrap()
 });
@@ -4037,8 +3766,7 @@ static RE_CASE_ARRET_CE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 /// « Par une ordonnance n° 468345 du 15 novembre 2022 » : ordonnance CE
-/// (5-6 chiffres nus — les ordonnances-instruments portent un tiret d'année,
-/// les ordonnances TA 7 chiffres, les judiciaires un RG à barre).
+/// (5-6 chiffres nus).
 static RE_CASE_ORD_CE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*n\s*[°oº]\s*s?\s*(\d{5,6})\b").unwrap());
 /// « La requête en référé n° 502527 de Mme D » : référé CE derrière
@@ -4047,7 +3775,7 @@ static RE_CASE_REF_CE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*en\s+refere\s+n\s*[°oº]\s*s?\s*(\d{5,6})\b").unwrap());
 /// Sonde ARRIÈRE CE : « Par une décision n° 432537 du 8 janvier 2020, le
 /// Conseil d'Etat… » — le n° précède l'ancre, gaté sur la nature
-/// décision/ordonnance/arrêt (un n° de requête nu serait ambigu).
+/// décision/ordonnance/arrêt.
 static RE_CASE_CE_BACK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?x)(?:decision|ordonnance|arret)s?\s+
@@ -4066,8 +3794,8 @@ static RE_CASE_OTHER_JUR: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 /// Décision du Conseil constitutionnel derrière « décision(s) » : le suffixe
-/// DC/QPC identifie la famille, sauf gate « décision » explicite
-/// (« dans sa décision n°2015-479 » — « n° 2004-575 » nu serait une loi).
+/// DC/QPC identifie la famille, sauf gate « décision » explicite (« dans sa
+/// décision n°2015-479 »).
 static RE_CASE_CONSTIT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^\s*(?:du\s+conseil\s+constitutionnel\s+)?n\s*[°oº]\s*(\d{2,4}-\d{1,4})\s*(?:dc|qpc)\b",
@@ -4100,8 +3828,7 @@ static RE_CASE_CONSTIT_BACK: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-/// Requête CEDH : format NNNNN/YY à barre oblique (« req. n° 30010/10 ») —
-/// les requêtes admin (7 chiffres nus) ne matchent pas.
+/// Requête CEDH : format NNNNN/YY à barre oblique (« req. n° 30010/10 »).
 static RE_CASE_CEDH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*n\s*[°oº]\s*s?\s*(\d{1,5}\s*/\s*\d{2})\b").unwrap());
 static RE_CASE_CEDH_WIN: LazyLock<Regex> = LazyLock::new(|| {
@@ -4122,8 +3849,8 @@ static RE_CASE_EU_ACT_BEFORE: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// Affaire CJUE ancrée derrière « affaire(s) / aff. » : préfixe de rôle
 /// C-/T-/F- optionnel (« aff. 6/64 » CJCE historique). Un slashnum nu à 4-5
-/// chiffres avant la barre est une requête CEDH (« l'affaire 26604/16
-/// Waldner c. France ») — routé par [`case_cjue_aff`].
+/// chiffres avant la barre est une requête CEDH — routé par
+/// [`case_cjue_aff`].
 static RE_CASE_AFF: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?x)^s?\s*\(?\s*(?:jointes\s+)?(?:n\s*[°oº]\s*)?
@@ -4131,12 +3858,10 @@ static RE_CASE_AFF: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-/// Affaire CJUE en fenêtre : le préfixe de rôle est exigé (un slashnum nu
-/// serait un acte UE — règlement 44/2001). Graphies tolérées : tiret absent
-/// collé (« C631/13 »), espace seul (« C 434/15 »), séparateur tiret
-/// (« C 287-16 »), espace dans le numéro (« C-29/ 10 ») — normalisées par
-/// [`cjue_key`]. Itéré sur toute la fenêtre (noms d'affaires et dates
-/// s'intercalent librement entre numéros préfixés).
+/// Affaire CJUE en fenêtre : le préfixe de rôle est exigé. Graphies tolérées :
+/// tiret absent collé (« C631/13 »), espace seul (« C 434/15 »), séparateur
+/// tiret (« C 287-16 »), espace dans le numéro (« C-29/ 10 ») — normalisées
+/// par [`cjue_key`]. Itéré sur toute la fenêtre.
 static RE_CASE_CJUE_WIN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b([ctf])(?:\s*-\s*|\s+)?(\d{1,4}\s*[/-]\s*\d{2,4})\b").unwrap());
 /// Plage / énumération sans re-préfixe : « C-338/11 à 347/11 »,
@@ -4145,7 +3870,7 @@ static RE_CASE_CJUE_WIN: LazyLock<Regex> =
 static RE_CASE_CJUE_RANGE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(?:,|a\s|et\s)\s*(\d{1,4}\s*/\s*\d{2,4})\b").unwrap());
 /// N° de jugement TA (7 chiffres nus) ou d'arrêt CAA (AAXX99999) derrière
-/// « jugement/arrêt n° » — chaîne du fond administratif (ADR 0165).
+/// « jugement/arrêt n° » — chaîne du fond administratif.
 static RE_CASE_ADMIN_TA: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*n\s*[°oº]\s*s?\s*(\d{7})\b").unwrap());
 static RE_CASE_ADMIN_TA_NEXT: LazyLock<Regex> =
@@ -4209,14 +3934,10 @@ static RE_CASE_ARRET_ORD: LazyLock<Regex> = LazyLock::new(|| {
 static RE_CASE_RG_OWN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"requetes?\b[^.;]{0,120}enregistr[a-z]*[^.;]{0,40}$").unwrap());
 /// Forme RG judiciaire derrière « jugement/arrêt/ordonnance » : marqueur n°
-/// STRICT (l'ancre est trop fréquente pour tolérer un numéro nu) —
-/// « Jugement (N° 14/00048) rendu … », « jugement rendu le 10/05/2016
+/// STRICT — « Jugement (N° 14/00048) rendu … », « jugement rendu le 10/05/2016
 /// (instance n° 14-08937) », « ordonnance d'injonction de payer
 /// n° 2023IP00245 ».
 static RE_CASE_ADMIN_RG: LazyLock<Regex> = LazyLock::new(|| {
-    // Forme tiret bornée à 5-6 chiffres au second membre : « instance
-    // n° 14-08937 » cite, « l'ordonnance n° 58-1067 » (instrument à tiret
-    // d'année) non.
     Regex::new(
         r"(?x)^\s*(?:rendue?\s+le\s+[\d/.-]{8,10}\s*)?(?:d'injonction\s+de\s+payer\s+)?
           \(?\s*(?:instance\s+)?n\s*[°oº]\s*s?\s*(?:rg\s*:?\s*)?(?:[a-z]\s+)?
@@ -4254,11 +3975,6 @@ static RE_SAME_PRECITE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 static RE_NUM: LazyLock<Regex> = LazyLock::new(|| {
-    // Préfixe « A. » (arrêtés — « A. 444-32 » code de commerce) : le point est
-    // exigé, contrairement à L/R/D — « a » nu est une préposition (« 3 à 5 »).
-    // Ordinaux latins : vocabulaire partagé avec le normaliseur
-    // (`ART_NUM_SUFFIX`, trié longueur décroissante — leftmost-first) ; `\b`
-    // rejette un mot de prose qui commence comme un ordinal (« terrain »).
     Regex::new(&format!(
         r"^(?:[lrd]\s*\.?\s*'?\s*|a\s*\.\s*)?(\d+(?:er)?(?:\.\d+)*(?:\s*-\s*\d+)*(?:\s+(?:{ART_NUM_SUFFIX})\b)?(?:\s*-\s*\d+)*)",
     ))
@@ -4268,10 +3984,19 @@ static RE_NUM: LazyLock<Regex> = LazyLock::new(|| {
 static RE_NUM_ORDINAL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^ (?:{ART_NUM_SUFFIX})\b")).unwrap());
 /// Alias TSV en forme datée NUE (nature + date, rien d'autre) : jamais un
-/// pattern de l'automate — voir `add_alias`.
+/// pattern de l'automate.
 static RE_BARE_DATED_ALIAS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^(?:decret|loi|arrete|ordonnance|decision|deliberation|circulaire) du \d{1,2}(?:er)? (?:janvier|fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|novembre|decembre) \d{4}$",
+    )
+    .unwrap()
+});
+/// Queue-objet d'une circulaire datée dans le TEXTE, après la mention :
+/// auteur (« du ministre de l'intérieur ») enjambé, connecteur explicite
+/// exigé, bornée à la ponctuation dure.
+static RE_CIRC_DOC_TAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"^\s*(?:du ministre [a-z' -]{0,60}? )?(?:relatives? |relatifs? |portant |concernant )(?:a |au |aux )?([^,;:.()!?«»"]{4,140})"#,
     )
     .unwrap()
 });
@@ -4289,18 +4014,23 @@ static RE_FORUM_GEN: LazyLock<Regex> = LazyLock::new(|| {
 /// Connecteur génitif directement après un numéral — l'article appartient à
 /// l'instrument qui suit, reconnu ou pas (gate du génitif orphelin).
 static RE_ORPHAN: LazyLock<Regex> = LazyLock::new(|| {
-    // Qualificatifs de subdivision et parenthèses tolérés avant le
-    // connecteur (« 11 alinéa 3 des statuts », « 14 (cessation) des
-    // statuts ») ; « de l' » colle au mot suivant, pas d'espace exigé.
     Regex::new(
         r"^[\s,]*(?:et\s+)?(?:(?:alineas?|alienas?|al\.?|§|paragraphes?|points?)\s*\d*\s*,?\s*|\([^)]{1,60}\)\s*)*(?:(?:du|de\s+la|des|dudit|de\s+ladite)\s|de\s+l')",
     )
     .unwrap()
 });
+/// Génitif DÉICTIQUE après un numéral (« 91 du présent Code », « 7 de la
+/// présente loi ») : le porteur se nomme lui-même. Mêmes qualificatifs de
+/// subdivision tolérés que [`RE_ORPHAN`].
+static RE_SELF_GEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^[\s,]*(?:et\s+)?(?:(?:alineas?|al\.?|§|paragraphes?|points?)\s*\d*\s*,?\s*)*(?:du|de\s+la|au|a\s+la)\s+present(?:e)?\s+(?:code|loi|decret|ordonnance|arrete|reglement|texte|convention|charte|statut|constitution|accord|protocole|deliberation)\b",
+    )
+    .unwrap()
+});
 /// Désignateur de zone d'urbanisme entre le numéral et le connecteur génitif
 /// (« 3 UA du POS », « 4 NC1 du PLU ») : le token capturé est examiné en
-/// aval — les coordinations (« L. 57 ou de la notification ») ne font pas
-/// zone, le génitif ne leur appartient pas.
+/// aval.
 static RE_ZONE_STEP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s+([0-9]?[a-z]{1,2}[0-9]{0,2})\s+(?:(?:du|de\s+la|des)\s|de\s+l')").unwrap()
 });
@@ -4308,8 +4038,7 @@ static RE_ZONE_STEP: LazyLock<Regex> = LazyLock::new(|| {
 /// l'énumération d'articles l'enjambe (« dans leur rédaction antérieure à la
 /// loi n° 2004-439 du 26 mai 2004 et 893, 894 du Code civil »). Seuls les
 /// participes qui EXIGENT un acte objet (antérieure à, issue de, modifiée
-/// par…) ouvrent l'enjambement : « dans sa rédaction applicable, du code
-/// civil » est un qualificatif clos suivi du génitif de l'énumération.
+/// par…) ouvrent l'enjambement.
 static RE_REDACTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^dans\s+(?:sa|leur|ses|leurs)\s+redactions?\s+(?:anterieures?|posterieures?|issues?|resultante?s?|modifiees?)\s+(?:a|de|du|par)\s+(?:la\s+|l'\s*)?",
@@ -4318,7 +4047,7 @@ static RE_REDACTION: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// Paragraphe(s) romain(s) de subdivision suivant un numéral d'article
 /// (« L. 1142-1, I, du code… », « II et III, »). Enjambé par la marche
-/// d'énumération avant le probe génitif — inerte si le génitif ne suit pas.
+/// d'énumération avant le probe génitif.
 static RE_ROMAN_PARA: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"^(?:i{1,3}|iv|v|vi{1,3}|ix|x)(?:\s*(?:,|et)\s*(?:i{1,3}|iv|v|vi{1,3}|ix|x))*\s*,\s*",
@@ -4344,9 +4073,9 @@ static RE_BARE_ART_GEN: LazyLock<Regex> = LazyLock::new(|| {
 /// Article NOMMÉ, sans numéral (« l'article préliminaire du CPP ») — token
 /// d'article à part entière de la marche d'énumération.
 static RE_NAMED_ART: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^preliminaire\b").unwrap());
-/// Queue de titre d'acte daté NON capturée par la mention (le catalogue ne la
-/// porte pas) : « loi du 10 juillet 1991 [relative à l'aide juridique] et
-/// L. 761-1 … » — la marche d'énumération la traverse, borne courte.
+/// Queue de titre d'acte daté NON capturée par la mention : « loi du
+/// 10 juillet 1991 [relative à l'aide juridique] et L. 761-1 … » — la marche
+/// d'énumération la traverse, borne courte.
 static RE_TITLE_TAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s+(?:relati(?:f|ve)s?|portant|concernant|modifiant|fixant|instituant)\b")
         .unwrap()
@@ -4354,18 +4083,19 @@ static RE_TITLE_TAIL: LazyLock<Regex> = LazyLock::new(|| {
 /// « et » de reprise d'énumération dans une queue de titre.
 static RE_ET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bet\s+").unwrap());
 static RE_SEP: LazyLock<Regex> = LazyLock::new(|| {
-    // « devenu » = séparateur : « 1134, devenu 1103, du code civil » émet les
-    // deux numéraux, l'héritage d'énumération rattache le premier. Le pont
-    // article-répété (« L. 626-22, du premier alinéa de l'article
-    // L. 642-20-1, de l'article L. 651-2 ») traverse la reprise génitive.
-    // Le qualificatif de subdivision collé au numéral (« 6 paragraphe 1 et
-    // 13 de la convention ») fait partie du séparateur : l'énumération le
-    // traverse, y compris derrière un tiret parasite (« 222-49- alinéa 1,
-    // 222-50 »). La parenthèse d'équivalence (« 1137 (1197 nouveau) et
-    // 1147 ») s'ouvre et se ferme en séparateur : les numéraux qu'elle porte
-    // sont des articles écrits (une ligne par numéro, ADR 0143 §6).
     Regex::new(
         r"^(?:\s*[a-z]\))?(?:\s*[-–](?:\s*\d{1,2}(?:er|eme|e)\s+alineas?\b)?)?(?:\s*(?:paragraphes?|paragr\.?|alineas?|§)\s*\d+(?:er)?)?(?:\s+(?:i{1,3}|iv|v|vi{1,3}|ix|x)\b)?(?:\s*(?:et|&)\s*suivant(?:e?s)?)?(?:\s*(?:anciens?|anciennes?|nouveaux?|nouvelles?|modifiee?s?|abrogee?s?))?(?:\s*,?\s*(?:et\s+|ou\s+)?\(\s*(?:anciennement\s+|anciens?\s+|ex[\s-]|devenus?\s+)?|\s*\)\s*,?\s*(?:et\s+|ou\s+)?|\s*,?\s*(?:et\s+|ou\s+)?(?:du\s+|de\s+l'\s*|des\s+|de\s+la\s+)(?:premier\s+|deuxieme\s+|dernier\s+)?(?:alinea\s+de\s+l'\s*)?articles?\s+|\s*,?\s*devenu\s+|\s*,?\s*(?:ou\s+)?anciennement\s+|\s*,?\s*\*\s*|\s*,?\s*(?:et\s+|ou\s+)?[-–]\s*|\s*,?\s*(?:et|ou|a|à|ainsi\s+que)\s+|\s*,?\s*)",
+    )
+    .unwrap()
+});
+/// Reprise du mot « article » derrière un connecteur de coordination, ancrée
+/// sur le numéral qui suit. Dans un corps du référentiel dont le porteur
+/// revendique la tête, elle borne l'héritage d'énumération : « l'article X ou
+/// de l'article Y du code Z » ne partage pas son génitif. La reprise en
+/// virgule (« , de l'article Y ») le partage toujours.
+static RE_COORD_ART: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:et|ou|ni|ainsi\s+que)\s+(?:du\s+|des\s+|de\s+la\s+|de\s+l'\s*|l'\s*)(?:(?:premier|deuxieme|dernier)\s+alinea\s+de\s+l'\s*)?articles?\s*$",
     )
     .unwrap()
 });
@@ -4390,9 +4120,6 @@ mod tests {
 
     fn fixture() -> (Vec<CatalogText>, Vec<(String, String)>) {
         let texts = vec![
-            // de référence administrative (ADR 0196) : BOFiP cité par code BOI
-            // (= text_uid, alias direct) ; circulaire datée résolue par
-            // (nature, date) unique.
             text(
                 "BOI-IR-BASE-10-10",
                 "IR - Base d'imposition - Revenus imposables",
@@ -4453,8 +4180,6 @@ mod tests {
             ),
             text("LEGI_TRAV", "Code du travail", "Code du travail", "CODE", 2500),
             text("LEGI_COM", "Code de commerce", "Code de commerce", "CODE", 2000),
-            // Titre officiel citant des articles : l'ancre « articles » du
-            // titre rouvre l'énumération (test title_artword).
             text(
                 "JORF_CERT",
                 "Arrêté du 27 décembre 2016 relatif aux conditions d'établissement et de \
@@ -4467,9 +4192,6 @@ mod tests {
                 30,
             ),
             text("LEGI_RUR", "Code rural", "Code rural", "CODE", 1500),
-            // Annexe du CGI (texte de catalogue DISTINCT du code de base) :
-            // uid réel — les alias TSV « annexe II au/du code général des
-            // impôts » ne résolvent que vers un uid présent au catalogue.
             text(
                 "LEGITEXT000006069569",
                 "Code général des impôts, annexe II",
@@ -4477,10 +4199,6 @@ mod tests {
                 "CODE",
                 1600,
             ),
-            // Titre officiel traversant « l'article N » au singulier (pas de
-            // réouverture d'énumération) : le walker avale le titre entier,
-            // le token article interne s'emboîte dans la mention (cas du
-            // crash reextract v13, décision 919).
             text(
                 "JORF_2010",
                 "Arrêté du 12 février 2010 pris en application du deuxième alinéa du 1 de \
@@ -4490,20 +4208,15 @@ mod tests {
                 "ARRETE",
                 30,
             ),
-            // Décret JORF de publication d'un traité : cible des alias
-            // embarqués (validés par existence au catalogue), sans structure.
             text(
-                "JORFTEXT000000703898",
-                "Décret n° 87-1034 du 22 décembre 1987 portant publication de la convention \
-                 des Nations unies sur les contrats de vente internationale de marchandises",
+                "INTL/CONVENTION-NATIONS-UNIES-CONTRATS-VENTE-1980",
                 "Convention des Nations unies sur les contrats de vente internationale de marchandises",
-                "DECRET",
+                "Convention des Nations unies sur les contrats de vente internationale de marchandises",
+                "CONVENTION",
                 40,
             ),
         ];
         let mut texts = texts;
-        // Circulaire à titre LIBRE (le cas majoritaire du fond) : l'identité
-        // datée vit en colonne `date_texte`, pas dans le titre.
         let mut cir_libre = text(
             "cir_50001",
             "Modalités de gestion des aides personnelles au logement",
@@ -4513,8 +4226,6 @@ mod tests {
         );
         cir_libre.date_texte = "2019-03-12".parse().ok();
         texts.push(cir_libre);
-        // Circulaire citée par son NOR (titre libre, date de signature absente
-        // de la mention) : seule la colonne `nor` la rend résoluble.
         let mut cir_nor = text(
             "cir_60001",
             "Orientations relatives à l'examen des demandes d'admission au séjour",
@@ -4524,9 +4235,21 @@ mod tests {
         );
         cir_nor.nor = Some("INTK1229185C".to_string());
         texts.push(cir_nor);
-        // num_key en forme d'affichage DB (« L. 761-1 »), cf. legal_article.num_key.
-        // Les R. 771-* du CJA sont étoilés au catalogue (décrets en Conseil
-        // d'État) — cités « R. 771-5 » dans les décisions.
+        for (uid, title) in [
+            (
+                "cir_70001",
+                "Conditions d'examen des demandes d'admission au séjour déposées par \
+                 des ressortissants étrangers en situation irrégulière",
+            ),
+            (
+                "cir_70002",
+                "Examen professionnel d'accès au corps des secrétaires administratifs",
+            ),
+        ] {
+            let mut c = text(uid, title, title, "CIRCULAIRE", 0);
+            c.date_texte = "2012-11-28".parse().ok();
+            texts.push(c);
+        }
         let articles = vec![
             ("LEGI_CJA".to_string(), "l761-1".to_string()),
             ("LEGI_CJA".to_string(), "r*771-5".to_string()),
@@ -4572,10 +4295,6 @@ mod tests {
         extract_citations(text, &vocab, &snap, None)
     }
 
-    /// Droit primaire UE (v67) : moteur bâti sur un catalogue local aux
-    /// fiches statut/règlement de procédure — les formes COURTES des
-    /// décisions CJUE (« du statut de la Cour », « du règlement de procédure
-    /// du Tribunal ») lient par alias, l'anaphore « du même statut » suit.
     fn eu_engine() -> (CompiledVocab, LinkSnapshot) {
         let texts = vec![
             text(
@@ -4646,7 +4365,6 @@ mod tests {
             &snap,
             None,
         );
-        // Fiche sans structure articles : lien texte, num jamais inventé.
         assert_eq!(
             out[0].target.ref_text_uid.as_deref(),
             Some("EU/RPROC/TRIBUNAL")
@@ -4659,7 +4377,6 @@ mod tests {
             None,
         );
         assert_eq!(out[0].target.ref_text_uid.as_deref(), Some("EU/RPROC/CJUE"));
-        // Forme NUE : ambiguë (Cour / Tribunal / règlement CEDH) — abstention.
         let out = extract_citations(
             "contraires aux prescriptions de l'article 38 du règlement de procédure",
             &vocab,
@@ -4669,9 +4386,6 @@ mod tests {
         assert_eq!(out[0].target.ref_text_uid, None);
     }
 
-    /// « statut de la Cour pénale internationale » : l'alias LONG (cible CPI)
-    /// prime le court (leftmost-longest) — cible absente du catalogue local,
-    /// la mention reste non liée plutôt que mislinkée vers le statut CJUE.
     #[test]
     fn statut_cpi_never_mislinked_to_cjue() {
         let (vocab, snap) = eu_engine();
@@ -4686,7 +4400,6 @@ mod tests {
             .all(|c| c.target.ref_text_uid.as_deref() != Some("EU/STATUT-CJUE")));
     }
 
-    /// BOFiP (ADR 0196) : le code BOI cité est lié par alias direct au uid.
     #[test]
     fn boi_reference_linked() {
         let out = cites(
@@ -4700,14 +4413,11 @@ mod tests {
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("BOI-IR-BASE-10-10"));
     }
 
-    /// « boi » en minuscules dans l'original n'est jamais une référence BOFiP.
     #[test]
     fn boi_lowercase_ignored() {
         assert!(cites("le boi-ir-base-10-10 du dossier").is_empty());
     }
 
-    /// Circulaire datée à queue de titre officielle : émise (signal
-    /// réglementaire) et résolue sur le catalogue CIRCULAIRE (ADR 0196).
     #[test]
     fn circulaire_dated_linked() {
         let out = cites(
@@ -4718,8 +4428,6 @@ mod tests {
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_45678"));
     }
 
-    /// Circulaire à titre libre : résolue par la date de signature en colonne
-    /// (`date_texte`), pas par le titre (ADR 0196).
     #[test]
     fn circulaire_dated_by_column_linked() {
         let out = cites(
@@ -4730,8 +4438,6 @@ mod tests {
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_50001"));
     }
 
-    /// Version BOFiP datée (« BOI-…-AAAAMMJJ ») : le span garde la forme
-    /// complète, la clé rabotée lie au document du snapshot vivant.
     #[test]
     fn boi_dated_version_linked() {
         let out = cites("les prévisions du BOI-IR-BASE-10-10-20140311 s'appliquent");
@@ -4740,7 +4446,87 @@ mod tests {
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("BOI-IR-BASE-10-10"));
     }
 
-    /// Circulaire datée absente du catalogue : mention émise, jamais liée.
+    #[test]
+    fn circulaire_date_homonyme_queue_objet_et_adoption() {
+        let out = cites(
+            "le refus méconnaît la circulaire du 28 novembre 2012 relative aux \
+             conditions d'examen des demandes d'admission au séjour ; \
+             en outre la circulaire du 28 novembre 2012 prévoit un récépissé.",
+        );
+        let linked: Vec<_> = out
+            .iter()
+            .filter(|c| c.target.ref_text_uid.as_deref() == Some("cir_70001"))
+            .collect();
+        assert_eq!(linked.len(), 2, "queue-objet + adoption de la forme nue");
+
+        let out = cites("en vertu de la circulaire du 28 novembre 2012 portant examen des cas");
+        let c = out.first().expect("mention circulaire");
+        assert_eq!(c.target.ref_text_uid, None);
+    }
+
+    #[test]
+    fn circulaire_alias_cure_passe_le_gate_acte_individuel() {
+        let mut texts = Vec::new();
+        for uid in ["cir_44486", "cir_36120"] {
+            let mut c = text(
+                uid,
+                "Conditions d'examen des demandes d'admission au séjour déposées par \
+                 des ressortissants étrangers en situation irrégulière",
+                "Conditions d'examen des demandes d'admission au séjour déposées par \
+                 des ressortissants étrangers en situation irrégulière",
+                "CIRCULAIRE",
+                0,
+            );
+            c.date_texte = "2012-11-28".parse().ok();
+            texts.push(c);
+        }
+        let snap = LinkSnapshot::build(texts.clone(), vec![]);
+        let vocab = CompiledVocab::build(&texts, &snap);
+        let out = extract_citations(
+            "il méconnaît les dispositions de la circulaire du 28 novembre 2012 ;",
+            &vocab,
+            &snap,
+            None,
+        );
+        let c = out.first().expect("mention nue émise malgré la prose");
+        assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_44486"));
+
+        let out = extract_citations(
+            "par référence aux lignes directrices de la circulaire ministérielle \
+             du 28 novembre 2012, dont le point 2.2 prévoit un récépissé.",
+            &vocab,
+            &snap,
+            None,
+        );
+        let c = out.first().expect("graphie qualifiée émise");
+        assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_44486"));
+
+        let out = cites("il méconnaît la circulaire du 3 février 2010 en cause.");
+        assert!(out.is_empty(), "forme nue non curée toujours gatée");
+    }
+
+    #[test]
+    fn circulaire_qualificatif_non_distinctif_resout_comme_la_forme_nue() {
+        let out = cites(
+            "la circulaire ministérielle du 28 novembre 2012 relative aux \
+             conditions d'examen des demandes d'admission au séjour ; \
+             le préfet l'a méconnue.",
+        );
+        let c = out.first().expect("mention qualifiée émise");
+        assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_70001"));
+
+        let out = cites(
+            "le refus méconnaît la circulaire du 28 novembre 2012 relative aux \
+             conditions d'examen des demandes d'admission au séjour ; la \
+             circulaire interministérielle du 28 novembre 2012 prévoit un récépissé.",
+        );
+        let linked = out
+            .iter()
+            .filter(|c| c.target.ref_text_uid.as_deref() == Some("cir_70001"))
+            .count();
+        assert_eq!(linked, 2, "graphie qualifiée adoptée par la forme nue");
+    }
+
     #[test]
     fn circulaire_dated_unknown_unlinked() {
         let out = cites("la circulaire du 12 mars 1999 relative au recouvrement des créances");
@@ -4748,9 +4534,6 @@ mod tests {
         assert_eq!(c.target.ref_text_uid, None);
     }
 
-    /// NOR entre la nature et la date : identité à lui seul, résolu par
-    /// l'index `nor` du snapshot ; la clé rabote le NOR (forme datée fusionne
-    /// avec les citations sans NOR).
     #[test]
     fn nor_before_date_linked() {
         let out = cites("les termes de la circulaire NOR INTK1229185C du 28 novembre 2012");
@@ -4759,8 +4542,6 @@ mod tests {
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_60001"));
     }
 
-    /// NOR sans date à portée (« du ministre de l'intérieur » s'intercale) :
-    /// le NOR seul porte l'identité et la résolution.
     #[test]
     fn nor_alone_linked() {
         let out = cites("la circulaire NOR : INTK1229185C du ministre de l'intérieur est invoquée");
@@ -4768,7 +4549,6 @@ mod tests {
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_60001"));
     }
 
-    /// Graphie collée « NORINTK1229185C » : même capture, même lien.
     #[test]
     fn nor_glued_linked() {
         let out =
@@ -4777,8 +4557,6 @@ mod tests {
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_60001"));
     }
 
-    /// NOR en queue après la date, parenthésé : le span l'embarque, le lien
-    /// passe par lui même quand la date seule ne résout pas.
     #[test]
     fn nor_after_date_linked() {
         let out = cites("l'arrêté du 4 mai 2017 (NOR : INTK1229185C) prévoit que");
@@ -4787,7 +4565,6 @@ mod tests {
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("cir_60001"));
     }
 
-    /// NOR inconnu du catalogue : mention émise, jamais liée.
     #[test]
     fn nor_unknown_unlinked() {
         let out = cites("la circulaire NOR ABCD1234567X du 3 février 1998 sur les gens du voyage");
@@ -4795,8 +4572,6 @@ mod tests {
         assert_eq!(c.target.ref_text_uid, None);
     }
 
-    /// Citations de jurisprudence (ADR 0165) : chemin `doc_extract` complet,
-    /// référentiel juridiction minimal pour les clés RG.
     fn cases(text: &str) -> Vec<CompiledCase> {
         let (vocab, snap) = engine();
         let chrono = crate::chrono::ChronoSnapshot::new(vec![
@@ -4827,11 +4602,10 @@ mod tests {
                 "Paris".to_string(),
             ),
         ]);
-        doc_extract(text, &vocab, &snap, &chrono, None).cases
+        doc_extract(text, &vocab, &snap, &chrono, None, None).cases
     }
 
-    /// (surface, target_ref) des spans émis — la surface vérifie la borne
-    /// « token identifiant » de la convention 0143.
+    /// (surface, target_ref) des spans émis.
     fn case_surfaces(text: &str) -> Vec<(String, String)> {
         cases(text)
             .into_iter()
@@ -4855,9 +4629,6 @@ mod tests {
 
     #[test]
     fn enumeration_bridges_redaction_qualifier() {
-        // Le qualificatif d'état du texte embarque un acte daté au milieu de
-        // l'énumération : elle l'enjambe (893 reprend), et l'héritage arrière
-        // traverse l'acte embarqué (230/232 remontent au Code civil).
         let out = cites(
             "la Cour d'appel a violé les articles 230, 232, dans leur rédaction \
              antérieure à la loi n° 2004-439 du 26 mai 2004 et 893, 894 du Code civil ;",
@@ -4895,8 +4666,6 @@ mod tests {
 
     #[test]
     fn same_code_anaphora_skips_instrument_quoted_in_frame() {
-        // ORCA_21NC03180 : la quote du cadre cite une ordonnance — l'anaphore
-        // « du même code » doit remonter PAR-DESSUS jusqu'au dernier code.
         let out = cites(
             "Aux termes de l'article R. 771-12 du code de justice administrative : \
              \" Lorsque, en application du dernier alinéa de l'article 23-2 de \
@@ -4909,7 +4678,6 @@ mod tests {
         );
         let c = by_article(&out, "R. 771-5");
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("LEGI_CJA"));
-        // Le num_key émis est la forme OFFICIELLE étoilée du catalogue.
         assert_eq!(c.target.ref_num_key.as_deref(), Some("r*771-5"));
         let c = by_article(&out, "R. 771-7");
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("LEGI_CJA"));
@@ -4917,7 +4685,6 @@ mod tests {
 
     #[test]
     fn same_code_after_ordinal_qualifier_resolves() {
-        // ORCA_23BX01652 : « le 9° de l'article L. 611-3 du même code ».
         let out = cites(
             "Il méconnaît l'article L. 425-9 du code de l'entrée et du séjour des \
              étrangers et du droit d'asile et le 9° de l'article L. 611-3 du même \
@@ -4929,11 +4696,6 @@ mod tests {
 
     #[test]
     fn bare_convention_anaphora_resolves_enumeration() {
-        // DCE_442036 : « …du protocole additionnel n° 12 et des articles 2,
-        // 5, 7 et 14 de la convention, d'une demande… » — la mention nue
-        // génitive est une anaphore de la CEDH épelée en amont.
-        // La CEDH n'apparaît qu'IMBRIQUÉE dans la mention protocole : c'est
-        // la mention interne (nested) qui sert d'antécédent.
         let out = cites(
             "Saisir la Cour sur le fondement de l'article 1er du protocole \
              additionnel n° 16 à la convention européenne de sauvegarde des \
@@ -4959,11 +4721,6 @@ mod tests {
 
     #[test]
     fn annexe_cgi_alias_attaches_and_links() {
-        // \u{c9}cole 2026-07-19 : \u{ab} article N de l'annexe X au CGI \u{bb} lie le texte
-        // ANNEXE (catalogue distinct), pas le CGI de base. L'alias TSV
-        // \u{ab} annexe II au code g\u{e9}n\u{e9}ral des imp\u{f4}ts \u{bb} est l'instrument reconnu
-        // (surface d'automate) : le g\u{e9}nitif \u{ab} de l' \u{bb} rattache, l'\u{e9}num\u{e9}ration
-        // h\u{e9}rite, la r\u{e9}solution est valid\u{e9}e par existence au catalogue.
         let out = cites(
             "le Premier ministre a refus\u{e9} de retirer et d'abroger les articles \
              202 A et 202 B de l'annexe II au code g\u{e9}n\u{e9}ral des imp\u{f4}ts, en tant \
@@ -4990,9 +4747,6 @@ mod tests {
 
     #[test]
     fn genitive_instrument_inside_quote_attaches() {
-        // DCA_22DA01151 : « l'article 97 du code général des impôts » cité
-        // DANS la quote de l'article L. 73 du LPF — le génitif explicite
-        // prime, dans la quote comme dehors.
         let out = cites(
             "7. Aux termes de l'article L. 73 du livre des procédures fiscales : \
              \" Peuvent être évalués d'office : () 2° Le bénéfice imposable des \
@@ -5036,15 +4790,12 @@ mod tests {
         let c = by_article(&out, "39");
         assert_eq!(
             c.target.ref_text_uid.as_deref(),
-            Some("JORFTEXT000000703898")
+            Some("INTL/CONVENTION-NATIONS-UNIES-CONTRATS-VENTE-1980")
         );
     }
 
     #[test]
     fn dead_treaty_prefix_emits_nothing() {
-        // Aucune forme longue RÉSOLUE dans le document : la forme courte est
-        // morte — l'article reste sans cible (adjacence autoritaire), la
-        // mention faible n'émet aucun span propre.
         let out =
             cites("Le choix est régi par l'article 3 de la Convention de Rome selon l'appelant.");
         let c = by_article(&out, "3");
@@ -5054,8 +4805,6 @@ mod tests {
 
     #[test]
     fn quoted_article_belongs_to_quoted_text() {
-        // L'article cité DANS la quote appartient au texte quoté (cadre),
-        // pas à un antécédent ni à l'unicité.
         let out = cites(
             "Aux termes de l'article L. 742-3 du code de l'entrée et du séjour des \
              étrangers et du droit d'asile : \" Par dérogation à l'article L. 313-14, \
@@ -5068,10 +4817,6 @@ mod tests {
 
     #[test]
     fn quoted_article_after_bare_frame_gets_folded_num_key() {
-        // Cadre à text_key VIDE (article nu résolu par unicité, antécédent
-        // hors portée) : l'article dans la quote hérite du texte cadre avec
-        // la clé CATALOGUE pliée — jamais la forme citable brute (résidu
-        // « L. 1233-30 » en prod, 2026-07-20).
         let filler = "considérant ce qui suit. ".repeat(70);
         let text = format!(
             "Vu le code de l'entrée et du séjour des étrangers et du droit d'asile. \
@@ -5089,8 +4834,6 @@ mod tests {
 
     #[test]
     fn non_genitive_following_instrument_is_not_attached() {
-        // « L. 742-3 ou d'une requête … du règlement » : le règlement n'est
-        // PAS le texte de l'article — l'antécédent (quote CESEDA) le porte.
         let out = cites(
             "Aux termes du code de l'entrée et du séjour des étrangers et du droit \
              d'asile : \" L'étranger qui fait l'objet d'une décision de transfert en \
@@ -5136,8 +4879,6 @@ mod tests {
 
     #[test]
     fn arabic_ordinal_subdivision_is_not_an_article() {
-        // « 1° » = subdivision de l'article, jamais un numéro d'article : pas
-        // de span « 1 », et le génitif rattache toujours l'article porteur.
         let out = cites("la cour a violé l'article L. 1142-1-1, 1°, du code civil ;");
         assert_eq!(out.iter().filter(|c| c.article.is_some()).count(), 1);
         assert_eq!(
@@ -5147,8 +4888,6 @@ mod tests {
                 .as_deref(),
             Some("LEGI_CC")
         );
-        // L'énumération continue derrière l'ordinal enjambé (avec ou sans
-        // virgule de clôture).
         let out = cites(
             "au regard des articles L. 1142-1-1, 1°, et L. 1142-17 du code civil, \
              et de l'article 78-2, 3° et 4° du code civil.",
@@ -5159,7 +4898,6 @@ mod tests {
 
     #[test]
     fn enumeration_inherits_trailing_genitive() {
-        // Seul le dernier item touche le génitif — les précédents héritent.
         let out = cites(
             "en application des articles R. 771-5 et R. 771-7 du code de justice \
              administrative, la requête est rejetée.",
@@ -5172,6 +4910,69 @@ mod tests {
             by_article(&out, "R. 771-7").target.ref_text_uid.as_deref(),
             Some("LEGI_CJA")
         );
+    }
+
+    #[test]
+    fn coordinated_article_repeat_does_not_share_genitive() {
+        let texts = vec![
+            text(
+                "GN_CPP",
+                "Code de procédure pénale",
+                "Code de procédure pénale",
+                "CODE",
+                1200,
+            ),
+            text("GN_CP", "Code pénal", "Code pénal", "CODE", 1000),
+        ];
+        let articles: Vec<(String, String)> =
+            [("GN_CPP", "1149"), ("GN_CPP", "1152"), ("GN_CP", "159")]
+                .iter()
+                .map(|(u, a)| (u.to_string(), a.to_string()))
+                .collect();
+        let snap = LinkSnapshot::build(texts.clone(), articles);
+        let vocab = CompiledVocab::build(&texts, &snap);
+        let chrono = crate::chrono::ChronoSnapshot::new(vec![]);
+        let body = "sera condamné par application des dispositions de l'article 1149 \
+                    ou de l'article 159 du Code pénal.";
+        let out = doc_extract(body, &vocab, &snap, &chrono, None, Some("GN_CPP")).citations;
+        let c = by_article(&out, "1149");
+        assert!(c.bare, "1149 : nu, le porteur le revendique en aval");
+        assert_eq!(c.target.ref_text_uid, None);
+        assert_eq!(
+            by_article(&out, "159").target.ref_text_uid.as_deref(),
+            Some("GN_CP")
+        );
+    }
+
+    #[test]
+    fn coordinated_article_repeat_shares_genitive_without_owner_claim() {
+        let out = cites(
+            "sur le fondement du 11° de l'article L. 313-11 et de l'article \
+             L. 313-14 du code de l'entrée et du séjour des étrangers et du \
+             droit d'asile.",
+        );
+        for art in ["L. 313-11", "L. 313-14"] {
+            assert_eq!(
+                by_article(&out, art).target.ref_text_uid.as_deref(),
+                Some("LEGI_CESEDA"),
+                "article {art}"
+            );
+        }
+    }
+
+    #[test]
+    fn comma_article_repeat_still_inherits_genitive() {
+        let out = cites(
+            "les jugements rendus en application des articles L. 622-8, du \
+             premier alinéa de l'article L. 642-20-1 du Code de commerce.",
+        );
+        for art in ["L. 622-8", "L. 642-20-1"] {
+            assert_eq!(
+                by_article(&out, art).target.ref_text_uid.as_deref(),
+                Some("LEGI_COM"),
+                "article {art}"
+            );
+        }
     }
 
     #[test]
@@ -5190,7 +4991,6 @@ mod tests {
 
     #[test]
     fn nature_anaphora_picks_matching_antecedent() {
-        // « de cette loi » saute le code (nature ≠ loi) pour retrouver la loi.
         let out = cites(
             "Vu la loi du 10 juillet 1991 relative à l'aide juridique. Vu le code \
              de justice administrative. L'article 37 de cette loi dispose que.",
@@ -5221,9 +5021,6 @@ mod tests {
         );
     }
 
-    /// ADR 0226 : la locution « et suivants » entre dans le span et pose le
-    /// signal `suivants` — variantes féminin et « et s. » incluses ; une
-    /// énumération n'étend que le dernier numéro.
     #[test]
     fn et_suivants_extends_span() {
         let text = "sur le fondement des articles 1240 et suivants du code civil.";
@@ -5251,17 +5048,12 @@ mod tests {
         assert!(c.suivants);
         assert_eq!(c.char_end - c.char_start, "1240 et s.".chars().count());
 
-        // Énumération : « 1240 » ne s'étend pas (le « et 1241 » n'est pas la
-        // locution), « 1241 » porte la famille.
         let text = "les articles 1240 et 1241 et suivants du code civil.";
         let out = cites(text);
         assert!(!by_article(&out, "1240").suivants);
         assert!(by_article(&out, "1241").suivants);
     }
 
-    /// Article NU (auto-résolution des corps du référentiel, ADR 0217) : nu
-    /// = aucun rattachement tenté ; l'orphelin génitif et le rattaché ne le
-    /// sont pas.
     #[test]
     fn bare_article_flag() {
         let out = cites("acquise en application de l'article 21-2, sans autre condition.");
@@ -5269,19 +5061,144 @@ mod tests {
         assert!(c.bare);
         assert_eq!(c.target.ref_text_uid, None);
 
-        // Orphelin génitif : appartient à son inconnu, jamais nu.
         let out = cites("sur le fondement de l'article 82 du code de la famille congolais.");
         assert!(!by_article(&out, "82").bare);
 
-        // Rattaché : jamais nu.
         let out = cites("l'article 1240 du code civil.");
         assert!(!by_article(&out, "1240").bare);
     }
 
     #[test]
+    fn bare_numeral_stays_with_owner_text() {
+        let texts = vec![
+            text(
+                "LEGI_CPC",
+                "Code de procédure civile",
+                "Code de procédure civile",
+                "CODE",
+                1500,
+            ),
+            text("LEGI_CIV", "Code civil", "Code civil", "CODE", 2500),
+        ];
+        let articles: Vec<(String, String)> = [
+            ("LEGI_CPC", "1049"),
+            ("LEGI_CPC", "1055"),
+            ("LEGI_CPC", "1056-1"),
+            ("LEGI_CIV", "1049"),
+            ("LEGI_CIV", "1055"),
+            ("LEGI_CIV", "57"),
+        ]
+        .iter()
+        .map(|(u, a)| (u.to_string(), a.to_string()))
+        .collect();
+        let snap = LinkSnapshot::build(texts.clone(), articles);
+        let vocab = CompiledVocab::build(&texts, &snap);
+        let chrono = crate::chrono::ChronoSnapshot::new(vec![]);
+        let body = "L'action aux fins de déclaration judiciaire de naissance est régie par \
+                    les dispositions des articles 1049 à 1055. Le dispositif de la décision, \
+                    contenant les énonciations prévues à l'article 57 du code civil, est \
+                    transcrit sur les registres.";
+
+        let out = doc_extract(body, &vocab, &snap, &chrono, None, Some("LEGI_CPC")).citations;
+        for k in ["1049", "1055"] {
+            let c = by_article(&out, k);
+            assert!(c.bare, "{k} : nu, le porteur le revendique en aval");
+            assert_eq!(
+                c.target.ref_text_uid, None,
+                "{k} : pas de cible de document"
+            );
+        }
+        assert_eq!(
+            by_article(&out, "57").target.ref_text_uid.as_deref(),
+            Some("LEGI_CIV"),
+            "le code nommé emporte son propre renvoi"
+        );
+
+        let out = doc_extract(body, &vocab, &snap, &chrono, None, None).citations;
+        assert_eq!(
+            by_article(&out, "1049").target.ref_text_uid.as_deref(),
+            Some("LEGI_CIV")
+        );
+    }
+
+    #[test]
+    fn deictic_genitive_names_the_owner_text() {
+        let texts = vec![
+            text(
+                "SN_FAM",
+                "Code de la famille",
+                "Code de la famille",
+                "CODE",
+                900,
+            ),
+            text("LEGI_CIV", "Code civil", "Code civil", "CODE", 2500),
+        ];
+        let articles: Vec<(String, String)> = [
+            ("SN_FAM", "33"),
+            ("SN_FAM", "91"),
+            ("SN_FAM", "86"),
+            ("LEGI_CIV", "33"),
+            ("LEGI_CIV", "91"),
+        ]
+        .iter()
+        .map(|(u, a)| (u.to_string(), a.to_string()))
+        .collect();
+        let snap = LinkSnapshot::build(texts.clone(), articles);
+        let vocab = CompiledVocab::build(&texts, &snap);
+        let chrono = crate::chrono::ChronoSnapshot::new(vec![]);
+        let body = "applique les sanctions prévues par les articles 33 et 91 du présent Code.";
+
+        let out = doc_extract(body, &vocab, &snap, &chrono, None, Some("SN_FAM")).citations;
+        assert!(by_article(&out, "33").bare, "33 : nu, revendiqué en aval");
+        assert_eq!(
+            by_article(&out, "91").target.ref_text_uid.as_deref(),
+            Some("SN_FAM"),
+            "91 touche le déictique : il désigne le porteur"
+        );
+
+        let out = doc_extract(body, &vocab, &snap, &chrono, None, None).citations;
+        assert_eq!(by_article(&out, "91").target.ref_text_uid, None);
+    }
+
+    #[test]
+    fn named_unknown_code_is_not_bare_anaphora() {
+        let out = cites(
+            "Vu le code civil ; considérant qu'aux termes de l'article 47 du code civil tout acte ; \
+             le ministre s'est fondé sur l'article 82 du code de la famille congolais sans toutefois établir.",
+        );
+        let c = by_article(&out, "82");
+        assert_eq!(c.target.ref_text_uid, None);
+
+        let out = cites(
+            "Aux termes de l'article 47 du code civil tout acte fait foi ; \
+             il résulte de l'article 34 du code qu'elle invoque que la filiation est établie.",
+        );
+        let c = by_article(&out, "34");
+        assert_eq!(c.target.ref_text_uid.as_deref(), Some("LEGI_CC"));
+    }
+
+    #[test]
+    fn orphan_enumeration_heads_inherit() {
+        let out = cites(
+            "Aux termes de l'article 47 du code civil tout acte fait foi ; l'acte est \
+             incomplet au regard des articles 84, 92 et 99 du code de la famille congolais.",
+        );
+        for num in ["84", "92", "99"] {
+            assert_eq!(by_article(&out, num).target.ref_text_uid, None, "art {num}");
+        }
+
+        let out = cites("les articles 1240, 1241 et 1242 du code civil s'appliquent.");
+        for num in ["1240", "1241", "1242"] {
+            assert_eq!(
+                by_article(&out, num).target.ref_text_uid.as_deref(),
+                Some("LEGI_CC"),
+                "art {num}"
+            );
+        }
+    }
+
+    #[test]
     fn orphan_genitive_never_guesses() {
-        // « du code de la famille congolais » : instrument hors catalogue —
-        // ni antécédent ni unicité, même si « 37 » n'existe qu'à un endroit.
         let out = cites(
             "Vu la loi n° 91-647 du 10 juillet 1991. Le ministre s'est fondé sur \
              l'article 37 du code de la famille congolais pour refuser le visa.",
@@ -5292,10 +5209,6 @@ mod tests {
 
     #[test]
     fn zone_designator_genitive_is_orphan() {
-        // « l'article 37 UA du POS » : article du règlement de zone d'un plan
-        // local d'urbanisme, hors catalogue. Le désignateur de zone est
-        // enjambé par la gate du génitif orphelin — sans elle, l'unicité
-        // lierait « 37 » à la loi du 10 juillet 1991 (seul porteur cité).
         let out = cites(
             "Vu la loi n° 91-647 du 10 juillet 1991. Considérant que l'article 37 UA du POS \
              prévoit que, pour être constructible, un terrain doit avoir un accès.",
@@ -5316,10 +5229,8 @@ mod tests {
     #[test]
     fn single_attached_instrument_has_no_own_span() {
         let out = cites("Vu l'article 1240 du code civil.");
-        // UNE occurrence : le numéral ; l'instrument vit dans le verbose.
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].article.as_deref(), Some("1240"));
-        // Mention nue : span propre.
         let out = cites("Vu le code civil.");
         assert_eq!(out.len(), 1);
         assert!(out[0].article.is_none());
@@ -5327,8 +5238,6 @@ mod tests {
 
     #[test]
     fn structural_dated_act_without_catalog_still_spans() {
-        // Acte numéroté ABSENT du catalogue : span structurel émis (identité
-        // chiffrée), lien vide — le catalogue s'enrichit sans changer le scan.
         let out = cites("en application de la loi n° 2099-1 du 1er janvier 2099 précitée.");
         assert_eq!(out.len(), 1);
         assert!(out[0].article.is_none());
@@ -5337,17 +5246,12 @@ mod tests {
 
     #[test]
     fn local_act_emits_no_span() {
-        // Acte local non citable : ni span ni lien (gate de citabilité).
         let out = cites("par un arrêté préfectoral du 3 mai 2019, le préfet a refusé.");
         assert!(out.is_empty());
     }
 
     #[test]
     fn reproduced_block_ties_break_on_nearest_resolved_citation() {
-        // judilibre/6253cba2bd3db21cbdd8de7a : bloc d'articles REPRODUITS
-        // (« - Article L212-8- " … ») — « L. 212-8 » vit dans le code du
-        // travail ET le code rural, tous deux cités au doc ; le code du
-        // travail introduit le bloc, chaque article résolu ancre le suivant.
         let out = cites(
             "Les articles L. 212-8 et L. 212-8-5 du code du travail de l'époque \
              admettaient la conclusion d'un tel accord d'entreprise : \
@@ -5363,8 +5267,6 @@ mod tests {
 
     #[test]
     fn fiscal_letter_suffix_articles_resolve() {
-        // Suffixe-lettre fiscal : la lettre seule MAJUSCULE fait partie du
-        // numéral (« 164 B » ≠ « 164 » au catalogue).
         let out = cites(
             "Il résulte de l'article 164 B du code général des impôts que le              contribuable est imposable. L'article L. 16 A du livre des              procédures fiscales encadre la demande.",
         );
@@ -5378,8 +5280,6 @@ mod tests {
 
     #[test]
     fn fiscal_letter_ordinal_and_arrete_prefix_resolve() {
-        // Combo lettre + ordinal (« 1518 A quinquies ») et préfixe d'arrêté
-        // (« A. 444-32 ») — le « a » nu reste une préposition (« 3 à 5 »).
         let out = cites(
             "La valeur locative est fixée selon l'article 1518 A quinquies du              code général des impôts. Les émoluments sont tarifés à l'article              A. 444-32 du code de commerce.",
         );
@@ -5393,9 +5293,6 @@ mod tests {
 
     #[test]
     fn title_citing_articles_reopens_enumeration() {
-        // Le walker de titre daté consomme l'ancre « articles » interne au
-        // titre officiel — l'énumération doit rouvrir derrière et rattacher
-        // les numéraux au génitif qui suit (CESEDA), pas à l'arrêté.
         let out = cites(
             "Vu : - l'arrêté du 27 décembre 2016 relatif aux conditions \
              d'établissement et de transmission des certificats médicaux, \
@@ -5410,11 +5307,6 @@ mod tests {
 
     #[test]
     fn spans_are_sorted_and_non_overlapping() {
-        // Invariant d'écriture store (PK `(decision_id, char_start)`) : spans
-        // triés, sans chevauchement — disjoints par construction (ADR 0160
-        // §3). Le titre officiel de l'arrêté traverse « l'article 238-0 A »
-        // au singulier — le token article interne appartient au titre et ne
-        // doit pas émettre (crash reextract v13, décision 919).
         let out = cites(
             "Vu : - le livre des procédures fiscales ; - l'arrêté du 12 février \
              2010 pris en application du deuxième alinéa du 1 de l'article \
@@ -5440,10 +5332,6 @@ mod tests {
 
     #[test]
     fn possessive_articles_visa_binds_to_preceding_instrument() {
-        // « Vu le CJA et notamment ses articles L. 761-1, R. 771-5 et
-        // R. 771-7 » (formule d'ordonnance) : « ses articles » est une ancre
-        // SameConn qui consomme l'ancre ArtWord — l'énumération rouvre sur sa
-        // fin et les numéraux se rattachent à l'instrument amont.
         let out = cites(
             "Vu les autres pièces produites. Vu le code de justice administrative \
              et notamment ses articles L. 761-1, R. 771-5 et R. 771-7. \
@@ -5457,11 +5345,6 @@ mod tests {
 
     #[test]
     fn tel_que_modifie_prose_is_not_a_genitive_gap() {
-        // « ses articles L. 761-1 et R. 771-5, tel que modifié par le décret
-        // n° 87-1034 … » : la prose « tel que modifié par le » n'est PAS un
-        // gap génitif (la branche qualificatif-seul de RE_GAP exigeait un
-        // blanc entre qualificatifs — sans lui, elle avalait toute prose
-        // bas-de-casse lettre à lettre) ; les articles restent au CJA amont.
         let out = cites(
             "Vu le code de justice administrative, notamment ses articles \
              L. 761-1 et R. 771-5, tel que modifié par le décret n° 87-1034 \
@@ -5475,9 +5358,6 @@ mod tests {
 
     #[test]
     fn ambiguous_bare_prefixed_article_abstains() {
-        // Les DEUX porteurs sont cités à portée : la proximité n'est plus un
-        // signal, on s'abstient (l'accord d'entreprise intercalé décroche
-        // aussi l'antécédent).
         let out = cites(
             "L'article L. 212-8-5 du code du travail et l'article 1144 du code \
              rural sont invoqués. Selon l'accord d'entreprise applicable, le \
@@ -5489,8 +5369,6 @@ mod tests {
 
     #[test]
     fn degree_enumeration_bridges_genitive_adjacency() {
-        // TA78 DTA_2305985 : « L. 611-3 1° et 5° du CESEDA » — l'énumération
-        // de degrés fait partie du gap génitif, l'adjacence reste autoritaire.
         let out = cites(
             "le préfet s'est fondé sur les dispositions de l'article L. 611-3 \
              1° et 5° du code de l'entrée et du séjour des étrangers et du \
@@ -5502,9 +5380,6 @@ mod tests {
 
     #[test]
     fn roman_paragraph_bridges_distributive_enumeration() {
-        // Uy4YBZQ25Fr2 : « les articles L. 1142-1, I, du code de la santé
-        // publique et 36 de la loi n° 66-879 » — le paragraphe romain suit
-        // le premier numéral, l'énumération distributive le traverse.
         let out = cites(
             "Vu les articles L. 761-1, I, du code de justice administrative \
              et 37 de la loi n° 91-647 du 10 juillet 1991 ;",
@@ -5527,12 +5402,10 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    // ── citations de jurisprudence (ADR 0165) ───────────────────────────────
+    // ── citations de jurisprudence ──────────────────────────────────────────
 
     #[test]
     fn case_pourvoi_anchored_and_enumeration() {
-        // Span = le token identifiant seul ; lettre de série hors span ;
-        // l'énumération émet un span par pourvoi.
         assert_eq!(
             case_surfaces("sur le pourvoi n° B 18-23.954 formé par M. X"),
             vec![("18-23.954".to_string(), "cc|1823954".to_string())]
@@ -5552,12 +5425,10 @@ mod tests {
             case_surfaces("voir Cour de cassation, 3e chambre civile, 16 mars 2022, n° 21-12.345"),
             vec![("21-12.345".to_string(), "cc|2112345".to_string())]
         );
-        // « Cass. soc., … » : l'ancre abrégée porte le point.
         assert_eq!(
             case_surfaces("(Cass. soc., 18 janvier 2011, n° 09-89.876)"),
             vec![("09-89.876".to_string(), "cc|0989876".to_string())]
         );
-        // Prose sans n° de pourvoi : rien.
         assert!(case_surfaces("le pourvoi formé par M. X est rejeté").is_empty());
     }
 
@@ -5567,14 +5438,11 @@ mod tests {
             case_surfaces("la décision du Conseil d'État du 12 avril 2019, n° 412412"),
             vec![("412412".to_string(), "ce|412412".to_string())]
         );
-        // Un n° à 6 chiffres SANS le contexte Conseil d'État n'émet rien.
         assert!(case_surfaces("la demande enregistrée sous le n° 412412 est rejetée").is_empty());
     }
 
     #[test]
     fn case_constit_requires_dc_qpc_suffix() {
-        // Par l'ancre juridiction ET par le mot « décision » (token
-        // multi-rôles Eu → Case).
         assert_eq!(
             case_surfaces(
                 "le Conseil constitutionnel, dans sa décision n° 2020-800 DC du 26 juin 2020"
@@ -5585,14 +5453,11 @@ mod tests {
             case_surfaces("selon la décision n° 2019-781 QPC du Conseil"),
             vec![("2019-781".to_string(), "constit|2019-781".to_string())]
         );
-        // Sans suffixe DC/QPC, « décision n° 2020-1310 » est un acte : rien.
         assert!(case_surfaces("la décision n° 2020-1310 du 29 octobre 2020").is_empty());
     }
 
     #[test]
     fn case_cedh_sigle_disambiguates_court_from_convention() {
-        // Sigle + n° de requête aval = la COUR (span jurisprudence, pas
-        // d'instrument).
         let text = "CEDH, arrêt X. c. France du 3 octobre 2014, req. n° 30010/10";
         assert_eq!(
             case_surfaces(text),
@@ -5602,7 +5467,6 @@ mod tests {
             cites(text).is_empty(),
             "le sigle ne doit pas lier la Convention"
         );
-        // Sigle sans requête : l'alias Convention garde la main.
         let conv = "sur le fondement de l'article 5 de la CEDH et de la loi";
         assert!(cases(conv).is_empty());
         assert!(cites(conv).iter().any(|c| c.text_key == "cedh"));
@@ -5625,15 +5489,11 @@ mod tests {
                 ("C-415/05".to_string(), "cjue|c-415/05".to_string()),
             ]
         );
-        // Slashnum nu en fenêtre d'« arrêt » : un acte UE, pas une affaire.
         assert!(case_surfaces("l'arrêt applique le règlement 44/2001 du Conseil").is_empty());
     }
 
     #[test]
     fn case_cjue_party_names_and_graphies() {
-        // Nom d'affaire entre l'ancre et le numéro, y compris dans
-        // l'énumération ; graphies tiret-séparateur et tiret absent
-        // normalisées dans la clé.
         assert_eq!(
             case_surfaces(
                 "au visa des arrêts MIT C-431/04, GSK C-210/13, Bayer C-11/13 \
@@ -5654,14 +5514,11 @@ mod tests {
             case_surfaces("dans son arrêt Forsgren C631/13 du 15 janvier 2015"),
             vec![("C631/13".to_string(), "cjue|c-631/13".to_string())]
         );
-        // « ordonnance » sans instrument daté FR : sonde CJUE (préfixe exigé).
         assert_eq!(
             case_surfaces("l'ordonnance Glaxosmithkline C-210/13 du 14 novembre 2013"),
             vec![("C-210/13".to_string(), "cjue|c-210/13".to_string())]
         );
-        // Une ordonnance FR datée reste un instrument, pas une affaire.
         assert!(case_surfaces("l'ordonnance n° 58-1067 du 7 novembre 1958").is_empty());
-        // Ancre « affaire » avec mots interstitiels : la fenêtre préfixée relaie.
         assert_eq!(
             case_surfaces("dans l'affaire déjà citée C-210/13 Glaxosmithkline"),
             vec![("C-210/13".to_string(), "cjue|c-210/13".to_string())]
@@ -5683,21 +5540,17 @@ mod tests {
                 "rg|ca_aix_provence|19/12345".to_string()
             )]
         );
-        // Sans juridiction mappable : clé NUE `rg||NUM` — jamais résolue
-        // (code vide ≠ tout code), mais décorée quand la GT la résorbe.
         assert_eq!(
             case_surfaces("l'affaire enregistrée RG n° 21/04532 au greffe"),
             vec![("21/04532".to_string(), "rg||21/04532".to_string())]
         );
-        // Tribunal hors référentiel de test : la forme la plus proche décide,
-        // sa ville ne mappe pas → clé nue aussi.
         assert_eq!(
             case_surfaces("le jugement du tribunal judiciaire de Meaux, RG n° 21/04532"),
             vec![("21/04532".to_string(), "rg||21/04532".to_string())]
         );
     }
 
-    /// Raccourci d'assertion : (surface, clé) attendues, dans l'ordre.
+    /// (surface, clé) attendues, dans l'ordre.
     fn assert_cases(text: &str, expected: &[(&str, &str)]) {
         let got = case_surfaces(text);
         let want: Vec<(String, String)> = expected
@@ -5709,14 +5562,11 @@ mod tests {
 
     #[test]
     fn case_admin_ta_jugement_with_downstream_jurisdiction() {
-        // Le signalement utilisateur : la chaîne du fond administratif doit
-        // être citable inline (ADR 0165 amendé).
         assert_cases(
             "Par un jugement n° 1901563 du 15 février 2023, le tribunal administratif \
              de Nantes a condamné l'ONIAM à verser une somme",
             &[("1901563", "af|ta_nantes|1901563")],
         );
-        // Énumération « Par deux jugements n° X et n° Y ».
         assert_cases(
             "Par deux jugements n° 2202850 et n° 2202851 du 16 mars 2023, le tribunal \
              administratif de Nantes a rejeté leurs demandes",
@@ -5748,7 +5598,6 @@ mod tests {
              d'Etat, statuant au contentieux",
             &[("431188", "ce|431188"), ("431348", "ce|431348")],
         );
-        // Une autre juridiction entre le n° et l'ancre invalide la sonde.
         assert_cases(
             "la décision n° 432537 du tribunal administratif de Rennes, puis le Conseil \
              d'Etat a rejeté le surplus",
@@ -5793,7 +5642,6 @@ mod tests {
                 ("2016-614", "constit|2016-614"),
             ],
         );
-        // Forme gatée « décision » sans suffixe DC/QPC.
         assert_cases(
             "le conseil constitutionnel a, dans sa décision n°2015-479, déclaré conforme",
             &[("2015-479", "constit|2015-479")],
@@ -5811,9 +5659,6 @@ mod tests {
              n°15670/18 et 43115/18 M. A et autres c. Croatie",
             &[("15670/18", "cedh|15670/18"), ("43115/18", "cedh|43115/18")],
         );
-        // Ordinal d'arrêt CA (année/n°) : clé nue rg||, pas une requête CEDH.
-        // EN CORPS de texte seulement — en tête de document, c'est le bandeau
-        // de LA décision (son propre ordinal), pas une citation.
         let pad = "considérant que la cour a déjà statué ; ".repeat(35);
         assert_cases(
             &format!("{pad}ARRÊT AU FOND DU 25 MARS 2011 N° 2011/183 Rôle N° 10/01539"),
@@ -5823,12 +5668,10 @@ mod tests {
             "ARRÊT AU FOND DU 25 MARS 2011 N° 2011/183 Rôle N° 10/01539",
             &[("10/01539", "rg||10/01539")],
         );
-        // Un acte UE derrière « arrêt » n'est pas une requête.
         assert_cases(
             "l'arrêt rendu au visa de l'article 3 du règlement n° 2988/95 du Conseil",
             &[],
         );
-        // Requête CEDH via l'ancre « affaire » (4-5 chiffres avant la barre).
         assert_cases(
             "jugé, dans l'affaire 26604/16 Waldner c. France, que la méthode choisie",
             &[("26604/16", "cedh|26604/16")],
@@ -5846,12 +5689,10 @@ mod tests {
                 ("C-249/13", "cjue|c-249/13"),
             ],
         );
-        // Plage à membre nu : préfixe hérité.
         assert_cases(
             "Par son arrêt C-338/11 à 347/11 Santander Asset Management du 10 mai 2012",
             &[("C-338/11", "cjue|c-338/11"), ("347/11", "cjue|c-347/11")],
         );
-        // Lettre de série d'un pourvoi Cassation : pas un rôle CJUE.
         assert_cases(
             "a rendu l'arrêt suivant : Pourvoi n° T 17-21.405 RÉPUBLIQUE FRANÇAISE",
             &[("17-21.405", "cc|1721405")],
@@ -5875,12 +5716,10 @@ mod tests {
                 ("00-45.041", "cc|0045041"),
             ],
         );
-        // Énumération datée derrière une chambre.
         assert_cases(
             "(Civ. 1ère 11 mars 1989, n 87-10798 ; 25 juin 1996, n 94-15130)",
             &[("87-10798", "cc|8710798"), ("94-15130", "cc|9415130")],
         );
-        // Date de l'arrêt comme seul marqueur (n° omis).
         assert_cases(
             "soumis au droit irlandais (Cass, com, 18 décembre 2019, 18-14.827).",
             &[("18-14.827", "cc|1814827")],
@@ -5889,7 +5728,6 @@ mod tests {
 
     #[test]
     fn case_rg_enrol_deferee_and_own_header_guards() {
-        // Forme épelée des bandeaux CA.
         assert_cases(
             "décision attaquée en date du 05 octobre 2020, enregistrée sous le no 20/00325",
             &[("20/00325", "rg||20/00325")],
@@ -5902,18 +5740,15 @@ mod tests {
             "Appel d'une décision (No RG 09/ 29) rendue par le juge de l'expropriation",
             &[("09/ 29", "rg||09/29")],
         );
-        // La requête EN COURS (JLD rétention) n'est pas une citation.
         assert_cases(
             "Vu la requête en prolongation de rétention, enregistrée sous le N°RG \
              25/04461 présentée par M. le Préfet",
             &[],
         );
-        // Bandeau des dossiers joints de la décision elle-même (Portalis).
         assert_cases(
             "N° RG 22/01114 - N° Portalis DBVF-V-B7G-GAYK MINUTE N°",
             &[],
         );
-        // Formes TCOM : lettrée et tout-chiffres, casse du docket conservée.
         assert_cases(
             "jugement du Tribunal de Commerce de PARIS - RG n° 2023063685",
             &[("2023063685", "rg|tcom7501|2023063685")],
@@ -5923,7 +5758,6 @@ mod tests {
              au répertoire général sous le n° 2015F00459",
             &[("2015F00459", "rg|tcom7501|2015F00459")],
         );
-        // Graphie tiret d'un RG à barre : canonisée dans la clé seulement.
         assert_cases(
             "d'un jugement rendu le 10/05/2016 (instance n° 14-08937) par le tribunal \
              de grande instance de Paris",
@@ -5933,8 +5767,6 @@ mod tests {
 
     #[test]
     fn case_spans_do_not_perturb_instrument_extraction() {
-        // Une citation d'arrêt au milieu d'une citation d'articles : les deux
-        // flux coexistent sans se voler de tokens.
         let text = "Vu l'article L. 761-1 du code de justice administrative ; \
                     vu l'arrêt de la CJUE du 6 octobre 2021, C-561/19 ; \
                     vu l'article 1240 du code civil ;";
@@ -5953,28 +5785,24 @@ mod tests {
         );
     }
 
-    /// Catalogue local des cibles v68 : CESDH, règlements de procédure CJUE,
-    /// aide juridique 91-647 (+ une sœur du même jour qui tue la clé datée),
-    /// Constitution de 1946, conventions 108 / OIT 158, règlements PAC
-    /// jumeaux du 17 décembre 2013.
     fn forum_engine() -> (CompiledVocab, LinkSnapshot) {
         let texts = vec![
-            text("JORFTEXT000000886019", "Convention de sauvegarde des droits de l'homme et des libertés fondamentales", "Convention de sauvegarde des droits de l'homme et des libertés fondamentales", "TRAITE", 0),
+            text("INTL/CEDH", "Convention de sauvegarde des droits de l'homme et des libertés fondamentales", "Convention de sauvegarde des droits de l'homme et des libertés fondamentales", "TRAITE", 0),
             text("EU/RPROC/CJUE", "Règlement de procédure de la Cour de justice", "Règlement de procédure de la Cour de justice", "REGLEMENT", 0),
             text("EU/RPROC/TRIBUNAL", "Règlement de procédure du Tribunal", "Règlement de procédure du Tribunal", "REGLEMENT", 0),
             text("JORFTEXT000000537611", "Loi n° 91-647 du 10 juillet 1991 relative à l'aide juridique", "Loi du 10 juillet 1991 relative à l'aide juridique", "LOI", 60),
-            text("JORFTEXT000000868390", "Constitution du 27 octobre 1946", "Constitution du 27 octobre 1946", "TRAITE", 0),
-            text("JORFTEXT000000682057", "Décret n° 85-1203 du 15 novembre 1985 portant publication de la convention pour la protection des personnes à l'égard du traitement automatisé des données à caractère personnel, faite à Strasbourg le 28 janvier 1981", "Décret du 15 novembre 1985", "TRAITE", 0),
-            text("JORFTEXT000000349885", "Décret n°90-140 du 9 février 1990 portant publication de la convention internationale du travail n° 158 concernant la cessation de la relation de travail à l'initiative de l'employeur.", "Décret du 9 février 1990", "TRAITE", 0),
+            text("FR/PREAMBULE-1946", "Préambule de la Constitution du 27 octobre 1946", "Préambule de la Constitution du 27 octobre 1946", "CONSTITUTION", 0),
+            text("INTL/CONV-108", "Convention pour la protection des personnes à l'égard du traitement automatisé des données à caractère personnel, faite à Strasbourg le 28 janvier 1981", "Convention pour la protection des personnes à l'égard du traitement automatisé des données à caractère personnel", "TRAITE", 27),
+            text("INTL/CONVENTION-INTERNATIONALE-TRAVAIL-158-CESSATION-1990", "Convention internationale du travail n° 158 concernant la cessation de la relation de travail à l'initiative de l'employeur", "Convention internationale du travail n° 158 concernant la cessation de la relation de travail à l'initiative de l'employeur", "CONVENTION", 0),
             text("EU/REG/1307-2013", "Règlement (UE) n° 1307/2013 du Parlement européen et du Conseil du 17 décembre 2013 établissant les règles relatives aux paiements directs en faveur des agriculteurs", "Règlement (UE) n° 1307/2013", "REGLEMENT", 0),
             text("EU/REG/1306-2013", "Règlement (UE) n° 1306/2013 du Parlement européen et du Conseil du 17 décembre 2013 relatif au financement, à la gestion et au suivi de la politique agricole commune", "Règlement (UE) n° 1306/2013", "REGLEMENT", 0),
             text("JORF_L91636", "Loi n° 91-636 du 10 juillet 1991 autorisant l'approbation d'une convention sur le crédit-bail", "Loi du 10 juillet 1991 autorisant l'approbation d'une convention sur le crédit-bail", "LOI", 2),
         ];
         let articles: Vec<(String, String)> = [
-            ("JORFTEXT000000886019", "3"),
-            ("JORFTEXT000000886019", "13"),
-            ("JORFTEXT000000886019", "44"),
-            ("JORFTEXT000000886019", "45"),
+            ("INTL/CEDH", "3"),
+            ("INTL/CEDH", "13"),
+            ("INTL/CEDH", "44"),
+            ("INTL/CEDH", "45"),
             ("JORFTEXT000000537611", "37"),
             ("JORFTEXT000000537611", "75"),
             ("EU/REG/1307-2013", "52"),
@@ -5994,9 +5822,6 @@ mod tests {
         )
     }
 
-    /// Parent implicite par juridiction (v68) : « du règlement de procédure »
-    /// nu dans un arrêt CJUE désigne le règlement de la formation qui parle —
-    /// et reste ambigu (abstention) sans forum.
     #[test]
     fn forum_rproc_links_by_court() {
         let (vocab, snap) = forum_engine();
@@ -6010,10 +5835,6 @@ mod tests {
         assert_eq!(target_of(&out), (None, None));
     }
 
-    /// CEDH : « de la Convention » nue = CESDH, article validé au catalogue ;
-    /// la nature suivie d'un nom (« convention d'indemnisation ») ne matche
-    /// pas ; « du règlement » (règlement de la Cour EDH, hors catalogue)
-    /// s'abstient.
     #[test]
     fn forum_cedh_bare_convention_is_cesdh() {
         let (vocab, snap) = forum_engine();
@@ -6023,16 +5844,14 @@ mod tests {
             &snap,
             Some(Forum::Cedh),
         );
-        assert_eq!(target_of(&out), (Some("JORFTEXT000000886019"), Some("44")));
+        assert_eq!(target_of(&out), (Some("INTL/CEDH"), Some("44")));
         let out = extract_citations(
             "conformément aux articles 45 § 2 de la Convention et 74 § 2 du règlement,",
             &vocab,
             &snap,
             Some(Forum::Cedh),
         );
-        assert_eq!(target_of(&out), (Some("JORFTEXT000000886019"), Some("45")));
-        // « du règlement » (règlement de la Cour EDH, hors catalogue) : aucun
-        // lien posé dessus.
+        assert_eq!(target_of(&out), (Some("INTL/CEDH"), Some("45")));
         assert!(out.iter().skip(1).all(|c| c.target.ref_text_uid.is_none()));
         let out = extract_citations(
             "la violation de l'article 3 de la convention d'indemnisation conclue entre les parties",
@@ -6043,10 +5862,6 @@ mod tests {
         assert_eq!(target_of(&out), (None, None));
     }
 
-    /// Annexes CEDH : l'article nu de STYLE Convention (« Art. 13 - … »,
-    /// anglais compris) lie ; une tête de citation du droit interne
-    /// (« Article 26 » plein, sans §) ne lie pas. La forme anglaise épelée
-    /// lie par alias, « of the » vaut génitif.
     #[test]
     fn forum_cedh_annex_style_and_english() {
         let (vocab, snap) = forum_engine();
@@ -6056,7 +5871,7 @@ mod tests {
             &snap,
             Some(Forum::Cedh),
         );
-        assert_eq!(target_of(&out), (Some("JORFTEXT000000886019"), Some("13")));
+        assert_eq!(target_of(&out), (Some("INTL/CEDH"), Some("13")));
         let out = extract_citations(
             "Article 26 Toute personne doit pouvoir exprimer",
             &vocab,
@@ -6070,12 +5885,9 @@ mod tests {
             &snap,
             Some(Forum::Cedh),
         );
-        assert_eq!(target_of(&out), (Some("JORFTEXT000000886019"), Some("3")));
+        assert_eq!(target_of(&out), (Some("INTL/CEDH"), Some("3")));
     }
 
-    /// « l'article 75-I de la loi du 10 juillet 1991 » : le paragraphe romain
-    /// collé au numéral est un qualificatif de gap génitif, et la clé datée —
-    /// tuée par les neuf lois du même JO — résout par alias d'article.
     #[test]
     fn roman_suffix_and_dated_alias_link_aide_juridique() {
         let (vocab, snap) = forum_engine();
@@ -6088,9 +5900,6 @@ mod tests {
         assert_eq!(target_of(&out), (Some("JORFTEXT000000537611"), Some("75")));
     }
 
-    /// Alias v68 : Constitution de 1946, convention n° 108 du Conseil de
-    /// l'Europe, convention OIT n° 158 — fiches présentes, formes citées sans
-    /// prise pour les règles structurelles.
     #[test]
     fn v68_aliases_resolve() {
         let (vocab, snap) = forum_engine();
@@ -6102,7 +5911,7 @@ mod tests {
         );
         assert_eq!(
             out[0].target.ref_text_uid.as_deref(),
-            Some("JORFTEXT000000868390")
+            Some("FR/PREAMBULE-1946")
         );
         let out = extract_citations(
             "méconnaît l'article 8 de la convention n° 108 du Conseil de l'Europe \
@@ -6112,20 +5921,22 @@ mod tests {
             &snap,
             None,
         );
-        assert_eq!(target_of(&out), (Some("JORFTEXT000000682057"), None));
+        assert_eq!(target_of(&out), (Some("INTL/CONV-108"), None));
         let out = extract_citations(
             "l'article 10 de la convention n° 158 de l'organisation internationale du travail",
             &vocab,
             &snap,
             None,
         );
-        assert_eq!(target_of(&out), (Some("JORFTEXT000000349885"), None));
+        assert_eq!(
+            target_of(&out),
+            (
+                Some("INTL/CONVENTION-INTERNATIONALE-TRAVAIL-158-CESSATION-1990"),
+                None
+            )
+        );
     }
 
-    /// Droit dérivé UE cité par DATE sans numéro (règle 5bis) : les tokens de
-    /// la queue de titre départagent les jumeaux du même jour ; la forme nue
-    /// sans queue s'abstient (six règlements PAC), le règlement de
-    /// copropriété reste gaté.
     #[test]
     fn eu_derived_act_by_date_and_title_tokens() {
         let (vocab, snap) = forum_engine();

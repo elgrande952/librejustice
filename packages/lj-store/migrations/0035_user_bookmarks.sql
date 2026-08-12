@@ -1,5 +1,4 @@
 -- Migration 0035 : signets utilisateur sur les décisions
--- ADR : docs/adr/0036-user-profile-local-bookmarks-history.md
 
 CREATE TABLE user_bookmarks (
     user_sub     TEXT   NOT NULL REFERENCES users (sub) ON DELETE CASCADE,

@@ -1,20 +1,20 @@
-//! Circulaires (fond DILA CIRCULAIRES, ADR 0196) : sync du fond complet
+//! Circulaires (fond DILA CIRCULAIRES) : sync du fond complet
 //! (stocks 2009-2014 + abrogations historiques + flux ≥ 2014) → `legal_text`
-//! nature=`CIRCULAIRE`, identité `cir_<ID>`, NOR en cascade ADR 0115, état
+//! nature=`CIRCULAIRE`, identité `cir_<ID>`, NOR en cascade, état
 //! V/A en `status`, résumé en `body`.
 //!
-//! **Corps** (ADR 0222, [`sync_circulaires_bodies`]) : passe séparée qui
-//! rejoue les stocks PDF (`pdf/<année>_pdf.tar.gz`) puis les PDF compagnons
-//! des flux — `pdftotext` déterministe, OCR Mistral cache-first en repli
-//! scanné (pattern ADR 0124) — et pose `body` = corps extrait. Le sync
-//! métadonnées écrit le résumé DILA (≤ 5 000 caractères) en `body`
-//! provisoire ; la passe corps le remplace quand un PDF exploitable existe.
+//! Corps ([`sync_circulaires_bodies`]) : passe séparée qui rejoue les stocks
+//! PDF (`pdf/<année>_pdf.tar.gz`) puis les PDF compagnons des flux —
+//! `pdftotext` déterministe, OCR Mistral cache-first en repli scanné — et pose
+//! `body` = corps extrait. Le sync métadonnées écrit le résumé DILA
+//! (≤ 5 000 caractères) en `body` provisoire ; la passe corps le remplace quand
+//! un PDF exploitable existe.
 //!
 //! Rejeu : stocks (par année) → `abroge_txt.tar` (flips d'état historiques)
-//! → flux en ordre chronologique (**last-write-wins par `ID_CIRCULAIRE`** —
+//! → flux en ordre chronologique (last-write-wins par `ID_CIRCULAIRE` —
 //! une abrogation moderne arrive en re-export `ETAT=A`). Chaque fichier
 //! ingéré est marqué au manifest (`mark_circulaire_done`) : un crash reprend
-//! où il s'était arrêté. Idempotent (#7) : upsert par `text_uid`.
+//! où il s'était arrêté. Idempotent : upsert par `text_uid`.
 
 use std::path::Path;
 
@@ -28,7 +28,7 @@ use crate::config::Settings;
 
 /// Sync du fond CIRCULAIRES : planifie (listing + téléchargements), ingère
 /// chaque fichier nouveau dans l'ordre de rejeu, marque le manifest, puis pose
-/// les slugs des textes nouveaux (ADR 0162).
+/// les slugs des textes nouveaux.
 pub async fn sync_circulaires() -> Result<()> {
     let settings = Settings::from_env()?;
     let dir = settings.cache_dir().join("circulaires");
@@ -61,7 +61,6 @@ pub async fn sync_circulaires() -> Result<()> {
                 abroges += apply_abroge_tar(&repo, &tarball.path).await?;
             }
         }
-        // Fichier rejoué avec succès → marqué (repris au prochain run sinon).
         let (dir, name) = (dir.clone(), tarball.name.clone());
         tokio::task::spawn_blocking(move || {
             lj_sources::circulaires::mark_circulaire_done(&dir, &name)
@@ -71,8 +70,8 @@ pub async fn sync_circulaires() -> Result<()> {
         .map_err(|e| anyhow!("mark_circulaire_done {}: {e}", tarball.name))?;
     }
 
-    // Slugs des textes nouveaux (ADR 0162) — pas de refresh code_title : la
-    // famille n'a pas d'articles.
+    // Slugs des textes nouveaux — pas de refresh code_title : la famille n'a
+    // pas d'articles.
     let slugged = super::slugs::assign_text_slugs(&repo).await?;
 
     tracing::info!(
@@ -86,13 +85,13 @@ pub async fn sync_circulaires() -> Result<()> {
     Ok(())
 }
 
-/// Passe corps du fond CIRCULAIRES (ADR 0222) : rejoue les tarballs PDF
-/// (stocks puis flux, last-write-wins par id), extrait chaque PDF
-/// (`pdftotext` natif, OCR Mistral cache-first en repli scanné) et pose
-/// `legal_text.body`. Un repli OCR qui manque (clé absente/épuisée) dépose
-/// le PDF en file d'attente (`ocr-pending/`), drainée en tête de chaque run :
-/// le retry coûte O(fichiers manqués), jamais un re-stream de tarball — le
-/// tarball est donc marqué au manifest inconditionnellement.
+/// Passe corps du fond CIRCULAIRES : rejoue les tarballs PDF (stocks puis
+/// flux, last-write-wins par id), extrait chaque PDF (`pdftotext` natif, OCR
+/// Mistral cache-first en repli scanné) et pose `legal_text.body`. Un repli OCR
+/// qui manque (clé absente/épuisée) dépose le PDF en file d'attente
+/// (`ocr-pending/`), drainée en tête de chaque run : le retry coûte
+/// O(fichiers manqués), jamais un re-stream de tarball — le tarball est donc
+/// marqué au manifest inconditionnellement.
 pub async fn sync_circulaires_bodies() -> Result<()> {
     let settings = Settings::from_env()?;
     let dir = settings.cache_dir().join("circulaires");
@@ -107,12 +106,12 @@ pub async fn sync_circulaires_bodies() -> Result<()> {
         .map_err(|e| anyhow!("plan_circulaires_pdf_sync: {e}"))?
     };
 
-    // Repli OCR marginal, pool standard. Client **collant** : on consomme une
-    // clé seule puis on bascule à l'épuisement (ADR 0124).
+    // Repli OCR marginal, pool standard. Client dédié, donc registre de quota
+    // dédié : le seau de `mistral-ocr` n'est pas celui du chat.
     let ocr_client = if settings.mistral_api_keys.is_empty() {
         None
     } else {
-        Some(MistralClient::new_sticky(
+        Some(MistralClient::new(
             settings.mistral_api_keys.clone(),
             "mistral-ocr-latest".to_string(),
         )?)
@@ -360,10 +359,10 @@ async fn ingest_circulaire_pdfs(
     Ok(counts)
 }
 
-/// Plancher moyen de caractères non-blancs **par page** au-dessus duquel la
-/// couche texte `pdftotext` est réputée native (ADR 0222). Un scan rend quasi
-/// rien ; la moyenne par page évite qu'une page de garde native fasse passer
-/// un document scanné pour du texte.
+/// Plancher moyen de caractères non-blancs par page au-dessus duquel la
+/// couche texte `pdftotext` est réputée native. Un scan rend quasi rien ; la
+/// moyenne par page évite qu'une page de garde native fasse passer un document
+/// scanné pour du texte.
 const PDF_TEXT_LAYER_FLOOR_PER_PAGE: usize = 100;
 
 /// Corps depuis la couche texte `pdftotext` ; `None` = PDF réputé scanné.
@@ -485,10 +484,9 @@ async fn apply_abroge_tar(repo: &DecisionRepository<'_>, path: &Path) -> Result<
     Ok(n)
 }
 
-/// Mapping métadonnées → `legal_text` (ADR 0196 §7). Dates ISO tolérantes :
-/// le fond porte des valeurs aberrantes réelles (`1190-…`) — `NaiveDate` les
-/// accepte ; un format illisible devient `None` (warn), jamais un abort du
-/// fond entier.
+/// Mapping métadonnées → `legal_text`. Dates ISO tolérantes : le fond porte
+/// des valeurs aberrantes réelles (`1190-…`) — `NaiveDate` les accepte ; un
+/// format illisible devient `None` (warn), jamais un abort du fond entier.
 fn circulaire_row(c: Circulaire) -> lj_store::repository::LegalTextRow {
     let date = |s: Option<&str>| -> Option<chrono::NaiveDate> {
         let s = s?;
@@ -521,8 +519,8 @@ fn circulaire_row(c: Circulaire) -> lj_store::repository::LegalTextRow {
         last_modified: date_publi.or(date_texte),
         date_texte,
         date_publi,
-        // Cascade d'identité ADR 0115 : le NOR (quand présent) collapse la
-        // manifestation JORF éventuelle du même acte.
+        // Cascade d'identité : le NOR (quand présent) collapse la manifestation
+        // JORF éventuelle du même acte.
         eli: None,
         nor: c.nor,
         instrument_key: None,
@@ -546,8 +544,6 @@ mod tests {
 
     #[test]
     fn scan_sous_le_plancher_par_page_bascule_ocr() {
-        // Page de garde native + 9 pages muettes : la moyenne par page doit
-        // classer scanné, pas la seule présence de texte.
         let garde = "République française — Ministère de la justice ".repeat(20);
         let brut = format!("{garde}{}", "\x0c \x0c \x0c \x0c \x0c \x0c \x0c \x0c \x0c");
         assert_eq!(body_from_text_layer(&brut), None);

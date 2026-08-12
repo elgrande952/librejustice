@@ -1,12 +1,12 @@
--- Migration 0063 — DROP des colonnes mono-source de `decisions` (ADR 0098 §2).
+-- Migration 0063 — DROP des colonnes mono-source de `decisions`.
 --
--- Clôt la frontière de l'ADR 0098 : `decisions` devient le **canonique pur**,
+-- Clôt la frontière : `decisions` devient le **canonique pur**,
 -- tout le per-source vit sur `decision_sources`. On DROP `source_uid`,
 -- `content_checksum` et `source_fields` de `decisions` — descendus dans
--- `decision_sources` par le portage (ADR 0098 §7 passe 1). Le DROP emporte la
+-- `decision_sources` par le portage (passe 1). Le DROP emporte la
 -- contrainte `UNIQUE`/`NOT NULL` de `source_uid` (0001) et l'index associé.
 --
--- PRÉREQUIS — ordre staged (ADR 0098 Conséquences) : le **portage des
+-- PRÉREQUIS — ordre staged : le **portage des
 -- provenances doit être TERMINÉ** avant ce DROP. Sinon `source_fields` (payload
 -- méta, présent seulement sur `decisions` pour les lignes non portées) serait
 -- PERDU. Le portage se fait HORS-MIGRATION, batché par keyset (base low-IOPS) :
@@ -48,7 +48,7 @@ BEGIN
 
     IF missing_prov > 0 OR missing_fields > 0 THEN
         RAISE EXCEPTION
-            'ADR 0098 : portage incomplet — % décision(s) sans provenance, % source_fields non porté(s). Lancer `lj-ingest dedup-backfill` (ou `backfill-decision-sources`) AVANT le DROP (§2/§7).',
+            'Portage incomplet — % décision(s) sans provenance, % source_fields non porté(s). Lancer `lj-ingest dedup-backfill` (ou `backfill-decision-sources`) AVANT le DROP.',
             missing_prov, missing_fields;
     END IF;
 END $$;

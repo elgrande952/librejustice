@@ -1,8 +1,8 @@
--- Migration 0071 — Étend le CHECK payload_format pour accueillir le DOCX (ADR 0110).
+-- Migration 0071 — Étend le CHECK payload_format pour accueillir le DOCX.
 --
 -- Certaines décisions CNDA sont publiées en Word (.docx) et non en PDF : le lien
 -- « Voir la décision » sert alors un OOXML. Born-digital, leur texte est extrait
--- de `word/document.xml` sans OCR (lj-sources::docx, ADR 0110) puis inséré avec
+-- de `word/document.xml` sans OCR (lj-sources::docx) puis inséré avec
 -- `payload_format = 'docx'`. Les deux CHECK (decision_full_text 0059,
 -- decision_sources 0064) étaient à ('xml','json','dila-xml','html','pdf') ⇒
 -- violation ⇒ ingest de ces décisions en échec. On les aligne sur +docx.

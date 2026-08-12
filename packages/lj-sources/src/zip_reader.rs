@@ -1,8 +1,8 @@
-//! Lecteur d'archives ZIP opendata (port de `sources/zip_reader.py`).
+//! Lecteur d'archives ZIP opendata.
 //!
 //! Chaque XML est décompressé indépendamment via le central directory du ZIP
-//! (crate `zip`), comme `zipfile` côté Python. La mémoire utilisée est celle du
-//! plus gros XML lu, pas celle de l'archive entière.
+//! (crate `zip`). La mémoire utilisée est celle du plus gros XML lu, pas celle
+//! de l'archive entière.
 
 use crate::error::{Result, SourceError};
 use std::fs::File;
@@ -11,7 +11,7 @@ use std::path::Path;
 use zip::ZipArchive;
 
 /// `true` si le membre est un fichier `.xml` (insensible à la casse), pas un
-/// répertoire. Port fidèle de `info.is_dir() / .lower().endswith(".xml")`.
+/// répertoire.
 fn is_xml_member(name: &str, is_dir: bool) -> bool {
     !is_dir && name.to_lowercase().ends_with(".xml")
 }
@@ -32,8 +32,8 @@ pub fn decision_members(zip_path: &Path) -> Result<Vec<String>> {
 
 /// Itère les entrées XML d'un ZIP en renvoyant `(nom_membre, contenu)`.
 ///
-/// Le port Python est un générateur ; ici on matérialise un `Vec` (l'appelant
-/// peut itérer dessus). L'ordre suit le central directory, comme `infolist()`.
+/// On matérialise un `Vec` (l'appelant peut itérer dessus). L'ordre suit le
+/// central directory.
 pub fn iter_decisions(zip_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     let file = File::open(zip_path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -66,8 +66,8 @@ pub fn count_decisions(zip_path: &Path) -> Result<usize> {
     Ok(decision_members(zip_path)?.len())
 }
 
-/// Erreur "membre absent" homogène (`zip` renvoie `FileNotFound`, on garde le
-/// type d'erreur d'origine ; cette helper sert la lisibilité des tests).
+/// Erreur « membre absent » homogène (`zip` renvoie `FileNotFound`, on garde le
+/// type d'erreur d'origine).
 #[allow(dead_code)]
 fn member_not_found(member: &str) -> SourceError {
     SourceError::Invalid(format!("membre absent du zip: {member}"))

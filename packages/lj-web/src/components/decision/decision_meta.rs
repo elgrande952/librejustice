@@ -1,5 +1,4 @@
 //! Bloc « Synthèse » : résumé + champs structurés + références juridiques.
-//! Port de `decision-meta.tsx`.
 use leptos::prelude::*;
 use lj_dtos::{DecisionDetail, FacetTag, LegalReference};
 
@@ -44,8 +43,8 @@ fn build_fields(detail: &DecisionDetail) -> Vec<MetaField> {
             mono: false,
         });
     }
-    // 4-7. Tags référentiels résolus par l'API (ADR 0146) : rendu direct des
-    // libellés servis. `voie` absente = procédure ordinaire (pas de champ).
+    // 4-7. Tags référentiels résolus par l'API : rendu direct des libellés
+    // servis. `voie` absente = procédure ordinaire (pas de champ).
     let tags: [(&'static str, &Option<FacetTag>); 3] = [
         ("Solution", &detail.solution),
         ("Procédure", &detail.procedure),
@@ -60,7 +59,7 @@ fn build_fields(detail: &DecisionDetail) -> Vec<MetaField> {
             });
         }
     }
-    // 9. Siège (position de chambre qualifiée, axes ADR 0170).
+    // 9. Siège (position de chambre qualifiée).
     if let Some(seat) = detail.seat.clone() {
         fields.push(MetaField {
             label: "Formation",
@@ -76,8 +75,8 @@ fn build_fields(detail: &DecisionDetail) -> Vec<MetaField> {
             mono: false,
         });
     }
-    // 11. Publication + portée (ADR 0167 : lecture normalisée des codes au
-    // rang le plus fort ; indéterminée = pas de champ).
+    // 11. Publication + portée : lecture normalisée des codes au rang le plus
+    // fort ; indéterminée = pas de champ.
     if let Some(pub_label) = publication_label(&detail.publication_codes) {
         fields.push(MetaField {
             label: "Publication",
@@ -92,7 +91,7 @@ fn build_fields(detail: &DecisionDetail) -> Vec<MetaField> {
             mono: false,
         });
     }
-    // 12. Nomenclature (nac, code brut). ADR 0090.
+    // 12. Nomenclature (nac, code brut).
     if let Some(nac) = detail.nac.clone() {
         fields.push(MetaField {
             label: "Nomenclature",
@@ -117,8 +116,8 @@ pub fn DecisionMeta(
         .filter(|r| !r.is_empty())
         .unwrap_or_default();
 
-    // Résumé garanti en base et porté par le détail (ADR 0051) : rendu direct,
-    // aucun fetch. Absent (cas résiduel) ⇒ bloc masqué.
+    // Résumé garanti en base et porté par le détail : rendu direct, aucun fetch.
+    // Absent (cas résiduel) ⇒ bloc masqué.
     let summary_view = detail.summary.clone().map(|text| {
         view! {
             <p class="mt-3 text-sm leading-relaxed text-[var(--color-ink-muted)]">{text}</p>
@@ -130,7 +129,7 @@ pub fn DecisionMeta(
         .map(|f| view! { <Field label=f.label value=f.value mono=f.mono /> })
         .collect_view();
 
-    // Chips de matière (themes Judilibre, ADR 0090).
+    // Chips de matière (themes Judilibre).
     let themes_view = (!themes.is_empty()).then(|| {
         let chips = themes
             .into_iter()
@@ -152,7 +151,7 @@ pub fn DecisionMeta(
 
     let refs_view = (!legal_references.is_empty()).then(|| {
         // Date de lecture propagée aux hover cards d'articles : version en
-        // vigueur à la date de la décision (ADR 0168).
+        // vigueur à la date de la décision.
         let at_date = detail.date_lecture.clone();
         let rows = legal_references
             .into_iter()
@@ -213,9 +212,8 @@ fn LegalRefRow(
         articles,
     } = reference;
     // Chaque article devient un lien `/texte/{slug}/{numKey}` quand la citation est
-    // **résolue** au catalogue (FK déterministe à l'ingest, ADR 0123 §2) : `slug`
-    // du `legal_text` + `numKey` canonique posés au DTO ; sinon texte brut. Plus de
-    // re-slugification côté front. Articles séparés par « , ».
+    // **résolue** au catalogue : `slug` du `legal_text` + `numKey` canonique posés
+    // au DTO ; sinon texte brut. Articles séparés par « , ».
     let articles_view = (!articles.is_empty()).then(|| {
         let last = articles.len() - 1;
         let items = articles
@@ -237,7 +235,7 @@ fn LegalRefRow(
                 );
                 let num = article.num;
                 let body = match target {
-                    // Hover card d'article sur le lien (ADR 0168).
+                    // Hover card d'article sur le lien.
                     Some((href, kind)) => view! {
                         <HoverPreview kind=kind>
                             <A href=href attr:class="underline underline-offset-4 hover:text-[var(--color-accent)]">
@@ -254,15 +252,14 @@ fn LegalRefRow(
                 }
             })
             .collect_view();
-        // `art.&nbsp;` : espace insécable U+00A0 (parité `&nbsp;`).
+        // `art.&nbsp;` : espace insécable U+00A0.
         view! {
             <span class="text-[var(--color-ink-muted)]">"art.\u{00A0}"{items}</span>
         }
     });
-    // Nom de l'instrument cliquable vers `/texte/{slug}` (le texte entier) dès que la
-    // citation est résolue au catalogue — même doctrine que le corps, où une
-    // mention nue mène à `/texte/{slug}` (decisions.rs, 2026-07-05). Sans ce lien, un
-    // texte cité EN BLOC (articles vides) n'ouvrait rien depuis l'encart.
+    // Nom de l'instrument cliquable vers `/texte/{slug}` (le texte entier) dès que
+    // la citation est résolue au catalogue — même doctrine que le corps, où une
+    // mention nue mène à `/texte/{slug}`.
     let instrument_view = match slug {
         Some(s) => view! {
             <A

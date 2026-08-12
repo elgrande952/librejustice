@@ -1,28 +1,21 @@
-//! Assemblage du routeur axum (port de `main.create_app`).
-//!
-//! Monte les mêmes routes que le `create_app` FastAPI, mêmes chemins/méthodes
-//! (syntaxe axum 0.8 `/{id}`), même ordre de middleware :
-//!
-//! 1. CORS (allowlist explicite, ADR 0038) ;
-//! 2. compression gzip (`minimum_size=1024`, parité `GZipMiddleware`) ;
-//! 3. access-log (trace tower-http — substitut de `_AccessLogMiddleware`).
+//! Assemblage du routeur axum.
 //!
 //! Les handlers de données (`search`, `decision/*`, `me/*`…) sont des fonctions
 //! pures `(&AppState, …) -> Result<…>` ; ce module les adapte en handlers axum
 //! (extraction des query/path params + alias camelCase, application des headers
-//! `Cache-Control`). Les résumés sont servis embarqués dans la recherche et le
-//! détail (garantis en base, ADR 0051) — pas d'endpoint de génération à la volée.
+//! `Cache-Control`).
 
 use crate::auth::{OptionalUser, RequiredUser};
 use crate::cache::{CachePolicy, CACHE_DECISION, CACHE_SEARCH};
 use crate::error::{validation, ApiError, Result};
 use crate::state::AppState;
 use crate::{
-    bookmarks, decision_views, decisions, docx_export, entities, jurisdiction_hubs, legi, mcp, me,
-    norm_hubs, oauth, pdf_export, redirect, registre, search, search_history, sitemap, stats,
+    annonces, bookmarks, decision_views, decisions, entities, jurisdiction_hubs, legi, mcp, me,
+    norm_hubs, oauth, pdf_export, redirect, registre, robots, search, search_history, sitemap,
+    stats, usage,
 };
 use axum::extract::{Path, Query, RawQuery, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post, put};
@@ -31,7 +24,7 @@ use axum_tracing_opentelemetry::middleware::{OtelAxumLayer, OtelInResponseLayer}
 use lj_dtos::{
     ActivitySource, ActivityTrackingUpdate, BookmarksResponse, DecisionViewsResponse, Domain,
     HealthResponse, JurisdictionType, Office, Procedure, SearchHistoryResponse, SearchMode,
-    SearchRequest, Significance, SimilarDecisionsResponse, Solution, SortOrder, UserProfileUpdate,
+    SearchRequest, Significance, Solution, SortOrder, UserProfileUpdate,
 };
 use serde::Deserialize;
 use tower_http::compression::CompressionLayer;
@@ -39,63 +32,41 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 /// Assemble les routes (data API `/api`, OAuth, discovery `.well-known`, MCP
-/// optionnel) avec l'état injecté — sans fallback ni middleware. Brique partagée
-/// par [`build_router`] (serveur fusionné, fallback fourni par l'hôte) et
-/// [`create_app`] (serveur API autonome).
+/// optionnel) avec l'état injecté — sans fallback ni middleware.
 fn assemble_routes(state: AppState, enable_mcp: bool) -> Router {
-    // ── DATA API (préfixe `/api`, ADR 0042) ──────────────────────────────────
+    // ── DATA API (préfixe `/api`) ─────────────────────────────────────────────
     let api = Router::new()
         .route("/health", get(health))
+        .route("/health/deep", get(health_deep))
         .route("/search", get(search_endpoint))
-        // Recherche plein-texte d'articles (ADR 0114), corpus distinct des
-        // décisions : route séparée, jambe BM25 lexicale sur `legal_article`.
         .route("/search-textes", get(search_textes_endpoint))
-        // Autocomplétion multi-mots (ADR 0216) : FST in-process pour
-        // jurisprudence/textes, délégation annuaire.
         .route("/suggest", get(suggest_endpoint))
-        // Catalogue des codes navigables (page `/codes`) : un texte de
-        // référentiel par entrée, avec son nombre d'articles.
         .route("/codes", get(codes_catalogue))
-        // Compteurs globaux du corpus (page d'accueil) : estimation décisions +
-        // nombre de codes, servis depuis un cache process-local (TTL 12 h).
         .route("/corpus-stats", get(corpus_stats))
-        // Hubs juridiction (ADR 0253) : catalogue, hub d'un code, page année.
         .route("/juridictions", get(jurisdictions_catalogue))
         .route("/juridictions/{code}", get(jurisdiction_hub))
         .route("/juridictions/{code}/{annee}", get(jurisdiction_year))
         .route("/normes", get(normes_catalogue))
         .route("/normes/{fond}", get(norm_hub))
         .route("/normes/{fond}/{annee}", get(norm_year))
+        .route("/annonces", get(annonces_endpoint))
+        .route("/annonces/catalogue", get(annonces_catalogue))
+        .route("/annonces/{uid}", get(annonce_detail))
         .route("/decision/{decision_id}", get(decision))
         .route("/decision/{decision_id}/similar", get(decision_similar))
         .route("/decision/{decision_id}/preview", get(decision_preview))
         .route("/decision/{decision_id}/parties", get(decision_parties))
-        // Fiche entité (ADR 0189) : identité registre + agrégats contentieux,
-        // et décisions citantes paginées.
         .route("/entity/{ns}/{id}", get(entity_page))
         .route("/entity/{ns}/{id}/decisions", get(entity_decisions))
-        // Volet registre servi par APIs externes (ADR 0199) : identité
-        // enrichie/dirigeants/finances + annonces BODACC/JOAFE, jamais stockés.
         .route("/entity/{ns}/{id}/registre", get(entity_registre))
-        // Annuaire des entités (ADR 0192) : recherche, listing paginé par
-        // catégorie, compteurs. Périmètre = entités avec contentieux.
         .route("/entities/search", get(entities_search))
         .route("/entities/directory", get(entities_directory))
         .route("/entities/stats", get(entities_stats))
         .route(
-            "/decision/{decision_id}/download.docx",
-            get(decision_download_docx),
-        )
-        .route(
             "/decision/{decision_id}/download.pdf",
             get(decision_download_pdf),
         )
-        // Référentiel LEGI versionné (`/texte`, ADR 0092). Ordre des routes : la
-        // version-à-date `{code}/{num}/{date}` et la sous-ressource
-        // `{code}/{num}/citing` ne peuvent collisionner — `citing` est un
-        // segment littéral, distinct d'une date ISO.
         .nest("/texte", legi_router())
-        // me / bookmarks / search-history / decision-views (RequiredUser).
         .route("/me", get(get_me).patch(patch_me).delete(delete_me))
         .route("/me/activity-tracking", put(set_activity_tracking))
         .route("/me/bookmarks", get(list_bookmarks))
@@ -113,38 +84,32 @@ fn assemble_routes(state: AppState, enable_mcp: bool) -> Router {
             "/me/decision-views/{decision_id}",
             post(record_view).delete(delete_view),
         )
-        // L'API (JSON + exports PDF/DOCX) reste servie en 200 mais ne doit
-        // jamais entrer dans l'index des moteurs — le contenu indexable est la
-        // page SSR. `X-Robots-Tag` couvre aussi les binaires, où un `<meta>`
-        // est impossible.
+        .route(
+            "/client/hydration-failure",
+            post(client_hydration_failure).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static("x-robots-tag"),
             HeaderValue::from_static("noindex"),
         ));
 
     // ── Racine : OAuth + discovery `.well-known` (consommés hors `/api`) ──────
-    // Ces sous-routeurs sont `Router<AppState>` ; on injecte l'état avec
-    // `with_state` pour obtenir un `Router<()>` montable par `axum::serve`.
     let mut app: Router = Router::new()
         .nest("/api", api)
         .merge(oauth::router())
         .merge(oauth::well_known_router())
-        // Sitemaps servis depuis Postgres (`/sitemap.xml` + `/sitemaps/{file}`),
-        // ADR 0064.
         .merge(sitemap::router())
+        .merge(robots::router())
+        .merge(annonces_feeds_router())
         .with_state(state.clone());
 
     // ── MCP (gated) ───────────────────────────────────────────────────────────
-    // `mcp_router` porte déjà son état et ses chemins absolus `/mcp/` + `/mcp`.
     if enable_mcp {
         app = app.merge(mcp::mcp_router(state.clone()));
     }
 
-    // ── IndexNow (ADR 0044) ───────────────────────────────────────────────────
-    // Le protocole exige la clé à `https://<host>/<clé>.txt` : sans elle, les
-    // soumissions nocturnes de `lj-ingest indexnow` sont rejetées par les
-    // moteurs. Clé publique par protocole, lue des `Settings` (même patron que
-    // le challenge OpenAI).
+    // ── IndexNow ──────────────────────────────────────────────────────────────
+    // Le protocole exige la clé servie à `https://<host>/<clé>.txt`.
     if let Some(key) = state.settings.indexnow_key.clone() {
         let path = format!("/{key}.txt");
         app = app.route(&path, get(move || std::future::ready(key.clone())));
@@ -155,20 +120,11 @@ fn assemble_routes(state: AppState, enable_mcp: bool) -> Router {
 /// Empile le middleware commun (CORS, compression, trace OTel) sur un routeur
 /// assemblé.
 ///
-/// L'ordre `.layer` est appliqué de l'extérieur vers l'intérieur : on empile la
-/// trace OTel (la plus externe : voit toutes les requêtes) puis compression puis
-/// CORS, ce qui reproduit l'ordre Python (CORS le plus externe côté Starlette,
-/// mais l'effet observable — gzip + en-têtes CORS — est identique).
-///
-/// `OtelAxumLayer` ouvre un span serveur par requête, nommé
-/// `{http.method} {http.route}` et portant les champs semconv OTel
-/// (`http.route`, `http.request.method`, `http.response.status_code`) que le
-/// cockpit Grafana filtre côté Tempo. `OtelInResponseLayer` (plus interne)
-/// réinjecte le `traceparent` dans la réponse.
+/// L'ordre `.layer` s'applique de l'extérieur vers l'intérieur : trace OTel la
+/// plus externe, puis compression, puis CORS.
 fn apply_layers(app: Router, cors: CorsLayer) -> Router {
-    // `pg_error_boundary` est la couche la PLUS INTERNE (premier `.layer`) : elle
-    // doit réécrire l'erreur PG marquée par le handler avant que CORS/gzip/OTel ne
-    // la voient, pour qu'ils s'appliquent au 422 final.
+    // Couche la plus interne : réécrit l'erreur PG marquée par le handler avant que
+    // CORS, gzip et OTel ne la voient.
     app.layer(middleware::from_fn(pg_error_boundary))
         .layer(cors)
         .layer(CompressionLayer::new())
@@ -177,11 +133,10 @@ fn apply_layers(app: Router, cors: CorsLayer) -> Router {
 }
 
 /// Frontière HTTP qui reclasse en 422 les erreurs Postgres marquées par
-/// [`ApiError::into_response`] (extension [`crate::error::PgErrKind`]) — parité des
-/// deux `@app.exception_handler` de `main.py` (`psycopg.DataError` → 422
-/// `invalid_request_bytes` ; `InternalError_` + `_PARADEDB_PARSE_ERR_RE` → 422
-/// `invalid_query_syntax`). Le `path`/`q`, indisponibles au moment du rendu de
-/// l'erreur, sont réinjectés ici depuis la requête entrante.
+/// [`ApiError::into_response`] (extension [`crate::error::PgErrKind`]) : class 22
+/// → 422 `invalid_request_bytes` ; message de syntaxe `paradedb.parse` → 422
+/// `invalid_query_syntax`. Le `path`/`q` sont réinjectés ici depuis la requête
+/// entrante.
 async fn pg_error_boundary(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let raw_query = req.uri().query().unwrap_or("").to_string();
@@ -210,27 +165,20 @@ async fn pg_error_boundary(req: Request, next: Next) -> Response {
 }
 
 /// Construit le routeur API (routes + middleware CORS/compression/OTel) sans
-/// fallback racine. Destiné au serveur fusionné de l'ADR 0061, qui pose son
-/// propre catch-all (handler de fichiers Leptos).
+/// fallback racine.
 pub fn build_router(state: AppState, enable_mcp: bool) -> Router {
     let cors = cors_layer(&state.settings.cors_origins);
     apply_layers(assemble_routes(state, enable_mcp), cors)
 }
 
-/// Construit l'app axum complète (routes search/decisions/auth/mcp + fallback de
-/// redirection trailing-slash + middleware CORS, access-log, cache headers).
-/// `enable_mcp` monte l'endpoint MCP.
+/// Construit l'app axum complète : routes, fallback de redirection
+/// trailing-slash et middleware. `enable_mcp` monte l'endpoint MCP.
 pub fn create_app(state: AppState, enable_mcp: bool) -> Router {
     let cors = cors_layer(&state.settings.cors_origins);
-    // Fallback racine : redirection trailing-slash 307 (parité Starlette
-    // `redirect_slashes=True`) ; 404 sinon. Posé avant les couches.
     let app = assemble_routes(state, enable_mcp).fallback(redirect::slash_redirect_fallback);
     apply_layers(app, cors)
 }
 
-/// Couche CORS — allowlist explicite (parité `CORSMiddleware`, ADR 0038).
-///
-/// `allow_credentials=False`, méthodes `GET/POST/PUT/PATCH/DELETE`, tous headers.
 fn cors_layer(origins: &[String]) -> CorsLayer {
     let parsed: Vec<HeaderValue> = origins
         .iter()
@@ -248,7 +196,6 @@ fn cors_layer(origins: &[String]) -> CorsLayer {
         .allow_headers(Any)
 }
 
-/// Pose le header `Cache-Control` sur une réponse JSON (parité `public_cache`).
 fn with_cache<T: serde::Serialize>(policy: CachePolicy, body: T) -> Response {
     let mut resp = Json(body).into_response();
     if let Ok(value) = HeaderValue::from_str(&policy.header_value()) {
@@ -266,13 +213,129 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+/// Requête sentinelle de la sonde profonde : large et intemporelle, son `total`
+/// ne peut tomber à zéro que si la recherche est cassée.
+const DEEP_PROBE_QUERY: &str = "responsabilité de l'État";
+
+/// Égalité de deux secrets sans sortie anticipée. La longueur, comparée d'abord,
+/// n'est pas protégée.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[tracing::instrument(name = "health_deep", skip_all, fields(
+    librejustice.probe.outcome = tracing::field::Empty,
+    librejustice.probe.total = tracing::field::Empty,
+    librejustice.probe.elapsed_ms = tracing::field::Empty,
+))]
+async fn health_deep(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(token) = state.settings.deep_probe_token.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(presented) = presented else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if !secret_eq(presented, token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let req = SearchRequest {
+        query: DEEP_PROBE_QUERY.to_string(),
+        jurisdiction_type: None,
+        solution: None,
+        procedure: None,
+        office: None,
+        legal_domain: None,
+        jurisdiction_code: None,
+        chamber: None,
+        legal_instrument: None,
+        legal_article: None,
+        publication: None,
+        significance: None,
+        date_from: None,
+        date_to: None,
+        mode: SearchMode::Auto,
+        sort: SortOrder::Relevance,
+        limit: 1,
+        offset: 0,
+        ai_mode: false,
+    };
+    let started = std::time::Instant::now();
+    let outcome = search::search_nocache(&state, &req).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let span = tracing::Span::current();
+    span.record("librejustice.probe.elapsed_ms", elapsed_ms);
+
+    let (status, state_label) = match &outcome {
+        Ok(resp) => {
+            span.record("librejustice.probe.total", resp.total);
+            if resp.total > 0 {
+                (StatusCode::OK, "ok")
+            } else {
+                (StatusCode::SERVICE_UNAVAILABLE, "empty")
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "sonde profonde : recherche en échec");
+            (StatusCode::SERVICE_UNAVAILABLE, "error")
+        }
+    };
+    span.record("librejustice.probe.outcome", state_label);
+    (
+        status,
+        Json(serde_json::json!({
+            "status": state_label,
+            "total": outcome.map(|r| r.total).unwrap_or(0),
+            "elapsed_ms": elapsed_ms,
+            "version": state.settings.version,
+        })),
+    )
+        .into_response()
+}
+
+// ── Sonde d'hydratation ─────────────────────────────────────────────────────
+
+/// Corps de la balise de la sonde d'hydratation.
+#[derive(Deserialize)]
+struct HydrationFailure {
+    path: String,
+    assets: Vec<String>,
+    elapsed_ms: u64,
+}
+
+/// Consigne une hydratation absente côté client, signalée par la page elle-même.
+async fn client_hydration_failure(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HydrationFailure>,
+) -> StatusCode {
+    let budget_key = crate::ratelimit::caller_key(None, &headers);
+    if state.hydration_budget.take(budget_key.as_ref()).await
+        == crate::ratelimit::Verdict::Exhausted
+    {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    tracing::warn!(
+        librejustice.hydration.path = %body.path,
+        librejustice.hydration.assets = %body.assets.join(","),
+        librejustice.hydration.elapsed_ms = body.elapsed_ms,
+        "hydratation absente côté client",
+    );
+    StatusCode::NO_CONTENT
+}
+
 // ── Search ──────────────────────────────────────────────────────────────────
 
-/// Paramètres de la query `/api/search`, alias camelCase (parité `Query(alias=…)`).
+/// Paramètres de la query `/api/search`, alias camelCase.
 ///
-/// Construits depuis la query string brute (les listes répétées
-/// `?jurisdictionType=A&jurisdictionType=B` ne sont pas gérées par
-/// `serde_urlencoded`), puis convertis en [`SearchRequest`].
+/// Construits depuis la query string brute (`serde_urlencoded` ne gère pas les
+/// listes répétées `?jurisdictionType=A&jurisdictionType=B`), puis convertis en
+/// [`SearchRequest`].
 #[derive(Debug)]
 struct SearchParams {
     q: Option<String>,
@@ -298,7 +361,6 @@ struct SearchParams {
 
 impl Default for SearchParams {
     fn default() -> Self {
-        // Défauts Pydantic : mode=auto, sort=relevance, limit=20, offset=0.
         Self {
             q: None,
             jurisdiction_type: Vec::new(),
@@ -326,22 +388,21 @@ impl Default for SearchParams {
 async fn search_endpoint(
     State(state): State<AppState>,
     OptionalUser(user_id): OptionalUser,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Result<Response> {
     let raw = raw.as_deref().unwrap_or("");
     let req = parse_search_query(raw)?;
     validate_referential_filters(&state, &req).await?;
     let context = parse_search_context(raw);
+    let budget_key = crate::ratelimit::caller_key(user_id.as_deref(), &headers);
     let result = search::search(
         &state,
         &req,
-        ActivitySource::Web,
-        user_id.is_some(),
-        context,
+        usage::Caller::web(user_id.is_some(), context, &headers),
+        budget_key.as_ref(),
     )
     .await?;
-    // Historique : recherches posées par l'utilisateur seulement — un fetch
-    // `teaser` (pont croisé) n'est pas une intention de recherche (ADR 0251).
     if context == lj_dtos::SearchContext::User {
         if let Some(user) = user_id.as_deref() {
             search_history::record_search(
@@ -370,8 +431,7 @@ fn parse_search_context(raw: &str) -> lj_dtos::SearchContext {
 }
 
 /// Parse la query string `/api/search` → [`SearchRequest`], avec les bornes
-/// Pydantic (`q` min/max, `limit` 1–50, `offset` 0–99). Erreur 400 sur entrée
-/// invalide (parité `422` Python — la frontière de validation).
+/// (`q` min/max, `limit` 1–50, `offset` 0–99). Erreur 400 sur entrée invalide.
 fn parse_search_query(raw: &str) -> Result<SearchRequest> {
     let mut p = SearchParams {
         mode: SearchMode::Auto,
@@ -441,12 +501,10 @@ fn parse_search_query(raw: &str) -> Result<SearchRequest> {
                 })?
             }
             "aiMode" => p.ai_mode = matches!(value.as_str(), "1" | "true" | "yes" | "on"),
-            _ => {} // no_cache & inconnus : ignorés (parité extra="ignore").
+            _ => {}
         }
     }
 
-    // `q` est `Query(..., min_length=1, max_length=512)` côté FastAPI : absent →
-    // `missing`, vide → `string_too_short`, trop long → `string_too_long`.
     let Some(query) = p.q else {
         return Err(ApiError::Unprocessable(validation::missing(&[
             "query", "q",
@@ -488,9 +546,6 @@ fn parse_search_query(raw: &str) -> Result<SearchRequest> {
             99,
         )));
     }
-    // `dateFrom`/`dateTo` sont `Optional[date]` bornés côté FastAPI : Pydantic
-    // valide format + plage AVANT le SQL. Sans ce garde, une date malformée
-    // partait en `::date` cast → 500. Validée à la frontière → 422.
     validate_date_param("dateFrom", &p.date_from)?;
     validate_date_param("dateTo", &p.date_to)?;
 
@@ -518,9 +573,8 @@ fn parse_search_query(raw: &str) -> Result<SearchRequest> {
 }
 
 /// Valide les axes à vocabulaire référentiel (`chamber`, `publication`,
-/// `jurisdictionCode`) — la frontière pure ([`parse_search_query`]) ne connaît
-/// pas le référentiel. Token inconnu → 422, jamais un filtre qui matche
-/// silencieusement zéro (même garantie que le flux MCP).
+/// `jurisdictionCode`) — la frontière pure ([`parse_search_query`]) ne connaît pas
+/// le référentiel. Token inconnu → 422.
 async fn validate_referential_filters(state: &AppState, req: &SearchRequest) -> Result<()> {
     if req.chamber.is_none() && req.publication.is_none() && req.jurisdiction_code.is_none() {
         return Ok(());
@@ -554,9 +608,8 @@ async fn validate_referential_filters(state: &AppState, req: &SearchRequest) -> 
     Ok(())
 }
 
-/// Valide une date `dateFrom`/`dateTo` à la frontière HTTP (parité du champ
-/// `Optional[date]` borné de l'oracle) : 422 byte-identique à la
-/// `RequestValidationError` sur format/plage invalide.
+/// Valide une date `dateFrom`/`dateTo` à la frontière HTTP : 422 sur
+/// format/plage invalide.
 fn validate_date_param(field: &str, raw: &Option<String>) -> Result<()> {
     let Some(s) = raw else { return Ok(()) };
     match search::parse_search_date(s) {
@@ -587,9 +640,8 @@ fn de_enum<T: serde::de::DeserializeOwned>(value: &str) -> Option<T> {
     serde_json::from_value(serde_json::Value::String(value.to_string())).ok()
 }
 
-/// Désérialise un token d'axe enum de `/api/search` ; token inconnu → 422
-/// `enum` listant les variantes valides (même frontière que `mode`/`sort` —
-/// un filtre invalide ne s'ignore jamais en silence, règle #12).
+/// Désérialise un token d'axe enum de `/api/search` ; token inconnu → 422 `enum`
+/// listant les variantes valides.
 fn de_enum_strict<T: serde::de::DeserializeOwned + serde::Serialize>(
     field: &str,
     value: &str,
@@ -609,7 +661,6 @@ fn de_enum_strict<T: serde::de::DeserializeOwned + serde::Serialize>(
 }
 
 /// Parse une query string `a=1&b=2` en paires décodées (`+`→espace, `%XX`).
-/// Dependency-free (pas de `form_urlencoded` en dép directe de `lj-api`).
 fn parse_qs(raw: &str) -> Vec<(String, String)> {
     raw.split('&')
         .filter(|s| !s.is_empty())
@@ -661,7 +712,6 @@ async fn decision(
     Ok(with_cache(CACHE_DECISION, result))
 }
 
-/// Prévisualisation légère (hover card, ADR 0168).
 async fn decision_preview(
     State(state): State<AppState>,
     Path(decision_id): Path<String>,
@@ -670,7 +720,7 @@ async fn decision_preview(
     Ok(with_cache(CACHE_DECISION, result))
 }
 
-/// Encart « Parties » d'une décision (ADR 0189). Décision inconnue → 404.
+/// Encart « Parties » d'une décision. Décision inconnue → 404.
 async fn decision_parties(
     State(state): State<AppState>,
     Path(decision_id): Path<String>,
@@ -679,7 +729,7 @@ async fn decision_parties(
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-// ── Fiche entité (`/api/entity/*`, ADR 0189) ──────────────────────────────────
+// ── Fiche entité (`/api/entity/*`) ───────────────────────────────────────────
 
 async fn entity_page(
     State(state): State<AppState>,
@@ -689,8 +739,8 @@ async fn entity_page(
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Volet registre d'une entité (ADR 0199) — APIs publiques à l'affichage,
-/// sections absentes si l'amont est indisponible (jamais de 5xx).
+/// Volet registre d'une entité — APIs publiques à l'affichage, sections absentes
+/// si l'amont est indisponible (jamais de 5xx).
 async fn entity_registre(
     State(state): State<AppState>,
     Path((ns, id)): Path<(String, String)>,
@@ -751,10 +801,10 @@ async fn entity_decisions(
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-// ── Annuaire des entités (`/api/entities/*`, ADR 0192) ─────────────────────────
+// ── Annuaire des entités (`/api/entities/*`) ─────────────────────────────────
 
-/// Slugs de catégorie acceptés par `kind` (message d'erreur 422 des params
-/// invalides), alignés sur la route web `/annuaire/{kind}`.
+/// Slugs de catégorie acceptés par `kind`, alignés sur la route web
+/// `/annuaire/{kind}`.
 const ENTITY_KINDS: &[&str] = &[
     "entreprises",
     "personnes-publiques",
@@ -899,9 +949,6 @@ async fn entities_directory(
             100,
         )));
     }
-    // Profondeur bornée (ADR 0239) : l'OFFSET profond sur un registre de
-    // millions de lignes ne sert personne — la recherche par préfixe couvre
-    // l'accès à la traîne.
     if p.page.saturating_mul(p.page_size) > entities::ENTITY_DIRECTORY_MAX_DEPTH {
         return Err(ApiError::Unprocessable(validation::less_than_equal(
             &["query", "page"],
@@ -922,8 +969,6 @@ async fn entities_stats(State(state): State<AppState>) -> Result<Response> {
 
 #[derive(Debug, Deserialize)]
 struct SimilarQuery {
-    // Capturé en brut : un `limit` non entier (`abc`) doit donner 422 (parité
-    // FastAPI `Query(int)`), pas le rejet 400 de l'extracteur `Query<u32>`.
     limit: Option<String>,
 }
 
@@ -952,15 +997,11 @@ async fn decision_similar(
             12,
         )));
     }
-    let hits = decisions::similar_decisions(&state, &decision_id, limit).await?;
-    let body = SimilarDecisionsResponse { decision_id, hits };
+    let body = decisions::similar_decisions(&state, &decision_id, limit).await?;
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Nom de fichier d'export (parité `_decision_filename`).
 fn decision_filename(detail: &lj_dtos::DecisionDetail) -> String {
-    // Parité Python (`result.jurisdiction_name or result.jurisdiction_type`) :
-    // le fallback est le code brut du type (« TA », « CE »…), pas un libellé.
     let raw = detail.jurisdiction_name.clone().unwrap_or_else(|| {
         serde_json::to_value(detail.jurisdiction_type)
             .ok()
@@ -1014,29 +1055,10 @@ fn decision_filename(detail: &lj_dtos::DecisionDetail) -> String {
     if parts.is_empty() {
         format!("decision-{}", detail.id)
     } else {
-        // Les n° RG judiciaires contiennent un `/` (« 25/01119 ») — interdit
-        // dans un nom de fichier.
+        // Les n° RG judiciaires contiennent un `/` (« 25/01119 »), interdit dans un nom
+        // de fichier.
         parts.join(" ").replace('/', "_")
     }
-}
-
-async fn decision_download_docx(
-    State(state): State<AppState>,
-    Path(decision_id): Path<String>,
-) -> Result<Response> {
-    let result = decisions::get_decision(&state, &decision_id).await?;
-    let filename = decision_filename(&result);
-    // Rendu DOCX (docx-rs + packing ZIP) = CPU-bloquant → offload sur le pool
-    // blocking, hors de l'unique thread async (runtime `current_thread`, ADR
-    // 0061), comme le parse de `get_decision` et le highlight de search.rs.
-    let content = tokio::task::spawn_blocking(move || docx_export::build_decision_docx(&result))
-        .await
-        .map_err(|e| ApiError::Internal(format!("docx render task: {e}")))?;
-    Ok(attachment_response(
-        content,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        &format!("attachment; filename=\"{filename}.docx\""),
-    ))
 }
 
 async fn decision_download_pdf(
@@ -1045,8 +1067,6 @@ async fn decision_download_pdf(
 ) -> Result<Response> {
     let result = decisions::get_decision(&state, &decision_id).await?;
     let filename = decision_filename(&result);
-    // Rendu PDF = CPU-bloquant (poste le plus lourd) → offload sur le pool
-    // blocking, hors de l'unique thread async (runtime `current_thread`, ADR 0061).
     let content = tokio::task::spawn_blocking(move || pdf_export::build_decision_pdf(&result))
         .await
         .map_err(|e| ApiError::Internal(format!("pdf render task: {e}")))?;
@@ -1057,8 +1077,6 @@ async fn decision_download_pdf(
     ))
 }
 
-/// Réponse binaire avec `Content-Type`, `Content-Disposition` et `Cache-Control`
-/// décision (les téléchargements portent `CACHE_DECISION`, parité Python).
 fn attachment_response(content: Vec<u8>, content_type: &str, disposition: &str) -> Response {
     let mut resp = (StatusCode::OK, content).into_response();
     let headers = resp.headers_mut();
@@ -1074,27 +1092,23 @@ fn attachment_response(content: Vec<u8>, content_type: &str, disposition: &str) 
     resp
 }
 
-// ── Référentiel LEGI (`/api/texte/*`, ADR 0092) ─────────────────────────────────
+// ── Référentiel LEGI (`/api/texte/*`) ───────────────────────────────────────
 
 /// Sous-routeur LEGI monté sous `/api/texte`. Les sous-ressources littérales
-/// `citing`/`related` sont déclarées avant la capture `{date}` ; matchit
-/// (axum 0.8) privilégie le segment statique sur le paramètre, sans collision.
+/// `citing`/`related` sont déclarées avant la capture `{date}` : matchit privilégie
+/// le segment statique sur le paramètre.
 fn legi_router() -> Router<AppState> {
     Router::new()
         .route("/{code}", get(legi_code_summary))
-        // Table des matières (`/texte/{code}/sommaire`) : le segment littéral
-        // `sommaire` est privilégié par matchit (axum 0.8) sur la capture
-        // `{num}`, sans collision.
         .route("/{code}/sommaire", get(legi_code_toc))
-        // Vue-lecture d'une section (`/texte/{code}/section/{cid}`, ADR 0207) :
-        // segment littéral `section` privilégié sur la capture `{num}`.
         .route("/{code}/section/{cid}", get(legi_section_reading))
+        .route("/{code}/section/{cid}/citing", get(legi_section_citing))
         .route("/{code}/{num}", get(legi_article_in_force))
         .route("/{code}/{num}/citing", get(legi_article_citing))
         .route("/{code}/{num}/related", get(legi_article_related))
         .route("/{code}/{num}/{date}", get(legi_article_at_date))
-        // Comparateur de versions (ADR 0193) : bornes = dates ISO de fenêtre de
-        // version (`initiale` = borne ouverte).
+        // Bornes du comparateur : dates ISO de fenêtre de version, `initiale` = borne
+        // ouverte.
         .route("/{code}/{num}/compare/{de}/{a}", get(legi_article_compare))
 }
 
@@ -1162,7 +1176,17 @@ async fn legi_article_citing(
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Articles co-cités (« souvent cité avec », plan graphe Phase D).
+async fn legi_section_citing(
+    State(state): State<AppState>,
+    Path((code, cid)): Path<(String, String)>,
+    Query(p): Query<LegiCitingQuery>,
+) -> Result<Response> {
+    p.validate()?;
+    let body =
+        legi::section_citing(&state, &code, &cid, p.date.as_deref(), p.limit, p.offset).await?;
+    Ok(with_cache(CACHE_DECISION, body))
+}
+
 async fn legi_article_related(
     State(state): State<AppState>,
     Path((code, num)): Path<(String, String)>,
@@ -1171,8 +1195,8 @@ async fn legi_article_related(
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Date de consultation Chronolégi (`?date=YYYY-MM-DD`, ADR 0193 §5) des
-/// sommaires/sections ; absente = en vigueur aujourd'hui.
+/// Date de consultation Chronolégi (`?date=YYYY-MM-DD`) des sommaires/sections ;
+/// absente = en vigueur aujourd'hui.
 #[derive(Debug, Deserialize)]
 struct LegiDateQuery {
     #[serde(default)]
@@ -1180,9 +1204,9 @@ struct LegiDateQuery {
 }
 
 /// Pagination des décisions citantes (`limit` 1–100, `offset` ≥ 0, fenêtre
-/// `offset + limit ≤ 100` — cap dur ADR 0250 : au-delà de 100 citantes on
-/// affine par la recherche, on ne pagine pas) + `date` de la version servie
-/// (ISO `YYYY-MM-DD`, absente = en vigueur) qui borne les citantes.
+/// `offset + limit ≤ 100`) + `date` de la version servie (ISO `YYYY-MM-DD`,
+/// absente = en vigueur) qui borne les citantes. Sur une division, `date` choisit
+/// la composition du sous-arbre agrégé.
 #[derive(Debug, Deserialize)]
 struct LegiCitingQuery {
     #[serde(default = "default_citing_limit")]
@@ -1229,14 +1253,13 @@ impl LegiCitingQuery {
     }
 }
 
-/// Recherche plein-texte d'articles (`GET /api/search-textes`, ADR 0114). `q`
-/// vide ⇒ 422 `string_too_short`, même frontière de validation que
-/// `/api/search` (le front gate déjà la requête vide, aucun appel n'arrive
-/// ici avec `q` vide). Mêmes bornes `limit`/`offset` que les décisions
-/// citantes. `code` optionnel borne la recherche à un texte.
+/// Recherche plein-texte d'articles (`GET /api/search-textes`). `q` vide ⇒ 422
+/// `string_too_short`. Mêmes bornes `limit`/`offset` que les décisions citantes ;
+/// `code` optionnel borne la recherche à un texte.
 async fn search_textes_endpoint(
     State(state): State<AppState>,
     OptionalUser(user_id): OptionalUser,
+    headers: HeaderMap,
     Query(p): Query<ArticleSearchQuery>,
 ) -> Result<Response> {
     p.validate()?;
@@ -1247,6 +1270,12 @@ async fn search_textes_endpoint(
             1,
         )));
     }
+    let context = if p.context.as_deref() == Some("teaser") {
+        lj_dtos::SearchContext::Teaser
+    } else {
+        lj_dtos::SearchContext::User
+    };
+    let at = p.date.as_deref().map(parse_legi_date).transpose()?;
     let body = legi::search_textes(
         &state,
         &p.q,
@@ -1255,34 +1284,35 @@ async fn search_textes_endpoint(
         p.nature.as_deref(),
         p.source.as_deref(),
         p.scope.as_deref(),
+        at,
         p.limit,
         p.offset,
+        usage::Caller::web(user_id.is_some(), context, &headers),
     )
     .await?;
-    // Historique (ADR 0251, connectés seulement — même règle que /search ;
-    // un fetch `teaser` n'est pas une intention de recherche).
-    // Clés de filtres alignées sur l'URL de la page (`origine`, pas `source`).
     if let Some(user) = user_id
         .as_deref()
         .filter(|_| p.context.as_deref() != Some("teaser"))
     {
-        let mut filters = serde_json::Map::new();
-        for (key, value) in [
-            ("code", &p.code),
-            ("jurisdiction", &p.jurisdiction),
-            ("nature", &p.nature),
-            ("origine", &p.source),
-            ("scope", &p.scope),
-        ] {
-            if let Some(v) = value {
-                filters.insert(key.to_string(), serde_json::Value::String(v.clone()));
-            }
+        let mut filters = legi::textes_filters(
+            p.code.as_deref(),
+            p.jurisdiction.as_deref(),
+            p.nature.as_deref(),
+            p.source.as_deref(),
+            p.scope.as_deref(),
+            at,
+        );
+        if let (Some(obj), Some(page)) = (
+            filters.as_object_mut(),
+            search_history::page_number(p.offset, p.limit),
+        ) {
+            obj.insert("page".to_string(), page.into());
         }
         search_history::record_search(
             &state.pool,
             user,
             p.q.trim(),
-            serde_json::Value::Object(filters),
+            filters,
             ActivitySource::Web,
             lj_dtos::SearchEngine::Textes,
         )
@@ -1291,16 +1321,223 @@ async fn search_textes_endpoint(
     Ok(with_cache(CACHE_SEARCH, body))
 }
 
+// ── Annonces ────────────────────────────────────────────────────────────────
+
+const ANNONCES_MAX_LIMIT: u32 = 100;
+const ANNONCES_MAX_OFFSET: u32 = 5_000;
+
+/// Parse la query string du moteur d'annonces (`/api/annonces` et les flux) —
+/// mêmes clés que l'URL de la page, listes en paramètres répétés
+/// (`?departement=75&departement=92`). Seuls les jetons de `fond` connus passent.
+fn parse_annonces_query(raw: &str) -> Result<lj_dtos::AnnonceSearchRequest> {
+    let mut req = lj_dtos::AnnonceSearchRequest::default();
+    for (key, value) in parse_qs(raw) {
+        match key.as_str() {
+            "q" => req.q = Some(value),
+            "fond" => req.fond.push(value),
+            "departement" => req.departement.push(value.to_uppercase()),
+            // L'égalité ODSQL des fonds proxy est sensible à la casse : la valeur passe
+            // telle quelle.
+            "famille" => req.famille.push(value),
+            "cpv" => req.cpv.push(value),
+            "echeanceJours" => {
+                req.echeance_jours = Some(value.parse().map_err(|_| {
+                    ApiError::Unprocessable(validation::int_parsing(
+                        &["query", "echeanceJours"],
+                        &value,
+                    ))
+                })?)
+            }
+            "closes" => req.closes = matches!(value.as_str(), "1" | "true" | "yes" | "on"),
+            "sort" => {
+                req.sort = de_enum::<lj_dtos::AnnonceSort>(&value).ok_or_else(|| {
+                    ApiError::Unprocessable(validation::enum_error(
+                        &["query", "sort"],
+                        &value,
+                        &["echeance", "publication", "nouveautes"],
+                    ))
+                })?
+            }
+            "limit" => {
+                req.limit = value.parse().map_err(|_| {
+                    ApiError::Unprocessable(validation::int_parsing(&["query", "limit"], &value))
+                })?
+            }
+            "offset" => {
+                req.offset = value.parse().map_err(|_| {
+                    ApiError::Unprocessable(validation::int_parsing(&["query", "offset"], &value))
+                })?
+            }
+            _ => {}
+        }
+    }
+    if let Some(inconnu) = req
+        .fond
+        .iter()
+        .find(|f| !annonces::FONDS.contains(&f.as_str()))
+    {
+        return Err(ApiError::Unprocessable(validation::enum_error(
+            &["query", "fond"],
+            inconnu,
+            &annonces::FONDS,
+        )));
+    }
+    if req.limit < 1 {
+        return Err(ApiError::Unprocessable(validation::greater_than_equal(
+            &["query", "limit"],
+            &req.limit.to_string(),
+            1,
+        )));
+    }
+    if req.limit > ANNONCES_MAX_LIMIT {
+        return Err(ApiError::Unprocessable(validation::less_than_equal(
+            &["query", "limit"],
+            &req.limit.to_string(),
+            i64::from(ANNONCES_MAX_LIMIT),
+        )));
+    }
+    if req.offset > ANNONCES_MAX_OFFSET {
+        return Err(ApiError::Unprocessable(validation::less_than_equal(
+            &["query", "offset"],
+            &req.offset.to_string(),
+            i64::from(ANNONCES_MAX_OFFSET),
+        )));
+    }
+    Ok(req)
+}
+
+/// Moteur facetté du pot Annonces (`GET /api/annonces`). Historique enregistré
+/// pour les connectés, moteur `annonces`.
+async fn annonces_endpoint(
+    State(state): State<AppState>,
+    OptionalUser(user_id): OptionalUser,
+    RawQuery(raw): RawQuery,
+) -> Result<Response> {
+    let req = parse_annonces_query(raw.as_deref().unwrap_or(""))?;
+    let body = annonces::search(&state, &req).await?;
+    if let Some(user) = user_id.as_deref() {
+        search_history::record_search(
+            &state.pool,
+            user,
+            req.q.as_deref().unwrap_or("").trim(),
+            annonces_filters(&req),
+            ActivitySource::Web,
+            lj_dtos::SearchEngine::Annonces,
+        )
+        .await;
+    }
+    Ok(with_cache(CACHE_SEARCH, body))
+}
+
+/// Filtres d'historique : le filtre entier moins la fenêtre, plus le numéro de
+/// page — mêmes clés que l'URL de `/annonces`.
+fn annonces_filters(req: &lj_dtos::AnnonceSearchRequest) -> serde_json::Value {
+    let mut value = serde_json::to_value(req).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("q");
+        obj.remove("limit");
+        obj.remove("offset");
+        if let Some(page) = search_history::page_number(i64::from(req.offset), i64::from(req.limit))
+        {
+            obj.insert("page".to_string(), page.into());
+        }
+    }
+    value
+}
+
+async fn annonces_catalogue(State(state): State<AppState>) -> Result<Response> {
+    let body = annonces::catalogue(&state).await?;
+    Ok(with_cache(CACHE_DECISION, body))
+}
+
+async fn annonce_detail(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+) -> Result<Response> {
+    let body = annonces::detail(&state, &uid).await?;
+    Ok(with_cache(CACHE_DECISION, body))
+}
+
+/// Flux d'alerte, montés à la racine : `/annonces.rss` (nouveautés) et
+/// `/annonces.ics` (échéances). Une alerte est un état de filtres — la même query
+/// string que la page, aucun compte.
+fn annonces_feeds_router() -> Router<AppState> {
+    Router::new()
+        .route("/annonces.rss", get(annonces_rss))
+        .route("/annonces.ics", get(annonces_ics))
+}
+
+/// Requête d'un flux : le filtre de la page, la fenêtre forcée au plafond du flux
+/// et l'ordre imposé par le média (nouveautés pour un lecteur, échéance pour un
+/// agenda).
+fn feed_request(raw: &str, sort: lj_dtos::AnnonceSort) -> Result<lj_dtos::AnnonceSearchRequest> {
+    let mut req = parse_annonces_query(raw)?;
+    req.sort = sort;
+    req.limit = annonces::FEED_MAX_ITEMS;
+    req.offset = 0;
+    req.closes = false;
+    Ok(req)
+}
+
+async fn annonces_rss(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Result<Response> {
+    let raw = raw.as_deref().unwrap_or("");
+    let req = feed_request(raw, lj_dtos::AnnonceSort::Nouveautes)?;
+    let hits = annonces::hits_flux(&state, &req).await?;
+    let base = state.settings.web_base_url.trim_end_matches('/');
+    let self_url = if raw.is_empty() {
+        format!("{base}/annonces.rss")
+    } else {
+        format!("{base}/annonces.rss?{raw}")
+    };
+    Ok(feed_response(
+        annonces::rss(&req, &hits, &self_url, base),
+        "application/rss+xml; charset=utf-8",
+    ))
+}
+
+async fn annonces_ics(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Result<Response> {
+    let mut req = feed_request(raw.as_deref().unwrap_or(""), lj_dtos::AnnonceSort::Echeance)?;
+    // Un agenda ne parle que des fonds qui ouvrent un délai.
+    if req.fond.is_empty() {
+        req.fond = annonces::FONDS
+            .iter()
+            .filter(|f| lj_dtos::annonce_fond_a_echeance(f))
+            .map(|f| (*f).to_string())
+            .collect();
+    } else {
+        req.fond.retain(|f| lj_dtos::annonce_fond_a_echeance(f));
+    }
+    let hits = annonces::hits_flux(&state, &req).await?;
+    let base = state.settings.web_base_url.trim_end_matches('/');
+    Ok(feed_response(
+        annonces::ics(&req, &hits, base),
+        "text/calendar; charset=utf-8",
+    ))
+}
+
+/// Réponse d'un flux : corps typé, cache CDN court et `noindex`.
+fn feed_response(body: String, content_type: &'static str) -> Response {
+    let mut resp = (StatusCode::OK, body).into_response();
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    if let Ok(v) = HeaderValue::from_str(&CACHE_SEARCH.header_value()) {
+        headers.insert(header::CACHE_CONTROL, v);
+    }
+    headers.insert(
+        header::HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static("noindex"),
+    );
+    resp
+}
+
 /// Query `/api/codes` : `scope=head` borne aux familles de tête (codes,
-/// constitutions) pour le SSR de `/codes` — la longue traîne se charge à part.
+/// constitutions).
 #[derive(Deserialize)]
 struct CodesCatalogueQuery {
     #[serde(default)]
     scope: Option<String>,
 }
 
-/// Catalogue des codes navigables (`GET /api/codes`). Réponse stable (le corpus
-/// de référentiel bouge à l'ingest), cache décision comme les pages `/texte`.
 async fn codes_catalogue(
     State(state): State<AppState>,
     Query(p): Query<CodesCatalogueQuery>,
@@ -1309,21 +1546,16 @@ async fn codes_catalogue(
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Compteurs globaux du corpus (`GET /api/corpus-stats`). Chiffres quasi
-/// immuables (bougent à l'ingest quotidien) → cache décision, 24 h CDN.
 async fn corpus_stats(State(state): State<AppState>) -> Result<Response> {
     let body = stats::corpus_stats(&state).await?;
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Catalogue des juridictions groupé par famille (`GET /api/juridictions`,
-/// ADR 0253). Réponse stable (ingest quotidien) → cache décision.
 async fn jurisdictions_catalogue(State(state): State<AppState>) -> Result<Response> {
     let body = jurisdiction_hubs::catalogue(&state).await?;
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Hub d'une juridiction : années couvertes (`GET /api/juridictions/{code}`).
 async fn jurisdiction_hub(
     State(state): State<AppState>,
     Path(code): Path<String>,
@@ -1339,8 +1571,6 @@ struct JurisdictionYearQuery {
     page: Option<u32>,
 }
 
-/// Page paginée des décisions d'une juridiction×année
-/// (`GET /api/juridictions/{code}/{annee}?page=N`).
 async fn jurisdiction_year(
     State(state): State<AppState>,
     Path((code, annee)): Path<(String, i32)>,
@@ -1350,21 +1580,16 @@ async fn jurisdiction_year(
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Catalogue des normes par fond (`GET /api/normes`, ADR 0255). Réponse
-/// stable (ingest quotidien) → cache décision.
 async fn normes_catalogue(State(state): State<AppState>) -> Result<Response> {
     let body = norm_hubs::catalogue(&state).await?;
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Hub d'un fond : années couvertes (`GET /api/normes/{fond}`).
 async fn norm_hub(State(state): State<AppState>, Path(fond): Path<String>) -> Result<Response> {
     let body = norm_hubs::hub(&state, &fond).await?;
     Ok(with_cache(CACHE_DECISION, body))
 }
 
-/// Page paginée des textes d'un fond×année
-/// (`GET /api/normes/{fond}/{annee}?page=N`, `annee` = année ou `sans-date`).
 async fn norm_year(
     State(state): State<AppState>,
     Path((fond, annee)): Path<(String, String)>,
@@ -1379,8 +1604,9 @@ async fn norm_year(
 }
 
 /// Query `/api/search-textes` : `q` (requête), `code` (slug optionnel), facettes
-/// `jurisdiction`/`nature`/`source` (filtres optionnels), `limit` 1–100,
-/// `offset` ≥ 0.
+/// `jurisdiction`/`nature`/`source`, `date` de consultation (ISO `YYYY-MM-DD` —
+/// versions valides à cette date, absente = en vigueur aujourd'hui), `limit`
+/// 1–100, `offset` ≥ 0.
 #[derive(Debug, Deserialize)]
 struct ArticleSearchQuery {
     #[serde(default)]
@@ -1395,8 +1621,10 @@ struct ArticleSearchQuery {
     source: Option<String>,
     #[serde(default)]
     scope: Option<String>,
-    /// `teaser` = fetch machine des ponts croisés (ADR 0251) — pas
-    /// d'historique. Absent ou autre valeur = recherche utilisateur.
+    #[serde(default)]
+    date: Option<String>,
+    /// `teaser` = fetch machine des ponts croisés : pas d'historique. Absent ou autre
+    /// valeur = recherche utilisateur.
     #[serde(default)]
     context: Option<String>,
     #[serde(default = "default_citing_limit")]
@@ -1431,9 +1659,8 @@ impl ArticleSearchQuery {
     }
 }
 
-/// Parse le segment `{date}` d'URL (ISO `YYYY-MM-DD`) — frontière de validation
-/// unique (#12). Format invalide → 422 à la frontière HTTP (jamais envoyé au cast
-/// `::date` du SQL).
+/// Parse le segment `{date}` d'URL (ISO `YYYY-MM-DD`). Format invalide → 422 à la
+/// frontière HTTP.
 fn parse_legi_date(raw: &str) -> Result<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
         ApiError::Unprocessable(validation::date_parsing(
@@ -1458,8 +1685,6 @@ async fn patch_me(
     RequiredUser(sub): RequiredUser,
     Json(body): Json<UserProfileUpdate>,
 ) -> Result<Response> {
-    // Bornes Pydantic `UserProfileUpdate.display_name` : min_length=1, max_length=80
-    // quand fourni (None = pas de changement). Hors bornes → 422.
     if let Some(name) = body.display_name.as_deref() {
         let n = name.chars().count() as u64;
         if n < 1 {
@@ -1539,8 +1764,8 @@ fn default_page_limit() -> i64 {
     50
 }
 impl PageQuery {
-    /// Bornes Pydantic `list_history`/`list_views` : `limit` 1–100, `offset` ≥ 0.
-    /// Hors bornes → 422 (et évite de passer un `offset` négatif au SQL → 500).
+    /// Bornes de `list_history`/`list_views` : `limit` 1–100, `offset` ≥ 0. Hors
+    /// bornes → 422.
     fn validate(&self) -> Result<()> {
         if self.limit < 1 {
             return Err(ApiError::Unprocessable(validation::greater_than_equal(
@@ -1582,8 +1807,6 @@ async fn delete_entry(
     RequiredUser(sub): RequiredUser,
     Path(entry_id): Path<String>,
 ) -> Result<StatusCode> {
-    // `{entry_id}` est `int` côté FastAPI : un id non entier → 422 (pas 400 du
-    // rejet d'extracteur axum `Path<i64>`). On parse à la main pour la parité.
     let entry_id: i64 = entry_id.parse().map_err(|_| {
         ApiError::Unprocessable(validation::int_parsing(&["path", "entry_id"], &entry_id))
     })?;
@@ -1642,9 +1865,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Spec (parité `test_search_crash_inputs.py` côté oracle) : une date
-    /// malformée ou hors plage est rejetée en 422 à la frontière HTTP — jamais
-    /// envoyée au `::date` cast (qui ferait un 500).
+    #[test]
+    fn secret_eq_compare_le_contenu_pas_le_prefixe() {
+        assert!(secret_eq("s3cret", "s3cret"));
+        assert!(!secret_eq("s3cret", "s3crft"));
+        assert!(!secret_eq("s3cret", "s3cretX"));
+        assert!(!secret_eq("s3cretX", "s3cret"));
+        assert!(!secret_eq("", "s3cret"));
+        assert!(secret_eq("", ""));
+    }
+
     #[test]
     fn search_query_rejects_malformed_date() {
         let err = parse_search_query("q=x&dateFrom=not-a-date").unwrap_err();
@@ -1680,13 +1910,8 @@ mod tests {
         assert_eq!(req.date_to.as_deref(), Some("2024-12-31"));
     }
 
-    /// Spec : un token inconnu sur un axe enum est rejeté en 422 avec les
-    /// variantes valides — jamais ignoré en silence (le filtre « oublié »
-    /// renverrait des résultats non filtrés que l'appelant croit filtrés).
     #[test]
     fn search_query_rejects_unknown_enum_token() {
-        // JAF est un token valide de l'axe `office`, pas de `procedure` : la
-        // confusion d'axe doit être corrigée à la frontière.
         let err = parse_search_query("q=x&procedure=JAF").unwrap_err();
         let ApiError::Unprocessable(obj) = err else {
             panic!("attendu Unprocessable, eu {err:?}");

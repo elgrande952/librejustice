@@ -1,8 +1,8 @@
-//! Traduction FR des erreurs d'auth Supabase (port pur de `lib/auth-errors.ts`).
-//! Module sans I/O ; la lecture/effacement du hash d'erreur passe par le shim JS
-//! `browser` (web-sys indisponible sans feature dans le crate fige).
+//! Traduction FR des erreurs d'auth Supabase.
+//! Module sans I/O ; la lecture et l'effacement du hash d'erreur passent par le
+//! shim JS `browser`.
 
-/// Codes d'erreur Supabase -> message FR (port verbatim de `CODE_MAP`).
+/// Codes d'erreur Supabase -> message FR.
 fn code_map(code: &str) -> Option<&'static str> {
     Some(match code {
         "invalid_credentials" => "Email ou mot de passe incorrect.",
@@ -31,9 +31,8 @@ fn code_map(code: &str) -> Option<&'static str> {
     })
 }
 
-/// Patterns de message -> code (port de `MESSAGE_PATTERNS`). Matching
-/// insensible a la casse via `contains` sur la forme minuscule (evite d'ajouter
-/// `regex` au bundle wasm — aucun de ces patterns n'a de structure variable).
+/// Patterns de message -> code. Matching insensible a la casse via `contains`
+/// sur la forme minuscule.
 fn match_message_pattern(msg_lower: &str) -> Option<&'static str> {
     if msg_lower.contains("password should contain") {
         Some("weak_password")
@@ -48,8 +47,7 @@ fn match_message_pattern(msg_lower: &str) -> Option<&'static str> {
     }
 }
 
-/// Extrait un message FR de rate-limit `after N seconds` (port de
-/// `rateLimitMessage` / `SECONDS_RE`).
+/// Extrait un message FR de rate-limit `after N seconds`.
 fn rate_limit_message(msg: &str) -> Option<String> {
     let lower = msg.to_lowercase();
     let idx = lower.find("after ")?;
@@ -68,8 +66,7 @@ fn rate_limit_message(msg: &str) -> Option<String> {
     ))
 }
 
-/// Traduit une erreur d'auth (code + message bruts) en message FR. Port fidele
-/// de `translateAuthError`.
+/// Traduit une erreur d'auth (code + message bruts) en message FR.
 pub(crate) fn translate_auth_error(code: Option<&str>, message: &str) -> String {
     if code.is_none() && message.is_empty() {
         return "Erreur inconnue.".to_string();
@@ -101,15 +98,14 @@ pub(crate) fn translate_auth_error(code: Option<&str>, message: &str) -> String 
     }
 }
 
-/// Erreur portee par le hash de redirection Supabase (port de `AuthHashError`).
+/// Erreur portee par le hash de redirection Supabase.
 pub(crate) struct AuthHashError {
     pub code: String,
     pub message: String,
 }
 
-/// Parse `#error=…&error_code=…&error_description=…` d'un hash brut. Port de
-/// `readAuthHashError` (la lecture du hash DOM est faite par l'appelant via le
-/// shim JS — ici on travaille sur la chaine brute, testable purement).
+/// Parse `#error=…&error_code=…&error_description=…` d'un hash brut. La lecture
+/// du hash DOM est faite par l'appelant ; ici on travaille sur la chaine brute.
 pub(crate) fn parse_auth_hash_error(hash: &str) -> Option<AuthHashError> {
     if !hash.contains("error") {
         return None;

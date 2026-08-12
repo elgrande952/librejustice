@@ -1,8 +1,8 @@
-//! Barre de décision sticky : contexte partagé (port de `DecisionBarProvider` /
-//! `useDecisionBar`) + passage d'état recherche→décision.
+//! Barre de décision sticky : contexte partagé + passage d'état
+//! recherche→décision.
 //!
-//! `leptos_router` n'a pas d'équivalent riche à `location.state` (React Router).
-//! On le remplace par deux contextes réactifs fournis au shell :
+//! `leptos_router` n'a pas d'équivalent riche à `location.state`. On le
+//! remplace par deux contextes réactifs fournis au shell :
 //! - `DecisionBarSignal` : ce que la `TopBar` affiche (titre, nav, retour).
 //! - `ResultNavSignal` : « graine » posée au clic par une carte résultat / une
 //!   voisine / le widget prev-next, lue UNE fois par `DecisionHeader` au montage
@@ -10,11 +10,11 @@
 //!   sans graine (activité, lien direct) ne réutilise pas une nav obsolète.
 
 use leptos::prelude::*;
+use serde::{Deserialize, Serialize};
 
 /// Origine « recherche » d'une consultation : permet au bouton retour de revenir
-/// à la liste exacte (query string) et de restaurer le scroll. Port de
-/// `fromSearch` (`{pathname:"/decisions", search, scrollY}` ; pathname implicite).
-#[derive(Clone, Debug, PartialEq)]
+/// à la liste exacte (query string) et de restaurer le scroll.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FromSearch {
     /// Query string complète (`?q=…&page=…`), telle quelle.
     pub search: String,
@@ -22,16 +22,16 @@ pub struct FromSearch {
     pub scroll_y: f64,
 }
 
-/// Navigation inter-résultats. Port de `DecisionNavState` : `position`/`total`
-/// pour l'affichage, `hit_ids` pour dériver précédent/suivant à l'`id` courant.
-#[derive(Clone, Debug, PartialEq)]
+/// Navigation inter-résultats : `position`/`total` pour l'affichage, `hit_ids`
+/// pour dériver précédent/suivant à l'`id` courant.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResultNav {
     pub position: i64,
     pub total: i64,
     pub hit_ids: Vec<String>,
 }
 
-/// État affiché par la barre sticky. Port de `DecisionBarState`.
+/// État affiché par la barre sticky.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecisionBarState {
     pub title: String,
@@ -40,9 +40,8 @@ pub struct DecisionBarState {
     pub from_search: Option<FromSearch>,
 }
 
-/// Graine posée au clic, consommée par `DecisionHeader`. Port du `state` passé à
-/// `navigate(...)` (resultNav + fromSearch).
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Graine posée au clic, consommée par `DecisionHeader`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResultNavSeed {
     pub nav: Option<ResultNav>,
     pub from_search: Option<FromSearch>,
@@ -51,11 +50,10 @@ pub struct ResultNavSeed {
 pub type DecisionBarSignal = RwSignal<Option<DecisionBarState>>;
 pub type ResultNavSignal = RwSignal<Option<ResultNavSeed>>;
 /// Graines consommées, par id de décision. Filet du back/forward navigateur :
-/// décision → article de loi → retour arrière remonte la page SANS graine (le
-/// one-shot a été consommé à la première visite) — sans mémoire, la barre
-/// perdait l'origine recherche (« Résultats » redevenait « Recherche ») et le
-/// prev/next. Clé = id : une décision atteinte sans graine ne récupère que SON
-/// dernier contexte, jamais celui d'une autre (le danger que le one-shot pare).
+/// décision → article de loi → retour arrière remonte la page SANS graine, le
+/// one-shot ayant été consommé à la première visite. Clé = id : une décision
+/// atteinte sans graine ne récupère que SON dernier contexte, jamais celui d'une
+/// autre.
 pub type SeedMemorySignal = StoredValue<std::collections::HashMap<String, ResultNavSeed>>;
 /// Position de scroll à restaurer sur la page résultats au retour depuis une
 /// décision. Posée par le bouton retour de la barre décision, consommée UNE fois
@@ -92,4 +90,22 @@ pub fn use_restore_scroll() -> RestoreScrollSignal {
 /// Mémoire des graines consommées (par id de décision).
 pub fn use_seed_memory() -> SeedMemorySignal {
     expect_context::<SeedMemorySignal>()
+}
+
+/// Persiste la graine de `id` dans l'onglet (`sessionStorage`,
+/// `js/nav-store.js`).
+///
+/// La mémoire ci-dessus vit en RAM : elle rattrape le back/forward, pas le
+/// rechargement de la page.
+#[cfg(feature = "hydrate")]
+pub fn persist_seed(id: &str, seed: &ResultNavSeed) {
+    if let Ok(json) = serde_json::to_string(seed) {
+        crate::dom::nav_seed_set(id, &json);
+    }
+}
+
+/// Relit la graine persistée de `id` — `None` si cet onglet n'en a pas.
+#[cfg(feature = "hydrate")]
+pub fn restore_seed(id: &str) -> Option<ResultNavSeed> {
+    serde_json::from_str(&crate::dom::nav_seed_get(id)?).ok()
 }

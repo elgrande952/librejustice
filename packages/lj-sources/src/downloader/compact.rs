@@ -1,4 +1,4 @@
-//! Compactage des archives `.jsonl.gz` (port de `compact_archives`, mono-thread).
+//! Compactage des archives `.jsonl.gz`.
 
 use super::http::path_with_added_extension;
 use super::manifest::Manifest;
@@ -12,9 +12,8 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-/// Réécrit chaque `.jsonl.gz` en supprimant les ids tombstoned + dédoublons
-/// (port de `compact_archives`). Mono-thread (`max_workers` ignoré ; le Python
-/// parallélise les fichiers). Atomique (tmp + rename).
+/// Réécrit chaque `.jsonl.gz` en supprimant les ids tombstoned + dédoublons.
+/// Mono-thread (`max_workers` ignoré). Atomique (tmp + rename).
 pub fn compact_archives(data_dir: &Path, manifest: &Manifest, _max_workers: usize) -> Result<()> {
     let source_dir = if data_dir.join(JUDILIBRE_DIR).is_dir() {
         data_dir.join(JUDILIBRE_DIR)
@@ -61,7 +60,7 @@ pub fn compact_archives(data_dir: &Path, manifest: &Manifest, _max_workers: usiz
 }
 
 /// Compacte un fichier : dédup par id (last-in-file wins), filtre tombstones,
-/// réécrit atomique (port de `_compact_one`). Renvoie le nombre de records gardés.
+/// réécrit atomique. Renvoie le nombre de records gardés.
 fn compact_one(path: &Path, deleted_ids: &std::collections::HashSet<String>) -> Result<usize> {
     use std::io::Read;
     let file = match fs::File::open(path) {
@@ -75,7 +74,7 @@ fn compact_one(path: &Path, deleted_ids: &std::collections::HashSet<String>) -> 
         return Ok(0);
     }
 
-    // Préserve l'ordre d'insertion (last write wins) comme le dict Python.
+    // Préserve l'ordre d'insertion (last write wins).
     let mut order: Vec<String> = Vec::new();
     let mut by_id: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     for line in content.lines() {
@@ -119,7 +118,7 @@ fn compact_one(path: &Path, deleted_ids: &std::collections::HashSet<String>) -> 
 }
 
 /// Vérifie l'invariant append-only (`newer.update_date >= older.update_date`)
-/// quand les deux existent (port de `_check_append_invariant`).
+/// quand les deux existent.
 fn check_append_invariant(rid: &str, older: &Value, newer: &Value, path: &Path) -> Result<()> {
     let old_ud = older.get("update_date").and_then(|v| v.as_str());
     let new_ud = newer.get("update_date").and_then(|v| v.as_str());
@@ -161,7 +160,7 @@ struct ParsedDt {
 }
 
 /// Parse un ISO `YYYY-MM-DDTHH:MM:SS[.fff][+oo:oo|Z]`, avec ou sans offset
-/// (port du `datetime.fromisoformat` Python + remplacement `Z`→`+00:00`).
+/// (`Z` remplacé par `+00:00`).
 fn parse_flexible_iso(s: &str) -> Option<ParsedDt> {
     let normalized = s.replace('Z', "+00:00");
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&normalized) {
@@ -209,7 +208,6 @@ mod tests {
         let older = serde_json::json!({"id": "x", "update_date": "2024-01-01T00:00:00Z"});
         let newer = serde_json::json!({"id": "x", "update_date": "2024-02-01T00:00:00Z"});
         assert!(check_append_invariant("x", &older, &newer, Path::new("f")).is_ok());
-        // update_date manquant → tolérant.
         let a = serde_json::json!({"id": "x"});
         let b = serde_json::json!({"id": "x", "update_date": "2024-02-01T00:00:00Z"});
         assert!(check_append_invariant("x", &a, &b, Path::new("f")).is_ok());
@@ -237,7 +235,6 @@ mod tests {
         ];
         append_decisions(&path, &recs).unwrap();
 
-        // Tombstone pour "c".
         append_tombstone(dir.path(), "c").unwrap();
 
         let mut manifest = Manifest::default();
@@ -247,13 +244,11 @@ mod tests {
 
         compact_archives(dir.path(), &manifest, 1).unwrap();
 
-        // Relit le fichier compacté.
         use std::io::Read;
         let mut decoder = flate2::read::MultiGzDecoder::new(fs::File::open(&path).unwrap());
         let mut out = String::new();
         decoder.read_to_string(&mut out).unwrap();
         let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
-        // a (dédupliqué, v=2) + b ; c retiré (tombstone).
         assert_eq!(lines.len(), 2);
         let a: Value =
             serde_json::from_str(lines.iter().find(|l| l.contains("\"a\"")).unwrap()).unwrap();

@@ -1,12 +1,11 @@
-//! Assignation des slugs de textes (ADR 0162, cascade sans uid ADR 0206) :
-//! unique écrivain de `legal_text.slug`. Tout texte reçoit un slug
-//! déterministe, immuable et **lisible** — jamais d'uid dedans. Cascade en
-//! collision : slug complet du titre, puis date du texte, puis NOR, puis
-//! ordinal. Les textes hors juridiction FR/UE/INTL portent le pays en suffixe
-//! ISO 3166-1 alpha-3, radical débarrassé de ses marqueurs pays
-//! (`code-civil-bel`). La passe tourne en fin de
-//! chaque ingest référentiel et s'expose en commande `assign-slugs`
-//! (backfill). Idempotente (#7) : elle ne remplit que les `slug NULL`.
+//! Assignation des slugs de textes : unique écrivain de `legal_text.slug`.
+//! Tout texte reçoit un slug déterministe, immuable et **lisible** — jamais
+//! d'uid dedans. Cascade en collision : slug complet du titre, puis date du
+//! texte, puis NOR, puis ordinal. Les textes hors juridiction FR/UE/INTL portent
+//! le pays en suffixe ISO 3166-1 alpha-3, radical débarrassé de ses marqueurs
+//! pays (`code-civil-bel`). La passe tourne en fin de chaque ingest référentiel
+//! et s'expose en commande `assign-slugs` (backfill). Idempotente : elle ne
+//! remplit que les `slug NULL`.
 
 use anyhow::{anyhow, bail, Result};
 use lj_store::repository::{DecisionRepository, SlugSourceRow};
@@ -33,7 +32,7 @@ fn truncate_slug(full: &str) -> String {
 /// 3166-1 alpha-3 minuscule, et tokens de radical à stripper (gentilés, nom
 /// du pays) — l'identité pays vit dans le seul suffixe, jamais dans le
 /// radical (`code-civil-syr`, pas `code-civil-syrien-syr`). Code inconnu =
-/// erreur franche (#12) : étendre la table à la curation du texte.
+/// erreur franche : étendre la table à la curation du texte.
 fn country(a2: &str) -> Result<(&'static str, &'static [&'static str])> {
     Ok(match a2 {
         "AM" => ("arm", &["armenien", "armenienne", "armenie"]),
@@ -268,8 +267,6 @@ mod tests {
         assert!(long.starts_with("loi-n-79-587-du-11-juillet-1979-relative-a-la-motivation"));
     }
 
-    /// Spec ADR 0206 : cascade de désambiguïsation sans uid — slug complet,
-    /// puis date, puis NOR, puis ordinal ; jamais l'uid.
     #[test]
     fn cascade_collision_sans_uid() {
         let mut taken = HashSet::new();
@@ -307,9 +304,6 @@ mod tests {
         assert_eq!(s5, format!("{s3}-2"));
     }
 
-    /// Spec ADR 0206 : juridiction étrangère → radical débarrassé de ses
-    /// marqueurs pays (gentilé, nom, alpha-2), identité portée par le seul
-    /// suffixe alpha-3 ; code hors table = erreur franche.
     #[test]
     fn juridiction_etrangere_suffixe_alpha3() {
         let taken = HashSet::new();

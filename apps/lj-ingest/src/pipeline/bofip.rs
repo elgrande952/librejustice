@@ -1,16 +1,13 @@
-//! BOFiP-Impôts (ADR 0196) : sync du snapshot open data `bofip-vigueur`
-//! (doctrine fiscale DGFiP opposable, ~9 k documents) → `legal_text`
-//! (nature=`BOFIP`, préambule en `body`) + `legal_article` (**un § numéroté =
-//! une ligne**, l'unité citée par les décisions : « paragraphe n° 130 du
-//! BOI-… ») + `legal_toc_edge` (plan du document dérivé des intertitres
-//! `h1`–`h6`, via `corpus_toc` — sommaire réel et vue-lecture structurée).
+//! BOFiP-Impôts : sync du snapshot open data `bofip-vigueur` (doctrine fiscale
+//! DGFiP opposable) → `legal_text` (nature=`BOFIP`, préambule en `body`) +
+//! `legal_article` (**un § numéroté = une ligne**, l'unité citée par les
+//! décisions : « paragraphe n° 130 du BOI-… ») + `legal_toc_edge` (plan du
+//! document dérivé des intertitres `h1`–`h6`, via `corpus_toc`).
 //!
-//! Source **snapshot vivant** (publications en vigueur), pas un fond
-//! incrémental : chaque sync re-télécharge l'export JSONL entier ;
-//! l'idempotence vit dans l'upsert par `content_checksum` (xxh3-64 du texte
-//! parsé du §, #7) et la purge des versions/§ hors snapshot
-//! (`delete_legal_articles_versions_except`). Le versionnage historique
-//! complet (tarballs `bofip-impots`) est un track ultérieur (ADR 0196 §7).
+//! Source **snapshot vivant** (publications en vigueur), pas un fond incrémental :
+//! chaque sync re-télécharge l'export JSONL entier ; l'idempotence vit dans
+//! l'upsert par `content_checksum` (xxh3-64 du texte parsé du §) et la purge des
+//! versions ou § hors snapshot (`delete_legal_articles_versions_except`).
 
 use std::path::Path;
 
@@ -32,15 +29,15 @@ pub async fn sync_bofip() -> Result<()> {
 }
 
 /// Ingère un export JSONL `bofip-vigueur` local (bootstrap manuel ou suite du
-/// sync). Parse + upsert en streaming, puis refresh `code_title` (ADR 0114) et
-/// slugs (ADR 0162) une fois en fin de run.
+/// sync). Parse + upsert en streaming, puis refresh `code_title` et slugs une fois
+/// en fin de run.
 pub async fn ingest_bofip(path: &Path) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    // Le refresh `code_title` final est un UPDATE-jointure pleine table → hors
-    // statement_timeout (batch offline, même règle que KALI/LEGI).
+    // Le refresh `code_title` final est un UPDATE-jointure pleine table : hors
+    // statement_timeout.
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
@@ -51,12 +48,18 @@ pub async fn ingest_bofip(path: &Path) -> Result<()> {
 
     let (docs, upserted, skipped, errors) = ingest_bofip_file(&repo, path).await?;
 
-    // Titre du document dénormalisé sur ses § (`search_title`, ADR 0114).
+    // Titre du document dénormalisé sur ses § (`search_title`).
     let retitled = repo
         .refresh_article_denorm()
         .await
         .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
-    // Slugs des textes nouveaux (ADR 0162).
+    // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
+    // rangs, ce finisseur les recalcule.
+    let (ranked_texts, ranked_rows) = repo
+        .refresh_reading_ranks()
+        .await
+        .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
+    tracing::info!(ranked_texts, ranked_rows, "reading ranks");
     let slugged = super::slugs::assign_text_slugs(&repo).await?;
 
     tracing::info!(
@@ -148,7 +151,7 @@ async fn ingest_bofip_doc(
         last_modified: Some(debut),
         date_texte: None,
         date_publi: Some(debut),
-        // Identité = l'identifiant juridique BOI (pas la cascade ELI/NOR ADR 0115).
+        // Identité = l'identifiant juridique BOI, pas la cascade ELI/NOR.
         eli: None,
         nor: None,
         instrument_key: None,
@@ -190,7 +193,7 @@ async fn ingest_bofip_doc(
             date_fin: None,
             // § porte-numéro d'un intertitre : ancre citable sans corps.
             texte: (!p.texte.is_empty()).then_some(p.texte),
-            // de référence FR officielle, monolingue (ADR 0116).
+            // Fond doctrinal FR officiel, monolingue.
             texte_original: None,
             lang_original: None,
             translation: "officiel".to_string(),
@@ -218,8 +221,8 @@ async fn ingest_bofip_doc(
     repo.delete_legal_articles_versions_except("bofip", &doc.identifiant, debut, &keep_num_keys)
         .await
         .map_err(|e| anyhow!("purge versions {}: {e}", doc.identifiant))?;
-    // Plan du document (ADR 0186) : purge autoritaire puis réécriture de
-    // l'arbre dérivé des intertitres (vide = document à plat).
+    // Plan du document : purge autoritaire puis réécriture de l'arbre dérivé des
+    // intertitres (vide = document à plat).
     repo.delete_toc_edges_by_text(&doc.identifiant)
         .await
         .map_err(|e| anyhow!("delete_toc_edges_by_text {}: {e}", doc.identifiant))?;

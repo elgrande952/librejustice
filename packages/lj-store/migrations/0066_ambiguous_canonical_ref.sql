@@ -1,7 +1,7 @@
 -- Migration 0066 — Garde anti-re-merge : liste des `canonical_ref` ambigus
--- (clés constatées NON-uniques), ADR 0103.
+-- (clés constatées NON-uniques).
 --
--- `canonical_ref` (`type|lieu|rg|date`, ADR 0100) n'est pas garanti unique : pour
+-- `canonical_ref` (`type|lieu|rg|date`) n'est pas garanti unique : pour
 -- une classe d'arrêts de cour d'appel, le champ judilibre `numbers` porte le RG
 -- de la décision DÉFÉRÉE (1re instance), partagé entre plusieurs arrêts d'appel
 -- distincts (le vrai RG d'appel ne vit que dans l'en-tête du `full_text`, à

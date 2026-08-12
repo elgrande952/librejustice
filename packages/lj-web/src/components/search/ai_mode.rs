@@ -1,12 +1,12 @@
-//! Toggle « mode IA » persistant (port de `lib/ai-mode.ts`, ADR 0041).
+//! Toggle « mode IA » persistant.
 //!
-//! Source de vérité : l'URL (`?aiMode=true`). Le localStorage sert de mémoire
-//! inter-sessions. Hook Leptos : `use_ai_mode()` renvoie `(Signal<bool>,
-//! Callback<bool>)` synchronisé avec le query param `aiMode` ET le localStorage.
+//! Source de vérité : l'URL. **Param absent = mode IA ON** ; seul un OFF
+//! explicite s'écrit (`?aiMode=false`). Le localStorage mémorise le choix entre
+//! sessions, y compris le OFF. Hook Leptos : `use_ai_mode()` renvoie
+//! `(Signal<bool>, Callback<bool>)` synchronisé avec le query param `aiMode` ET
+//! le localStorage.
 //!
-//! NB : ce fichier est rattaché au module via `#[path]` depuis `compact_search`
-//! (le `mod.rs` de `search/` est figé par la substrate et n'expose que les
-//! composants ; on ajoute ici un module privé de la tranche sans le toucher).
+//! Ce fichier est rattaché au module via `#[path]` depuis `compact_search`.
 
 use leptos::prelude::*;
 
@@ -14,34 +14,36 @@ use leptos::prelude::*;
 #[cfg(feature = "hydrate")]
 const STORAGE_KEY: &str = "librejustice.aiMode";
 
-/// `true` si la valeur de query param vaut `"true"` ou `"1"`. Port de
-/// `isAiModeParam`.
-pub fn is_ai_mode_param(value: Option<&str>) -> bool {
-    matches!(value, Some("true") | Some("1"))
+/// État du mode IA pour une valeur de query param : **absent ⇒ ON** (défaut),
+/// `false`/`0` ⇒ OFF explicite, tout le reste ⇒ ON.
+pub fn ai_mode_from_param(value: Option<&str>) -> bool {
+    !matches!(value, Some("false") | Some("0"))
 }
 
-/// Lit la préférence stockée (localStorage). SSR : pas de `window` => `false`.
-/// Accès via `js_sys::Reflect` sur `window.localStorage` (la feature web-sys
-/// `Storage` n'est pas activée dans le workspace).
+/// Préférence stockée : `Some(bool)` si l'utilisateur a tranché, `None` s'il n'a
+/// jamais touché au toggle (→ le défaut s'applique). Accès via `js_sys::Reflect`
+/// sur `window.localStorage` (la feature web-sys `Storage` n'est pas activée
+/// dans le workspace).
 #[cfg(feature = "hydrate")]
-pub fn read_stored() -> bool {
-    local_storage_get(STORAGE_KEY).as_deref() == Some("1")
+pub fn read_stored() -> Option<bool> {
+    match local_storage_get(STORAGE_KEY).as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
 }
 
-/// SSR : pas de localStorage (parité `typeof localStorage === undefined`).
+/// SSR : pas de localStorage, donc aucune préférence connue.
 #[cfg(feature = "ssr")]
-pub fn read_stored() -> bool {
-    false
+pub fn read_stored() -> Option<bool> {
+    None
 }
 
-/// Écrit/efface la préférence (port de `writeStoredAiMode`).
+/// Écrit la préférence. Les deux sens sont mémorisés (`"1"` / `"0"`) : le OFF
+/// est un choix, pas une absence de choix.
 #[cfg(feature = "hydrate")]
 pub fn write_stored(value: bool) {
-    if value {
-        local_storage_set(STORAGE_KEY, "1");
-    } else {
-        local_storage_remove(STORAGE_KEY);
-    }
+    local_storage_set(STORAGE_KEY, if value { "1" } else { "0" });
 }
 
 #[cfg(feature = "ssr")]
@@ -79,41 +81,25 @@ fn local_storage_set(key: &str, value: &str) {
     }
 }
 
-#[cfg(feature = "hydrate")]
-fn local_storage_remove(key: &str) {
-    use wasm_bindgen::JsCast;
-    if let Some(storage) = local_storage() {
-        if let Ok(remove) = js_sys::Reflect::get(&storage, &"removeItem".into()) {
-            if let Ok(func) = remove.dyn_into::<js_sys::Function>() {
-                let _ = func.call1(&storage, &key.into());
-            }
-        }
-    }
-}
-
 /// Hook : état `aiMode` synchronisé avec le query param `aiMode` et le
 /// localStorage. Renvoie `(getter, setter)`.
 ///
-/// - Init : `aiMode` URL présent => l'adopter ; sinon `read_stored()`.
+/// - Init : l'URL seule (absente ⇒ défaut ON), identique SSR et client.
 /// - Effect (hydrate) : sync URL -> state au back/forward.
-/// - Effect mount (hydrate) : si l'URL n'a pas `aiMode` mais le store dit ON et
-///   `q` est présent, patcher l'URL (`replace`) pour servir un résultat IA.
+/// - Effect mount (hydrate) : si l'URL n'a pas `aiMode` mais le store dit OFF et
+///   `q` est présent, patcher l'URL (`replace`) pour servir un résultat sans IA.
 /// - `set` : maj state + `write_stored` ; si `q` présent, refléter dans l'URL.
 pub fn use_ai_mode() -> (Signal<bool>, Callback<bool>) {
     use leptos_router::hooks::use_query_map;
 
     let query = use_query_map();
     // Init aligné sur le SSR : l'URL seule, jamais le localStorage. Lire le store
-    // ici désynchroniserait le SSR (`read_stored` = false, pas de `window`) du
-    // client (préférence mémorisée) ; Leptos adopte alors le DOM SSR à
-    // l'hydratation et ne re-patche PAS l'attribut tant que le signal ne CHANGE
-    // pas → l'interrupteur resterait visuellement OFF alors que l'état interne est
-    // ON. La préférence localStorage est donc appliquée post-hydratation par
-    // l'effet de mount (un vrai `false → true` qui, lui, re-patche l'attribut).
-    let initial = match query.get_untracked().get("aiMode") {
-        Some(v) => is_ai_mode_param(Some(v.as_str())),
-        None => false,
-    };
+    // ici désynchroniserait le SSR (pas de `window`) du client (préférence
+    // mémorisée) ; Leptos adopte alors le DOM SSR à l'hydratation et ne re-patche
+    // PAS l'attribut tant que le signal ne CHANGE pas. La préférence localStorage
+    // est donc appliquée post-hydratation par l'effet de mount, un vrai changement
+    // de valeur. Depuis le défaut ON, le seul cas à rattraper est le OFF mémorisé.
+    let initial = ai_mode_from_param(query.get_untracked().get("aiMode").as_deref());
     let state = RwSignal::new(initial);
 
     #[cfg(feature = "hydrate")]
@@ -121,30 +107,28 @@ pub fn use_ai_mode() -> (Signal<bool>, Callback<bool>) {
         use leptos_router::hooks::use_navigate;
         use leptos_router::NavigateOptions;
 
-        // Sync URL -> state (back/forward).
+        // Sync URL -> state (back/forward). Param retiré = retour au défaut ON.
         Effect::new(move |_| {
             let map = query.get();
-            if let Some(v) = map.get("aiMode") {
-                state.set(is_ai_mode_param(Some(v.as_str())));
-            }
+            state.set(ai_mode_from_param(map.get("aiMode").as_deref()));
         });
 
         // Au mount (post-hydratation) : applique la préférence localStorage. Le
-        // store ON sans `aiMode` dans l'URL => `state` passe false (valeur SSR) à
-        // true, ce qui re-patche `aria-checked` (le mismatch d'hydratation n'est
-        // pas réconcilié par Leptos, cf. init). Si `q` est présent on patche aussi
-        // l'URL (replace) pour servir un résultat IA dès la 1re requête ; sans `q`
-        // (landing) le toggle s'affiche ON, l'URL est posée au submit par le caller.
+        // store OFF sans `aiMode` dans l'URL fait passer `state` de true (défaut
+        // SSR) à false, ce qui re-patche `aria-checked`. Si `q` est présent on
+        // patche aussi l'URL (replace) pour servir un résultat sans IA dès la 1re
+        // requête ; sans `q` (landing) le toggle s'affiche OFF, l'URL est posée au
+        // submit par le caller.
         let navigate = use_navigate();
         Effect::new(move |prev: Option<()>| {
             if prev.is_some() {
                 return;
             }
             let map = query.get_untracked();
-            if map.get("aiMode").is_none() && read_stored() {
-                state.set(true);
+            if map.get("aiMode").is_none() && read_stored() == Some(false) {
+                state.set(false);
                 if map.get("q").is_some() {
-                    let qs = super::query_state::with_param(&map, "aiMode", Some("true"), false);
+                    let qs = super::query_state::with_param(&map, "aiMode", Some("false"), false);
                     navigate(
                         &super::query_state::search_href(&qs),
                         NavigateOptions {
@@ -168,10 +152,12 @@ pub fn use_ai_mode() -> (Signal<bool>, Callback<bool>) {
                 write_stored(value);
                 let map = query.get_untracked();
                 if map.get("q").is_some() {
+                    // OFF explicite dans l'URL (l'absence vaut ON) ; ON = retrait
+                    // du param, l'URL partagée reste propre.
                     let qs = super::query_state::with_param(
                         &map,
                         "aiMode",
-                        if value { Some("true") } else { None },
+                        if value { None } else { Some("false") },
                         false,
                     );
                     navigate(

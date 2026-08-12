@@ -4,7 +4,7 @@
 -- préfixe d'instrument (« A. » arrêté, « LP. » loi du pays, parfois « D. »), mais les
 -- juridictions les citent avec un préfixe INCOHÉRENT (« L. 111-4 », « D. 111-4 »,
 -- « 111-4 » nu) pour le MÊME article — le numéro identifie l'article à lui seul, le
--- préfixe est de la provenance, pas un discriminant. Le résolveur (ADR 0112) matche
+-- préfixe est de la provenance, pas un discriminant. Le résolveur matche
 -- `legal_article.num_key = cited_reference.article_key` en égalité exacte, et
 -- `normalize_article` garde les préfixes `[LRDA]` distincts À RAISON (en métropole
 -- `L.111` ≠ `R.111` ≠ `D.111`). On ne peut donc PAS stripper globalement.

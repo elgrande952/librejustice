@@ -1,4 +1,4 @@
--- Migration 0041 — Publication : codes bruts multi-valeur par ordre (ADR 0054).
+-- Migration 0041 — Publication : codes bruts multi-valeur par ordre.
 --
 -- Remplace les colonnes générées cassées ``is_recueil`` / ``is_tables_lebon``
 -- (migration 0009, ``LIKE '%A%'`` sensible à la casse → 117 852 arrêts judiciaires
@@ -9,7 +9,7 @@
 -- Harmonise aussi ``docket_numbers`` en ``NOT NULL DEFAULT '{}'`` (un array de
 -- facette n'a pas de raison d'être NULL ; un NULL casse ``= ANY`` / overlap).
 --
--- ⚠️ Fenêtre de maintenance OBLIGATOIRE : ce script DROP + CREATE ``chunks_bm25``
+-- Fenêtre de maintenance OBLIGATOIRE : ce script DROP + CREATE ``chunks_bm25``
 -- (≈ plusieurs minutes sur le corpus). Pendant le build, /search en mode lexical
 -- ou hybrid échoue. À programmer off-peak. Rollback : recréer ``chunks_bm25`` avec
 -- ``is_recueil`` / ``is_tables_lebon`` (état migration 0038).

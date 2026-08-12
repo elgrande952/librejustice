@@ -1,4 +1,4 @@
--- ADR 0174 : `legal_link` — graphe de liens DILA (bloc <LIENS>), miroir fidèle
+-- `legal_link` — graphe de liens DILA (bloc <LIENS>), miroir fidèle
 -- par propriétaire. Une ligne par <LIEN> tel qu'il apparaît dans le fichier de
 -- son propriétaire (version d'article, ou texte lui-même : owner_num_key = ''
 -- et owner_date_debut = '0001-01-01', sentinelles alignées sur legal_article).

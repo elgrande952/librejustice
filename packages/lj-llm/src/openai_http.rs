@@ -1,5 +1,4 @@
-//! Backend OpenAI-HTTP `/v1/embeddings` (vLLM compatible) — port de
-//! `embedding/openai_http.py`.
+//! Backend OpenAI-HTTP `/v1/embeddings` (vLLM compatible).
 
 use crate::backend::{format_query, Embedder, EMBEDDING_DIM, LEGAL_QUERY_INSTRUCTION};
 use crate::error::{EmbedError, Result};
@@ -10,14 +9,14 @@ use serde_json::Value;
 
 const DEFAULT_TIMEOUT_S: f64 = 600.0;
 /// Plafond de la phase d'établissement TCP. Sans lui, un backend injoignable
-/// (ex. vLLM sur une machine éteinte : SYN sans réponse, pas de RST) fait pendre
-/// le connect sur le timeout TCP de l'OS (~30 s) avant que `AnyEmbedder::Auto`
-/// ne bascule sur Cloudflare. Le connect vLLM légitime (tailnet) est <100 ms.
+/// (SYN sans réponse, pas de RST) fait pendre le connect sur le timeout TCP de l'OS
+/// avant que `AnyEmbedder::Auto` ne bascule sur Cloudflare. Le connect vLLM
+/// légitime (tailnet) est <100 ms.
 const CONNECT_TIMEOUT_S: f64 = 2.0;
 const DEFAULT_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 
 /// Phrases présentes dans les réponses d'erreur des APIs compatibles OpenAI
-/// quand le contexte est dépassé (port de `_CONTEXT_OVERFLOW_PHRASES`).
+/// quand le contexte est dépassé.
 const CONTEXT_OVERFLOW_PHRASES: &[&str] = &["context length", "context_length_exceeded"];
 
 /// Embedder via endpoint OpenAI-compatible (`/v1/embeddings`). Détecte les
@@ -30,7 +29,7 @@ pub struct OpenAIHttpEmbedder {
     dim: usize,
     timeout_s: f64,
     // ClientWithMiddleware : TracingMiddleware emet un span HTTP par appel
-    // (url.full inclus) — alimente le row "Cloudflare Workers AI" du cockpit.
+    // (url.full inclus).
     client: ClientWithMiddleware,
 }
 
@@ -66,7 +65,7 @@ impl OpenAIHttpEmbedder {
         }
     }
 
-    /// POST des textes, parse + L2-normalise par lignes (port de `_post`).
+    /// POST des textes, parse + L2-normalise par lignes.
     async fn post(&self, texts: &[String]) -> Result<Array2<f32>> {
         let mut req = self
             .client
@@ -95,7 +94,6 @@ impl OpenAIHttpEmbedder {
             .and_then(Value::as_array)
             .ok_or_else(|| EmbedError::Invalid("openai-http : champ data manquant".into()))?;
 
-        // Tri par index (port de `sorted(..., key=lambda x: x["index"])`).
         let mut rows: Vec<(i64, &Value)> = data
             .iter()
             .map(|item| {
@@ -128,7 +126,7 @@ impl OpenAIHttpEmbedder {
     }
 }
 
-/// L2-normalisation par ligne avec plancher `1e-12` (port de `_normalize_batch`).
+/// L2-normalisation par ligne avec plancher `1e-12`.
 fn normalize_batch(arr: &mut Array2<f32>) {
     for mut row in arr.rows_mut() {
         let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
@@ -178,7 +176,6 @@ mod tests {
         normalize_batch(&mut arr);
         assert!((arr[[0, 0]] - 0.6).abs() < 1e-6);
         assert!((arr[[0, 1]] - 0.8).abs() < 1e-6);
-        // Ligne nulle : divisée par 1e-12 → reste ~0.
         assert!(arr[[1, 0]].abs() < 1e-3);
     }
 }

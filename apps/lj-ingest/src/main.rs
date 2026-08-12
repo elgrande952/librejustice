@@ -1,6 +1,7 @@
-//! Binaire `librejustice` (CLI ingest, clap). Port de `apps/ingest/.../cli.py`.
+//! Binaire `lj-ingest` : CLI d'ingest (clap).
 
 mod analyze;
+mod chain;
 mod chunking;
 mod citations_maintenance;
 mod config;
@@ -18,16 +19,14 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use lj_telemetry::{InitOpts, OtlpCreds, TelemetryGuard};
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Settings;
 
-/// Juridictions Judilibre par défaut (port de
-/// `judilibre.DEFAULT_JURISDICTIONS`).
+/// Juridictions Judilibre par défaut.
 const JUDILIBRE_DEFAULT_JURISDICTIONS: &[&str] = &["cc", "ca", "tj", "tcom"];
-/// URL de prod de l'API PISTE Judilibre (port de `client.JudilibreClient`
-/// `base_url` par défaut).
+/// URL de prod de l'API PISTE Judilibre.
 const JUDILIBRE_BASE_URL: &str = "https://api.piste.gouv.fr/cassation/judilibre/v1.0";
 
 /// Construit un client Judilibre depuis les identifiants OAuth2 PISTE partagés
@@ -54,8 +53,6 @@ fn judilibre_client(settings: &Settings) -> Result<lj_sources::judilibre::Judili
 )]
 struct Cli {
     /// Niveau de log global (trace/debug/info/warning/error ou entier).
-    ///
-    /// Port de l'option `--log-level` du callback Typer `_main`.
     #[arg(
         long,
         global = true,
@@ -70,6 +67,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Déroule une chaîne planifiée (cron). Chaque étape a son propre watchdog
+    /// et un échec n'interrompt pas les suivantes ; la chaîne sort non-zéro
+    /// après un `error!` récapitulatif.
+    Chain {
+        #[arg(value_enum)]
+        kind: chain::ChainKind,
+    },
     /// Sync incrémental des sources (opendata ZIP + Judilibre).
     Sync,
     /// Calcule les plages de dates Judilibre à synchroniser.
@@ -79,14 +83,18 @@ enum Command {
     /// Applique les migrations Postgres.
     Migrate,
     /// Matérialise le champ `legal_article.usage_terms` (sacs de n-grammes
-    /// des contextes de citation + seeds curatés, ADR 0248).
+    /// des contextes de citation + seeds curatés).
     UsageTerms {
-        /// Nombre de chunks du pool (parallélisme SQL séquentiel, reprise).
+        /// Nombre de chunks du pool (grain de progression et de répartition).
         #[arg(long, default_value_t = 32)]
-        chunks: i32,
+        chunks: usize,
         /// Seuil de citations pour matérialiser un sac.
         #[arg(long, default_value_t = 10)]
         min_citations: i64,
+        /// Connexions parallèles (le coût est I/O-bound : lecture TOAST des
+        /// full_text échantillonnés).
+        #[arg(long, default_value_t = 6)]
+        workers: usize,
     },
     /// Ingère les archives locales en base (parse → chunk → upsert).
     Ingest {
@@ -100,8 +108,8 @@ enum Command {
         mode: pipeline::IngestMode,
     },
     /// Re-fetch ciblé de décisions Judilibre par id (`/decision`) puis ingest.
-    /// Répare quelques décisions désynchronisées (ex. résurrection, ADR 0087)
-    /// sans reculer le watermark global.
+    /// Répare quelques décisions désynchronisées (ex. résurrection) sans reculer
+    /// le watermark global.
     Refetch {
         /// Ids Judilibre à re-fetch (ex. `6a28fc8ecdc6046d47cb0167`).
         #[arg(required = true)]
@@ -113,17 +121,21 @@ enum Command {
     ReextractFields {
         #[arg(long)]
         overwrite: bool,
-        /// Passe intégrale (ADR 0145) : TOUT le fonds `extract_version < 1000`,
-        /// même déjà à la version courante — c'est le relink hebdomadaire (un
-        /// texte nouveau au catalogue attire ses citations anciennes ; le skip
-        /// des sets de citations inchangés borne les écritures au delta).
+        /// Sonde : n'écrit RIEN, compte les lignes qu'un `--overwrite`
+        /// réécrirait (même comparaison NULL-safe que le skip-tuple de l'UPDATE) et
+        /// les couches satellites qu'il purgerait.
+        #[arg(long)]
+        dry_run: bool,
+        /// Passe intégrale : TOUT le fonds `extract_version < 1000`, même déjà à
+        /// la version courante — c'est le relink hebdomadaire (un texte nouveau au
+        /// catalogue attire ses citations anciennes ; le skip des sets de citations
+        /// inchangés borne les écritures au delta).
         #[arg(long, conflicts_with_all = ["jurisdiction_type", "citing_ref_uid"])]
         full: bool,
         /// Cible des `jurisdiction_type` (CSV, ex. `CNDA,CEDH,CJUE,CONSTIT,TC`) à
         /// re-extraire **quelle que soit la `extract_version`** (sans bump global).
-        /// Pour activer un comportement d'extraction nouveau sur un sous-ensemble
-        /// (citations famille générique, ADR 0102 §B). Vide = comportement par
-        /// défaut (toutes les versions divergentes).
+        /// Pour activer un comportement d'extraction nouveau sur un sous-ensemble.
+        /// Vide = comportement par défaut (toutes les versions divergentes).
         #[arg(long, value_delimiter = ',')]
         jurisdiction_type: Vec<String>,
         /// Champs à re-extraire (CSV, ex. `legal_references`). Vide = tous les
@@ -131,21 +143,21 @@ enum Command {
         /// que les citations (via `replace_citations`), sans toucher les colonnes.
         #[arg(long, value_delimiter = ',')]
         field: Vec<String>,
-        /// Cible les décisions **citant** ce texte (`ref_text_uid`, ADR 0145 M4),
-        /// quelle que soit la `extract_version`. Pour rejouer extract+link sur le
-        /// seul gisement d'un instrument, sans bump global.
+        /// Cible les décisions **citant** ce texte (`ref_text_uid`), quelle que
+        /// soit la `extract_version`. Pour rejouer extract+link sur le seul gisement
+        /// d'un instrument, sans bump global.
         #[arg(long)]
         citing_ref_uid: Option<String>,
         /// Workers concurrents = connexions DB simultanées (chacun fait
         /// fetch→extract→write en parallèle). C'est le levier de pression sur la
-        /// base : `--workers 2` reste doux sur une prod qui sert du trafic ;
-        /// vide = défaut agressif (cœurs−4, borné [2,8]) pour un drain rapide.
+        /// base : `--workers 2` reste doux sur une prod qui sert du trafic ; vide =
+        /// défaut agressif (cœurs−4, borné [2,8]).
         #[arg(long)]
         workers: Option<usize>,
     },
-    /// Re-embed ciblé des décisions orphelines (chunks sans embedding, #39).
-    /// Reconstruit depuis `(full_text, source_fields)` (ADR 0085) et ne remplit
-    /// que les embeddings manquants — vLLM strict (jamais Cloudflare, coût).
+    /// Re-embed ciblé des décisions orphelines (chunks sans embedding).
+    /// Reconstruit depuis `(full_text, source_fields)` et ne remplit que les
+    /// embeddings manquants — vLLM strict.
     EmbedMissing {
         /// Borne le nombre de décisions traitées (défaut : toutes).
         #[arg(long)]
@@ -158,23 +170,64 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
         /// Appels Mistral concurrents (sémaphore). Le débit réel est cadencé
-        /// par le throttle du client (~5 s entre appels par clé vivante, sous
-        /// le TPM du modèle) ; ce plafond borne juste les appels en vol.
+        /// par le throttle du client ; ce plafond borne juste les appels en vol.
         /// Défaut (absent) : clés vivantes × 7.
         #[arg(long)]
         concurrency: Option<usize>,
         /// Régénère AUSSI les résumés dont le prompt est plus ancien que la
         /// version courante (`summary_prompt_version < SUMMARY_PROMPT_VERSION`).
         /// Sans ce flag, seuls les résumés manquants (`summary IS NULL`) sont
-        /// générés : un bump de version ne réécrit jamais le stock historique
-        /// par défaut.
+        /// générés.
         #[arg(long)]
         refresh_stale: bool,
     },
     /// Recompute des arrays légaux dénormalisés depuis `legal_citation`
-    /// (réparation / recompute, migration 0098). Idempotent, lots autocommit ;
-    /// en régime normal l'écrivain de citations tient les arrays à jour.
+    /// (réparation). Idempotent, lots autocommit ; en régime normal l'écrivain
+    /// de citations tient les arrays à jour.
     ResyncLegalArrays,
+    /// Re-key one-shot du namespace cnb: vers l'identité CNBF : ponte les uids
+    /// legacy {barreau}:{nom}-{prenom} vers cnb:{avCnbfCode} (snapshot courant),
+    /// purge les entités pieds de fichier, réhydrate les liens danglants.
+    /// Dry-run par défaut ; préalable au premier reload upsert de
+    /// `registries avocats`.
+    RekeyCnb {
+        /// Écrit réellement (sans ce flag : plan + compteurs, aucune écriture).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Rejeu des snapshots CNB publiés depuis 2022 : plie la présence observée
+    /// en spans d'activité (come and go) et le siren de structure en arêtes
+    /// d'affiliation datées, sous la provenance `cnb-hist`. Recalcule ses
+    /// évidences en entier à chaque run et remplace les précédentes. Dry-run par
+    /// défaut.
+    CnbHistory {
+        /// Écrit réellement (sans ce flag : plan + compteurs, aucune écriture).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Filet de dérive des acteurs, unique rattrapage de la relation :
+    /// re-dérive `decision_party` depuis les colonnes NER de `decisions` et
+    /// n'écrit que ce qui a changé — les sets inchangés gardent leurs
+    /// `entity_uid`. Sharde sur N workers.
+    PartiesReconcile {
+        /// Workers concurrents (défaut : cœurs − 4, borné [2, 8]).
+        #[arg(long)]
+        workers: Option<usize>,
+    },
+    /// Affiliations avocat ↔ cabinet dérivées des appositions des décisions,
+    /// sous la provenance `decision` : couples `firm_ord` dont les deux bouts
+    /// sont résolus, attestés par ≥ 2 décisions distinctes. Fonction du corpus —
+    /// recalcule en entier à chaque run. Dry-run par défaut.
+    DeriveAffiliations {
+        /// Écrit réellement (sans ce flag : compteurs, aucune écriture).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Filet unique de dérive : enchaîne tous les filets du régime « dérivé à
+    /// l'écriture » — rôles de textes + dénorm articles, arrays légaux,
+    /// liens/citations pendants. Idempotent, ~no-op en régime ; planifié en fin
+    /// de chaîne dominicale. Le volet parties vit dans `parties-relink`.
+    Reconcile,
     /// Génère les sitemaps et les publie en base (servis par lj-server).
     Sitemap {
         /// Construit les sitemaps sans les écrire en base (vérification locale).
@@ -190,20 +243,20 @@ enum Command {
         #[arg(long, default_value_t = 10_000)]
         max_urls: usize,
     },
-    /// Ingère un stock ou un incrément LEGI (référentiel versionné, ADR 0092)
-    /// depuis un `tar.gz` bulk DILA local (`Freemium_legi_global_*.tar.gz` ou
-    /// incrément `LEGI_*.tar.gz`, téléchargé hors-bande).
+    /// Ingère un stock ou un incrément LEGI (référentiel versionné) depuis un
+    /// `tar.gz` bulk DILA local (`Freemium_legi_global_*.tar.gz` ou incrément
+    /// `LEGI_*.tar.gz`, téléchargé hors-bande).
     Legi {
         /// Chemin local de l'archive `tar.gz` LEGI.
         #[arg(required = true)]
         path: std::path::PathBuf,
     },
-    /// Sync incrémental LEGI (ADR 0092/0093) : télécharge les incréments
-    /// `LEGI_*.tar.gz` postérieurs au watermark puis les ingère (le stock global
-    /// se bootstrape hors-bande via `legi <path>`). Idempotent.
+    /// Sync incrémental LEGI : télécharge les incréments `LEGI_*.tar.gz`
+    /// postérieurs au watermark puis les ingère (le stock global se bootstrape
+    /// hors-bande via `legi <path>`). Idempotent.
     SyncLegi,
-    /// Backfill du graphe `legal_link` (ADR 0174) : streame des tarballs DILA
-    /// locaux (stock global puis incréments, LEGI et/ou KALI, dans l'ordre
+    /// Backfill du graphe `legal_link` : streame des tarballs DILA locaux
+    /// (stock global puis incréments, LEGI et/ou KALI, dans l'ordre
     /// chronologique) et remplace les arêtes `<LIENS>` par propriétaire, sans
     /// upsert d'articles (hors gate `content_checksum`). Rejouable ; purge les
     /// arêtes orphelines en fin de run.
@@ -212,66 +265,135 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<std::path::PathBuf>,
     },
-    /// Backfill de l'arbre structurel `legal_toc_edge` (ADR 0207) : streame des
-    /// tarballs LEGI locaux (stock global puis incréments, ordre chronologique)
-    /// et remplace les arêtes `TEXTELR`/`SECTION_TA` par propriétaire, hors gate
+    /// Backfill de l'arbre structurel `legal_toc_edge` : streame des tarballs
+    /// LEGI locaux (stock global puis incréments, ordre chronologique) et
+    /// remplace les arêtes `TEXTELR`/`SECTION_TA` par propriétaire, hors gate
     /// `content_checksum`. Rejouable ; purge les arbres orphelins en fin de run.
     BackfillToc {
         /// Archives `tar.gz` LEGI, dans l'ordre chronologique.
         #[arg(required = true)]
         paths: Vec<std::path::PathBuf>,
     },
-    /// Backfill des métadonnées de textes (ADR 0178) : rejoue l'upsert
-    /// `legal_text` + `upcoming_versions` depuis les `TEXTE_VERSION` des
-    /// tarballs LEGI locaux. Rejouable.
+    /// Backfill des métadonnées de textes : rejoue l'upsert `legal_text` +
+    /// `upcoming_versions` depuis les `TEXTE_VERSION` des tarballs LEGI locaux.
+    /// Rejouable.
     BackfillTextes {
         /// Archives `tar.gz` LEGI, dans l'ordre chronologique.
         #[arg(required = true)]
         paths: Vec<std::path::PathBuf>,
     },
-    /// Ingère un stock ou un incrément KALI (conventions collectives nationales,
-    /// bulk DILA, ADR 0120) depuis un `tar.gz` local (`Freemium_kali_global_*.tar.gz`
-    /// ou incrément `KALI_*.tar.gz`). KALICONT → `legal_text`, KALIARTI → `legal_article`
-    /// (ancrés sur la convention). Idempotent.
+    /// Ingère un stock ou un incrément KALI (conventions collectives
+    /// nationales, bulk DILA) depuis un `tar.gz` local
+    /// (`Freemium_kali_global_*.tar.gz` ou incrément `KALI_*.tar.gz`).
+    /// KALICONT → `legal_text`, KALIARTI → `legal_article` (ancrés sur la
+    /// convention). Idempotent.
     Kali {
         /// Chemin local de l'archive `tar.gz` KALI.
         #[arg(required = true)]
         path: std::path::PathBuf,
     },
-    /// Sync incrémental KALI (ADR 0120/0093) : cold start télécharge le stock global
-    /// puis les incréments `KALI_*.tar.gz` postérieurs au watermark, chacun ingéré.
+    /// Sync incrémental KALI : cold start télécharge le stock global puis les
+    /// incréments `KALI_*.tar.gz` postérieurs au watermark, chacun ingéré.
     /// Idempotent.
     SyncKali,
-    /// Ingère un export JSONL `bofip-vigueur` local (doctrine fiscale DGFiP,
-    /// ADR 0196) : document BOI → `legal_text` (nature=BOFIP, préambule en `body`),
-    /// § numérotés → `legal_article`. Idempotent (snapshot : purge des versions/§
+    /// Moisson quotidienne du fond marchés du pot Annonces : les 12 canaux
+    /// (BOAMP Opendatasoft + 11 moteurs de profils d'acheteurs) ré-énumérés en
+    /// entier, réconciliés en lignes canoniques, upsertés. Aucun état stampé ni
+    /// supprimé : la moisson n'écrit que ce qu'elle voit, la fenêtre vivante se
+    /// calcule à la lecture. Idempotent.
+    Annonces,
+    /// Backfill de l'historique BOAMP dans le fond `marche` : mois par mois,
+    /// les avis de marché puis les résultats de la même fenêtre, depuis 2010.
+    /// Manuel, jamais planifié. Idempotent et reprenable : relancer sur une
+    /// fenêtre déjà passée ne réécrit rien.
+    AnnoncesBackfill {
+        /// Premier mois inclus (`YYYY-MM-DD`, ramené au 1er du mois). Défaut :
+        /// 2010-01-01, le plancher du dataset. Après une coupure, reprendre au
+        /// dernier `mois` du journal.
+        #[arg(long)]
+        depuis: Option<String>,
+        /// Borne de fin exclue (`YYYY-MM-DD`).
+        #[arg(long)]
+        jusqu: String,
+    },
+    /// Enrichit les annonces ouvertes par leur page de détail : le code CPV et
+    /// la procédure, que les 11 moteurs de scraping ne portent pas en liste.
+    /// File dérivée (ouvertes, sans bloc `detail`, sans canal BOAMP), une page
+    /// par annonce et une seule fois dans sa vie. Quotidien. Idempotent.
+    AnnoncesEnrichir {
+        /// Pages tirées au plus par run.
+        #[arg(long, default_value_t = 2_000)]
+        limite: i64,
+        /// Minutes accordées à chaque moteur. Le défaut borne la quotidienne ; un
+        /// rattrapage manuel monte le plafond pour vider une file rationnée d'une
+        /// traite, à la cadence de son hôte.
+        #[arg(long, default_value_t = 15)]
+        budget_min: u64,
+        /// Rattrapage : tire les annonces sans libellé d'acheteur au lieu des
+        /// non visitées. Rouvre les fiches lues avant que leur extracteur ne
+        /// sache lire l'acheteur (Atexo). Manuel, jamais planifié.
+        #[arg(long, default_value_t = false)]
+        sans_acheteur: bool,
+    },
+    /// Recense les profils d'acheteurs cités par les avis BOAMP actifs et les
+    /// classe par moteur (`profil_acheteur`) — les moteurs multi-tenants
+    /// (Atexo, Safetender, Modula) en dépendent pour savoir quels hôtes énumérer.
+    /// Hebdomadaire. Idempotent.
+    AnnoncesDiscover,
+    /// Tient le stock `marche` en conformité : chaque ligne orpheline (uid
+    /// abandonné par un re-groupage, plus aucun canal) est résolue par ses
+    /// `details.liens` vers la ligne qui porte aujourd'hui ses canaux, puis
+    /// absorbée (redirection 301 + suppression). Étape quotidienne de la chaîne.
+    /// Idempotent.
+    AnnoncesRegulariser {
+        /// Réapplique aussi les règles de forme (titres, acheteurs, lots
+        /// d'attribution) à tout le stock — le filet hebdomadaire qui porte
+        /// une règle nouvelle au stock clos, que la moisson ne revisite pas.
+        #[arg(long)]
+        formes: bool,
+    },
+    /// Fusionne par leur jumelle les lignes `marche` ouvertes que seul le
+    /// BOAMP publie et dont l'avis déclare une plateforme de dépôt **sans
+    /// identifiant de dossier** : sans clé de jointure, la seule attache est
+    /// l'annonce que cette plateforme publie sous les mêmes titre et acheteur.
+    /// La ligne plateforme est l'élue, la ligne BOAMP est absorbée (redirection
+    /// 301 + suppression). **Dry-run par défaut** : sans `--applique`, la passe
+    /// journalise les paires et n'écrit rien. Idempotent.
+    AnnoncesJumeler {
+        /// Applique réellement les fusions (write). Sans ce flag : dry-run.
+        #[arg(long)]
+        applique: bool,
+    },
+    /// Ingère un export JSONL `bofip-vigueur` local (doctrine fiscale DGFiP) :
+    /// document BOI → `legal_text` (nature=BOFIP, préambule en `body`), §
+    /// numérotés → `legal_article`. Idempotent (snapshot : purge des versions/§
     /// hors export).
     Bofip {
         /// Chemin local de l'export `bofip-vigueur.jsonl`.
         #[arg(required = true)]
         path: std::path::PathBuf,
     },
-    /// Sync BOFiP (ADR 0196) : re-télécharge l'export open data `bofip-vigueur`
-    /// (data.economie.gouv.fr, snapshot des publications en vigueur) puis l'ingère.
-    /// Idempotent.
+    /// Sync BOFiP : re-télécharge l'export open data `bofip-vigueur`
+    /// (data.economie.gouv.fr, snapshot des publications en vigueur) puis
+    /// l'ingère. Idempotent.
     SyncBofip,
-    /// Sync du fond DILA CIRCULAIRES (ADR 0196) : stocks 2009-2014 + abrogations
-    /// historiques + flux chronologiques (last-write-wins par ID) → `legal_text`
-    /// nature=CIRCULAIRE (métadonnées + résumé ; corps = passe séparée
-    /// sync-circulaires-bodies). Reprend au dernier fichier ingéré (manifest).
-    /// Idempotent.
+    /// Sync du fond DILA CIRCULAIRES : stocks 2009-2014 + abrogations
+    /// historiques + flux chronologiques (last-write-wins par ID) →
+    /// `legal_text` nature=CIRCULAIRE (métadonnées + résumé ; corps = passe
+    /// séparée sync-circulaires-bodies). Reprend au dernier fichier ingéré
+    /// (manifest). Idempotent.
     SyncCirculaires,
-    /// Passe corps des circulaires (ADR 0222) : stocks PDF + PDF compagnons
-    /// des flux (last-write-wins par ID) → `legal_text.body` (pdftotext natif,
-    /// OCR Mistral cache-first en repli scanné). Reprend au dernier tarball
-    /// rejoué (manifest pdf). Idempotent.
+    /// Passe corps des circulaires : stocks PDF + PDF compagnons des flux
+    /// (last-write-wins par ID) → `legal_text.body` (pdftotext natif, OCR
+    /// Mistral cache-first en repli scanné). Reprend au dernier tarball rejoué
+    /// (manifest pdf). Idempotent.
     SyncCirculairesBodies,
     /// Corps des traités (TRAITE) et accords interprofessionnels (TI) depuis
-    /// les blocs sans numéro des stocks bulk JORF/KALI du cache (ADR 0223) :
+    /// les blocs sans numéro des stocks bulk JORF/KALI du cache :
     /// concaténation dans l'ordre du document → `legal_text.body` des fiches
     /// sans articles ni corps. Aucun téléchargement. Idempotent.
     BackfillTreatyBodies,
-    /// Sync ArianeWeb (ADR 0204) : analyses AJCE + existence des conclusions du
+    /// Sync ArianeWeb : analyses AJCE + existence des conclusions du
     /// rapporteur public (CRP) → bundles `commentaires[]` en `decision_sources`
     /// (source `ariane-web`, une ligne par décision CE). Année par année,
     /// reprend au manifeste, cache HTML sous state_dir. Idempotent.
@@ -289,152 +411,196 @@ enum Command {
     /// l'ADDE → commentaires doctrine web `kind:"note"` (liens sortants) des
     /// décisions rattachées par (dossier, date). Idempotent, non cherchable.
     SyncAdde,
-    /// Charge les commentaires de norme curés (ADR 0212) depuis
+    /// Charge les commentaires de norme curés depuis
     /// `<state_dir>/ingest/article-commentaires.json` → `article_commentaire`
-    /// (liens `kind:"note"` sur des articles de loi/traité). Idempotent.
+    /// (liens `kind:"note"` sur des articles de loi/traité). Entrées ancrées par
+    /// `slug` d'URL, résolues et vérifiées à chaque passage ; les entrées
+    /// absentes du dataset sont tombstonées. Idempotent, réconciliant.
     SeedArticleCommentaires,
-    /// Extrait les renvois norme→article (text_legal_citation, ADR 0217) et
-    /// les citations de jurisprudence (text_case_citation, ADR 0196 §5) de
-    /// TOUS les corps du référentiel — versions d'articles + corps
-    /// monolithiques — en une passe doc_extract. Idempotent.
+    /// Extrait les renvois norme→article (text_legal_citation) et les
+    /// citations de jurisprudence (text_case_citation) de TOUS les corps du
+    /// référentiel — versions d'articles + corps monolithiques — en une passe
+    /// doc_extract. Idempotent.
     ExtractTextRefs,
-    /// Ingère un stock ou un incrément JORF (Journal officiel, bulk DILA, ADR 0109)
+    /// Ingère un stock ou un incrément JORF (Journal officiel, bulk DILA)
     /// depuis un `tar.gz` local (`Freemium_jorf_global_*.tar.gz` ou incrément
     /// `JORF_*.tar.gz`). Deux passes : textes (`referential_texts`, tag
-    /// `treaty`/`jorf`) puis articles numérotés (`referential_articles`). Idempotent.
+    /// `treaty`/`jorf`) puis articles numérotés (`referential_articles`).
+    /// Idempotent.
     Jorf {
-        /// Chemin local de l'archive `tar.gz` JORF.
+        /// Chemins locaux d'archives `tar.gz` JORF (traitées dans l'ordre,
+        /// finisseurs une fois en fin de lot).
         #[arg(required = true)]
-        path: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
     },
-    /// Sync du fond JORF complet (ADR 0246, fiches + rôles + liens) : télécharge
+    /// Sync du fond JORF complet (fiches + rôles + liens) : télécharge
     /// stock/incréments DILA postérieurs au watermark puis les ingère (mécanique
     /// `sync-legi`). Idempotent, reprenable.
     SyncJorf,
-    /// Charge un corpus de loi curé générique (datasets `<state_dir>/ingest/
-    /// corpus/*.json`, règle #17) → `legal_text` + `legal_article`. Source-
-    /// agnostique : le JSON porte les métadonnées du texte + des `articles[]` **déjà
-    /// segmentés par la curation Python** (ADR 0118), chacun mono-version (`texte`)
-    /// ou multi-versions (`versions[]`, avenants des traités). Le loader est un pur
-    /// inséreur (seule transformation : `num_key = identity_key`, ADR 0236). Dataset
-    /// autoritaire (purge avant rechargement). Idempotent. ADR 0108/0109/0118.
-    /// Assigne les slugs manquants de `legal_text` (ADR 0162) : backfill puis
-    /// no-op (la passe tourne aussi en fin de chaque ingest référentiel).
+    /// Assigne les slugs manquants de `legal_text` : backfill puis no-op (la
+    /// passe tourne aussi en fin de chaque ingest référentiel).
     AssignSlugs,
-    /// Recalcule `legal_text.role` (ADR 0246, classification v1 conservatrice)
-    /// et aligne `legal_link.verb` sur le repli verbe/nom courant. Idempotent.
+    /// Recalcule `legal_text.role` (classification v1 conservatrice) et aligne
+    /// `legal_link.verb` sur le repli verbe/nom courant. Idempotent.
     BackfillTextRoles,
+    /// Déménage la chronique LEGI d'un instrument consolidée par DILA sous le
+    /// cid du véhicule : lignes LEGIARTI + arêtes TOC vers la fiche instrument
+    /// (arête publie). Liste fermée vérifiée à la main ; re-runnable après une
+    /// retouche DILA du dossier.
+    MoveChronicle {
+        /// Uid JORFTEXT du véhicule dont le dossier LEGI porte la chronique.
+        #[arg(long)]
+        vehicle: String,
+        /// Couples `<num_key>@<YYYY-MM-DD>` qui restent au véhicule (jumeaux
+        /// LEGI du dispositif dans un dossier mixte). Répétable.
+        #[arg(long)]
+        exclude: Vec<String>,
+    },
+    /// Re-frappe des uids de fiches par dataset JSONL
+    /// `{from, to, jurisdiction?}` (droit étranger par ordre juridique, stubs
+    /// EUR-Lex → EU/). Cascade articles/TOC/liens/citations texte, slug
+    /// inchangé ; suivre du drain reextract-fields --full --field
+    /// legal_references. Résumable.
+    RenameTexts {
+        /// Chemin du dataset JSONL de re-frappe.
+        dataset: std::path::PathBuf,
+    },
     /// Rebase les clés d'article (num_key et colonnes liées) vers la clé
-    /// publique slug (ADR 0209). One-shot, idempotent.
+    /// publique slug. One-shot, idempotent.
     RekeyArticleKeys,
     /// Rebase `legal_article.num_key` (+ liens possédés) et
     /// `legal_toc_edge.child_num_key` vers la clé d'IDENTITÉ recalculée depuis
-    /// le num source (ADR 0236). One-shot, idempotent.
+    /// le num source. One-shot, idempotent.
     RekeyIdentityKeys,
-    /// Purge du stock les citations procédurales (denylist ADR 0211) et
-    /// resynchronise les composites. One-shot, idempotent.
-    PurgeProceduralCitations,
     LoadLegalCorpus {
         /// Restreint le chargement aux datasets dont le nom contient cette sous-chaîne
         /// (chargement chirurgical, ex. `--only eu-rproc`). Défaut : tous les datasets.
         #[arg(long)]
         only: Option<String>,
     },
-    /// Génère les datasets catalogue EUR-Lex (règlements/directives UE cités mais
-    /// absents) sous `<state_dir>/ingest/corpus/`, via SPARQL Cellar, pilotés par
-    /// les slashnums réellement cités (spans non liés de `legal_citation`, ADR
-    /// 0138/0145). Entrées catalogue-seul (`articles: []`) ; auto-validées (le titre
-    /// FR doit porter le slashnum cité). À enchaîner avec `load-legal-corpus` ; les
-    /// citations s'attachent à la passe intégrale suivante. `--limit` borne aux N
-    /// slashnums les plus cités (rodage). Idempotent (skip datasets présents).
+    /// Génère les datasets catalogue EUR-Lex (règlements/directives UE cités
+    /// mais absents) sous `<state_dir>/ingest/corpus/`, via SPARQL Cellar,
+    /// pilotés par les slashnums réellement cités (spans non liés de
+    /// `legal_citation`). Entrées catalogue-seul (`articles: []`) ; auto-validées
+    /// (le titre FR doit porter le slashnum cité). À enchaîner avec
+    /// `load-legal-corpus` ; les citations s'attachent à la passe intégrale
+    /// suivante. `--limit` borne aux N slashnums les plus cités (rodage).
+    /// Idempotent (skip datasets présents).
     IngestEuCatalog {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Ingestion catalogue des règlements de procédure des juridictions UE (Cour de
-    /// justice, Tribunal, ex-TFP) — corpus gap ADR 0137 (≈25 K mentions CJUE). Écrit
-    /// des datasets catalogue curés (variantes = alias TSV du linker) ; enchaîner
-    /// avec `load-legal-corpus`. `--dry-run` liste sans écrire. Idempotent.
+    /// Sync quotidien du fond UE : chaque acte du registre (datasets
+    /// `eu-*.json`) suit sa dernière version consolidée applicable, sourcée en
+    /// Formex 4 via CELLAR (notice branch → manifestation `.FRA.fmx4` → item
+    /// cellar). En régime, un **delta SPARQL** (consolidations parues depuis le
+    /// watermark + versions futures à échéance) borne les sondes aux actes
+    /// touchés ; `--full` force le balayage intégral des notices (filet hebdo
+    /// auto-réparant, aussi le bootstrap quand le manifeste est vierge). Seuls
+    /// les datasets dont la version disponible diffère du marqueur
+    /// `consolidated_celex` sont régénérés puis rechargés (loader legal-corpus,
+    /// purge par texte). Les actes sans Formex gardent leur stock. Le skip est
+    /// gagé sur l'état DB (celex de `source_url`), pas sur le fichier.
+    /// `--limit` borne aux N premiers actes, `--only` filtre par sous-chaîne du
+    /// nom de dataset (rodage) — tous deux sans effet sur le manifeste —,
+    /// `--force` re-fetche et recharge tout.
+    SyncEuLaw {
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        only: Option<String>,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        full: bool,
+    },
+    /// Ingestion catalogue des règlements de procédure des juridictions UE
+    /// (Cour de justice, Tribunal, ex-TFP). Écrit des datasets catalogue curés
+    /// (variantes = alias TSV du linker) ; enchaîner avec `load-legal-corpus`.
+    /// `--dry-run` liste sans écrire. Idempotent.
     IngestEuRproc {
         #[arg(long)]
         dry_run: bool,
     },
     /// Rafraîchit la fraîcheur « as-of » des sources *live* autoritaires
-    /// (legifrance/kali/jorf) à la date du jour dans `ingest_freshness` (ADR 0129) :
-    /// re-confirme que la copie reflète le droit en vigueur. À lancer après chaque
-    /// ingest LEGI/KALI/JORF (cron). Idempotent (une ligne par source).
+    /// (legifrance/kali/jorf) à la date du jour dans `ingest_freshness` :
+    /// re-confirme que la copie reflète le droit en vigueur. À lancer après
+    /// chaque ingest LEGI/KALI/JORF (cron). Idempotent (une ligne par source).
     StampFreshness,
-    /// Retrofit ADR 0131 : reclasse les `source` catégorie/méthode hérités (`treaty`,
-    /// `eu-law`, `official-fr`, `traduction-automatique`) en libellés de diffuseur réels,
-    /// dérivés de `source_url`. Idempotent ; lignes sans URL hors bulk JORF laissées au
-    /// reload de curation (loguées). One-shot après déploiement.
+    /// Recalcule l'ordre de lecture (`legal_article.reading_rank`) des textes
+    /// sales — ceux dont un article a un rang `NULL`. Appelé en fin de chaque
+    /// pipeline qui écrit des articles ; en manuel pour le rattrapage.
+    /// Idempotent : une seconde passe n'écrit rien.
+    ReadingRanks,
+    /// Reclasse les `source` catégorie/méthode hérités (`treaty`, `eu-law`,
+    /// `official-fr`, `traduction-automatique`) en libellés de diffuseur réels,
+    /// dérivés de `source_url`. Idempotent ; lignes sans URL hors bulk JORF
+    /// laissées au reload de curation (loguées). One-shot après déploiement.
     RelabelSources,
-    /// Canonicalise les variantes d'hôte d'un diffuseur (`jafbase.fr` → `jafbase`) vers
-    /// son libellé unique (ADR 0131). Idempotent. One-shot post-déploiement.
+    /// Canonicalise les variantes d'hôte d'un diffuseur (`jafbase.fr` →
+    /// `jafbase`) vers son libellé unique. Idempotent. One-shot
+    /// post-déploiement.
     CanonicalizeSourceLabels,
-    /// Ingère un fond bulk DILA (`tar.gz` locaux sous `<cache>/dila/<fond>/tarballs/`,
-    /// ADR 0093) : `jade` (admin CE/CAA/TC), `constit` (Conseil constitutionnel).
-    /// Idempotent ; dédup ECLI-first (ADR 0080). INCA retiré (superset Judilibre, ADR 0099).
+    /// Ingère un fond bulk DILA (`tar.gz` locaux sous
+    /// `<cache>/dila/<fond>/tarballs/`) : `jade` (admin CE/CAA/TC), `constit`
+    /// (Conseil constitutionnel). Idempotent ; dédup par `canonical_ref`.
     IngestDila {
         /// Fond DILA à ingérer.
         #[arg(value_enum)]
         fond: pipeline::Fond,
     },
-    /// Sync incrémental d'un fond DILA (télécharge les incréments postérieurs au
-    /// watermark, ADR 0093). N'ingère rien — `ingest-dila` consomme les archives.
+    /// Sync incrémental d'un fond DILA (télécharge les incréments postérieurs
+    /// au watermark). N'ingère rien — `ingest-dila` consomme les archives.
     SyncDila {
         /// Fond DILA à synchroniser.
         #[arg(value_enum)]
         fond: pipeline::Fond,
     },
-    /// Backfill de la colonne `decisions.ecli` depuis `source_fields->>'ecli'`
-    /// (ADR 0093) : rend la dédup ECLI-first (ADR 0080) active sur les lignes
-    /// historiques (Judilibre porte l'ECLI dans son payload, colonne NULL).
+    /// Backfill de la colonne `decisions.ecli` depuis
+    /// `source_fields->>'ecli'` : expose l'ECLI sur les lignes historiques
+    /// (Judilibre le porte dans son payload, colonne NULL).
     /// Keyset batché, idempotent.
     BackfillEcli,
-    /// Construit le vocabulaire d'autocomplétion (ADR 0219) : n-grammes 1-3
-    /// comptés sur un échantillon des décisions + articles + titres, FST
-    /// déposé en blob dans `suggest_index`. Relançable (remplace le blob).
+    /// Construit le vocabulaire d'autocomplétion : n-grammes 1-3 comptés sur
+    /// un échantillon des décisions + articles + titres, FST déposé en blob dans
+    /// `suggest_index`. Relançable (remplace le blob).
     BuildSuggest,
-    /// Re-dérive `decisions.canonical_ref` (ADR 0100). Sans `--force` : ne traite
-    /// que les `NULL` (peuplement). Avec `--force` : **re-dérive toutes** les
-    /// décisions (`full_text` présent) pour migrer les clés 3-champs historiques
-    /// `{nom}|{rg}|{date}` en 4-champs `{type}|{location}|{rg}|{date}` (fix
-    /// cross-court 2026-06-15). Pur calcul, aucun re-embed ; une clé `None` laisse
-    /// l'existante (jamais d'écrasement vers `NULL`).
+    /// Re-dérive `decisions.canonical_ref`. Sans `--force` : ne traite que les
+    /// `NULL` (peuplement). Avec `--force` : **re-dérive toutes** les décisions
+    /// (`full_text` présent) pour migrer les clés 3-champs historiques
+    /// `{nom}|{rg}|{date}` en 4-champs `{type}|{location}|{rg}|{date}`. Pur
+    /// calcul, aucun re-embed ; une clé `None` laisse l'existante (jamais
+    /// d'écrasement vers `NULL`).
     BackfillCanonicalRef {
         /// Re-dérive toutes les décisions (pas seulement `canonical_ref IS NULL`).
         #[arg(long)]
         force: bool,
     },
-    /// Fusion rétroactive des **faux splits cross-source** (ADR 0098/0100/0106) :
-    /// décisions distinctes au même `canonical_ref` avec sources **disjointes** =
-    /// même décision multi-sources (p.ex. 33 CAA JADE↔opendata réalignées par la
-    /// clé RG). Garde l'autorité (rang max), fusionne les autres dedans. Jamais de
-    /// fusion intra-source (ADR 0104). Aucun re-embed. Idempotent.
+    /// Fusion rétroactive des **faux splits cross-source** : décisions
+    /// distinctes au même `canonical_ref` avec sources **disjointes** = même
+    /// décision multi-sources. Garde l'autorité (rang max), fusionne les autres
+    /// dedans. Jamais de fusion intra-source. Aucun re-embed. Idempotent.
     MergeCrossSourceDuplicates,
-    /// Re-ingest **ciblé** des décisions opendata dont l'autorité a basculé sur
-    /// opendata (rang 55 généré, ADR 0109) mais dont le `full_text` reste figé sur
-    /// la provenance rang 50 (jade/constit/cedh/cjue/cnda) qui gagnait quand
-    /// opendata valait 40 — ~61,7k CAA/CE. Re-parse leur payload opendata (seuls les
-    /// ZIPs portant une cible sont ouverts) en mode All : re-chunk + re-embed (vLLM
-    /// strict, jamais Cloudflare) + réécriture du `full_text` opendata. One-shot,
-    /// hors cron. Idempotent (rejoué, ne re-flippe que ce qui n'est pas déjà à jour).
+    /// Re-ingest **ciblé** des décisions opendata dont l'autorité a basculé
+    /// sur opendata mais dont le `full_text` reste figé sur une provenance de
+    /// rang inférieur (jade/constit/cedh/cjue/cnda). Re-parse leur payload
+    /// opendata (seuls les ZIPs portant une cible sont ouverts) en mode All :
+    /// re-chunk + re-embed (vLLM strict) + réécriture du `full_text` opendata.
+    /// One-shot, hors cron. Idempotent.
     ReingestStaleOpendata,
-    /// Analyse **read-only** des faux merges judilibre (#29 / ADR 0100) : recalcule
+    /// Analyse **read-only** des faux merges judilibre : recalcule
     /// `canonical_ref` par provenance sur les décisions multi-provenances
     /// tout-judilibre et compte légitimes / ambiguës / faux merges (clés
     /// divergentes). N'écrit rien — mesure l'ampleur avant le re-split.
     AnalyzeFalseMerges,
-    /// Réparation des faux merges judilibre (#29 / ADR 0100 §5). **`--dry-run` par
-    /// défaut** (read-only) : recalcule `canonical_ref` par provenance, planifie le
+    /// Réparation des faux merges judilibre. **`--dry-run` par défaut**
+    /// (read-only) : recalcule `canonical_ref` par provenance, planifie le
     /// scinde (groupe gardé = celui de l'autorité ; groupes divergents à
-    /// reconstituer) et émet le PLAN sans **aucune** écriture. `--execute` (write,
-    /// gaté JADE + 0065 + GPU libre) : crée les décisions scindées, re-fetch les
-    /// `source_uid` divergents + le groupe gardé + ré-ingère (re-chunk + re-embed
-    /// ciblé vLLM local, jamais Cloudflare). Transaction par cluster, reprise
-    /// idempotente. `--limit` borne le 1ᵉʳ rollout (s'arrête après N clusters
-    /// réparés) pour auditer avant la passe complète.
+    /// reconstituer) et émet le PLAN sans **aucune** écriture. `--execute`
+    /// (write, gaté JADE + GPU libre) : crée les décisions scindées, re-fetch
+    /// les `source_uid` divergents + le groupe gardé + ré-ingère (re-chunk +
+    /// re-embed ciblé vLLM local). Transaction par cluster, reprise idempotente.
+    /// `--limit` borne le 1ᵉʳ rollout (s'arrête après N clusters réparés).
     ResplitFalseMerges {
         /// Applique réellement le scinde (write). Sans ce flag : dry-run read-only.
         #[arg(long)]
@@ -447,9 +613,9 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Défait les faux merges **intra-source** judilibre (ADR 0104) : détache
-    /// chaque provenance perdante (≥2 judilibre/décision) vers sa propre décision
-    /// et la re-matérialise **depuis le cache local** (re-chunk + re-embed vLLM).
+    /// Défait les faux merges **intra-source** judilibre : détache chaque
+    /// provenance perdante (≥2 judilibre/décision) vers sa propre décision et la
+    /// re-matérialise **depuis le cache local** (re-chunk + re-embed vLLM).
     UnmergeSameSource {
         /// Applique réellement (write + GPU). Sans ce flag : dry-run read-only.
         #[arg(long)]
@@ -459,9 +625,9 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Défait les faux merges **intra-source** `dila-jade` (ADR 0104, #47) :
-    /// analogue de `unmerge-same-source` pour le fond DILA JADE. Re-matérialise
-    /// chaque perdante depuis les **tarballs locaux** (streaming, re-embed vLLM).
+    /// Défait les faux merges **intra-source** `dila-jade` : analogue de
+    /// `unmerge-same-source` pour le fond DILA JADE. Re-matérialise chaque
+    /// perdante depuis les **tarballs locaux** (streaming, re-embed vLLM).
     UnmergeSameSourceDila {
         /// Applique réellement (write + GPU). Sans ce flag : dry-run read-only.
         #[arg(long)]
@@ -472,7 +638,7 @@ enum Command {
         limit: Option<usize>,
     },
     /// Bootstrap CEDH (HUDOC) : balaye toutes les années, fetch les arrêts FR
-    /// (HFJUD) et les ingère (ADR 0094). Idempotent par `content_checksum`.
+    /// (HFJUD) et les ingère. Idempotent par `content_checksum`.
     IngestCedh {
         /// Première année balayée (défaut : 1960). Backfill ciblé d'un trou
         /// d'ingest sans re-lister le fonds ancien.
@@ -487,36 +653,74 @@ enum Command {
         #[arg(long)]
         from_year: Option<i32>,
     },
-    /// Bootstrap CJUE (EUR-Lex) : balaye toutes les années, fetch le texte FR des
-    /// arrêts/ordonnances et les ingère (ADR 0094). Idempotent.
+    /// Bootstrap CJUE (EUR-Lex) : balaye toutes les années, fetch le texte FR
+    /// des arrêts/ordonnances et les ingère. Idempotent.
     IngestCjue,
-    /// Sync incrémental CEDH : ne balaye que l'année courante (ADR 0094).
+    /// Sync incrémental CEDH : ne balaye que l'année courante.
     SyncCedh,
-    /// Sync incrémental CJUE : ne balaye que l'année courante (ADR 0094).
+    /// Sync incrémental CJUE : ne balaye que l'année courante.
     SyncCjue,
-    /// Bootstrap CNDA (Cour nationale du droit d'asile, ADR 0096) : crawl la liste
+    /// Bootstrap CNDA (Cour nationale du droit d'asile) : crawl la liste
     /// jurisprudentielle paginée de `cnda.fr`, fusionne fiche HTML + PDF lié par
     /// numéro et les ingère (`source_uid = cnda/<numero>`, ECLI fabriqué).
     /// Idempotent par `content_checksum`. `--mode all` force la ré-extraction
     /// complète (re-OCR + ré-chunk/ré-embed) de toutes les décisions, même à
-    /// PDF inchangé — utilisé après un changement d'extraction (bascule OCR).
-    /// `--only <numéro>` (répétable) : ne ré-ingère que ces décisions précises —
-    /// crawl la liste mais ne traite/persiste que les numéros visés (re-OCR forcé,
-    /// ne touche pas le watermark). Pour récupérer un scanné jamais persisté ou
-    /// rafraîchir une décision sans re-balayer tout le corpus.
+    /// PDF inchangé. `--only <numéro>` (répétable) : ne ré-ingère que ces
+    /// décisions précises — crawl la liste mais ne traite/persiste que les
+    /// numéros visés (re-OCR forcé, ne touche pas le watermark).
     IngestCnda {
         #[arg(long, value_enum, default_value_t = pipeline::IngestMode::MissingHash)]
         mode: pipeline::IngestMode,
         #[arg(long)]
         only: Vec<String>,
     },
-    /// Sync incrémental CNDA : reprend le crawl à la page suivant le watermark
-    /// (ADR 0096).
+    /// Sync incrémental CNDA : reprend le crawl à la page suivant le
+    /// watermark.
     SyncCnda,
-    /// Charge un registre d'entités (ADR 0179) : SIRENE, RNA, annuaire des
-    /// avocats (CNB) ou avocats aux Conseils (`oacc:`, snapshot curé, ADR 0190)
-    /// — découverte data.gouv + download streamé (bulk) ou lecture du JSON curé
-    /// sous `ingest/corpus/registries/`, remplacement de namespace.
+    /// Sonde JuriCAF : charge les pages « arrêt » téléchargées sous
+    /// `<state_dir>/ingest/juricaf-probe/html/` (repérage du fond francophone,
+    /// référentiel `jurisdiction` minté depuis l'URN:LEX des pages).
+    JuricafProbe {
+        /// Dossier des pages HTML (défaut : `<state_dir>/ingest/juricaf-probe/html`).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Backfill `article_scope` depuis les compteurs d'applicabilité
+    /// outre-mer : `etend`/`ecarte` vers NC/PF/WF/TF, version cible résolue par
+    /// l'ancre de rédaction ou gelée à la date du compteur. Dry-run par défaut.
+    ScopeBackfillCompteurs {
+        /// Collectivité : PF, NC, WF ou TF.
+        #[arg(long, default_value = "PF")]
+        collectivite: String,
+        /// Restreint à un texte (LEGITEXT…) pour un pilote ciblé.
+        #[arg(long)]
+        text_uid: Option<String>,
+        /// Écrit en base (sinon dry-run).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Backfill Alsace-Moselle : clauses des trois départements →
+    /// restreint/ecarte `geo:FR-ALS`, textes entièrement locaux →
+    /// `legal_text.default_scope`. Dry-run par défaut.
+    ScopeBackfillAlsace {
+        /// Écrit en base (sinon dry-run).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Backfill `solution_uid` dans les `source_fields` CNDA : les provenances
+    /// écrites avant que le parser ne pose la clé ne la portent pas, et la
+    /// ré-extraction rend alors la déduction générique au lieu du dispositif lu.
+    /// Recalculé depuis `(full_text, source_fields)`, sans re-télécharger.
+    /// Dry-run par défaut.
+    BackfillCndaSolution {
+        /// Écrit en base (sinon dry-run).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Charge un registre d'entités : SIRENE, RNA, annuaire des avocats (CNB)
+    /// ou avocats aux Conseils (`oacc:`, snapshot curé) — découverte data.gouv +
+    /// download streamé (bulk) ou lecture du JSON curé sous
+    /// `ingest/corpus/registries/`, remplacement de namespace.
     Registries {
         #[arg(value_enum)]
         source: pipeline::RegistrySource,
@@ -524,12 +728,15 @@ enum Command {
         #[arg(long)]
         with_history: bool,
     },
-    /// Backfill decision_party depuis les colonnes NER + résolution vers le
-    /// référentiel d'entités (ADR 0181) — TRUNCATE + COPY, rejouable.
-    PartiesBackfill,
     /// Résout les clés pendantes decision_party → entity (post-rechargement
     /// mensuel de registre).
-    PartiesRelink,
+    PartiesRelink {
+        /// Toutes les passes pleines (dépliage SIRENE/RNA) — one-shot post-reload
+        /// de registre. Sans le flag : passe « cabinets normalisés » + recount
+        /// annuaire (hebdo).
+        #[arg(long)]
+        full: bool,
+    },
     /// Maintenance DB (sous-commandes).
     #[command(subcommand)]
     Db(DbCommand),
@@ -539,24 +746,22 @@ enum Command {
 enum DbCommand {
     /// ANALYZE des tables.
     Analyze,
-    /// Reconstruit l'index de recherche.
+    /// Maintenance hebdomadaire des tables de recherche : REINDEX TABLE
+    /// CONCURRENTLY + VACUUM, sans indisponibilité.
     ReindexSearch,
-    /// VACUUM FULL sur les chunks.
-    VacuumFullChunks,
+    /// VACUUM FULL des tables de recherche — repli MANUEL : compacte heap et
+    /// TOAST en rendant l'espace à l'OS, au prix d'un lock exclusif par table.
+    /// Hors chaîne planifiée.
+    VacuumFull,
     /// GC des tokens/clients MCP expirés.
     GcMcp,
-    /// Réconcilie les liens « pendants » (ADR 0240) : rejoue les quatre
-    /// résolveurs batch (chronologie, citations décision→décision et
-    /// texte→décision, acteurs) + reconstruit l'annuaire. Idempotent — outil de
-    /// rattrapage après un ingest interrompu, sans re-extraction.
-    Reconcile,
     /// Préchauffe le cache (prewarm).
     Prewarm,
     /// Purge les tombstones **orphelins** (retraits totaux : retirés, vidés,
     /// sans provenance active). Dry-run par défaut ; `--apply` pour supprimer.
     PurgeOrphanTombstones {
         /// Supprime réellement. Sans ce flag : compte + échantillon, aucune
-        /// suppression (ceinture-bretelle).
+        /// suppression.
         #[arg(long)]
         apply: bool,
     },
@@ -567,6 +772,7 @@ impl Command {
     /// Loki : `phase="ingest"`). Statique, indépendant des args.
     fn label(&self) -> &'static str {
         match self {
+            Command::Chain { .. } => "chain",
             Command::Sync => "sync",
             Command::JudilibreRanges => "judilibre-ranges",
             Command::Analyze => "analyze",
@@ -579,6 +785,11 @@ impl Command {
             Command::PurgeReverses => "purge-reverses",
             Command::GenerateSummaries { .. } => "generate-summaries",
             Command::ResyncLegalArrays => "resync-legal-arrays",
+            Command::RekeyCnb { .. } => "rekey-cnb",
+            Command::CnbHistory { .. } => "cnb-history",
+            Command::PartiesReconcile { .. } => "parties-reconcile",
+            Command::DeriveAffiliations { .. } => "derive-affiliations",
+            Command::Reconcile => "reconcile",
             Command::Sitemap { .. } => "sitemap",
             Command::Indexnow { .. } => "indexnow",
             Command::Legi { .. } => "legi",
@@ -588,6 +799,12 @@ impl Command {
             Command::BackfillTextes { .. } => "backfill-textes",
             Command::Kali { .. } => "kali",
             Command::SyncKali => "sync-kali",
+            Command::Annonces => "annonces",
+            Command::AnnoncesBackfill { .. } => "annonces-backfill",
+            Command::AnnoncesEnrichir { .. } => "annonces-enrichir",
+            Command::AnnoncesDiscover => "annonces-discover",
+            Command::AnnoncesRegulariser { .. } => "annonces-regulariser",
+            Command::AnnoncesJumeler { .. } => "annonces-jumeler",
             Command::Bofip { .. } => "bofip",
             Command::SyncBofip => "sync-bofip",
             Command::SyncCirculaires => "sync-circulaires",
@@ -601,13 +818,16 @@ impl Command {
             Command::SyncJorf => "sync-jorf",
             Command::AssignSlugs => "assign-slugs",
             Command::BackfillTextRoles => "backfill-text-roles",
+            Command::MoveChronicle { .. } => "move-chronicle",
+            Command::RenameTexts { .. } => "rename-texts",
             Command::RekeyArticleKeys => "rekey-article-keys",
             Command::RekeyIdentityKeys => "rekey-identity-keys",
-            Command::PurgeProceduralCitations => "purge-procedural-citations",
             Command::LoadLegalCorpus { .. } => "load-legal-corpus",
             Command::IngestEuCatalog { .. } => "ingest-eu-catalog",
+            Command::SyncEuLaw { .. } => "sync-eu-law",
             Command::IngestEuRproc { .. } => "ingest-eu-rproc",
             Command::StampFreshness => "stamp-freshness",
+            Command::ReadingRanks => "reading-ranks",
             Command::RelabelSources => "relabel-sources",
             Command::CanonicalizeSourceLabels => "canonicalize-source-labels",
             Command::IngestDila { .. } => "ingest-dila",
@@ -628,14 +848,16 @@ impl Command {
             Command::SyncCjue => "sync-cjue",
             Command::IngestCnda { .. } => "ingest-cnda",
             Command::SyncCnda => "sync-cnda",
+            Command::JuricafProbe { .. } => "juricaf-probe",
+            Command::ScopeBackfillCompteurs { .. } => "scope-backfill-compteurs",
+            Command::ScopeBackfillAlsace { .. } => "scope-backfill-alsace",
+            Command::BackfillCndaSolution { .. } => "backfill-cnda-solution",
             Command::Registries { .. } => "registries",
-            Command::PartiesBackfill => "parties-backfill",
-            Command::PartiesRelink => "parties-relink",
+            Command::PartiesRelink { .. } => "parties-relink",
             Command::Db(DbCommand::Analyze) => "db:analyze",
             Command::Db(DbCommand::ReindexSearch) => "db:reindex-search",
-            Command::Db(DbCommand::VacuumFullChunks) => "db:vacuum-full-chunks",
+            Command::Db(DbCommand::VacuumFull) => "db:vacuum-full",
             Command::Db(DbCommand::GcMcp) => "db:gc-mcp",
-            Command::Db(DbCommand::Reconcile) => "db:reconcile",
             Command::Db(DbCommand::Prewarm) => "db:prewarm",
             Command::Db(DbCommand::PurgeOrphanTombstones { .. }) => "db:purge-orphan-tombstones",
         }
@@ -647,36 +869,29 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let settings = Settings::from_env()?;
 
-    // Callback global (port de `_main`) : installe le subscriber + l'export OTLP
-    // avant toute sous-commande. Le guard est tenu vivant pour tout le process :
-    // son `Drop` flush les batch processors (cron court-vivant → sans ça les
-    // derniers spans/logs ne partiraient pas vers Grafana Cloud).
     let _telemetry_guard = init_telemetry(&cli.log_level, &settings)?;
     install_panic_hook();
 
-    let result = run_with_watchdog(cli.command, settings.watchdog_secs).await;
+    let result = match cli.command {
+        Command::Chain { kind } => chain::run(kind, settings.watchdog_secs).await,
+        command => run_with_watchdog(command, settings.watchdog_secs).await,
+    };
     arm_teardown_sentinel();
     result
 }
 
-/// Délai accordé au teardown post-commande (flush télémétrie + drop du runtime)
-/// avant que la sentinelle ne considère le process comme coincé. Le flush OTLP
-/// est borné à ~5 s par provider (3 providers) : 60 s = large marge.
+/// Délai accordé au teardown post-commande (flush télémétrie + drop du
+/// runtime) avant que la sentinelle ne considère le process comme coincé.
 const TEARDOWN_SENTINEL_SECS: u64 = 60;
 
 /// Arme un thread détaché qui, si le process est encore vivant
-/// [`TEARDOWN_SENTINEL_SECS`] après la fin de la commande, dumpe l'état de tous
-/// les threads (`/proc/self/task/*` : comm, état, wchan) sur **stderr** puis
-/// `abort()`.
+/// [`TEARDOWN_SENTINEL_SECS`] après la fin de la commande, dumpe l'état de
+/// tous les threads (`/proc/self/task/*` : comm, état, wchan) sur **stderr**
+/// puis `abort()`.
 ///
 /// Le teardown (Drop du `TelemetryGuard` puis du runtime tokio) est la seule
-/// phase qui ne peut ni logger sa fin ni être couverte par le watchdog : un
-/// blocage là (ex. `Runtime::drop` attendant une tâche `spawn_blocking`
-/// orpheline coincée sur du réseau) pendait le process en silence — invisible
-/// sans un humain devant un `eu-stack`. La sentinelle rend le diagnostic
-/// autonome (le dump part vers journald via supercronic côté cron) et fait
-/// échouer la chaîne `&&` / le deploy vite et fort au lieu de pendre.
-/// À la sortie normale le thread, détaché et endormi, meurt avec le process.
+/// phase qui ne peut ni logger sa fin ni être couverte par le watchdog. À la
+/// sortie normale le thread, détaché et endormi, meurt avec le process.
 fn arm_teardown_sentinel() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(TEARDOWN_SENTINEL_SECS));
@@ -718,15 +933,14 @@ fn arm_teardown_sentinel() {
 /// Exécute la commande sous un watchdog + breadcrumbs de cycle de vie.
 ///
 /// - **Watchdog** : au-delà de `watchdog_secs`, on logge une erreur et on
-///   abandonne avec un `Err` (code non nul) au lieu de rester pendu. Le `&&` du
-///   cron casse alors proprement (le 2026-06-11, faute de borne, la chaîne est
-///   restée pendue ~7 h après l'ingest jusqu'au reboot). `0` = désactivé.
-/// - **Breadcrumbs** : `info!` début + `info!`/`error!` fin, shippés vers Loki
-///   (bridge ingest à INFO). Un « début » sans « fin » localise un hang.
+///   abandonne avec un `Err` (code non nul) au lieu de rester pendu. Le `&&`
+///   du cron casse alors proprement. `0` = désactivé.
+/// - **Breadcrumbs** : `info!` début + `info!`/`error!` fin, shippés vers
+///   Loki. Un « début » sans « fin » localise un hang.
 ///
-/// Le timer du watchdog vit sur le runtime multi-thread : même si la commande
-/// bloque un worker, le timeout se déclenche, `main` rend `Err`, le guard flush
-/// les logs et le process sort (les threads orphelins meurent à l'exit).
+/// Le timer du watchdog vit sur le runtime multi-thread : même si la
+/// commande bloque un worker, le timeout se déclenche, `main` rend `Err`, le
+/// guard flush les logs et le process sort.
 async fn run_with_watchdog(command: Command, watchdog_secs: u64) -> Result<()> {
     let phase = command.label();
     let started = Instant::now();
@@ -759,7 +973,8 @@ async fn run_with_watchdog(command: Command, watchdog_secs: u64) -> Result<()> {
             ))
         }
         Err(e) => {
-            tracing::error!(phase, elapsed_s, error = %e, "commande lj-ingest : échec");
+            // `{e:#}` et non `{e}` : l'alternate déplie la chaîne anyhow sur une ligne.
+            tracing::error!(phase, elapsed_s, error = %format!("{e:#}"), "commande lj-ingest : échec");
             Err(e)
         }
     }
@@ -777,17 +992,19 @@ fn install_panic_hook() {
     }));
 }
 
-/// Construit les `InitOpts` (niveau parité Python + format + creds OTLP via
-/// `Settings`, regle #5) et installe la telemetrie partagee. `service.name =
-/// librejustice-ingest`.
+/// Construit les `InitOpts` (niveau + format + creds OTLP via `Settings`)
+/// et installe la telemetrie partagee. `service.name = librejustice-ingest`.
 fn init_telemetry(log_level: &str, settings: &Settings) -> Result<TelemetryGuard> {
     let level = logging::resolve_level(Some(log_level));
+    // `rustls_platform_verifier` loggue en ERROR chaque certificat invalide : le
+    // recensement des profils d'acheteurs sonde des milliers de sites publics dont
+    // beaucoup ont un certificat qui ne couvre pas leur propre nom. Le niveau global
+    // est répété dans la chaîne de directives : la directive par défaut du builder ne
+    // s'applique que si la chaîne est vide.
     let filter = EnvFilter::builder()
         .with_default_directive(level.into())
-        .parse_lossy("");
+        .parse_lossy(format!("{level},rustls_platform_verifier=off"));
 
-    // Creds OTLP lus via Settings (jamais d'env dispersé). Les trois presents →
-    // export actif ; sinon subscriber fmt seul (dev local).
     let otlp = match (
         settings.grafana_otlp_endpoint.clone(),
         settings.grafana_otlp_user.clone(),
@@ -807,16 +1024,14 @@ fn init_telemetry(log_level: &str, settings: &Settings) -> Result<TelemetryGuard
         service_name: settings.otel_service_name.clone(),
         deployment_environment: settings.deployment_environment.clone(),
         // Ingest (cron, bas volume) : on ship INFO+ pour les breadcrumbs de phase.
-        otlp_log_level: LevelFilter::INFO,
+        otlp_log_filter: Targets::new().with_default(LevelFilter::INFO),
         otlp,
     })
 }
 
-/// Dispatch des sous-commandes (port du corps de chaque `@app.command` de
-/// `cli.py`). Chaque branche construit `Settings`, le pool DB et les clients
-/// nécessaires comme la commande Typer correspondante.
 async fn dispatch(command: Command) -> Result<()> {
     match command {
+        Command::Chain { .. } => unreachable!("Command::Chain est déroulée par main"),
         Command::Sync => cmd_sync().await,
         Command::JudilibreRanges => cmd_judilibre_ranges().await,
         Command::Analyze => cmd_analyze(),
@@ -824,7 +1039,8 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::UsageTerms {
             chunks,
             min_citations,
-        } => usage_terms::run(chunks, min_citations).await,
+            workers,
+        } => usage_terms::run(chunks, min_citations, workers).await,
         Command::Ingest {
             with_embeddings,
             mode,
@@ -835,6 +1051,7 @@ async fn dispatch(command: Command) -> Result<()> {
         } => cmd_refetch(ids, with_embeddings).await,
         Command::ReextractFields {
             overwrite,
+            dry_run,
             full,
             jurisdiction_type,
             field,
@@ -843,6 +1060,7 @@ async fn dispatch(command: Command) -> Result<()> {
         } => {
             cmd_reextract_fields(
                 overwrite,
+                dry_run,
                 full,
                 jurisdiction_type,
                 field,
@@ -859,6 +1077,11 @@ async fn dispatch(command: Command) -> Result<()> {
             refresh_stale,
         } => summary_pipeline_generate(limit, concurrency, refresh_stale).await,
         Command::ResyncLegalArrays => citations_maintenance::resync_arrays().await,
+        Command::RekeyCnb { apply } => pipeline::rekey_cnb(apply).await,
+        Command::CnbHistory { apply } => pipeline::replay_cnb_history(apply).await,
+        Command::PartiesReconcile { workers } => pipeline::reconcile_parties(workers).await,
+        Command::DeriveAffiliations { apply } => pipeline::derive_affiliations(apply).await,
+        Command::Reconcile => pipeline::reconcile_all().await,
         Command::Sitemap { dry_run } => cmd_sitemap(dry_run).await,
         Command::Indexnow {
             since_hours,
@@ -871,6 +1094,23 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::BackfillTextes { paths } => pipeline::backfill_textes(&paths).await,
         Command::Kali { path } => pipeline::ingest_kali(&path).await,
         Command::SyncKali => pipeline::sync_kali().await,
+        Command::Annonces => pipeline::annonces().await,
+        Command::AnnoncesBackfill { depuis, jusqu } => {
+            let date = |s: &str| {
+                s.parse::<jiff::civil::Date>()
+                    .map_err(|e| anyhow!("date {s} illisible: {e}"))
+            };
+            let depuis = depuis.as_deref().map(date).transpose()?;
+            pipeline::annonces_backfill(depuis, date(&jusqu)?).await
+        }
+        Command::AnnoncesEnrichir {
+            limite,
+            budget_min,
+            sans_acheteur,
+        } => pipeline::annonces_enrichir(limite, budget_min, sans_acheteur).await,
+        Command::AnnoncesDiscover => pipeline::annonces_discover().await,
+        Command::AnnoncesRegulariser { formes } => pipeline::annonces_regulariser(formes).await,
+        Command::AnnoncesJumeler { applique } => pipeline::annonces_jumeler(applique).await,
         Command::Bofip { path } => pipeline::ingest_bofip(&path).await,
         Command::SyncBofip => pipeline::sync_bofip().await,
         Command::SyncCirculaires => pipeline::sync_circulaires().await,
@@ -880,17 +1120,27 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::SyncAdde => pipeline::sync_adde().await,
         Command::SeedArticleCommentaires => pipeline::seed_article_commentaires().await,
         Command::ExtractTextRefs => pipeline::extract_text_refs().await,
-        Command::Jorf { path } => pipeline::ingest_jorf(&path).await,
+        Command::Jorf { paths } => pipeline::ingest_jorf(&paths).await,
         Command::SyncJorf => pipeline::sync_jorf().await,
         Command::AssignSlugs => pipeline::assign_slugs().await,
         Command::BackfillTextRoles => pipeline::backfill_text_roles().await,
+        Command::MoveChronicle { vehicle, exclude } => {
+            pipeline::move_chronicle(&vehicle, &exclude).await
+        }
+        Command::RenameTexts { dataset } => pipeline::rename_texts(&dataset).await,
         Command::RekeyArticleKeys => pipeline::rekey_article_keys().await,
         Command::RekeyIdentityKeys => pipeline::rekey_identity_keys().await,
-        Command::PurgeProceduralCitations => pipeline::purge_procedural_citations().await,
         Command::LoadLegalCorpus { only } => pipeline::load_legal_corpus(only.as_deref()).await,
         Command::IngestEuCatalog { limit } => pipeline::ingest_eu_catalog(limit).await,
+        Command::SyncEuLaw {
+            limit,
+            only,
+            force,
+            full,
+        } => pipeline::sync_eu_law(limit, only.as_deref(), force, full).await,
         Command::IngestEuRproc { dry_run } => pipeline::ingest_eu_rproc(dry_run).await,
         Command::StampFreshness => pipeline::stamp_freshness().await,
+        Command::ReadingRanks => pipeline::reading_ranks().await,
         Command::RelabelSources => pipeline::relabel_sources().await,
         Command::CanonicalizeSourceLabels => pipeline::canonicalize_source_labels().await,
         Command::IngestDila { fond } => pipeline::ingest_dila(fond).await,
@@ -919,18 +1169,23 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::SyncCjue => pipeline::sync_cjue().await,
         Command::IngestCnda { mode, only } => pipeline::ingest_cnda(mode, only).await,
         Command::SyncCnda => pipeline::sync_cnda().await,
+        Command::JuricafProbe { dir } => pipeline::juricaf_probe(dir).await,
+        Command::ScopeBackfillCompteurs {
+            collectivite,
+            text_uid,
+            apply,
+        } => pipeline::scope_backfill_compteurs(collectivite, text_uid, apply).await,
+        Command::ScopeBackfillAlsace { apply } => pipeline::scope_backfill_alsace(apply).await,
+        Command::BackfillCndaSolution { apply } => pipeline::backfill_cnda_solution(apply).await,
         Command::Registries {
             source,
             with_history,
         } => pipeline::load_registries(source, with_history).await,
-        Command::PartiesBackfill => pipeline::backfill_parties().await,
-        Command::PartiesRelink => pipeline::relink_parties().await,
+        Command::PartiesRelink { full } => pipeline::relink_parties(full).await,
         Command::Db(db_command) => cmd_db(db_command).await,
     }
 }
 
-/// Pool deadpool sur la DB cible + migrations idempotentes appliquées (factorise
-/// le `db_connect(url); apply_migrations(conn)` répété dans `cli.py`).
 async fn pool_with_migrations(settings: &Settings) -> Result<deadpool_postgres::Pool> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
@@ -942,39 +1197,32 @@ async fn pool_with_migrations(settings: &Settings) -> Result<deadpool_postgres::
 }
 
 /// Pool deadpool sans migrations (pour les commandes de maintenance DB qui ne
-/// veulent pas toucher au schéma).
-async fn pool_only(settings: &Settings) -> Result<deadpool_postgres::Pool> {
-    lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))
+/// veulent pas toucher au schéma). `pool_max` : 4 suffit partout sauf
+/// `db vacuum-full` (une connexion par table en parallèle + la connexion
+/// partagée de `cmd_db`).
+async fn pool_only(settings: &Settings, pool_max: usize) -> Result<deadpool_postgres::Pool> {
+    lj_store::db::build_pool(&settings.db_url, pool_max).map_err(|e| anyhow!("build_pool: {e}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sync (port de `cmd_sync`)
+// sync
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Synchronise le cache local des deux sources (opendata + Judilibre), comme
-/// `cmd_sync` sans argument (toutes les sources, options par défaut).
-///
-/// Le clap `Sync` ne porte pas les options Typer (`--juridictions`, `--from`,
-/// `--max-workers`, …) : on appelle les syncers `lj-sources` avec leurs valeurs
-/// par défaut, identiques aux défauts Typer (`earliest=DEFAULT_EARLIEST`,
-/// `latest=None`, `force=False`).
 async fn cmd_sync() -> Result<()> {
     let settings = Settings::from_env()?;
     let cache_dir = settings.cache_dir();
 
-    // === sync opendata_conseil_etat === (port de `_sync_opendata_conseil_etat`).
-    // Non-fatal : une panne transitoire opendata ne doit pas abandonner le reste
-    // de la chaîne nocturne (Judilibre = décisions du jour). On log et on continue.
+    // Non-fatal : une panne transitoire opendata ne doit pas abandonner le
+    // reste de la chaîne nocturne. On log et on continue.
     tracing::info!("=== sync opendata_conseil_etat ===");
     if let Err(e) = lj_sources::downloader::sync_opendata(&cache_dir, false) {
         tracing::error!(error = %e, "sync opendata échoué — on poursuit avec Judilibre");
     }
 
-    // === sync judilibre === (port de `_sync_judilibre`).
     tracing::info!("=== sync judilibre ===");
     let client = judilibre_client(&settings)?;
-    // `cmd_sync` n'expose pas `--from` côté clap → `date_start=None` (chaîne
-    // vide = défaut par juridiction MONTHLY_START, cf. `sync_judilibre`).
+    // `cmd_sync` n'expose pas `--from` → `date_start=None` (chaîne vide =
+    // défaut par juridiction MONTHLY_START).
     lj_sources::downloader::sync_judilibre(&client, &cache_dir, "")
         .await
         .map_err(|e| anyhow!("sync judilibre: {e}"))?;
@@ -982,15 +1230,14 @@ async fn cmd_sync() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// judilibre-ranges (port de `cmd_judilibre_ranges`)
+// judilibre-ranges
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Une plage bornée par bisection : `(date_start, date_end, total)`.
 type JudilibreRange = (String, String, i64);
 
-/// Bisection one-shot des plages de bootstrap Judilibre (port de
-/// `cmd_judilibre_ranges`, valeurs par défaut : toutes les juridictions,
-/// `max_chunk=50_000`, `date_from="1900-01-01"`).
+/// Bisection one-shot des plages de bootstrap Judilibre (toutes les
+/// juridictions, `max_chunk=50_000`, `date_from="1900-01-01"`).
 async fn cmd_judilibre_ranges() -> Result<()> {
     use chrono::{Duration, NaiveDate, Utc};
 
@@ -1030,9 +1277,8 @@ async fn cmd_judilibre_ranges() -> Result<()> {
         Ok((a + Duration::days(days)).format("%Y-%m-%d").to_string())
     }
 
-    // Bisection dichotomique itérative (pile explicite — évite la récursion
-    // dans une `async fn`, qui exigerait un `Box<dyn Future>`). L'ordre de
-    // sortie reste celui de la récursion gauche-d'abord du Python.
+    // Bisection dichotomique itérative (pile explicite). Ordre de sortie
+    // gauche-d'abord.
     async fn bisect(
         client: &lj_sources::judilibre::JudilibreClient,
         jur: &str,
@@ -1042,8 +1288,6 @@ async fn cmd_judilibre_ranges() -> Result<()> {
     ) -> Result<Vec<JudilibreRange>> {
         use chrono::Duration;
         let mut ranges: Vec<JudilibreRange> = Vec::new();
-        // Pile LIFO : on empile (d_end, d_start) à l'envers pour dépiler dans
-        // l'ordre gauche-d'abord.
         let mut stack: Vec<(String, String)> = vec![(start.to_string(), end.to_string())];
         while let Some((d_start, d_end)) = stack.pop() {
             let total = scan_total(client, jur, &d_start, &d_end).await?;
@@ -1073,8 +1317,7 @@ async fn cmd_judilibre_ranges() -> Result<()> {
         all_ranges.push((jur.to_string(), ranges));
     }
 
-    // Sortie copy-pastable (port de la sortie `print(...)` finale).
-    println!("\n# BOOTSTRAP_RANGES — coller dans downloader.py");
+    println!("\n# BOOTSTRAP_RANGES");
     println!("BOOTSTRAP_RANGES: dict[str, list[tuple[str, str]]] = {{");
     for (jur, ranges) in &all_ranges {
         println!("    \"{jur}\": [");
@@ -1088,28 +1331,26 @@ async fn cmd_judilibre_ranges() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// analyze (port de `cmd_analyze`)
+// analyze
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Passe d'analyse du corpus local (port de `cmd_analyze`, défauts :
-/// `extra_dir=[]`, `sample=20`, `seed=0`, `out=None` → stdout).
+/// Passe d'analyse du corpus local (défauts : `extra_dir=[]`, `sample=20`,
+/// `seed=0`, sortie stdout).
 fn cmd_analyze() -> Result<()> {
     let settings = Settings::from_env()?;
     let report = analyze::run(&settings.paths().opendata(), &[], 20, 0)?;
-    // `json.dumps(report, indent=2, ensure_ascii=False)` + newline final.
     let payload = serde_json::to_string_pretty(&report)?;
     println!("{payload}");
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// migrate (port de `cmd_migrate`)
+// migrate
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Applique les migrations SQL idempotemment (port de `cmd_migrate`).
 async fn cmd_migrate() -> Result<()> {
     let settings = Settings::from_env()?;
-    let pool = pool_only(&settings).await?;
+    let pool = pool_only(&settings, 4).await?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
     let applied = lj_store::migrator::apply_migrations(&conn)
         .await
@@ -1123,15 +1364,15 @@ async fn cmd_migrate() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ingest (port de `cmd_ingest`)
+// ingest
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Ingère les deux sources connues (port de `cmd_ingest` avec `--sources all`).
+/// Ingère les deux sources connues.
 ///
-/// On itère les sources dans l'ordre du router Python (`opendata_conseil_etat`
-/// puis `judilibre`), chacune sur son sous-dossier de cache. `pipeline::ingest_*`
-/// gère pool, migrations et embedder en interne. `mode` propage la trappe ALL
-/// (re-traitement total) jusqu'au triage.
+/// On itère les sources dans l'ordre `opendata_conseil_etat` puis
+/// `judilibre`, chacune sur son sous-dossier de cache. `pipeline::ingest_*`
+/// gère pool, migrations et embedder en interne. `mode` propage la trappe
+/// ALL (re-traitement total) jusqu'au triage.
 async fn cmd_ingest(with_embeddings: bool, mode: pipeline::IngestMode) -> Result<()> {
     let settings = Settings::from_env()?;
     pipeline::ingest_opendata(&settings.paths().opendata(), with_embeddings, mode).await?;
@@ -1139,26 +1380,26 @@ async fn cmd_ingest(with_embeddings: bool, mode: pipeline::IngestMode) -> Result
     Ok(())
 }
 
-/// Re-ingest ciblé des décisions opendata à `full_text` figé sur une provenance
-/// rang 50 (ADR 0109). Scanne le dossier opendata, mais ne ré-embed que les
-/// ~61,7k cibles (CAA/CE) ; vLLM strict.
+/// Re-ingest ciblé des décisions opendata à `full_text` figé sur une
+/// provenance de rang inférieur. Scanne le dossier opendata, mais ne
+/// ré-embed que les cibles (CAA/CE) ; vLLM strict.
 async fn cmd_reingest_stale_opendata() -> Result<()> {
     let settings = Settings::from_env()?;
     pipeline::reingest_stale_opendata(&settings.paths().opendata()).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// reextract-fields (port de `cmd_reextract_fields`)
+// reextract-fields
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Ré-extrait les champs structurés depuis les payloads stockés (port de
-/// `cmd_reextract_fields`). `--field` (vide → tous les champs ré-extractibles) ;
-/// `--juridiction-type` (vide → keyset par version) cible un sous-ensemble quelle
-/// que soit la version (ADR 0102 §B, citations famille générique) ;
-/// `--citing-ref-uid` cible les décisions citant un texte donné (ADR 0145 M4) ;
+/// Ré-extrait les champs structurés depuis les payloads stockés.
+/// `--field` (vide → tous les champs ré-extractibles) ; `--juridiction-type`
+/// (vide → keyset par version) cible un sous-ensemble quelle que soit la
+/// version ; `--citing-ref-uid` cible les décisions citant un texte donné ;
 /// `--full` = passe intégrale/relink hebdo (tout le fonds < 1000).
 async fn cmd_reextract_fields(
     overwrite: bool,
+    dry_run: bool,
     full: bool,
     jurisdiction_type: Vec<String>,
     field: Vec<String>,
@@ -1170,6 +1411,7 @@ async fn cmd_reextract_fields(
     pipeline::reextract_fields(
         fields.as_deref(),
         overwrite,
+        dry_run,
         full,
         jts.as_deref(),
         citing_ref_uid.as_deref(),
@@ -1178,16 +1420,15 @@ async fn cmd_reextract_fields(
     .await
 }
 
-/// Re-fetch ciblé de décisions Judilibre par id puis ingest (ADR 0087).
 async fn cmd_refetch(ids: Vec<String>, with_embeddings: bool) -> Result<()> {
     let settings = Settings::from_env()?;
     let client = judilibre_client(&settings)?;
     pipeline::refetch_judilibre(&client, &ids, with_embeddings).await
 }
 
-/// Réparation des faux merges judilibre (#29 / ADR 0100 §5). Dry-run (défaut) :
-/// read-only, aucun client requis. `--execute` : construit le client Judilibre
-/// (re-fetch des provenances divergentes) puis re-split + re-embed ciblé.
+/// Réparation des faux merges judilibre. Dry-run (défaut) : read-only,
+/// aucun client requis. `--execute` : construit le client Judilibre (re-fetch
+/// des provenances divergentes) puis re-split + re-embed ciblé.
 async fn cmd_resplit_false_merges(
     execute: bool,
     audit_sample: usize,
@@ -1204,11 +1445,10 @@ async fn cmd_resplit_false_merges(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// purge-reverses (port de `cmd_purge_reverses`)
+// purge-reverses
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Hard-delete des décisions retirées (CSV `documents_reverses`), port de
-/// `cmd_purge_reverses`.
+/// Hard-delete des décisions retirées (CSV `documents_reverses`).
 async fn cmd_purge_reverses() -> Result<()> {
     let settings = Settings::from_env()?;
     let csv_dir = settings.paths().opendata().join("documents_reverses");
@@ -1229,12 +1469,11 @@ async fn cmd_purge_reverses() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// generate-summaries (port de `cmd_generate_summaries`)
+// generate-summaries
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Backfill des résumés Mistral (port de `cmd_generate_summaries`). `--concurrency`
-/// borne les appels Mistral concurrents (défaut dérivé du nombre de clés) ;
-/// `batch_size=1000`, `shuffle=False` reprennent les défauts Typer.
+/// Backfill des résumés Mistral. `--concurrency` borne les appels Mistral
+/// concurrents (défaut dérivé du nombre de clés).
 async fn summary_pipeline_generate(
     limit: Option<usize>,
     concurrency: Option<usize>,
@@ -1252,32 +1491,38 @@ async fn summary_pipeline_generate(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sitemap (port de `cmd_sitemap`)
+// sitemap
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Fenêtre d'archive des fiches de consultation publiées au sitemap.
+const ANNONCES_SITEMAP_ARCHIVE_JOURS: i32 = 180;
 
 /// Source sitemap matérialisée : décisions `(public_id, lastmod)` et articles de
 /// référentiel `(slug, num, lastmod)` pré-chargés depuis le repo (les méthodes
 /// repo sont async, le trait `SitemapSource` est sync).
 struct LoadedSitemapSource {
-    decisions: Vec<(String, chrono::NaiveDate)>,
-    referential: Vec<(String, String, chrono::NaiveDate)>,
-    entities: Vec<(String, String, chrono::NaiveDate)>,
-    codes: Vec<(String, chrono::NaiveDate)>,
+    decisions: Vec<(String, sitemap::SourceLastmod)>,
+    referential: Vec<(String, String, sitemap::SourceLastmod)>,
+    entities: Vec<(String, String, sitemap::SourceLastmod)>,
+    codes: Vec<(String, sitemap::SourceLastmod)>,
     jurisdiction_hubs: Vec<(String, Vec<i32>)>,
     norm_hubs: Vec<(String, Vec<String>)>,
+    annonces: (Vec<(String, sitemap::SourceLastmod)>, Vec<String>),
 }
 
 impl sitemap::SitemapSource for LoadedSitemapSource {
-    fn iter_decisions_for_sitemap(&self) -> Result<Vec<(String, chrono::NaiveDate)>> {
+    fn iter_decisions_for_sitemap(&self) -> Result<Vec<(String, sitemap::SourceLastmod)>> {
         Ok(self.decisions.clone())
     }
-    fn iter_referential_for_sitemap(&self) -> Result<Vec<(String, String, chrono::NaiveDate)>> {
+    fn iter_referential_for_sitemap(
+        &self,
+    ) -> Result<Vec<(String, String, sitemap::SourceLastmod)>> {
         Ok(self.referential.clone())
     }
-    fn iter_entities_for_sitemap(&self) -> Result<Vec<(String, String, chrono::NaiveDate)>> {
+    fn iter_entities_for_sitemap(&self) -> Result<Vec<(String, String, sitemap::SourceLastmod)>> {
         Ok(self.entities.clone())
     }
-    fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, chrono::NaiveDate)>> {
+    fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, sitemap::SourceLastmod)>> {
         Ok(self.codes.clone())
     }
     fn iter_jurisdiction_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<i32>)>> {
@@ -1286,19 +1531,23 @@ impl sitemap::SitemapSource for LoadedSitemapSource {
     fn iter_norm_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<String>)>> {
         Ok(self.norm_hubs.clone())
     }
+    fn iter_annonces_for_sitemap(&self) -> Result<sitemap::AnnoncesSitemap> {
+        Ok(self.annonces.clone())
+    }
 }
 
-/// Génère les sitemaps et les publie en base (ADR 0064).
+/// Génère les sitemaps et les publie en base.
 ///
 /// Charge les décisions via le repo, construit l'ensemble en mémoire, puis
-/// (sauf `--dry-run`) remplace la table `sitemaps` dans une transaction unique
-/// — `lj-server` sert ces lignes sous `/sitemap.xml` + `/sitemap-{n}.xml.gz`.
+/// (sauf `--dry-run`) remplace la table `sitemaps` dans une transaction
+/// unique — `lj-server` sert ces lignes sous `/sitemap.xml` +
+/// `/sitemap-{n}.xml.gz`.
 async fn cmd_sitemap(dry_run: bool) -> Result<()> {
     let settings = Settings::from_env()?;
 
     tracing::info!("=== build sitemaps ===");
     let pool = pool_with_migrations(&settings).await?;
-    let (decisions, referential, entities, codes, jurisdiction_hubs, norm_hubs) = {
+    let (decisions, referential, entities, codes, jurisdiction_hubs, norm_hubs, annonces) = {
         let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
         let repo = lj_store::repository::DecisionRepository::new(&conn);
         let decisions = repo
@@ -1325,6 +1574,27 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
             .iter_norm_hubs_for_sitemap()
             .await
             .map_err(|e| anyhow!("iter_norm_hubs_for_sitemap: {e}"))?;
+        // Annonces : la fenêtre ouverte + l'archive récente pour les fiches, et
+        // les départements qui ont au moins une consultation ouverte pour les
+        // hubs — au-delà, la page répond 404.
+        let fond = lj_dtos::ANNONCE_FOND_MARCHE;
+        let fiches = repo
+            .annonces_sitemap(fond, ANNONCES_SITEMAP_ARCHIVE_JOURS)
+            .await
+            .map_err(|e| anyhow!("annonces_sitemap: {e}"))?
+            .into_iter()
+            .map(|(uid, date)| (uid, Some(date)))
+            .collect();
+        let departements = repo
+            .annonces_facette(
+                &lj_store::repository::AnnonceFiltre::nouveau(fond),
+                lj_store::repository::AnnonceAxe::Departement,
+            )
+            .await
+            .map_err(|e| anyhow!("annonces_facette(departement): {e}"))?
+            .into_iter()
+            .map(|(code, _, _)| code)
+            .collect();
         (
             decisions,
             referential,
@@ -1332,6 +1602,7 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
             codes,
             jurisdiction_hubs,
             norm_hubs,
+            (fiches, departements),
         )
     };
     let source = LoadedSitemapSource {
@@ -1341,6 +1612,7 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
         codes,
         jurisdiction_hubs,
         norm_hubs,
+        annonces,
     };
     let files = sitemap::build_sitemaps(&source, chrono::Utc::now().date_naive())?;
 
@@ -1356,8 +1628,7 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Régénération complète atomique : DELETE + INSERT en une transaction (les
-    // sub-sitemaps d'un corpus rétréci disparaissent automatiquement).
+    // Régénération complète atomique : DELETE + INSERT en une transaction.
     let rows: Vec<lj_store::repository::SitemapRow> = files
         .into_iter()
         .map(|f| lj_store::repository::SitemapRow {
@@ -1382,15 +1653,15 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// indexnow (port de `cmd_indexnow`)
+// indexnow
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Pousse vers IndexNow les décisions récemment mises à jour (port de
-/// `cmd_indexnow`).
+/// Pousse vers IndexNow les décisions récemment mises à jour.
 ///
-/// Valide la clé (`LIBREJUSTICE_INDEXNOW_KEY`), collecte les `public_id` dont
-/// `updated_at >= now - since_hours` (cap dur à `max_urls`, troncature
-/// signalée), puis soumet via `indexnow::submit`.
+/// Valide la clé (`LIBREJUSTICE_INDEXNOW_KEY`), collecte les `public_id`
+/// dont `updated_at >= now - since_hours` et les consultations parues dans
+/// la même fenêtre, puis soumet via `indexnow::submit` sous le cap dur
+/// `max_urls` (troncature signalée).
 async fn cmd_indexnow(since_hours: f64, max_urls: usize) -> Result<()> {
     use chrono::{Duration, Utc};
 
@@ -1400,71 +1671,71 @@ async fn cmd_indexnow(since_hours: f64, max_urls: usize) -> Result<()> {
             "LIBREJUSTICE_INDEXNOW_KEY non posé — clé IndexNow requise."
         ));
     };
-    // `timedelta(hours=since_hours)` — fenêtre flottante d'heures.
     let since = Utc::now() - Duration::milliseconds((since_hours * 3_600_000.0) as i64);
 
     let pool = pool_with_migrations(&settings).await?;
-    let (public_ids, truncated) = {
+    let (urls, truncated) = {
         let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
         // `iter_public_ids_updated_since` pagine en keyset sur `id` mais filtre
-        // `updated_at` (aucun index dédié, par choix — on n'alourdit pas le schéma
-        // pour IndexNow). Sur un gros backlog (rattrapage, re-résumé en masse) un
-        // batch balaie d'immenses plages d'`id` et dépasse le `statement_timeout`
-        // 30 s par défaut → `query_canceled`. On le lève sur CETTE connexion : la
-        // commande `indexnow` est un process CLI one-shot (pas de réutilisation de
-        // la connexion poolée après), donc aucune fuite du SET de session.
+        // `updated_at` (aucun index dédié, par choix). Sur un gros backlog un batch
+        // balaie d'immenses plages d'`id` et dépasse le `statement_timeout` 30 s par
+        // défaut → `query_canceled`. On le lève sur CETTE connexion : la commande
+        // `indexnow` est un process CLI one-shot.
         conn.batch_execute("SET statement_timeout = 0").await?;
         let repo = lj_store::repository::DecisionRepository::new(&conn);
-        // `iter_public_ids_updated_since` (batch 10 000 côté Python) matérialise
-        // les `public_id`. On applique ensuite le cap dur `max_urls` (troncature
-        // jamais muette — règle #12).
-        let all = repo
+        let decisions = repo
             .iter_public_ids_updated_since(since, 10_000)
             .await
             .map_err(|e| anyhow!("iter_public_ids_updated_since: {e}"))?;
+        let annonces = repo
+            .annonces_vues_depuis(lj_dtos::ANNONCE_FOND_MARCHE, since, max_urls as i64)
+            .await
+            .map_err(|e| anyhow!("annonces_vues_depuis: {e}"))?;
+        // Les consultations passent devant : leur fenêtre utile est l'échéance, à
+        // trois ou quatre semaines, alors qu'une décision reste indexable des
+        // années. Sous le cap, c'est donc la queue des décisions qui cède.
+        let mut all: Vec<String> = annonces.iter().map(|u| indexnow::marche_url(u)).collect();
+        all.extend(decisions.iter().map(|p| indexnow::decision_url(p)));
         let truncated = all.len() > max_urls;
-        let mut public_ids = all;
-        public_ids.truncate(max_urls);
-        (public_ids, truncated)
+        all.truncate(max_urls);
+        (all, truncated)
     };
 
     if truncated {
-        // Cap explicite, jamais muet (AGENTS.md règle #12) : on signale la
-        // troncature pour ne pas laisser croire à une couverture complète.
         tracing::warn!(
             max_urls,
             since_hours,
-            "plus de décisions mises à jour que la borne — soumission tronquée. \
+            "plus d'URLs (re)publiées que la borne — soumission tronquée. \
              Relancer avec --max-urls plus haut, ou par fenêtres --since-hours plus courtes."
         );
     }
-    let submitted = indexnow::submit(&public_ids, key).await?;
+    let submitted = indexnow::submit(&urls, key).await?;
     tracing::info!(submitted, "IndexNow : URL(s) soumises.");
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// db (port des `@db_app.command`)
+// db
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `statement_timeout` des commandes de maintenance lourdes (ANALYZE, VACUUM
-/// FULL, REINDEX CONCURRENTLY, prewarm). `build_pool` arme 30 s sur chaque
-/// connexion pour borner les requêtes API/search ; ces ops-là durent
-/// légitimement de plusieurs minutes (REINDEX) à ~1 h (VACUUM FULL) et étaient
-/// donc **tuées à 30 s** (compaction jamais aboutie → bloat). Un `SET` de
-/// session écrase l'option de démarrage `options`. Backstop fini volontaire
-/// (pas `0`) : une op qui dérape finit par être tuée.
+/// `statement_timeout` des commandes de maintenance lourdes (ANALYZE,
+/// VACUUM FULL, REINDEX CONCURRENTLY, prewarm). `build_pool` arme 30 s sur
+/// chaque connexion pour borner les requêtes API/search ; ces ops-là durent
+/// légitimement de plusieurs minutes (REINDEX) à ~1 h (VACUUM FULL). Un
+/// `SET` de session écrase l'option de démarrage `options`. Backstop fini
+/// volontaire (pas `0`) : une op qui dérape finit par être tuée.
 const MAINTENANCE_STATEMENT_TIMEOUT: &str = "2h";
 
-/// Maintenance DB (port des sous-commandes `db.*`). Toutes ouvrent une
-/// connexion en `autocommit` (équivalent `conn.autocommit = True`) et exécutent
-/// du SQL de maintenance — pas de migrations.
+/// Maintenance DB. Toutes ouvrent une connexion en `autocommit` et
+/// exécutent du SQL de maintenance — pas de migrations.
 async fn cmd_db(command: DbCommand) -> Result<()> {
     let settings = Settings::from_env()?;
-    let pool = pool_only(&settings).await?;
+    // 6 = connexion partagée ci-dessous + les 5 vacuums parallèles de
+    // `db vacuum-full` ; large pour les autres commandes.
+    let pool = pool_only(&settings, 6).await?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    // Relève le statement_timeout pour les ops lourdes (cf. constante). `gc-mcp`
-    // (DELETE borné) garde le garde-fou 30 s.
+    // Relève le statement_timeout pour les ops lourdes. `gc-mcp` (DELETE borné)
+    // garde le garde-fou 30 s.
     if !matches!(command, DbCommand::GcMcp) {
         conn.batch_execute(&format!(
             "SET statement_timeout = '{MAINTENANCE_STATEMENT_TIMEOUT}'"
@@ -1473,13 +1744,9 @@ async fn cmd_db(command: DbCommand) -> Result<()> {
     }
     match command {
         DbCommand::Analyze => db_analyze(&conn).await,
-        DbCommand::ReindexSearch => db_reindex_search(&conn).await,
-        DbCommand::VacuumFullChunks => db_vacuum_full_chunks(&conn).await,
+        DbCommand::ReindexSearch => db_reindex_search(&pool).await,
+        DbCommand::VacuumFull => db_vacuum_full(&pool).await,
         DbCommand::GcMcp => db_gc_mcp(&conn).await,
-        DbCommand::Reconcile => {
-            let repo = lj_store::repository::DecisionRepository::new(&conn);
-            pipeline::reconcile_pending(&repo).await
-        }
         DbCommand::Prewarm => db_prewarm(&conn).await,
         DbCommand::PurgeOrphanTombstones { apply } => {
             db_purge_orphan_tombstones(&conn, apply).await
@@ -1509,7 +1776,6 @@ async fn db_purge_orphan_tombstones(conn: &lj_store::db::Connection, apply: bool
     }
     let deleted = repo.purge_orphan_tombstones().await?;
     println!("{deleted} décisions supprimées (cascade provenances/chunks/full_text/citations).");
-    // Ceinture-bretelle : il ne doit plus rester aucun orphelin.
     let remaining = repo.count_orphan_tombstones().await?;
     if remaining != 0 {
         return Err(anyhow!(
@@ -1520,15 +1786,14 @@ async fn db_purge_orphan_tombstones(conn: &lj_store::db::Connection, apply: bool
     Ok(())
 }
 
-/// `ANALYZE` des tables hot (port de `cmd_db_analyze`).
 async fn db_analyze(conn: &lj_store::db::Connection) -> Result<()> {
-    // `conn.autocommit = True` côté Python : sans transaction ouverte, chaque
-    // `execute` tokio-postgres s'auto-commit. ANALYZE ne tourne pas dans un bloc.
+    // Sans transaction ouverte, chaque `execute` tokio-postgres s'auto-commit.
+    // ANALYZE ne tourne pas dans un bloc.
     conn.execute("ANALYZE decisions", &[]).await?;
     conn.execute("ANALYZE decision_chunks", &[]).await?;
     conn.execute("ANALYZE decision_full_text", &[]).await?;
-    // Blobs citations + catalogue (ADR 0145/0247) : stats fraîches pour
-    // l'overlay, les backlinks (GIN `lj_cit_terms`) et le service `/texte/`.
+    // Stats fraîches pour l'overlay, les backlinks (GIN `lj_cit_terms`) et le
+    // service `/texte/`.
     conn.execute("ANALYZE legal_citation", &[]).await?;
     conn.execute("ANALYZE legal_text", &[]).await?;
     conn.execute("ANALYZE legal_article", &[]).await?;
@@ -1536,93 +1801,246 @@ async fn db_analyze(conn: &lj_store::db::Connection) -> Result<()> {
     Ok(())
 }
 
-/// `REINDEX` de `decisions_bm25` puis `chunks_vec` (port de `cmd_db_reindex_search`).
-///
-/// `decisions_bm25` est l'index BM25 au grain décision (ADR 0084) ; `chunks_bm25`
-/// a été droppé. Le clap n'expose pas `--concurrent`/`--maintenance-work-mem`/
-/// `--max-parallel-workers` : on reprend les défauts Typer (`concurrent=True`,
-/// pas d'override de session). Le pré-flight `DROP INDEX IF EXISTS *_ccnew`
-/// (auto-heal d'un REINDEX CONCURRENTLY tué) est conservé.
-async fn db_reindex_search(conn: &lj_store::db::Connection) -> Result<()> {
-    for index_name in ["decisions_bm25", "chunks_vec"] {
-        let orphan = format!("{index_name}_ccnew");
-        println!("DROP INDEX IF EXISTS {orphan} …");
-        conn.batch_execute(&format!("DROP INDEX IF EXISTS {orphan}"))
+/// Supprime les index **invalides** d'une table. Un `REINDEX CONCURRENTLY`
+/// interrompu (deadlock, kill) laisse derrière lui un `<index>_ccnew` marqué
+/// `indisvalid = false` : inutilisable en lecture, mais `indisready = true`
+/// donc **maintenu à chaque écriture** et occupant sa taille pleine.
+/// Appelé avant ET après le reindex.
+async fn drop_invalid_indexes(conn: &lj_store::db::Connection, table: &str) -> Result<()> {
+    let rows = conn
+        .query(
+            "SELECT c.relname FROM pg_class c \
+             JOIN pg_index i ON i.indexrelid = c.oid \
+             JOIN pg_class t ON t.oid = i.indrelid \
+             WHERE t.relname = $1 AND NOT i.indisvalid",
+            &[&table],
+        )
+        .await?;
+    for row in &rows {
+        let index: String = row.get(0);
+        println!("DROP INDEX CONCURRENTLY {index} (invalide, résidu d'un reindex interrompu) …");
+        conn.batch_execute(&format!("DROP INDEX CONCURRENTLY {index}"))
             .await?;
-    }
-    // `concurrent=True` (défaut Typer) → REINDEX INDEX CONCURRENTLY. CONCURRENTLY
-    // ne peut pas tourner dans un bloc transactionnel → `batch_execute` (mode
-    // simple, hors transaction implicite des requêtes paramétrées).
-    for index_name in ["decisions_bm25", "chunks_vec"] {
-        println!("REINDEX INDEX CONCURRENTLY {index_name} …");
-        conn.batch_execute(&format!("REINDEX INDEX CONCURRENTLY {index_name}"))
-            .await?;
-        println!("REINDEX {index_name} terminé.");
     }
     Ok(())
 }
 
-/// `VACUUM FULL decision_chunks` (port de `cmd_db_vacuum_full_chunks`).
+/// Maintenance hebdomadaire des tables de recherche :
+/// `REINDEX TABLE CONCURRENTLY` puis `VACUUM`, table par table, en
+/// parallèle. Zéro indisponibilité.
 ///
-/// Le clap n'expose pas `--maintenance-work-mem` : défaut Typer `'512MB'`.
-async fn db_vacuum_full_chunks(conn: &lj_store::db::Connection) -> Result<()> {
+/// `REINDEX TABLE` et non `REINDEX INDEX` sur les seuls BM25 : les btrees
+/// bloatent tout autant. Le rebuild purge aussi les tombstones tantivy des
+/// index BM25, que la politique de merge par couches ne reprend jamais.
+///
+/// Le `VACUUM` simple qui suit rend l'espace mort du heap réutilisable sur
+/// place et entretient la visibility map ; il ne rend rien à l'OS.
+///
+/// `CONCURRENTLY` ne peut pas tourner dans un bloc transactionnel →
+/// `batch_execute` (protocole simple, hors transaction implicite des
+/// requêtes paramétrées). Un échec ne coûte que sa semaine : les index en
+/// place restent valides et servent, l'orphelin est nettoyé, et la chaîne
+/// remonte `chain_failed`. Pas de retry.
+async fn db_reindex_search(pool: &deadpool_postgres::Pool) -> Result<()> {
+    let mut handles = Vec::new();
+    for table in SEARCH_TABLES {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+            conn.batch_execute(&format!(
+                "SET statement_timeout = '{MAINTENANCE_STATEMENT_TIMEOUT}'"
+            ))
+            .await?;
+            drop_invalid_indexes(&conn, table).await?;
+
+            println!("REINDEX TABLE CONCURRENTLY {table} … [aucun lock exclusif]");
+            let started = std::time::Instant::now();
+            let outcome = conn
+                .batch_execute(&format!("REINDEX TABLE CONCURRENTLY {table}"))
+                .await;
+            if let Err(e) = outcome {
+                drop_invalid_indexes(&conn, table).await?;
+                return Err(anyhow!("REINDEX {table} : {e}"));
+            }
+            println!(
+                "REINDEX {table} terminé en {} s.",
+                started.elapsed().as_secs()
+            );
+
+            let started = std::time::Instant::now();
+            println!("VACUUM {table} …");
+            conn.batch_execute(&format!("VACUUM {table}")).await?;
+            println!(
+                "VACUUM {table} terminé en {} s.",
+                started.elapsed().as_secs()
+            );
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+    let mut failures = Vec::new();
+    for (table, handle) in SEARCH_TABLES.iter().zip(handles) {
+        if let Err(e) = handle.await? {
+            failures.push(format!("{table}: {e}"));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!(
+            "reindex-search en échec — {}",
+            failures.join(" ; ")
+        ));
+    }
+    Ok(())
+}
+
+/// Tables porteuses d'index de recherche, couvertes par la maintenance
+/// hebdomadaire `db reindex-search` et par le repli manuel `db vacuum-full`.
+const SEARCH_TABLES: [&str; 5] = [
+    "decision_chunks",
+    "legal_article",
+    "legal_text",
+    "legal_article_usage",
+    "decisions",
+];
+
+/// `VACUUM FULL` des tables de recherche : compacte le heap et
+/// reconstruit **tous** leurs index — seul moyen de purger les tombstones
+/// tantivy des gros segments, que les merges par couches ne reprennent
+/// jamais. Les cinq tables passent en **parallèle** (une connexion chacune) :
+/// le wall-clock tient à la plus grosse. Lock AccessExclusive par table
+/// pendant sa réécriture ; un échec n'interrompt pas les autres (join
+/// complet puis erreur agrégée).
+///
+/// Chaque table enchaîne sur un `VACUUM` simple qui reconstruit sa
+/// visibility map, que le `VACUUM FULL` laisse vide.
+async fn db_vacuum_full(pool: &deadpool_postgres::Pool) -> Result<()> {
     let maintenance_work_mem = "512MB";
-    conn.batch_execute(&format!(
-        "SET maintenance_work_mem = '{maintenance_work_mem}'"
-    ))
-    .await?;
-    println!(
-        "VACUUM FULL decision_chunks (mwm={maintenance_work_mem}) … \
-         [lock AccessExclusive, /search indisponible]"
-    );
-    // VACUUM FULL ne peut pas tourner dans un bloc transactionnel.
-    conn.batch_execute("VACUUM FULL decision_chunks").await?;
-    println!("VACUUM FULL terminé.");
+    let mut handles = Vec::new();
+    for table in SEARCH_TABLES {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+            // Timeout maintenance + work_mem par connexion (le SET de session
+            // de `cmd_db` ne vaut que pour la connexion partagée).
+            conn.batch_execute(&format!(
+                "SET statement_timeout = '{MAINTENANCE_STATEMENT_TIMEOUT}'; \
+                 SET maintenance_work_mem = '{maintenance_work_mem}'"
+            ))
+            .await?;
+            println!("VACUUM FULL {table} (mwm={maintenance_work_mem}) … [lock AccessExclusive]");
+            let started = std::time::Instant::now();
+            // VACUUM FULL ne peut pas tourner dans un bloc transactionnel.
+            conn.batch_execute(&format!("VACUUM FULL {table}")).await?;
+            println!(
+                "VACUUM FULL {table} terminé en {} s.",
+                started.elapsed().as_secs()
+            );
+            // VACUUM FULL réécrit le heap et laisse la visibility map VIDE. Tant
+            // qu'elle n'est pas reconstruite, tout Index Only Scan va chercher chaque
+            // ligne dans le heap pour tester sa visibilité — l'« index only » ne l'est
+            // plus. L'autovacuum ne rattrape pas : il se déclenche sur un ratio de
+            // lignes mortes que ces tables, fraîchement compactées, mettent des
+            // semaines à atteindre. Un VACUUM simple (lock ShareUpdateExclusive, ni
+            // lecture ni écriture bloquée) la repose.
+            let started = std::time::Instant::now();
+            println!("VACUUM {table} (visibility map) …");
+            conn.batch_execute(&format!("VACUUM {table}")).await?;
+            println!(
+                "VACUUM {table} terminé en {} s.",
+                started.elapsed().as_secs()
+            );
+            Ok::<(), anyhow::Error>(())
+        }));
+    }
+    let mut failures = Vec::new();
+    for (table, handle) in SEARCH_TABLES.iter().zip(handles) {
+        if let Err(e) = handle.await? {
+            failures.push(format!("{table}: {e}"));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!("VACUUM FULL en échec — {}", failures.join(" ; ")));
+    }
     Ok(())
 }
 
-/// Purge des tokens/codes MCP expirés (port de `cmd_db_gc_mcp`).
+/// Purge des tokens/codes MCP expirés — les trois tables.
+///
+/// `mcp_refresh_tokens` ne fait que croître, sur des lignes qu'aucun chemin
+/// ne peut plus valider (`token_refresh` filtre sur `expires_at > now()`).
 async fn db_gc_mcp(conn: &lj_store::db::Connection) -> Result<()> {
     let tokens = conn
         .execute("DELETE FROM mcp_tokens WHERE expires_at < now()", &[])
         .await?;
+    let refresh = conn
+        .execute(
+            "DELETE FROM mcp_refresh_tokens WHERE expires_at < now()",
+            &[],
+        )
+        .await?;
     let codes = conn
         .execute("DELETE FROM mcp_auth_codes WHERE expires_at < now()", &[])
         .await?;
-    println!("GC MCP : {tokens} token(s) + {codes} code(s) expirés supprimés.");
+    println!("GC MCP : {tokens} access + {refresh} refresh + {codes} code(s) expirés supprimés.");
     Ok(())
 }
 
-/// Prewarm des deux index de recherche : l'ANN `chunks_vec` et le BM25
-/// `chunks_bm25`. Sans le BM25, `bm25_parse_leg` paie le coût d'ouverture des
-/// segments à froid (mesuré 10-22 s vs 45 ms à chaud). `chunks_bm25` est tiré
-/// en mode `read` (cache page OS) plutôt que `buffer` : à 16 Go il dépasse les
-/// 5 Go de `shared_buffers`, donc le mode `buffer` éviction­nerait tout le reste.
+/// Prewarm des index de recherche après un redémarrage : sans lui, la
+/// première requête paie l'ouverture des segments à froid.
+///
+/// La liste est **découverte dans le catalogue**, pas écrite ici : un index
+/// neuf est couvert le jour où il existe.
+///
+/// Deux caches distincts, donc deux modes et aucune concurrence entre eux :
+/// l'ANN VectorChord est épinglé en `shared_buffers`, le BM25 est tiré en
+/// mode `read` (cache page OS) — les index dépassent ensemble
+/// `shared_buffers`.
 async fn db_prewarm(conn: &lj_store::db::Connection) -> Result<()> {
-    println!("vchordrq_prewarm('chunks_vec', 0) … [tire ~4,2 Go en cache, lent à froid]");
-    let row = conn
-        .query_opt("SELECT vchordrq_prewarm('chunks_vec', 0)", &[])
-        .await?;
-    match row {
-        Some(row) => {
-            // La fonction retourne un entier (nb de buffers chargés).
-            let n: i32 = row.try_get(0).unwrap_or(0);
-            println!("{n}");
-        }
-        None => println!("(aucune sortie)"),
-    }
+    // Le plus gros d'abord : si le cache manque, c'est lui qu'on veut dedans.
+    const INDEXES: &str = "SELECT am.amname, c.relname, t.relname, pg_relation_size(c.oid) \
+         FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         JOIN pg_class t ON t.oid = i.indrelid \
+         JOIN pg_am am ON am.oid = c.relam \
+         WHERE am.amname IN ('vchordrq', 'bm25') \
+         ORDER BY pg_relation_size(c.oid) DESC";
 
-    println!("pg_prewarm('decisions_bm25', 'read') … [tire ~12 Go en cache page OS, lent à froid]");
-    let row = conn
-        .query_opt("SELECT pg_prewarm('decisions_bm25', 'read')", &[])
-        .await?;
-    match row {
-        Some(row) => {
-            // `pg_prewarm` retourne le nombre de blocs (int8) chargés.
-            let n: i64 = row.try_get(0).unwrap_or(0);
-            println!("{n}");
+    let mut chauffes = 0usize;
+    for row in conn.query(INDEXES, &[]).await? {
+        let am: &str = row.get(0);
+        let index: &str = row.get(1);
+        let table: &str = row.get(2);
+        let octets: i64 = row.get(3);
+
+        // Les index du banc vivent dans la même base mais aucune requête servie ne
+        // les lit.
+        if table.starts_with("bench_") {
+            println!("{index} : écarté (index du banc, hors chemin servi)");
+            continue;
         }
-        None => println!("(aucune sortie)"),
+
+        let go = octets as f64 / 1e9;
+        if am == "vchordrq" {
+            println!("vchordrq_prewarm('{index}') … [{go:.1} Go, épinglé en shared_buffers]");
+            let r = conn
+                .query_one("SELECT vchordrq_prewarm($1::text::regclass, 0)", &[&index])
+                .await?;
+            // Rend un RAPPORT texte multi-ligne (hauteur de l'arbre, nœuds, pages),
+            // pas un compte de blocs.
+            let rapport: String = r.get(0);
+            for ligne in rapport.lines().filter(|l| !l.trim_matches('-').is_empty()) {
+                println!("  {}", ligne.trim_end());
+            }
+        } else {
+            println!("pg_prewarm('{index}', 'read') … [{go:.1} Go, cache page OS]");
+            let r = conn
+                .query_one("SELECT pg_prewarm($1::text::regclass, 'read')", &[&index])
+                .await?;
+            // `pg_prewarm` rend le nombre de blocs (int8) chargés.
+            let blocs: i64 = r.get(0);
+            println!("  {blocs} blocs");
+        }
+        chauffes += 1;
     }
+    println!("{chauffes} index préchauffés");
     Ok(())
 }

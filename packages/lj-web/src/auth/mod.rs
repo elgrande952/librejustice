@@ -1,10 +1,9 @@
-//! Shim d'authentification : bindings wasm-bindgen vers `js/auth.js` (port de
-//! `apps/web/src/lib/supabase.ts`) + `AuthGuard` (port de `auth-guard.tsx`).
+//! Shim d'authentification : bindings wasm-bindgen vers `js/auth.js` +
+//! `AuthGuard`.
 //!
 //! Cote SSR (pas de `localStorage`/session), toutes les fns sont des no-op
 //! anonymes : `get_access_token() -> None`, l'AuthGuard ne redirige pas (le
-//! gate effectif se joue cote client apres hydratation, comme le React legacy
-//! qui montait `null` puis verifiait la session dans un `useEffect`).
+//! gate effectif se joue cote client apres hydratation).
 
 mod bindings;
 mod guard;
@@ -32,6 +31,23 @@ pub async fn get_access_token() -> Option<String> {
 #[cfg(feature = "hydrate")]
 pub async fn get_access_token() -> Option<String> {
     bindings::get_access_token().await
+}
+
+/// `true` si une session vit dans le storage local. Lu quand
+/// [`get_access_token`] rend `None` : la session est la, mais son jeton n'a pas
+/// pu etre rafraichi dans le delai — la requete part en anonyme et le client
+/// HTTP le signale par [`lj_dtos::SESSION_DEGRADED_HEADER`].
+///
+/// Cote SSR : toujours `false` (pas de storage local).
+#[cfg(feature = "ssr")]
+pub fn session_in_storage() -> bool {
+    false
+}
+
+/// `true` si une session vit dans le storage local.
+#[cfg(feature = "hydrate")]
+pub fn session_in_storage() -> bool {
+    bindings::session_in_storage()
 }
 
 /// Etat d'authentification reactif partage : email de la session courante,

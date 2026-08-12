@@ -1,14 +1,13 @@
-//! Page `/entite/{ns}/{id}` (fiche entité, ADR 0189). Identité registre
-//! (`entity`/`entity_denomination`, ADR 0179) + agrégats contentieux dérivés du
-//! reverse-lookup `decision_party`. Calquée sur [`crate::pages::decision_page`]
-//! et [`crate::pages::law_code_page`] : en-tête + agrégats bloquants SSR (SEO
-//! dans le document initial), liste de décisions citantes streamée
-//! (`PartiallyBlocked`), paginée par `?page=`.
+//! Page `/entite/{ns}/{id}` (fiche entité). Identité registre
+//! (`entity`/`entity_denomination`) + agrégats contentieux dérivés du
+//! reverse-lookup `decision_party`. En-tête + agrégats bloquants SSR (SEO dans le
+//! document initial), liste de décisions citantes streamée (`PartiallyBlocked`),
+//! paginée par `?page=`.
 //!
 //! Le rendu s'adapte au namespace (`siren` entreprise, `rna` association,
 //! `cnb`/`oacc` avocat) : libellé de catégorie et forme lisible de l'uid registre.
 
-use leptos::either::Either;
+use leptos::either::{Either, EitherOf3};
 use leptos::prelude::*;
 use leptos_meta::{Link, Meta, Title};
 use leptos_router::components::A;
@@ -21,12 +20,13 @@ use lj_dtos::{
 use serde::{Deserialize, Serialize};
 
 use crate::api::ApiClient;
+use crate::components::own_page_description;
 use crate::components::search::ResultCard;
 use crate::helpers::{format_iso_date, group_thousands, split_entity_uid};
 use crate::pages::decision_page::data::{sendable, PageError};
 use crate::seo::CANONICAL_BASE;
 
-/// Décisions citantes par page (offset-based, ADR 0189).
+/// Décisions citantes par page (offset-based).
 const PAGE_SIZE: i64 = 20;
 
 fn client() -> ApiClient {
@@ -55,8 +55,8 @@ pub async fn fetch_entity(ns: String, id: String) -> Result<EntityPageResponse, 
     Ok(data)
 }
 
-/// Volet registre (non bloquant, streamé — ADR 0199). `None` = namespace sans
-/// volet ou amont indisponible : la section ne se rend pas, jamais d'erreur.
+/// Volet registre (non bloquant, streamé). `None` = namespace sans volet ou
+/// amont indisponible : la section ne se rend pas, jamais d'erreur.
 pub async fn fetch_entity_registre(ns: String, id: String) -> Option<EntityRegistreResponse> {
     if !matches!(ns.as_str(), "siren" | "rna") {
         return None;
@@ -104,10 +104,11 @@ fn page_param() -> Signal<i64> {
 
 #[component]
 pub fn EntityPage() -> impl IntoView {
+    own_page_description();
+
     let (ns, id) = entity_params();
     let page = page_param();
 
-    // Fiche bloquante (SEO) ; décisions streamées et rechargées à chaque `?page=`.
     let entity = Resource::new_blocking(
         move || (ns.get(), id.get()),
         |(ns, id)| sendable(fetch_entity(ns, id)),
@@ -148,8 +149,8 @@ pub fn EntityPage() -> impl IntoView {
     }
 }
 
-/// `Cache-Control` de la réponse document (aligné sur decision/law : 200 → 7 j au
-/// CDN, 404/400 → 5 min, 5xx → no-store). No-op côté hydrate.
+/// `Cache-Control` de la réponse document (200 → 7 j au CDN, 404/400 → 5 min,
+/// 5xx → no-store). No-op côté hydrate.
 #[cfg(feature = "ssr")]
 fn set_cache_control(status: u16) {
     use axum::http::{header::CACHE_CONTROL, HeaderValue, StatusCode};
@@ -313,7 +314,7 @@ fn meta_description(header: &EntityHeaderDto, stats: &EntityStatsDto, category: 
 }
 
 /// JSON-LD schema.org : `Person` pour une personne physique, `Organization`
-/// sinon. Un seul `@type` (parité `seo::decision`/`seo::law`).
+/// sinon. Un seul `@type`.
 fn build_json_ld(header: &EntityHeaderDto, url: &str, category: &str) -> String {
     use serde_json::{json, Map, Value};
     let type_ = if header.nature == "physique" {
@@ -341,7 +342,6 @@ fn EntityHeader(header: EntityHeaderDto, category: &'static str) -> impl IntoVie
     let (ns, local) = split_entity_uid(&header.uid);
     let registry = registry_label(ns, local);
 
-    // Badges : forme juridique, uid registre lisible, état actif/inactif.
     let forme_badge = header.forme.clone().map(neutral_badge);
     let registry_badge = registry.map(|r| {
         view! {
@@ -367,7 +367,6 @@ fn EntityHeader(header: EntityHeaderDto, category: &'static str) -> impl IntoVie
         .into_any()
     };
 
-    // Sigle en sous-titre discret quand distinct de la dénomination.
     let sigle = header
         .sigle
         .clone()
@@ -473,7 +472,6 @@ fn contentieux_section(stats: &EntityStatsDto, is_avocat: bool) -> AnyView {
         </div>
     };
 
-    // Corps masqué si l'entité n'apparaît dans aucune décision.
     if stats.decision_count == 0 {
         return view! {
             <section aria-label="Contentieux" class="mt-10">
@@ -685,11 +683,10 @@ fn counsel_row(item: EntityCounselDto) -> AnyView {
     view! { <li class="flex items-baseline justify-between gap-3">{name} {count}</li> }.into_any()
 }
 
-// ── Registre (APIs externes à l'affichage, ADR 0199) ─────────────────────────
+// ── Registre et annonces ────────────────────────────────────────────────────
 
-/// Volet registre streamé : identité enrichie/dirigeants/finances
-/// (recherche-entreprises) et annonces officielles (BODACC/JOAFE), servis par
-/// les APIs publiques sans stock local. Rien à afficher (namespace sans volet,
+/// Volet streamé : l'identité registre (recherche-entreprises) et les annonces
+/// de l'entité, tous fonds confondus. Rien à afficher (namespace sans volet,
 /// amont indisponible) → la section n'existe pas dans le flux.
 #[component]
 fn RegistreSection(registre: Resource<Option<EntityRegistreResponse>>) -> impl IntoView {
@@ -705,19 +702,20 @@ fn registre_view(data: EntityRegistreResponse) -> Option<AnyView> {
         return None;
     }
     let entreprise = data.entreprise.map(entreprise_block);
-    let annonces = annonces_block(data.annonces, data.annonces_total);
     let liens = liens_block(data.liens);
-    Some(
+    // Une seule section « Annonces », toutes origines fusionnées : nos lignes par
+    // rôle d'arête et le live DILA par fond, projetés dans le même `AnnonceHit`.
+    let annonces = annonces_section(data.annonces);
+    let registre = (entreprise.is_some() || liens.is_some()).then(|| {
         view! {
             <section aria-label="Registre" class="mt-10">
                 <h2 class="font-sans text-base text-[var(--color-ink)]">"Registre"</h2>
                 {entreprise}
-                {annonces}
                 {liens}
             </section>
         }
-        .into_any(),
-    )
+    });
+    Some(view! { {registre} {annonces} }.into_any())
 }
 
 /// Identité enrichie + dirigeants + finances (entreprises `siren:`).
@@ -828,65 +826,97 @@ fn format_euros(value: i64) -> String {
     format!("{} €", group_thousands(value))
 }
 
-/// Annonces officielles (BODACC/JOAFE), plus récentes d'abord. Le PDF JOAFE
-/// est un lien direct vers l'hébergement DILA — jamais proxifié.
-fn annonces_block(annonces: Vec<lj_dtos::RegistreAnnonceDto>, total: i64) -> Option<AnyView> {
-    if annonces.is_empty() {
+/// Les annonces de l'entité, un bloc par groupe. Le groupe est un rôle d'arête
+/// pour nos lignes (« Marchés publics en cours »), un fond pour le live DILA
+/// (« Vie des entreprises », « Journal officiel des associations »). Une ligne à
+/// nous mène à sa fiche `/marche/{uid}` ; une ligne live pointe vers la source
+/// officielle, jamais proxifiée.
+fn annonces_section(groups: Vec<lj_dtos::EntityAnnonceGroupDto>) -> Option<AnyView> {
+    if groups.is_empty() {
         return None;
     }
-    let shown = annonces.len() as i64;
-    let rows = annonces
-        .into_iter()
-        .map(|a| {
-            let date = a.date.map(|d| {
-                view! {
-                    <span class="w-24 shrink-0 text-xs tabular-nums text-[var(--color-ink-subtle)]">
-                        {format_iso_date(Some(&d))}
-                    </span>
-                }
-            });
-            let pdf = a.url_pdf.map(|url| {
-                view! {
-                    <a
-                        href=url
-                        target="_blank"
-                        rel="noopener external"
-                        class="shrink-0 text-xs text-[var(--color-ink)] underline underline-offset-4 hover:text-[var(--color-accent)]"
-                    >
-                        "PDF ↗"
-                    </a>
-                }
-            });
-            view! {
-                <li class="flex items-baseline gap-3">
-                    {date}
-                    <span class="min-w-0 flex-1 truncate text-sm text-[var(--color-ink)]">
-                        {a.famille}
-                    </span>
-                    {pdf}
-                </li>
-            }
-        })
-        .collect_view();
-    let more = (total > shown).then(|| {
-        view! {
-            <p class="text-xs text-[var(--color-ink-subtle)]">
-                {format!("{} annonces au total.", group_thousands(total))}
-            </p>
-        }
-    });
+    let blocs = groups.into_iter().map(annonce_group_block).collect_view();
     Some(
         view! {
-            <div class="mt-6 flex flex-col gap-2">
-                <h3 class="text-xs uppercase tracking-[0.16em] text-[var(--color-ink-subtle)]">
-                    "Annonces officielles"
-                </h3>
-                <ul class="flex flex-col gap-1.5">{rows}</ul>
-                {more}
-            </div>
+            <section aria-label="Annonces" class="mt-10">
+                <h2 class="font-sans text-base text-[var(--color-ink)]">"Annonces"</h2>
+                {blocs}
+            </section>
         }
         .into_any(),
     )
+}
+
+fn annonce_group_block(g: lj_dtos::EntityAnnonceGroupDto) -> AnyView {
+    let shown = g.items.len() as i64;
+    let rows = g.items.into_iter().map(annonce_row).collect_view();
+    let more = (g.total > shown).then(|| {
+        view! {
+            <p class="text-xs text-[var(--color-ink-subtle)]">
+                {format!("{} annonces au total.", group_thousands(g.total))}
+            </p>
+        }
+    });
+    view! {
+        <div class="mt-6 flex flex-col gap-2">
+            <h3 class="text-xs uppercase tracking-[0.16em] text-[var(--color-ink-subtle)]">
+                {g.label}
+            </h3>
+            <ul class="flex flex-col gap-1.5">{rows}</ul>
+            {more}
+        </div>
+    }
+    .into_any()
+}
+
+/// Une annonce en ligne. La date affichée est celle qui compte pour le fond :
+/// l'échéance quand il y en a une (une consultation se lit par sa date limite),
+/// la parution sinon.
+fn annonce_row(a: lj_dtos::AnnonceHit) -> AnyView {
+    let date = a
+        .echeance
+        .as_deref()
+        .unwrap_or(&a.date_publication)
+        .get(..10)
+        .map(|d| format_iso_date(Some(d)))
+        .unwrap_or_else(|| "—".to_string());
+    let libelle = view! {
+        <span class="min-w-0 flex-1 truncate text-sm text-[var(--color-ink)]">{a.titre}</span>
+    };
+    // Nos lignes ont une fiche chez nous ; les lignes live n'ont que leur source,
+    // et un fond sans `url_action` (un JOAFE sans PDF) ne pose pas de lien.
+    let cible = if a.fond == lj_dtos::ANNONCE_FOND_MARCHE {
+        EitherOf3::A(view! {
+            <A
+                href=format!("/marche/{}", a.uid)
+                attr:class="min-w-0 flex-1 truncate text-sm text-[var(--color-ink)] hover:text-[var(--color-accent)]"
+            >
+                {libelle}
+            </A>
+        })
+    } else if a.url_action.is_empty() {
+        EitherOf3::B(libelle)
+    } else {
+        EitherOf3::C(view! {
+            <a
+                href=a.url_action
+                target="_blank"
+                rel="noopener external"
+                class="min-w-0 flex-1 truncate text-sm text-[var(--color-ink)] underline underline-offset-4 hover:text-[var(--color-accent)]"
+            >
+                {libelle}
+            </a>
+        })
+    };
+    view! {
+        <li class="flex items-baseline gap-3">
+            <span class="w-24 shrink-0 text-xs tabular-nums text-[var(--color-ink-subtle)]">
+                {date}
+            </span>
+            {cible}
+        </li>
+    }
+    .into_any()
 }
 
 /// Liens sortants vers les sources officielles (annuaire-entreprises, INPI).
@@ -1074,8 +1104,6 @@ fn pagination_view(base_path: &str, page: i64, total_pages: i64) -> Option<AnyVi
 mod tests {
     use super::abbreviate_jurisdiction;
 
-    /// Fige la convention d'abréviation, dont le dépliage des articles
-    /// contractés (« du Havre » → « Le Havre »).
     #[test]
     fn abbreviation_juridictions() {
         for (full, court) in [

@@ -1,16 +1,17 @@
-//! Barre superieure. Port de `components/layout/top-bar.tsx`. Deux etats, choisis
-//! reactivement via le contexte `DecisionBar` : barre par defaut (wordmark + MCP +
-//! auth) ou barre decision (retour + titre + navigation inter-resultats).
+//! Barre superieure. Deux etats, choisis
+//! reactivement via le contexte `DecisionBar` : barre par defaut (wordmark +
+//! hamburger) ou barre decision (retour + titre + navigation inter-resultats).
 //!
-//! `AuthButton` lit l'`AuthState` reactif : anonyme => lien Connexion ; connecte
-//! => avatar (initiale de l'email) + menu compte (Profil / Mon activite /
-//! Deconnexion). L'email est `None` au SSR (session locale) puis peuple cote
-//! client => premier rendu = Connexion, swap apres hydratation (pas de mismatch).
+//! Les menus du site et le compte vivent dans le hamburger, a toutes les
+//! tailles. Le panneau lit l'`AuthState` reactif : anonyme => lien Connexion ;
+//! connecte => menu compte (Profil / Mon activite / Deconnexion). L'email est
+//! `None` au SSR (session locale) puis peuple cote client : premier rendu =
+//! Connexion, swap apres hydratation.
 
 use leptos::either::Either;
 use leptos::prelude::*;
-use leptos_router::components::A;
-use leptos_router::hooks::use_navigate;
+use leptos_router::components::{ToHref, A};
+use leptos_router::hooks::{use_location, use_navigate};
 use leptos_router::NavigateOptions;
 
 use crate::components::decision_bar::{
@@ -27,13 +28,12 @@ pub fn TopBar() -> impl IntoView {
     }
 }
 
-/// Barre par defaut (toutes les pages hors decision). Comme la barre décision :
-/// nav inline à `lg+`, hamburger sous `lg` (même breakpoint partout → comportement
-/// et hauteur `h-14` cohérents sur toutes les pages).
+/// Barre par defaut (toutes les pages hors decision) : wordmark + hamburger,
+/// une seule rangée `h-14` à toutes les tailles.
 #[component]
 fn DefaultTopBar() -> impl IntoView {
     view! {
-        <header class="sticky top-0 z-30 border-b border-[var(--color-rule)] bg-[var(--color-parchment)]/95 backdrop-blur supports-[backdrop-filter]:bg-[var(--color-parchment)]/80">
+        <header class="sticky top-0 z-30 border-b border-[var(--color-rule)] bg-[var(--color-parchment)]/95 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-[var(--color-parchment)]/80">
             <div class="mx-auto flex h-14 max-w-7xl items-center justify-between gap-2 px-4 sm:gap-6 sm:px-6 lg:px-8">
                 <A
                     href="/"
@@ -41,29 +41,9 @@ fn DefaultTopBar() -> impl IntoView {
                 >
                     <Wordmark />
                 </A>
-                <div class="hidden lg:block">
-                    <SiteNav />
-                </div>
-                <div class="lg:hidden">
-                    <BurgerMenu />
-                </div>
+                <BurgerMenu />
             </div>
         </header>
-    }
-}
-
-/// Menus du site (Décisions / Textes / MCP / compte), partagés par la barre
-/// par défaut et les deux variantes de la barre décision.
-#[component]
-fn SiteNav() -> impl IntoView {
-    view! {
-        <nav class="flex shrink-0 items-center gap-0.5 sm:gap-1">
-            <NavItem href="/decisions">"Décisions"</NavItem>
-            <NavItem href="/textes">"Textes"</NavItem>
-            <NavItem href="/annuaire">"Annuaire"</NavItem>
-            <NavItem href="/mcp-guide">"MCP"</NavItem>
-            <AuthButton />
-        </nav>
     }
 }
 
@@ -83,10 +63,8 @@ fn BackButton(from_search: Option<crate::components::decision_bar::FromSearch>) 
             Some(fs) => format!("/decisions{}", fs.search),
             None => "/decisions".to_string(),
         };
-        // Pose la position à restaurer AVANT de naviguer : `ResultsBody` la
-        // consomme à son montage et scrolle dès que la liste est peinte (pas de
-        // saut, contrairement à un scroll différé après la nav qui peignait
-        // d'abord le haut de page).
+        // Pose la position à restaurer AVANT de naviguer : `ResultsBody` la consomme
+        // à son montage et scrolle dès que la liste est peinte.
         if let Some(fs) = &from_search {
             restore_scroll.set(Some(fs.scroll_y));
         }
@@ -100,8 +78,7 @@ fn BackButton(from_search: Option<crate::components::decision_bar::FromSearch>) 
             )
         });
     };
-    // Sous `lg`, flèche seule (le libellé passe en `aria-label`) : la rangée
-    // unique mobile rend chaque pixel au titre.
+    // Sous `lg`, flèche seule : le libellé passe en `aria-label`.
     view! {
         <button
             type="button"
@@ -116,13 +93,11 @@ fn BackButton(from_search: Option<crate::components::decision_bar::FromSearch>) 
 }
 
 /// Barre decision : retour (recherche ou resultats), titre, widget de
-/// navigation inter-resultats. Deux gabarits :
-/// - **< lg** : rangée unique — retour + titre tronqué + prev/next + menu
-///   hamburger qui replie les menus du site et le compte (rien ne disparaît,
-///   tout tient sur une ligne).
-/// - **≥ lg** : rangée unique 3 colonnes ; colonne centrale `minmax(0,34rem)`
-///   (un plancher `20rem` faisait déborder la grille vers ~1024 px et poussait
-///   les menus hors écran).
+/// navigation inter-resultats. Les menus du site et le compte sont repliés
+/// dans le hamburger à toutes les tailles : la rangée appartient au titre.
+/// Deux gabarits :
+/// - < lg : rangée unique — retour + titre tronqué + prev/next + hamburger.
+/// - ≥ lg : rangée unique 3 colonnes ; colonne centrale `minmax(0,44rem)`.
 #[component]
 fn DecisionTopBar(bar: DecisionBarState) -> impl IntoView {
     let nav_widget = |bar: &DecisionBarState| {
@@ -138,21 +113,19 @@ fn DecisionTopBar(bar: DecisionBarState) -> impl IntoView {
     let desktop_back = bar.from_search.clone();
 
     view! {
-        <header class="sticky top-0 z-30 border-b border-[var(--color-rule)] bg-[var(--color-parchment)]/95 backdrop-blur supports-[backdrop-filter]:bg-[var(--color-parchment)]/80">
+        <header class="sticky top-0 z-30 border-b border-[var(--color-rule)] bg-[var(--color-parchment)]/95 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-[var(--color-parchment)]/80">
             <div class="flex h-14 items-center gap-2 px-4 sm:px-6 lg:hidden">
                 <BackButton from_search=mobile_back />
-                <p class="min-w-0 flex-1 truncate text-sm leading-tight font-semibold text-[var(--color-ink)]">
+                <p class="min-w-0 flex-1 truncate text-center text-sm leading-tight font-semibold text-[var(--color-ink)]">
                     {mobile_title}
                 </p>
                 {mobile_widget}
                 <BurgerMenu />
             </div>
             // Pistes latérales `1fr` = minmax(auto, 1fr) : leur minimum reste le
-            // min-content (PAS de `min-w-0` sur la colonne gauche — il mettait
-            // son minimum à 0 et son contenu `shrink-0` débordait sous le
-            // titre) ; seule la colonne titre `minmax(0,…)` absorbe la
-            // compression, en tronquant.
-            <div class="mx-auto hidden h-14 max-w-7xl grid-cols-[1fr_minmax(0,34rem)_1fr] items-center gap-2 px-8 lg:grid">
+            // min-content ; seule la colonne titre `minmax(0,…)` absorbe la compression,
+            // en tronquant.
+            <div class="mx-auto hidden h-14 max-w-7xl grid-cols-[1fr_minmax(0,44rem)_1fr] items-center gap-2 px-8 lg:grid">
                 <div class="flex items-center gap-3">
                     <A
                         href="/"
@@ -173,15 +146,15 @@ fn DecisionTopBar(bar: DecisionBarState) -> impl IntoView {
                     <span aria-hidden="true" class="text-[var(--color-rule)]">
                         "·"
                     </span>
-                    <SiteNav />
+                    <BurgerMenu />
                 </div>
             </div>
         </header>
     }
 }
 
-/// Navigation precedent / suivant entre resultats. Port de `DecisionNavWidget` :
-/// l'index courant est derive de `hit_ids.indexOf(current_id)`, la graine de la
+/// Navigation precedent / suivant entre resultats : l'index courant est derive
+/// de la position dans `hit_ids`, la graine de la
 /// cible est posee avant de naviguer (la barre de la page cible la consomme).
 #[component]
 fn DecisionNavWidget(
@@ -273,37 +246,6 @@ fn DecisionNavWidget(
     }
 }
 
-/// Lien de navigation. `A` pose `aria-current` automatiquement sur la route
-/// active ; on s'appuie dessus pour le style actif via le selecteur
-/// `aria-[current]`.
-#[component]
-fn NavItem(href: &'static str, children: Children) -> impl IntoView {
-    // `text-xs px-1.5` sous `sm` : wordmark (~115 px) + 4 entrées à `text-sm
-    // px-2` (~272 px) débordaient les ~358 px utiles d'un écran de 390 —
-    // la nav peinte par-dessus le wordmark comprimé.
-    let class = cn([
-        "px-1.5 py-2 text-xs transition-colors sm:px-3 sm:text-sm",
-        "text-[var(--color-ink-muted)] hover:text-[var(--color-ink)]",
-        "aria-[current=page]:text-[var(--color-ink)]",
-    ]);
-    view! {
-        <A href=href attr:class=class>
-            {children()}
-        </A>
-    }
-}
-
-/// Bouton d'authentification. Anonyme => lien Connexion ; connecte => avatar +
-/// menu compte. Bascule reactivement sur l'email de l'`AuthState`.
-#[component]
-fn AuthButton() -> impl IntoView {
-    let auth = crate::auth::use_auth();
-    move || match auth.email.get() {
-        None => Either::Left(view! { <NavItem href="/connexion">"Connexion"</NavItem> }),
-        Some(email) => Either::Right(view! { <AccountMenu email=email /> }),
-    }
-}
-
 /// Fermeture d'un panneau flottant au clic exterieur (listener `mousedown`) et
 /// a tout changement de route (ilots client, inertes au SSR).
 fn close_on_outside_or_nav(open: RwSignal<bool>, container_ref: NodeRef<leptos::html::Div>) {
@@ -339,12 +281,12 @@ fn close_on_outside_or_nav(open: RwSignal<bool>, container_ref: NodeRef<leptos::
     let _ = (open, container_ref);
 }
 
-/// Corps du menu compte (email + Profil / Mon activité / Déconnexion), partagé
-/// par l'avatar (`AccountMenu`) et le hamburger mobile (`BurgerMenu`).
+/// Corps du menu compte (email + Profil / Mon activité / Déconnexion), affiché
+/// dans le panneau du hamburger (`BurgerMenu`) quand une session est active.
 #[component]
 fn AccountItems(email: String, open: RwSignal<bool>) -> impl IntoView {
-    // `StoredValue` (Copy) : `on_sign_out` reste un closure `Copy` => `Fn`,
-    // requis car il vit dans les enfants de `<Show>` (rappeles a chaque rendu).
+    // `StoredValue` (Copy) : `on_sign_out` doit rester `Copy` pour être `Fn`, il
+    // vit dans les enfants de `<Show>` (rappeles a chaque rendu).
     #[cfg(feature = "hydrate")]
     let navigate = StoredValue::new_local(use_navigate());
     let on_sign_out = move |_| {
@@ -385,74 +327,55 @@ fn AccountItems(email: String, open: RwSignal<bool>) -> impl IntoView {
     }
 }
 
-/// Avatar (initiale de l'email) ouvrant un menu compte flottant. Port de
-/// `AuthButton` (branche connectee) de `top-bar.tsx`.
-#[component]
-fn AccountMenu(email: String) -> impl IntoView {
-    let open = RwSignal::new(false);
-    let container_ref = NodeRef::<leptos::html::Div>::new();
-    close_on_outside_or_nav(open, container_ref);
-
-    let initial = email
-        .chars()
-        .next()
-        .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_else(|| "?".to_string());
-
-    view! {
-        <div node_ref=container_ref class="relative">
-            <button
-                type="button"
-                on:click=move |_| open.update(|o| *o = !*o)
-                aria-label="Menu du compte"
-                aria-expanded=move || open.get().then_some("true")
-                class="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--color-accent)] text-xs font-semibold text-white transition-opacity hover:opacity-85"
-            >
-                {initial}
-            </button>
-            <Show when=move || open.get()>
-                <div class="absolute right-0 top-full z-50 mt-2 w-52 overflow-hidden rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] shadow-lg">
-                    <AccountItems email=email.clone() open=open />
-                </div>
-            </Show>
-        </div>
-    }
-}
-
-/// Menu hamburger de la barre decision mobile : replie l'accueil, les menus du
-/// site et le compte dans un panneau flottant, pour laisser la rangée unique
-/// au retour + titre + navigation inter-résultats.
+/// Menu hamburger : replie l'accueil, les menus du site et le compte dans un
+/// panneau flottant. Unique point d'entrée de la navigation, sur toutes les
+/// barres et à toutes les tailles.
 #[component]
 fn BurgerMenu() -> impl IntoView {
     let open = RwSignal::new(false);
     let container_ref = NodeRef::<leptos::html::Div>::new();
     close_on_outside_or_nav(open, container_ref);
     let auth = crate::auth::use_auth();
+    let login_href = login_href();
 
     view! {
         <div node_ref=container_ref class="relative shrink-0">
+            // Déclencheur, même cadre que le bouton retour « ← Recherche ».
+            // Morphing hamburger ⇄ croix à emprise constante : géométrie et courbes dans
+            // `main.css` (`.lj-burger-*`). Libellé « Menu » sur desktop uniquement.
             <button
                 type="button"
                 on:click=move |_| open.update(|o| *o = !*o)
                 aria-label="Menu du site"
                 aria-expanded=move || open.get().then_some("true")
-                class="flex h-7 w-7 items-center justify-center rounded border border-[var(--color-rule)] text-[var(--color-ink-muted)] transition-colors hover:border-[var(--color-ink)] hover:text-[var(--color-ink)]"
+                class="flex shrink-0 items-center gap-2 rounded-md border border-[var(--color-rule)] px-2.5 py-1.5 text-sm font-medium text-[var(--color-ink-muted)] transition-colors hover:border-[var(--color-ink)] hover:text-[var(--color-ink)]"
             >
-                "☰"
+                <span
+                    aria-hidden="true"
+                    class="relative flex h-4 w-4 items-center justify-center"
+                    class=("lj-burger-open", move || open.get())
+                >
+                    <span class="lj-burger-line lj-burger-line-top"></span>
+                    <span class="lj-burger-line lj-burger-line-bottom"></span>
+                </span>
+                <span class="hidden lg:inline">"Menu"</span>
             </button>
-            <Show when=move || open.get()>
-                <div class="absolute right-0 top-full z-50 mt-2 w-52 overflow-hidden rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] shadow-lg">
-                    <div class="py-1">
+            <div
+                data-open=move || open.get().then_some("true")
+                class="lj-panel absolute right-0 top-full z-50 mt-2 w-52 overflow-hidden rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] shadow-lg"
+            >
+                <div class="py-1">
                         <DropdownItem href="/">"Accueil"</DropdownItem>
                         <DropdownItem href="/decisions">"Décisions"</DropdownItem>
                         <DropdownItem href="/textes">"Textes"</DropdownItem>
                         <DropdownItem href="/annuaire">"Annuaire"</DropdownItem>
+                        <DropdownItem href="/annonces">"Annonces"</DropdownItem>
                         <DropdownItem href="/mcp-guide">"MCP"</DropdownItem>
                     </div>
                     {move || match auth.email.get() {
                         None => Either::Left(view! {
                             <div class="border-t border-[var(--color-rule)] py-1">
-                                <DropdownItem href="/connexion">"Connexion"</DropdownItem>
+                                <DropdownItem href=login_href>"Connexion"</DropdownItem>
                             </div>
                         }),
                         Some(email) => Either::Right(view! {
@@ -461,17 +384,43 @@ fn BurgerMenu() -> impl IntoView {
                             </div>
                         }),
                     }}
-                </div>
-            </Show>
+            </div>
         </div>
+    }
+}
+
+/// `href` du lien Connexion : `/connexion?next=<page courante>`, pour revenir
+/// d'ou l'on vient une fois authentifie. Depuis les pages d'auth elles-memes,
+/// pas de `next` — la destination serait la page de connexion.
+fn login_href() -> impl Fn() -> String + Copy + Send + Sync + 'static {
+    let location = use_location();
+    let (pathname, search) = (location.pathname, location.search);
+    move || {
+        let path = pathname.get();
+        if path.starts_with("/connexion") || path.starts_with("/reinitialiser-mot-de-passe") {
+            return "/connexion".to_string();
+        }
+        let search = search.get();
+        let target = if search.is_empty() {
+            path
+        } else {
+            format!("{path}?{search}")
+        };
+        format!(
+            "/connexion?next={}",
+            leptos_router::location::Url::escape(&target)
+        )
     }
 }
 
 /// Entree du menu compte. `A` pose `aria-current` sur la route active (style via
 /// `aria-[current=page]`) ; la fermeture du menu est portee par l'effet de
-/// navigation d'`AccountMenu`.
+/// navigation de `close_on_outside_or_nav`.
 #[component]
-fn DropdownItem(href: &'static str, children: Children) -> impl IntoView {
+fn DropdownItem<H>(href: H, children: Children) -> impl IntoView
+where
+    H: ToHref + Send + Sync + 'static,
+{
     let class = cn([
         "block px-3 py-1.5 text-sm transition-colors",
         "text-[var(--color-ink-muted)] hover:bg-[var(--color-rule)] hover:text-[var(--color-ink)]",
@@ -484,7 +433,6 @@ fn DropdownItem(href: &'static str, children: Children) -> impl IntoView {
     }
 }
 
-/// Logotype textuel.
 #[component]
 pub fn Wordmark() -> impl IntoView {
     view! {

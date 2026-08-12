@@ -1,5 +1,5 @@
 -- Migration 0067 — Garde anti-re-merge : flag porté par `decisions`, pas une table.
--- Supersede la partie « table » de l'ADR 0103 (0066).
+-- Supersede la partie « table » de la 0066.
 --
 -- 0066 matérialisait les `canonical_ref` ambiguës dans une table dédiée. Inutile :
 -- l'ambiguïté est une propriété de la clé, déjà portée par les lignes `decisions`

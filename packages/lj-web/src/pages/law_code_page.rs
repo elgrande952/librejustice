@@ -1,11 +1,14 @@
 //! Page `/texte/{code}` (LawCodePage, SEO-critique). Sommaire d'un texte :
-//! en-tête (titre, nature, méta), rail « Plan du texte » ancré sur les
-//! divisions de premier niveau, puis — selon la taille servie par l'API —
-//! vue-lecture intégrale (textes courts : BOFiP, décrets, arrêtés…) ou
-//! recherche bornée + table des matières arborescente (chevrons, compteurs
-//! d'articles, vue-lecture par division). Calquée sur
-//! [`crate::pages::law_page`] : sommaire bloquant SSR (SEO dans le document
-//! initial), JSON-LD `Legislation`.
+//! en-tête (titre, nature, méta), rail « Plan du texte » ancré sur les divisions de
+//! premier niveau, puis — selon la taille servie par l'API — vue-lecture intégrale
+//! (textes courts : BOFiP, décrets, arrêtés…) ou recherche bornée + table des
+//! matières arborescente (chevrons, compteurs d'articles, vue-lecture par
+//! division). Sommaire bloquant SSR (SEO dans le document initial), JSON-LD
+//! `Legislation`.
+//!
+//! Gabarit trois colonnes commun aux pages document, monté par [`DecisionLayout`] :
+//! gauche = le plan et la dimension temporelle, centre = le texte et son sommaire,
+//! droite = les articles les plus cités du code.
 
 use leptos::either::Either;
 use leptos::prelude::*;
@@ -13,16 +16,24 @@ use leptos_meta::{Link, Meta, Title};
 use leptos_router::components::A;
 use lj_dtos::{LawCodeSummary, LawSectionItem, TocEntry, INLINE_READING_MAX};
 
+use crate::components::decision::DecisionLayout;
+use crate::components::layout::{CONTENT_COL, GRID_3COL, SHELL};
+use crate::components::own_page_description;
 use crate::helpers::{format_article_num, format_iso_date, group_thousands};
 use crate::pages::law_page::data::{
     chrono_date, code_param, fetch_code_summary, fetch_toc, sendable, PageError, TocResult,
 };
+use crate::pages::law_page::top_cited::top_cited_block;
 use crate::pages::law_page::{rail_block, rail_item, ChronoDatePicker};
 use crate::seo::law::code_canonical_url;
 use crate::seo::OG_IMAGE;
 
 #[component]
 pub fn LawCodePage() -> impl IntoView {
+    // La page pose sa propre description (parfois depuis un `<Suspense>`) : on la
+    // déclare ici, synchroniquement.
+    own_page_description();
+
     let code = code_param();
     let summary = Resource::new_blocking(
         move || code.get(),
@@ -30,7 +41,7 @@ pub fn LawCodePage() -> impl IntoView {
     );
     // Table des matières non bloquante (streamée via `<Suspense>`) : hors du chemin
     // critique du rendu SEO, qui n'attend que le sommaire. Datée par `?date=`
-    // (Chronolégi, ADR 0193 §5).
+    // (Chronolégi).
     let date = chrono_date();
     let toc = Resource::new(
         move || (code.get(), date.get()),
@@ -101,13 +112,11 @@ fn CodeError(err: PageError) -> impl IntoView {
 #[component]
 fn CodeSkeleton() -> impl IntoView {
     use crate::components::ui::Skeleton;
-    // Même grille rail + contenu que la page chargée : le squelette s'aligne sur
-    // la colonne contenu, pas de saut latéral au remplacement.
     view! {
-        <div class="mx-auto w-full max-w-[92rem] flex-1 px-4 py-8 sm:px-6 lg:px-8">
-            <div class="grid gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12">
+        <div class=format!("{SHELL} flex-1")>
+            <div class=GRID_3COL>
                 <div class="hidden lg:block"></div>
-                <div class="flex w-full min-w-0 max-w-3xl flex-col gap-6">
+                <div class=CONTENT_COL>
                     <Skeleton class="h-4 w-1/6" />
                     <Skeleton class="h-10 w-1/2" />
                     <Skeleton class="h-4 w-1/3" />
@@ -123,8 +132,8 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
     let title = summary.titre.clone();
     let code = summary.code.clone();
     let has_articles = summary.article_count > 0;
-    // Corps monolithique (ADR 0196) : circulaires… — un texte peut porter un
-    // corps, des articles, ou les deux (préambule BOFiP).
+    // Corps monolithique : un texte peut porter un corps, des articles, ou les deux
+    // (préambule BOFiP).
     let body = summary.body.clone().filter(|b| !b.trim().is_empty());
     let description = if has_articles {
         format!(
@@ -154,16 +163,12 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
         "legislationIdentifier": summary.legitext,
     });
     let jsonld = serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string());
-    // Fil d'Ariane structuré vers le catalogue des normes (ADR 0255) — absent
-    // si le texte est hors catalogue (acte individuel). Le fond `codes` pointe
-    // sur son catalogue dédié `/codes`.
+    // Fil d'Ariane structuré vers le catalogue des normes — absent si le texte est
+    // hors catalogue (acte individuel). Le fond `codes` pointe sur son catalogue dédié
+    // `/normes/codes`.
     let fond_hub = summary.fond.clone().map(|fond| {
         let label = summary.fond_label.clone().unwrap_or_else(|| fond.clone());
-        let href = if fond == "codes" {
-            "/codes".to_string()
-        } else {
-            format!("/normes/{fond}")
-        };
+        let href = format!("/normes/{fond}");
         let year_href = (fond != "codes").then(|| {
             let token = match summary.fond_year {
                 Some(y) => y.to_string(),
@@ -193,19 +198,17 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
     });
 
     // Provenance : seuls les textes LEGI portent l'attribution DILA et leur
-    // identifiant LEGITEXT ; les textes curés (étrangers, traduits) renvoient
-    // à la page sources générale — leur uid technique n'apprend rien.
+    // identifiant LEGITEXT ; les textes curés (étrangers, traduits) renvoient à la
+    // page sources générale.
     let is_legi = summary.legitext.starts_with("LEGITEXT");
     let (source_href, source_label) = if is_legi {
         ("/sources#dila", "Base LEGI · DILA")
     } else {
         ("/sources", "Données & sources")
     };
-    // Bloc méta (articles / dernière modif / source / LEGITEXT), un item par
-    // ligne — dans la colonne étroite du rail, des séparateurs « · » se replient
-    // en orphelins de bout/début de ligne. Bâti par une closure pour être rendu à
-    // deux endroits : en tête de la gouttière gauche sur desktop (au-dessus du
-    // « Plan du texte », équilibre la page) et dans l'en-tête sur mobile.
+    // Bloc méta (articles / dernière modif / source / LEGITEXT), un item par ligne.
+    // Bâti par une closure pour être rendu à deux endroits : la gouttière gauche sur
+    // desktop, l'en-tête sur mobile.
     let article_count = summary.article_count;
     let modif_date = summary
         .derniere_modification
@@ -218,8 +221,7 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
     let nor = summary.nor.clone();
     let legitext_uid = is_legi.then(|| summary.legitext.clone());
     // Texte publié au JO (uid JORFTEXT) : lien composé vers sa page Légifrance
-    // d'origine — version au JO, travaux préparatoires, dossiers législatifs
-    // (ADR 0215, zéro ingest).
+    // d'origine — version au JO, travaux préparatoires, dossiers législatifs.
     let jorf_url = summary.legitext.starts_with("JORFTEXT").then(|| {
         format!(
             "https://www.legifrance.gouv.fr/jorf/id/{}",
@@ -271,13 +273,12 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
             </p>
         }
     };
-    // Bandeau temporel (ADR 0178) : prochaine version programmée du texte.
     let upcoming = summary
         .upcoming_versions
         .first()
         .map(|d| crate::pages::law_page::upcoming_banner("Ce texte sera modifié", d));
-    // État de diffusion (ADR 0196) : les circulaires abrogées restent lisibles,
-    // le bandeau signale l'abrogation.
+    // État de diffusion : les circulaires abrogées restent lisibles, le bandeau
+    // signale l'abrogation.
     let abroge = (summary.status.as_deref() == Some("ABROGE")).then(|| {
         view! {
             <p class="mt-1 w-fit rounded-md border border-[var(--color-rule)] bg-[var(--color-vellum)]/60 px-3 py-1.5 text-sm text-[var(--color-ink-muted)]">
@@ -285,8 +286,6 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
             </p>
         }
     });
-    // Badge de portée (ADR 0196) : doctrine administrative — les normes n'en
-    // portent pas.
     let scope_badge = summary.scope.clone().map(|label| {
         view! {
             <span class="w-fit rounded-full border border-[var(--color-rule)] px-2.5 py-0.5 text-xs normal-case tracking-normal text-[var(--color-ink-muted)]">
@@ -294,8 +293,8 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
             </span>
         }
     });
-    // Corps monolithique (ADR 0196) : rendu en flux (retours à la ligne
-    // préservés), coiffé d'un intertitre quand le texte a aussi des articles.
+    // Corps monolithique : rendu en flux (retours à la ligne préservés), coiffé d'un
+    // intertitre quand le texte a aussi des articles.
     let body_section = body.map(|b| {
         let heading = has_articles.then(|| {
             view! {
@@ -329,15 +328,9 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
         {breadcrumb
             .map(|bc| view! { <leptos_meta::Script type_="application/ld+json">{bc}</leptos_meta::Script> })}
 
-        <div class="mx-auto w-full max-w-[92rem] flex-1 px-4 py-8 sm:px-6 lg:px-8">
-            // Gabarit commun /decisions · /textes · /decision : conteneur 92rem,
-            // gouttière 240px, colonne contenu bornée 3xl — le rail « Plan du
-            // texte » et le contenu tombent au même x que sur les autres pages.
-            <div class="grid gap-8 lg:grid-cols-[240px_minmax(0,1fr)] lg:gap-12">
-                // Gouttière gauche (desktop) : la ligne méta coiffe le rail « Plan
-                // du texte » — elle remplit le haut de la colonne, ce qui équilibre
-                // la page (sinon le rail flottait sous un grand vide).
-                <div class="hidden lg:block">
+        <DecisionLayout
+            toc=view! {
+                <div>
                     <div class="mb-6 flex flex-col gap-5">
                         {meta_line()}
                         {has_articles.then(|| view! {
@@ -346,10 +339,13 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
                     </div>
                     {has_articles.then(|| view! { <CodePlanRail toc=toc /> })}
                 </div>
-                <div class="flex w-full min-w-0 max-w-3xl flex-col gap-8">
+            }
+                .into_any()
+            main=view! {
+                <div class="flex flex-col gap-8">
                     <header class="flex flex-col gap-3">
-                        // Nature en libellé lisible : les textes curés portent un type
-                        // technique à underscores (« CODE_PROCEDURE_CIVILE »).
+                        // Nature en libellé lisible : les textes curés portent un type technique à
+                        // underscores (« CODE_PROCEDURE_CIVILE »).
                         <p class="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
                             <span>{summary.nature.replace('_', " ")}</span>
                             {scope_badge}
@@ -357,8 +353,6 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
                         <h1 class="font-sans text-3xl text-[var(--color-ink)] sm:text-4xl">
                             {title}
                         </h1>
-                        // Méta + Chronolégi en mobile uniquement : sur desktop ils
-                        // vivent dans la gouttière gauche, au-dessus du plan.
                         <div class="flex flex-col gap-4 lg:hidden">
                             {meta_line()}
                             {has_articles.then(|| view! {
@@ -373,7 +367,6 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
                     {has_articles.then(|| view! {
                         <CodeTocSection toc=toc code=code.clone() />
                     })}
-                    // Maillage retour vers l'arborescence des normes (ADR 0255).
                     {fond_hub
                         .map(|(label, href, year_href)| {
                             view! {
@@ -398,13 +391,23 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
                             }
                         })}
                 </div>
-            </div>
-        </div>
+            }
+                .into_any()
+            similar=view! {
+                // Piste droite : les articles du texte que la jurisprudence travaille le plus.
+                <aside
+                    aria-label="Articles les plus cités"
+                    class="flex flex-col gap-6 lg:sticky lg:top-20 lg:self-start"
+                >
+                    {top_cited_block(&summary.code, summary.top_cited)}
+                </aside>
+            }
+                .into_any()
+        />
     }
 }
 
-/// Recherche bornée à ce code (gabarit Légifrance « Rechercher dans tout le
-/// code ») : formulaire GET nu vers `/textes?q=…&code={slug}` — pas de signal,
+/// Recherche bornée à ce code : formulaire GET nu vers `/textes?q=…&code={slug}` —
 /// la page textes lit `code` et borne le moteur au texte.
 #[component]
 fn CodeSearchForm(code: String) -> impl IntoView {
@@ -465,9 +468,8 @@ fn toc_view(resolved: TocResult, code: String, date: Option<String>) -> AnyView 
         }
         .into_any();
     }
-    // Vue-lecture intégrale (textes courts) : les articles se lisent à la
-    // suite sur la page — pas de chips ni de recherche bornée à cette échelle.
-    // Intertitres ancrés `#{cid}` (le rail « Plan du texte » y pointe).
+    // Vue-lecture intégrale (textes courts) : les articles se lisent à la suite sur la
+    // page. Intertitres ancrés `#{cid}` (le rail « Plan du texte » y pointe).
     if !resolved.reading.is_empty() {
         let items: Vec<AnyView> = resolved
             .reading
@@ -483,10 +485,8 @@ fn toc_view(resolved: TocResult, code: String, date: Option<String>) -> AnyView 
         }
         .into_any();
     }
-    // Arbre structurel réel daté (ADR 0207) : sections ancrées (`#{cid}`),
-    // vue-lecture par division. Prime sur la reconstruction par `title_path`. Le
-    // rail « Plan du texte » vit désormais dans la gouttière gauche de la page
-    // (`CodePlanRail`), pas ici — cette vue ne rend que la table des matières.
+    // Arbre structurel réel daté : sections ancrées (`#{cid}`), vue-lecture par
+    // division. Prime sur la reconstruction par `title_path`.
     if !resolved.tree.is_empty() {
         let (views, _) = render_real_level(&resolved.tree, 0, 1, &code, date.as_deref());
         return with_code_search(&code, toc_section(views));
@@ -499,8 +499,8 @@ fn toc_view(resolved: TocResult, code: String, date: Option<String>) -> AnyView 
     with_code_search(&code, toc)
 }
 
-/// Coiffe la table des matières du formulaire de recherche bornée au texte —
-/// rendu avec elle (même Suspense) : il n'a de sens que face à un sommaire.
+/// Coiffe la table des matières du formulaire de recherche bornée au texte, rendu
+/// avec elle (même Suspense).
 fn with_code_search(code: &str, toc: AnyView) -> AnyView {
     view! {
         <div class="flex min-w-0 flex-col gap-8">
@@ -514,12 +514,11 @@ fn with_code_search(code: &str, toc: AnyView) -> AnyView {
 /// Rail « Plan du texte » de la gouttière gauche, streamé et sticky sur desktop.
 /// La colonne gauche parente (`hidden lg:block`, toujours présente) stabilise la
 /// grille pendant le streaming et garde l'en-tête aligné même quand le rail est
-/// absent (parité /textes : la gouttière existe même sans contenu). Le rail vit
-/// sous `lg` uniquement (aucun rail en mobile).
+/// absent. Le rail vit sous `lg` uniquement (aucun rail en mobile).
 #[component]
 fn CodePlanRail(toc: Resource<TocResult>) -> impl IntoView {
-    // Pas de wrapper `hidden lg:block` ici : la colonne gauche parente le porte
-    // déjà (et fournit le bloc englobant étiré dont le rail sticky a besoin).
+    // Pas de wrapper `hidden lg:block` ici : la colonne gauche parente le porte déjà,
+    // et fournit le bloc englobant étiré dont le rail sticky a besoin.
     view! {
         <Suspense>
             {move || Suspend::new(async move {
@@ -539,7 +538,6 @@ fn plan_rail_view(resolved: &TocResult) -> Option<AnyView> {
     plan_rail(&resolved.tree)
 }
 
-/// Colonne « Table des matières » : en-tête petites capitales + arbre.
 fn toc_section(views: Vec<AnyView>) -> AnyView {
     view! {
         <section aria-label="Table des matières" class="flex min-w-0 flex-col gap-3">
@@ -553,8 +551,7 @@ fn toc_section(views: Vec<AnyView>) -> AnyView {
 }
 
 /// Rail « Plan du texte » (sticky, desktop) : les divisions de premier niveau,
-/// ancrées `#{cid}` — orientation immédiate dans un code de plusieurs milliers
-/// d'articles. Masqué s'il n'y a pas au moins deux divisions.
+/// ancrées `#{cid}`. Masqué s'il n'y a pas au moins deux divisions.
 fn plan_rail(items: &[lj_dtos::TocNode]) -> Option<AnyView> {
     let entries: Vec<AnyView> = items
         .iter()
@@ -586,10 +583,10 @@ fn plan_rail(items: &[lj_dtos::TocNode]) -> Option<AnyView> {
     )
 }
 
-/// Contexte de matérialisation en place d'une division (accordéon de lecture,
-/// ADR 0214) : de quoi fetcher sa vue-lecture (`/api/texte/{code}/section/{cid}`)
-/// à la date de consultation. `cid` n'est lu que par le fetch et l'alignement
-/// du fragment — côté client uniquement.
+/// Contexte de matérialisation en place d'une division (accordéon de lecture) : de
+/// quoi fetcher sa vue-lecture (`/api/texte/{code}/section/{cid}`) à la date de
+/// consultation. `cid` n'est lu que par le fetch et l'alignement du fragment, côté
+/// client uniquement.
 #[derive(Clone)]
 #[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
 struct InlineRead {
@@ -599,18 +596,15 @@ struct InlineRead {
 }
 
 /// Une division du sommaire en `<details>` : chevron custom, libellé, compteur
-/// d'articles, lien « Lire » vers la vue-lecture — le tout sur une ligne qui ne
-/// casse plus. Tous les niveaux arrivent dépliés : le sommaire entier se lit
-/// sans un clic (gabarit Légifrance), le rail « Plan » sert de navigation.
-/// `top` (premier niveau) : filet séparateur, typo plus grande.
+/// d'articles, lien « Lire » vers la vue-lecture. Tous les niveaux arrivent
+/// dépliés : le sommaire entier se lit sans un clic, le rail « Plan » sert de
+/// navigation. `top` (premier niveau) : filet séparateur, typo plus grande.
 ///
-/// `inline` (divisions ≤ [`INLINE_READING_MAX`] articles, ADR 0214) : le lien
-/// « Lire » matérialise la vue-lecture sur place — les chips s'effacent, le
-/// re-clic (« Sommaire ») les rappelle. Amélioration progressive : sans JS le
-/// lien navigue vers la page section (URL canonique) ; clic modifié idem.
-/// Arrivée sur `#{cid}` : le scroll natif est complété par la matérialisation
-/// de la division pointée (parité Légifrance — un lien copié rend la lecture,
-/// pas seulement la position).
+/// `inline` (divisions ≤ [`INLINE_READING_MAX`] articles) : le lien « Lire »
+/// matérialise la vue-lecture sur place — les chips s'effacent, le re-clic
+/// (« Sommaire ») les rappelle. Amélioration progressive : sans JS le lien navigue
+/// vers la page section (URL canonique) ; clic modifié idem. Arrivée sur `#{cid}` :
+/// le scroll natif est complété par la matérialisation de la division pointée.
 fn section_details(
     label: String,
     top: bool,
@@ -642,15 +636,15 @@ fn section_details(
             </span>
         }
     });
-    // Accordéon (ADR 0214) : la vue-lecture fetchée remplace les chips tant
-    // que la division est dépliée en lecture.
+    // Accordéon : la vue-lecture fetchée remplace les chips tant que la division est
+    // dépliée en lecture.
     let open_reading = RwSignal::new(false);
     let reading = RwSignal::new(None::<Vec<LawSectionItem>>);
     // Fetch en vol : un seul départ ; remis à faux sur échec (retente ensuite).
     let loading = StoredValue::new(false);
     let items_ctx = inline.clone();
-    // Arrivée sur `#{cid}` (lien copié, rail « Plan ») : matérialise la
-    // division pointée en plus du scroll natif du navigateur.
+    // Arrivée sur `#{cid}` (lien copié, rail « Plan ») : matérialise la division
+    // pointée en plus du scroll natif du navigateur.
     #[cfg(feature = "hydrate")]
     if let Some(ctx) = inline.clone() {
         Effect::new(move |_| {
@@ -770,11 +764,10 @@ fn materialize(
     });
 }
 
-/// Lien « Lire » d'une division lisible sur place (ADR 0214) : au clic simple,
-/// toggle de matérialisation, fragment aligné `#{cid}` sans entrée
-/// d'historique ; ouvert, le lien devient « Sommaire » (retour aux chips — le
-/// chevron de la ligne, lui, plie le sous-arbre). Clic modifié ou sans JS :
-/// navigation vers la page section.
+/// Lien « Lire » d'une division lisible sur place : au clic simple, toggle de
+/// matérialisation, fragment aligné `#{cid}` sans entrée d'historique ; ouvert, le
+/// lien devient « Sommaire » (le chevron de la ligne, lui, plie le sous-arbre).
+/// Clic modifié ou sans JS : navigation vers la page section.
 fn inline_read_control(
     href: String,
     ctx: InlineRead,
@@ -789,8 +782,8 @@ fn inline_read_control(
             if ev.ctrl_key() || ev.meta_key() || ev.shift_key() || ev.alt_key() {
                 return;
             }
-            // Annule la navigation ET le toggle du `<details>` parent (le
-            // `preventDefault` couvre l'action par défaut du `<summary>`).
+            // Annule la navigation ET le toggle du `<details>` parent (le `preventDefault`
+            // couvre l'action par défaut du `<summary>`).
             ev.prevent_default();
             if open_reading.get_untracked() {
                 open_reading.set(false);
@@ -838,7 +831,7 @@ fn sync_hash(cid: &str) {
 }
 
 /// Nombre d'articles du sous-arbre qui commence à `after` (liste aplatie par
-/// `depth`, ADR 0207) : les items de profondeur strictement supérieure à `depth`.
+/// `depth`) : les items de profondeur strictement supérieure à `depth`.
 fn subtree_article_count(items: &[lj_dtos::TocNode], after: usize, depth: i32) -> usize {
     items[after..]
         .iter()
@@ -847,10 +840,10 @@ fn subtree_article_count(items: &[lj_dtos::TocNode], after: usize, depth: i32) -
         .count()
 }
 
-/// Rend un niveau de l'arbre structurel réel (liste aplatie par `depth`,
-/// ADR 0207) à partir de l'index `i` : articles consécutifs en flux, sections
-/// en `<details>` ancrés (`id = cid`) avec lien « Lire » vers la vue-lecture.
-/// Renvoie `(vues, index du premier item hors de ce niveau)`.
+/// Rend un niveau de l'arbre structurel réel (liste aplatie par `depth`) à partir
+/// de l'index `i` : articles consécutifs en flux, sections en `<details>` ancrés
+/// (`id = cid`) avec lien « Lire » vers la vue-lecture. Renvoie `(vues, index du
+/// premier item hors de ce niveau)`.
 fn render_real_level(
     items: &[lj_dtos::TocNode],
     mut i: usize,
@@ -873,13 +866,12 @@ fn render_real_level(
         let article_count = subtree_article_count(items, i + 1, depth);
         let (children, next) = render_real_level(items, i + 1, depth + 1, code, date);
         let cid = item.cid.clone().unwrap_or_default();
-        // La date de consultation suit dans la vue-lecture (Chronolégi).
         let lire = match date {
             Some(d) => format!("/texte/{code}/section/{cid}?date={d}"),
             None => format!("/texte/{code}/section/{cid}"),
         };
-        // Division lisible sur place (ADR 0214) : même borne que la
-        // vue-lecture intégrale des textes courts.
+        // Division lisible sur place : même borne que la vue-lecture intégrale des textes
+        // courts.
         let inline =
             (article_count > 0 && article_count <= INLINE_READING_MAX).then(|| InlineRead {
                 code: code.to_string(),
@@ -904,7 +896,7 @@ fn render_real_level(
 }
 
 /// Flux d'articles consécutifs d'une division de l'arbre réel : chips liées
-/// sur la clé canonique, articles abrogés barrés (parité `article_flow`).
+/// sur la clé canonique, articles abrogés barrés.
 fn real_article_flow(items: Vec<&lj_dtos::TocNode>, code: &str, date: Option<&str>) -> AnyView {
     let links = items
         .into_iter()
@@ -918,9 +910,9 @@ fn real_article_flow(items: Vec<&lj_dtos::TocNode>, code: &str, date: Option<&st
 }
 
 /// Chip d'article du sommaire : numéro en petite pastille bordée, abrogé barré.
-/// Hover card d'article (ADR 0168) : le texte se lit au survol, sans naviguer.
-/// `<a>` natif plutôt que le `<A>` routeur : un gros code en aligne des
-/// milliers, on épargne le tracking de route par lien.
+/// Hover card d'article : le texte se lit au survol, sans naviguer. `<a>` natif
+/// plutôt que le `<A>` routeur : un gros code en aligne des milliers, on épargne le
+/// tracking de route par lien.
 fn article_chip(
     code: &str,
     num_key: String,
@@ -990,8 +982,7 @@ fn build_toc_tree(entries: Vec<TocEntry>) -> Vec<TocNode> {
 /// manquantes. Chemin vide ⇒ article en racine. Une division existante de même
 /// titre est réutilisée où qu'elle soit parmi ses sœurs (pas seulement la dernière
 /// insérée) : les articles d'une même division n'arrivent pas forcément groupés
-/// (`position` NULL ⇒ tri `num_key` qui entrelace les divisions), sinon l'arbre se
-/// fragmenterait en doublons.
+/// (`position` NULL ⇒ tri `num_key` qui entrelace les divisions).
 fn insert_entry(level: &mut Vec<TocNode>, segments: &[String], entry: TocEntry) {
     let Some((head, rest)) = segments.split_first() else {
         level.push(TocNode::Article(entry));
@@ -1024,10 +1015,8 @@ fn division_article_count(nodes: &[TocNode]) -> usize {
 }
 
 /// Rend une liste de nœuds : divisions repliables, articles en feuilles. Les
-/// divisions racines (parties) sont dépliées d'office — refermées, la page
-/// d'arrivée se réduisait à deux lignes mortes. Les articles consécutifs d'une
-/// même division coulent en chips (une entrée par ligne noierait les 1 500
-/// articles d'un code).
+/// divisions racines (parties) sont dépliées d'office. Les articles consécutifs
+/// d'une même division coulent en chips.
 fn render_nodes(nodes: &[TocNode], code: &str, depth: usize, date: Option<&str>) -> AnyView {
     let mut views: Vec<AnyView> = Vec::new();
     let mut run: Vec<&TocEntry> = Vec::new();
@@ -1063,8 +1052,7 @@ fn article_flow(entries: Vec<&TocEntry>, code: &str, date: Option<&str>) -> AnyV
     let links = entries
         .into_iter()
         .map(|entry| {
-            // Chip sur la clé canonique (`numKey`), résolue en lookup exact
-            // (ADR 0123 §2).
+            // Chip sur la clé canonique (`numKey`), résolue en lookup exact.
             let label = format_article_num(&entry.num);
             article_chip(
                 code,
@@ -1098,9 +1086,9 @@ mod tests {
         }
     }
 
-    /// Articles d'une même division arrivant **non contigus** (cas `position` NULL,
-    /// tri `num_key` lexical entrelaçant les divisions) : l'arbre doit les regrouper
-    /// sous une division unique, pas fragmenter en doublons.
+    /// Articles d'une même division arrivant **non contigus** (cas `position` NULL, tri
+    /// `num_key` lexical entrelaçant les divisions) : l'arbre doit les regrouper sous
+    /// une division unique.
     #[test]
     fn groups_non_contiguous_divisions() {
         let entries = vec![

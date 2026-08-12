@@ -1,7 +1,4 @@
-//! Kit UI partage (port de `apps/web/src/components/ui/`). Memes classes
-//! Tailwind EXACTES et meme hierarchie DOM que les composants React. Les
-//! variantes CVA sont portees en fns Rust renvoyant les memes chaines de
-//! classes. Composants partages : NE PAS dupliquer cote tranches.
+//! Kit UI partage. Composants partages : NE PAS dupliquer cote tranches.
 
 pub mod badge;
 pub mod button;

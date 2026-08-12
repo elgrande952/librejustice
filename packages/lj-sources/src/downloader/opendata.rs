@@ -1,4 +1,4 @@
-//! Sync incrémental opendata (port de `sources/downloader.py`, HTTP synchrone).
+//! Sync incrémental opendata (HTTP synchrone).
 
 use super::calendar::month_range;
 use super::http::{get_to_file_retrying, get_with_body_retrying, path_with_added_extension};
@@ -12,7 +12,7 @@ use std::path::Path;
 use tracing::instrument;
 
 // ----------------------------------------------------------------------------
-// Constantes opendata (port de downloader.py)
+// Constantes opendata
 // ----------------------------------------------------------------------------
 
 const OPENDATA_BASE_URL: &str = "https://opendata.justice-administrative.fr";
@@ -32,7 +32,7 @@ fn jurisdiction_meta(jur: &str) -> Option<(&'static str, &'static str, &'static 
 
 const OPENDATA_JURISDICTIONS: &[&str] = &["TA", "CAA", "CE"];
 
-/// Construit l'URL d'une archive opendata (port de `_build_url`).
+/// Construit l'URL d'une archive opendata.
 fn build_opendata_url(jur: &str, yyyymm: &str) -> String {
     let (sub, prefix, _) = jurisdiction_meta(jur).expect("juridiction opendata connue");
     let (y, m) = (&yyyymm[0..4], &yyyymm[4..6]);
@@ -40,7 +40,7 @@ fn build_opendata_url(jur: &str, yyyymm: &str) -> String {
 }
 
 // ----------------------------------------------------------------------------
-// sync_opendata — port de downloader.sync (HTTP synchrone)
+// sync_opendata (HTTP synchrone)
 // ----------------------------------------------------------------------------
 
 /// Sync incrémental opendata : télécharge les ZIP mensuels manquants/modifiés
@@ -48,9 +48,6 @@ fn build_opendata_url(jur: &str, yyyymm: &str) -> String {
 ///
 /// Reprise idempotente via le manifeste : conditional GET (`If-Modified-Since`),
 /// HEAD pour vérifier qu'un ZIP local est à jour, refetch des mois `not_found`.
-/// La reprise partielle `Range`/`.part` et `tqdm` du Python ne sont pas portées
-/// (cf. `unresolved`).
-///
 /// Client HTTP synchrone (`reqwest::blocking`) : reqwest-middleware est
 /// async-only, donc pas de span par requête ici. Le `#[instrument]` ouvre un
 /// span parent couvrant tout le sync opendata.
@@ -67,9 +64,8 @@ pub fn sync_opendata(data_dir: &Path, force: bool) -> Result<Manifest> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(OPENDATA_USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(10))
-        // Timeout global (connexion + corps) : sans lui un body qui stalle pend
-        // indéfiniment au lieu d'errorer. Un ZIP mensuel reste < quelques Mo →
-        // 300 s est large. L'erreur déclenchée est retentée par download_one.
+        // Timeout global (connexion + corps) : un body qui stalle pend indéfiniment
+        // sinon. L'erreur déclenchée est retentée par download_one.
         .timeout(std::time::Duration::from_secs(300))
         .build()?;
 
@@ -95,10 +91,10 @@ pub fn sync_opendata(data_dir: &Path, force: bool) -> Result<Manifest> {
                 embeddings_complete: false,
             });
 
-            // Fraîcheur pilotée par le registry (plus de HEAD réseau, cf. ADR
-            // 0068) : un ZIP déjà `ok` n'est re-téléchargé que si le registry
-            // porte un reversement plus récent que le watermark stocké. Absent
-            // du registry => aucun reversement => mois stable => skip sans réseau.
+            // Fraîcheur pilotée par le registry : un ZIP déjà `ok` n'est re-téléchargé
+            // que si le registry porte un reversement plus récent que le watermark
+            // stocké. Absent du registry ⇒ aucun reversement ⇒ mois stable ⇒ skip sans
+            // réseau.
             let reg_rev = registry.get(yyyymm).map(String::as_str);
             let abs_path = source_dir.join(&rel);
             if entry.status == "ok"
@@ -108,11 +104,9 @@ pub fn sync_opendata(data_dir: &Path, force: bool) -> Result<Manifest> {
             {
                 continue;
             }
-            // Isolation par ZIP : un échec persistant (réseau / body tronqué)
-            // après les retries de download_one marque ce mois `error` et passe
-            // au suivant — il sera re-tenté au prochain sync (status != ok). Sans
-            // ça, un seul mois en échec avortait tout l'opendata (mois restants +
-            // juridictions suivantes), cf. crash 2026-06-09.
+            // Isolation par ZIP : un échec persistant (réseau / body tronqué) après les
+            // retries de download_one marque ce mois `error` et passe au suivant — il sera
+            // re-tenté au prochain sync (status != ok).
             if let Err(e) = download_one(&client, &mut entry, &abs_path, force) {
                 tracing::warn!(url = %entry.url, error = %e, "download ZIP échoué, on continue");
                 entry.status = "error_download".to_string();
@@ -139,8 +133,8 @@ fn load_reverses_registry(jur: &str, source_dir: &Path) -> Result<BTreeMap<Strin
     let (_, _, csv_name) = jurisdiction_meta(jur).expect("juridiction opendata connue");
     let path = source_dir.join("documents_reverses").join(csv_name);
     // CSV opendata non-UTF-8 (Latin-1/Windows-1252 : accents dans les noms de
-    // fichiers / numéros). Les colonnes lues (ZIP, date) sont ASCII → décodage
-    // lossy sans perte sur ce qui nous intéresse.
+    // fichiers / numéros). Les colonnes lues (ZIP, date) sont ASCII → décodage lossy
+    // sans perte sur ce qui nous intéresse.
     let bytes = fs::read(&path).map_err(|e| {
         SourceError::Invalid(format!(
             "registry documents_reverses absent/illisible ({}): {e}",
@@ -193,7 +187,7 @@ fn normalize_reversement(raw: &str) -> Option<String> {
 }
 
 /// Télécharge un ZIP : conditional GET (`If-Modified-Since`), 304 → skip, 404 →
-/// `not_found` (port de `_download_one`, sans la reprise `Range`/`.part`/`tqdm`).
+/// `not_found`.
 fn download_one(
     client: &reqwest::blocking::Client,
     entry: &mut Entry,
@@ -209,8 +203,8 @@ fn download_one(
             req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
         }
     }
-    // Streamé sur disque (RAM ~constante : un ZIP mensuel peut peser des centaines
-    // de Mo). Sur 200, le corps est écrit dans `.part` ; 304/404/autre n'écrivent rien.
+    // Streamé sur disque, RAM ~constante : un ZIP mensuel peut peser des centaines
+    // de Mo. Sur 200, le corps est écrit dans `.part` ; 304/404/autre n'écrivent rien.
     let part_path = path_with_added_extension(abs_path, "part");
     let (status, last_mod, _n) = get_to_file_retrying(&entry.url, &part_path, || {
         req.try_clone()
@@ -242,8 +236,8 @@ fn download_one(
     Ok(())
 }
 
-/// Télécharge le CSV `documents_reverses` d'une juridiction (port de
-/// `_download_reverses_csv`). Absence (404) silencieuse.
+/// Télécharge le CSV `documents_reverses` d'une juridiction. Absence (404)
+/// silencieuse.
 fn download_reverses_csv(
     client: &reqwest::blocking::Client,
     jur: &str,
@@ -295,7 +289,6 @@ mod tests {
 
     #[test]
     fn normalize_reversement_formats() {
-        // TA/CAA : fraction de seconde de longueur variable, ignorée.
         assert_eq!(
             normalize_reversement("01-05-2025 06:09:04:60"),
             Some("20250501060904".to_string())
@@ -304,12 +297,10 @@ mod tests {
             normalize_reversement("05-06-2026 04:59:12:595"),
             Some("20260605045912".to_string())
         );
-        // CE : pas de fraction.
         assert_eq!(
             normalize_reversement("01-07-2025 05:45:14"),
             Some("20250701054514".to_string())
         );
-        // Tri lexical = ordre chronologique.
         assert!(
             normalize_reversement("31-12-2025 23:59:59").unwrap()
                 < normalize_reversement("01-01-2026 00:00:00").unwrap()
@@ -322,7 +313,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rev_dir = dir.path().join("documents_reverses");
         fs::create_dir_all(&rev_dir).unwrap();
-        // csv_name de CAA = "CAA_documents_reverses.csv".
         let csv =
             "Nom_du_fichier__xml;Num;Date_de_lecture;Date_de_reversement;Nom_du_fichier__zip\n\
             DCA_a.xml;a;01/01/2026;01-05-2025 06:09:04:60;CAA_202503.zip\n\
@@ -331,7 +321,6 @@ mod tests {
         fs::write(rev_dir.join("CAA_documents_reverses.csv"), csv).unwrap();
 
         let map = load_reverses_registry("CAA", dir.path()).unwrap();
-        // 202503 : max(01-05, 08-05) = 08-05.
         assert_eq!(
             map.get("202503").map(String::as_str),
             Some("20250508061410")

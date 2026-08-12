@@ -1,10 +1,3 @@
-//! Page 404. Port de `not-found-page.tsx`. Pose son propre meta
-//! (`<Title>` + `<Meta robots=noindex>` depuis `seo::not_found_meta()`).
-//!
-//! En SSR, le markup seul ne suffit pas : on pose aussi le status HTTP 404 via
-//! `leptos_axum::ResponseOptions` (contexte fourni par `leptos_routes`). Gate
-//! `ssr` — inerte cote wasm hydrate.
-
 use leptos::prelude::*;
 use leptos_meta::{Meta, Title};
 use leptos_router::components::A;
@@ -22,10 +15,8 @@ pub fn NotFound() -> impl IntoView {
         response.set_status(StatusCode::NOT_FOUND);
     }
 
-    // Parite RR : le 404 pose `robots noindex` SANS description. On supprime donc
-    // la `<meta description>` generique du shell (sinon le 404 en aurait une, la
-    // page racine en posant une par defaut). Reset au demontage : a la navigation
-    // client 404 -> page valide, la generique doit revenir.
+    // Le 404 pose `robots noindex` sans description : on supprime la
+    // `<meta description>` générique du shell, rétablie au démontage.
     if let Some(suppress) = use_context::<SuppressSiteDescription>() {
         suppress.0.set(true);
         on_cleanup(move || suppress.0.set(false));

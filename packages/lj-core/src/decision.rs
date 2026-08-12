@@ -1,4 +1,4 @@
-//! Modèle `Decision` / `DecisionSection` (port de `parsing/decision_input.py`).
+//! Modèle `Decision` / `DecisionSection`.
 //!
 //! Modèle canonique unique pour les sources XML opendata (TA/CAA/CE) et
 //! Judilibre (CC/CA/TJ/TCOM). Tous les champs source-spécifiques ont une
@@ -13,8 +13,8 @@ pub const VISA_TRIM_MAX_CHARS: usize =
     (VISA_TRIM_TARGET_TOKENS as f64 * crate::tokens::CHARS_PER_TOKEN_MEDIAN) as usize;
 
 /// Décision attaquée telle que la source la déclare (champ `contested`
-/// Judilibre, ADR 0161) : matière brute du lien de chronologie — les clés
-/// canoniques se dérivent dans `lj-extract::chrono`.
+/// Judilibre) : matière brute du lien de chronologie — les clés canoniques se
+/// dérivent dans `lj-extract::chrono`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttackedRef {
     /// Libellé juridiction verbatim (« Cour d'appel de Nancy »).
@@ -42,9 +42,9 @@ pub struct Decision {
     pub source_uid: String,
     /// Nom du fichier dans le ZIP.
     pub member_name: String,
-    /// ECLI lu verbatim de la source (`payload["ecli"]` Judilibre) — jamais
-    /// dérivé. `None` quand la source n'en porte pas (XML opendata). Pivot
-    /// d'identité inter-sources (ADR 0080).
+    /// ECLI lu verbatim de la source (`payload["ecli"]` Judilibre) — jamais dérivé.
+    /// `None` quand la source n'en porte pas (XML opendata). Pivot d'identité
+    /// inter-sources.
     pub ecli: Option<String>,
     // ── Optionnels (padding inter-sources) ───────────────────────────────
     /// Code juridiction du greffe opendata (`Code_Juridiction`, ex. « TA13 »).
@@ -53,8 +53,8 @@ pub struct Decision {
     /// texte libre de greffe CA/TJ/TCOM.
     pub chamber: Option<String>,
     /// Code NAC (nomenclature des affaires civiles, payload Judilibre `nac`,
-    /// ex. `14H`) posé par le greffe à l'enregistrement de l'affaire — porté
-    /// par les TJ (100 %) et CA (90 %), absent ailleurs.
+    /// ex. `14H`) posé par le greffe à l'enregistrement de l'affaire — porté par
+    /// les TJ et les CA, absent ailleurs.
     #[serde(default)]
     pub nac: Option<String>,
     pub jurisdiction_name: Option<String>,
@@ -76,22 +76,22 @@ pub struct Decision {
     pub type_decision: Option<String>,
     pub type_recours: Option<String>,
     pub solution: Option<String>,
-    /// Codes de publication bruts (cf. ADR 0054). Multi-valeur côté judiciaire.
+    /// Codes de publication bruts. Multi-valeur côté judiciaire.
     pub publication_codes: Vec<String>,
     /// XML opendata uniquement.
     pub avocat_requerant: Option<String>,
     /// Thèmes Judilibre (`payload["themes"]` : matière → chaîne de mots-clés),
     /// verbatim. Vide pour les autres sources.
     pub themes: Vec<String>,
-    /// Décision attaquée déclarée par la source (Judilibre `contested`,
-    /// ADR 0161). `None` pour les autres sources (le texte prend le relais).
+    /// Décision attaquée déclarée par la source (Judilibre `contested`). `None`
+    /// pour les autres sources (le texte prend le relais).
     #[serde(default)]
     pub attacked: Option<AttackedRef>,
     /// Texte brut depuis l'XML (avec `<br/>`) ou Judilibre.
     pub texte_integral_raw: String,
     pub texte_integral_clean: String,
     pub sections: Vec<DecisionSection>,
-    // ── Préfixes embedding (jamais stockés en DB ; cf. ADR 0018) ──────────
+    // ── Préfixes embedding (jamais stockés en DB) ─────────────────────────
     /// 3 lignes : jur|date / recours|solution / formation.
     pub metadata_header: String,
     /// Début du visa, ≤ `VISA_TRIM_MAX_CHARS`, paragraph-aware.

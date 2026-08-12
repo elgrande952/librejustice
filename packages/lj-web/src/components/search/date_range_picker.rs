@@ -1,9 +1,7 @@
-//! `DateRangePicker` (réécriture intégrale de `date-range-picker.tsx`).
+//! `DateRangePicker`.
 //!
-//! Le React utilise `react-day-picker` + `date-fns`. Cible : calendrier HTML/CSS
-//! pur, mono-mois (le rail fait ~260px : deux mois côte à côte s'y chevauchent),
-//! dates en arithmétique civile maison (pas de `jiff` : absent des dépendances
-//! `lj-web`, Cargo figé). Zéro dépendance JS.
+//! Calendrier HTML/CSS pur, mono-mois, dates en arithmétique civile maison.
+//! Zéro dépendance JS.
 //!
 //! Props : `from`/`to` ISO `YYYY-MM-DD` (ou vide), `on_change(from, to)`.
 
@@ -40,8 +38,8 @@ const MONTHS_FR_SHORT: [&str; 12] = [
     "janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.",
     "déc.",
 ];
-/// Jours de semaine FR (lundi-first), abrégés 2 lettres (parité React, tient en
-/// largeur dans le rail étroit ; capitalisés par CSS `uppercase`).
+/// Jours de semaine FR (lundi-first), abrégés 2 lettres (tient en largeur dans
+/// le rail étroit ; capitalisés par CSS `uppercase`).
 const WEEKDAYS_FR: [&str; 7] = ["lu", "ma", "me", "je", "ve", "sa", "di"];
 const START_YEAR: i32 = 1965;
 
@@ -125,7 +123,7 @@ fn current_year() -> i32 {
 }
 
 /// Mois courant `(année, mois 1-12)` : ouverture du calendrier sur le mois en
-/// cours (parité React), pas sur janvier.
+/// cours, pas sur janvier.
 #[cfg(feature = "hydrate")]
 fn current_ym() -> (i32, u32) {
     let d = js_sys::Date::new_0();
@@ -257,11 +255,9 @@ pub fn DateRangePicker(
     let at_start = move || view_month.get() <= (START_YEAR, 1);
     let at_end = move || view_month.get() >= (end_year, 12);
 
-    // Menus déroulants mois + année : saut direct (sinon ~12 clics/an sur les
-    // flèches pour reculer de plusieurs années). `DropdownSelect` (panneau thémé,
-    // capé + scrollable, positionné `fixed` pour échapper à l'`overflow-hidden` de
-    // l'accordéon du rail) plutôt que `<select>` natif, dont le popup hérite du fond
-    // système et déborde (62 années).
+    // Menus déroulants mois + année : saut direct à un mois ou une année.
+    // `DropdownSelect` (panneau thémé, capé + scrollable, positionné `fixed` pour
+    // échapper à l'`overflow-hidden` de l'accordéon du rail).
     let month_options = Signal::derive(|| {
         MONTHS_FR
             .iter()
@@ -305,7 +301,7 @@ pub fn DateRangePicker(
         // `<button>` est du HTML invalide (le parseur referme le bouton externe
         // au bouton interne) → mismatch d'hydratation fatal côté SSR. Le champ est
         // donc un `div[role=button]` (clic + Enter/Espace) ; le bouton interne
-        // reste valide. Parité visuelle/comportement avec le `<button>` Node.
+        // reste valide.
         let on_activate_key = move |ev: leptos::ev::KeyboardEvent| {
             if ev.key() == "Enter" || ev.key() == " " {
                 ev.prevent_default();
@@ -523,7 +519,6 @@ mod tests {
 
     #[test]
     fn weekday_known_dates() {
-        // 2026-06-05 est un vendredi -> index 4 (lundi=0).
         assert_eq!(
             weekday_monday0(Civil {
                 y: 2026,
@@ -532,7 +527,6 @@ mod tests {
             }),
             4
         );
-        // 2000-01-01 est un samedi -> index 5.
         assert_eq!(
             weekday_monday0(Civil {
                 y: 2000,
@@ -553,9 +547,8 @@ mod tests {
 
     #[test]
     fn grid_has_42_cells_and_starts_monday() {
-        let g = month_grid(2026, 6); // juin 2026 : le 1er est un lundi
+        let g = month_grid(2026, 6);
         assert_eq!(g.len(), 42);
-        // 2026-06-01 est un lundi -> pas de jour outside en tête.
         assert!(!g[0].outside);
         assert_eq!(
             g[0].date,
@@ -569,7 +562,6 @@ mod tests {
 
     #[test]
     fn grid_leading_outside_days() {
-        // mars 2026 : le 1er est un dimanche -> 6 jours outside en tête.
         let g = month_grid(2026, 3);
         let lead = g.iter().take_while(|c| c.outside).count();
         assert_eq!(lead, 6);

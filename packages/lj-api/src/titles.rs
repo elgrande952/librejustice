@@ -1,4 +1,4 @@
-//! Titre lisible d'une décision côté API (ADR 0049 / 0170) : résolution de la
+//! Titre lisible d'une décision côté API : résolution de la
 //! juridiction (nom réel assaini, sinon libellé référentiel du type fourni
 //! par l'appelant), siège recomposé depuis les axes structurés
 //! (`chamber_position` + uids `formation:*` / `office:*`), puis délégation au
@@ -19,7 +19,7 @@ pub fn decision_jurisdiction(type_label: &str, jurisdiction_name: Option<&str>) 
     type_label.to_string()
 }
 
-/// Siège composé depuis les axes structurés (ADR 0170) : délègue à
+/// Siège composé depuis les axes structurés : délègue à
 /// [`lj_core::titles::seat_display`] avec les labels référentiels des uids.
 pub fn decision_seat(
     jurisdiction: &str,

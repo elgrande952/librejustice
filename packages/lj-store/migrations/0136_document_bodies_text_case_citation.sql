@@ -1,4 +1,4 @@
--- ADR 0196 — documents non codifiés : corps monolithique + graphe texte→décision.
+-- Documents non codifiés : corps monolithique + graphe texte→décision.
 --
 -- 1. `legal_text.body` : corps d'un texte SANS articles numérotés (circulaires,
 --    réponses ministérielles…). Un texte a un corps OU des articles (OU les
@@ -9,7 +9,7 @@
 --    Table ~180 k lignes quasi toutes NULL au moment de la pose → build trivial,
 --    il grossit avec les ingest de familles à corps.
 --
--- 3. `text_case_citation` : la 4ᵉ case du graphe de citations (ADR 0196 §5) —
+-- 3. `text_case_citation` : la 4ᵉ case du graphe de citations —
 --    un texte/article cite une décision (§ BOFiP commentant un arrêt, circulaire
 --    citant une jurisprudence). Miroir de `case_citation` (0113/0165) côté cible
 --    (`target_ref` pendante par famille + `target_decision_id` résolu, relink

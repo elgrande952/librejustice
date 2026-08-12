@@ -1,9 +1,7 @@
-//! `lj-extract` — étage INGEST de l'extraction légale (ADR 0123).
-//!
-//! Sorti de `lj-core` pour que le binaire serveur (`lj-server`) ne compile plus
-//! cette pile lourde qu'il n'exécute jamais : recognizer de citations (DFA à
-//! `dfa_size_limit(64 Mo)`), normaliseurs (`normalize_instrument`/`_article`),
-//! parsers de sources Légifrance/JORF/KALI, identité canonique.
+//! `lj-extract` — étage INGEST de l'extraction légale : recognizer de citations
+//! (DFA à `dfa_size_limit(64 Mo)`), normaliseurs
+//! (`normalize_instrument`/`_article`), parsers de sources Légifrance/JORF/KALI,
+//! identité canonique.
 //!
 //! PUR comme `lj-core` (aucune I/O, aucun client réseau) ; il dépend de `lj-core`
 //! (primitives texte partagées, modèle `Decision`, `error`, `schema`) et de
@@ -20,6 +18,7 @@ pub mod formation;
 pub mod gazetteer;
 pub mod identity;
 pub mod instrument_key;
+pub mod instrument_mint;
 pub mod jorf;
 pub mod kali;
 pub mod legi;

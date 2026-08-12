@@ -2,9 +2,9 @@
 //!
 //! Schéma unifié : ordre administratif (CE/CAA/TA/CNDA/Cour des comptes/TC) ET
 //! ordre judiciaire (Cour de cassation/CA/TJ/TCOM). Les enums de facettes
-//! ([`Solution`], [`Procedure`], [`Office`], [`Domain`]) sont le **miroir compilé
-//! du seed** de la migration `0100_facet_referentiels.sql` (ADR 0146 §4) :
-//! chaque valeur sérialisée est le suffixe d'un uid `facet_value` — le test
+//! ([`Solution`], [`Procedure`], [`Office`], [`Domain`]) sont le **miroir
+//! compilé du seed** de la migration `0100_facet_referentiels.sql` : chaque
+//! valeur sérialisée est le suffixe d'un uid `facet_value` — le test
 //! `enums_match_migration_seed` diffe enum ↔ seed, toute dérive est un build
 //! rouge. Les autres enums gardent les chaînes SCREAMING_CASE historiques des
 //! colonnes Postgres `text`.
@@ -39,10 +39,10 @@ pub enum JurisdictionLevel {
     Autre,
 }
 
-/// Solution — miroir compilé du seed `solution:*` (migration 0100, ADR 0146) :
-/// les 15 valeurs de référence + Satisfaction totale/partielle. Chaque
-/// valeur sérialisée est le suffixe d'un uid `facet_value` (`"REJET"` ↔
-/// `solution:REJET`). Le test `enums_match_migration_seed` diffe enum ↔ seed.
+/// Solution — miroir compilé du seed `solution:*` (migration 0100) : les 15
+/// valeurs du référentiel de place + Satisfaction totale/partielle (second
+/// référentiel). Chaque valeur sérialisée est le suffixe d'un uid `facet_value`
+/// (`"REJET"` ↔ `solution:REJET`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Solution {
@@ -89,8 +89,8 @@ impl Solution {
 }
 
 /// Voie procédurale — miroir du seed `voie:*` (migration 0100), namespace
-/// renommé `procedure:*` par la 0145 (ADR 0213). `null` = procédure
-/// contentieuse ordinaire ; vocabulaire fermé, pas de `AUTRE`.
+/// renommé `procedure:*` par la 0145. `null` = procédure contentieuse
+/// ordinaire ; vocabulaire fermé, pas de `AUTRE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Procedure {
@@ -156,11 +156,10 @@ impl Office {
     ];
 }
 
-/// Portée jurisprudentielle — miroir du seed `portee:*` (migration 0114,
-/// ADR 0167), namespace renommé `significance:*` par la 0145 (ADR 0213) :
-/// groupes de `publication_codes` au rang le plus fort
-/// (`significance_codes` de lj-core). Mapping total : `INDETERMINEE` sans code
-/// classant (gabarit  : majeure · importante · limitée · indéterminée).
+/// Portée jurisprudentielle — miroir du seed `portee:*` (migration 0114),
+/// namespace renommé `significance:*` par la 0145 : groupes de
+/// `publication_codes` au rang le plus fort (`significance_codes` de lj-core).
+/// Mapping total : `INDETERMINEE` sans code classant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Significance {
@@ -180,11 +179,11 @@ impl Significance {
     ];
 }
 
-/// Domaine juridique — arbre de référence verbatim, miroir du seed `domaine:*`
-/// (migration 0100), namespace renommé `legal_domain:*` par la 0145
-/// (ADR 0213) : 9 racines + 36 feuilles. La racine d'une feuille est portée par
-/// `parent_uid` en base ; côté requête une racine sélectionnée matche
-/// elle-même + toutes ses feuilles (expansion côté API).
+/// Domaine juridique — arbre du référentiel de place repris tel quel, miroir du
+/// seed `domaine:*` (migration 0100), namespace renommé `legal_domain:*` par la
+/// 0145 : 9 racines + 36 feuilles. La racine d'une feuille est portée par
+/// `parent_uid` en base ; côté requête une racine sélectionnée matche elle-même
+/// + toutes ses feuilles (expansion côté API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Domain {
@@ -322,9 +321,8 @@ pub enum DecisionType {
 
 /// Ordre de juridiction déduit (préfixe uid opendata / type Judilibre).
 /// Valeurs : `TA` `CAA` `CE` `TC` `CONSTIT` (admin/suprême) ; `CC` `CA` `TJ`
-/// `TCOM` (judiciaire) ; `CEDH` `CJUE` (européen, ADR 0094) ; `CNDA` (Cour
-/// nationale du droit d'asile, source scrapée, ADR 0096) ; `CNIL` (délibérations
-/// de la CNIL, fond DILA, ADR 0185).
+/// `TCOM` (judiciaire) ; `CEDH` `CJUE` (européen) ; `CNDA` (Cour nationale du
+/// droit d'asile) ; `CNIL` (délibérations de la CNIL).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum JurisdictionType {
     #[serde(rename = "TA")]
@@ -470,7 +468,6 @@ mod tests {
 
     #[test]
     fn jurisdiction_level_serialized_strings() {
-        // Doit matcher les StrEnum Python (colonnes Postgres text + DTOs).
         assert_eq!(ser(&JurisdictionLevel::ConseilDEtat), "CONSEIL_D_ETAT");
         assert_eq!(
             ser(&JurisdictionLevel::TribunalAdministratif),
@@ -499,7 +496,8 @@ mod tests {
         assert_eq!(ser(&Domain::CivilDroitLocatif), "CIVIL_DROIT_LOCATIF");
     }
 
-    /// Uids d'une facette dans un seed de migration (lignes `('facet:… — les seeds gardent les préfixes historiques, la 0145 renomme`).
+    /// Uids d'une facette dans un seed de migration (lignes `('facet:…`) — les
+    /// seeds gardent les préfixes historiques.
     fn seed_uid_suffixes_in(migration: &str, facet: &str) -> std::collections::BTreeSet<String> {
         let sql = std::fs::read_to_string(format!(
             "{}/../lj-store/migrations/{migration}",
@@ -526,9 +524,9 @@ mod tests {
         all.iter().map(ser).collect()
     }
 
-    /// Les enums de facettes sont le miroir exact du seed DB (ADR 0146 §4) :
-    /// toute dérive enum ↔ référentiel est un build rouge. `ALL` porte chaque
-    /// variante (l'égalité de cardinal garde la complétude des deux côtés).
+    /// Les enums de facettes sont le miroir exact du seed DB : toute dérive enum ↔
+    /// référentiel est un build rouge. `ALL` porte chaque variante (l'égalité de
+    /// cardinal garde la complétude des deux côtés).
     #[test]
     fn enums_match_migration_seed() {
         assert_eq!(all_codes(&Solution::ALL), seed_uid_suffixes("solution"));

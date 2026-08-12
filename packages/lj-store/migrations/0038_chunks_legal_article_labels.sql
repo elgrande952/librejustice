@@ -11,11 +11,11 @@
 -- Solution structurelle : dénormaliser les **labels** d'articles cités
 -- directement sur ``decision_chunks`` dans un TEXT[] flat, mirror exact
 -- de ``legal_instruments`` (qui contient les **codes**, granularité
--- supérieure — cf. amend ADR 0033). On peut alors filtrer en
+-- supérieure). On peut alors filtrer en
 -- ``c.legal_article_labels && %s::text[]`` (GIN overlap, indexé) —
 -- même path que les instruments.
 --
--- ⚠️ Fenêtre de maintenance OBLIGATOIRE : ce script DROP + CREATE
+-- Fenêtre de maintenance OBLIGATOIRE : ce script DROP + CREATE
 -- ``chunks_bm25``. Pendant la durée du build (≈ plusieurs minutes selon
 -- corpus + mémoire), /search avec mode lexical ou hybrid retourne soit
 -- une erreur Postgres ("operator does not exist: bigint @@@ …"), soit

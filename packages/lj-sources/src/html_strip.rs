@@ -1,10 +1,10 @@
-//! Strip HTML → texte au bord I/O (ADR 0094 §Frontière pure ↔ I/O).
+//! Strip HTML → texte au bord I/O.
 //!
-//! Les corps CEDH (DOCX converti en HTML) et CJUE (resource xhtml/html) sont
-//! du HTML born-digital. Le décodage de format reste dans `lj-sources` : ce
-//! module aplatit le HTML en texte (retrait des balises, décodage des entités,
-//! collapse du whitespace) pour que le parser pur de `lj-core` reçoive du texte,
-//! pas du HTML à décoder. Strip plat, sans re-parse des sections CSS.
+//! Les corps CEDH (DOCX converti en HTML) et CJUE (resource xhtml/html) sont du
+//! HTML born-digital. Le décodage de format reste dans `lj-sources` : ce module
+//! aplatit le HTML en texte (retrait des balises, décodage des entités, collapse
+//! du whitespace) pour que le parser pur de `lj-core` reçoive du texte, pas du
+//! HTML à décoder. Strip plat, sans re-parse des sections CSS.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -36,10 +36,23 @@ pub fn strip_html(html: &str) -> String {
     collapse_whitespace(&decoded)
 }
 
-/// Décode les entités HTML nommées courantes + numériques (`&#160;`, `&#xA0;`).
-/// Couvre ce qui apparaît réellement dans les corps CEDH/CJUE convertis ; une
-/// entité inconnue est laissée telle quelle (pas de panique : strip best-effort).
+/// Décode les entités HTML nommées courantes + numériques (`&#160;`, `&#xA0;`),
+/// itéré jusqu'au point fixe (borné) : certains corps arrivent double-encodés
+/// (`&amp;#8217;`) et un seul passage laisse une entité. Une entité inconnue est
+/// laissée telle quelle.
 fn decode_entities(s: &str) -> String {
+    let mut courant = decode_entities_once(s);
+    for _ in 0..2 {
+        let suivant = decode_entities_once(&courant);
+        if suivant == courant {
+            break;
+        }
+        courant = suivant;
+    }
+    courant
+}
+
+fn decode_entities_once(s: &str) -> String {
     static ENTITY_RE: OnceLock<Regex> = OnceLock::new();
     let re = ENTITY_RE.get_or_init(|| {
         Regex::new(r"&(#x?[0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);").expect("regex entité valide")
@@ -85,6 +98,23 @@ fn decode_entities(s: &str) -> String {
             "iuml" => "ï".to_string(),
             "ocirc" => "ô".to_string(),
             "euml" => "ë".to_string(),
+            "Eacute" => "É".to_string(),
+            "Egrave" => "È".to_string(),
+            "Ecirc" => "Ê".to_string(),
+            "Agrave" => "À".to_string(),
+            "Acirc" => "Â".to_string(),
+            "Ccedil" => "Ç".to_string(),
+            "Ugrave" => "Ù".to_string(),
+            "Ucirc" => "Û".to_string(),
+            "Icirc" => "Î".to_string(),
+            "Iuml" => "Ï".to_string(),
+            "Ocirc" => "Ô".to_string(),
+            "Euml" => "Ë".to_string(),
+            "oelig" => "œ".to_string(),
+            "OElig" => "Œ".to_string(),
+            "iquest" => "¿".to_string(),
+            // Trait d'union conditionnel : invisible, il ne porte rien en texte plat.
+            "shy" => String::new(),
             "deg" => "\u{b0}".to_string(),
             "euro" => "\u{20ac}".to_string(),
             "sect" => "\u{a7}".to_string(),
@@ -123,9 +153,6 @@ mod tests {
 
     #[test]
     fn decodes_named_and_numeric_entities() {
-        // Les entités sont décodées (`&agrave;`→à, `&laquo;`→«, `&amp;`→&) ; le
-        // `&nbsp;` décodé en U+00A0 est ensuite collapsé en espace simple comme
-        // tout whitespace.
         let html = "<p>droit &agrave; un proc&egrave;s &laquo;&nbsp;\u{e9}quitable&nbsp;&raquo; &amp; libre</p>";
         let out = strip_html(html);
         assert_eq!(out, "droit à un procès « équitable » & libre");
@@ -133,9 +160,16 @@ mod tests {
 
     #[test]
     fn decodes_numeric_entities_dec_and_hex() {
-        // &#167; = §, &#xA7; = § aussi.
         let out = strip_html("<p>article &#167; et &#xA7; bis</p>");
         assert_eq!(out, "article § et § bis");
+    }
+
+    #[test]
+    fn decodes_uppercase_ligature_and_double_encoded_entities() {
+        let out = strip_html(
+            "<p>&Eacute;tude de ma&icirc;trise d&rsquo;&oelig;uvre &amp;#8217; &amp;Ocirc;</p>",
+        );
+        assert_eq!(out, "Étude de maîtrise d’œuvre ’ Ô");
     }
 
     #[test]

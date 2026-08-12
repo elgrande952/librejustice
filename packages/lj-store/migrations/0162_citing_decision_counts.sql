@@ -1,6 +1,6 @@
--- ADR 0250 — décomptes de décisions citantes par terme cité.
+-- Décomptes de décisions citantes par terme cité.
 --
--- `cited_term` reprend l'alphabet du GIN `lj_cit_terms` (ADR 0247) :
+-- `cited_term` reprend l'alphabet du GIN `lj_cit_terms` :
 -- `text_uid` (usage d'un texte) ou `text_uid|num_key` (usage d'un article).
 -- Une ligne `legal_citation` = une décision et `lj_cit_terms` dédoublonne par
 -- blob : `count(*)` = nombre de décisions citantes.

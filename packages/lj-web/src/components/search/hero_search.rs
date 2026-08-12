@@ -1,16 +1,16 @@
-//! `HeroSearch` (port de `hero-search.tsx`). Îlot interactif de la landing :
+//! `HeroSearch` : îlot interactif de la landing :
 //! eyebrow + titre + accroche + formulaire + exemples groupés par univers.
 //!
-//! La barre porte un **sélecteur de portée** (Décisions | Textes | Annuaire,
-//! note landing-didactique 2026-07-22) : la soumission route vers `/decisions`,
-//! `/textes` ou `/annuaire`, et le suggest comme le pied de barre (aide à la
-//! recherche, lien pleine page) suivent la portée. Les chips d'exemples
-//! sont groupées par univers — le groupe enseigne ce que le site couvre, la
-//! chip pose le mode et route vers le bon moteur.
+//! La barre porte un sélecteur de portée (Décisions | Textes | Annonces |
+//! Annuaire) : la soumission route vers `/decisions`, `/textes`, `/annonces` ou
+//! `/annuaire`, et le suggest comme le pied de barre (aide à la recherche, lien
+//! pleine page) suivent la portée. Les chips d'exemples sont groupées par
+//! univers — le groupe enseigne ce que le site couvre, la chip pose le mode et
+//! route vers le bon moteur.
 //!
 //! L'`<input>` est rendu inline (mêmes classes que `ui::Input`, taille `h-14`)
-//! pour un champ contrôlé — cf. `compact_search` (l'`Input` substrate ne propage
-//! ni valeur ni `on:input`).
+//! pour un champ contrôlé : l'`Input` substrate ne propage ni valeur ni
+//! `on:input`.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -29,6 +29,7 @@ use super::syntax_hint::{HelpCorpus, SyntaxHint};
 enum Scope {
     Decisions,
     Textes,
+    Annonces,
     Annuaire,
 }
 
@@ -37,6 +38,7 @@ impl Scope {
         match self {
             Scope::Decisions => "Décisions",
             Scope::Textes => "Textes",
+            Scope::Annonces => "Annonces",
             Scope::Annuaire => "Annuaire",
         }
     }
@@ -45,6 +47,9 @@ impl Scope {
         match self {
             Scope::Decisions => "jurisprudence",
             Scope::Textes => "textes",
+            // Le pot Annonces n'a pas d'index de suggestion : la fenêtre
+            // vivante se renouvelle plus vite qu'un index de complétion.
+            Scope::Annonces => "",
             Scope::Annuaire => "annuaire",
         }
     }
@@ -54,6 +59,7 @@ impl Scope {
         match self {
             Scope::Decisions => "decisions",
             Scope::Textes => "textes",
+            Scope::Annonces => "annonces",
             Scope::Annuaire => "annuaire",
         }
     }
@@ -63,17 +69,21 @@ impl Scope {
     /// l'annuaire se parcourt par catégories.
     fn full_page_label(self) -> &'static str {
         match self {
-            Scope::Decisions | Scope::Textes => "Recherche avancée",
+            Scope::Decisions | Scope::Textes | Scope::Annonces => "Recherche avancée",
             Scope::Annuaire => "Parcourir l'annuaire",
         }
     }
 }
 
-const SCOPES: [Scope; 3] = [Scope::Decisions, Scope::Textes, Scope::Annuaire];
+const SCOPES: [Scope; 4] = [
+    Scope::Decisions,
+    Scope::Textes,
+    Scope::Annonces,
+    Scope::Annuaire,
+];
 
 /// Groupe d'exemples d'un univers : le libellé enseigne la couverture, chaque
-/// chip soumet vers le moteur du groupe. Exemples validés en les rejouant sur
-/// le corpus (articles/entités attendus en tête).
+/// chip soumet vers le moteur du groupe.
 struct ExampleGroup {
     label: &'static str,
     scope: Scope,
@@ -98,6 +108,11 @@ const EXAMPLE_GROUPS: &[ExampleGroup] = &[
         ],
     },
     ExampleGroup {
+        label: "Marchés publics, vie des entreprises",
+        scope: Scope::Annonces,
+        examples: &["voirie communale", "redressement judiciaire"],
+    },
+    ExampleGroup {
         label: "Annuaire",
         scope: Scope::Annuaire,
         examples: &["SNCF"],
@@ -110,14 +125,17 @@ pub fn HeroSearch() -> impl IntoView {
     let query = RwSignal::new(String::new());
     let scope = RwSignal::new(Scope::Decisions);
     let (ai_mode, set_ai_mode) = use_ai_mode();
-    // Autocomplétion (ADR 0216) : le mode suit le sélecteur de portée.
+    // Autocomplétion : le mode suit le sélecteur de portée.
     let suggest = SuggestController::new(query, Signal::derive(move || scope.get().suggest_mode()));
 
     // Soumission : route vers le moteur de la portée. Depuis la landing, pas
     // de filtres existants à conserver — `q` seul (+ `aiMode`, décisions).
     let submit = move |value: String, target: Scope| {
         let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
+        // Le pot d'annonces répond sans requête — « ce qui est ouvert en ce
+        // moment » est un résultat. Les autres portées n'ont rien à dire sans
+        // mots.
+        if trimmed.is_empty() && target != Scope::Annonces {
             return;
         }
         let href = match target {
@@ -125,11 +143,13 @@ pub fn HeroSearch() -> impl IntoView {
                 let qs = query_state::with_query(
                     &leptos_router::params::ParamsMap::new(),
                     &trimmed,
-                    ai_mode.get_untracked(),
+                    Some(ai_mode.get_untracked()),
                 );
                 format!("/decisions?{qs}")
             }
             Scope::Textes => format!("/textes?q={}", encode_query(&trimmed)),
+            Scope::Annonces if trimmed.is_empty() => "/annonces".to_string(),
+            Scope::Annonces => format!("/annonces?q={}", encode_query(&trimmed)),
             Scope::Annuaire => format!("/annuaire?q={}", encode_query(&trimmed)),
         };
         navigate(&href, Default::default());
@@ -142,8 +162,7 @@ pub fn HeroSearch() -> impl IntoView {
     };
 
     // Sous-blocs erasés en `AnyView` : casse la profondeur du type-tuple SSR
-    // pour limiter la pression sur `recursion_limit` (cf. note tranche : la
-    // crate a besoin de `#![recursion_limit = "512"]` côté substrate).
+    // pour limiter la pression sur `recursion_limit`.
     let intro = view! {
         <div class="flex flex-col gap-4">
             <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
@@ -207,7 +226,7 @@ pub fn HeroSearch() -> impl IntoView {
                 {move || match scope.get() {
                     Scope::Decisions => Some(view! { <SyntaxHint /> }),
                     Scope::Textes => Some(view! { <SyntaxHint corpus=HelpCorpus::Textes /> }),
-                    Scope::Annuaire => None,
+                    Scope::Annonces | Scope::Annuaire => None,
                 }}
                 <div class="ml-auto flex items-center gap-4">
                     {move || {
@@ -298,7 +317,7 @@ pub fn HeroSearch() -> impl IntoView {
 /// barre (elle porte la bordure) : libellé de la portée courante + chevron,
 /// pleine hauteur, filet séparateur à droite. Le panneau prolonge la barre
 /// vers le bas (mêmes bords, même fond, pas de bordure haute) et ne liste que
-/// les **autres** portées — la courante est déjà le libellé du bouton.
+/// les autres portées — la courante est déjà le libellé du bouton.
 #[component]
 fn ScopeDropdown(scope: RwSignal<Scope>) -> impl IntoView {
     let open = RwSignal::new(false);
@@ -388,15 +407,15 @@ fn ScopeDropdown(scope: RwSignal<Scope>) -> impl IntoView {
                     />
                 </svg>
             </button>
-            // Panneau dans la continuité de la barre (gabarit
-            // justice.pappers.fr) : collé sous le déclencheur (`top-full`
-            // recouvre la bordure basse de la barre), étiré du bord GAUCHE de
-            // la barre (`-left-[13px]` = padding `px-3` + bordure 1px) au
-            // filet séparateur (`right-0`), sans bordure haute et arrondi en
-            // bas seulement — il semble sortir de la barre, pas flotter.
-            <Show when=move || open.get()>
-                <div class="absolute -left-[13px] right-0 top-full z-50 overflow-hidden rounded-b-md border border-t-0 border-[var(--color-rule)] bg-[var(--color-parchment)] pb-1 shadow-lg">
-                    {move || {
+            // Panneau dans la continuité de la barre : collé sous le déclencheur
+            // (`top-full` recouvre la bordure basse de la barre), étiré du bord gauche
+            // de la barre (`-left-[13px]` = padding `px-3` + bordure 1px) au filet
+            // séparateur (`right-0`), sans bordure haute et arrondi en bas seulement.
+            <div
+                data-open=move || open.get().then_some("true")
+                class="lj-panel absolute -left-[13px] right-0 top-full z-50 overflow-hidden rounded-b-md border border-t-0 border-[var(--color-rule)] bg-[var(--color-parchment)] pb-1 shadow-lg"
+            >
+                {move || {
                         let current = scope.get();
                         SCOPES
                             .iter()
@@ -418,8 +437,7 @@ fn ScopeDropdown(scope: RwSignal<Scope>) -> impl IntoView {
                             })
                             .collect_view()
                     }}
-                </div>
-            </Show>
+            </div>
         </span>
     }
 }

@@ -1,5 +1,5 @@
-//! KALI (conventions collectives nationales, bulk DILA, ADR 0120) : ingest
-//! tarball stock/incrément + sync incrémental. Calque de [`super::legi`] (même
+//! KALI (conventions collectives nationales, bulk DILA) : ingest tarball
+//! stock/incrément + sync incrémental. Calque de [`super::legi`] (même
 //! mécanique tar→parse→upsert, même canal borné, même watermark `sync_dila`) ;
 //! seuls le parser pur (`lj_extract::kali`) et l'ancrage `text_uid = KALICONT`
 //! (la convention, pas l'avenant) diffèrent.
@@ -43,7 +43,7 @@ pub(crate) fn classify_kali_member(name: &str) -> KaliMember {
     KaliMember::Ignore
 }
 
-/// Convertit une date ISO (`YYYY-MM-DD`) en `NaiveDate`. Erreur franche (#12).
+/// Convertit une date ISO (`YYYY-MM-DD`) en `NaiveDate`. Erreur franche.
 fn kali_date(iso: &str) -> Result<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(iso, "%Y-%m-%d")
         .map_err(|e| anyhow!("date KALI invalide {iso:?}: {e}"))
@@ -64,6 +64,7 @@ fn kali_article_row(
     art: lj_extract::kali::KaliArticle,
     content_checksum: u64,
 ) -> Result<lj_store::repository::LegalArticleRow> {
+    let date_debut = Some(kali_date(&art.date_debut)?);
     let date_fin = match art.date_fin {
         Some(d) => Some(kali_date(&d)?),
         None => None,
@@ -72,14 +73,14 @@ fn kali_article_row(
         text_uid: art.kalicont,
         num: art.num,
         num_key: art.num_key,
-        // Le tar KALI n'expose pas l'ordre de lecture → repli `num_key` (ADR 0112 §9).
+        // Le tar KALI n'expose pas l'ordre de lecture → repli `num_key`.
         position: None,
         title_path: art.titre_text,
         status: art.etat,
-        date_debut: Some(kali_date(&art.date_debut)?),
+        date_debut,
         date_fin,
         texte: art.texte,
-        // Convention collective FR officielle, monolingue (ADR 0116).
+        // Convention collective FR officielle, monolingue.
         texte_original: None,
         lang_original: None,
         translation: "officiel".to_string(),
@@ -88,7 +89,7 @@ fn kali_article_row(
         source: "kali".to_string(),
         source_uid: art.kaliarti,
         source_url: None,
-        // Source *live* autoritaire : fraîcheur dérivée de `ingest_freshness` (ADR 0129).
+        // Source *live* autoritaire : fraîcheur dérivée de `ingest_freshness`.
         source_asof: None,
         source_upstream_url: None,
     })
@@ -111,7 +112,7 @@ fn kali_conteneur_row(
         last_modified: date_publi,
         date_texte: None,
         date_publi,
-        // Identité d'une convention = son KALICONT (pas la cascade ELI/NOR ADR 0115).
+        // Identité d'une convention = son KALICONT, pas la cascade ELI/NOR.
         eli: None,
         nor: None,
         instrument_key: None,
@@ -120,8 +121,8 @@ fn kali_conteneur_row(
     })
 }
 
-/// Ingère un stock ou un incrément KALI (`tar.gz` bulk DILA, ADR 0120). Bootstrap
-/// manuel d'un tarball depuis le disque (dev/reprise) sans toucher au watermark.
+/// Ingère un stock ou un incrément KALI (`tar.gz` bulk DILA). Bootstrap manuel
+/// d'un tarball depuis le disque (dev/reprise) sans toucher au watermark.
 pub async fn ingest_kali(path: &Path) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -138,12 +139,19 @@ pub async fn ingest_kali(path: &Path) -> Result<()> {
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
     ingest_kali_tarball(&repo, path).await?;
-    // Dénormalise le titre de la convention sur ses articles (search_title, ADR 0114).
+    // Dénormalise le titre de la convention sur ses articles (`search_title`).
     let retitled = repo
         .refresh_article_denorm()
         .await
         .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
-    // Slugs des textes nouveaux (ADR 0162).
+    // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
+    // rangs, ce finisseur les recalcule.
+    let (ranked_texts, ranked_rows) = repo
+        .refresh_reading_ranks()
+        .await
+        .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
+    tracing::info!(ranked_texts, ranked_rows, "reading ranks");
+    // Slugs des textes nouveaux.
     let slugged = super::slugs::assign_text_slugs(&repo).await?;
     tracing::info!(retitled, slugged, "ingest_kali refresh code_title");
     Ok(())
@@ -151,7 +159,7 @@ pub async fn ingest_kali(path: &Path) -> Result<()> {
 
 /// Ingère un unique `tar.gz` KALI via `repo` (boucle membres → parse → upsert +
 /// suppressions `.dat`). Renvoie `(upserted, skipped, errors)`. Idempotent par
-/// `content_checksum` (#7). Calque de `ingest_legi_tarball`.
+/// `content_checksum`. Calque de `ingest_legi_tarball`.
 async fn ingest_kali_tarball(
     repo: &DecisionRepository<'_>,
     path: &Path,
@@ -190,19 +198,13 @@ async fn ingest_kali_tarball(
             let msg = match classify_kali_member(&name) {
                 KaliMember::Article => match lj_extract::kali::parse_kali_article(&raw) {
                     // Article sans numéro (non citable) → hors référentiel ;
-                    // le corps des TI les consomme à part (ADR 0223).
+                    // le corps des TI les consomme à part.
                     Ok(art) if art.num_key.is_empty() => return Ok(()),
                     Ok(mut art) => {
                         let checksum = xxhash_rust::xxh3::xxh3_64(&raw);
                         let liens = std::mem::take(&mut art.liens);
-                        let built = kali_article_row(art, checksum).and_then(|row| {
-                            let owner = lj_store::repository::LegalLinkOwner {
-                                text_uid: row.text_uid.clone(),
-                                num_key: row.num_key.clone(),
-                                date_debut: row.date_debut,
-                            };
-                            Ok((row, super::legi::legal_link_rows(&owner, liens)?))
-                        });
+                        let built = kali_article_row(art, checksum)
+                            .and_then(|row| Ok((row, super::legi::legal_link_rows(liens)?)));
                         match built {
                             Ok(pair) => KaliMsg::Article(Box::new(pair)),
                             Err(e) => {
@@ -275,7 +277,7 @@ async fn ingest_kali_tarball(
         flush_kali_conteneurs(repo, conteneurs).await?;
     }
 
-    // Suppressions après les upserts (un incrément ajoute ET retire, #7).
+    // Suppressions après les upserts (un incrément ajoute ET retire).
     let mut deleted: u64 = 0;
     for paths in dat_paths {
         deleted += repo
@@ -284,10 +286,10 @@ async fn ingest_kali_tarball(
             .map_err(|e| anyhow!("delete_legal_articles_by_paths: {e}"))?;
     }
 
-    // Le refresh `code_title` (dénorm. titre convention → articles, search_title
-    // ADR 0114) est fait UNE fois en fin de run par l'appelant (`ingest_kali` /
-    // `sync_kali`), pas par tarball : c'est un UPDATE-jointure pleine table, à ne pas
-    // répéter sur chaque incrément d'un rattrapage.
+    // Le refresh `code_title` (dénorm. titre convention → articles, `search_title`)
+    // est fait UNE fois en fin de run par l'appelant (`ingest_kali` / `sync_kali`),
+    // pas par tarball : c'est un UPDATE-jointure pleine table, à ne pas répéter sur
+    // chaque incrément d'un rattrapage.
     tracing::info!(
         source = %path.display(),
         upserted,
@@ -299,9 +301,9 @@ async fn ingest_kali_tarball(
     Ok((upserted, skipped, errors))
 }
 
-/// Upsert d'un batch d'articles KALI (idempotent #7) ; cumule modifiés/skippés.
+/// Upsert d'un batch d'articles KALI (idempotent) ; cumule modifiés/skippés.
 /// Les arêtes `legal_link` des articles réellement écrits sont remplacées dans
-/// la foulée (ADR 0174, même règle que LEGI).
+/// la foulée, même règle que LEGI.
 async fn flush_kali_articles(
     repo: &DecisionRepository<'_>,
     articles: Vec<(
@@ -353,8 +355,8 @@ async fn flush_kali_conteneurs(
     Ok(())
 }
 
-/// Sync incrémental KALI (ADR 0120/0093) : `sync_dila` télécharge stock (cold) puis
-/// incréments postérieurs au watermark, chacun ingéré par [`ingest_kali_tarball`].
+/// Sync incrémental KALI : `sync_dila` télécharge stock (cold) puis incréments
+/// postérieurs au watermark, chacun ingéré par [`ingest_kali_tarball`].
 pub async fn sync_kali() -> Result<()> {
     let settings = Settings::from_env()?;
     let downloaded =
@@ -391,8 +393,15 @@ pub async fn sync_kali() -> Result<()> {
             .await
             .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?
     };
+    // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
+    // rangs, ce finisseur les recalcule.
+    let (ranked_texts, ranked_rows) = repo
+        .refresh_reading_ranks()
+        .await
+        .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
+    tracing::info!(ranked_texts, ranked_rows, "reading ranks");
 
-    // Slugs des textes nouveaux (ADR 0162).
+    // Slugs des textes nouveaux.
     let slugged = super::slugs::assign_text_slugs(&repo).await?;
 
     tracing::info!(

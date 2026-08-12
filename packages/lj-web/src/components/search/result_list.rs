@@ -1,4 +1,4 @@
-//! `ResultList` (port de `result-list.tsx`). Liste ordonnée de `ResultCard`.
+//! `ResultList` : liste ordonnée de `ResultCard`.
 
 use leptos::prelude::*;
 use lj_dtos::SearchHit;
@@ -16,13 +16,10 @@ pub fn ResultList(
     animate: bool,
 ) -> impl IntoView {
     let all_hit_ids = std::sync::Arc::new(all_hit_ids);
-    // Liste keyée par `hit.id` (parité React `<li key={hit.id}>`) : à chaque
-    // recherche dont les hits diffèrent (nouvelle requête, filtre, page), les clés
-    // changent → `<For>` recrée les `<article>` → l'animation « rise » rejoue. Un
-    // simple `.map()` laissait `<Transition>` réutiliser les nœuds en place (patch
-    // d'attributs), si bien que l'animation CSS — déjà jouée — ne redémarrait
-    // jamais. Mode IA (mêmes hits, mêmes clés) → nœuds réutilisés → pas de rejeu
-    // (comme React) ; le « mouvement » à l'activation IA vient des résumés.
+    // Liste keyée par `hit.id` : quand les hits diffèrent (nouvelle requête, filtre,
+    // page), les clés changent, `<For>` recrée les `<article>` et l'animation « rise »
+    // rejoue. Mode IA (mêmes hits, mêmes clés) → nœuds réutilisés, pas de rejeu ; le
+    // « mouvement » à l'activation IA vient des résumés.
     let hits: Vec<(usize, SearchHit)> = hits.into_iter().enumerate().collect();
     view! {
         <ol class="flex flex-col">

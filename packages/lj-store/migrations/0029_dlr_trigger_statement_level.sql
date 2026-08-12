@@ -1,7 +1,7 @@
 -- Migration 0029 — Trigger ``dlr_sync_chunks_legal_instruments`` en
 -- STATEMENT-level (au lieu de ROW-level).
 --
--- Contexte : ``replace_legal_references`` (cf. ADR 0034) fait, pour chaque
+-- Contexte : ``replace_legal_references`` fait, pour chaque
 -- décision ré-extraite, un DELETE bulk puis un INSERT bulk sur
 -- ``decision_legal_references``. Avec le trigger 0028 (ROW-level), chaque
 -- ligne supprimée/insérée déclenche un fire complet : recalcul de l'agrégat

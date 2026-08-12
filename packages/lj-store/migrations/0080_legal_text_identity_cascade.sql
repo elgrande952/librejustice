@@ -1,6 +1,6 @@
--- Migration 0080 — Identité canonique des instruments : colonnes de cascade (ADR 0115).
+-- Migration 0080 — Identité canonique des instruments : colonnes de cascade.
 --
--- ADR 0112 promettait « une identité par instrument » mais a gardé `text_uid` = uid du
+-- La phase A promettait « une identité par instrument » mais a gardé `text_uid` = uid du
 -- diffuseur (LEGITEXT vs JORFTEXT) → 24 889 doublons. On ajoute les clés diffuseur-
 -- agnostiques de la cascade `eli → nor → instrument_key` qui permettront le collapse
 -- (étape destructive ultérieure, hors de cette migration additive).

@@ -1,5 +1,4 @@
 -- Migration 0034 : table users locale, identité déléguée à Supabase
--- ADR : docs/adr/0036-user-profile-local-bookmarks-history.md
 
 CREATE TABLE users (
     sub           TEXT PRIMARY KEY,

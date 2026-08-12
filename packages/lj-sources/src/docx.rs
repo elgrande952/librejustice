@@ -1,11 +1,11 @@
-//! Extraction texte DOCX born-digital au bord I/O (ADR 0110, frontière #1/#12).
+//! Extraction texte DOCX born-digital au bord I/O.
 //!
 //! Certaines décisions CNDA sont publiées en **Word (.docx)** et non en PDF (le
-//! lien « Voir la décision » sert alors un OOXML, pas un PDF). Mistral OCR ne
-//! traite que PDF/images ⇒ rejette le DOCX (HTTP 400). Mais un DOCX est
-//! born-digital : son texte vit dans `word/document.xml` (zip OOXML), extractible
-//! **sans OCR**, déterministe. Ce module rend le texte plat (un paragraphe `<w:p>`
-//! par ligne) pour que le parser pur de `lj-core` reçoive du texte, pas des octets.
+//! lien « Voir la décision » sert alors un OOXML). Mistral OCR ne traite que
+//! PDF/images et rejette le DOCX (HTTP 400). Un DOCX est born-digital : son texte
+//! vit dans `word/document.xml` (zip OOXML), extractible **sans OCR**,
+//! déterministe. Ce module rend le texte plat (un paragraphe `<w:p>` par ligne)
+//! pour que le parser pur de `lj-core` reçoive du texte, pas des octets.
 
 use crate::error::{Result, SourceError};
 use quick_xml::events::Event;
@@ -39,9 +39,9 @@ pub fn extract_docx_text(bytes: &[u8]) -> Result<String> {
                     .map_err(|e| SourceError::Invalid(format!("docx texte non-UTF8: {e}")))?;
                 out.push_str(&raw);
             }
-            // quick-xml 0.40 émet les entités `&amp;`/`&#233;` comme événements
-            // séparés (nom seul, sans `&;`) ; on les résout via `escape::unescape`
-            // (prédéfinies XML + numériques). Hors `<w:t>` ⇒ ignorées.
+            // quick-xml émet les entités `&amp;`/`&#233;` comme événements séparés
+            // (nom seul, sans `&;`) ; on les résout via `escape::unescape` (prédéfinies
+            // XML + numériques). Hors `<w:t>` ⇒ ignorées.
             Ok(Event::GeneralRef(r)) if in_text => {
                 let name = std::str::from_utf8(r.as_ref()).unwrap_or("");
                 if let Ok(u) = quick_xml::escape::unescape(&format!("&{name};")) {

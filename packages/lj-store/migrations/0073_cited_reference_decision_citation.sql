@@ -1,14 +1,14 @@
--- Migration 0073 — cited_reference / decision_citation (ADR 0112, phase B).
+-- Migration 0073 — cited_reference / decision_citation (phase B).
 --
 -- Modèle de citation unifié : une ligne `cited_reference` par couple
--- (text_key, article_key) canonique cité — le vocabulaire searchable (ADR 0112
--- §10 : résolus ET non-résolus) —, et une arête `decision_citation` par décision
+-- (text_key, article_key) canonique cité — le vocabulaire searchable
+-- (résolus ET non-résolus) —, et une arête `decision_citation` par décision
 -- citant cette référence. Remplace le 3NF legal_codes / legal_articles /
 -- decision_legal_references + legal_article_resolution (droppés en 0075, une fois
 -- la parité facettes vérifiée contre la GT du banc).
 --
 --   text_key    : clé normalisée de l'instrument CANONIQUE (snap fréquentiel
---                 ADR 0079 + recognizer) — joignable à legal_text.title_key.
+--                 et recognizer) — joignable à legal_text.title_key.
 --   article_key : normalize_article(label), NULL si citation sans article.
 --   raw_text    : forme d'affichage représentative de l'instrument (facette,
 --                 affichage des non-résolus). NOT NULL.

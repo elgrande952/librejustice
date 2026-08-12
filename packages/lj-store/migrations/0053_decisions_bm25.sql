@@ -1,20 +1,20 @@
--- Migration 0053 — Index BM25 au grain décision (ADR 0084).
+-- Migration 0053 — Index BM25 au grain décision.
 --
 -- ``decisions_bm25`` indexe ``full_text`` (texte entier de la décision) +
 -- ``search_title`` + facettes/arrays légaux en fast fields. Les jambes BM25
 -- body et titre l'interrogent directement au grain décision
 -- (``LIMIT leg_limit``, plus de sur-récupération ni de pooling — supersede la
--- jambe BM25 chunk de l'ADR 0080). Mêmes tokenizers que ``chunks_bm25`` (0048) :
+-- jambe BM25 chunk). Mêmes tokenizers que ``chunks_bm25`` (0048) :
 -- regex ``[\p{L}\p{N}-]+`` + ascii folding + stopwords FR ``["a", "à"]``.
 -- ``record: position`` requis pour les requêtes de phrase (``paradedb.parse``).
 --
--- ⚠️ PRÉREQUIS : appliquer APRÈS le backfill ``full_text`` (étape 1 ADR 0084)
+-- PRÉREQUIS : appliquer APRÈS le backfill ``full_text`` (étape 1)
 -- et la migration 0052 (arrays légaux). Sinon l'index ne couvre que les lignes
 -- déjà peuplées (les UPDATE de backfill restants l'alimenteraient au fil de
 -- l'eau, mais le build d'un coup post-backfill est nettement plus rapide).
 --
--- ⚠️ Fenêtre de maintenance : ``chunks_bm25`` reste en service ; le cutover des
--- jambes vers ``decisions_bm25`` se fait côté code (étape 3 ADR 0084), pas ici.
+-- Fenêtre de maintenance : ``chunks_bm25`` reste en service ; le cutover des
+-- jambes vers ``decisions_bm25`` se fait côté code (étape 3), pas ici.
 -- Cet index s'ajoute sans rien supprimer (+~11 GB) ; le DROP de ``chunks_bm25``
 -- vient à l'étape 4.
 

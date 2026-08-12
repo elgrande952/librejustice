@@ -1,11 +1,11 @@
 -- Migration 0165 — Colonnes de recherche dénormalisées sur legal_article
--- (ADR 0254) : jurisdiction / nature (upper) / slug / searchable copiées de
+-- : jurisdiction / nature (upper) / slug / searchable copiées de
 -- legal_text pour rendre les jambes articles de /recherche-textes
 -- single-table (prédicat 100 % indexé, éligible Top-K/columnar ParadeDB).
 -- Rafraîchies en fin d'ingest par refresh_article_denorm (ex
 -- refresh_article_code_titles), même contrat de fraîcheur que code_title.
 --
--- ⚠️ Rebuild complet de legal_article_bm25 (ParadeDB n'autorise qu'UN index
+-- Rebuild complet de legal_article_bm25 (ParadeDB n'autorise qu'UN index
 -- bm25 par table : impossible d'ajouter des champs en place). Le DROP prend
 -- un verrou exclusif tenu jusqu'au COMMIT : la recherche d'articles est
 -- indisponible pendant le backfill + rebuild (~5-10 min) — à jouer en creux.
@@ -21,7 +21,7 @@ ALTER TABLE legal_article
 DROP INDEX legal_article_bm25;
 
 -- Backfill (2,2 M lignes). searchable reproduit exactement le prédicat des
--- jambes articles : t.slug IS NOT NULL AND role visible (ADR 0246 §6).
+-- jambes articles : t.slug IS NOT NULL AND role visible.
 UPDATE legal_article a SET
     jurisdiction = t.jurisdiction,
     nature = upper(t.nature),

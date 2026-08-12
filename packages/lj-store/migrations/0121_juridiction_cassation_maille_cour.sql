@@ -1,10 +1,10 @@
--- Migration 0121 — Cassation ramenée à la maille cour (ADR 0172).
+-- Migration 0121 — Cassation ramenée à la maille cour.
 --
 -- Le référentiel `jurisdiction` mélangeait deux mailles : la Cassation à la
 -- chambre (`cass_civ1`, `cass_soc`… avec la chambre fondue dans le label),
 -- tout le reste à la cour. Invariant nouveau : `jurisdiction` = la cour, pour
 -- tous les ordres. La chambre vit dans les axes déjà remplis
--- (`chamber_position` fin + `chambre_uid` catégorie, ADR 0170), jamais dans
+-- (`chamber_position` fin + `chambre_uid` catégorie), jamais dans
 -- l'identité de juridiction.
 --
 -- `search_title` (BM25) n'est pas réécrite : « Cour de cassation, chambre

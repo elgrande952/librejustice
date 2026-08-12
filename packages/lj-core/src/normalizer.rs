@@ -1,5 +1,4 @@
-//! Nettoyage texte + normalisation des références juridiques
-//! (port de `parsing/normalizer.py`).
+//! Nettoyage texte + normalisation des références juridiques.
 //!
 //! Produit la liste des tokens d'articles cités (`L_611_1`, `CESEDA_L_611_1`…)
 //! ajoutés à l'index FTS. Volontairement non exhaustif : on préfère le silence
@@ -17,12 +16,19 @@ static BR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)<br\s*/?>").un
 static WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new("[ \t\u{a0}\u{202f}]+").unwrap());
 static BLANKLINES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n{3,}").unwrap());
 
-/// Transforme le texte XML brut en texte lisible (`<br/>` → `\n`, décodage HTML,
-/// suppression NUL, espaces insécables → espace, collapse, ≤ 2 sauts de ligne).
-pub fn clean_texte(raw: &str) -> String {
-    let txt = BR_RE.replace_all(raw, "\n");
-    let txt = html_escape::decode_html_entities(&txt);
-    let txt = txt.replace('\u{0}', "");
+/// Normalisation caractères **invariante et source-agnostique** : suppression
+/// NUL, NEL → `…`, séparateurs de ligne Unicode → `\n`, espaces insécables →
+/// espace, collapse des blancs, lignes trimées, ≤ 2 sauts de ligne.
+///
+/// Ne connaît aucune source et ne grandit pas quand une source arrive — c'est ce
+/// qui autorise à l'appliquer au point d'écriture unique du référentiel.
+/// Idempotente : sa sortie ne contient plus aucun de ses déclencheurs.
+pub fn normalize_chars(raw: &str) -> String {
+    let txt = raw.replace('\u{0}', "");
+    // U+0085 (NEL) dans les textes DILA est le mojibake cp1252 de « … » (0x85),
+    // l'élision des citations : « aux termes de l'article … : (…) ».
+    let txt = txt.replace('\u{85}', "…");
+    let txt = txt.replace(['\u{2028}', '\u{2029}'], "\n");
     let txt = txt.replace(['\u{a0}', '\u{202f}'], " ");
     let txt = WS_RE.replace_all(&txt, " ");
     let joined = txt
@@ -32,6 +38,15 @@ pub fn clean_texte(raw: &str) -> String {
         .join("\n");
     let collapsed = BLANKLINES_RE.replace_all(&joined, "\n\n");
     collapsed.trim().to_string()
+}
+
+/// Transforme le texte XML brut en texte lisible : `<br/>` → `\n` et décodage
+/// des entités HTML — le volet **format source**, propre au XML/HTML brut des
+/// décisions — puis [`normalize_chars`].
+pub fn clean_texte(raw: &str) -> String {
+    let txt = BR_RE.replace_all(raw, "\n");
+    let txt = html_escape::decode_html_entities(&txt);
+    normalize_chars(&txt)
 }
 
 // ── 2. Normalisation des références ─────────────────────────────────────────
@@ -199,8 +214,27 @@ mod tests {
     }
 
     #[test]
+    fn clean_texte_repairs_nel_and_unicode_line_separators() {
+        let raw = "code civil : (\u{85}) l'acquisition\u{2028}de la nationalité\u{2029}française";
+        let out = clean_texte(raw);
+        assert_eq!(
+            out,
+            "code civil : (…) l'acquisition\nde la nationalité\nfrançaise"
+        );
+    }
+
+    #[test]
+    fn normalize_chars_is_idempotent_and_leaves_markup_alone() {
+        // Le volet format source (`<br/>`, entités) n'est PAS de son ressort : le
+        // réappliquer à du texte déjà décodé double-décoderait `&amp;nbsp;`.
+        let raw = "a\u{a0}b<br/>&amp;nbsp;  c\u{85}";
+        let once = normalize_chars(raw);
+        assert_eq!(once, "a b<br/>&amp;nbsp; c…");
+        assert_eq!(normalize_chars(&once), once);
+    }
+
+    #[test]
     fn extract_refs_with_code_and_dedup() {
-        // L. 611-1 du CESEDA, puis répétition (dédupliquée), puis R.521-1 du CJA.
         let texte = "Vu l'article L. 611-1 du code de l'entrée et du séjour des étrangers et du droit d'asile ; \
                      l'article L. 611-1 du CESEDA ; et l'article R.521-1 du code de justice administrative.";
         let refs = extract_refs(texte);
@@ -226,7 +260,6 @@ mod tests {
 
     #[test]
     fn extract_refs_requires_two_digits() {
-        // « L. 1 » trop peu discriminant : pas de match.
         assert!(extract_refs("article L. 1 du code civil").is_empty());
     }
 }
