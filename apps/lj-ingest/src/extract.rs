@@ -20,18 +20,35 @@ pub fn canonical_ref(decision: &Decision) -> Option<String> {
     lj_extract::identity::decision_canonical_ref(decision)
 }
 
+/// What the extraction reads of the corpus AT THE MOMENT OF THE PASS, and of
+/// nothing else: hydrated once per process, immutable afterwards.
+pub struct Snapshots<'a> {
+    pub link: &'a LinkSnapshot,
+    pub vocab: &'a lj_extract::compiled::CompiledVocab,
+    pub chrono: &'a lj_extract::chrono::ChronoSnapshot,
+    /// Referential labels healed with their city, keyed by SOURCE code.
+    pub jur_labels: &'a HashMap<String, String>,
+    /// Source code to canonical code.
+    pub jur_codes: &'a HashMap<String, String>,
+    pub case_names: &'a lj_extract::case_link::CaseNameSnapshot,
+    pub seats: &'a lj_extract::seat_link::SeatVocabulary,
+}
+
 /// Champs structurés extraits d'une décision, prêts à persister.
 ///
 /// Un [`lj_extract::compiled::doc_extract`] par décision : une seule passe
 /// automate partagée entre les composeurs de champs (`DocScan`) et les citations
 /// compilées.
-pub fn extracted_fields(
-    decision: &Decision,
-    link: &LinkSnapshot,
-    vocab: &lj_extract::compiled::CompiledVocab,
-    chrono: &lj_extract::chrono::ChronoSnapshot,
-    jur_labels: &std::collections::HashMap<String, String>,
-) -> Result<ExtractedFields> {
+pub fn extracted_fields(decision: &Decision, snap: &Snapshots<'_>) -> Result<ExtractedFields> {
+    let Snapshots {
+        link,
+        vocab,
+        chrono,
+        jur_labels,
+        jur_codes,
+        case_names,
+        seats,
+    } = *snap;
     use lj_extract::extract as ex;
     // La garde `routed` couvre la nomenclature FR/EU ; le fond international
     // (JuriCAF, types propres `COUR_SUPREME`/`CCJA`…) passe par le traitement
@@ -66,8 +83,6 @@ pub fn extracted_fields(
     );
     let scan = Some(&docx.scan);
 
-    // Formation structurée : champs source + bandeau scanné, décomposés en
-    // axes ; nourrit aussi la coloration du vote domaine.
     let axes = ex::formation_axes_scanned(decision, scan);
 
     let citation_occurrences = Some(
@@ -84,16 +99,41 @@ pub fn extracted_fields(
     );
 
     let docket_numbers = ex::docket_numbers_scanned(decision, scan).unwrap_or_default();
-    let case_citations = Some(merge_attacked_spans(
+    let own_keys = lj_extract::identity::pending_target_keys(
+        decision.jurisdiction_type.as_deref().unwrap_or_default(),
+        decision.jurisdiction_location.as_deref(),
+        &docket_numbers,
+    );
+    let numerotees = merge_bridged_spans(
         case_citation_rows(&docx.cases, &docket_numbers),
         lj_extract::chrono::attacked_text_spans(decision, chrono),
-    ));
+    );
+    let nommees = drop_named_next_to_ref(
+        lj_extract::case_link::cited_case_name_spans(
+            &decision.texte_integral_clean,
+            case_names,
+            &own_keys,
+            lj_extract::case_link::Citing {
+                european: matches!(
+                    decision.jurisdiction_type.as_deref(),
+                    Some("CJUE") | Some("CEDH")
+                ),
+                date: decision.date_lecture.as_deref(),
+            },
+        ),
+        &numerotees,
+        &decision.texte_integral_clean,
+    );
+    let case_citations = Some(merge_bridged_spans(numerotees, nommees));
 
     let mut procedure = ex::procedure_scanned(decision, scan);
     // Vote domaine par le profil des codes cités (`lj_extract::domain`),
     // seulement quand le chemin signaux n'a rien rendu.
     if procedure.legal_domain_uid.is_none() {
-        let ctx = lj_extract::domain::context_for(decision, &axes, procedure.domain_hint);
+        let ctx = lj_extract::domain::DomainContext {
+            admin: !lj_extract::extract::is_judiciaire(decision),
+            hint: procedure.domain_hint,
+        };
         let cites = docx.citations.iter().filter_map(|c| {
             Some((
                 c.target.ref_text_uid.as_deref()?,
@@ -151,16 +191,27 @@ pub fn extracted_fields(
             "juridiction admin hors nomenclature : décision sans facette juridiction"
         );
     }
+    let seat = seat_of(&axes, decision, jurisdiction.as_ref(), jur_codes);
     let mut fields = ExtractedFields {
         jurisdiction,
-        publication_uid: Some(lj_extract::facets::publication_uid(
-            &decision.publication_codes,
-        )),
         date_lecture: parse_date(ex::extract_date_lecture(decision)),
         date_audience: parse_date(ex::date_audience_scanned(decision, scan)),
         docket_numbers,
-        chamber_position: axes.chamber_position,
-        chamber_uid: axes.chamber_uid.map(str::to_string),
+        chamber_key: axes.chamber_key(),
+        seat_paths: seat
+            .as_ref()
+            .map(|s| {
+                seats
+                    .resolve(&lj_extract::seat_link::SeatRow {
+                        seat: s.clone(),
+                        chamber: decision.chamber.clone(),
+                        formation: decision.formation.clone(),
+                        span: None,
+                    })
+                    .paths()
+            })
+            .unwrap_or_default(),
+        seat,
         formation_uid: axes.formation_uid.map(str::to_string),
         publication_codes: decision.publication_codes.clone(),
         solution_uid: ex::solution_scanned(decision, scan),
@@ -182,7 +233,7 @@ pub fn extracted_fields(
         themes: decision.themes.clone(),
         citation_occurrences,
         decision_links: Some(
-            lj_extract::chrono::prior_decision_refs(decision, chrono)
+            lj_extract::chrono::prior_decision_refs(decision, chrono, &docx.scan)
                 .into_iter()
                 .map(|r| lj_store::repository::DecisionLinkRow {
                     link_type: r.link_type.as_str().to_string(),
@@ -191,25 +242,43 @@ pub fn extracted_fields(
                 .collect(),
         ),
         case_citations,
+        // Le titre EUR-Lex, en tête du texte, nomme les parties ; HUDOC le porte
+        // hors du texte, et passe par `prebuilt_from_source_fields`.
+        case_name: decision
+            .source_uid
+            .starts_with("cjue/")
+            .then(|| lj_core::parsing::cjue_case_name(&decision.texte_integral_clean))
+            .flatten(),
         ..Default::default()
     };
-    fields.search_title =
-        compose_search_title(&fields, decision.jurisdiction_type.as_deref(), jur_labels);
+    fields.search_title = compose_search_title(
+        &fields,
+        decision.jurisdiction_type.as_deref(),
+        jur_labels,
+        fields.case_name.as_deref(),
+    );
     // Relation canonique `decision_party` : grain acteur dérivé des cellules
     // plates finales (spans-évidences par matching replié, nature, resolve_key). La
     // qualité `intervenor` est gatée en prod — la colonne plate reste la seule
     // émission.
-    let cells: [lj_extract::parties::Cell<'_>; 6] = [
-        ("party", Some("applicant"), &fields.applicant_companies),
-        ("party", Some("defendant"), &fields.defendant_companies),
-        ("law_firm", Some("applicant"), &fields.applicant_law_firms),
-        ("law_firm", Some("defendant"), &fields.defendant_law_firms),
-        (
+    use lj_extract::parties::Cell;
+    // Les parties personnes physiques ne sont pas des colonnes de `decisions` :
+    // elles n'existent que dans la relation, où la nature les distingue.
+    let app_indiv = ex::applicant_individuals_scanned(scan).unwrap_or_default();
+    let def_indiv = ex::defendant_individuals_scanned(scan).unwrap_or_default();
+    let cells: [Cell<'_>; 8] = [
+        Cell::new("party", Some("applicant"), &fields.applicant_companies),
+        Cell::new("party", Some("defendant"), &fields.defendant_companies),
+        Cell::physique("party", Some("applicant"), &app_indiv),
+        Cell::physique("party", Some("defendant"), &def_indiv),
+        Cell::new("law_firm", Some("applicant"), &fields.applicant_law_firms),
+        Cell::new("law_firm", Some("defendant"), &fields.defendant_law_firms),
+        Cell::new(
             "counsel_name",
             Some("applicant"),
             &fields.applicant_counsel_names,
         ),
-        (
+        Cell::new(
             "counsel_name",
             Some("defendant"),
             &fields.defendant_counsel_names,
@@ -226,6 +295,8 @@ pub fn extracted_fields(
             barreau: r.barreau,
             role: r.role.map(str::to_string),
             firm_ord: r.firm_ord,
+            party_ord: r.party_ord,
+            sub_ord: r.sub_ord,
             char_starts: r.char_starts,
             char_ends: r.char_ends,
         })
@@ -234,15 +305,43 @@ pub fn extracted_fields(
     Ok(fields)
 }
 
-/// Titre canonique persistant (`search_title`) : composé à l'extraction via
-/// `lj_core::titles`, la même recomposition que l'affichage. Juridiction = label
-/// de la ligne catégorielle, guéri par le label référentiel (`jur_labels`, code →
-/// label avec ville) quand il est nu, sinon label du type ; siège recomposé
-/// depuis les axes.
+/// The seat the decision sat in, positioned on its court. The court code is the
+/// CANONICAL one, the resolution `ensure_jurisdictions` runs at write time: the
+/// paths are derived here, before it.
+fn seat_of(
+    axes: &lj_extract::formation::FormationAxes,
+    decision: &Decision,
+    jurisdiction: Option<&lj_store::repository::JurisdictionRow>,
+    jur_codes: &HashMap<String, String>,
+) -> Option<lj_core::chamber::Seat> {
+    let mut seat = axes.chamber.clone();
+    seat.jurisdiction_type = decision.jurisdiction_type.clone()?;
+    seat.jurisdiction_code = jurisdiction.map(|j| {
+        jur_codes.get(&j.source_code).cloned().unwrap_or_else(|| {
+            lj_store::repository::canonical_jurisdiction_code(
+                &j.jurisdiction_type,
+                j.city.as_deref(),
+                &j.source_code,
+            )
+        })
+    });
+    Some(seat)
+}
+
+/// Persistent canonical title (`search_title`), composed through `lj_core::titles`,
+/// the same recomposition the display runs. Jurisdiction is the categorial label,
+/// healed by the referential one (`jur_labels`, code to label with city) when bare,
+/// otherwise the type label. The seat is NOT in it: it reads from the stored seat,
+/// and the indexed title equals the displayed one.
+///
+/// `case_name` is taken rather than read off `e`: the extraction only knows the name
+/// its source carries, while the corpus also holds names elected downstream, and
+/// composing without them silently drops the name from the indexed title.
 pub fn compose_search_title(
     e: &ExtractedFields,
     jurisdiction_type: Option<&str>,
     jur_labels: &std::collections::HashMap<String, String>,
+    case_name: Option<&str>,
 ) -> Option<String> {
     use lj_core::titles as t;
     let jurisdiction = e
@@ -257,26 +356,20 @@ pub fn compose_search_title(
                 .and_then(t::jurisdiction_type_label)
                 .map(str::to_string)
         })?;
-    let seat = t::seat_display(
-        &jurisdiction,
-        e.chamber_position.as_deref(),
-        e.formation_uid.as_deref().and_then(t::formation_label),
-        e.office_uid.as_deref().and_then(t::office_label),
-    );
     let date = e.date_lecture.map(|d| d.to_string());
     Some(t::decision_title(
         &jurisdiction,
-        seat.as_deref(),
+        None,
         date.as_deref(),
+        case_name,
         e.docket_numbers.first().map(String::as_str),
     ))
 }
 
 /// Variante sans `Decision` (fonds scrapés à `ExtractedFields` préconstruits,
-/// ex. CNDA) : ligne `jurisdiction` par override du type, `publication:*`,
-/// titre — pas de code de localisation ni de nom scanné.
+/// ex. CNDA) : ligne `jurisdiction` par override du type et titre, pas de code
+/// de localisation ni de nom scanné.
 pub fn with_facet_uids(mut e: ExtractedFields, jurisdiction_type: Option<&str>) -> ExtractedFields {
-    e.publication_uid = Some(lj_extract::facets::publication_uid(&e.publication_codes));
     e.jurisdiction = jurisdiction_type
         .and_then(|jt| lj_extract::facets::jurisdiction_ref(jt, None, None))
         .map(|j| lj_store::repository::JurisdictionRow {
@@ -287,7 +380,13 @@ pub fn with_facet_uids(mut e: ExtractedFields, jurisdiction_type: Option<&str>) 
             label: j.label,
         });
     // Label toujours porté par l'override du type (CNDA…) : rien à guérir.
-    e.search_title = compose_search_title(&e, jurisdiction_type, &std::collections::HashMap::new());
+    let nom = e.case_name.clone();
+    e.search_title = compose_search_title(
+        &e,
+        jurisdiction_type,
+        &std::collections::HashMap::new(),
+        nom.as_deref(),
+    );
     e
 }
 
@@ -301,11 +400,19 @@ pub fn with_facet_uids(mut e: ExtractedFields, jurisdiction_type: Option<&str>) 
 /// Judilibre minimal, relu par `from_source_fields_json`). CNDA a un champ qui
 /// ne tenait dans ni l'un ni l'autre — `solution_uid`, lu du dispositif par une
 /// connaissance que l'extracteur générique n'a pas ; il vit en `source_fields`,
-/// et se relit ici.
+/// et se relit ici. La CEDH est dans le même cas : le nom de l'affaire est dans
+/// le `docname` HUDOC, que le texte ne porte pas.
 pub fn prebuilt_from_source_fields(
     source_uid: &str,
     source_fields: &serde_json::Value,
 ) -> Option<ExtractedFields> {
+    if source_uid.starts_with("cedh/") {
+        let docname = source_fields.get("docname").and_then(|v| v.as_str())?;
+        return Some(ExtractedFields {
+            case_name: Some(lj_core::parsing::cedh_case_name(docname)?),
+            ..Default::default()
+        });
+    }
     let solution_uid = source_uid
         .starts_with("cnda/")
         .then(|| source_fields.get("solution_uid").and_then(|v| v.as_str()))
@@ -333,16 +440,17 @@ pub fn merge_prebuilt(pre: ExtractedFields, full: ExtractedFields) -> ExtractedF
         date_lecture: pre.date_lecture.or(full.date_lecture),
         date_audience: pre.date_audience.or(full.date_audience),
         docket_numbers: vec_or(pre.docket_numbers, full.docket_numbers),
-        chamber_position: pre.chamber_position.or(full.chamber_position),
-        chamber_uid: pre.chamber_uid.or(full.chamber_uid),
+        chamber_key: pre.chamber_key.or(full.chamber_key),
+        seat: pre.seat.or(full.seat),
+        seat_paths: vec_or(pre.seat_paths, full.seat_paths),
         formation_uid: pre.formation_uid.or(full.formation_uid),
+        case_name: pre.case_name.or(full.case_name),
         search_title: pre.search_title.or(full.search_title),
         publication_codes: vec_or(pre.publication_codes, full.publication_codes),
         solution_uid: pre.solution_uid.or(full.solution_uid),
         procedure_uid: pre.procedure_uid.or(full.procedure_uid),
         office_uid: pre.office_uid.or(full.office_uid),
         legal_domain_uid: pre.legal_domain_uid.or(full.legal_domain_uid),
-        publication_uid: pre.publication_uid.or(full.publication_uid),
         applicant_counsel_names: vec_or(pre.applicant_counsel_names, full.applicant_counsel_names),
         applicant_law_firms: vec_or(pre.applicant_law_firms, full.applicant_law_firms),
         applicant_companies: vec_or(pre.applicant_companies, full.applicant_companies),
@@ -411,12 +519,42 @@ pub fn case_citation_rows(
         .collect()
 }
 
-/// Fusionne les spans pontés métadonnée dans les lignes du lexer : la
-/// décision attaquée citée inline sans docket (« l'arrêt attaqué (Paris,
-/// 22 août 2024) ») porte le `target_ref` du lien de chronologie, résolu par le
-/// pont SQL depuis `decision_links`. Les spans du lexer priment en cas de
-/// chevauchement.
-pub fn merge_attacked_spans(
+/// Fusionne les spans qu'un pont apporte là où le texte ne porte pas de numéro :
+/// la décision attaquée citée inline (« l'arrêt attaqué (Paris, 22 août 2024) »)
+/// et le nom d'usage (« la jurisprudence Danthony »). Les spans déjà présents
+/// priment en cas de chevauchement.
+/// Codepoints between the end of a name and the number that follows it: « arrêt
+/// Pellegrin c. France [GC], n° 28541/95 » is one citation, not two. The nine
+/// cases reread sit between 5 and 48 characters, the longest being « décision
+/// Czabaj (Assemblée du contentieux, 13 juillet 2016, no 387763) » (31/08/2026).
+const NAMED_REF_WINDOW: i32 = 60;
+
+/// A usage name followed by its reference yields a single line, carried by the
+/// number, the only identifying token. Sentence-ending punctuation in between
+/// separates two citations.
+pub fn drop_named_next_to_ref(
+    named: Vec<(usize, usize, String)>,
+    case_rows: &[lj_store::repository::CaseCitationRow],
+    text: &str,
+) -> Vec<(usize, usize, String)> {
+    named
+        .into_iter()
+        .filter(|(_, fin, _)| {
+            let fin = *fin as i32;
+            !case_rows.iter().any(|c| {
+                c.char_start >= fin
+                    && c.char_start - fin <= NAMED_REF_WINDOW
+                    && !text
+                        .chars()
+                        .skip(fin as usize)
+                        .take((c.char_start - fin) as usize)
+                        .any(|ch| ch == '.' || ch == ';')
+            })
+        })
+        .collect()
+}
+
+pub fn merge_bridged_spans(
     mut case_rows: Vec<lj_store::repository::CaseCitationRow>,
     attacked: Vec<(usize, usize, String)>,
 ) -> Vec<lj_store::repository::CaseCitationRow> {
@@ -726,6 +864,60 @@ mod tests {
         assert_eq!(
             merged.legal_domain_uid.as_deref(),
             Some("legal_domain:PUBLIC")
+        );
+    }
+
+    #[test]
+    fn prebuilt_from_source_fields_names_the_cedh_case() {
+        let sf = serde_json::json!({ "docname": "AFFAIRE TAMAKULOVA ET AUTRES c. UKRAINE" });
+        let pre = prebuilt_from_source_fields("cedh/001-250438", &sf).expect("couche CEDH");
+        assert_eq!(
+            pre.case_name.as_deref(),
+            Some("TAMAKULOVA ET AUTRES c. UKRAINE")
+        );
+
+        let anonyme = serde_json::json!({ "docname": "AFFAIRE K c. FRANCE" });
+        assert!(prebuilt_from_source_fields("cedh/001-250439", &anonyme).is_none());
+        assert!(prebuilt_from_source_fields("cedh/001-250440", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn compose_search_title_places_the_case_name_between_date_and_docket() {
+        let nomme = ExtractedFields {
+            date_lecture: NaiveDate::from_ymd_opt(1992, 12, 16),
+            docket_numbers: vec!["C-144/91".to_string()],
+            case_name: Some("Gilbert Demoor en Zonen NV contre État belge".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            compose_search_title(
+                &nomme,
+                Some("CJUE"),
+                &HashMap::new(),
+                nomme.case_name.as_deref()
+            )
+            .as_deref(),
+            Some(
+                "Cour de justice de l'Union européenne, 16 décembre 1992, \
+                 Gilbert Demoor en Zonen NV contre État belge, C-144/91"
+            )
+        );
+
+        let anonyme = ExtractedFields {
+            case_name: None,
+            ..nomme
+        };
+        assert_eq!(
+            compose_search_title(&anonyme, Some("CJUE"), &HashMap::new(), None).as_deref(),
+            Some("Cour de justice de l'Union européenne, 16 décembre 1992, C-144/91")
+        );
+
+        // A French decision is named by the ones citing it, long after extraction, so
+        // its name reaches the title only through the argument.
+        assert_eq!(
+            compose_search_title(&anonyme, Some("CJUE"), &HashMap::new(), Some("Danthony"))
+                .as_deref(),
+            Some("Cour de justice de l'Union européenne, 16 décembre 1992, Danthony, C-144/91")
         );
     }
 

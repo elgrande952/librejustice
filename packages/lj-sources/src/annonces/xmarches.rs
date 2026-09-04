@@ -1,12 +1,3 @@
-//! Xmarches (`xmarches.fr`).
-//!
-//! Liste publique paginée `/entreprise/liste-des-consultations,<page>.html`,
-//! une ligne par consultation avec `detailConsultation.php?key=<id>`. La
-//! liste ne porte ni référence ni dates : on complète par la fiche de
-//! détail, tirée en parallèle. Le moteur le moins fiable du lot — une fiche en
-//! échec garde sa ligne de liste, sans dates, plutôt que de perdre la
-//! consultation.
-
 use std::sync::LazyLock;
 
 use futures::StreamExt;
@@ -20,6 +11,9 @@ use crate::error::Result;
 const BASE: &str = "https://www.xmarches.fr/entreprise";
 const MAX_PAGES: u64 = 80;
 const FICHES_PARALLELES: usize = 10;
+/// Relectures de la liste au plus. Quatre suffisent à ramasser les 296
+/// consultations du 27/08 (271, puis 288, 295, 296) ; la sixième est la marge.
+const PASSES_MAX: u32 = 6;
 
 fn parse_page(html: &str) -> Vec<AnnonceBrute> {
     static KEY: LazyLock<Regex> =
@@ -138,24 +132,31 @@ pub async fn enumerate() -> Result<MoteurRun> {
 
     let mut rows: Vec<AnnonceBrute> = Vec::new();
     let mut vus = std::collections::HashSet::new();
-    for r in parse_page(&premiere) {
-        if vus.insert(r.source_uid.clone()) {
-            rows.push(r);
-        }
-    }
-    for p in 2..=MAX_PAGES {
-        let html = send_text(
-            client.get(format!("{BASE}/liste-des-consultations,{p}.html")),
-            &format!("xmarches liste {p}"),
-        )
-        .await?;
-        let avant = vus.len();
-        for r in parse_page(&html) {
+    let mut absorber = |lot: Vec<AnnonceBrute>, rows: &mut Vec<AnnonceBrute>| {
+        for r in lot {
             if vus.insert(r.source_uid.clone()) {
                 rows.push(r);
             }
         }
-        if vus.len() == avant {
+    };
+    absorber(parse_page(&premiere), &mut rows);
+    for _ in 0..PASSES_MAX {
+        let avant = rows.len();
+        for p in 1..=MAX_PAGES {
+            let html = send_text(
+                client.get(format!("{BASE}/liste-des-consultations,{p}.html")),
+                &format!("xmarches liste {p}"),
+            )
+            .await?;
+            // Fin de liste : la page est vide. Une page qui n'apprend rien ne
+            // l'annonce pas, le réordonnancement en produit au milieu du stock.
+            let lot = parse_page(&html);
+            if lot.is_empty() {
+                break;
+            }
+            absorber(lot, &mut rows);
+        }
+        if rows.len() == avant || total > 0 && rows.len() as u64 >= total {
             break;
         }
     }
@@ -171,6 +172,7 @@ pub async fn enumerate() -> Result<MoteurRun> {
     Ok(MoteurRun {
         annonce: (total > 0).then_some(total),
         echecs: 0,
+        hotes: Vec::new(),
         rows: dedup_source_uid(rows),
     })
 }

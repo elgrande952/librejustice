@@ -5,14 +5,6 @@
 -- `lj-ingest backfill-decision-sources` (batché par keyset, repris), pour ne pas
 -- tenir une transaction longue qui bloquerait les écritures sur `decisions`
 -- (base low-IOPS).
---
--- VERSION ADDITIVE STAGED : `decisions.source_uid` reste en place (NOT NULL
--- UNIQUE) et reste le pivot de l'idempotence intra-source ; `decision_full_text
--- .payload_format` n'est PAS droppé. La table `decision_sources` est ajoutée
--- À CÔTÉ et duplique la provenance, sans rien retirer de l'existant (0089 /
--- reverses / tombstones / find_existing_source_uids lisent encore
--- `decisions.source_uid`). La « migration de source_uid vers decision_sources »
--- décrite par l'ADR est l'état CIBLE, différée à un ADR ultérieur.
 
 -- ── ECLI sur decisions ────────────────────────────────────────────────────
 -- Colonne nullable (vide pour l'existant, peuplée au prochain re-extract / par
@@ -26,11 +18,8 @@ ON decisions (ecli)
 WHERE ecli IS NOT NULL;
 
 -- ── Provenances découplées ─────────────────────────────────────────────────
--- Une ligne = une provenance d'une décision canonique. `source_uid UNIQUE` y
--- est dupliqué (l'idempotence intra-source reste portée par decisions.source_uid
--- en parallèle dans cette version staged). `payload_format` étend le CHECK
--- ('xml','json') de 0019 à ('xml','json','dila-xml','html') — prêt pour les
--- parsers DILA/européens (ADRs 0093-0094) sans nouvelle migration.
+-- `source_uid` is duplicated here: intra-source idempotence stays carried by
+-- `decisions.source_uid`.
 CREATE TABLE decision_sources (
     id               BIGSERIAL PRIMARY KEY,
     decision_id      BIGINT   NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,

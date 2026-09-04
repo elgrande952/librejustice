@@ -152,22 +152,24 @@ pub fn format_score(score: f64) -> String {
     format!("{score:.3}")
 }
 
-/// Plafond d'affichage du nombre de resultats.
-const RESULTS_CAP: i64 = 400;
+/// Forme de pagination des TROIS surfaces de recherche, decisions, textes et
+/// annonces : dix resultats par page, dix pages. La portee qui en resulte, 100,
+/// est le `MAX_RESULTS` du moteur decisions, seul des trois a etre borne par son
+/// classement ; les deux autres pourraient aller plus loin et suivent la meme
+/// forme. Mesure du 26/08/2026 : sur 15 229 recherches de 90 jours, aucune n'est
+/// allee au-dela de la page 5. Le listing annuaire n'en releve pas, c'est un
+/// catalogue qu'on parcourt et non un classement qu'on lit.
+///
+/// Le plafond de pages vaut aussi en mode parcours, ou le total se compte en
+/// millions : `key_from_map` ramene toute page au-dela a la dixieme, donc sans
+/// lui la pagination offrirait des pages qui reviennent sur elles-memes.
+pub const SEARCH_PAGE_SIZE: u32 = 10;
+pub const SEARCH_MAX_PAGES: i64 = 10;
 
-/// Libelle FR du nombre de resultats.
+/// Libelle FR d'un nombre de resultats. Le total est celui du fonds apparie,
+/// pas celui de la liste classee : la facette juridiction annonce « CA 178 072 »
+/// juste a cote, un « 400+ » y serait plus pauvre que la colonne voisine.
 pub fn format_results_count(total: i64) -> String {
-    match total {
-        0 => "Aucun résultat".to_string(),
-        1 => "1 résultat".to_string(),
-        n if n > RESULTS_CAP => format!("{RESULTS_CAP}+ résultats"),
-        n => format!("{} résultats", group_thousands(n)),
-    }
-}
-
-/// Libelle FR d'un nombre de resultats EXACT — corpus textes, dont le total
-/// n'est pas plafonne (le plafond 400 vient du cap de pagination decisions).
-pub fn format_results_count_exact(total: i64) -> String {
     match total {
         0 => "Aucun résultat".to_string(),
         1 => "1 résultat".to_string(),
@@ -217,28 +219,11 @@ pub fn group_thousands(n: i64) -> String {
     }
 }
 
-/// Nombre de pages de pagination (plafonne par `RESULTS_CAP` et `max_pages`).
-pub fn total_pages(total: i64, limit: i64, max_pages: i64) -> i64 {
-    let capped = total.min(RESULTS_CAP);
-    let pages = (capped + limit - 1) / limit;
-    pages.min(max_pages)
+/// Nombre de pages de pagination d'une surface de recherche.
+pub fn total_pages(total: i64) -> i64 {
+    let taille = i64::from(SEARCH_PAGE_SIZE);
+    (total.min(taille * SEARCH_MAX_PAGES) + taille - 1) / taille
 }
-
-/// Noms de mois FR longs (rendu `toLocaleDateString("fr-FR", { month: "long" })`).
-const MONTHS_FR: [&str; 12] = [
-    "janvier",
-    "février",
-    "mars",
-    "avril",
-    "mai",
-    "juin",
-    "juillet",
-    "août",
-    "septembre",
-    "octobre",
-    "novembre",
-    "décembre",
-];
 
 /// Numéro d'article en graphie française : la forme compacte LEGI colle le préfixe
 /// de partie au numéral (« L1142-1 », « R123-4 », « D45 ») et la clé publique le
@@ -264,26 +249,7 @@ pub fn format_iso_date(value: Option<&str>) -> String {
     let Some(value) = value.map(str::trim).filter(|s| !s.is_empty()) else {
         return "—".to_string();
     };
-    match parse_iso_date(value) {
-        Some((y, m, d)) => format!("{d} {} {y}", MONTHS_FR[(m - 1) as usize]),
-        None => value.to_string(),
-    }
-}
-
-/// Parse `YYYY-MM-DD` en `(année, mois 1-12, jour 1-31)` ; `None` si invalide.
-fn parse_iso_date(value: &str) -> Option<(i32, u32, u32)> {
-    let parts: Vec<&str> = value.split('-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let y: i32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let d: u32 = parts[2].parse().ok()?;
-    if (1..=12).contains(&m) && (1..=31).contains(&d) {
-        Some((y, m, d))
-    } else {
-        None
-    }
+    lj_dtos::format_date_fr(value)
 }
 
 #[cfg(test)]

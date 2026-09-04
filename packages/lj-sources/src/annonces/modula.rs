@@ -1,42 +1,3 @@
-//! Modula-Demat — un seul moteur, plusieurs portails de marque.
-//!
-//! `proxilegales.fr`, `achatspublicscorse.com`, `marches-demat.com`,
-//! `marchespublics.pro`, `antilles-legales.fr`,
-//! `laprovencemarchespublics.com` servent la même application JSP
-//! (`/publisher_portail/`), éditée par Modula Démat. La liste est **close** : ce
-//! sont des marques, pas des instances qu'un acheteur ouvre — d'où la constante,
-//! là où Atexo et Safetender tirent leurs hôtes du recensement `profil_acheteur`.
-//!
-//! **Trois natures cohabitent dans le listing**, et une seule s'ingère :
-//!
-//! 1. **natif** — la consultation est hébergée par ce portail : boutons
-//!    « Télécharger le DCE » (popup `popupTelechargementDCEAnonyme.jsp`) et
-//!    « Répondre à la consultation ». C'est ce qu'on moissonne.
-//! 2. **relais réseau** — « Accéder au marché sur le site source », un
-//!    `window.open` vers la recherche du portail voisin qui l'héberge. On le
-//!    verra à sa source.
-//! 3. **relais presse** — l'annonce légale republiée
-//!    (`displayPetiteAnnonceDetail.jsp`, identifiant haché, aucun bouton de
-//!    dépôt).
-//!
-//! Le test de nature est le DCE anonyme : seul le portail qui héberge la
-//! consultation a les pièces à servir. Il rend aussi l'identifiant, et écarte du
-//! même coup les avis d'attribution (AATR), qui n'ont pas de dossier à
-//! télécharger.
-//!
-//! Recette du listing : `afficherAnnonces.jsp`, **`numPage` compté à partir de
-//! 0** (`numPage=1` rend la deuxième page), `se_iMaxElementPerPage=200` accepté
-//! partout, et `sIsAnnonceDemat=demat` qui filtre côté serveur sur les marchés
-//! dématérialisés.
-//!
-//! **La Centrale des Marchés est hors périmètre.** `marches.medialex.fr`,
-//! `demat.centraledesmarches.com`, `www.centraledesmarches.com`,
-//! `lacentraledesmarches.com` et `www.medialex.fr` sont derrière Akamai Bot
-//! Manager, et leur `robots.txt` dit `User-Agent: * / Disallow: /`.
-//!
-//! Pas de page de détail : le listing porte déjà la procédure, et aucune page
-//! HTML du produit ne publie de CPV.
-
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -275,6 +236,7 @@ pub async fn enumerate() -> Result<MoteurRun> {
         // comparable au collecté.
         annonce: None,
         echecs: 0,
+        hotes: Vec::new(),
         rows: Vec::new(),
     };
     for (host, res) in resultats {

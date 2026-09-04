@@ -1,10 +1,8 @@
 //! Registre de quota Mistral.
 //!
-//! Une réponse Mistral porte l'état du quota de la clé :
-//! `x-ratelimit-{limit,remaining}-{req,tokens}-minute` et
-//! `x-ratelimit-tokens-query-cost`. Il n'y a pas de `Retry-After`. Ce module tient
-//! ces compteurs par clé et n'admet une requête que s'il a de quoi la payer. Un
-//! refus n'en porte qu'une paire, celle de la ressource épuisée : cf. [`Quota`].
+//! Une réponse Mistral porte l'état du quota de la clé
+//! (`x-ratelimit-*-minute`), mais aucun `Retry-After` : ce module tient les
+//! compteurs et n'admet une requête que s'il a de quoi la payer.
 //!
 //! Les deux compteurs n'ont pas la même loi :
 //!
@@ -118,6 +116,12 @@ struct Bucket {
     minute: u64,
     inflight_req: u32,
     inflight_tok: u32,
+    /// Vrai dès qu'une réponse a parlé des tokens de cette clé. Avant, les
+    /// compteurs ne sont que les plafonds d'amorce, et ils supposent le seau
+    /// libre — ce qu'un process neuf ne peut pas savoir : le seau est tenu par le
+    /// service, partagé avec qui d'autre tape la clé, et ne s'observe qu'en le
+    /// consommant.
+    informed: bool,
 }
 
 impl Bucket {
@@ -131,6 +135,7 @@ impl Bucket {
             minute: (now / 60.0) as u64,
             inflight_req: 0,
             inflight_tok: 0,
+            informed: false,
         }
     }
 
@@ -168,6 +173,13 @@ impl Bucket {
 
     fn try_reserve(&mut self, cost: u32, now: f64) -> Result<(), Duration> {
         self.roll(now);
+        // Démarrage prudent : tant qu'aucune réponse n'a parlé de cette clé, un
+        // seul appel en vol. Il sert de sonde — son `settle` rend les compteurs
+        // exacts, les suivants partent informés. Sans ça, la première vague vaut
+        // ce que vaut l'amorce, et l'amorce ignore les autres consommateurs.
+        if !self.informed && self.inflight_req > 0 {
+            return Err(MIN_WAIT);
+        }
         // Une requête plus chère que le seau entier ne passerait jamais : on la laisse
         // partir se faire refuser par le service.
         let cost = cost.min(self.tok_limit);
@@ -218,6 +230,7 @@ impl Bucket {
             self.tok_limit = tok.limit;
             let unrestored = self.consumed_prev * (1.0 - (now % 60.0) / 60.0);
             self.consumed_this = (tok.limit as f64 - tok.left as f64 - unrestored).max(0.0);
+            self.informed = true;
         }
     }
 }
@@ -398,6 +411,25 @@ mod tests {
         }
     }
 
+    /// Un seau neuf n'admet qu'un appel, quelle que soit la place qu'annoncent
+    /// ses plafonds d'amorce : ils supposent le seau libre, et un process qui
+    /// partage la clé avec un résident ne peut pas le savoir avant d'avoir tiré.
+    /// La première réponse le renseigne, et il s'ouvre.
+    #[test]
+    fn un_seau_neuf_n_admet_qu_une_sonde() {
+        let m = 30_000_000u64;
+        let t = m as f64 * 60.0 + 10.0;
+        let mut b = Bucket::seed(t);
+
+        assert!(b.try_reserve(1_000, t).is_ok());
+        assert_eq!(b.try_reserve(1_000, t), Err(MIN_WAIT));
+
+        // Le `settle` de la sonde renseigne le seau : les suivants passent.
+        b.settle(quota(43, 45_537, 1097), t);
+        assert!(b.informed);
+        assert!(b.try_reserve(1_000, t).is_ok());
+    }
+
     /// Charge brûlée à la seconde 10 d'une minute, puis restitution linéaire de la
     /// minute suivante.
     #[test]
@@ -438,6 +470,9 @@ mod tests {
     fn l_attente_sur_les_tokens_est_proportionnelle_au_deficit() {
         let m = 30_000_000u64;
         let mut b = Bucket::seed(m as f64 * 60.0);
+        // Une consommation observée sur la minute précédente : ce seau a déjà vu
+        // une réponse, sinon il n'admettrait qu'une sonde.
+        b.informed = true;
         b.consumed_prev = 50_000.0;
         b.consumed_this = 0.0;
 

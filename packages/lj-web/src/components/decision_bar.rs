@@ -22,12 +22,10 @@ pub struct FromSearch {
     pub scroll_y: f64,
 }
 
-/// Navigation inter-résultats : `position`/`total` pour l'affichage, `hit_ids`
-/// pour dériver précédent/suivant à l'`id` courant.
+/// Navigation inter-résultats : la liste servie, dont se dérivent le rang, le
+/// compte et précédent/suivant à l'`id` courant.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResultNav {
-    pub position: i64,
-    pub total: i64,
     pub hit_ids: Vec<String>,
 }
 
@@ -92,8 +90,7 @@ pub fn use_seed_memory() -> SeedMemorySignal {
     expect_context::<SeedMemorySignal>()
 }
 
-/// Persiste la graine de `id` dans l'onglet (`sessionStorage`,
-/// `js/nav-store.js`).
+/// Persiste la graine de `id` dans l'onglet (`sessionStorage`).
 ///
 /// La mémoire ci-dessus vit en RAM : elle rattrape le back/forward, pas le
 /// rechargement de la page.

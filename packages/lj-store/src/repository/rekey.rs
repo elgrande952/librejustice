@@ -13,6 +13,45 @@ use tokio_postgres::types::ToSql;
 use super::DecisionRepository;
 use crate::error::Result;
 
+/// Tables dont une ligne appartient à une version d'article par son triplet
+/// propriétaire `(text_uid, num_key, date_debut)` : elle tombe avec elle.
+const OWNED_BY_VERSION: [(&str, &str, &str, &str); 4] = [
+    (
+        "legal_link",
+        "owner_text_uid",
+        "owner_num_key",
+        "owner_date_debut",
+    ),
+    ("article_scope", "text_uid", "num_key", "date_debut"),
+    (
+        "text_legal_citation",
+        "owner_text_uid",
+        "owner_num_key",
+        "owner_date_debut",
+    ),
+    (
+        "text_case_citation",
+        "owner_text_uid",
+        "owner_num_key",
+        "owner_date_debut",
+    ),
+];
+
+/// Ligne que le désétoilage ferait collisionner sur la PK de `legal_article`.
+/// `degenerate` : `date_fin <= date_debut`. `overlaps` : l'intervalle recouvre
+/// celui d'une autre version de la clé cible, jour de relais compris.
+pub struct StarConflict {
+    pub text_uid: String,
+    pub new_key: String,
+    pub num: String,
+    pub num_key: String,
+    pub date_debut: String,
+    pub date_fin: Option<String>,
+    pub status: String,
+    pub degenerate: bool,
+    pub overlaps: bool,
+}
+
 impl<'a> DecisionRepository<'a> {
     /// Clés d'article distinctes de toutes les colonnes porteuses.
     pub async fn distinct_article_keys(&self) -> Result<Vec<String>> {
@@ -113,6 +152,151 @@ impl<'a> DecisionRepository<'a> {
         Ok((articles, links))
     }
 
+    /// Clés d'article portant une astérisque, toutes colonnes porteuses
+    /// confondues, blobs `legal_citation.spans` compris.
+    pub async fn starred_article_keys(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT k FROM (
+                     SELECT num_key AS k FROM legal_article WHERE num_key LIKE '%*%'
+                     UNION SELECT num_key FROM legal_article_usage WHERE num_key LIKE '%*%'
+                     UNION SELECT num_key FROM article_scope WHERE num_key LIKE '%*%'
+                     UNION SELECT num_key FROM article_commentaire WHERE num_key LIKE '%*%'
+                     UNION SELECT child_num_key FROM legal_toc_edge WHERE child_num_key LIKE '%*%'
+                     UNION SELECT owner_num_key FROM legal_link WHERE owner_num_key LIKE '%*%'
+                     UNION SELECT target_num_key FROM legal_link WHERE target_num_key LIKE '%*%'
+                     UNION SELECT owner_num_key FROM text_legal_citation
+                            WHERE owner_num_key LIKE '%*%'
+                     UNION SELECT ref_num_key FROM text_legal_citation
+                            WHERE ref_num_key LIKE '%*%'
+                     UNION SELECT owner_num_key FROM text_case_citation
+                            WHERE owner_num_key LIKE '%*%'
+                     UNION SELECT el->>3 FROM legal_citation, jsonb_array_elements(spans) AS el
+                            WHERE el->>3 LIKE '%*%'
+                 ) keys(k)",
+                &[],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Lignes de `legal_article` que le mapping de session ferait collisionner
+    /// sur la PK, groupe par groupe, jugées par [`StarConflict`].
+    pub async fn star_pk_conflicts(&self) -> Result<Vec<StarConflict>> {
+        let rows = self
+            .conn
+            .query(
+                "WITH mapped AS (
+                     SELECT a.text_uid, coalesce(m.new, a.num_key) AS nk, a.num, a.num_key,
+                            a.date_debut, a.date_fin, a.status
+                     FROM legal_article a LEFT JOIN rekey_map m ON m.old = a.num_key
+                 ), dup AS (
+                     SELECT text_uid, nk, date_debut FROM mapped
+                     GROUP BY 1, 2, 3 HAVING count(*) > 1
+                 )
+                 SELECT c.text_uid, c.nk, c.num, c.num_key, c.date_debut::text,
+                        c.date_fin::text, c.status,
+                        c.date_fin IS NOT NULL AND c.date_fin <= c.date_debut,
+                        EXISTS (
+                            SELECT 1 FROM mapped o
+                            WHERE o.text_uid = c.text_uid AND o.nk = c.nk
+                              AND o.date_debut <> c.date_debut
+                              AND o.date_debut <= coalesce(c.date_fin, 'infinity')
+                              AND coalesce(o.date_fin, 'infinity') >= c.date_debut
+                        )
+                 FROM mapped c JOIN dup d USING (text_uid, nk, date_debut)
+                 ORDER BY c.text_uid, c.nk, c.date_debut, c.num_key",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| StarConflict {
+                text_uid: r.get(0),
+                new_key: r.get(1),
+                num: r.get(2),
+                num_key: r.get(3),
+                date_debut: r.get(4),
+                date_fin: r.get(5),
+                status: r.get(6),
+                degenerate: r.get(7),
+                overlaps: r.get(8),
+            })
+            .collect())
+    }
+
+    /// Supprime des versions d'article par PK, et avec elles tout ce que le
+    /// triplet propriétaire leur attache. Renvoie une ligne par table touchée.
+    pub async fn drop_article_versions(
+        &self,
+        rows: &[(String, String, String)],
+    ) -> Result<Vec<(&'static str, u64)>> {
+        let uids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        let keys: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
+        let dates: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        let mut counts = Vec::new();
+        for (table, uid_col, key_col, date_col) in OWNED_BY_VERSION {
+            let n = self
+                .conn
+                .execute(
+                    &format!(
+                        "DELETE FROM {table} t
+                         USING unnest($1::text[], $2::text[], $3::text[]) AS x(uid, key, jour)
+                         WHERE t.{uid_col} = x.uid AND t.{key_col} = x.key
+                           AND t.{date_col} = x.jour::date"
+                    ),
+                    &[&uids, &keys, &dates],
+                )
+                .await?;
+            counts.push((table, n));
+        }
+        let articles = self
+            .conn
+            .execute(
+                "DELETE FROM legal_article a
+                 USING unnest($1::text[], $2::text[], $3::text[]) AS x(uid, key, jour)
+                 WHERE a.text_uid = x.uid AND a.num_key = x.key AND a.date_debut = x.jour::date",
+                &[&uids, &keys, &dates],
+            )
+            .await?;
+        counts.push(("legal_article", articles));
+        Ok(counts)
+    }
+
+    /// Salit l'ordre de lecture des textes dont une clé va bouger, donc à
+    /// appeler **avant** le rebasage : la clé cible se confond avec des clés
+    /// banales (`annexe`, `2`), la clé source non.
+    pub async fn invalidate_rekeyed_reading_ranks(&self) -> Result<u64> {
+        Ok(self
+            .conn
+            .execute(
+                "UPDATE legal_article SET reading_rank = NULL
+                 WHERE id IN (
+                     SELECT s.id FROM (
+                         SELECT DISTINCT a.text_uid FROM legal_article a
+                         JOIN rekey_map m ON m.old = a.num_key) t
+                     CROSS JOIN LATERAL (
+                         SELECT a.id FROM legal_article a
+                         WHERE a.text_uid = t.text_uid AND a.reading_rank IS NOT NULL
+                         LIMIT 1) s)",
+                &[],
+            )
+            .await?)
+    }
+
+    /// Lignes qu'un rebasage de cette colonne toucherait, sans rien écrire.
+    pub async fn count_rekey_column(&self, table: &str, column: &str) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_one(
+                &format!("SELECT count(*) FROM {table} t JOIN rekey_map m ON t.{column} = m.old"),
+                &[],
+            )
+            .await?
+            .get(0))
+    }
+
     /// Rebase une colonne clé d'article via le mapping de session. Renvoie le
     /// nombre de lignes réécrites.
     pub async fn rekey_column(&self, table: &str, column: &str) -> Result<u64> {
@@ -126,6 +310,22 @@ impl<'a> DecisionRepository<'a> {
                 &[],
             )
             .await?)
+    }
+
+    /// Décisions dont un blob `legal_citation.spans` porte une clé du mapping,
+    /// sans rien écrire.
+    pub async fn count_rekey_citation_spans(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_one(
+                "SELECT count(*) FROM legal_citation lc
+                 WHERE EXISTS (
+                     SELECT 1 FROM jsonb_array_elements(lc.spans) AS e
+                     JOIN rekey_map m ON m.old = e->>3)",
+                &[],
+            )
+            .await?
+            .get(0))
     }
 
     /// Rebase les `ref_num_key` portés par les blobs `legal_citation.spans` via le

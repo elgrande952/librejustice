@@ -17,14 +17,14 @@ use crate::{
 use axum::extract::{Path, Query, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{Html, IntoResponse, Json, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use axum_tracing_opentelemetry::middleware::{OtelAxumLayer, OtelInResponseLayer};
 use lj_dtos::{
     ActivitySource, ActivityTrackingUpdate, BookmarksResponse, DecisionViewsResponse, Domain,
     HealthResponse, JurisdictionType, Office, Procedure, SearchHistoryResponse, SearchMode,
-    SearchRequest, Significance, Solution, SortOrder, UserProfileUpdate,
+    SearchRequest, Solution, SortOrder,
 };
 use serde::Deserialize;
 use tower_http::compression::CompressionLayer;
@@ -34,11 +34,12 @@ use tower_http::set_header::SetResponseHeaderLayer;
 /// Assemble les routes (data API `/api`, OAuth, discovery `.well-known`, MCP
 /// optionnel) avec l'état injecté — sans fallback ni middleware.
 fn assemble_routes(state: AppState, enable_mcp: bool) -> Router {
-    // ── DATA API (préfixe `/api`) ─────────────────────────────────────────────
+    // ── DATA API (préfixe `/internal`) ────────────────────────────────────────
     let api = Router::new()
         .route("/health", get(health))
-        .route("/health/deep", get(health_deep))
+        .route("/origine-interne", get(origine_interne))
         .route("/search", get(search_endpoint))
+        .route("/search/decompte", get(search_decompte_endpoint))
         .route("/search-textes", get(search_textes_endpoint))
         .route("/suggest", get(suggest_endpoint))
         .route("/codes", get(codes_catalogue))
@@ -67,7 +68,21 @@ fn assemble_routes(state: AppState, enable_mcp: bool) -> Router {
             get(decision_download_pdf),
         )
         .nest("/texte", legi_router())
-        .route("/me", get(get_me).patch(patch_me).delete(delete_me))
+        .merge(
+            Router::new()
+                .nest("/auth", crate::accounts::router())
+                .nest(
+                    "/auth/google",
+                    crate::oidc_auth::router(crate::oidc_auth::Fournisseur::Google),
+                )
+                .nest(
+                    "/auth/microsoft",
+                    crate::oidc_auth::router(crate::oidc_auth::Fournisseur::Microsoft),
+                )
+                .layer(middleware::from_fn_with_state(state.clone(), auth_budget)),
+        )
+        .nest("/account", crate::account::router())
+        .route("/me", get(get_me))
         .route("/me/activity-tracking", put(set_activity_tracking))
         .route("/me/bookmarks", get(list_bookmarks))
         .route(
@@ -79,15 +94,18 @@ fn assemble_routes(state: AppState, enable_mcp: bool) -> Router {
             get(list_history).delete(clear_history),
         )
         .route("/me/search-history/{entry_id}", delete(delete_entry))
+        .route("/me/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/me/api-keys/{key_id}", delete(revoke_api_key))
         .route("/me/decision-views", get(list_views).delete(clear_views))
         .route(
             "/me/decision-views/{decision_id}",
             post(record_view).delete(delete_view),
         )
         .route(
-            "/client/hydration-failure",
-            post(client_hydration_failure).layer(axum::extract::DefaultBodyLimit::max(4096)),
+            "/client/incident",
+            post(client_incident).layer(axum::extract::DefaultBodyLimit::max(4096)),
         )
+        .merge(crate::support::router().layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
         .layer(SetResponseHeaderLayer::overriding(
             header::HeaderName::from_static("x-robots-tag"),
             HeaderValue::from_static("noindex"),
@@ -95,8 +113,10 @@ fn assemble_routes(state: AppState, enable_mcp: bool) -> Router {
 
     // ── Racine : OAuth + discovery `.well-known` (consommés hors `/api`) ──────
     let mut app: Router = Router::new()
-        .nest("/api", api)
-        .merge(oauth::router())
+        .nest("/admin", operations(state.clone()))
+        .nest("/api", publique(state.clone()))
+        .nest("/internal", api)
+        .merge(oauth::router().layer(middleware::from_fn_with_state(state.clone(), auth_budget)))
         .merge(oauth::well_known_router())
         .merge(sitemap::router())
         .merge(robots::router())
@@ -126,10 +146,73 @@ fn apply_layers(app: Router, cors: CorsLayer) -> Router {
     // Couche la plus interne : réécrit l'erreur PG marquée par le handler avant que
     // CORS, gzip et OTel ne la voient.
     app.layer(middleware::from_fn(pg_error_boundary))
+        .layer(middleware::from_fn(renew_session_cookie))
         .layer(cors)
         .layer(CompressionLayer::new())
+        // Dedans OTel, dehors compression : la ligne naît dans le span serveur,
+        // donc elle porte le trace_id, et la durée inclut gzip.
+        .layer(middleware::from_fn(slow_request_log))
         .layer(OtelAxumLayer::default())
         .layer(OtelInResponseLayer)
+}
+
+/// Seuil au-delà duquel une requête laisse une ligne. Aligné sur le bucket
+/// `le="2.5"` de l'histogramme Caddy que compte la règle d'alerte « latence
+/// dégradée » : la métrique dit **combien**, cette ligne dit **lesquelles**.
+const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Journal de la queue : une ligne `WARN` par requête au-delà de
+/// [`SLOW_REQUEST`], ~100 par jour au régime mesuré.
+///
+/// Les traces ne suffisent pas : l'échantillonnage par tête abandonne le crawl
+/// non surveillé, qui est précisément l'essentiel du trafic lent — un événement
+/// de log, lui, part toujours. Le chemin est journalisé **sans la query
+/// string**, que le scrubbing retire des spans.
+///
+/// ⚠️ La durée s'arrête au retour du handler : le SSR répond par un corps
+/// streamé, donc son rendu compte pour partie hors de cette mesure. Un écart
+/// avec le compte de Caddy, qui voit la réponse entière, est attendu.
+async fn slow_request_log(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let started = std::time::Instant::now();
+    let resp = next.run(req).await;
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_REQUEST {
+        let ms = elapsed.as_millis();
+        // Le chemin MCP sait dire où son temps est passé ; les autres non, et une
+        // ligne sans découpage vaut mieux qu'un champ à zéro qui ment.
+        match resp.extensions().get::<crate::mcp::McpPhases>() {
+            Some(p) => tracing::warn!(
+                requete_lente = true,
+                method = %method,
+                path = %path,
+                status = resp.status().as_u16(),
+                elapsed_ms = ms as u64,
+                attente_pool_ms = p.pool.as_millis() as u64,
+                lookup_jeton_ms = p.lookup.as_millis() as u64,
+                bump_last_seen_ms = p.bump.as_millis() as u64,
+                dispatch_ms = p.dispatch.as_millis() as u64,
+                outil = p.tool.unwrap_or("protocole"),
+                "requête lente : {method} {path} en {ms} ms \
+                 (pool {}, jeton {}, bump {}, dispatch {} pour {})",
+                p.pool.as_millis(),
+                p.lookup.as_millis(),
+                p.bump.as_millis(),
+                p.dispatch.as_millis(),
+                p.tool.unwrap_or("protocole"),
+            ),
+            None => tracing::warn!(
+                requete_lente = true,
+                method = %method,
+                path = %path,
+                status = resp.status().as_u16(),
+                elapsed_ms = ms as u64,
+                "requête lente : {method} {path} en {ms} ms"
+            ),
+        }
+    }
+    resp
 }
 
 /// Frontière HTTP qui reclasse en 422 les erreurs Postgres marquées par
@@ -137,6 +220,22 @@ fn apply_layers(app: Router, cors: CorsLayer) -> Router {
 /// → 422 `invalid_request_bytes` ; message de syntaxe `paradedb.parse` → 422
 /// `invalid_query_syntax`. Le `path`/`q` sont réinjectés ici depuis la requête
 /// entrante.
+/// Réémet le cookie de session quand l'extracteur d'identité l'a demandé : le
+/// `Max-Age` du navigateur est figé à la connexion, alors que la base fait
+/// glisser l'échéance. Sans ça une session utilisée tous les jours meurt quand
+/// même au 30ᵉ.
+async fn renew_session_cookie(mut req: Request, next: Next) -> Response {
+    let slot = crate::session::CookieRefresh::default();
+    req.extensions_mut().insert(slot.clone());
+    let mut resp = next.run(req).await;
+    if let Some(valeur) = slot.take() {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&valeur) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
 async fn pg_error_boundary(req: Request, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let raw_query = req.uri().query().unwrap_or("").to_string();
@@ -213,50 +312,46 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-/// Requête sentinelle de la sonde profonde : large et intemporelle, son `total`
-/// ne peut tomber à zéro que si la recherche est cassée.
-const DEEP_PROBE_QUERY: &str = "responsabilité de l'État";
-
-/// Égalité de deux secrets sans sortie anticipée. La longueur, comparée d'abord,
-/// n'est pas protégée.
-fn secret_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-#[tracing::instrument(name = "health_deep", skip_all, fields(
-    librejustice.probe.outcome = tracing::field::Empty,
-    librejustice.probe.total = tracing::field::Empty,
-    librejustice.probe.elapsed_ms = tracing::field::Empty,
-))]
-async fn health_deep(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let Some(token) = state.settings.deep_probe_token.as_deref() else {
+async fn origine_interne(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(token) = state.settings.internal_origin_token.as_deref() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let Some(presented) = presented else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    if !secret_eq(presented, token) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if !crate::usage::internal_origin(&headers, Some(token)) {
+        return StatusCode::NOT_FOUND.into_response();
     }
+    let pose = format!(
+        "{}={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
+        lj_dtos::INTERNAL_ORIGIN_COOKIE,
+        365 * 86_400
+    );
+    match crate::session::header(pose) {
+        // An empty 200 and not a 204: Chrome aborts a navigation to a 204, and
+        // this route is only ever a navigation target.
+        Ok(entete) => (StatusCode::OK, [entete], Html("")).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
 
-    let req = SearchRequest {
-        query: DEEP_PROBE_QUERY.to_string(),
+/// Requêtes sentinelles de la sonde profonde, toutes exigées non vides. La large
+/// est intemporelle, sa liste ne se vide que si la recherche est cassée ; le nom
+/// d'arrêt est le seul déclencheur de la jambe clé exacte, et porte aussi le
+/// décompte : étroit, son agrégat coûte 0,2 s là où la large en coûterait 1,2.
+const DEEP_PROBE_QUERIES: [&str; 2] = ["responsabilité de l'État", "Danthony"];
+
+/// Recherche d'une sentinelle : une seule ligne rendue.
+fn deep_probe_request(query: &str) -> SearchRequest {
+    SearchRequest {
+        query: query.to_string(),
         jurisdiction_type: None,
         solution: None,
         procedure: None,
         office: None,
         legal_domain: None,
         jurisdiction_code: None,
-        chamber: None,
+        seat: None,
         legal_instrument: None,
         legal_article: None,
         publication: None,
-        significance: None,
         date_from: None,
         date_to: None,
         mode: SearchMode::Auto,
@@ -264,33 +359,63 @@ async fn health_deep(State(state): State<AppState>, headers: HeaderMap) -> Respo
         limit: 1,
         offset: 0,
         ai_mode: false,
-    };
+    }
+}
+
+#[tracing::instrument(name = "health_deep", skip_all, fields(
+    librejustice.probe.outcome = tracing::field::Empty,
+    librejustice.probe.total = tracing::field::Empty,
+    librejustice.probe.servis = tracing::field::Empty,
+    librejustice.probe.elapsed_ms = tracing::field::Empty,
+))]
+async fn health_deep(State(state): State<AppState>) -> Response {
     let started = std::time::Instant::now();
-    let outcome = search::search_nocache(&state, &req).await;
+    let mut total = 0i64;
+    let mut servis = 0usize;
+    let mut state_label = "ok";
+    for (rang, query) in DEEP_PROBE_QUERIES.iter().enumerate() {
+        let decompte = rang == DEEP_PROBE_QUERIES.len() - 1;
+        let req = deep_probe_request(query);
+        let fait = if decompte {
+            search::search_nocache_counted(&state, &req).await
+        } else {
+            search::search_nocache(&state, &req).await
+        };
+        match fait {
+            Ok(resp) if !resp.all_hit_ids.is_empty() && resp.total.unwrap_or(1) > 0 => {
+                servis += resp.all_hit_ids.len();
+                total += resp.total.unwrap_or_default();
+            }
+            Ok(_) => {
+                tracing::warn!(query, "sonde profonde : sentinelle sans résultat");
+                state_label = "empty";
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(query, error = %e, "sonde profonde : recherche en échec");
+                state_label = "error";
+                break;
+            }
+        }
+    }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let span = tracing::Span::current();
     span.record("librejustice.probe.elapsed_ms", elapsed_ms);
-
-    let (status, state_label) = match &outcome {
-        Ok(resp) => {
-            span.record("librejustice.probe.total", resp.total);
-            if resp.total > 0 {
-                (StatusCode::OK, "ok")
-            } else {
-                (StatusCode::SERVICE_UNAVAILABLE, "empty")
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "sonde profonde : recherche en échec");
-            (StatusCode::SERVICE_UNAVAILABLE, "error")
-        }
-    };
+    span.record("librejustice.probe.total", total);
+    span.record("librejustice.probe.servis", servis);
     span.record("librejustice.probe.outcome", state_label);
+
+    let status = if state_label == "ok" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (
         status,
         Json(serde_json::json!({
             "status": state_label,
-            "total": outcome.map(|r| r.total).unwrap_or(0),
+            "total": total,
+            "servis": servis,
             "elapsed_ms": elapsed_ms,
             "version": state.settings.version,
         })),
@@ -298,34 +423,90 @@ async fn health_deep(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .into_response()
 }
 
-// ── Sonde d'hydratation ─────────────────────────────────────────────────────
+// ── Incidents clients ───────────────────────────────────────────────────────
 
-/// Corps de la balise de la sonde d'hydratation.
+/// Panne que seule la page peut constater : le serveur a répondu, et pourtant
+/// l'utilisateur n'a pas ce qu'il a demandé.
 #[derive(Deserialize)]
-struct HydrationFailure {
-    path: String,
-    assets: Vec<String>,
-    elapsed_ms: u64,
+#[serde(rename_all = "snake_case")]
+enum ClientIncidentKind {
+    /// Le bundle wasm n'a jamais pris la main.
+    Hydration,
+    /// Le bundle a pris la main, mais après une attente visible. Mesure de
+    /// queue, pas une panne : consignée en `info` pour rester hors de l'alerte.
+    HydrationLente,
+    /// Une navigation interne a atterri sur la page 404 : un lien du site ne
+    /// mène nulle part.
+    Route404,
+    /// L'API a refusé la recherche d'un navigateur (4xx hors 429) : le front et
+    /// l'API ne s'entendent plus sur le contrat. Le trafic REST direct rend le
+    /// même 422 sans être une panne, seul le navigateur sait que le refus tombe
+    /// sur nos propres pages.
+    RechercheRefusee,
 }
 
-/// Consigne une hydratation absente côté client, signalée par la page elle-même.
-async fn client_hydration_failure(
+impl ClientIncidentKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hydration => "hydration",
+            Self::HydrationLente => "hydration_lente",
+            Self::Route404 => "route_404",
+            Self::RechercheRefusee => "recherche_refusee",
+        }
+    }
+}
+
+/// Corps de la balise émise par le shell (`lj_web::app`) ou par la page 404.
+#[derive(Deserialize)]
+struct ClientIncident {
+    kind: ClientIncidentKind,
+    path: String,
+    #[serde(default)]
+    assets: Vec<String>,
+    #[serde(default)]
+    elapsed_ms: u64,
+    /// Statut HTTP reçu par le navigateur, quand l'incident en a un.
+    #[serde(default)]
+    status: u16,
+}
+
+/// Consigne un incident constaté côté client, signalé par la page elle-même.
+async fn client_incident(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<HydrationFailure>,
+    Json(body): Json<ClientIncident>,
 ) -> StatusCode {
     let budget_key = crate::ratelimit::caller_key(None, &headers);
-    if state.hydration_budget.take(budget_key.as_ref()).await
+    if state
+        .budgets
+        .take(crate::ratelimit::Cost::ClientIncident, budget_key.as_ref())
+        .await
         == crate::ratelimit::Verdict::Exhausted
     {
         return StatusCode::TOO_MANY_REQUESTS;
     }
-    tracing::warn!(
-        librejustice.hydration.path = %body.path,
-        librejustice.hydration.assets = %body.assets.join(","),
-        librejustice.hydration.elapsed_ms = body.elapsed_ms,
-        "hydratation absente côté client",
-    );
+    // Le motif est dans le corps du message et pas seulement en métadonnée : une
+    // règle d'alerte Loki le filtre alors au sélecteur, comme les autres.
+    let kind = body.kind.as_str();
+    let assets = body.assets.join(",");
+    match &body.kind {
+        ClientIncidentKind::HydrationLente => tracing::info!(
+            librejustice.client.kind = kind,
+            librejustice.client.path = %body.path,
+            librejustice.client.assets = %assets,
+            librejustice.client.elapsed_ms = body.elapsed_ms,
+            librejustice.client.status = body.status,
+            "incident client : {kind}",
+        ),
+        _ => tracing::warn!(
+            librejustice.client.kind = kind,
+            librejustice.client.path = %body.path,
+            librejustice.client.assets = %assets,
+            librejustice.client.elapsed_ms = body.elapsed_ms,
+            librejustice.client.status = body.status,
+            "incident client : {kind}",
+        ),
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -345,10 +526,9 @@ struct SearchParams {
     office: Vec<Office>,
     legal_domain: Vec<Domain>,
     jurisdiction_code: Vec<String>,
-    chamber: Vec<String>,
+    seat: Vec<String>,
     legal_instrument: Vec<String>,
     legal_article: Vec<String>,
-    significance: Vec<Significance>,
     publication: Vec<String>,
     date_from: Option<String>,
     date_to: Option<String>,
@@ -369,10 +549,9 @@ impl Default for SearchParams {
             office: Vec::new(),
             legal_domain: Vec::new(),
             jurisdiction_code: Vec::new(),
-            chamber: Vec::new(),
+            seat: Vec::new(),
             legal_instrument: Vec::new(),
             legal_article: Vec::new(),
-            significance: Vec::new(),
             publication: Vec::new(),
             date_from: None,
             date_to: None,
@@ -385,48 +564,137 @@ impl Default for SearchParams {
     }
 }
 
+/// Trace un refus de validation de recherche. L'objet porte `loc`, `msg` et la
+/// valeur fautive, jamais la question posée.
+fn journaliser_refus(err: ApiError) -> ApiError {
+    if let ApiError::Unprocessable(detail) = &err {
+        tracing::warn!(
+            librejustice.search.refus = %detail,
+            "recherche refusée : validation",
+        );
+    }
+    err
+}
+
 async fn search_endpoint(
+    state: State<AppState>,
+    user: OptionalUser,
+    headers: HeaderMap,
+    raw: RawQuery,
+) -> Result<Response> {
+    search_served(state, user, headers, raw, Surface::Internal).await
+}
+
+async fn search_public_endpoint(
+    state: State<AppState>,
+    user: OptionalUser,
+    headers: HeaderMap,
+    raw: RawQuery,
+) -> Result<Response> {
+    search_served(state, user, headers, raw, Surface::Public).await
+}
+
+/// `Public` answers in the shape the MCP tools describe, one set of descriptions
+/// covering both doors, and carries its own total: it has no `/decompte`.
+#[derive(Clone, Copy, PartialEq)]
+enum Surface {
+    Internal,
+    Public,
+}
+
+impl Surface {
+    fn source(self) -> ActivitySource {
+        match self {
+            Surface::Internal => ActivitySource::Web,
+            Surface::Public => ActivitySource::Api,
+        }
+    }
+}
+
+async fn search_served(
     State(state): State<AppState>,
     OptionalUser(user_id): OptionalUser,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
+    surface: Surface,
 ) -> Result<Response> {
     let raw = raw.as_deref().unwrap_or("");
-    let req = parse_search_query(raw)?;
-    validate_referential_filters(&state, &req).await?;
-    let context = parse_search_context(raw);
-    let budget_key = crate::ratelimit::caller_key(user_id.as_deref(), &headers);
-    let result = search::search(
-        &state,
-        &req,
-        usage::Caller::web(user_id.is_some(), context, &headers),
-        budget_key.as_ref(),
+    let mut req = parse_search_query(raw).map_err(journaliser_refus)?;
+    validate_referential_filters(&state, &mut req)
+        .await
+        .map_err(journaliser_refus)?;
+    let marker = raw
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("context="));
+    let context = search_context(marker, surface);
+    let identity = crate::identity::Identity::resolve(user_id.as_deref(), &headers);
+    let budget_key = crate::ratelimit::key_of(&identity);
+    let caller = usage::Caller::http(
+        surface.source(),
+        user_id.is_some(),
+        context,
+        &headers,
+        &state.settings,
     )
-    .await?;
-    if context == lj_dtos::SearchContext::User {
+    .pseudonymise(&identity, state.pseudonymiser.as_ref(), &headers);
+    let result = match surface {
+        Surface::Public => {
+            search::search_with_count(&state, &req, caller, budget_key.as_ref()).await?
+        }
+        Surface::Internal => search::search(&state, &req, caller, budget_key.as_ref()).await?,
+    };
+    // Ni question ni filtre : l'arrivée sur la page, pas une recherche. Sans ce
+    // garde-fou, chaque chargement écrirait la même ligne d'historique.
+    let worth_recording = !req.query.trim().is_empty() || search::has_filters(&req);
+    if context == lj_dtos::SearchContext::User && worth_recording {
         if let Some(user) = user_id.as_deref() {
             search_history::record_search(
                 &state.pool,
                 user,
                 &req.query,
                 search_history::filters_from_request(&req),
-                ActivitySource::Web,
+                surface.source(),
                 lj_dtos::SearchEngine::Decisions,
             )
             .await;
         }
     }
+    match surface {
+        Surface::Internal => Ok(with_cache(CACHE_SEARCH, result)),
+        Surface::Public => Ok(with_cache(
+            CACHE_SEARCH,
+            crate::mcp_presenters::present_search_response(&result, &state.settings.web_base_url),
+        )),
+    }
+}
+
+/// Décompte et facettes des mêmes paramètres que `/api/search`, appelable en
+/// parallèle : la clé du bundle se recalcule des paramètres, aucun jeton ne
+/// circule. N'écrit pas d'historique, la recherche l'ayant déjà fait.
+async fn search_decompte_endpoint(
+    State(state): State<AppState>,
+    OptionalUser(user_id): OptionalUser,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Result<Response> {
+    let raw = raw.as_deref().unwrap_or("");
+    let mut req = parse_search_query(raw).map_err(journaliser_refus)?;
+    validate_referential_filters(&state, &mut req)
+        .await
+        .map_err(journaliser_refus)?;
+    let identity = crate::identity::Identity::resolve(user_id.as_deref(), &headers);
+    let budget_key = crate::ratelimit::key_of(&identity);
+    let result = search::count(&state, &req, budget_key.as_ref()).await?;
     Ok(with_cache(CACHE_SEARCH, result))
 }
 
-/// Contexte d'appel depuis la query string brute : la paire exacte
-/// `context=teaser` marque un fetch machine des ponts croisés ; tout le reste
-/// (absent, autre valeur) est une recherche utilisateur.
-fn parse_search_context(raw: &str) -> lj_dtos::SearchContext {
-    if raw.split('&').any(|pair| pair == "context=teaser") {
-        lj_dtos::SearchContext::Teaser
-    } else {
-        lj_dtos::SearchContext::User
+/// The `teaser` marker names a machine fetch of the cross bridges, which usage
+/// counts and search history both leave out. Honoured on `/internal` alone: a
+/// keyed caller setting it would scrape the corpus and read itself at zero.
+fn search_context(marker: Option<&str>, surface: Surface) -> lj_dtos::SearchContext {
+    match (surface, marker) {
+        (Surface::Internal, Some("teaser")) => lj_dtos::SearchContext::Teaser,
+        _ => lj_dtos::SearchContext::User,
     }
 }
 
@@ -462,13 +730,9 @@ fn parse_search_query(raw: &str) -> Result<SearchRequest> {
                     .push(de_enum_strict("legalDomain", &value, &Domain::ALL)?)
             }
             "jurisdictionCode" => p.jurisdiction_code.push(value),
-            "chamber" => p.chamber.push(value),
+            "seat" => p.seat.push(value),
             "legalInstrument" => p.legal_instrument.push(value),
             "legalArticle" => p.legal_article.push(value),
-            "significance" => {
-                p.significance
-                    .push(de_enum_strict("significance", &value, &Significance::ALL)?)
-            }
             "publication" => p.publication.push(value),
             "dateFrom" => p.date_from = Some(value),
             "dateTo" => p.date_to = Some(value),
@@ -505,24 +769,15 @@ fn parse_search_query(raw: &str) -> Result<SearchRequest> {
         }
     }
 
-    let Some(query) = p.q else {
-        return Err(ApiError::Unprocessable(validation::missing(&[
-            "query", "q",
-        ])));
-    };
+    // `q` absent ou vide n'est pas une erreur : c'est le mode parcours, le fonds
+    // filtré listé par date.
+    let query = p.q.unwrap_or_default();
     let q_len = query.chars().count() as u64;
-    if q_len < 1 {
-        return Err(ApiError::Unprocessable(validation::string_too_short(
-            &["query", "q"],
-            &query,
-            1,
-        )));
-    }
-    if q_len > 512 {
+    if q_len > lj_dtos::QUERY_MAX_CHARS as u64 {
         return Err(ApiError::Unprocessable(validation::string_too_long(
             &["query", "q"],
             &query,
-            512,
+            lj_dtos::QUERY_MAX_CHARS as u64,
         )));
     }
     if p.limit < 1 {
@@ -557,10 +812,9 @@ fn parse_search_query(raw: &str) -> Result<SearchRequest> {
         office: opt_vec(p.office),
         legal_domain: opt_vec(p.legal_domain),
         jurisdiction_code: opt_vec(p.jurisdiction_code),
-        chamber: opt_vec(p.chamber),
+        seat: opt_vec(p.seat),
         legal_instrument: opt_vec(p.legal_instrument),
         legal_article: opt_vec(p.legal_article),
-        significance: opt_vec(p.significance),
         publication: opt_vec(p.publication),
         date_from: p.date_from,
         date_to: p.date_to,
@@ -572,15 +826,16 @@ fn parse_search_query(raw: &str) -> Result<SearchRequest> {
     })
 }
 
-/// Valide les axes à vocabulaire référentiel (`chamber`, `publication`,
+/// Valide les axes à vocabulaire référentiel (`publication`,
 /// `jurisdictionCode`) — la frontière pure ([`parse_search_query`]) ne connaît pas
 /// le référentiel. Token inconnu → 422.
-async fn validate_referential_filters(state: &AppState, req: &SearchRequest) -> Result<()> {
-    if req.chamber.is_none() && req.publication.is_none() && req.jurisdiction_code.is_none() {
+async fn validate_referential_filters(state: &AppState, req: &mut SearchRequest) -> Result<()> {
+    if req.publication.is_none() && req.jurisdiction_code.is_none() && req.seat.is_none() {
         return Ok(());
     }
     let refs = crate::referential::referential(state).await?;
-    for (field, values) in [("chamber", &req.chamber), ("publication", &req.publication)] {
+    {
+        let (field, values) = ("publication", &req.publication);
         if let Some(bad) = values
             .as_deref()
             .and_then(|vs| refs.find_unknown_token(field, vs))
@@ -603,6 +858,13 @@ async fn validate_referential_filters(state: &AppState, req: &SearchRequest) -> 
             &["query", "jurisdictionCode"],
             bad,
             &crate::referential::unknown_jurisdiction_code_msg(bad, &refs),
+        )));
+    }
+    if let Some(bad) = req.seat.iter().flatten().find(|p| !refs.has_seat(p)) {
+        return Err(ApiError::Unprocessable(validation::value_error(
+            &["query", "seat"],
+            bad,
+            &crate::referential::unknown_seat_msg(bad, refs.seat_nodes()),
         )));
     }
     Ok(())
@@ -710,6 +972,32 @@ async fn decision(
 ) -> Result<Response> {
     let result = decisions::get_decision(&state, &decision_id).await?;
     Ok(with_cache(CACHE_DECISION, result))
+}
+
+async fn decision_public(
+    State(state): State<AppState>,
+    OptionalUser(user_id): OptionalUser,
+    Path(decision_id): Path<String>,
+) -> Result<Response> {
+    let detail = decisions::get_decision(&state, &decision_id).await?;
+    if let Some(user) = user_id.as_deref() {
+        crate::decision_views::record_decision_view(
+            &state.pool,
+            user,
+            &decision_id,
+            ActivitySource::Api,
+        )
+        .await;
+    }
+    let refs = crate::referential::referential(&state).await?;
+    Ok(with_cache(
+        CACHE_DECISION,
+        crate::mcp_presenters::present_decision_detail(
+            &detail,
+            &state.settings.web_base_url,
+            &refs,
+        ),
+    ))
 }
 
 async fn decision_preview(
@@ -1010,35 +1298,10 @@ fn decision_filename(detail: &lj_dtos::DecisionDetail) -> String {
     });
     let jur = lj_dtos::abbreviate_jurisdiction_name(&raw);
 
-    const MONTHS: [&str; 12] = [
-        "janvier",
-        "février",
-        "mars",
-        "avril",
-        "mai",
-        "juin",
-        "juillet",
-        "août",
-        "septembre",
-        "octobre",
-        "novembre",
-        "décembre",
-    ];
     let date_str = detail
         .date_lecture
         .as_deref()
-        .map(|d| {
-            let parts: Vec<&str> = d.split('-').collect();
-            match (parts.first(), parts.get(1), parts.get(2)) {
-                (Some(y), Some(m), Some(day)) => match (day.parse::<usize>(), m.parse::<usize>()) {
-                    (Ok(dd), Ok(mm)) if (1..=12).contains(&mm) => {
-                        format!("{dd} {} {y}", MONTHS[mm - 1])
-                    }
-                    _ => d.to_string(),
-                },
-                _ => d.to_string(),
-            }
-        })
+        .map(lj_dtos::format_date_fr)
         .unwrap_or_default();
 
     let docket = detail
@@ -1092,11 +1355,60 @@ fn attachment_response(content: Vec<u8>, content_type: &str, disposition: &str) 
     resp
 }
 
+fn operations(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/health", get(health))
+        .route("/health/deep", get(health_deep))
+        .layer(middleware::from_fn_with_state(state, admin_only))
+}
+
+async fn admin_only(State(state): State<AppState>, requete: Request, next: Next) -> Response {
+    if !usage::is_first_party(requete.headers(), &state.settings) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    next.run(requete).await
+}
+
+/// MCP tool parity in REST, nothing else. A real break will be `/api/v2`.
+fn publique(state: AppState) -> Router<AppState> {
+    let lectures = Router::new()
+        .route("/decision/{decision_id}", get(decision_public))
+        .route("/texte/{code}", get(legi_root_public))
+        .route("/texte/{code}/section/{cid}", get(legi_section_public))
+        .route("/texte/{code}/{num}", get(legi_article_public))
+        .route("/article/{uid}", get(legi_article_by_uid_public))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::api_keys::lecture,
+        ));
+    Router::new()
+        .route("/search", get(search_public_endpoint))
+        .route("/search-textes", get(search_textes_public_endpoint))
+        .merge(lectures)
+        .layer(middleware::from_fn_with_state(
+            state,
+            crate::api_keys::garde,
+        ))
+}
+
+/// One `Auth` token per network, before any session exists.
+async fn auth_budget(State(state): State<AppState>, requete: Request, next: Next) -> Response {
+    let cle = crate::ratelimit::caller_key(None, requete.headers());
+    if state
+        .budgets
+        .take(crate::ratelimit::Cost::Auth, cle.as_ref())
+        .await
+        == crate::ratelimit::Verdict::Exhausted
+    {
+        return ApiError::TooManyRequests.into_response();
+    }
+    next.run(requete).await
+}
+
 // ── Référentiel LEGI (`/api/texte/*`) ───────────────────────────────────────
 
-/// Sous-routeur LEGI monté sous `/api/texte`. Les sous-ressources littérales
-/// `citing`/`related` sont déclarées avant la capture `{date}` : matchit privilégie
-/// le segment statique sur le paramètre.
+/// Les sous-ressources littérales `citing`/`related` sont déclarées avant la
+/// capture `{date}` : matchit privilégie le segment statique sur le paramètre.
 fn legi_router() -> Router<AppState> {
     Router::new()
         .route("/{code}", get(legi_code_summary))
@@ -1155,6 +1467,79 @@ async fn legi_article_at_date(
     let date = parse_legi_date(&date)?;
     let body = legi::article_at_date(&state, &code, &num, date).await?;
     Ok(with_cache(CACHE_DECISION, body))
+}
+
+/// The four doors the `get_legal_text` description gives, addressed the way the
+/// `url` of a hit reads: the text alone, one of its divisions, one article, and
+/// the Légifrance id of an article.
+async fn legi_root_public(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Response> {
+    let code = legi::resolve_code(&state, &code).await?;
+    let web = &state.settings.web_base_url;
+    let body = match legi::law_root(&state, &code).await? {
+        legi::LawRoot::Body(summary) => crate::mcp_presenters::present_law_text(&summary, web),
+        legi::LawRoot::Toc(summary, toc) => {
+            crate::mcp_presenters::present_law_text_root(&summary, &toc, web)
+        }
+    };
+    Ok(with_cache(CACHE_DECISION, body))
+}
+
+async fn legi_section_public(
+    State(state): State<AppState>,
+    Path((code, cid)): Path<(String, String)>,
+    Query(q): Query<LegiDateQuery>,
+) -> Result<Response> {
+    let code = legi::resolve_code(&state, &code).await?;
+    let date = q.date.as_deref().map(parse_legi_date).transpose()?;
+    let section = legi::law_section(&state, &code, &cid, date).await?;
+    Ok(with_cache(
+        CACHE_DECISION,
+        crate::mcp_presenters::present_law_section(&section, &state.settings.web_base_url),
+    ))
+}
+
+async fn legi_article_public(
+    State(state): State<AppState>,
+    Path((code, num)): Path<(String, String)>,
+    Query(q): Query<LegiDateQuery>,
+) -> Result<Response> {
+    let code = legi::resolve_code(&state, &code).await?;
+    article_public(&state, &code, &num, q.date.as_deref()).await
+}
+
+async fn legi_article_by_uid_public(
+    State(state): State<AppState>,
+    Path(uid): Path<String>,
+    Query(q): Query<LegiDateQuery>,
+) -> Result<Response> {
+    let mut targets = legi::article_refs_by_source_uid(&state, &uid).await?;
+    if targets.len() != 1 {
+        return Err(ApiError::NotFound);
+    }
+    let (code, num) = targets.remove(0);
+    article_public(&state, &code, &num, q.date.as_deref()).await
+}
+
+/// Unlike the internal door, the public one takes any spelling of an article
+/// number: nothing hands it a `num_key` it did not compose itself.
+async fn article_public(
+    state: &AppState,
+    code: &str,
+    num: &str,
+    date: Option<&str>,
+) -> Result<Response> {
+    let num = lj_core::article_key::article_key(num);
+    let article = match date.map(parse_legi_date).transpose()? {
+        Some(date) => legi::article_at_date(state, code, &num, date).await?,
+        None => legi::article_in_force(state, code, &num).await?,
+    };
+    Ok(with_cache(
+        CACHE_DECISION,
+        crate::mcp_presenters::present_law_article(&article, &state.settings.web_base_url),
+    ))
 }
 
 async fn legi_article_compare(
@@ -1253,29 +1638,38 @@ impl LegiCitingQuery {
     }
 }
 
-/// Recherche plein-texte d'articles (`GET /api/search-textes`). `q` vide ⇒ 422
-/// `string_too_short`. Mêmes bornes `limit`/`offset` que les décisions citantes ;
-/// `code` optionnel borne la recherche à un texte.
+/// `offset` stops at 99, as on decisions: the reachable window ends there, and the
+/// referential is not walked page by page.
 async fn search_textes_endpoint(
+    state: State<AppState>,
+    user: OptionalUser,
+    headers: HeaderMap,
+    query: Query<ArticleSearchQuery>,
+) -> Result<Response> {
+    search_textes_served(state, user, headers, query, Surface::Internal).await
+}
+
+async fn search_textes_public_endpoint(
+    state: State<AppState>,
+    user: OptionalUser,
+    headers: HeaderMap,
+    query: Query<ArticleSearchQuery>,
+) -> Result<Response> {
+    search_textes_served(state, user, headers, query, Surface::Public).await
+}
+
+async fn search_textes_served(
     State(state): State<AppState>,
     OptionalUser(user_id): OptionalUser,
     headers: HeaderMap,
     Query(p): Query<ArticleSearchQuery>,
+    surface: Surface,
 ) -> Result<Response> {
-    p.validate()?;
-    if p.q.trim().is_empty() {
-        return Err(ApiError::Unprocessable(validation::string_too_short(
-            &["query", "q"],
-            &p.q,
-            1,
-        )));
-    }
-    let context = if p.context.as_deref() == Some("teaser") {
-        lj_dtos::SearchContext::Teaser
-    } else {
-        lj_dtos::SearchContext::User
-    };
+    p.validate().map_err(journaliser_refus)?;
+    let context = search_context(p.context.as_deref(), surface);
     let at = p.date.as_deref().map(parse_legi_date).transpose()?;
+    let identity = crate::identity::Identity::resolve(user_id.as_deref(), &headers);
+    let budget_key = crate::ratelimit::key_of(&identity);
     let body = legi::search_textes(
         &state,
         &p.q,
@@ -1287,12 +1681,32 @@ async fn search_textes_endpoint(
         at,
         p.limit,
         p.offset,
-        usage::Caller::web(user_id.is_some(), context, &headers),
+        usage::Caller::http(
+            surface.source(),
+            user_id.is_some(),
+            context,
+            &headers,
+            &state.settings,
+        )
+        .pseudonymise(&identity, state.pseudonymiser.as_ref(), &headers),
+        budget_key.as_ref(),
     )
     .await?;
+    // Ni question ni filtre : l'arrivée sur la page, pas une recherche.
+    let worth_recording = !p.q.trim().is_empty()
+        || [
+            p.code.as_deref(),
+            p.jurisdiction.as_deref(),
+            p.nature.as_deref(),
+            p.source.as_deref(),
+            p.scope.as_deref(),
+        ]
+        .iter()
+        .any(Option::is_some)
+        || at.is_some();
     if let Some(user) = user_id
         .as_deref()
-        .filter(|_| p.context.as_deref() != Some("teaser"))
+        .filter(|_| context == lj_dtos::SearchContext::User && worth_recording)
     {
         let mut filters = legi::textes_filters(
             p.code.as_deref(),
@@ -1313,12 +1727,18 @@ async fn search_textes_endpoint(
             user,
             p.q.trim(),
             filters,
-            ActivitySource::Web,
+            surface.source(),
             lj_dtos::SearchEngine::Textes,
         )
         .await;
     }
-    Ok(with_cache(CACHE_SEARCH, body))
+    match surface {
+        Surface::Internal => Ok(with_cache(CACHE_SEARCH, body)),
+        Surface::Public => Ok(with_cache(
+            CACHE_SEARCH,
+            crate::mcp_presenters::present_law_search(&p.q, &body, &state.settings.web_base_url),
+        )),
+    }
 }
 
 // ── Annonces ────────────────────────────────────────────────────────────────
@@ -1655,6 +2075,13 @@ impl ArticleSearchQuery {
                 0,
             )));
         }
+        if self.offset > 99 {
+            return Err(ApiError::Unprocessable(validation::less_than_equal(
+                &["query", "offset"],
+                &self.offset.to_string(),
+                99,
+            )));
+        }
         Ok(())
     }
 }
@@ -1680,40 +2107,6 @@ async fn get_me(
     Ok(Json(me::get_me(&state, &sub).await?).into_response())
 }
 
-async fn patch_me(
-    State(state): State<AppState>,
-    RequiredUser(sub): RequiredUser,
-    Json(body): Json<UserProfileUpdate>,
-) -> Result<Response> {
-    if let Some(name) = body.display_name.as_deref() {
-        let n = name.chars().count() as u64;
-        if n < 1 {
-            return Err(ApiError::Unprocessable(validation::string_too_short(
-                &["body", "displayName"],
-                name,
-                1,
-            )));
-        }
-        if n > 80 {
-            return Err(ApiError::Unprocessable(validation::string_too_long(
-                &["body", "displayName"],
-                name,
-                80,
-            )));
-        }
-    }
-    let profile = me::patch_me(&state, &sub, body.display_name.as_deref()).await?;
-    Ok(Json(profile).into_response())
-}
-
-async fn delete_me(
-    State(state): State<AppState>,
-    RequiredUser(sub): RequiredUser,
-) -> Result<StatusCode> {
-    me::delete_me(&state, &sub).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn set_activity_tracking(
     State(state): State<AppState>,
     RequiredUser(sub): RequiredUser,
@@ -1721,6 +2114,43 @@ async fn set_activity_tracking(
 ) -> Result<Response> {
     let profile = me::set_activity_tracking(&state, &sub, body.enabled).await?;
     Ok(Json(profile).into_response())
+}
+
+// ── Clés de la surface publique ─────────────────────────────────────────────
+
+async fn list_api_keys(
+    State(state): State<AppState>,
+    RequiredUser(sub): RequiredUser,
+) -> Result<Response> {
+    let items = crate::api_keys::list(&state, &sub).await?;
+    Ok(Json(lj_dtos::ApiKeysResponse { items }).into_response())
+}
+
+/// Le secret n'est lisible que dans cette réponse : il n'est pas stocké en
+/// clair, donc rien ne le resservira.
+async fn create_api_key(
+    State(state): State<AppState>,
+    RequiredUser(sub): RequiredUser,
+    Json(body): Json<lj_dtos::ApiKeyCreate>,
+) -> Result<Response> {
+    let label = body.label.trim();
+    if label.is_empty() || label.chars().count() > 64 {
+        return Err(ApiError::BadRequest("libelle_invalide".into()));
+    }
+    let cree = crate::api_keys::create(&state, &sub, label).await?;
+    Ok((StatusCode::CREATED, Json(cree)).into_response())
+}
+
+async fn revoke_api_key(
+    State(state): State<AppState>,
+    RequiredUser(sub): RequiredUser,
+    Path(key_id): Path<String>,
+) -> Result<Response> {
+    if crate::api_keys::revoke(&state, &sub, &key_id).await? {
+        Ok(StatusCode::NO_CONTENT.into_response())
+    } else {
+        Err(ApiError::NotFound)
+    }
 }
 
 // ── Signets ─────────────────────────────────────────────────────────────────
@@ -1866,16 +2296,6 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn secret_eq_compare_le_contenu_pas_le_prefixe() {
-        assert!(secret_eq("s3cret", "s3cret"));
-        assert!(!secret_eq("s3cret", "s3crft"));
-        assert!(!secret_eq("s3cret", "s3cretX"));
-        assert!(!secret_eq("s3cretX", "s3cret"));
-        assert!(!secret_eq("", "s3cret"));
-        assert!(secret_eq("", ""));
-    }
-
-    #[test]
     fn search_query_rejects_malformed_date() {
         let err = parse_search_query("q=x&dateFrom=not-a-date").unwrap_err();
         let ApiError::Unprocessable(obj) = err else {
@@ -1935,5 +2355,45 @@ mod tests {
                 .unwrap();
         assert_eq!(req.procedure.as_deref().map(<[_]>::len), Some(1));
         assert_eq!(req.office.as_deref().map(<[_]>::len), Some(1));
+    }
+
+    /// Both search routes stop paging at the same rank: the public surface is a
+    /// search, not an export.
+    #[test]
+    fn both_search_routes_cap_offset_at_99() {
+        let deepest = |offset: i64| ArticleSearchQuery {
+            q: "x".to_string(),
+            offset,
+            limit: 20,
+            code: None,
+            jurisdiction: None,
+            nature: None,
+            source: None,
+            scope: None,
+            date: None,
+            context: None,
+        };
+        deepest(99).validate().unwrap();
+        let ApiError::Unprocessable(obj) = deepest(100).validate().unwrap_err() else {
+            panic!("attendu Unprocessable");
+        };
+        assert_eq!(obj["type"], json!("less_than_equal"));
+        assert_eq!(obj["loc"], json!(["query", "offset"]));
+
+        parse_search_query("q=x&offset=99").unwrap();
+        let ApiError::Unprocessable(obj) = parse_search_query("q=x&offset=100").unwrap_err() else {
+            panic!("attendu Unprocessable");
+        };
+        assert_eq!(obj["type"], json!("less_than_equal"));
+        assert_eq!(obj["loc"], json!(["query", "offset"]));
+    }
+
+    #[test]
+    fn the_teaser_marker_is_ignored_on_the_public_surface() {
+        use lj_dtos::SearchContext::{Teaser, User};
+        assert_eq!(search_context(Some("teaser"), Surface::Internal), Teaser);
+        assert_eq!(search_context(Some("teaser"), Surface::Public), User);
+        assert_eq!(search_context(None, Surface::Internal), User);
+        assert_eq!(search_context(Some("Teaser"), Surface::Internal), User);
     }
 }

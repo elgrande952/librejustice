@@ -1,9 +1,10 @@
 //! `AuthGuard` : protege les routes authentifiees.
 //!
-//! La session vit en `localStorage`, invisible au SSR : le gate se joue cote
-//! client (Effect), redirige vers `/connexion?next=…` si absente, sinon affiche
-//! les enfants. Pendant la verification, rend `fallback` (skeleton calque sur la
-//! page protegee) au lieu d'une zone vide — l'ecran reste « plein » au reload.
+//! Le SSR public reste anonyme, cookie ou pas : le gate se joue cote client
+//! (Effect), redirige vers `/login?next=…` si `/internal/me` ne rend personne,
+//! sinon affiche les enfants. Pendant la verification, rend `fallback` (skeleton
+//! calque sur la page protegee) au lieu d'une zone vide — l'ecran reste
+//! « plein » au reload.
 
 use leptos::prelude::*;
 
@@ -28,11 +29,11 @@ pub fn AuthGuard(
         let navigate = use_navigate();
         Effect::new(move |_| {
             let pathname = location.pathname.get();
-            // La redirection vers `/connexion` re-declenche cet Effect avant le
+            // La redirection vers `/login` re-declenche cet Effect avant le
             // demontage de la route protegee : sans cette sortie, la destination
-            // s'auto-encapsule (`next=/connexion?next=…`) et la vraie page est
+            // s'auto-encapsule (`next=/login?next=…`) et la vraie page est
             // perdue.
-            if pathname.starts_with("/connexion") {
+            if pathname.starts_with("/login") {
                 return;
             }
             // La query appartient a la destination, mais ne re-arme pas le gate.
@@ -49,7 +50,7 @@ pub fn AuthGuard(
                     };
                     let next = String::from(js_sys::encode_uri_component(&target));
                     navigate(
-                        &format!("/connexion?next={next}"),
+                        &format!("/login?next={next}"),
                         NavigateOptions {
                             replace: true,
                             ..Default::default()

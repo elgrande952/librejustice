@@ -42,33 +42,51 @@ pub fn labels_by_code() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-/// Groupes de portée (IN-list dérivées des codes) : `majeure` / `importante` / `limitee`.
-pub fn significance_codes(group: &str) -> &'static [&'static str] {
-    match group {
-        "majeure" => &["r", "A"],
-        "importante" => &["b", "l", "c", "B", "C+", "R"],
-        "limitee" => &["n", "C", "D", "Z"],
-        _ => &[],
-    }
+/// Valeurs de la facette `publication:*` et les codes source de chacune, dans
+/// l'ordre du menu : les quatre catégories que la Cour sert elle-même, l'inédit
+/// judiciaire, puis les trois niveaux du Lebon.
+pub fn publication_groups() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
+        ("PUBLIE_BULLETIN", &["b"]),
+        ("PUBLIE_RAPPORT", &["r"]),
+        ("LETTRE_CHAMBRE", &["l"]),
+        ("COMMUNIQUE", &["c"]),
+        ("INEDIT_BULLETIN", &["n"]),
+        ("PUBLIE_LEBON", &["A"]),
+        ("MENTIONNE_LEBON", &["B", "C+", "R"]),
+        ("INEDIT_LEBON", &["C", "D", "Z"]),
+    ]
 }
 
-/// Clé `significance:*` d'une décision : groupe du code au rang le plus fort
-/// (`{b,r}` → `MAJEURE`), `INDETERMINEE` sans code classant. Mapping total —
-/// toute décision est facettable.
-pub fn significance_key(codes: &[String]) -> &'static str {
-    for (group, key) in [
-        ("majeure", "MAJEURE"),
-        ("importante", "IMPORTANTE"),
-        ("limitee", "LIMITEE"),
-    ] {
-        if codes
-            .iter()
-            .any(|c| significance_codes(group).contains(&c.as_str()))
-        {
-            return key;
-        }
-    }
-    "INDETERMINEE"
+/// Paliers d'autorité, du plus fort au plus faible, pour trier une liste de
+/// décisions quand la pertinence ne tranche pas. Clé de tri interne, jamais un
+/// libellé : le lecteur voit la publication réelle, pas un rang.
+pub fn authority_tiers() -> &'static [&'static [&'static str]] {
+    &[
+        &["r", "A"],
+        &["b", "l", "c", "B", "C+", "R"],
+        &["n", "C", "D", "Z"],
+    ]
+}
+
+/// Codes source d'une valeur de facette, vide si la clé est inconnue.
+pub fn publication_codes_of(key: &str) -> &'static [&'static str] {
+    publication_groups()
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, codes)| *codes)
+        .unwrap_or(&[])
+}
+
+/// Clés `publication:*` d'une décision. Appartenance **multiple** : 4 148
+/// décisions portent plus d'un code, et un rang le plus fort les cacherait.
+/// Aucun code source rend une liste vide, sans valeur de repli.
+pub fn publication_keys(codes: &[String]) -> Vec<&'static str> {
+    publication_groups()
+        .iter()
+        .filter(|(_, group)| codes.iter().any(|c| group.contains(&c.as_str())))
+        .map(|(key, _)| *key)
+        .collect()
 }
 
 #[cfg(test)]
@@ -115,26 +133,62 @@ mod tests {
     }
 
     #[test]
-    fn significance_groups() {
-        assert_eq!(significance_codes("majeure"), &["r", "A"]);
-        assert_eq!(
-            significance_codes("importante"),
-            &["b", "l", "c", "B", "C+", "R"]
-        );
-        assert_eq!(significance_codes("limitee"), &["n", "C", "D", "Z"]);
-        assert_eq!(significance_codes("inconnu"), &[] as &[&str]);
+    fn publication_groups_cover_every_labelled_code() {
+        let grouped: Vec<&str> = publication_groups()
+            .iter()
+            .flat_map(|(_, codes)| codes.iter().copied())
+            .collect();
+        for (code, _) in labels_by_code() {
+            assert!(grouped.contains(code), "code {code} sans valeur de facette");
+        }
+        assert_eq!(publication_codes_of("MENTIONNE_LEBON"), &["B", "C+", "R"]);
+        assert_eq!(publication_codes_of("inconnu"), &[] as &[&str]);
     }
 
+    /// Miroir exact du référentiel : toute dérive entre les groupes compilés et
+    /// les valeurs semées est un build rouge.
     #[test]
-    fn significance_key_takes_strongest_rank() {
-        assert_eq!(significance_key(&codes(&["b", "r", "c"])), "MAJEURE");
-        assert_eq!(significance_key(&codes(&["A"])), "MAJEURE");
-        assert_eq!(significance_key(&codes(&["b", "l"])), "IMPORTANTE");
-        assert_eq!(significance_key(&codes(&["l"])), "IMPORTANTE");
-        assert_eq!(significance_key(&codes(&["c", "n"])), "IMPORTANTE");
-        assert_eq!(significance_key(&codes(&["n"])), "LIMITEE");
-        assert_eq!(significance_key(&codes(&["C", "D"])), "LIMITEE");
-        assert_eq!(significance_key(&[]), "INDETERMINEE");
-        assert_eq!(significance_key(&codes(&["xyz"])), "INDETERMINEE");
+    fn groups_mirror_the_seeded_referential() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../lj-store/migrations");
+        let mut seeded: std::collections::BTreeSet<String> = Default::default();
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        files.sort();
+        for path in files {
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let line = line.trim_start();
+                if let Some(rest) = line.strip_prefix("('publication:") {
+                    seeded.insert(rest[..rest.find('\'').unwrap()].to_string());
+                } else if let Some(rest) =
+                    line.strip_prefix("DELETE FROM facet_value WHERE uid = 'publication:")
+                {
+                    seeded.remove(&rest[..rest.find('\'').unwrap()]);
+                }
+            }
+        }
+        let compiled: std::collections::BTreeSet<String> = publication_groups()
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .collect();
+        assert_eq!(compiled, seeded);
+    }
+
+    /// Une décision porte toutes les valeurs dont elle a un code, pas la plus
+    /// forte : `{b, l}` se trouve sous « bulletin » ET sous « lettre ».
+    #[test]
+    fn publication_keys_are_multiple() {
+        assert_eq!(
+            publication_keys(&codes(&["b", "l"])),
+            vec!["PUBLIE_BULLETIN", "LETTRE_CHAMBRE"]
+        );
+        assert_eq!(publication_keys(&codes(&["r"])), vec!["PUBLIE_RAPPORT"]);
+        assert_eq!(
+            publication_keys(&codes(&["C", "D", "Z"])),
+            vec!["INEDIT_LEBON"]
+        );
+        assert!(publication_keys(&[]).is_empty());
+        assert!(publication_keys(&codes(&["xyz"])).is_empty());
     }
 }

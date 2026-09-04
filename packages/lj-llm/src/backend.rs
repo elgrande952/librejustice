@@ -2,7 +2,14 @@
 
 use crate::error::{EmbedError, Result};
 use ndarray::Array2;
+use opentelemetry::KeyValue;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::instrument;
+
+/// Cible des évènements du disjoncteur. Les deux transitions se lisent en paire
+/// ou pas du tout : côté `lj-api`, l'export OTLP plafonne à WARN, donc le
+/// réarmement (INFO) n'atteint Loki que si la cible y est inscrite.
+pub const LOG_TARGET: &str = "lj_llm::backend";
 
 /// Dimension cible des embeddings.
 pub const EMBEDDING_DIM: usize = 1024;
@@ -35,13 +42,8 @@ pub enum AnyEmbedder {
     Dummy(DummyEmbedder),
     Cloudflare(crate::cloudflare::CloudflareWorkersAIEmbedder),
     OpenAiHttp(crate::openai_http::OpenAIHttpEmbedder),
-    /// vLLM (OpenAI-HTTP) primaire, repli Cloudflare Workers AI en disjoncteur
-    /// binaire. `degraded=false` : vLLM seul. À son premier échec (typiquement le
-    /// `connect_timeout` quand la machine vLLM est éteinte) on latch `degraded=true` ;
-    /// chaque requête lance alors vLLM et Cloudflare en même temps, le premier qui
-    /// répond gagne — un succès vLLM ré-arme `degraded=false`.
     Auto {
-        vllm: crate::openai_http::OpenAIHttpEmbedder,
+        local: crate::openai_http::OpenAIHttpEmbedder,
         cloudflare: crate::cloudflare::CloudflareWorkersAIEmbedder,
         degraded: AtomicBool,
     },
@@ -50,15 +52,18 @@ pub enum AnyEmbedder {
 /// Disjoncteur du mode `auto`, factorisé entre passages et requêtes via deux
 /// fabriques de futures (une par backend), ré-appelables (`Fn`).
 ///
-/// `degraded=false` : vLLM seul. Son premier échec latch `degraded=true` et sert la
-/// requête courante via Cloudflare (le seul appel qui « attend » vLLM — borné par
-/// son `connect_timeout`). `degraded=true` : vLLM et Cloudflare sont lancés **en
-/// même temps**, `tokio::select!` renvoie le premier qui répond ; le vLLM concurrent
-/// est la sonde de reprise — dès qu'il regagne la course, on ré-arme
-/// `degraded=false`.
+/// Once `degraded` latches, both backends run at once and the losing local call
+/// is the recovery probe: winning the race is what re-arms `degraded=false`.
+///
+/// En dégradé les deux jambes émettent la même trace HTTP : le champ `backend`
+/// du span est le seul à dire laquelle a rendu la réponse.
+#[instrument(skip_all, fields(
+    librejustice.embed.degraded = tracing::field::Empty,
+    librejustice.embed.backend = tracing::field::Empty,
+))]
 async fn auto_embed<VF, CF, VFut, CFut>(
     degraded: &AtomicBool,
-    vllm: VF,
+    local: VF,
     cloudflare: CF,
 ) -> Result<Array2<f32>>
 where
@@ -67,29 +72,66 @@ where
     VFut: std::future::Future<Output = Result<Array2<f32>>>,
     CFut: std::future::Future<Output = Result<Array2<f32>>>,
 {
-    if !degraded.load(Ordering::Relaxed) {
-        match vllm().await {
-            Ok(r) => return Ok(r),
-            Err(exc) if is_request_fault(&exc) => return Err(exc),
+    let span = tracing::Span::current();
+    let entry_degraded = degraded.load(Ordering::Relaxed);
+    span.record("librejustice.embed.degraded", entry_degraded);
+
+    let (out, backend) = race(degraded, entry_degraded, local, cloudflare).await;
+
+    span.record("librejustice.embed.backend", backend);
+    lj_telemetry::meter()
+        .u64_counter("embed.auto.served")
+        .with_description("Embeddings du mode auto, par backend ayant rendu la réponse.")
+        .build()
+        .add(1, &[KeyValue::new("backend", backend)]);
+    out
+}
+
+/// Corps du disjoncteur : rend la réponse et le backend qui l'a produite —
+/// `local`, `cloudflare`, `aucun` (les deux en échec) ou `refus` (entrée
+/// invalide, qui ne renseigne sur la santé d'aucun backend).
+async fn race<VF, CF, VFut, CFut>(
+    degraded: &AtomicBool,
+    entry_degraded: bool,
+    local: VF,
+    cloudflare: CF,
+) -> (Result<Array2<f32>>, &'static str)
+where
+    VF: Fn() -> VFut,
+    CF: Fn() -> CFut,
+    VFut: std::future::Future<Output = Result<Array2<f32>>>,
+    CFut: std::future::Future<Output = Result<Array2<f32>>>,
+{
+    if !entry_degraded {
+        return match local().await {
+            Ok(r) => (Ok(r), "local"),
+            Err(exc) if is_request_fault(&exc) => (Err(exc), "refus"),
             Err(exc) => {
                 degraded.store(true, Ordering::Relaxed);
-                tracing::warn!(error = %exc, "vllm KO → dégradé, repli Cloudflare");
-                return cloudflare().await;
+                tracing::warn!(error = %exc, "local KO → dégradé, repli Cloudflare");
+                fallback_served(cloudflare().await)
             }
-        }
+        };
     }
     tokio::select! {
-        r = vllm() => match r {
+        r = local() => match r {
             Ok(v) => {
                 degraded.store(false, Ordering::Relaxed);
-                tracing::info!("vllm a regagné la course → mode nominal réarmé");
-                Ok(v)
+                tracing::info!("local a regagné la course → mode nominal réarmé");
+                (Ok(v), "local")
             }
-            Err(exc) if is_request_fault(&exc) => Err(exc),
-            Err(_) => cloudflare().await,
+            Err(exc) if is_request_fault(&exc) => (Err(exc), "refus"),
+            Err(_) => fallback_served(cloudflare().await),
         },
-        r = cloudflare() => r,
+        r = cloudflare() => fallback_served(r),
     }
+}
+
+/// Étiquette la sortie du repli : `aucun` quand Cloudflare échoue à son tour,
+/// donc qu'aucun des deux backends n'a servi.
+fn fallback_served(r: Result<Array2<f32>>) -> (Result<Array2<f32>>, &'static str) {
+    let backend = if r.is_ok() { "cloudflare" } else { "aucun" };
+    (r, backend)
 }
 
 /// L'erreur porte-t-elle sur la **requête** plutôt que sur la santé du backend ?
@@ -116,13 +158,13 @@ impl Embedder for AnyEmbedder {
             AnyEmbedder::Cloudflare(e) => e.embed_passages(texts).await,
             AnyEmbedder::OpenAiHttp(e) => e.embed_passages(texts).await,
             AnyEmbedder::Auto {
-                vllm,
+                local,
                 cloudflare,
                 degraded,
             } => {
                 auto_embed(
                     degraded,
-                    || vllm.embed_passages(texts),
+                    || local.embed_passages(texts),
                     || cloudflare.embed_passages(texts),
                 )
                 .await
@@ -135,13 +177,13 @@ impl Embedder for AnyEmbedder {
             AnyEmbedder::Cloudflare(e) => e.embed_query(texts).await,
             AnyEmbedder::OpenAiHttp(e) => e.embed_query(texts).await,
             AnyEmbedder::Auto {
-                vllm,
+                local,
                 cloudflare,
                 degraded,
             } => {
                 auto_embed(
                     degraded,
-                    || vllm.embed_query(texts),
+                    || local.embed_query(texts),
                     || cloudflare.embed_query(texts),
                 )
                 .await
@@ -288,6 +330,89 @@ French court decisions that best answer it."
         let a = e.embed_query(&["a".to_string()]).await.unwrap();
         let b = e.embed_query(&["b".to_string()]).await.unwrap();
         assert_ne!(a, b);
+    }
+
+    /// Fabrique de jambe : rend toujours `out`, immédiatement.
+    fn leg(
+        out: fn() -> Result<Array2<f32>>,
+    ) -> impl Fn() -> std::future::Ready<Result<Array2<f32>>> {
+        move || std::future::ready(out())
+    }
+
+    /// Jambe qui ne répond jamais. `tokio::select!` tire l'ordre de ses branches
+    /// au hasard : deux jambes prêtes en même temps donnent un gagnant aléatoire,
+    /// et seule celle-ci fait perdre l'autre à coup sûr.
+    fn leg_lente() -> impl Fn() -> std::future::Pending<Result<Array2<f32>>> {
+        std::future::pending
+    }
+
+    fn ok() -> Result<Array2<f32>> {
+        Ok(Array2::zeros((1, 2)))
+    }
+    fn panne() -> Result<Array2<f32>> {
+        Err(EmbedError::Middleware(
+            reqwest_middleware::Error::Middleware(anyhow::anyhow!("backend injoignable")),
+        ))
+    }
+    fn entree_invalide() -> Result<Array2<f32>> {
+        Err(EmbedError::InputTooLong)
+    }
+
+    #[tokio::test]
+    async fn nominal_sert_le_local_sans_armer_le_disjoncteur() {
+        let degraded = AtomicBool::new(false);
+        let (out, backend) = race(&degraded, false, leg(ok), leg(panne)).await;
+        assert!(out.is_ok());
+        assert_eq!(backend, "local");
+        assert!(!degraded.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn panne_du_local_arme_le_disjoncteur_et_sert_cloudflare() {
+        let degraded = AtomicBool::new(false);
+        let (out, backend) = race(&degraded, false, leg(panne), leg(ok)).await;
+        assert!(out.is_ok());
+        assert_eq!(backend, "cloudflare");
+        assert!(degraded.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn les_deux_en_panne_ne_designent_aucun_backend() {
+        let degraded = AtomicBool::new(false);
+        let (out, backend) = race(&degraded, false, leg(panne), leg(panne)).await;
+        assert!(out.is_err());
+        assert_eq!(backend, "aucun");
+    }
+
+    /// Une entrée invalide n'apprend rien sur la santé du backend : elle remonte
+    /// telle quelle, sans repli et sans armer le disjoncteur.
+    #[tokio::test]
+    async fn entree_invalide_ne_degrade_pas() {
+        let degraded = AtomicBool::new(false);
+        let (out, backend) = race(&degraded, false, leg(entree_invalide), leg(ok)).await;
+        assert!(matches!(out, Err(EmbedError::InputTooLong)));
+        assert_eq!(backend, "refus");
+        assert!(!degraded.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn le_local_qui_regagne_la_course_rearme_le_mode_nominal() {
+        let degraded = AtomicBool::new(true);
+        let (out, backend) = race(&degraded, true, leg(ok), leg_lente()).await;
+        assert!(out.is_ok());
+        assert_eq!(backend, "local");
+        assert!(!degraded.load(Ordering::Relaxed));
+    }
+
+    /// En dégradé, un local toujours KO laisse Cloudflare servir et le verrou
+    /// fermé : sans ça chaque requête repaierait le stall du primaire.
+    #[tokio::test]
+    async fn degrade_avec_le_local_toujours_ko_reste_degrade() {
+        let degraded = AtomicBool::new(true);
+        let (out, backend) = race(&degraded, true, leg(panne), leg(ok)).await;
+        assert!(out.is_ok());
+        assert_eq!(backend, "cloudflare");
+        assert!(degraded.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

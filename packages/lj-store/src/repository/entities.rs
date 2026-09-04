@@ -803,7 +803,8 @@ impl DecisionRepository<'_> {
         let rows = self
             .conn
             .query(
-                "SELECT p.quality, p.side, p.value, p.nature, p.barreau, p.entity_uid \
+                "SELECT p.quality, p.side, p.value, p.nature, p.barreau, p.entity_uid, \
+                        p.ord, p.party_ord \
                  FROM decision_party p \
                  JOIN decisions d ON d.id = p.decision_id \
                  WHERE d.public_id = $1 \
@@ -824,6 +825,8 @@ impl DecisionRepository<'_> {
                     nature: r.get(3),
                     barreau: r.get(4),
                     entity_uid: r.get(5),
+                    ord: r.get(6),
+                    party_ord: r.get(7),
                 })
                 .collect(),
         ))

@@ -29,14 +29,19 @@ pub struct Settings {
     // Divers
     pub leg_limit: u32,
     pub cors_origins: Vec<String>,
-    pub supabase_url: Option<String>,
-    pub supabase_secret_key: Option<String>,
     pub mcp_require_auth: bool,
     pub mcp_allowed_hosts: Vec<String>,
     /// Token de vérification de propriété du domaine pour le catalogue d'apps
     /// ChatGPT (servi en `text/plain` sur `/.well-known/openai-apps-challenge`).
     /// Valeur publique. Absent → 404.
     pub openai_apps_challenge_token: Option<String>,
+    /// Secret que présentent nos propres émetteurs dans
+    /// [`lj_dtos::INTERNAL_ORIGIN_HEADER`] pour que leur trafic soit compté
+    /// `internal`. Absent → tout est `external`.
+    pub internal_origin_token: Option<String>,
+    /// Clé du MAC qui pseudonymise l'appelant en télémétrie. Absent → aucun
+    /// pseudonyme n'est posé, et rien ne nomme personne.
+    pub usage_pseudonym_key: Option<String>,
     /// Mainteneur déclaré pour le claim du connecteur sur Glama (servi en JSON
     /// sur `/.well-known/glama.json` : `{"maintainers": [<valeur>]}` — email du
     /// compte Glama ou login GitHub). Valeur publique. Absent → 404.
@@ -45,10 +50,6 @@ pub struct Settings {
     /// exige qu'elle soit servie à `https://<host>/<clé>.txt`. Publique par
     /// protocole. Absent → pas de route.
     pub indexnow_key: Option<String>,
-    /// Jeton de la sonde profonde `/api/health/deep`, présenté en
-    /// `Authorization: Bearer`. **Secret** : la route force un aller-retour DB
-    /// complet non cacheable. Absent → 404.
-    pub deep_probe_token: Option<String>,
     pub gunicorn_workers: usize,
     pub version: String,
     // Export OTel vers la gateway Grafana Cloud.
@@ -57,10 +58,36 @@ pub struct Settings {
     pub grafana_cloud_api_key: Option<String>,
     pub otel_service_name: String,
     pub deployment_environment: Option<String>,
+    pub host_name: Option<String>,
+    pub container_name: Option<String>,
     pub db_application_name: Option<String>,
     pub slow_request_ms: u64,
     pub web_base_url: String,
     pub public_base_url: String,
+    /// Clé d'envoi Resend (envoi seul, restreinte au domaine) et expéditeur des
+    /// mails d'auth. Vides = émission désactivée, l'inscription refuse.
+    pub resend_api_key: String,
+    pub mail_from: String,
+    /// Relais SMTP par lequel part un signalement. Adresse ou identifiants
+    /// vides = signalement désactivé.
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_user: String,
+    pub smtp_password: String,
+    /// Boîte qui reçoit les signalements.
+    pub support_mailbox: String,
+    /// Signalements émis dans la journée, toutes origines confondues. Le relais
+    /// borne ce qu'il accepte et se ferme au-delà : un seau par appelant ne
+    /// protège que du répéteur, celui-ci protège d'une foule.
+    pub signalements_par_jour: u32,
+    /// Client OAuth du tour de connexion Google. Vides = tour désactivé,
+    /// `/api/auth/google/start` répond 503.
+    pub google_client_id: String,
+    pub google_client_secret: String,
+    /// Client OAuth du tour de connexion Microsoft, multi-tenant (`/common`).
+    /// Vides = tour désactivé, `/api/auth/microsoft/start` répond 503.
+    pub microsoft_client_id: String,
+    pub microsoft_client_secret: String,
     pub mistral_api_keys: Vec<String>,
     pub mistral_model: String,
     /// Dépenses de recherche par appelant et par minute (embedding + récupération
@@ -119,6 +146,15 @@ fn parse_bool(var: &str, default: bool) -> bool {
     }
 }
 
+/// The environments whose traffic is all ours. A listed set and not `!= "prod"`:
+/// `/.env` carries `dev`, and prod owes its `prod` to the deploy's `export`
+/// alone, so a hand-run `compose up` would come up `dev` and the negation would
+/// make prod silent on usage, without a sign. An unknown environment counts as
+/// external, which shows and gets fixed.
+fn environment_is_first_party(env: Option<&str>) -> bool {
+    matches!(env, Some("beta" | "dev" | "staging"))
+}
+
 /// Parse une liste séparée par des virgules, items vides éliminés.
 fn parse_csv(var: &str) -> Vec<String> {
     match opt(var) {
@@ -165,9 +201,6 @@ impl Settings {
         // CORS : liste explicite, sinon dérivée de web_base_url.
         let cors_origins = parse_csv("LIBREJUSTICE_API_CORS_ORIGINS");
 
-        let supabase_url = opt("LIBREJUSTICE_VITE_SUPABASE_URL");
-        let supabase_secret_key = opt("LIBREJUSTICE_API_SUPABASE_SECRET_KEY");
-
         let mcp_require_auth = parse_bool("LIBREJUSTICE_API_MCP_REQUIRE_AUTH", false);
         let mcp_allowed_hosts = match opt("LIBREJUSTICE_API_MCP_ALLOWED_HOSTS") {
             Some(_) => parse_csv("LIBREJUSTICE_API_MCP_ALLOWED_HOSTS"),
@@ -182,13 +215,13 @@ impl Settings {
         };
 
         let openai_apps_challenge_token = opt("LIBREJUSTICE_API_OPENAI_APPS_CHALLENGE_TOKEN");
+        let internal_origin_token = opt("LIBREJUSTICE_API_INTERNAL_ORIGIN_TOKEN");
+        let usage_pseudonym_key = opt("LIBREJUSTICE_API_USAGE_PSEUDONYM_KEY");
         let glama_maintainer = opt("LIBREJUSTICE_API_GLAMA_MAINTAINER");
         let indexnow_key = opt("LIBREJUSTICE_INDEXNOW_KEY");
-        let deep_probe_token = opt("LIBREJUSTICE_API_DEEP_PROBE_TOKEN");
 
         let gunicorn_workers =
             parse_ranged::<usize>("LIBREJUSTICE_API_GUNICORN_WORKERS", 4, 1, 32)?;
-        let version = or_default("LIBREJUSTICE_API_VERSION", "dev");
 
         // Credentials gateway OTLP Grafana Cloud. L'export OTel s'active si les
         // trois sont là.
@@ -198,6 +231,23 @@ impl Settings {
         let otel_service_name =
             or_default("LIBREJUSTICE_API_OTEL_SERVICE_NAME", "librejustice-api");
         let deployment_environment = opt("LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT");
+        // Only the deploy knows the shipped commit, so prod refuses to start
+        // rather than answer "dev" to whoever asks what is running.
+        let version = match (
+            opt("LIBREJUSTICE_API_VERSION"),
+            deployment_environment.as_deref(),
+        ) {
+            (Some(v), _) => v,
+            (None, Some("prod")) => {
+                anyhow::bail!("LIBREJUSTICE_API_VERSION absente : le déploiement doit l'exporter")
+            }
+            (None, _) => "dev".to_string(),
+        };
+        // Même nom pour les deux binaires : c'est un fait d'environnement du
+        // processus, pas un réglage de l'API. Absents sur l'hôte, où le hostname
+        // du noyau suffit et où il n'y a pas de conteneur à nommer.
+        let host_name = opt("LIBREJUSTICE_HOST_NAME");
+        let container_name = opt("LIBREJUSTICE_CONTAINER_NAME");
         let db_application_name = opt("LIBREJUSTICE_API_DB_APPLICATION_NAME");
 
         let slow_request_ms = match opt("LIBREJUSTICE_API_SLOW_REQUEST_MS") {
@@ -216,11 +266,35 @@ impl Settings {
             "https://librejustice.fr",
         );
 
+        let resend_api_key = or_default("LIBREJUSTICE_API_RESEND_API_KEY", "");
+        let mail_from = or_default(
+            "LIBREJUSTICE_API_MAIL_FROM",
+            "LibreJustice <noreply@librejustice.fr>",
+        );
+
+        let smtp_host = or_default("LIBREJUSTICE_COCKPIT_SMTP_HOST", "");
+        let smtp_port = parse_ranged("LIBREJUSTICE_COCKPIT_SMTP_PORT", 587, 1, 65_535)? as u16;
+        let smtp_user = or_default("LIBREJUSTICE_COCKPIT_SMTP_USER", "");
+        let smtp_password = or_default("LIBREJUSTICE_COCKPIT_SMTP_PASSWORD", "");
+        let support_mailbox = or_default(
+            "LIBREJUSTICE_API_SUPPORT_MAILBOX",
+            "contact@librejustice.fr",
+        );
+        let signalements_par_jour =
+            parse_ranged("LIBREJUSTICE_API_SIGNALEMENTS_PAR_JOUR", 200, 1, 100_000)?;
+
+        let google_client_id = or_default("LIBREJUSTICE_GOOGLE_OAUTH_CLIENT_ID", "");
+        let google_client_secret = or_default("LIBREJUSTICE_GOOGLE_OAUTH_CLIENT_SECRET", "");
+        let microsoft_client_id = or_default("LIBREJUSTICE_MICROSOFT_OAUTH_CLIENT_ID", "");
+        let microsoft_client_secret = or_default("LIBREJUSTICE_MICROSOFT_OAUTH_CLIENT_SECRET", "");
+
         let mistral_api_keys = parse_csv("LIBREJUSTICE_MISTRAL_API_KEYS");
         let mistral_model = or_default("LIBREJUSTICE_MISTRAL_MODEL", "mistral-small-2603");
 
+        // 30/min: over seven days the busiest of 392 callers peaked at 23 searches
+        // in a sliding minute, and none went above 25.
         let search_budget_per_min =
-            parse_ranged("LIBREJUSTICE_API_SEARCH_BUDGET_PER_MIN", 60, 1, 10_000)?;
+            parse_ranged("LIBREJUSTICE_API_SEARCH_BUDGET_PER_MIN", 30, 1, 10_000)?;
         let search_budget_enforce = parse_bool("LIBREJUSTICE_API_SEARCH_BUDGET_ENFORCE", true);
         let rerank_budget_per_min =
             parse_ranged("LIBREJUSTICE_API_RERANK_BUDGET_PER_MIN", 20, 1, 10_000)?;
@@ -241,14 +315,13 @@ impl Settings {
             cloudflare_backend_token,
             leg_limit,
             cors_origins,
-            supabase_url,
-            supabase_secret_key,
             mcp_require_auth,
             mcp_allowed_hosts,
             openai_apps_challenge_token,
+            internal_origin_token,
+            usage_pseudonym_key,
             glama_maintainer,
             indexnow_key,
-            deep_probe_token,
             gunicorn_workers,
             version,
             grafana_otlp_endpoint,
@@ -256,10 +329,24 @@ impl Settings {
             grafana_cloud_api_key,
             otel_service_name,
             deployment_environment,
+            host_name,
+            container_name,
             db_application_name,
             slow_request_ms,
             web_base_url,
             public_base_url,
+            resend_api_key,
+            mail_from,
+            smtp_host,
+            smtp_port,
+            smtp_user,
+            smtp_password,
+            support_mailbox,
+            signalements_par_jour,
+            google_client_id,
+            google_client_secret,
+            microsoft_client_id,
+            microsoft_client_secret,
             mistral_api_keys,
             mistral_model,
             search_budget_per_min,
@@ -279,6 +366,22 @@ impl Settings {
                 self.db_url = injected;
             }
         }
+    }
+
+    /// Les scrapers de ressources partagées — l'hôte, la base — ne tournent que
+    /// dans l'instance de prod : beta et dev lisent la même machine et la même
+    /// base, et n'en publiaient que des copies (1 254 séries pour 418 utiles).
+    /// Les métriques du processus restent par environnement, elles y décrivent
+    /// bien trois choses différentes.
+    pub fn scrapes_shared_resources(&self) -> bool {
+        self.grafana_otlp_endpoint.is_some()
+            && self.grafana_otlp_user.is_some()
+            && self.grafana_cloud_api_key.is_some()
+            && self.deployment_environment.as_deref() == Some("prod")
+    }
+
+    pub fn traffic_is_first_party(&self) -> bool {
+        environment_is_first_party(self.deployment_environment.as_deref())
     }
 
     /// `cors_origins` vide → dérivé de `web_base_url` + dev local.
@@ -365,5 +468,17 @@ mod tests {
         std::env::set_var("LIBREJUSTICE_TEST_PORT", "70000");
         assert!(parse_ranged::<u16>("LIBREJUSTICE_TEST_PORT", 8300, 1, 65535).is_err());
         std::env::remove_var("LIBREJUSTICE_TEST_PORT");
+    }
+
+    #[test]
+    fn only_named_environments_are_first_party() {
+        for env in ["beta", "dev", "staging"] {
+            assert!(environment_is_first_party(Some(env)), "{env}");
+        }
+        // Le défaut prudent : ni la prod, ni l'absence de réglage, ni un nom
+        // inconnu ne rendent la mesure d'usage muette.
+        for env in [None, Some("prod"), Some("preprod"), Some("")] {
+            assert!(!environment_is_first_party(env), "{env:?}");
+        }
     }
 }

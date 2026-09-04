@@ -16,12 +16,14 @@
 mod adde;
 mod affiliations;
 mod annonces;
+mod annonces_couverture;
 mod ariane;
 mod article_commentaires;
 mod attract;
 mod backfill;
 mod batch;
 mod bofip;
+mod ce_list;
 mod chronicle_move;
 mod circulaires;
 mod cnb_history;
@@ -32,7 +34,7 @@ mod corpus_toc;
 mod dila;
 mod embed;
 mod embed_missing;
-mod eu_catalog;
+pub(crate) mod eu_catalog;
 mod eu_law;
 mod eu_rproc;
 mod europe;
@@ -45,7 +47,9 @@ mod legal_corpus;
 mod legi;
 mod opendata;
 mod parties;
+mod precompute;
 mod prepare;
+mod quantum_gold;
 mod reconcile;
 mod reextract;
 mod registries;
@@ -54,6 +58,7 @@ mod resplit;
 mod roles;
 mod scope_alsace;
 mod scope_compteurs;
+mod seats;
 mod slugs;
 mod suggest_build;
 mod text_refs;
@@ -66,12 +71,14 @@ pub use adde::sync_adde;
 pub use affiliations::derive_affiliations;
 pub use annonces::{
     annonces, annonces_backfill, annonces_discover, annonces_enrichir, annonces_jumeler,
-    annonces_regulariser,
+    annonces_regulariser, annonces_resoudre,
 };
+pub use annonces_couverture::annonces_couverture;
 pub use ariane::sync_ariane;
 pub use article_commentaires::{reconcile_article_commentaires, seed_article_commentaires};
 pub use backfill::{backfill_canonical_ref, backfill_ecli, merge_cross_source_duplicates};
 pub use bofip::{ingest_bofip, sync_bofip};
+pub use ce_list::sync_ce_list;
 pub use chronicle_move::move_chronicle;
 pub use circulaires::{sync_circulaires, sync_circulaires_bodies};
 pub use cnb_history::replay_cnb_history;
@@ -80,28 +87,34 @@ pub use cnda::{ingest_cnda, sync_cnda};
 pub use cnda_solution::backfill_cnda_solution;
 pub use dila::{ingest_dila, sync_dila, Fond};
 pub use embed_missing::embed_missing;
-pub use eu_catalog::ingest_eu_catalog;
+pub(crate) use eu_catalog::{canonical_of, datasets_a_retirer};
+pub use eu_catalog::{ingest_eu_catalog, merge_eu_swapped_uids, sync_eu_catalog, sync_eu_jorf};
 pub use eu_law::sync_eu_law;
 pub use eu_rproc::ingest_eu_rproc;
 pub use europe::{cache_cedh, ingest_cedh, ingest_cjue, sync_cedh, sync_cjue};
 pub use false_merges::analyze_false_merges;
 pub use jorf::{ingest_jorf, sync_jorf};
 pub use juricaf::juricaf_probe;
-pub use kali::{ingest_kali, sync_kali};
+pub use kali::{ingest_kali, requalifier_kali, sync_kali};
 pub use legal_corpus::{
     canonicalize_source_labels, load_legal_corpus, reading_ranks, relabel_sources, stamp_freshness,
 };
 pub use legi::{backfill_links, backfill_textes, backfill_toc, ingest_legi, sync_legi};
 pub use opendata::{ingest_judilibre, ingest_opendata, refetch_judilibre, reingest_stale_opendata};
 pub use parties::{reconcile_parties, relink_parties};
+pub use precompute::{
+    precompute_all, resync_chambers, resync_corpus_counts, resync_jurisdiction_counts,
+};
+pub use quantum_gold::load_quantum_gold;
 pub use reconcile::reconcile_all;
 pub use reextract::reextract_fields;
 pub use registries::{load_registries, RegistrySource};
-pub use rekey::{rekey_article_keys, rekey_identity_keys};
+pub use rekey::{destar_article_keys, rekey_article_keys, rekey_identity_keys};
 pub use resplit::resplit_false_merges;
 pub use roles::backfill_text_roles;
 pub use scope_alsace::scope_backfill_alsace;
 pub use scope_compteurs::scope_backfill_compteurs;
+pub use seats::resolve_seats;
 pub use slugs::assign_slugs;
 pub use suggest_build::build_suggest;
 pub use text_refs::extract_text_refs;
@@ -134,6 +147,33 @@ pub(crate) struct ExtractCtx {
     /// Labels guéris du référentiel `jurisdiction` (code → label avec ville), pour
     /// composer `search_title` quand le libellé source est nu.
     pub jur_labels: std::collections::HashMap<String, String>,
+    /// Source code to canonical code, the resolution `ensure_jurisdictions` runs
+    /// at write time: the seat paths are derived before it.
+    pub jur_codes: std::collections::HashMap<String, String>,
+    /// Libellés du référentiel `chamber`, keyés `(code source, clé)` comme le
+    /// reste des snapshots : le siège d'un titre les lit, il ne les recompose pas.
+    /// Noms d'usage à porteur unique, pour les citations que le corps fait par
+    /// le nom. Posé par la projection des renvois, donc à jour d'elle : une
+    /// passe d'extraction avant la projection cite sous des noms périmés.
+    pub case_names: lj_extract::case_link::CaseNameSnapshot,
+    /// What each court calls its rooms, read from the seat as WRITTEN.
+    /// Empty on the pass that first writes the seats, so nothing resolves
+    /// before a second one has a corpus to read.
+    pub seats: lj_extract::seat_link::SeatVocabulary,
+}
+
+impl ExtractCtx {
+    pub fn snapshots(&self) -> lj_ingest::extract::Snapshots<'_> {
+        lj_ingest::extract::Snapshots {
+            link: &self.link,
+            vocab: &self.vocab,
+            chrono: &self.chrono,
+            jur_labels: &self.jur_labels,
+            jur_codes: &self.jur_codes,
+            case_names: &self.case_names,
+            seats: &self.seats,
+        }
+    }
 }
 
 static EXTRACT_CTX: tokio::sync::OnceCell<ExtractCtx> = tokio::sync::OnceCell::const_new();
@@ -161,10 +201,37 @@ pub(crate) async fn extract_ctx(conn: &Connection) -> anyhow::Result<&'static Ex
                 .iter()
                 .map(|j| (j.source_code.clone(), j.label.clone()))
                 .collect();
+            let jur_codes = jurisdictions
+                .iter()
+                .map(|j| (j.source_code.clone(), j.code.clone()))
+                .collect();
             let chrono = lj_extract::chrono::ChronoSnapshot::new(
                 jurisdictions
                     .into_iter()
                     .filter_map(|j| Some((j.source_code, j.jurisdiction_type, j.city?))),
+            );
+            let case_names = lj_extract::case_link::CaseNameSnapshot::new(
+                repo.unambiguous_case_names().await?.into_iter().filter_map(
+                    |(cle, jt, code, dockets, date)| {
+                        let target = lj_extract::identity::pending_target_keys(
+                            &jt,
+                            code.as_deref(),
+                            &dockets,
+                        );
+                        Some((cle, target.into_iter().next()?, date))
+                    },
+                ),
+            );
+            let seats = lj_extract::seat_link::SeatVocabulary::new(
+                repo.seat_vocabulary()
+                    .await?
+                    .into_iter()
+                    .map(|s| lj_extract::seat_link::SeatRow {
+                        seat: s.seat,
+                        chamber: s.chamber,
+                        formation: s.formation,
+                        span: s.span,
+                    }),
             );
             tracing::info!(n_texts, n_articles, "contexte d'extraction hydraté");
             Ok(ExtractCtx {
@@ -172,6 +239,9 @@ pub(crate) async fn extract_ctx(conn: &Connection) -> anyhow::Result<&'static Ex
                 vocab,
                 chrono,
                 jur_labels,
+                jur_codes,
+                case_names,
+                seats,
             })
         })
         .await

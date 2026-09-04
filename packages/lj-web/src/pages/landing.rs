@@ -12,6 +12,7 @@ use crate::seo::SITE_JSONLD;
 
 #[component]
 pub fn Landing() -> impl IntoView {
+    crate::pages::cache_public_5_min();
     view! {
         <leptos_meta::Script type_="application/ld+json">{SITE_JSONLD}</leptos_meta::Script>
         <div class="relative flex flex-1 flex-col">
@@ -60,7 +61,7 @@ fn Stats() -> impl IntoView {
     }
 }
 
-/// Charge les compteurs corpus (`GET /api/corpus-stats`).
+/// Charge les compteurs corpus (`GET /internal/corpus-stats`).
 async fn fetch_stats() -> Result<CorpusStatsResponse, PageError> {
     ApiClient::from_context()
         .fetch_corpus_stats()

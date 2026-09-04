@@ -149,6 +149,14 @@ fn decisions_help() -> AnyView {
         </section>
         <section class="flex flex-col gap-2">
             <h4 class="text-[0.7rem] font-medium uppercase tracking-[0.15em] text-[var(--color-ink-muted)]">
+                "Tri IA"
+            </h4>
+            <p class="text-xs text-[var(--color-ink-muted)]">
+                "Actif par défaut en sémantique : une IA réordonne les 50 premiers résultats selon votre question."
+            </p>
+        </section>
+        <section class="flex flex-col gap-2">
+            <h4 class="text-[0.7rem] font-medium uppercase tracking-[0.15em] text-[var(--color-ink-muted)]">
                 "Opérateurs booléens"
             </h4>
             <div class="flex flex-wrap gap-x-4 gap-y-2 text-xs">

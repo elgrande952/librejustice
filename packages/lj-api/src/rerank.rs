@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use opentelemetry::KeyValue;
 use tokio::time::Instant;
 
 use lj_llm::mistral::{is_retryable_status, MistralClient, MistralError};
@@ -43,9 +44,9 @@ const HEDGE_AFTER: Duration = Duration::from_millis(1500);
 /// Relances autorisées par passe.
 const HEDGES_PER_PASS: usize = 1;
 
-/// Budget de bout en bout du rerank sur le chemin live, passé en `deadline` par
-/// [`crate::search`]. Au-delà, les appels non revenus sont abandonnés et la fusion
-/// se fait sur ce qui est arrivé ([`fuse_scores`]).
+/// Échéance de latence de bout en bout du rerank sur le chemin live, passée en
+/// `deadline` par [`crate::search`]. Au-delà, les appels non revenus sont
+/// abandonnés et la fusion se fait sur ce qui est arrivé ([`fuse_scores`]).
 ///
 /// Couvre toute la distribution mesurée. À 2 s, la coupe tombait dans le régime
 /// normal du modèle et une recherche sur dix sortait au classement dégradé.
@@ -270,6 +271,13 @@ fn build_batches(pool: &[&RerankItem], anchors: &[&RerankItem], seed: u64) -> Ve
     batches
 }
 
+/// Pourquoi un batch n'a pas rendu ses notes. `Echeance` est le régime prévu
+/// sous charge, `Amont` un échec du reranker : deux lignes de log distinctes.
+enum BatchPerdu {
+    Echeance,
+    Amont(ApiError),
+}
+
 /// Note en parallèle les batches d'une passe → une note par document envoyé,
 /// ancres comprises.
 ///
@@ -323,10 +331,10 @@ async fn score_pass(
             };
             match deadline {
                 Some(t) => match tokio::time::timeout_at(t, scored).await {
-                    Ok(r) => r,
-                    Err(_) => Err(ApiError::Internal("budget rerank dépassé".into())),
+                    Ok(r) => r.map_err(BatchPerdu::Amont),
+                    Err(_) => Err(BatchPerdu::Echeance),
                 },
-                None => scored.await,
+                None => scored.await.map_err(BatchPerdu::Amont),
             }
             .inspect(|m: &HashMap<i64, f64>| sink(m.clone()))
         });
@@ -342,10 +350,14 @@ async fn score_pass(
                 batches_ok += 1;
                 scores.extend(m);
             }
-            Err(err) => tracing::warn!(
+            Err(BatchPerdu::Echeance) => tracing::warn!(
+                seed,
+                "batch de rerank coupé sur l'échéance de latence — fusion sur les notes restantes"
+            ),
+            Err(BatchPerdu::Amont(err)) => tracing::warn!(
                 error = %err,
                 seed,
-                "batch de rerank perdu — fusion sur les notes restantes"
+                "batch de rerank perdu sur erreur du reranker — fusion sur les notes restantes"
             ),
         }
     }
@@ -527,6 +539,11 @@ pub async fn rerank_shortlist(
     };
     let span = tracing::Span::current();
     span.record("librejustice.rerank.outcome", outcome);
+    lj_telemetry::meter()
+        .u64_counter("search.rerank.outcome")
+        .with_description("Reranks de recherche, par qualité de sortie.")
+        .build()
+        .add(1, &[KeyValue::new("outcome", outcome)]);
     span.record("librejustice.rerank.batches_ok", batches_ok);
     span.record("librejustice.rerank.batches_total", batches_total);
     span.record("librejustice.rerank.docs_cached", docs_cached);

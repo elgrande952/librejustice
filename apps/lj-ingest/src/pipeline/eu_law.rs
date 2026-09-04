@@ -134,16 +134,38 @@ async fn refresh_act(
             return Ok((Outcome::Updated(seed.path.clone()), futures));
         }
     }
-    let Some(xml) = client
+    let documents = client
         .formex_act_fr(&target)
         .await
-        .map_err(|e| anyhow!("formex {target}: {e}"))?
-    else {
+        .map_err(|e| anyhow!("formex {target}: {e}"))?;
+    if documents.is_empty() {
         // Pas de repli consolidé → base : régresser au texte d'origine écraserait
         // un stock potentiellement plus riche (bootstrap XHTML).
         return Ok((Outcome::NoFormex, futures));
-    };
-    let articles = parse_formex_articles(&xml);
+    }
+    // A consolidated act carries its annexes inline, an original act publishes
+    // them as separate volumes of the same manifestation. Reading both sources
+    // emits every annex twice, under the key the loader takes for a primary key.
+    let mut articles = parse_formex_articles(&documents[0]);
+    if !articles.iter().any(|a| a.num.starts_with("Annexe")) {
+        articles.extend(
+            documents[1..]
+                .iter()
+                .flat_map(|xml| parse_formex_articles(xml)),
+        );
+    }
+    let mut seen = HashSet::new();
+    let mut collisions: Vec<String> = Vec::new();
+    articles.retain(|a| {
+        let kept = seen.insert(lj_core::article_key::identity_key(&a.num));
+        if !kept {
+            collisions.push(a.num.clone());
+        }
+        kept
+    });
+    if !collisions.is_empty() {
+        tracing::warn!(celex = %target, text_uid = %seed.doc.text_uid, numeros = ?collisions, "clé d'article en double, contenu écarté");
+    }
     if articles.is_empty() {
         tracing::warn!(celex = %target, text_uid = %seed.doc.text_uid, "Formex sans article, dataset conservé");
         return Ok((Outcome::NoFormex, futures));
@@ -206,6 +228,35 @@ async fn refresh_act(
     Ok((Outcome::Updated(seed.path.clone()), futures))
 }
 
+/// Pose la borne de validité de chaque acte du registre (`(CELEX de base,
+/// text_uid)`). Un acte abrogé ne fait paraître aucune consolidation : le delta
+/// ne le voit jamais, d'où un registre **entier** à chaque passe.
+async fn poser_bornes(
+    client: &CjueClient,
+    repo: &DecisionRepository<'_>,
+    registre: &[(String, String)],
+) -> Result<()> {
+    let bases: Vec<String> = registre.iter().map(|(base, _)| base.clone()).collect();
+    let ends = client
+        .acts_end_of_validity(&bases)
+        .await
+        .map_err(|e| anyhow!("bornes de validité: {e}"))?;
+    let closures: Vec<(String, chrono::NaiveDate)> = registre
+        .iter()
+        .filter_map(|(base, uid)| ends.get(base).map(|fin| (uid.clone(), *fin)))
+        .collect();
+    let articles = repo
+        .close_legal_articles(&closures)
+        .await
+        .map_err(|e| anyhow!("close_legal_articles: {e}"))?;
+    tracing::info!(
+        actes = closures.len(),
+        articles,
+        "sync-eu-law : bornes de validité posées"
+    );
+    Ok(())
+}
+
 /// Registre des actes : les datasets `eu-*.json` du corpus dir.
 fn seed_acts(dir: &Path, only: Option<&str>) -> Result<Vec<SeedAct>> {
     let mut seeds = Vec::new();
@@ -246,6 +297,10 @@ fn seed_acts(dir: &Path, only: Option<&str>) -> Result<Vec<SeedAct>> {
     Ok(seeds)
 }
 
+/// Registry refresh window in steady state. Two passes overlap widely, which
+/// catches up a missed chain run with no watermark to corrupt.
+const FENETRE_REGISTRE_JOURS: i64 = 90;
+
 /// Passe `sync-eu-law` : régénère les datasets dont une version consolidée
 /// plus récente est applicable, recharge ces seuls datasets. Deux cadences :
 /// **delta** (défaut en régime — une requête SPARQL liste les consolidations
@@ -262,6 +317,18 @@ pub async fn sync_eu_law(
 ) -> Result<()> {
     let settings = Settings::from_env()?;
     let dir = settings.legal_corpus_dir();
+    // The registry is refreshed before being followed: without this pass, an act
+    // nobody cited never enters. A partial run is debugging and has no business
+    // growing the corpus.
+    if limit.is_none() && only.is_none() {
+        let aujourdhui = chrono::Utc::now().date_naive();
+        super::eu_catalog::sync_eu_catalog(
+            aujourdhui - chrono::Duration::days(FENETRE_REGISTRE_JOURS),
+            aujourdhui,
+            None,
+        )
+        .await?;
+    }
     let mut seeds = seed_acts(&dir, only)?;
 
     let pool =
@@ -330,6 +397,12 @@ pub async fn sync_eu_law(
     let mut manifest = lj_sources::cjue::EuLawManifest::load(&manifest_path)
         .map_err(|e| anyhow!("manifest eu-law: {e}"))?;
     let all_bases: HashSet<String> = seeds.iter().map(|s| s.celex_base.clone()).collect();
+    // Capturé avant le filtre du delta : la borne de validité se pose sur tout
+    // le registre, pas sur les seuls actes que la fenêtre du jour a touchés.
+    let registre: Vec<(String, String)> = seeds
+        .iter()
+        .map(|s| (s.celex_base.clone(), s.doc.text_uid.clone()))
+        .collect();
 
     let client = Arc::new(CjueClient::new());
     let mut mode = "full";
@@ -367,12 +440,15 @@ pub async fn sync_eu_law(
 
     let total = seeds.len();
     if total == 0 {
-        // Delta vide : rien de paru pour le registre, le watermark avance.
+        // Delta vide : rien de paru pour le registre, le watermark avance. La
+        // borne de validité se pose quand même — c'est le cas le plus fréquent,
+        // et une clôture d'acte ne fait paraître aucune consolidation.
+        poser_bornes(&client, &repo, &registre).await?;
         manifest.last_delta_date = Some(today_iso);
         manifest
             .save(&manifest_path)
             .map_err(|e| anyhow!("manifest save: {e}"))?;
-        println!("sync-eu-law : delta vide, rien à recharger.");
+        println!("sync-eu-law : delta vide, bornes de validité posées.");
         return Ok(());
     }
     tracing::info!(total, force, mode, "sync-eu-law : balayage CELLAR");
@@ -465,6 +541,9 @@ pub async fn sync_eu_law(
         }
         super::legal_corpus::run_corpus_finishers(&repo, publie_targets).await?;
     }
+
+    // APRÈS le loader : une régénération réécrirait la fermeture.
+    poser_bornes(&client, &repo, &registre).await?;
 
     tracing::info!(
         total,

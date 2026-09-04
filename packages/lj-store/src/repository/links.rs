@@ -125,6 +125,12 @@ impl DecisionRepository<'_> {
             self.conn
                 .execute(RESOLVE_SQL_FOR_DECISIONS, &[&changed_ids])
                 .await?;
+            self.conn
+                .execute(
+                    resolve_parties_sql(" AND dl.decision_id = ANY($1)").as_str(),
+                    &[&changed_ids],
+                )
+                .await?;
         }
         Ok(changed_ids)
     }
@@ -135,13 +141,18 @@ impl DecisionRepository<'_> {
     /// liens résolus. À appeler en fin d'ingest et par la passe hebdo.
     #[tracing::instrument(name = "db.resolve_pending_decision_links", skip(self), fields(db.system = "postgresql"))]
     pub async fn resolve_pending_decision_links(&self) -> Result<u64> {
-        let n = self.conn.execute(RESOLVE_SQL_ALL, &[]).await?;
+        let mut n = self.conn.execute(RESOLVE_SQL_ALL, &[]).await?;
+        n += self
+            .conn
+            .execute(resolve_parties_sql("").as_str(), &[])
+            .await?;
         Ok(n)
     }
 
     /// Jumeau par CLÉ (sonde inversée) : liens pendants dont le `target_ref`
-    /// est dans le lot — l'index partiel `decision_links_pending_target_idx`
-    /// sert la sonde. Même sémantique d'unicité que le sweep.
+    /// est dans le lot, l'index partiel `decision_links_pending_target_idx`
+    /// servant la sonde. Même sémantique d'unicité que le sweep. La famille
+    /// `ca-parties|` en est absente : sa clé n'égale aucun `canonical_ref`.
     pub(super) async fn resolve_decision_links_by_key(&self, refs: &[String]) -> Result<u64> {
         let n = self.conn.execute(RESOLVE_SQL_FOR_KEYS, &[&refs]).await?;
         Ok(n)
@@ -163,6 +174,49 @@ const RESOLVE_SQL_FOR_KEYS: &str = "
         WHERE d.canonical_ref = dl.target_ref AND d.deleted_at IS NULL
         HAVING count(*) = 1)
     WHERE dl.target_ref = ANY($1) AND dl.target_decision_id IS NULL";
+
+/// Famille `ca-parties|<cour>|<date>` : la cassation nomme la cour et la date de
+/// l'arrêt attaqué, jamais son RG ; les parties tranchent entre les 42 arrêts que
+/// cour et date rendent (1 100 justes, 24 faux sur 3 000, 3,5 ms le lien pendant).
+///
+/// Les personnes physiques sont hors de la jointure : le pseudonyme est
+/// réattribué par décision, donc « Vincent X... » en cassation et
+/// « Vincent X... » en appel sont deux personnes différentes. Le garde de
+/// longueur seul ne suffit pas, il n'écarte que l'ère à deux lettres.
+fn resolve_parties_sql(scope: &str) -> String {
+    format!(
+        "WITH pendant AS (
+             SELECT dl.id AS lien, dl.decision_id AS amont,
+                    split_part(dl.target_ref, '|', 2) AS cour,
+                    split_part(dl.target_ref, '|', 3)::date AS jour
+             FROM decision_links dl
+             WHERE dl.target_decision_id IS NULL
+               AND dl.target_ref LIKE 'ca-parties|%'{scope}
+         ), candidat AS (
+             SELECT p.lien, d.id AS cible
+             FROM pendant p
+             JOIN decisions d
+               ON d.jurisdiction_code = p.cour
+              AND d.date_lecture = p.jour
+              AND d.deleted_at IS NULL
+             WHERE EXISTS (
+                 SELECT 1 FROM decision_party a
+                 JOIN decision_party b
+                   ON b.decision_id = d.id AND b.quality = 'party'
+                  AND b.nature IS DISTINCT FROM 'physique'
+                  AND ((a.entity_uid IS NOT NULL AND a.entity_uid = b.entity_uid)
+                    OR (length(lj_party_fold(a.resolve_key)) >= 4
+                        AND lj_party_fold(a.resolve_key) = lj_party_fold(b.resolve_key)))
+                 WHERE a.decision_id = p.amont AND a.quality = 'party'
+                   AND a.nature IS DISTINCT FROM 'physique')
+         ), tranche AS (
+             SELECT lien, min(cible) AS cible FROM candidat
+             GROUP BY lien HAVING count(DISTINCT cible) = 1
+         )
+         UPDATE decision_links dl SET target_decision_id = t.cible
+         FROM tranche t WHERE dl.id = t.lien"
+    )
+}
 
 const RESOLVE_SQL_ALL: &str = "
     UPDATE decision_links dl

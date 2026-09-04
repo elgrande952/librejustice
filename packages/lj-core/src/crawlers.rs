@@ -178,11 +178,32 @@ pub const CRAWLERS: &[(&str, Category)] = &[
 /// être refusé aux agents auxquels il s'adresse.
 pub const ROBOTS_PATH: &str = "/robots.txt";
 
-/// Chemins soustraits à tout crawler : l'API (JSON + exports PDF/DOCX) et les
-/// pages de résultats, qui sont un espace de crawl infini — le contenu
-/// canonique est `/decision/{id}` et `/texte/{slug}`, publiés au sitemap.
-const DISALLOW_API: &str = "/api/";
+/// Chemins des sitemaps — l'index puis le préfixe des sous-fichiers. Servis par
+/// `lj-api`, réservés aux bots vérifiés par une règle WAF : la route et la règle
+/// lisent les mêmes constantes.
+pub const SITEMAP_PATH: &str = "/sitemap.xml";
+pub const SITEMAPS_PREFIX: &str = "/sitemaps/";
+
+/// Paths withheld from every crawler: the browser's JSON surface with its
+/// PDF/DOCX exports, and the result pages, an infinite crawl space whose
+/// canonical content is `/decision/{id}` and `/texte/{slug}`, both in the
+/// sitemap. `/api/` left this table when the keyed public surface moved in: a URL
+/// the guide sends integrators to cannot be forbidden here.
+const DISALLOW_API: [&str; 1] = ["/internal/"];
 const DISALLOW_SEARCH: [&str; 2] = ["/decisions?", "/textes?"];
+
+/// Seul des deux culs-de-sac à porter aussi une règle WAF : la règle et le
+/// `robots.txt` lisent la même constante.
+pub const FEEDBACK_PATH: &str = "/feedback";
+
+/// Écrans qui se pointent l'un l'autre : la barre pose `/login?next=<page>`, le
+/// pied `/feedback?from=<page>`, et `/feedback` porte les deux, donc un client qui
+/// ne dédoublonne pas rebondit sans fin. Mesuré le 23/08/2026 : 34 308 requêtes.
+const DISALLOW_DEAD_ENDS: [&str; 2] = ["/login", FEEDBACK_PATH];
+
+fn disallow_crawl_space() -> impl Iterator<Item = &'static str> {
+    DISALLOW_SEARCH.into_iter().chain(DISALLOW_DEAD_ENDS)
+}
 
 fn uas_of(category: Category) -> impl Iterator<Item = &'static str> {
     CRAWLERS
@@ -197,8 +218,10 @@ pub fn robots_txt(sitemap_url: &str) -> String {
 
     out.push_str("User-agent: *\n");
     out.push_str("Content-Signal: search=yes, ai-input=yes, ai-train=no\n");
-    out.push_str(&format!("Disallow: {DISALLOW_API}\n"));
-    for path in DISALLOW_SEARCH {
+    for path in DISALLOW_API {
+        out.push_str(&format!("Disallow: {path}\n"));
+    }
+    for path in disallow_crawl_space() {
         out.push_str(&format!("Disallow: {path}\n"));
     }
     out.push_str("Allow: /\n");
@@ -219,11 +242,14 @@ pub fn robots_txt(sitemap_url: &str) -> String {
             out.push_str("Disallow: /\n");
             continue;
         }
-        out.push_str(&format!("Disallow: {DISALLOW_API}\n"));
+        for path in DISALLOW_API {
+            out.push_str(&format!("Disallow: {path}\n"));
+        }
         // Un aperçu de lien porte sur l'URL qu'une personne a partagée, y
-        // compris une recherche : seule l'API lui reste fermée.
+        // compris une recherche ou un écran d'application : seule l'API lui
+        // reste fermée.
         if category != Category::LinkPreview {
-            for path in DISALLOW_SEARCH {
+            for path in disallow_crawl_space() {
                 out.push_str(&format!("Disallow: {path}\n"));
             }
         }
@@ -248,7 +274,7 @@ pub fn waf_deny_all_expression() -> String {
     )
 }
 
-/// Expression WAF du refus de `/api/` aux crawlers autorisés ailleurs.
+/// Expression WAF du refus des surfaces JSON aux crawlers autorisés ailleurs.
 ///
 /// Les catégories refusées partout sont hors de cette expression : elles sont déjà
 /// couvertes.
@@ -257,10 +283,12 @@ pub fn waf_deny_api_expression() -> String {
         .chain(uas_of(Category::UserFetch))
         .chain(uas_of(Category::Tooling))
         .chain(uas_of(Category::LinkPreview));
-    format!(
-        "(starts_with(http.request.uri.path, \"{DISALLOW_API}\")) and ({})",
-        ua_clause(uas)
-    )
+    let paths = DISALLOW_API
+        .iter()
+        .map(|path| format!("starts_with(http.request.uri.path, \"{path}\")"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    format!("({paths}) and ({})", ua_clause(uas))
 }
 
 #[cfg(test)]
@@ -378,9 +406,35 @@ mod tests {
         for group in txt.split("\n\n") {
             let allows = group.contains("Allow: /\n");
             if allows {
-                assert!(
-                    group.contains("Disallow: /api/"),
-                    "groupe autorisé sans exclusion de /api/ :\n{group}"
+                for path in DISALLOW_API {
+                    assert!(
+                        group.contains(&format!("Disallow: {path}\n")),
+                        "groupe autorisé sans exclusion de {path} :\n{group}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Un aperçu de lien garde les culs-de-sac : quelqu'un qui colle
+    /// `librejustice.fr/login` dans un salon doit obtenir sa vignette.
+    #[test]
+    fn robots_ferme_les_culs_de_sac_sauf_a_l_apercu_de_lien() {
+        let txt = robots_txt("https://librejustice.fr/sitemap.xml");
+        let apercu = format!(
+            "User-agent: {}\n",
+            uas_of(Category::LinkPreview).next().unwrap()
+        );
+        for group in txt.split("\n\n") {
+            if !group.contains("Allow: /\n") {
+                continue;
+            }
+            let attendu = !group.contains(&apercu);
+            for path in DISALLOW_DEAD_ENDS {
+                assert_eq!(
+                    group.contains(&format!("Disallow: {path}\n")),
+                    attendu,
+                    "{path} mal traité dans :\n{group}"
                 );
             }
         }
@@ -416,7 +470,13 @@ mod tests {
                 assert!(deny_api.contains(&needle), "{ua} absent du refus /api/");
             }
         }
-        assert!(deny_api.starts_with("(starts_with(http.request.uri.path, \"/api/\"))"));
+        let (paths, _) = deny_api.split_once(") and (").expect("deux groupes");
+        for path in DISALLOW_API {
+            assert!(
+                paths.contains(&format!("starts_with(http.request.uri.path, \"{path}\")")),
+                "{path} absent du groupe de chemins : {paths}"
+            );
+        }
     }
 
     #[test]

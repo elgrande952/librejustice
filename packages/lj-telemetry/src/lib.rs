@@ -1,23 +1,17 @@
 //! Telemetrie partagee : subscriber tracing + export DIRECT vers la gateway
 //! OTLP Grafana Cloud (traces + logs + metriques), HTTP/protobuf + Basic Auth.
 //!
-//! Crate consommee par les binaires `lj-api` (serveur axum, long-vivant) et
-//! `lj-ingest` (cron, court-vivant). Trois roles :
+//! Trois roles :
 //!
-//! - export OTLP/HTTP des 3 signaux vers un endpoint unique (`/otlp`), avec
-//!   l'en-tete `Authorization: Basic base64(<otlp_user>:<api_key>)` ;
-//! - scrub PII des spans avant export via un [`ScrubbingSpanProcessor`] :
-//!   suppression IP / `db.statement`, troncature des query-strings d'URL ;
+//! - export OTLP/HTTP des 3 signaux vers un endpoint unique, en Basic Auth ;
+//! - scrub PII des spans avant export ([`ScrubbingSpanProcessor`]) : IP et
+//!   `db.statement` retires, query-strings tronquees ;
 //!   `librejustice.search.query` est conserve ;
-//! - echantillonnage par tete : `ParentBased` sur [`UnattendedRootSampler`],
-//!   qui abandonne la trace d'un crawl non surveille des son span racine
-//!   ([`unattended_request_span`]).
+//! - echantillonnage par tete ([`RootSampler`]), qui abandonne la trace d'un
+//!   crawl non surveille des son span racine.
 //!
-//! L'activation OTel = presence des credentials Grafana ([`InitOpts::otlp`]).
-//! Sans eux, on reste sur un simple subscriber fmt (dev local).
-//!
-//! Court-vivant (cron) : [`init`] renvoie un [`TelemetryGuard`] dont le `Drop`
-//! flush les batch processors.
+//! Sans credentials Grafana, on reste sur un simple subscriber fmt. En
+//! court-vivant, [`init`] rend un [`TelemetryGuard`] dont le `Drop` flush.
 
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
@@ -70,6 +64,14 @@ pub struct InitOpts {
     pub service_name: String,
     /// `deployment.environment` du `Resource` (ex. `prod`), si pose.
     pub deployment_environment: Option<String>,
+    /// `host.name` du `Resource` : la **machine**. A defaut, le hostname du
+    /// noyau, qui vaut l'identifiant du conteneur des qu'on tourne dedans — d'ou
+    /// l'override, pose par le compose.
+    pub host_name: Option<String>,
+    /// `container.name` du `Resource`, pose par le compose et donc **absent**
+    /// d'un lancement sur l'hote : c'est ce qui distingue la chaine du cron d'un
+    /// tir a la main.
+    pub container_name: Option<String>,
     /// Plancher du bridge logs -> LogRecords OTLP (Loki), par cible. L'API reste
     /// sur `WARN` par defaut et n'ouvre `INFO` que sur sa cible d'usage ; l'ingest
     /// passe tout a `INFO` pour exporter les breadcrumbs de cycle de vie
@@ -112,14 +114,18 @@ struct OtlpExport {
 }
 
 impl OtlpExport {
-    fn new(creds: OtlpCreds, service_name: &str, deployment_environment: Option<&str>) -> Self {
+    fn new(creds: OtlpCreds, opts: &InitOpts) -> Self {
         let token = STANDARD.encode(format!("{}:{}", creds.user, creds.api_key));
-        let mut attrs = vec![KeyValue::new("host.name", hostname())];
-        if let Some(env) = deployment_environment {
-            attrs.push(KeyValue::new("deployment.environment", env.to_string()));
+        let host = opts.host_name.clone().unwrap_or_else(hostname);
+        let mut attrs = vec![KeyValue::new("host.name", host)];
+        if let Some(env) = &opts.deployment_environment {
+            attrs.push(KeyValue::new("deployment.environment", env.clone()));
+        }
+        if let Some(nom) = &opts.container_name {
+            attrs.push(KeyValue::new("container.name", nom.clone()));
         }
         let resource = Resource::builder()
-            .with_service_name(service_name.to_string())
+            .with_service_name(opts.service_name.clone())
             .with_attributes(attrs)
             .build();
         Self {
@@ -144,7 +150,7 @@ impl OtlpExport {
 /// Installe le subscriber tracing global et, si [`InitOpts::otlp`] est fourni,
 /// branche l'export OTLP/HTTP des traces + logs + metriques. Renvoie un guard de
 /// flush a garder vivant jusqu'a la fin du process.
-pub fn init(opts: InitOpts) -> Result<TelemetryGuard> {
+pub fn init(mut opts: InitOpts) -> Result<TelemetryGuard> {
     let fmt_layer = if opts.json {
         tracing_subscriber::fmt::layer()
             .json()
@@ -154,7 +160,7 @@ pub fn init(opts: InitOpts) -> Result<TelemetryGuard> {
         tracing_subscriber::fmt::layer().with_target(true).boxed()
     };
 
-    let Some(creds) = opts.otlp else {
+    let Some(creds) = opts.otlp.take() else {
         tracing_subscriber::registry()
             .with(opts.filter)
             .with(fmt_layer)
@@ -162,11 +168,7 @@ pub fn init(opts: InitOpts) -> Result<TelemetryGuard> {
         return Ok(TelemetryGuard::default());
     };
 
-    let export = OtlpExport::new(
-        creds,
-        &opts.service_name,
-        opts.deployment_environment.as_deref(),
-    );
+    let export = OtlpExport::new(creds, &opts);
 
     let tracer_provider = build_tracer_provider(&export)?;
     let meter_provider = build_meter_provider(&export)?;
@@ -208,13 +210,13 @@ pub fn meter() -> opentelemetry::metrics::Meter {
 
 /// Attribut qui marque le span racine d'une requete servie a un crawl non
 /// surveille. Ecrit par [`unattended_request_span`], lu par
-/// [`UnattendedRootSampler`] — les deux doivent nommer la meme cle.
+/// [`RootSampler`] — les deux doivent nommer la meme cle.
 const UNATTENDED_KEY: &str = "librejustice.unattended";
 
 /// Span racine d'une requete servie a un crawl non surveille.
 ///
 /// C'est ici, et une seule fois par requete, que se prend la decision de ne pas
-/// tracer : [`UnattendedRootSampler`] y lit [`UNATTENDED_KEY`] et repond `Drop`.
+/// tracer : [`RootSampler`] y lit [`UNATTENDED_KEY`] et repond `Drop`.
 /// Le `SpanContext` non echantillonne qui en resulte porte la decision a toute
 /// la descendance via `ParentBased` — les `db.*` du rendu SSR compris.
 ///
@@ -227,20 +229,32 @@ pub fn unattended_request_span() -> tracing::Span {
     tracing::info_span!("http.request", librejustice.unattended = true)
 }
 
-/// Delegue racine du `ParentBased` : abandonne une trace dont le span racine
-/// porte [`UNATTENDED_KEY`], echantillonne toutes les autres.
+/// Prefixe des spans d'acces base. Un tel span qui se retrouve RACINE n'a aucun
+/// contexte : ni requete, ni etape de chaine. Voir [`RootSampler`].
+const DB_SPAN_PREFIX: &str = "db.";
+
+/// Delegue racine du `ParentBased`. Deux regles, toutes deux sur le span racine :
+/// abandon si le span porte [`UNATTENDED_KEY`], abandon si son nom commence par
+/// [`DB_SPAN_PREFIX`]. Tout le reste est echantillonne.
+///
+/// La seconde vise l'ingest, qui appelle le depot ligne par ligne sans envelopper
+/// ses commandes dans un span : chaque acces y forme une trace d'un seul span,
+/// que rien ne rattache a une execution, et 500/s saturent l'export. Cote serveur
+/// ces memes spans ont toujours le span de requete pour parent, donc ils ne
+/// passent pas ici — mesure : 16 traces racines `db.*` par heure contre 30 979
+/// pour l'ingest.
 ///
 /// Un span qui a deja un parent ne passe pas ici — `ParentBased` suit alors le
 /// bit `sampled` du parent.
 #[derive(Debug, Clone)]
-struct UnattendedRootSampler;
+struct RootSampler;
 
-impl ShouldSample for UnattendedRootSampler {
+impl ShouldSample for RootSampler {
     fn should_sample(
         &self,
         _parent_context: Option<&Context>,
         _trace_id: TraceId,
-        _name: &str,
+        name: &str,
         _span_kind: &SpanKind,
         attributes: &[KeyValue],
         _links: &[Link],
@@ -249,7 +263,7 @@ impl ShouldSample for UnattendedRootSampler {
             .iter()
             .any(|kv| kv.key.as_str() == UNATTENDED_KEY && kv.value == Value::Bool(true));
         SamplingResult {
-            decision: if unattended {
+            decision: if unattended || name.starts_with(DB_SPAN_PREFIX) {
                 SamplingDecision::Drop
             } else {
                 SamplingDecision::RecordAndSample
@@ -262,7 +276,7 @@ impl ShouldSample for UnattendedRootSampler {
 
 /// Sampler du provider de traces.
 fn sampler() -> Sampler {
-    Sampler::ParentBased(Box::new(UnattendedRootSampler))
+    Sampler::ParentBased(Box::new(RootSampler))
 }
 
 /// Construit le `TracerProvider` OTLP/HTTP et le pose en global. Le
@@ -382,9 +396,13 @@ impl SpanProcessor for ScrubbingSpanProcessor {
     }
 }
 
-/// Nom d'hote, best-effort.
+/// Nom d'hote, lu du noyau : un shell non interactif et une unite systemd
+/// n'exportent pas `HOSTNAME`, si bien que tout ce qui tourne hors conteneur
+/// s'etiquetait « unknown » — 6 488 lignes sur 24 h, mesure du 12/08/2026.
 fn hostname() -> String {
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|nom| nom.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 #[cfg(test)]

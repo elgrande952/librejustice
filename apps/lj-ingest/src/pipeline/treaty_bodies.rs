@@ -142,7 +142,8 @@ async fn backfill_jorf(
                 }
                 match lj_extract::jorf::parse_jorf_struct(&raw) {
                     Ok(s) => {
-                        h.orders.insert(s.jorftext, s.article_ids);
+                        h.orders
+                            .insert(s.jorftext, s.articles.into_iter().map(|a| a.id).collect());
                     }
                     Err(e) => {
                         tracing::error!(member = %name, error = %e, "jorf struct: parse échec");

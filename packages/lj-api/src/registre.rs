@@ -24,6 +24,10 @@ use crate::state::AppState;
 
 /// Timeout par appel amont — au-delà, la section dégrade (absente du rendu).
 pub(crate) const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
+/// Seuil au-delà duquel un appel amont RÉUSSI laisse une ligne : 25× le p50
+/// mesuré (41 ms), donc rien au régime normal, et un amont qui dérive vers le
+/// budget se voit avant d'échouer.
+const UPSTREAM_LENT: Duration = Duration::from_millis(1000);
 /// Annonces affichées sur la fiche (le total réel est renvoyé à part).
 const ANNONCES_LIMIT: usize = 10;
 
@@ -336,6 +340,9 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     url: &str,
     query: &[(&str, &str)],
 ) -> std::result::Result<T, ()> {
+    // Sans la durée, un budget épuisé et un TCP refusé s'écrivent pareil, et
+    // l'épisode suivant se rediscute sans chiffre.
+    let t = std::time::Instant::now();
     let response = state
         .registre_http
         .get(url)
@@ -343,7 +350,23 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| tracing::warn!(url, kind = upstream_kind(&e), error = %chain(&e), "registre upstream failed"))?;
+        .map_err(|e| {
+            tracing::warn!(
+                url,
+                kind = upstream_kind(&e),
+                elapsed_ms = t.elapsed().as_millis() as u64,
+                error = %chain(&e),
+                "registre upstream failed"
+            )
+        })?;
+    let elapsed = t.elapsed();
+    if elapsed >= UPSTREAM_LENT {
+        tracing::warn!(
+            url,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "registre upstream lent"
+        );
+    }
     response
         .json::<T>()
         .await

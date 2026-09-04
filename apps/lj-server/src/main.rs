@@ -12,7 +12,7 @@ use axum::Router;
 use axum_tracing_opentelemetry::middleware::OtelAxumLayer;
 use leptos::prelude::*;
 use leptos_axum::{generate_route_list, LeptosRoutes};
-use lj_api::{config::Settings, pg_metrics, state::AppState, telemetry};
+use lj_api::{config::Settings, host_metrics, pg_metrics, state::AppState, telemetry};
 use lj_store::db;
 use lj_web::app::{shell, App};
 use std::pin::Pin;
@@ -48,6 +48,7 @@ async fn run() -> Result<()> {
     let settings = Settings::from_env()?;
     // Guard à garder vivant : son `Drop` flush les batch processors OTLP.
     let _telemetry_guard = telemetry::init_telemetry(&settings)?;
+    install_panic_hook();
     // À poser avant la première requête : sinon `leptos_axum` installe l'exécuteur
     // tokio nu, qui perd le span courant à chaque resource.
     tracing_executor::install()?;
@@ -55,11 +56,18 @@ async fn run() -> Result<()> {
     let pool = db::build_pool(&settings.db_url, settings.pool_max)?;
     let state = AppState::build(Arc::new(settings.clone()), pool);
 
-    if settings.grafana_otlp_endpoint.is_some()
-        && settings.grafana_otlp_user.is_some()
-        && settings.grafana_cloud_api_key.is_some()
-    {
+    tokio::spawn(lj_api::cache_metrics::run(state.clone()));
+    if settings.scrapes_shared_resources() {
         tokio::spawn(pg_metrics::run(state.pool.clone()));
+        tokio::spawn(host_metrics::run());
+    } else {
+        tracing::info!(
+            env = settings
+                .deployment_environment
+                .as_deref()
+                .unwrap_or("(absent)"),
+            "scrapers de ressources partagées inactifs"
+        );
     }
 
     {
@@ -123,15 +131,6 @@ async fn run() -> Result<()> {
         axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
 
-    // Libs vendorées (`/vendor`) : chaque bundle porte sa version épinglée dans son
-    // nom, donc l'URL est aussi immuable que celles de `/pkg`.
-    let vendor_dir = std::path::Path::new(&leptos_options.site_root.to_string()).join("vendor");
-    let vendor_service = SetResponseHeader::overriding(
-        ServeDir::new(vendor_dir),
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
-    );
-
     // Routeur SSR Leptos : l'`AppState` est fourni au contexte de chaque requête (le
     // client SSR `lj-web` l'y lit pour appeler la couche service in-process). Le
     // fallback reçoit le même contexte : le Router Leptos matche les chemins à slash
@@ -183,6 +182,10 @@ async fn run() -> Result<()> {
         // Racine de trace des pages SSR ; dans l'ordre `.layer`, le dernier est le plus
         // externe. `OtelAxumLayer` ouvre le span serveur semconv (`{method} {route}`,
         // `http.response.status_code`), `body_in_request_span` l'étend au rendu du corps.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            lj_api::page_gates::session_gates,
+        ))
         .layer(axum::middleware::from_fn(body_in_request_span))
         .layer(OtelAxumLayer::default());
 
@@ -190,8 +193,32 @@ async fn run() -> Result<()> {
     // file-handler Leptos qui catch-all) + redirection `/mcp` → `/mcp/`.
     // `CompressionLayer` (br + gzip, négociés via `Accept-Encoding`) pour les réponses
     // dynamiques (HTML SSR, JSON API) ; elle saute les réponses déjà encodées.
+    // Identité du bundle servi, posée sur les réponses `/api` que rien ne peut
+    // resservir depuis un cache : un onglet ouvert avant un déploiement voit la
+    // valeur changer et propose de recharger (`lj_web::app::BANDEAU`).
+    let mut api = lj_api::routes::build_router(state.clone(), true);
+    if let Some(build) = front_build_id() {
+        let nom = axum::http::HeaderName::from_static("x-lj-front-build");
+        api = api.layer(axum::middleware::map_response(
+            move |mut resp: axum::response::Response| {
+                let (nom, build) = (nom.clone(), build.clone());
+                async move {
+                    let cachable = resp
+                        .headers()
+                        .get(axum::http::header::CACHE_CONTROL)
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| v.contains("public"));
+                    if !cachable {
+                        resp.headers_mut().insert(nom, build);
+                    }
+                    resp
+                }
+            },
+        ));
+    }
+
     let app = leptos_router
-        .merge(lj_api::routes::build_router(state.clone(), true))
+        .merge(api)
         .route(
             "/mcp",
             axum::routing::get(|| async { axum::response::Redirect::temporary("/mcp/") }),
@@ -203,40 +230,44 @@ async fn run() -> Result<()> {
             "/recherche-decisions",
             redirect_preserving_query("/decisions"),
         )
+        .route("/recherche-textes", redirect_preserving_query("/textes"))
         .route(
-            "/recherche-textes",
-            axum::routing::get(|raw: axum::extract::RawQuery| async move {
-                let parts: Vec<String> = raw
-                    .0
-                    .as_deref()
-                    .unwrap_or("")
-                    .split('&')
-                    .filter(|p| !p.is_empty())
-                    .map(|p| match p.strip_prefix("source=") {
-                        Some(v) => format!("origine={v}"),
-                        None => p.to_string(),
-                    })
-                    .collect();
-                let target = if parts.is_empty() {
-                    "/textes".to_string()
-                } else {
-                    format!("/textes?{}", parts.join("&"))
-                };
-                axum::response::Redirect::permanent(&target)
-            }),
+            "/mentions-legales",
+            redirect_preserving_query("/legal-notice"),
         )
-        // Activité : une route explicite par onglet sous `/activite/` ; `/activite` nu
-        // redirige vers l'onglet recherches.
+        .route("/confidentialite", redirect_preserving_query("/privacy"))
+        // Routes d'auth renommées en anglais : les liens français dorment encore
+        // dans des boîtes mail et des favoris, la query (jeton, next) doit
+        // survivre au 308.
+        .route("/confirmer", redirect_preserving_query("/confirm"))
         .route(
-            "/activite",
-            redirect_preserving_query("/activite/recherches"),
+            "/reinitialiser-mot-de-passe",
+            redirect_preserving_query("/reset-password"),
+        )
+        .route("/profil", redirect_preserving_query("/profile"))
+        .route("/connexion", redirect_preserving_query("/login-link"))
+        // Activité : une route explicite par onglet sous `/activity/` ; `/activity` nu
+        // redirige vers l'onglet recherches.
+        .route("/activity", redirect_preserving_query("/activity/searches"))
+        .route("/activite", redirect_preserving_query("/activity/searches"))
+        .route(
+            "/activite/recherches",
+            redirect_preserving_query("/activity/searches"),
+        )
+        .route(
+            "/activite/signets",
+            redirect_preserving_query("/activity/bookmarks"),
+        )
+        .route(
+            "/activite/lectures",
+            redirect_preserving_query("/activity/readings"),
         )
         .route(
             "/recherches",
-            redirect_preserving_query("/activite/recherches"),
+            redirect_preserving_query("/activity/searches"),
         )
-        .route("/signets", redirect_preserving_query("/activite/signets"))
-        .route("/lectures", redirect_preserving_query("/activite/lectures"))
+        .route("/signets", redirect_preserving_query("/activity/bookmarks"))
+        .route("/lectures", redirect_preserving_query("/activity/readings"))
         .route(
             "/codes",
             axum::routing::get(|| async { axum::response::Redirect::permanent("/normes/codes") }),
@@ -256,7 +287,6 @@ async fn run() -> Result<()> {
         )
         .nest_service("/pkg", pkg_service)
         .nest_service("/fonts", fonts_service)
-        .nest_service("/vendor", vendor_service)
         .layer(CompressionLayer::new())
         .layer(axum::middleware::from_fn(html_cache_policy))
         .layer(axum::middleware::from_fn(security_headers))
@@ -283,6 +313,23 @@ async fn run() -> Result<()> {
         .serve(app.into_make_service())
         .await?;
     Ok(())
+}
+
+/// Hook de panique : logge la panique en `error!` — donc shippée vers Loki par le
+/// bridge — avant de déléguer au hook par défaut. Sans lui, une panique n'écrit que
+/// sur stderr, qui ne quitte jamais le serveur : le `podman logs` de la prod est le
+/// seul endroit où elle existe. Le backtrace part dans le `LogRecord` plutôt que sur
+/// stderr seul, et ne nomme ses frames que tant que le binaire garde ses symboles.
+fn install_panic_hook() {
+    let defaut = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(
+            panic = %info,
+            backtrace = %std::backtrace::Backtrace::force_capture(),
+            "panic lj-server"
+        );
+        defaut(info);
+    }));
 }
 
 /// Fenêtre laissée aux requêtes en vol après le signal d'arrêt. Tenue **sous** le
@@ -327,11 +374,17 @@ async fn pageview_span(
             .get(axum::http::header::ACCEPT)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|a| a.contains("text/html"));
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().host())
+        .map(normalized_host);
     let external_referer = req
         .headers()
         .get(axum::http::header::REFERER)
         .and_then(|v| v.to_str().ok())
-        .filter(|r| !r.contains("librejustice.fr"))
+        .filter(|r| referer_is_external(r, host.as_deref()))
         .map(str::to_owned);
     let Some(referer) = external_referer.filter(|_| is_document) else {
         return next.run(req).await;
@@ -479,6 +532,32 @@ fn client_kind(user_agent: &str, headers: &axum::http::HeaderMap) -> &'static st
     }
 }
 
+fn normalized_host(authority: &str) -> String {
+    let without_port = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map_or(rest, |(host, _)| host),
+        None => authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host),
+    };
+    let bare = without_port.strip_prefix("www.").unwrap_or(without_port);
+    bare.to_ascii_lowercase()
+}
+
+fn referer_is_external(referer: &str, host: Option<&str>) -> bool {
+    let Some(authority) = referer
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .filter(|a| !a.is_empty())
+    else {
+        return false;
+    };
+    let referrer_host = normalized_host(authority.rsplit_once('@').map_or(authority, |(_, h)| h));
+    if referrer_host == "localhost" || referrer_host == "::1" || referrer_host.starts_with("127.") {
+        return false;
+    }
+    host != Some(referrer_host.as_str())
+}
+
 /// Famille du navigateur — `edge` | `chrome` | `firefox` | `safari` | `other`.
 /// L'ordre des tests est imposé par l'imbrication des UA : Edge se déclare aussi
 /// `chrome` et `safari`, Chrome se déclare aussi `safari`.
@@ -544,18 +623,15 @@ async fn security_headers(
     resp
 }
 
-/// Politique de cache **par défaut** des documents HTML : posée uniquement sur les
-/// pages qui n'ont pas déjà la leur (décision / texte / code / entité fixent 7 j de
-/// CDN via `ResponseOptions`).
+/// Politique de cache **par défaut** des documents HTML : `private, no-store`
+/// pour toute page qui ne déclare pas la sienne. Une page publique pose son
+/// `Cache-Control` via `ResponseOptions` (décision / texte / entité : 7 j de
+/// CDN ; accueil, recherche, pages statiques : 5 min).
 ///
-/// Une URL de page est son identité et ne peut pas être content-hashée. Deux
-/// leviers, que ce header pose tous les deux : `max-age=0, must-revalidate` fait
-/// revalider le navigateur à chaque navigation, et `s-maxage` laisse le CDN
-/// absorber le trafic, purgé à chaque déploiement.
-///
-/// Sûr pour un cache partagé : le rendu SSR ne dépend d'aucune identité (la session
-/// vit en `localStorage`, lue après hydratation), donc deux visiteurs reçoivent le
-/// même document pour la même URL.
+/// Le défaut protège, il n'optimise pas : la session est un cookie `HttpOnly`
+/// lisible au rendu, donc une page peut personnaliser son HTML. L'oubli d'un
+/// en-tête doit produire une page non cachée, jamais une identité servie à un
+/// autre visiteur depuis un cache partagé.
 async fn html_cache_policy(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -573,12 +649,31 @@ async fn html_cache_policy(
     {
         resp.headers_mut().insert(
             axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static(
-                "public, max-age=0, must-revalidate, s-maxage=300",
-            ),
+            axum::http::HeaderValue::from_static("private, no-store"),
         );
     }
     resp
+}
+
+/// Identité du bundle front servi, lue dans `hash.txt` à côté du binaire — là où
+/// leptos le lit. `None` en dev, où le fichier n'existe pas : aucun en-tête posé,
+/// mécanisme inerte.
+fn front_build_id() -> Option<axum::http::HeaderValue> {
+    let fichier = std::env::current_exe().ok()?.parent()?.join("hash.txt");
+    let id = build_id(&std::fs::read_to_string(fichier).ok()?)?;
+    axum::http::HeaderValue::from_str(&id).ok()
+}
+
+/// Empreintes `wasm` et `css` de `hash.txt`. Le `js` n'identifie pas un build :
+/// deux compilations au Rust différent rendent la même empreinte de glue.
+fn build_id(hash_txt: &str) -> Option<String> {
+    let champ = |cle: &str| {
+        hash_txt.lines().find_map(|ligne| {
+            let (k, v) = ligne.split_once(':')?;
+            (k.trim() == cle).then(|| v.trim())
+        })
+    };
+    Some(format!("{}.{}", champ("wasm")?, champ("css")?))
 }
 
 /// Route GET répondant un 308 vers `target`, query string préservée telle quelle.
@@ -594,7 +689,10 @@ fn redirect_preserving_query(target: &'static str) -> axum::routing::MethodRoute
 
 #[cfg(test)]
 mod tests {
-    use super::{body_in_request_span, browser_family, client_kind, SpannedBody};
+    use super::{
+        body_in_request_span, browser_family, build_id, client_kind, referer_is_external,
+        SpannedBody,
+    };
     use axum::body::{Body, Bytes, HttpBody};
     use axum::http::HeaderMap;
     use std::pin::Pin;
@@ -646,6 +744,30 @@ mod tests {
     }
 
     #[test]
+    fn une_arrivee_vient_d_un_autre_hote_et_jamais_d_une_boucle_locale() {
+        let servi = Some("exemple.test");
+        assert!(referer_is_external("https://www.google.com/", servi));
+        assert!(referer_is_external(
+            "android-app://com.linkedin.android/",
+            servi
+        ));
+        assert!(!referer_is_external(
+            "https://exemple.test/decisions?q=a",
+            servi
+        ));
+        assert!(!referer_is_external("https://www.exemple.test/", servi));
+        assert!(!referer_is_external(
+            "http://127.0.0.1:3000/decisions?q=a",
+            servi
+        ));
+        assert!(!referer_is_external("http://localhost:3000/", servi));
+        assert!(!referer_is_external("http://[::1]:3000/", servi));
+        assert!(!referer_is_external("pas une url", servi));
+        assert!(referer_is_external("https://exemple.test/", None));
+        assert!(!referer_is_external("http://127.0.0.1:3000/", None));
+    }
+
+    #[test]
     fn familles_dans_l_ordre_d_imbrication() {
         assert_eq!(
             browser_family(
@@ -669,6 +791,18 @@ mod tests {
             "firefox"
         );
         assert_eq!(browser_family("guzzlehttp/7"), "other");
+    }
+
+    /// Spec de l'identité de bundle : elle change dès qu'un des deux artefacts
+    /// hydratés change, et ignore l'empreinte de la glue JS, que deux builds au
+    /// Rust différent partagent.
+    #[test]
+    fn identite_du_bundle_ignore_la_glue_js() {
+        let a = "js: GGGG\nwasm: WWWW\ncss: CCCC\n";
+        assert_eq!(build_id(a).as_deref(), Some("WWWW.CCCC"));
+        assert_ne!(build_id(a), build_id("js: GGGG\nwasm: XXXX\ncss: CCCC\n"));
+        assert_ne!(build_id(a), build_id("js: GGGG\nwasm: WWWW\ncss: DDDD\n"));
+        assert_eq!(build_id("js: GGGG"), None);
     }
 
     /// Couche `tracing` d'observation : enregistre les fermetures de spans, dans

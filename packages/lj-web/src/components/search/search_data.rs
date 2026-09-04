@@ -4,16 +4,17 @@
 //! `QueryClient::resource` : SWR par clé `(query, filtres, page)`, dédup des nav
 //! vers la même recherche.
 //!
-//! `run_search` est `Send` sous SSR (reqwest tokio, auth no-op) et `!Send` sous
-//! wasm (le client HTTP fait `get_access_token().await`, un `JsFuture`). On le
-//! passe à travers `sendable` (identité sous SSR ; `SendWrapper` sous wasm) pour
-//! satisfaire la borne `Send` de `resource`. La recherche SSR est anonyme.
+//! `run_search` est `Send` sous SSR (reqwest tokio) et `!Send` sous wasm (le
+//! client HTTP est le `fetch` du navigateur, dont la future tient des `JsValue`).
+//! On le passe à travers `sendable` (identité sous SSR ; `SendWrapper` sous wasm)
+//! pour satisfaire la borne `Send` de `resource`. La recherche SSR est anonyme.
 
 use std::collections::HashSet;
 
+use crate::api::client::SearchFailure;
 use leptos::prelude::*;
 use leptos_fetch::{QueryClient, QueryScope};
-use lj_dtos::SearchResponse;
+use lj_dtos::{SearchCountResponse, SearchResponse};
 
 use crate::api::ApiClient;
 use crate::pages::decision_page::data::sendable;
@@ -32,8 +33,11 @@ pub fn provide_seen_search_keys() {
     provide_context(SeenSearchKeys(StoredValue::new(HashSet::new())));
 }
 
-/// Résultat d'une recherche : la réponse, ou un message d'erreur.
-pub type SearchResult = Result<SearchResponse, String>;
+/// Résultat d'une recherche : la réponse, ou de quoi le dire à l'utilisateur.
+pub type SearchResult = Result<SearchResponse, SearchFailure>;
+
+/// Résultat du décompte, qui arrive après la liste.
+pub type CountResult = Result<SearchCountResponse, SearchFailure>;
 
 /// Effectue une recherche via le client API (base URL résolue par cible).
 async fn run_search(key: SearchKey) -> SearchResult {
@@ -42,7 +46,21 @@ async fn run_search(key: SearchKey) -> SearchResult {
     client
         .search(&request, lj_dtos::SearchContext::User)
         .await
-        .map_err(|e| e.message)
+        .map_err(|e| {
+            #[cfg(feature = "hydrate")]
+            crate::incident::signaler_recherche_refusee(e.status);
+            SearchFailure::from_error(&e, &key.query)
+        })
+}
+
+/// Décompte et facettes : second appel, lancé en même temps que la recherche.
+async fn run_count(key: SearchKey) -> CountResult {
+    let client = ApiClient::from_context();
+    let request = request_from_key(&key);
+    client
+        .search_count(&request)
+        .await
+        .map_err(|e| SearchFailure::from_error(&e, &key.query))
 }
 
 /// Scope de cache partagé : `QueryScope::new` dérive sa `cache_key` du `TypeId`
@@ -53,28 +71,29 @@ fn search_scope() -> QueryScope<SearchKey, SearchResult> {
     QueryScope::new(|key: SearchKey| sendable(run_search(key)))
 }
 
-/// Clé « enabled » : `None` quand la requête est vide → la recherche n'est pas
-/// lancée.
-fn enabled_key(key: Signal<SearchKey>) -> Option<SearchKey> {
-    let k = key.get();
-    if k.query.is_empty() {
-        None
-    } else {
-        Some(k)
-    }
-}
-
-/// `Resource` de recherche, clé sur l'état URL. La valeur est
-/// `Option<SearchResult>` : `None` quand la requête est vide, sinon le résultat.
+/// `Resource` de recherche, clé sur l'état URL. Une requête vide n'est pas un
+/// état inerte : c'est le mode parcours, servi par le même appel.
 /// SSR-streamable : prime la liste côté serveur tout en conservant le cache SWR
 /// client.
-pub fn search_resource(key: Signal<SearchKey>) -> Resource<Option<SearchResult>> {
+pub fn search_resource(key: Signal<SearchKey>) -> Resource<SearchResult> {
     let client = expect_context::<QueryClient>();
     // Non-bloquant (streaming, pas `resource_blocking`) : le shell (barre + rail +
     // skeleton) est émis immédiatement et la liste arrive en chunk out-of-order.
     // La page de recherche n'est pas indexée. Les facettes du rail sont
     // alimentées par un `Effect` client.
-    client.resource(search_scope(), move || enabled_key(key))
+    client.resource(search_scope(), move || key.get())
+}
+
+fn count_scope() -> QueryScope<SearchKey, CountResult> {
+    QueryScope::new(|key: SearchKey| sendable(run_count(key)))
+}
+
+/// `Resource` du décompte, sur la part de la clé dont il dépend
+/// ([`SearchKey::count_key`]) : il part en même temps que la liste, le serveur
+/// les rattache au même bundle, et tourner une page ne le rejoue pas.
+pub fn count_resource(key: Signal<SearchKey>) -> Resource<CountResult> {
+    let client = expect_context::<QueryClient>();
+    client.resource(count_scope(), move || key.get().count_key())
 }
 
 /// Lecture SYNCHRONE du cache pour une clé donnée. `Some` au retour depuis une
@@ -92,5 +111,5 @@ pub fn cached_search(key: &SearchKey) -> Option<SearchResult> {
 /// skeleton.
 pub fn search_is_loading(key: Signal<SearchKey>) -> Signal<bool> {
     let client = expect_context::<QueryClient>();
-    client.subscribe_is_loading(search_scope(), move || enabled_key(key))
+    client.subscribe_is_loading(search_scope(), move || key.get())
 }

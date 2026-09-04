@@ -1,16 +1,11 @@
-//! Scan du document : le vocabulaire des valeurs est ouvert, mais les MARQUEURS
-//! qui structurent une décision forment un vocabulaire fermé — formes sociales,
-//! têtes institutionnelles, en-têtes de bloc (APPELANT/INTIMÉ), pivots du pourvoi
-//! CC, ouvertures de requête admin, frontières de zone (motifs, dispositif),
-//! terminateurs de nom, intros de conseil. Ce catalogue est compilé une fois en
+//! Scan du document : le vocabulaire des valeurs est ouvert, celui des MARQUEURS
+//! qui structurent une décision est fermé. Le catalogue est compilé une fois en
 //! automate Aho-Corasick leftmost-longest ; chaque document est scanné en une
-//! passe sur texte plié longueur-stable (casse d'origine conservée pour les
-//! contrôles de légitimité et les tranches verbatim), et les composeurs par champ
-//! rejouent le même flux de tokens ([`DocScan`]).
+//! passe sur texte plié **longueur-stable** (la casse d'origine reste lisible
+//! pour les contrôles de légitimité et les tranches verbatim), et les composeurs
+//! par champ rejouent le même flux de tokens ([`DocScan`]).
 //!
-//! Les zones sont bornées par tokens : l'en-tête finit au premier marqueur
-//! Motifs/Dispositif, le dispositif commence à son marqueur. Gabarits de parties
-//! auto-détectés dans le flux :
+//! Les zones sont bornées par tokens. Gabarits de parties auto-détectés :
 //! - CC moderne : « <demandeurs> a/ont formé le/un pourvoi … l'opposant
 //!   <défendeurs> … défendeurs à la cassation » ;
 //! - CC ancien : « pourvoi formé par <demandeurs> contre l'arrêt … » ;
@@ -26,6 +21,7 @@ use regex::Regex;
 use std::sync::OnceLock;
 
 use crate::compiled::{fold_stable, Norm};
+use crate::registry::Mention;
 
 // ── catalogue de marqueurs (surfaces PLIÉES : minuscules, sans accents) ─────
 
@@ -97,6 +93,12 @@ pub(crate) enum Mk {
     /// Marqueur rétroactif de défense (« conclut au rejet ») : qualifie le
     /// mémoire qui le porte sans le borner.
     DefConclu,
+    /// Clause de notification du dispositif (« sera notifié à … ») : elle
+    /// ÉNUMÈRE les parties de l'instance. La copie pour information, non.
+    NotifPartie,
+    /// Tête d'autorité administrative (« ministre », « préfet », « recteur ») :
+    /// son titre porte ses virgules, d'où une extension propre.
+    AutoriteHead,
     /// « Moyen produit par <cabinet> … pour <partie> » (moyens annexés CC).
     MoyenPar,
     /// Début des motifs (« Considérant ce qui suit », « EXPOSÉ DU LITIGE »,
@@ -253,6 +255,127 @@ pub(crate) enum Mk {
     ProcDomPiLit,
     ProcDomPiInd,
 }
+
+/// Genre d'un atome pour le lecteur de parties personnes physiques.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Atome {
+    /// Trace de pseudonymisation : lettre seule, lettre suivie de points de
+    /// suspension, groupe crocheté (« A », « X... », « [FE] »).
+    Pseudo,
+    /// Mot capitalisé en clair : prénom conservé, patronyme non pseudonymisé.
+    Mot,
+    /// Civilité : consommée, jamais imprimée.
+    Civilite,
+    /// Se traverse à l'intérieur d'un nom déjà ouvert.
+    Virgule,
+    /// Mention matrimoniale : elle ferme le nom, et ce qui la suit renomme la
+    /// même personne au lieu d'en ouvrir une autre.
+    Lien,
+    /// Ferme le nom.
+    Stop,
+}
+
+/// Borne du bandeau de greffe quand aucun marqueur d'ouverture ne le ferme, en
+/// caractères normalisés. Le nom de chambre y tient dans les 200 premiers.
+const BANDEAU_MAX: usize = 600;
+
+/// Marqueurs qui ferment un nom de personne. Le lexique du scan porte déjà ces
+/// coupes, le lecteur de personnes les emprunte au lieu de tenir sa propre liste.
+const COUPE_NOM: &[Mk] = &[
+    Mk::TrimAlways,
+    Mk::TrimLower,
+    Mk::CounselIntro,
+    Mk::AvocatDe,
+    Mk::Me,
+    Mk::LawStruct,
+    Mk::Form,
+    Mk::Societe,
+    Mk::InstHead,
+    Mk::InstSigle,
+    Mk::AutoriteHead,
+    Mk::IndirectRole,
+    Mk::BlockApp,
+    Mk::BlockDef,
+    Mk::BlockOther,
+    Mk::Stop,
+    Mk::Motifs,
+    Mk::Dispositif,
+];
+
+/// Un conseil tient son côté de la partie qu'il représente : il ne peut pas
+/// être des deux. « Emmanuel Levanti » en demande et « Levanti » en défense
+/// sont le même avocat, la seconde mention étant un écho de la prose. La
+/// graphie la plus complète porte l'arête, donc le côté ; à égalité, la
+/// demande, dont l'en-tête nomme le conseil avec son « représenté par ».
+fn un_seul_cote(apps: &mut Vec<Mention>, defs: &mut Vec<Mention>) {
+    if apps.is_empty() || defs.is_empty() {
+        return;
+    }
+    let variante = |a: &str, b: &str| {
+        let (x, y) = (mots_personne(a), mots_personne(b));
+        let (court, long) = if x.len() <= y.len() {
+            (&x, &y)
+        } else {
+            (&y, &x)
+        };
+        !court.is_empty() && (long.starts_with(&court[..]) || long.ends_with(&court[..]))
+    };
+    let mut i = 0;
+    while i < defs.len() {
+        match apps.iter().position(|a| variante(&a.value, &defs[i].value)) {
+            Some(j)
+                if mots_personne(&apps[j].value).len() >= mots_personne(&defs[i].value).len() =>
+            {
+                defs.remove(i);
+            }
+            Some(j) => {
+                apps.remove(j);
+                i += 1;
+            }
+            None => i += 1,
+        }
+    }
+}
+
+/// Mots d'identité d'une personne pseudonymisée : les marques de
+/// pseudonymisation ne la portent pas (« [FE] [XL] » = « FE XL »).
+fn mots_personne(v: &str) -> Vec<String> {
+    fold_stable(v)
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '.' | '\u{2026}' | '[' | ']' | ',' | '-' | '\'')
+        })
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Mentions matrimoniales pliées : le gold coupe le nom devant elles 304 fois
+/// contre 23.
+#[rustfmt::skip]
+const LIENS: &[&str] = &[
+    "epouse", "epoux", "veuve", "veuf", "nee", "ne", "divorce", "divorcee", "dit", "dite",
+    "anciennement",
+];
+
+/// Civilités pliées.
+#[rustfmt::skip]
+const CIVILITES: &[&str] = &[
+    "m",
+    "m.",
+    "mm",
+    "mm.",
+    "mme",
+    "mmes",
+    "mlle",
+    "mlles",
+    "melle",
+    "melles",
+    "monsieur",
+    "messieurs",
+    "madame",
+    "mesdames",
+    "mademoiselle",
+];
 
 #[rustfmt::skip]
 const MARKERS: &[(&str, Mk)] = &[
@@ -431,6 +554,23 @@ const MARKERS: &[(&str, Mk)] = &[
     ("par deux memoires", Mk::MemIntro), ("par trois memoires", Mk::MemIntro),
     ("par un nouveau memoire", Mk::MemIntro), ("par de nouveaux memoires", Mk::MemIntro),
     ("conclut au rejet", Mk::DefConclu), ("concluent au rejet", Mk::DefConclu),
+    // têtes d'autorité : le vocabulaire des 1 480 défendeurs administratifs
+    // annotés, par poids décroissant
+    ("ministre", Mk::AutoriteHead), ("ministere", Mk::AutoriteHead),
+    ("prefet", Mk::AutoriteHead), ("prefete", Mk::AutoriteHead),
+    ("prefecture", Mk::AutoriteHead), ("garde des sceaux", Mk::AutoriteHead),
+    ("recteur", Mk::AutoriteHead), ("rectrice", Mk::AutoriteHead),
+    ("maire", Mk::AutoriteHead), ("region", Mk::AutoriteHead),
+    ("universite", Mk::AutoriteHead), ("directeur", Mk::AutoriteHead),
+    ("directrice", Mk::AutoriteHead), ("conseil national", Mk::AutoriteHead),
+    ("conseil departemental", Mk::AutoriteHead),
+    ("conseil regional", Mk::AutoriteHead), ("agence nationale", Mk::AutoriteHead),
+    ("agence regionale", Mk::AutoriteHead),
+    ("service departemental", Mk::AutoriteHead),
+    ("centre national", Mk::AutoriteHead), ("assistance publique", Mk::AutoriteHead),
+    ("sera notifie", Mk::NotifPartie), ("sera notifiee", Mk::NotifPartie),
+    ("seront notifies", Mk::NotifPartie), ("seront notifiees", Mk::NotifPartie),
+    ("est notifie", Mk::NotifPartie), ("est notifiee", Mk::NotifPartie),
     ("moyen produit par", Mk::MoyenPar), ("moyens produits par", Mk::MoyenPar),
     ("moyen annexe produit par", Mk::MoyenPar), ("moyens annexes produits par", Mk::MoyenPar),
     // en-têtes sans « produit par » (« MOYENS ANNEXES au present arret », puis
@@ -1005,6 +1145,16 @@ pub struct CounselOut {
     pub defendant_firms: Vec<String>,
 }
 
+/// Les mêmes quatre cellules, mentions ancrées : ce que les composeurs par
+/// gabarit remplissent avant projection.
+#[derive(Debug, Clone, Default)]
+struct CounselMentions {
+    applicant_names: Vec<Mention>,
+    applicant_firms: Vec<Mention>,
+    defendant_names: Vec<Mention>,
+    defendant_firms: Vec<Mention>,
+}
+
 fn is_upper_span(chars: &[char], s: usize, e: usize) -> bool {
     let mut seen = false;
     for &c in &chars[s..e] {
@@ -1054,6 +1204,54 @@ impl DocScan {
     /// Texte plié du document (`fold_stable`, 1:1 char-stable).
     pub fn folded(&self) -> &str {
         &self.norm.folded
+    }
+
+    pub(crate) fn chars(&self) -> &[char] {
+        &self.norm.chars
+    }
+
+    pub(crate) fn byte2char(&self) -> &[usize] {
+        &self.norm.byte2char
+    }
+
+    pub(crate) fn verbatim(&self, s: usize, e: usize) -> String {
+        self.text_slice(s, e)
+    }
+
+    /// Bornes (chars) du dispositif : son ouvreur, puis les moyens annexés ou la fin.
+    pub(crate) fn dispositif_span(&self) -> (usize, usize) {
+        let s = self.dispositif_start();
+        (s, self.dispositif_end(s))
+    }
+
+    /// Positions of the outcome verbs of the dispositif, each opening a clause.
+    pub(crate) fn dispositif_clause_starts(&self) -> Vec<usize> {
+        let (s, e) = self.dispositif_span();
+        self.toks
+            .iter()
+            .filter(|t| t.s >= s && t.s < e)
+            .filter(|t| {
+                matches!(
+                    t.kind,
+                    Mk::OutDesist
+                        | Mk::OutNonAdmis
+                        | Mk::OutNonLieu
+                        | Mk::OutGrant
+                        | Mk::OutNeutral
+                        | Mk::OutJonction
+                        | Mk::OutIrrec
+                        | Mk::OutCasse
+                        | Mk::OutPartial
+                        | Mk::OutConfirme
+                        | Mk::OutInfirme
+                        | Mk::OutSauf
+                        | Mk::OutRejette
+                        | Mk::OutAnnule
+                        | Mk::OutCondamne
+                )
+            })
+            .map(|t| t.s)
+            .collect()
     }
 }
 
@@ -1605,8 +1803,149 @@ impl DocScan {
 
     /// Récolte les personnes morales d'un segment `[from..to)`, en ordre.
     /// `inst_to` borne les têtes institutionnelles (admin : avant « demande »).
-    pub fn harvest(&self, from: usize, to: usize, inst_to: usize) -> Vec<String> {
+    pub fn harvest(&self, from: usize, to: usize, inst_to: usize) -> Vec<Mention> {
         self.harvest_in(from, to, inst_to, false)
+    }
+
+    /// Atome du lecteur de personnes physiques, à partir du premier caractère
+    /// non blanc en `i` : la fin de la tranche lue et son genre.
+    fn atome(&self, i: usize, to: usize) -> (usize, Atome) {
+        let chars = &self.norm.chars;
+        if chars[i] == ',' {
+            return (i + 1, Atome::Virgule);
+        }
+        if chars[i] == '[' {
+            let mut j = i + 1;
+            while j < to && j < i + 6 && chars[j].is_ascii_uppercase() {
+                j += 1;
+            }
+            if j > i + 1 && j < to && chars[j] == ']' {
+                return (j + 1, Atome::Pseudo);
+            }
+            return (i + 1, Atome::Stop);
+        }
+        if !chars[i].is_alphabetic() {
+            return (i + 1, Atome::Stop);
+        }
+        let mut j = i;
+        while j < to && (chars[j].is_alphabetic() || matches!(chars[j], '\'' | '\u{2019}' | '-')) {
+            j += 1;
+        }
+        let mut e = j;
+        if j < to && chars[j] == '.' {
+            e = j + 1;
+            while e < to && chars[e] == '.' {
+                e += 1;
+            }
+        } else if j < to && chars[j] == '\u{2026}' {
+            e = j + 1;
+        }
+        if !chars[i].is_uppercase() {
+            if LIENS.contains(&self.folded_slice(i, j)) {
+                return (e, Atome::Lien);
+            }
+            return (e, Atome::Stop);
+        }
+        if CIVILITES.contains(&self.folded_slice(i, j))
+            || CIVILITES.contains(&self.folded_slice(i, e))
+        {
+            return (e, Atome::Civilite);
+        }
+        if j == i + 1 {
+            return (e, Atome::Pseudo);
+        }
+        (e, Atome::Mot)
+    }
+
+    /// Parties personnes physiques d'un segment `[from..to)`.
+    ///
+    /// Le discriminant est la trace de pseudonymisation (lettre seule, lettre
+    /// suivie de points de suspension, groupe crocheté), jamais ce qui précède :
+    /// le greffe imprime « M. A B », « X... Jacques » ou « [FE] [XL] » nu. Une
+    /// suite d'atomes capitalisés sans aucune trace est un cabinet ou une
+    /// juridiction, pas une partie.
+    ///
+    /// La civilité n'entre pas dans la valeur, et la mention matrimoniale la
+    /// ferme (« Régine X..., épouse Y... » ⇒ « Régine X... » : le gold coupe
+    /// 304 fois contre 23).
+    fn persons_in(&self, from: usize, to: usize) -> Vec<Mention> {
+        let to = to.min(self.len());
+        let mut out: Vec<Mention> = Vec::new();
+        let mut coupes: Vec<usize> = self
+            .toks
+            .iter()
+            .filter(|t| t.s >= from && t.s < to && COUPE_NOM.contains(&t.kind))
+            .map(|t| t.s)
+            .collect();
+        coupes.sort_unstable();
+        let coupe = |pos: usize| coupes.binary_search(&pos).is_ok();
+        let mut atomes: Vec<(usize, usize, Atome)> = Vec::new();
+        let mut i = self.skip_spaces(from, to);
+        while i < to {
+            let (e, g) = self.atome(i, to);
+            atomes.push((i, e, g));
+            i = self.skip_spaces(e.max(i + 1), to);
+        }
+        let mut k = 0;
+        while k < atomes.len() {
+            // « Régine Y..., épouse Z... » : « Z... » renomme la personne déjà
+            // lue, la sauter est ce que le gold annote
+            if atomes[k].2 == Atome::Lien {
+                k += 1;
+                while atomes
+                    .get(k)
+                    .is_some_and(|a| matches!(a.2, Atome::Mot | Atome::Pseudo | Atome::Virgule))
+                {
+                    k += 1;
+                }
+                continue;
+            }
+            if !matches!(atomes[k].2, Atome::Mot | Atome::Pseudo) || coupe(atomes[k].0) {
+                k += 1;
+                continue;
+            }
+            let (debut, mut j, mut vu, mut fin) = (k, k, false, k);
+            while j < atomes.len() {
+                match atomes[j].2 {
+                    Atome::Pseudo => {
+                        vu = true;
+                        fin = j;
+                        j += 1;
+                    }
+                    // un prénom en clair suivi d'un pseudonyme, après un
+                    // pseudonyme déjà lu, ouvre la personne suivante
+                    // (« Pierre X... Danièle X... »)
+                    Atome::Mot
+                        if coupe(atomes[j].0)
+                            || (vu && atomes.get(j + 1).is_some_and(|n| n.2 == Atome::Pseudo)) =>
+                    {
+                        break
+                    }
+                    Atome::Mot => {
+                        fin = j;
+                        j += 1;
+                    }
+                    Atome::Virgule
+                        if vu
+                            && atomes
+                                .get(j + 1)
+                                .is_some_and(|n| matches!(n.2, Atome::Mot | Atome::Pseudo)) =>
+                    {
+                        j += 1
+                    }
+                    _ => break,
+                }
+            }
+            if vu {
+                let (s, e) = (atomes[debut].0, atomes[fin].1);
+                let v = self.text_slice(s, e).trim().to_string();
+                if !v.is_empty() {
+                    out.push(Mention::new(s, e, v));
+                }
+            }
+            k = j.max(debut + 1);
+        }
+        out
     }
 
     /// Variante à skip génitif : une entité introduite par « de la » / « du » /
@@ -1618,25 +1957,25 @@ impl DocScan {
         to: usize,
         inst_to: usize,
         skip_genitive: bool,
-    ) -> Vec<String> {
+    ) -> Vec<Mention> {
         let to = to.min(self.len());
-        let mut out: Vec<String> = Vec::new();
+        let mut out: Vec<Mention> = Vec::new();
         let mut consumed_until = from;
         // fusion par contenance (préfixe/suffixe, casse pliée) : on garde la plus
         // longue
-        let push = |name: String, out: &mut Vec<String>| {
-            let nu = name.to_uppercase();
+        let push = |m: Mention, out: &mut Vec<Mention>| {
+            let nu = m.value.to_uppercase();
             for o in out.iter_mut() {
-                let ou = o.to_uppercase();
+                let ou = o.value.to_uppercase();
                 if ou.starts_with(&nu) || ou.ends_with(&nu) {
                     return;
                 }
                 if nu.starts_with(&ou) || nu.ends_with(&ou) {
-                    *o = name;
+                    *o = m;
                     return;
                 }
             }
-            out.push(name);
+            out.push(m);
         };
         for idx in 0..self.toks.len() {
             let t = self.toks[idx].clone();
@@ -1672,7 +2011,7 @@ impl DocScan {
                         continue;
                     }
                     if let Some(name) = self.clean(ns, ne) {
-                        push(format!("{form} {name}"), &mut out);
+                        push(Mention::new(t.s, ne, format!("{form} {name}")), &mut out);
                         consumed_until = ne;
                     }
                 }
@@ -1735,10 +2074,11 @@ impl DocScan {
                         // entière.
                         let bare = ns == head_end && !lower_start;
                         if bare && fold_stable(&name) != "generale" {
-                            push(name, &mut out);
+                            push(Mention::new(ns, ne, name), &mut out);
                         } else {
                             let head = self.text_slice(t.s, ns);
-                            push(format!("{} {name}", head.trim_end()), &mut out);
+                            let v = format!("{} {name}", head.trim_end());
+                            push(Mention::new(t.s, ne, v), &mut out);
                         }
                         consumed_until = ne;
                     }
@@ -1764,7 +2104,7 @@ impl DocScan {
                         {
                             continue;
                         }
-                        push(name, &mut out);
+                        push(Mention::new(t.s, ne, name), &mut out);
                         consumed_until = ne;
                     }
                 }
@@ -1810,7 +2150,7 @@ impl DocScan {
                     }
                     if let Some(name) = self.clean_law_party(ns, ne) {
                         let kind = self.text_slice(t.s, t.e);
-                        push(format!("{kind} {name}"), &mut out);
+                        push(Mention::new(t.s, ne, format!("{kind} {name}")), &mut out);
                         consumed_until = ne;
                     }
                 }
@@ -1886,7 +2226,9 @@ impl DocScan {
     }
 
     /// Fin du bandeau d'en-tête de greffe (« CIV. 1 … NON-ADMISSION … ») : premier
-    /// marqueur d'ouverture de parties ou de requête.
+    /// marqueur d'ouverture de parties ou de requête. Un texte abîmé n'en tokenise
+    /// aucun ; le repli sur les motifs ouvre alors le bandeau au récit, où la
+    /// formation d'une décision CITÉE se lit comme la sienne, d'où [`BANDEAU_MAX`].
     fn bandeau_end(&self) -> usize {
         self.toks
             .iter()
@@ -1903,7 +2245,7 @@ impl DocScan {
                 )
             })
             .map(|t| t.s)
-            .unwrap_or_else(|| self.motifs_start())
+            .unwrap_or_else(|| self.motifs_start().min(BANDEAU_MAX))
     }
 
     /// Tranche verbatim du bandeau : en-tête de greffe où vivent chambre et pôle.
@@ -2036,6 +2378,18 @@ impl DocScan {
     /// Fenêtres après « joint les pourvois » : la clause des numéros joints.
     pub fn joint_pourvois_windows(&self) -> Vec<String> {
         self.windows(0, 400, |t| t.kind == Mk::JointPourvois)
+    }
+
+    /// Fenêtres depuis « contre l'arrêt / en cassation d'un arrêt » du préambule,
+    /// où se nomme la décision attaquée. Une fenêtre par token, sans fusion :
+    /// l'appelant ancre sa regex sur la surface.
+    pub fn contre_windows(&self) -> Vec<String> {
+        let fin = self.motifs_start().min(4_000);
+        self.toks
+            .iter()
+            .filter(|t| t.kind == Mk::Contre && t.s < fin)
+            .map(|t| self.text_slice(t.s, (t.e + 300).min(self.len())))
+            .collect()
     }
 
     /// Fenêtres autour des ancres « sous le(s) n°/numéro(s) » (AdminReq) du récit
@@ -2866,7 +3220,9 @@ impl DocScan {
     /// Sous le n°…, par une requête…, X et Y demandent… 2° Sous le n°… »), chacun
     /// borné à son verbe « demande(nt) ». Sans ouverture de bloc détectée :
     /// en-tête simple borné au premier « demande ».
-    pub fn admin_companies(&self) -> Vec<String> {
+    /// Segments requérants du gabarit admin : un par bloc de requête, borné à
+    /// son verbe « demande(nt) ».
+    fn admin_segments(&self) -> Vec<(usize, usize)> {
         let end = self.motifs_start();
         let reqs: Vec<usize> = self
             .toks
@@ -2879,20 +3235,183 @@ impl DocScan {
             if self.toks.iter().any(|t| t.kind == Mk::DefEnd && t.s < 300) {
                 return Vec::new();
             }
-            let b = self.demande_boundary(0, end);
-            return self.harvest(0, b, b);
+            return vec![(0, self.demande_boundary(0, end))];
         }
-        let mut out: Vec<String> = Vec::new();
-        for (i, &rs) in reqs.iter().enumerate() {
-            let next = reqs.get(i + 1).copied().unwrap_or(end);
-            let seg_end = self.demande_boundary(rs, next);
-            for name in self.harvest(rs, seg_end, seg_end) {
-                if !out.contains(&name) {
-                    out.push(name);
+        reqs.iter()
+            .enumerate()
+            .map(|(i, &rs)| {
+                let next = reqs.get(i + 1).copied().unwrap_or(end);
+                (rs, self.demande_boundary(rs, next))
+            })
+            .collect()
+    }
+
+    pub fn admin_companies(&self) -> Vec<Mention> {
+        let mut out: Vec<Mention> = Vec::new();
+        for (from, to) in self.admin_segments() {
+            for m in self.harvest(from, to, to) {
+                if !out.iter().any(|o| o.value == m.value) {
+                    out.push(m);
                 }
             }
         }
         out
+    }
+
+    /// Gabarit admin : la partie défenderesse, lue dans la clause de
+    /// notification du dispositif (« Le présent arrêt sera notifié à M. A et au
+    /// ministre de l'intérieur »), qui énumère les parties de l'instance. Ce qui
+    /// y figure et n'est pas un requérant défend.
+    ///
+    /// « Copie en sera adressée à … » désigne un intéressé, pas une partie : la
+    /// fenêtre s'arrête avant.
+    pub fn admin_defendants(&self) -> Vec<Mention> {
+        let apps_f: Vec<String> = self
+            .admin_companies()
+            .iter()
+            .map(|a| fold_stable(&a.value))
+            .collect();
+        let mut out: Vec<Mention> = Vec::new();
+        // « le ministre de l'action et des comptes publics conclut au rejet » :
+        // le verbe qualifie la defense, son SUJET est la partie defenderesse.
+        for t in self.toks.iter().filter(|t| t.kind == Mk::DefConclu) {
+            let from = self.sentence_start(t.s, 0);
+            for m in self.autorites_in(from, t.s) {
+                let f = fold_stable(&m.value);
+                if side_match(&f, &apps_f, &[]) {
+                    continue;
+                }
+                Self::pousse_la_plus_longue(&mut out, m);
+            }
+        }
+        for t in self.toks.iter().filter(|t| t.kind == Mk::NotifPartie) {
+            let to = self.sentence_end(t.e, (t.e + 300).min(self.len()));
+            for (from, upto) in self.enumeration_cells(t.e, to) {
+                let mut cellule = self.harvest(from, upto, upto);
+                cellule.extend(self.autorites_in(from, upto));
+                for m in cellule {
+                    let f = fold_stable(&m.value);
+                    // une valeur contenue dans une autre est la meme partie vue
+                    // deux fois (« commune de Conca » et « Conca ») : la plus
+                    // longue porte le titre entier
+                    if side_match(&f, &apps_f, &[]) {
+                        continue;
+                    }
+                    Self::pousse_la_plus_longue(&mut out, m);
+                }
+            }
+        }
+        out
+    }
+
+    /// Une valeur contenue dans une autre est la meme partie vue deux fois
+    /// (« commune de Conca » et « Conca ») : la plus longue porte le titre.
+    fn pousse_la_plus_longue(out: &mut Vec<Mention>, m: Mention) {
+        let f = fold_stable(&m.value);
+        match out.iter_mut().find(|o| {
+            let g = fold_stable(&o.value);
+            g == f || g.contains(&f) || f.contains(&g)
+        }) {
+            Some(o) if o.value.len() < m.value.len() => *o = m,
+            Some(_) => {}
+            None => out.push(m),
+        }
+    }
+
+    /// Debut de la phrase qui contient `pos`, sans descendre sous `plancher`.
+    fn sentence_start(&self, pos: usize, plancher: usize) -> usize {
+        let mut i = pos;
+        while i > plancher {
+            if self.norm.chars[i - 1] == ' '
+                && i >= 2
+                && matches!(self.norm.chars[i - 2], '.' | ';' | ':')
+            {
+                return i;
+            }
+            i -= 1;
+        }
+        plancher
+    }
+
+    /// Autorites administratives d'une fenetre : la tete porte son titre
+    /// entier, virgules comprises (« ministre de l'economie, des finances et de
+    /// la relance »), ce que l'extension de nom ordinaire coupe a la virgule.
+    fn autorites_in(&self, from: usize, to: usize) -> Vec<Mention> {
+        let mut out: Vec<Mention> = Vec::new();
+        for t in self.toks.iter() {
+            if t.kind != Mk::AutoriteHead || t.s < from || t.s >= to {
+                continue;
+            }
+            let e = self.autorite_end(t.e, to);
+            if e <= t.e {
+                continue;
+            }
+            let v = self.text_slice(t.s, e);
+            let v = v.trim().trim_end_matches([',', ';', '.', ' ']);
+            if v.len() < 4 {
+                continue;
+            }
+            out.push(Mention::new(t.s, e, v.to_string()));
+        }
+        out
+    }
+
+    /// Fin du titre d'une autorite. La virgule ne le ferme que si ce qui suit
+    /// n'en est pas la suite : un titre enchaine ses complements (« , des
+    /// finances », « , charge du logement », « , ministre de la justice »).
+    fn autorite_end(&self, from: usize, to: usize) -> usize {
+        const SUITE: [&str; 8] = [
+            " de ",
+            " du ",
+            " des ",
+            " d'",
+            " charge",
+            " et de",
+            " et des",
+            " ministre",
+        ];
+        let mut i = from;
+        while i < to {
+            match self.norm.chars[i] {
+                '.' | ';' | ':' | ')' | '(' => return i,
+                ',' => {
+                    let apres = (i + 1).min(to);
+                    let fin = (apres + 10).min(to);
+                    let f = self.folded_slice(apres, fin);
+                    if !SUITE.iter().any(|k| f.starts_with(*k)) {
+                        return i;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        to
+    }
+
+    /// Decoupe une enumeration de parties en cellules : « a A et au B et a la
+    /// C » donne trois fenetres. Sans la coupe, la moisson traverse le
+    /// connecteur et colle deux parties en une seule valeur.
+    fn enumeration_cells(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        const CONNECTEURS: [&str; 4] = [" et a ", " et au ", " et aux ", " et a l"];
+        let mut cells = Vec::new();
+        let mut debut = from;
+        let mut i = from;
+        while i < to {
+            let fin = (i + 8).min(to);
+            let f = self.folded_slice(i, fin);
+            match CONNECTEURS.iter().find(|c| f.starts_with(**c)) {
+                Some(c) => {
+                    // le connecteur n'appartient a aucune des deux cellules
+                    cells.push((debut, i));
+                    debut = i + c.len();
+                    i = debut;
+                }
+                None => i += 1,
+            }
+        }
+        cells.push((debut, to));
+        cells
     }
 
     /// Gabarit structurel du document, lu dans le flux de tokens de l'en-tête.
@@ -2936,6 +3455,9 @@ impl DocScan {
             let (apps, defs) = self.companies_uncached();
             r.push(apps, Some(Side::Applicant), Quality::Party);
             r.push(defs, Some(Side::Defendant), Quality::Party);
+            let (ia, id) = self.individuals_uncached();
+            r.push(ia, Some(Side::Applicant), Quality::Individual);
+            r.push(id, Some(Side::Defendant), Quality::Individual);
             let c = self.counsel_uncached();
             r.push(
                 c.applicant_names,
@@ -2954,11 +3476,109 @@ impl DocScan {
         })
     }
 
-    fn companies_uncached(&self) -> (Vec<String>, Vec<String>) {
+    /// Parties personnes physiques par côté, sur les MÊMES segments que les
+    /// personnes morales : la nature de la partie ne change pas où elle se
+    /// nomme. Côté défendeur admin, la clause de notification du dispositif.
+    fn individuals_uncached(&self) -> (Vec<Mention>, Vec<Mention>) {
+        let mut apps: Vec<Mention> = Vec::new();
+        let mut defs: Vec<Mention> = Vec::new();
+        let pousse = |cible: &mut Vec<Mention>, from: usize, to: usize, s: &Self| {
+            for m in s.persons_in(from, to) {
+                if !cible.iter().any(|o| same_words(&o.value, &m.value)) {
+                    cible.push(m);
+                }
+            }
+        };
+        match self.gabarit() {
+            Gabarit::Cc => {
+                if let Some(segs) = self.cc_segments() {
+                    for &(from, to) in &segs.app {
+                        pousse(&mut apps, from, to, self);
+                    }
+                    for &(from, to) in &segs.def {
+                        pousse(&mut defs, from, to, self);
+                    }
+                }
+            }
+            Gabarit::Blocs => {
+                for (kind, from, to) in self.block_segments() {
+                    match kind {
+                        Mk::BlockApp => pousse(&mut apps, from, to, self),
+                        Mk::BlockDef => pousse(&mut defs, from, to, self),
+                        _ => continue,
+                    }
+                }
+            }
+            Gabarit::Admin => {
+                for (from, to) in self.admin_segments() {
+                    pousse(&mut apps, from, to, self);
+                }
+                for t in self.toks.iter().filter(|t| t.kind == Mk::NotifPartie) {
+                    let to = self.sentence_end(t.e, (t.e + 300).min(self.len()));
+                    for (from, upto) in self.enumeration_cells(t.e, to) {
+                        pousse(&mut defs, from, upto, self);
+                    }
+                }
+            }
+        }
+        // partie nommée des deux côtés : le segment demandeur prime. L'arbitrage
+        // porte sur les mentions telles que lues, avant que la résolution ne les
+        // rallonge, sinon un défendeur tombe contre une graphie qu'il ne
+        // partageait pas (11 records au banc).
+        defs.retain(|d| !apps.iter().any(|a| same_words(&a.value, &d.value)));
+        // côté demandeur seul : la clause de notification qui nomme les
+        // défendeurs porte déjà la graphie longue, la résoudre lui coûte
+        // 20 records
+        Self::resout_variantes(&mut apps, &self.persons_in(0, self.motifs_start()));
+        (apps, defs)
+    }
+
+    /// Deux graphies de la même personne : « M. A B » dans le rappel de
+    /// procédure, « M. B » dans la requête. La plus longue porte l'identité, et
+    /// deux courtes qui remontent à la même longue n'en font qu'une.
+    fn resout_variantes(mentions: &mut Vec<Mention>, toutes: &[Mention]) {
+        if mentions.is_empty() {
+            return;
+        }
+        let candidats: Vec<(Vec<String>, &Mention)> = toutes
+            .iter()
+            .map(|c| (mots_personne(&c.value), c))
+            .collect();
+        for m in mentions.iter_mut() {
+            let court = mots_personne(&m.value);
+            let mut retenu: Option<(usize, &Mention)> = None;
+            for (long, c) in &candidats {
+                if long.len() <= court.len()
+                    || !(long.starts_with(&court[..]) || long.ends_with(&court[..]))
+                {
+                    continue;
+                }
+                if retenu.is_none_or(|(n, _)| n < long.len()) {
+                    retenu = Some((long.len(), c));
+                }
+            }
+            if let Some((_, c)) = retenu {
+                *m = c.clone();
+            }
+        }
+        let mut vus: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < mentions.len() {
+            let k = mots_personne(&mentions[i].value).join(" ");
+            if vus.contains(&k) {
+                mentions.remove(i);
+            } else {
+                vus.push(k);
+                i += 1;
+            }
+        }
+    }
+
+    fn companies_uncached(&self) -> (Vec<Mention>, Vec<Mention>) {
         let (mut apps, mut defs) = match self.gabarit() {
             Gabarit::Cc => self.cc_companies(),
             Gabarit::Blocs => self.block_companies(),
-            Gabarit::Admin => (self.admin_companies(), Vec::new()),
+            Gabarit::Admin => (self.admin_companies(), self.admin_defendants()),
         };
         // moyens annexés CC (« Moyen produit par <conseil> … pour la société X ») :
         // filet parties demanderesses quand le préambule n'en nomme pas
@@ -2967,8 +3587,8 @@ impl DocScan {
         }
         // arbitrage de qualité par force du signal par mention : une entité dont
         // toutes les mentions fortes sont côté cabinet n'est pas une partie
-        apps.retain(|n| !self.drop_from_companies(n));
-        defs.retain(|n| !self.drop_from_companies(n));
+        apps.retain(|m| !self.drop_from_companies(&m.value));
+        defs.retain(|m| !self.drop_from_companies(&m.value));
         (apps, defs)
     }
 
@@ -2985,8 +3605,8 @@ impl DocScan {
         }
     }
 
-    fn counsel_uncached(&self) -> CounselOut {
-        let mut out = CounselOut::default();
+    fn counsel_uncached(&self) -> CounselMentions {
+        let mut out = CounselMentions::default();
         match self.gabarit() {
             Gabarit::Cc => self.cc_counsel(&mut out),
             Gabarit::Blocs => self.block_counsel(&mut out),
@@ -3003,8 +3623,12 @@ impl DocScan {
         }
         // arbitrage de qualité par force du signal par mention : une entité dont
         // toutes les mentions fortes sont côté partie n'est pas un cabinet
-        out.applicant_firms.retain(|f| !self.drop_from_firms(f));
-        out.defendant_firms.retain(|f| !self.drop_from_firms(f));
+        out.applicant_firms
+            .retain(|f| !self.drop_from_firms(&f.value));
+        out.defendant_firms
+            .retain(|f| !self.drop_from_firms(&f.value));
+        un_seul_cote(&mut out.applicant_names, &mut out.defendant_names);
+        un_seul_cote(&mut out.applicant_firms, &mut out.defendant_firms);
         out
     }
 
@@ -3134,46 +3758,46 @@ impl DocScan {
     }
 
     /// Gabarits CC : (demandeurs, défendeurs) depuis le préambule du pourvoi.
-    pub fn cc_companies(&self) -> (Vec<String>, Vec<String>) {
+    pub fn cc_companies(&self) -> (Vec<Mention>, Vec<Mention>) {
         let Some(segs) = self.cc_segments() else {
             return (Vec::new(), Vec::new());
         };
         let end = self.motifs_start();
-        let mut applicants: Vec<String> = Vec::new();
+        let mut applicants: Vec<Mention> = Vec::new();
         for &(from, to) in &segs.app {
-            for name in self.harvest(from, to, to) {
-                if !applicants.iter().any(|o| same_words(o, &name)) {
-                    applicants.push(name);
+            for m in self.harvest(from, to, to) {
+                if !applicants.iter().any(|o| same_words(&o.value, &m.value)) {
+                    applicants.push(m);
                 }
             }
         }
-        let mut defendants: Vec<String> = Vec::new();
+        let mut defendants: Vec<Mention> = Vec::new();
         for &(from, to) in &segs.def {
-            for name in self.harvest(from, to, to) {
-                if !defendants.iter().any(|o| same_words(o, &name)) {
-                    defendants.push(name);
+            for m in self.harvest(from, to, to) {
+                if !defendants.iter().any(|o| same_words(&o.value, &m.value)) {
+                    defendants.push(m);
                 }
             }
         }
         // demandeur nommé des deux côtés : le pivot prime la fenêtre défendeurs
-        defendants.retain(|d| !applicants.iter().any(|a| same_words(a, d)));
+        defendants.retain(|d| !applicants.iter().any(|a| same_words(&a.value, &d.value)));
         if defendants.is_empty() {
             // filet : « avocat de <partie> » des observations, moins les demandeurs déjà
             // connus (comparaison pliée et variantes de graphie)
-            let apps_f: Vec<String> = applicants.iter().map(|a| fold_stable(a)).collect();
+            let apps_f: Vec<String> = applicants.iter().map(|a| fold_stable(&a.value)).collect();
             for t in self.toks.iter().filter(|t| t.kind == Mk::AvocatDe) {
                 if t.s >= end {
                     break;
                 }
                 let w_end = (t.e + 140).min(end);
                 for c in self.harvest(t.e, w_end, w_end) {
-                    let cf = fold_stable(&c);
+                    let cf = fold_stable(&c.value);
                     if apps_f.iter().any(|a| a.contains(cf.as_str()))
                         || side_match(&cf, &apps_f, &[])
                     {
                         continue;
                     }
-                    if !defendants.contains(&c) {
+                    if !defendants.iter().any(|o| o.value == c.value) {
                         defendants.push(c);
                     }
                 }
@@ -3246,18 +3870,18 @@ impl DocScan {
     }
 
     /// Gabarit blocs CA/TJ/TCOM : parties de tous les segments étiquetés.
-    pub fn block_companies(&self) -> (Vec<String>, Vec<String>) {
-        let mut applicants: Vec<String> = Vec::new();
-        let mut defendants: Vec<String> = Vec::new();
+    pub fn block_companies(&self) -> (Vec<Mention>, Vec<Mention>) {
+        let mut applicants: Vec<Mention> = Vec::new();
+        let mut defendants: Vec<Mention> = Vec::new();
         for (kind, from, to) in self.block_segments() {
             let side = match kind {
                 Mk::BlockApp => &mut applicants,
                 Mk::BlockDef => &mut defendants,
                 _ => continue,
             };
-            for name in self.harvest(from, to, to) {
-                if !side.contains(&name) {
-                    side.push(name);
+            for m in self.harvest(from, to, to) {
+                if !side.iter().any(|o| o.value == m.value) {
+                    side.push(m);
                 }
             }
         }
@@ -3272,8 +3896,8 @@ impl DocScan {
             .view(None, crate::registry::Quality::Intervenor)
     }
 
-    fn intervenors_uncached(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+    fn intervenors_uncached(&self) -> Vec<Mention> {
+        let mut out: Vec<Mention> = Vec::new();
         // queue de récolte : connecteurs traînants (« CPAM DE CHARENTE DE ») et
         // placeholders d'adresse empilés — un placeholder après un autre groupe fermé
         // est du bloc adresse, un placeholder seul peut être le nom même
@@ -3302,18 +3926,20 @@ impl DocScan {
                 return t;
             }
         }
-        // dédup par contenance pliée (« Organisme [3] » ↔ « organisme [3] »)
-        fn push(v: String, out: &mut Vec<String>) {
-            let v = trim_tail(&v).to_string();
-            if v.is_empty() {
+        // dédup par contenance pliée (« Organisme [3] » ↔ « organisme [3] »).
+        // La queue rognée sort de la valeur, pas de la tranche : celle-ci reste
+        // l'occurrence décisive, elle n'est pas la copie de la valeur.
+        fn push(mut m: Mention, out: &mut Vec<Mention>) {
+            m.value = trim_tail(&m.value).to_string();
+            if m.value.is_empty() {
                 return;
             }
-            let vu = v.to_uppercase();
+            let vu = m.value.to_uppercase();
             if !out.iter().any(|o| {
-                let ou = o.to_uppercase();
+                let ou = o.value.to_uppercase();
                 ou.starts_with(&vu) || ou.ends_with(&vu)
             }) {
-                out.push(v);
+                out.push(m);
             }
         }
         let hdr = self.motifs_start();
@@ -3410,7 +4036,7 @@ impl DocScan {
                     let colon = self.norm.chars.get(after).copied() == Some(':');
                     if !colon {
                         if let Some(name) = self.clean(ns, ne) {
-                            push(name, &mut out);
+                            push(Mention::new(ns, ne, name), &mut out);
                         }
                     }
                 }
@@ -3466,13 +4092,13 @@ impl DocScan {
                         && self.norm.chars[s..e].iter().any(|c| c.is_alphabetic())
                     {
                         if let Some(name) = self.clean(s, e) {
-                            push(name, &mut out);
+                            push(Mention::new(s, e, name), &mut out);
                         }
                     }
                 }
             }
-            for name in self.harvest_in(from, to, to, true) {
-                push(name, &mut out);
+            for m in self.harvest_in(from, to, to, true) {
+                push(m, &mut out);
             }
         }
         // apposition : l'entité précède la parenthèse
@@ -3485,8 +4111,8 @@ impl DocScan {
                 continue;
             }
             let from = t.s.saturating_sub(160);
-            if let Some(name) = self.harvest_in(from, t.s, t.s, true).pop() {
-                push(name, &mut out);
+            if let Some(m) = self.harvest_in(from, t.s, t.s, true).pop() {
+                push(m, &mut out);
             }
         }
         // mémoire en intervention : les entités de la fenêtre aval (« présenté
@@ -3501,8 +4127,8 @@ impl DocScan {
                 continue;
             }
             let to = (t.e + 220).min(self.len());
-            for name in self.harvest_in(t.e, to, to, true) {
-                push(name, &mut out);
+            for m in self.harvest_in(t.e, to, to, true) {
+                push(m, &mut out);
             }
         }
         // re-casse d'élision : « L'organisme [3] » livre « organisme [3] », la
@@ -3510,20 +4136,23 @@ impl DocScan {
         // document sont élidées et que la chaîne existe avec initiale majuscule,
         // c'est elle le nom — verbatim ancré, jamais de casse fabriquée.
         let mut text: Option<String> = None;
-        for v in &mut out {
-            let Some(first) = v.chars().next().filter(|c| c.is_lowercase()) else {
+        for m in &mut out {
+            let Some(first) = m.value.chars().next().filter(|c| c.is_lowercase()) else {
                 continue;
             };
-            let cap: String = first.to_uppercase().chain(v.chars().skip(1)).collect();
+            let cap: String = first
+                .to_uppercase()
+                .chain(m.value.chars().skip(1))
+                .collect();
             let text = text.get_or_insert_with(|| self.norm.chars.iter().collect());
-            let all_elided = text.match_indices(v.as_str()).all(|(i, _)| {
+            let all_elided = text.match_indices(m.value.as_str()).all(|(i, _)| {
                 text[..i]
                     .chars()
                     .next_back()
                     .is_some_and(|c| c == '\'' || c == '\u{2019}')
             });
             if all_elided && text.contains(&cap) {
-                *v = cap;
+                m.value = cap;
             }
         }
         out
@@ -3531,7 +4160,7 @@ impl DocScan {
 
     /// Gabarit blocs : les conseils de chaque segment vont au côté de son
     /// étiquette (le conseil d'une partie est nommé dans son bloc).
-    fn block_counsel(&self, out: &mut CounselOut) {
+    fn block_counsel(&self, out: &mut CounselMentions) {
         let segs = self.block_segments();
         for &(kind, from, to) in &segs {
             let (names, firms) = match kind {
@@ -3545,8 +4174,12 @@ impl DocScan {
         // deux côtés est tranchée par l'intro forte (« Rep/assistant : »,
         // « représenté par ») quand un seul côté en porte ; sans signal net, les deux
         // côtés restent.
-        let arbitrate = |app: &mut Vec<String>, def: &mut Vec<String>| {
-            let dual: Vec<String> = app.iter().filter(|v| def.contains(v)).cloned().collect();
+        let arbitrate = |app: &mut Vec<Mention>, def: &mut Vec<Mention>| {
+            let dual: Vec<String> = app
+                .iter()
+                .filter(|m| def.iter().any(|d| d.value == m.value))
+                .map(|m| m.value.clone())
+                .collect();
             for v in dual {
                 let (mut app_strong, mut def_strong) = (false, false);
                 for &(kind, from, to) in &segs {
@@ -3557,14 +4190,26 @@ impl DocScan {
                     }
                 }
                 if app_strong && !def_strong {
-                    def.retain(|x| x != &v);
+                    def.retain(|x| x.value != v);
                 } else if def_strong && !app_strong {
-                    app.retain(|x| x != &v);
+                    app.retain(|x| x.value != v);
                 }
             }
         };
         arbitrate(&mut out.applicant_names, &mut out.defendant_names);
         arbitrate(&mut out.applicant_firms, &mut out.defendant_firms);
+    }
+
+    /// Partie designee par le connecteur « representant » colle a la fin d'une
+    /// entree conseil (« Me X, representant la SAS Alpha »). Renvoie la fenetre
+    /// pliee qui la nomme, a resoudre contre les partis connus.
+    fn partie_representee(&self, apres: usize, to: usize) -> Option<String> {
+        let c = self.toks.iter().find(|c| {
+            c.kind == Mk::CounselIntro && c.s >= apres && c.s < to && c.s <= apres + 3 && {
+                fold_stable(&self.text_slice(c.s, c.e)).starts_with("representant")
+            }
+        })?;
+        Some(fold_stable(&self.text_slice(c.e, to.min(c.e + 120))))
     }
 
     /// Une mention de `v` dans `[from..to)` porte-t-elle une intro de
@@ -3616,7 +4261,7 @@ impl DocScan {
     /// requérant si la partie est un requérant connu, défendeur sinon ; sans
     /// requérant connu (personnes physiques), ordre de greffe — première
     /// entrée « avocat de » = requérant.
-    fn admin_counsel(&self, out: &mut CounselOut) {
+    fn admin_counsel(&self, out: &mut CounselMentions) {
         let end = self.motifs_start();
         let bounds: Vec<(usize, usize, Mk)> = self
             .toks
@@ -3649,7 +4294,12 @@ impl DocScan {
         let apps_f: Vec<String> = self
             .admin_companies()
             .iter()
-            .map(|a| fold_stable(a))
+            .map(|a| fold_stable(&a.value))
+            .collect();
+        let defs_f: Vec<String> = self
+            .admin_defendants()
+            .iter()
+            .map(|d| fold_stable(&d.value))
             .collect();
         let ctoks: Vec<PTok> = self
             .toks
@@ -3660,12 +4310,13 @@ impl DocScan {
         let mut first_avde_seen = false;
         for (i, t) in ctoks.iter().enumerate() {
             let entry = match t.kind {
-                Mk::Me => self.person_after_me(t.e, end).map(|(v, ne)| (v, ne, false)),
-                _ => self.firm_entry(t, end).map(|(v, ne)| (v, ne, true)),
+                Mk::Me => self.person_after_me(t.e, end).map(|m| (m, false)),
+                _ => self.firm_entry(t, end).map(|m| (m, true)),
             };
-            let Some((v, ne, is_firm)) = entry else {
+            let Some((v, is_firm)) = entry else {
                 continue;
             };
+            let ne = v.e;
             let win_end = ctoks.get(i + 1).map(|n| n.s).unwrap_or(end);
             let avde = self
                 .toks
@@ -3685,7 +4336,15 @@ impl DocScan {
                     first_avde_seen = true;
                     d
                 }
-                None => seg_def(t.s),
+                // « Me X, représentant la SAS Alpha » : l'arête nomme la
+                // PARTIE, et le conseil tient son côté d'elle. Elle prime le
+                // segment, qui ne sait que sa position dans l'en-tête et avale
+                // le rapport d'audience.
+                None => match self.partie_representee(v.e, win_end) {
+                    Some(party) if side_match(&party, &apps_f, &defs_f) => false,
+                    Some(party) if side_match(&party, &defs_f, &apps_f) => true,
+                    _ => seg_def(t.s),
+                },
             };
             let (names, firms) = if is_def {
                 (&mut out.defendant_names, &mut out.defendant_firms)
@@ -3693,7 +4352,7 @@ impl DocScan {
                 (&mut out.applicant_names, &mut out.applicant_firms)
             };
             let list = if is_firm { firms } else { names };
-            if !list.contains(&v) {
+            if !list.iter().any(|o| o.value == v.value) {
                 list.push(v);
             }
         }
@@ -3703,7 +4362,7 @@ impl DocScan {
     /// observations (« les observations de la SCP A, avocat de <partie>, de la SCP
     /// B… ») — le côté suit la partie citée après « avocat de » ; sans
     /// rattachement, la première entrée défend le demandeur (ordre de greffe).
-    fn cc_counsel(&self, out: &mut CounselOut) {
+    fn cc_counsel(&self, out: &mut CounselMentions) {
         let Some(segs) = self.cc_segments() else {
             return;
         };
@@ -3723,17 +4382,17 @@ impl DocScan {
             .max()
             .unwrap_or(0);
         let (apps, defs) = self.cc_companies();
-        let apps_f: Vec<String> = apps.iter().map(|a| fold_stable(a)).collect();
-        let defs_f: Vec<String> = defs.iter().map(|d| fold_stable(d)).collect();
+        let apps_f: Vec<String> = apps.iter().map(|a| fold_stable(&a.value)).collect();
+        let defs_f: Vec<String> = defs.iter().map(|d| fold_stable(&d.value)).collect();
         let mut starts: Vec<usize> = Vec::new();
-        let mut entries: Vec<(usize, bool, String)> = Vec::new(); // (fin, cabinet?, valeur)
+        let mut entries: Vec<(bool, Mention)> = Vec::new();
         for t in &self.toks {
             if t.s < obs_from || t.s >= end {
                 continue;
             }
             let entry = match t.kind {
-                Mk::Me => self.person_after_me(t.e, end).map(|(v, ne)| (ne, false, v)),
-                Mk::LawStruct | Mk::Form => self.firm_entry(t, end).map(|(v, ne)| (ne, true, v)),
+                Mk::Me => self.person_after_me(t.e, end).map(|m| (false, m)),
+                Mk::LawStruct | Mk::Form => self.firm_entry(t, end).map(|m| (true, m)),
                 _ => None,
             };
             if let Some(en) = entry {
@@ -3741,7 +4400,8 @@ impl DocScan {
                 entries.push(en);
             }
         }
-        for (i, (ne, is_firm, v)) in entries.iter().enumerate() {
+        for (i, (is_firm, m)) in entries.iter().enumerate() {
+            let ne = &m.e;
             let win_end = starts.get(i + 1).copied().unwrap_or(end);
             // partie rattachée : « avocat de <partie> » juste après l'entrée
             let side_def = self
@@ -3766,8 +4426,8 @@ impl DocScan {
                 (&mut out.applicant_names, &mut out.applicant_firms)
             };
             let list = if *is_firm { firms } else { names };
-            if !list.contains(v) {
-                list.push(v.clone());
+            if !list.iter().any(|o| o.value == m.value) {
+                list.push(m.clone());
             }
         }
     }
@@ -3777,13 +4437,13 @@ impl DocScan {
     /// la clause court jusqu'au marqueur suivant. Les moyens incidents ou
     /// provoqués sont écartés, soit par l'incise qui casse le marqueur, soit par
     /// la queue de clause (« …, demanderesse au pourvoi incident »).
-    fn moyen_par_entries(&self) -> Vec<(String, bool, usize, usize)> {
+    fn moyen_par_entries(&self) -> Vec<(Mention, bool, usize)> {
         let mps: Vec<&PTok> = self
             .toks
             .iter()
             .filter(|t| t.kind == Mk::MoyenPar)
             .collect();
-        let mut entries: Vec<(String, bool, usize, usize)> = Vec::new();
+        let mut entries: Vec<(Mention, bool, usize)> = Vec::new();
         for (i, t) in mps.iter().enumerate() {
             let clause_end = mps.get(i + 1).map(|n| n.s).unwrap_or(self.len());
             let Some(ct) = self
@@ -3794,21 +4454,18 @@ impl DocScan {
                 continue;
             };
             let entry = match ct.kind {
-                Mk::Me => self
-                    .person_after_me(ct.e, self.len())
-                    .map(|(v, ne)| (v, false, ne)),
-                _ => self
-                    .firm_after_struct(ct, self.len())
-                    .map(|(v, ne)| (v, true, ne)),
+                Mk::Me => self.person_after_me(ct.e, self.len()).map(|m| (m, false)),
+                _ => self.firm_after_struct(ct, self.len()).map(|m| (m, true)),
             };
-            let Some((v, is_firm, ne)) = entry else {
+            let Some((v, is_firm)) = entry else {
                 continue;
             };
+            let ne = v.e;
             let tail = fold_stable(&self.text_slice(ne, clause_end.min(ne + 120)));
             if tail.contains("incident") || tail.contains("provoqu") {
                 continue;
             }
-            entries.push((v, is_firm, ne, clause_end));
+            entries.push((v, is_firm, clause_end));
         }
         entries
     }
@@ -3876,12 +4533,12 @@ impl DocScan {
     /// Conseil (avocats + cabinets) des moyens annexés CC : filet demandeur —
     /// un seul conseil distinct exigé (plusieurs = pourvois croisés,
     /// attribution ambiguë).
-    fn moyen_par_counsel(&self) -> (Vec<String>, Vec<String>) {
-        let mut names: Vec<String> = Vec::new();
-        let mut firms: Vec<String> = Vec::new();
-        for (v, is_firm, _, _) in self.moyen_par_entries() {
+    fn moyen_par_counsel(&self) -> (Vec<Mention>, Vec<Mention>) {
+        let mut names: Vec<Mention> = Vec::new();
+        let mut firms: Vec<Mention> = Vec::new();
+        for (v, is_firm, _) in self.moyen_par_entries() {
             let list = if is_firm { &mut firms } else { &mut names };
-            if !list.contains(&v) {
+            if !list.iter().any(|o| o.value == v.value) {
                 list.push(v);
             }
         }
@@ -3895,17 +4552,18 @@ impl DocScan {
     /// Parties des « Moyen produit par <conseil> … pour <partie> » annexés : filet
     /// demandeur quand le préambule n'en nomme pas, avec la même garde d'unicité
     /// de conseil que [`Self::moyen_par_counsel`].
-    fn moyen_par_parties(&self) -> Vec<String> {
+    fn moyen_par_parties(&self) -> Vec<Mention> {
         let entries = self.moyen_par_entries();
         let distinct = entries
             .iter()
-            .map(|(v, _, _, _)| v)
+            .map(|(v, _, _)| v.value.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         if distinct.len() != 1 {
             return Vec::new();
         }
-        let mut out: Vec<String> = Vec::new();
-        for (_, _, ne, clause_end) in entries {
+        let mut out: Vec<Mention> = Vec::new();
+        for (v, _, clause_end) in entries {
+            let ne = v.e;
             // « , avocat aux Conseils, pour <partie> » : le « pour » vit à
             // portée courte du conseil, dans la même clause
             let lim = clause_end.min(ne + 60).min(self.len());
@@ -3921,9 +4579,9 @@ impl DocScan {
             };
             let to = self.sentence_end(from, clause_end.min(from + 140));
             let to = self.moyen_body_start(from, to);
-            for name in self.harvest(from, to, to) {
-                if !out.iter().any(|o| same_words(o, &name)) {
-                    out.push(name);
+            for m in self.harvest(from, to, to) {
+                if !out.iter().any(|o| same_words(&o.value, &m.value)) {
+                    out.push(m);
                 }
             }
         }
@@ -3932,7 +4590,13 @@ impl DocScan {
 
     /// Récolte les conseils d'un segment `[from..to)` : personnes après
     /// « Me », cabinets via [`Self::firm_entry`].
-    fn counsel_in(&self, from: usize, to: usize, names: &mut Vec<String>, firms: &mut Vec<String>) {
+    fn counsel_in(
+        &self,
+        from: usize,
+        to: usize,
+        names: &mut Vec<Mention>,
+        firms: &mut Vec<Mention>,
+    ) {
         let to = to.min(self.len());
         for t in &self.toks {
             if t.s < from || t.s >= to {
@@ -3940,15 +4604,15 @@ impl DocScan {
             }
             match t.kind {
                 Mk::Me => {
-                    if let Some((p, _)) = self.person_after_me(t.e, to) {
-                        if !names.contains(&p) {
+                    if let Some(p) = self.person_after_me(t.e, to) {
+                        if !names.iter().any(|o| o.value == p.value) {
                             names.push(p);
                         }
                     }
                 }
                 Mk::LawStruct | Mk::Form => {
-                    if let Some((f, _)) = self.firm_entry(t, to) {
-                        if !firms.contains(&f) {
+                    if let Some(f) = self.firm_entry(t, to) {
+                        if !firms.iter().any(|o| o.value == f.value) {
                             firms.push(f);
                         }
                     }
@@ -3964,8 +4628,9 @@ impl DocScan {
     /// - forme commerciale (SARL, SAS…) uniquement sur intro de conseil
     ///   explicite sans marqueur de bloc interposé (« représentée par la
     ///   SARL Le Prado - Gilbert ») ou apposition — sinon c'est une partie.
-    fn firm_entry(&self, t: &PTok, to: usize) -> Option<(String, usize)> {
-        let (f, ne) = self.firm_after_struct(t, to)?;
+    fn firm_entry(&self, t: &PTok, to: usize) -> Option<Mention> {
+        let f = self.firm_after_struct(t, to)?;
+        let ne = f.e;
         let ok = match t.kind {
             Mk::LawStruct => self.counsel_ctx_before(t.s) || self.followed_by_counsel(ne),
             Mk::Form => {
@@ -3986,7 +4651,7 @@ impl DocScan {
             }
             _ => false,
         };
-        ok.then_some((f, ne))
+        ok.then_some(f)
     }
 
     /// Nom de personne après « Me »/« Maître » : tranche verbatim jusqu'à la
@@ -3995,7 +4660,7 @@ impl DocScan {
     /// Un nom de personne = mots Capitalisés (+ particules de/du/van…) : la
     /// prose en bas-de-casse qui suit sans ponctuation (« Me B... à assister
     /// et représenter… ») et le groupe parenthésé (cabinet) coupent le nom.
-    fn person_after_me(&self, e: usize, to: usize) -> Option<(String, usize)> {
+    fn person_after_me(&self, e: usize, to: usize) -> Option<Mention> {
         let ns = self.skip_spaces(e, to);
         let first = self.norm.chars.get(ns).copied().unwrap_or(' ');
         if !(first.is_uppercase() || first == '[') || self.opens_on_terminator(ns) {
@@ -4038,13 +4703,13 @@ impl DocScan {
                 i += 1;
             }
         }
-        self.clean_inner(ns, cut).map(|v| (v, cut))
+        self.clean_inner(ns, cut).map(|v| Mention::new(ns, cut, v))
     }
 
     /// Cabinet après une structure d'avocats (SCP, SELARL…) : les associés
     /// s'enchaînent par virgule (« SCP Célice, Texidor, Périer ») — on
     /// prolonge sur un mot Capitalisé qui n'ouvre pas de token.
-    fn firm_after_struct(&self, t: &PTok, to: usize) -> Option<(String, usize)> {
+    fn firm_after_struct(&self, t: &PTok, to: usize) -> Option<Mention> {
         let ns = self.skip_spaces(t.e, to);
         let first = self.norm.chars.get(ns).copied().unwrap_or(' ');
         if !(first.is_uppercase() || first.is_ascii_digit() || first == '[')
@@ -4054,7 +4719,8 @@ impl DocScan {
         }
         let ne = self.chain_end(self.extend_name(ns, to), to);
         let name = self.clean_inner(ns, ne)?;
-        Some((format!("{} {}", self.text_slice(t.s, t.e), name), ne))
+        let v = format!("{} {}", self.text_slice(t.s, t.e), name);
+        Some(Mention::new(t.s, ne, v))
     }
 
     /// Un token ouvre-t-il exactement à `pos` ?
@@ -4493,6 +5159,126 @@ fn side_match(party: &str, side: &[String], other: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Jugement du TAE de Paris dont la source a perdu ses `s` : aucun marqueur
+    /// d'ouverture ne tokenise, le bandeau se repliait sur les motifs et lisait
+    /// le pôle de la cour d'appel CITÉE comme sa propre formation.
+    #[test]
+    fn le_bandeau_sans_marqueur_ne_lit_pas_la_formation_d_une_decision_citee() {
+        let doc = "*1DE/06/51/25/41*\n\nCopie : -DGFIP -SAS ALEPH elle-même repré entée par  on \
+             pré ident M. [P] [F] -SCP BTSG en la per onne de Me Deni  Ga nier -Parquet\n\n\
+             R.G. : 2025108154 P.C. : P202500899\n\nREPUBLIQUE FRANCAISE AU NOM DU PEUPLE \
+             FRANCAIS TRIBUNAL DES ACTIVITES ECONOMIQUES DE PARIS\n\nJugement prononcé le \
+             mardi 6 janvier 2026 Audience de vacation\n\nREPORT DE LA PERIODE D'OB ERVATION \
+             NOMINATION DE JUGE COMMI  AIRE\n\nFAIT  ET PROCEDURE\n\nPar jugement en date du \
+             13 mar  2025, le tribunal a ouvert,  ur a  ignation, une procédure de \
+             liquidation judiciaire à l'égard de la  A  NIP UX EXPERT . Par arrêt en date du \
+             7 octobre 2025, la cour d'appel de Paris Pôle 5 - Chambre 8 a infirmé ledit \
+             jugement et,  tatuant à nouveau : a ouvert une procédure de redre  ement.";
+        let bandeau = scan(doc).bandeau_text();
+        assert!(bandeau.chars().count() <= BANDEAU_MAX);
+        assert!(!bandeau.contains("Pôle 5"));
+    }
+
+    /// Un avocat nommé deux fois, une seule fois avec son prénom, ne peut pas
+    /// se retrouver des deux côtés : la graphie complète porte l'arête.
+    #[test]
+    fn un_avocat_ne_tient_qu_un_cote() {
+        let mut apps = vec![Mention::new(0, 16, "Emmanuel Levanti".into())];
+        let mut defs = vec![Mention::new(90, 97, "Levanti".into())];
+        un_seul_cote(&mut apps, &mut defs);
+        assert_eq!(apps.len(), 1);
+        assert!(defs.is_empty());
+
+        // la graphie complète est en défense : c'est elle qui reste
+        let mut apps = vec![Mention::new(0, 7, "Brumaire".into())];
+        let mut defs = vec![Mention::new(90, 106, "SELARL Brumaire".into())];
+        un_seul_cote(&mut apps, &mut defs);
+        assert!(apps.is_empty());
+        assert_eq!(defs.len(), 1);
+
+        // deux avocats distincts restent chacun de son côté
+        let mut apps = vec![Mention::new(0, 6, "Dirou".into())];
+        let mut defs = vec![Mention::new(90, 97, "Thinon".into())];
+        un_seul_cote(&mut apps, &mut defs);
+        assert_eq!((apps.len(), defs.len()), (1, 1));
+    }
+
+    /// Grammaire du pseudonyme : les trois ères de pseudonymisation, la
+    /// civilité hors valeur, la mention matrimoniale terminatrice, et la
+    /// résolution de deux graphies sur la plus longue.
+    #[test]
+    fn lecteur_de_partie_personne_physique() {
+        let cas: [(&str, &[&str], &[&str]); 6] = [
+            (
+                "Vu la procedure suivante : Par une requete, M. A B, representé par Me Airiau, demande a la cour d'annuler l'arreté.",
+                &["A B"],
+                &[],
+            ),
+            (
+                "Statuant sur le pourvoi formé par : X... Jacques, partie civile, contre l'arret rendu par la cour d'appel de Paris.",
+                &["X... Jacques"],
+                &[],
+            ),
+            (
+                "APPELANT : Monsieur Vincent X... INTIMÉE : Madame Régine Y..., épouse Z...",
+                &["Vincent X..."],
+                &["Régine Y..."],
+            ),
+            (
+                "APPELANTS : [CP] [F] né le 3 mars 1970 INTIMÉ : [YS] [WC] [R] [I] demeurant a Paris",
+                &["[CP] [F]"],
+                &["[YS] [WC] [R] [I]"],
+            ),
+            (
+                "APPELANTS : Monsieur Pierre X... Madame Danièle X... INTIMÉE : SA Verrerie du Nord",
+                &["Pierre X...", "Danièle X..."],
+                &[],
+            ),
+            (
+                "Vu la procedure suivante : Procedure contentieuse anterieure : M. A B a demandé au tribunal administratif de Strasbourg d'annuler l'arreté. Procedure devant la cour : Par une requete, M. B, representé par Me Airiau, demande a la cour.",
+                &["A B"],
+                &[],
+            ),
+        ];
+        for (texte, apps, defs) in cas {
+            let s = scan(texte);
+            let (a, d) = s.individuals_uncached();
+            let lu = |v: &[Mention]| v.iter().map(|m| m.value.clone()).collect::<Vec<_>>();
+            assert_eq!(lu(&a), apps, "demandeurs de « {texte} »");
+            assert_eq!(lu(&d), defs, "défendeurs de « {texte} »");
+        }
+    }
+
+    /// Contrat de [`Mention`] : la tranche `[s..e)` porte tous les mots de la
+    /// valeur, dans l'ordre. Elle n'en est pas la copie (forme sociale
+    /// recollée, intérieur nettoyé, queue rognée), elle l'ancre.
+    #[test]
+    fn mention_span_carries_its_value() {
+        let textes = [
+            "Vu la procédure suivante : Par une requête enregistrée le 3 mars 2023, la SAS Alpha Distribution, représentée par Me Bouyssou, demande à la cour : 1°) d'annuler l'arrêté du maire de Saint-Priest ;",
+            "APPELANTE : SAS Gondrand, représentée par Me Laura Javert, avocat au barreau de MÂCON INTIMÉE : SA Verrerie du Nord, représentée par la SELARL Brumaire",
+            "Sur le pourvoi formé par la société anonyme Crédit Lyonnais, contre l'arrêt rendu par la cour d'appel de Paris, dans le litige l'opposant à la CPAM du Gard, défenderesse à la cassation ;",
+        ];
+        for texte in textes {
+            let s = scan(texte);
+            let r = s.party_registry();
+            assert!(!r.entities.is_empty(), "aucune entité : {texte}");
+            for e in &r.entities {
+                let tranche = fold_stable(&s.text_slice(e.s, e.e));
+                let mut reste = tranche.as_str();
+                for mot in fold_stable(&e.value).split_whitespace() {
+                    let Some(i) = reste.find(mot) else {
+                        panic!(
+                            "« {mot} » de « {} » hors de sa tranche « {tranche} »",
+                            e.value
+                        );
+                    };
+                    reste = &reste[i + mot.len()..];
+                }
+            }
+        }
+    }
 
     #[test]
     fn composite_stop_recasts_to_audience_in_prose() {

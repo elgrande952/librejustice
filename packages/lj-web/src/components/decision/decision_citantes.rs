@@ -1,0 +1,43 @@
+//! Bloc « Citée par » : les décisions dont le texte cite celle de la page,
+//! autorité d'abord. Ni la chronologie du rail (les étapes de la même affaire),
+//! ni les analyses du Conseil d'État (écrites par un documentaliste).
+
+use leptos::prelude::*;
+use lj_dtos::CitingDecisionHit;
+
+use crate::helpers::group_thousands;
+use crate::pages::law_page::cited_by::CitedDecisionRow;
+
+#[component]
+pub fn DecisionCitantes(citantes: Vec<CitingDecisionHit>, total: Option<i64>) -> impl IntoView {
+    if citantes.is_empty() {
+        return ().into_any();
+    }
+    let title = "Citée par";
+    let reste = total
+        .map(|t| t - citantes.len() as i64)
+        .filter(|r| *r > 0)
+        .map(|r| match r {
+            1 => "Une autre décision la cite.".to_string(),
+            r => format!("{} autres décisions la citent.", group_thousands(r)),
+        });
+    let lignes = citantes
+        .into_iter()
+        .map(|hit| view! { <CitedDecisionRow hit=hit cited=None /> })
+        .collect_view();
+
+    view! {
+        <section
+            aria-label=title
+            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6"
+        >
+            <h2 class="font-sans text-base text-[var(--color-ink)]">{title}</h2>
+            <ul class="mt-4 flex flex-col">{lignes}</ul>
+            {reste
+                .map(|r| {
+                    view! { <p class="mt-3 text-xs text-[var(--color-ink-subtle)]">{r}</p> }
+                })}
+        </section>
+    }
+    .into_any()
+}

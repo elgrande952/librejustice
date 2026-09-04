@@ -1,32 +1,16 @@
 //! Scraper de métriques Postgres → OTLP.
 //!
-//! Le row « PostgreSQL » du cockpit Grafana interroge le jeu de métriques du
-//! `postgresqlreceiver` OTel (taille des tables/index, taille de la base,
-//! vacuum, âge du WAL). On émet **les mêmes noms et unités** que ce receiver
-//! pour que, après conversion OTLP → Prometheus côté Grafana Cloud (points →
-//! underscores, suffixe d'unité ajouté), on retrouve
-//! `postgresql_db_size_bytes`, `postgresql_table_size_bytes`,
-//! `postgresql_index_size_bytes`, `postgresql_table_vacuum_count` et
-//! `postgresql_wal_age_seconds`.
+//! Noms et unités du `postgresqlreceiver` OTel, pour que la conversion
+//! OTLP → Prometheus rende `postgresql_db_size_bytes` et ses voisins.
 //!
-//! Modèle d'export : des observable gauges OTel dont le callback (synchrone)
-//! lit un snapshot rafraîchi par une boucle async toutes les 60 s — 1 DPM, la
-//! limite incluse au free tier Grafana Cloud (`included_dpm_per_series`).
+//! Chaque famille se scrape dans sa propre transaction bornée par
+//! [`SCRAPE_STATEMENT_TIMEOUT`] : `pg_database_size` et `pg_relation_size`
+//! appellent `stat()` par segment de fichier, donc leur latence suit l'I/O et
+//! non le volume. Une famille lente n'aveugle pas les autres.
 //!
-//! Chaque famille de métriques se scrape **indépendamment**, dans sa propre
-//! transaction bornée par [`SCRAPE_STATEMENT_TIMEOUT`] : les requêtes de taille
-//! (`pg_database_size`, `pg_relation_size`) appellent `stat()` par segment de
-//! fichier, donc leur latence suit l'I/O de la machine et non le volume de
-//! données. Une famille lente n'aveugle donc pas les autres, le scraper ne
-//! retient pas une connexion du pool pendant la saturation, et une famille qui
-//! échoue garde sa valeur précédente.
-//!
-//! Point clé :
-//! `postgresql.database.name`, `postgresql.table.name`, `postgresql.index.name`
-//! sont posés comme **attributs de datapoint** sur chaque mesure — ils
-//! deviennent des labels Prometheus. Posés comme attributs de `Resource`, ils
-//! finiraient noyés dans la série `target_info`, sans dimension par
-//! table/index.
+//! `postgresql.{database,table,index}.name` sont des attributs de DATAPOINT :
+//! ils deviennent des labels Prometheus. En attributs de `Resource`, ils
+//! finiraient dans `target_info`, sans dimension par table.
 
 use deadpool_postgres::Pool;
 use opentelemetry::{global, KeyValue};

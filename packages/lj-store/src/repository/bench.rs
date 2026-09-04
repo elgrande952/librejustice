@@ -9,6 +9,7 @@ use crate::error::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use lj_core::{CERTIFIER_VERSION, EXTRACT_VERSION};
 use serde_json::Value;
+use tokio_postgres::types::Json;
 
 /// Sort d'une écriture de révision manuelle par [`DecisionRepository::upsert_fields_at_version`].
 ///
@@ -39,8 +40,10 @@ pub struct ManualFields {
     pub procedure_uid: Option<String>,
     pub office_uid: Option<String>,
     pub legal_domain_uid: Option<String>,
-    pub chamber_position: Option<String>,
-    pub chamber_uid: Option<String>,
+    /// Column `decisions.seat` (jsonb), from which `chamber_key` is derived at
+    /// write time: the gold annotates a room label, and one parse turns it into
+    /// both forms.
+    pub seat: Option<lj_core::chamber::Seat>,
     pub formation_uid: Option<String>,
     pub jurisdiction_code: Option<String>,
 }
@@ -78,6 +81,24 @@ impl DecisionRepository<'_> {
         Ok(rows
             .into_iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+            .collect())
+    }
+
+    /// Reading date per `decision_id`. Rows with a null `date_lecture` are
+    /// omitted: the offline ranking bench needs the date to drop hits the
+    /// ground truth could not have judged, and no date means no bound.
+    pub async fn fetch_reading_dates(&self, ids: &[i64]) -> Result<Vec<(i64, NaiveDate)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT id, date_lecture FROM decisions \
+                 WHERE id = ANY($1) AND date_lecture IS NOT NULL",
+                &[&ids],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, NaiveDate>(1)))
             .collect())
     }
 
@@ -241,6 +262,35 @@ impl DecisionRepository<'_> {
     /// trois derniers viennent de la provenance autoritaire (rang max active),
     /// celle dont le texte EST `full_text`. `None` si pas de provenance active ou si
     /// `full_text`/`source_fields` manque.
+    /// Décisions dont aucune provenance ne porte de charge : elles ne peuvent
+    /// pas être ré-extraites, et rien dans le produit ne le dit.
+    #[tracing::instrument(name = "db.decisions_sans_charge", skip(self), fields(db.system = "postgresql"))]
+    pub async fn decisions_sans_charge(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query(
+                "
+                SELECT d.public_id
+                FROM decisions d
+                WHERE d.deleted_at IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM decision_sources ds
+                    WHERE ds.decision_id = d.id AND ds.deleted_at IS NULL
+                      AND ds.source_rank > 0
+                  )
+                ORDER BY d.id
+                ",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Charge de ré-extraction d'une décision : sa provenance la plus
+    /// autoritaire. Le rang 0 dit qu'une ligne ne porte AUCUNE décision (bundle
+    /// de commentaires ArianeWeb, analyse ADDE) : elle ne peut pas être lue
+    /// comme une charge, et une source de charge oubliée au barème laisse la
+    /// décision non ré-extraite, jamais mal extraite.
     pub async fn fetch_reextract_inputs(
         &self,
         decision_id: i64,
@@ -254,7 +304,7 @@ impl DecisionRepository<'_> {
                 JOIN LATERAL (
                     SELECT source_fields, source_uid
                     FROM decision_sources
-                    WHERE decision_id = d.id AND deleted_at IS NULL
+                    WHERE decision_id = d.id AND deleted_at IS NULL AND source_rank > 0
                     ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC
                     LIMIT 1
                 ) ds ON true
@@ -279,17 +329,17 @@ impl DecisionRepository<'_> {
     pub async fn fetch_reextract_inputs_batch(
         &self,
         ids: &[i64],
-    ) -> Result<Vec<(i64, String, Value, String)>> {
+    ) -> Result<Vec<(i64, String, Value, String, Option<String>)>> {
         let rows = self
             .conn
             .query(
                 "
-                SELECT d.id, d.full_text, ds.source_fields, ds.source_uid
+                SELECT d.id, d.full_text, ds.source_fields, ds.source_uid, d.case_name
                 FROM decisions d
                 JOIN LATERAL (
                     SELECT source_fields, source_uid
                     FROM decision_sources
-                    WHERE decision_id = d.id AND deleted_at IS NULL
+                    WHERE decision_id = d.id AND deleted_at IS NULL AND source_rank > 0
                     ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC
                     LIMIT 1
                 ) ds ON true
@@ -306,9 +356,13 @@ impl DecisionRepository<'_> {
                 let full_text: Option<String> = r.get(1);
                 let source_fields: Option<Value> = r.get(2);
                 match (full_text, source_fields) {
-                    (Some(ft), Some(sf)) => {
-                        Some((r.get::<_, i64>(0), ft, sf, r.get::<_, String>(3)))
-                    }
+                    (Some(ft), Some(sf)) => Some((
+                        r.get::<_, i64>(0),
+                        ft,
+                        sf,
+                        r.get::<_, String>(3),
+                        r.get::<_, Option<String>>(4),
+                    )),
                     _ => None,
                 }
             })
@@ -572,12 +626,19 @@ impl DecisionRepository<'_> {
     /// N'écrit que sur différence : une révision identique laisse `updated_at`
     /// intact. `cible` vide = `NotFound` (pas de décision, ou version supérieure) ;
     /// `cible` non vide sans ligne écrite = `Unchanged`.
+    ///
+    /// `seat_paths` is NOT written here: a path resolves against the room
+    /// vocabulary of the whole corpus, which only `resolve-seats` holds. So a
+    /// gold load leaves the axis to that pass, as the first write of the seats
+    /// did.
     pub async fn upsert_fields_at_version(
         &self,
         source_uid: &str,
         version: i16,
         fields: &ManualFields,
     ) -> Result<ManualUpsert> {
+        let seat = fields.seat.clone().map(Json);
+        let chamber_key = fields.seat.as_ref().and_then(lj_core::chamber::Seat::key);
         let row = self
             .conn
             .query_one(
@@ -586,26 +647,26 @@ impl DecisionRepository<'_> {
                      FROM decisions d
                      JOIN decision_sources ds ON ds.decision_id = d.id
                      WHERE ds.source_uid = $1
-                       AND (d.extract_version IS NULL OR d.extract_version <= $14)
+                       AND (d.extract_version IS NULL OR d.extract_version <= $12)
                  ), maj AS (
                      UPDATE decisions d SET
                          date_lecture = $2, date_audience = $3, docket_numbers = $4,
                          publication_codes = $5,
                          solution_uid = $6, procedure_uid = $7, office_uid = $8,
                          legal_domain_uid = $9,
-                         chamber_position = $10, chamber_uid = $11, formation_uid = $12,
-                         jurisdiction_code = COALESCE($13, d.jurisdiction_code),
-                         extract_version = $14, updated_at = now()
+                         seat = $13, chamber_key = $14, formation_uid = $10,
+                         jurisdiction_code = COALESCE($11, d.jurisdiction_code),
+                         extract_version = $12, updated_at = now()
                      FROM cible
                      WHERE d.id = cible.id
                        AND (d.date_lecture, d.date_audience, d.docket_numbers,
                             d.publication_codes, d.solution_uid, d.procedure_uid,
-                            d.office_uid, d.legal_domain_uid, d.chamber_position,
-                            d.chamber_uid, d.formation_uid, d.jurisdiction_code,
-                            d.extract_version)
+                            d.office_uid, d.legal_domain_uid,
+                            d.seat, d.chamber_key, d.formation_uid,
+                            d.jurisdiction_code, d.extract_version)
                            IS DISTINCT FROM
-                           ($2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                            COALESCE($13, d.jurisdiction_code), $14)
+                           ($2, $3, $4, $5, $6, $7, $8, $9, $13, $14, $10,
+                            COALESCE($11, d.jurisdiction_code), $12)
                      RETURNING 1
                  )
                  SELECT (SELECT count(*) FROM cible), (SELECT count(*) FROM maj)",
@@ -619,11 +680,11 @@ impl DecisionRepository<'_> {
                     &fields.procedure_uid,
                     &fields.office_uid,
                     &fields.legal_domain_uid,
-                    &fields.chamber_position,
-                    &fields.chamber_uid,
                     &fields.formation_uid,
                     &fields.jurisdiction_code,
                     &version,
+                    &seat,
+                    &chamber_key,
                 ],
             )
             .await?;
@@ -665,30 +726,51 @@ impl DecisionRepository<'_> {
     }
 
     /// Keyset des décisions à re-parser ciblées par `jurisdiction_type`,
-    /// indépendamment de `extract_version` et sans bump global. Révisions manuelles
-    /// exclues.
+    /// indépendamment de `extract_version` et sans bump global. Révisions
+    /// manuelles exclues. `text_query` restreint au gisement d'une expression
+    /// BM25 : une grammaire neuve n'atteint que les textes qui portent le
+    /// littéral qu'elle exige, au lieu du fonds entier.
     pub async fn decision_ids_for_reextract_by_juridiction(
         &self,
         last_id: i64,
         limit: i64,
         jurisdiction_types: &[String],
+        text_query: Option<&str>,
     ) -> Result<Vec<i64>> {
-        let rows = self
-            .conn
-            .query(
-                "
-                SELECT d.id
-                FROM decisions d
-                WHERE d.id > $1
-                  AND d.full_text IS NOT NULL
-                  AND d.jurisdiction_type = ANY($3)
-                  AND (d.extract_version IS NULL OR d.extract_version <= $4)
-                ORDER BY d.id
-                LIMIT $2
-                ",
-                &[&last_id, &limit, &jurisdiction_types, &EXTRACT_VERSION],
-            )
-            .await?;
+        let filtre = match text_query {
+            Some(_) => "AND d.id @@@ paradedb.parse_with_field('full_text', $5)",
+            None => "",
+        };
+        let sql = format!(
+            "SELECT d.id
+             FROM decisions d
+             WHERE d.id > $1
+               AND d.full_text IS NOT NULL
+               AND d.jurisdiction_type = ANY($3)
+               AND (d.extract_version IS NULL OR d.extract_version <= $4)
+               {filtre}
+             ORDER BY d.id
+             LIMIT $2"
+        );
+        let rows = match text_query {
+            Some(q) => {
+                let q = q.to_string();
+                self.conn
+                    .query(
+                        sql.as_str(),
+                        &[&last_id, &limit, &jurisdiction_types, &EXTRACT_VERSION, &q],
+                    )
+                    .await?
+            }
+            None => {
+                self.conn
+                    .query(
+                        sql.as_str(),
+                        &[&last_id, &limit, &jurisdiction_types, &EXTRACT_VERSION],
+                    )
+                    .await?
+            }
+        };
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 

@@ -171,19 +171,21 @@ fn DecisionNavWidget(
     let next_id = idx
         .filter(|&i| i + 1 < len)
         .map(|i| nav.hit_ids[i + 1].clone());
+    // Décision hors de la liste servie : le compteur n'a pas de rang à afficher
+    // et les deux flèches seraient mortes.
+    let Some(rang) = idx else {
+        return ().into_any();
+    };
 
     let btn_class = "flex h-7 w-7 items-center justify-center rounded border border-[var(--color-rule)] text-[var(--color-ink-muted)] transition-colors hover:border-[var(--color-ink)] hover:text-[var(--color-ink)]";
     let disabled_class = "flex h-7 w-7 items-center justify-center rounded border border-[var(--color-rule)] text-[var(--color-ink-subtle)] opacity-30";
 
     let go = {
         let hit_ids = nav.hit_ids.clone();
-        let total = nav.total;
         let from_search = from_search.clone();
-        move |target_idx: usize, target_id: String| {
+        move |target_id: String| {
             seed.set(Some(ResultNavSeed {
                 nav: Some(ResultNav {
-                    position: target_idx as i64 + 1,
-                    total,
                     hit_ids: hit_ids.clone(),
                 }),
                 from_search: from_search.clone(),
@@ -197,13 +199,13 @@ fn DecisionNavWidget(
         }
     };
 
-    let prev_view = match (idx, prev_id) {
-        (Some(i), Some(pid)) => {
+    let prev_view = match prev_id {
+        Some(pid) => {
             let go = go.clone();
             Either::Left(view! {
                 <button
                     type="button"
-                    on:click=move |_| go(i - 1, pid.clone())
+                    on:click=move |_| go(pid.clone())
                     aria-label="Résultat précédent"
                     class=btn_class
                 >
@@ -211,16 +213,16 @@ fn DecisionNavWidget(
                 </button>
             })
         }
-        _ => Either::Right(view! { <span class=disabled_class>"←"</span> }),
+        None => Either::Right(view! { <span class=disabled_class>"←"</span> }),
     };
 
-    let next_view = match (idx, next_id) {
-        (Some(i), Some(nid)) => {
+    let next_view = match next_id {
+        Some(nid) => {
             let go = go.clone();
             Either::Left(view! {
                 <button
                     type="button"
-                    on:click=move |_| go(i + 1, nid.clone())
+                    on:click=move |_| go(nid.clone())
                     aria-label="Résultat suivant"
                     class=btn_class
                 >
@@ -228,11 +230,11 @@ fn DecisionNavWidget(
                 </button>
             })
         }
-        _ => Either::Right(view! { <span class=disabled_class>"→"</span> }),
+        None => Either::Right(view! { <span class=disabled_class>"→"</span> }),
     };
 
-    let position = nav.position;
-    let total = nav.total;
+    let position = rang + 1;
+    let total = len;
     view! {
         <div class="flex shrink-0 items-center gap-2 text-sm text-[var(--color-ink-subtle)]">
             {prev_view}
@@ -244,6 +246,7 @@ fn DecisionNavWidget(
             {next_view}
         </div>
     }
+    .into_any()
 }
 
 /// Fermeture d'un panneau flottant au clic exterieur (listener `mousedown`) et
@@ -289,6 +292,8 @@ fn AccountItems(email: String, open: RwSignal<bool>) -> impl IntoView {
     // vit dans les enfants de `<Show>` (rappeles a chaque rendu).
     #[cfg(feature = "hydrate")]
     let navigate = StoredValue::new_local(use_navigate());
+    #[cfg(feature = "hydrate")]
+    let auth = crate::auth::use_auth();
     let on_sign_out = move |_| {
         open.set(false);
         #[cfg(feature = "hydrate")]
@@ -296,6 +301,9 @@ fn AccountItems(email: String, open: RwSignal<bool>) -> impl IntoView {
             let nav = navigate.get_value();
             leptos::task::spawn_local(async move {
                 crate::auth::sign_out().await;
+                // Le pilote d'auth relit l'identite, vide le cache de requetes et
+                // remet le theme clair.
+                auth.bump();
                 nav(
                     "/",
                     NavigateOptions {
@@ -312,8 +320,8 @@ fn AccountItems(email: String, open: RwSignal<bool>) -> impl IntoView {
             <p class="truncate text-xs text-[var(--color-ink-subtle)]">{email}</p>
         </div>
         <div class="py-1">
-            <DropdownItem href="/profil">"Profil"</DropdownItem>
-            <DropdownItem href="/activite/recherches">"Mon activité"</DropdownItem>
+            <DropdownItem href="/profile">"Profil"</DropdownItem>
+            <DropdownItem href="/activity/searches">"Mon activité"</DropdownItem>
         </div>
         <div class="border-t border-[var(--color-rule)] py-1">
             <button
@@ -371,6 +379,7 @@ fn BurgerMenu() -> impl IntoView {
                         <DropdownItem href="/annuaire">"Annuaire"</DropdownItem>
                         <DropdownItem href="/annonces">"Annonces"</DropdownItem>
                         <DropdownItem href="/mcp-guide">"MCP"</DropdownItem>
+                        <DropdownItem href="/api-guide">"API"</DropdownItem>
                     </div>
                     {move || match auth.email.get() {
                         None => Either::Left(view! {
@@ -389,7 +398,7 @@ fn BurgerMenu() -> impl IntoView {
     }
 }
 
-/// `href` du lien Connexion : `/connexion?next=<page courante>`, pour revenir
+/// `href` du lien Connexion : `/login?next=<page courante>`, pour revenir
 /// d'ou l'on vient une fois authentifie. Depuis les pages d'auth elles-memes,
 /// pas de `next` — la destination serait la page de connexion.
 fn login_href() -> impl Fn() -> String + Copy + Send + Sync + 'static {
@@ -397,8 +406,8 @@ fn login_href() -> impl Fn() -> String + Copy + Send + Sync + 'static {
     let (pathname, search) = (location.pathname, location.search);
     move || {
         let path = pathname.get();
-        if path.starts_with("/connexion") || path.starts_with("/reinitialiser-mot-de-passe") {
-            return "/connexion".to_string();
+        if path.starts_with("/login") || path.starts_with("/reset-password") {
+            return "/login".to_string();
         }
         let search = search.get();
         let target = if search.is_empty() {
@@ -407,7 +416,7 @@ fn login_href() -> impl Fn() -> String + Copy + Send + Sync + 'static {
             format!("{path}?{search}")
         };
         format!(
-            "/connexion?next={}",
+            "/login?next={}",
             leptos_router::location::Url::escape(&target)
         )
     }

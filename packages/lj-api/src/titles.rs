@@ -1,7 +1,7 @@
 //! Titre lisible d'une décision côté API : résolution de la
 //! juridiction (nom réel assaini, sinon libellé référentiel du type fourni
-//! par l'appelant), siège recomposé depuis les axes structurés
-//! (`chamber_position` + uids `formation:*` / `office:*`), puis délégation au
+//! par l'appelant), siège composé du libellé de chambre du référentiel et des
+//! uids `formation:*` / `office:*`, puis au
 //! composeur canonique [`lj_core::titles`] — le même qui écrit
 //! `search_title` à l'ingest.
 
@@ -23,16 +23,27 @@ pub fn decision_jurisdiction(type_label: &str, jurisdiction_name: Option<&str>) 
 /// [`lj_core::titles::seat_display`] avec les labels référentiels des uids.
 pub fn decision_seat(
     jurisdiction: &str,
-    chamber_position: Option<&str>,
+    chamber_label: Option<&str>,
     formation_uid: Option<&str>,
     office_uid: Option<&str>,
 ) -> Option<String> {
     lj_core::titles::seat_display(
         jurisdiction,
-        chamber_position,
+        chamber_label,
         formation_uid.and_then(lj_core::titles::formation_label),
         office_uid.and_then(lj_core::titles::office_label),
     )
+}
+
+/// Seat tag: the deepest path, as the `seat` filter expects it, and the label
+/// of its last segment. Paths come out unfolded from shortest to longest, so
+/// the last one is the room.
+pub fn seat_path_tag(paths: &[String]) -> Option<lj_dtos::FacetTag> {
+    let path = paths.last()?;
+    Some(lj_dtos::FacetTag {
+        key: path.clone(),
+        label: lj_core::chamber::seat_path_label(path)?,
+    })
 }
 
 /// Titre lisible « <juridiction>[, <siège>], <date FR>, <numéro> »
@@ -43,6 +54,7 @@ pub fn decision_title(
     jurisdiction_name: Option<&str>,
     seat: Option<&str>,
     date_lecture: Option<&str>,
+    nom_usage: Option<&str>,
     docket_numbers: Option<&[String]>,
 ) -> String {
     let jurisdiction = decision_jurisdiction(type_label, jurisdiction_name);
@@ -50,6 +62,7 @@ pub fn decision_title(
         &jurisdiction,
         seat,
         date_lecture,
+        nom_usage,
         docket_numbers.and_then(|d| d.first()).map(String::as_str),
     )
 }
@@ -66,6 +79,7 @@ mod tests {
             None,
             None,
             Some("2026-05-29"),
+            None,
             Some(&dockets),
         );
         assert_eq!(title, "Cour de cassation, 29 mai 2026, 24-17.384");
@@ -79,6 +93,7 @@ mod tests {
             None,
             Some("chambres 5/6 réunies"),
             Some("2026-02-25"),
+            None,
             Some(&dockets),
         );
         assert_eq!(
@@ -90,10 +105,10 @@ mod tests {
     #[test]
     fn seat_cc_deja_dans_la_juridiction() {
         // Le label cass_civ2 porte déjà la chambre : le siège composé tombe.
-        let jur = "Cour de cassation, deuxième chambre civile";
+        let jur = "Cour de cassation, 2e chambre civile";
         let seat = decision_seat(
             jur,
-            Some("Deuxième chambre civile"),
+            Some("2e chambre civile"),
             Some("formation:RESTREINTE"),
             None,
         );
@@ -102,9 +117,11 @@ mod tests {
 
     #[test]
     fn seat_office_depuis_les_axes() {
+        // Chambre que rien ne qualifie : le libellé tombe sur la clé seule.
+        let label = lj_core::chamber::seat_label(Some("C7"));
         let seat = decision_seat(
             "Tribunal judiciaire de Nanterre",
-            Some("7e chambre"),
+            label.as_deref(),
             None,
             Some("office:JLD"),
         );
@@ -122,13 +139,14 @@ mod tests {
             None,
             Some("2024-02-13"),
             None,
+            None,
         );
         assert_eq!(title, "Tribunal administratif de Paris, 13 février 2024");
     }
 
     #[test]
     fn blank_jurisdiction_name_falls_back_to_label() {
-        let title = decision_title("Conseil d'État", Some("   "), None, None, None);
+        let title = decision_title("Conseil d'État", Some("   "), None, None, None, None);
         assert_eq!(title, "Conseil d'État");
     }
 
@@ -137,6 +155,7 @@ mod tests {
         let title = decision_title(
             "Cour d'appel",
             Some("Cour d'appel de Paris , chambre 1"),
+            None,
             None,
             None,
             None,

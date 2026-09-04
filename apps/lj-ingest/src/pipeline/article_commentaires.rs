@@ -7,18 +7,13 @@
 //! devient une ligne `article_commentaire` (`source='web-curated'`), idempotente
 //! par checksum. `num_key` absent = commentaire du texte entier.
 //!
-//! L'ancre stockée est le **slug** d'URL, pas le `text_uid` : le slug est la clé
-//! que nos liens portent et que nous maîtrisons, là où le `text_uid` est une
-//! identité physique de source qui bouge (le traité CEDH est passé de
-//! `JORFTEXT000000886019` à `INTL/CEDH`, orphelinant le commentaire). L'ancre
-//! n'est donc pas un état dérivé : rien à re-dériver au fil des syncs.
+//! L'ancre stockée est le **slug** d'URL, pas le `text_uid` : ce dernier est une
+//! identité physique de source qui bouge, et le traité CEDH a déjà changé de
+//! `text_uid` sous ses commentaires.
 //!
-//! Deux régimes :
-//!   - **écriture** (`lj-ingest seed-article-commentaires`, au changement du
-//!     dataset) : l'ancre est vérifiée et une ancre morte **échoue franchement**
-//!     — un commentaire qui ne s'affichera jamais est un défaut de dataset ;
-//!   - **filet de dérive** (`reconcile_all`, hebdo) : même passe, mais une ancre
-//!     morte se compte et se `warn` au lieu d'avorter les autres filets.
+//! Deux régimes : à l'**écriture**, une ancre morte échoue franchement — un
+//! commentaire qui ne s'affichera jamais est un défaut de dataset ; en **filet
+//! de dérive** hebdomadaire, elle se compte et se `warn`.
 
 use std::fs;
 
@@ -174,7 +169,7 @@ async fn dangling_reason(
     slug: &str,
     num_key: Option<&str>,
 ) -> Result<Option<String>> {
-    let Some((text_uid, _)) = repo.referential_ref(slug).await? else {
+    let Some((text_uid, _, _)) = repo.referential_ref(slug).await? else {
         return Ok(Some(format!(
             "slug de texte inconnu au référentiel: {slug}"
         )));

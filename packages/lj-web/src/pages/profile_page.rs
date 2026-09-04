@@ -1,264 +1,319 @@
-//! Page `/profil`.
+//! Page `/profile`.
 //!
-//! Sous `AuthGuard`. Profil charge en pur client (token Supabase en localStorage,
-//! absent au SSR). Edition du nom affiche, reglages de theme, suppression de
-//! compte (mot de confirmation « SUPPRIMER »).
+//! Rendue serveur derrière la garde de session (`page_gates`) : le résumé du
+//! compte se lit au rendu (resource bloquante, sérialisée pour l'hydratation),
+//! chaque action est un formulaire natif → 303 avec l'issue en query (`done=`,
+//! `sent=`, `error=`). Les moyens d'accès — identités liées, mot de passe — se
+//! gèrent entre l'apparence et la zone danger. L'apparence reste un
+//! îlot client : le thème vit dans `localStorage`.
 
 use leptos::prelude::*;
 use leptos_meta::{Meta, Title};
+use lj_dtos::{AccountSummary, LinkedIdentity};
 
-use lj_dtos::UserProfile;
-
-#[cfg(feature = "hydrate")]
-use crate::api::ApiClient;
-use crate::auth::AuthGuard;
-use crate::components::profile::ThemeSettings;
+use super::login_page::auth_errors::translate_auth_error;
+use crate::components::client_only::ClientOnly;
+use crate::components::profile::{ApiKeysSettings, ThemeSettings};
 use crate::components::ui::Skeleton;
+use crate::pages::decision_page::data::sendable;
 
-/// Mot a saisir pour confirmer la suppression.
-const DELETE_CONFIRM_WORD: &str = "SUPPRIMER";
+const CHAMP: &str = "rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] \
+     px-3 py-2 text-sm text-[var(--color-ink)] outline-none focus:border-[var(--color-accent)]";
+const BOUTON: &str = "self-start rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm \
+     font-medium text-white transition-opacity hover:opacity-90";
+const ETIQUETTE: &str = "text-xs text-[var(--color-ink-subtle)]";
+const TITRE_SECTION: &str =
+    "text-sm font-medium uppercase tracking-widest text-[var(--color-ink-subtle)]";
+const CARTE: &str =
+    "flex items-center justify-between rounded-md border border-[var(--color-rule)] px-4 py-3";
+const ACTION: &str = "text-sm text-[var(--color-accent)] underline hover:opacity-80";
+const ACTION_RETRAIT: &str =
+    "text-sm text-[var(--color-ink-muted)] underline hover:text-[var(--color-ink)]";
+const FOURNISSEURS: [(&str, &str); 2] = [("google", "Google"), ("microsoft", "Microsoft")];
 
 #[component]
 pub fn ProfilePage() -> impl IntoView {
+    let compte = Resource::new_blocking(|| (), move |_| sendable(charger()));
+
     view! {
         <Title text="Profil - LibreJustice" />
         <Meta name="robots" content="noindex" />
-        <AuthGuard fallback=|| view! { <ProfileSkeleton /> }>
-            <ProfileView />
-        </AuthGuard>
+        <Suspense fallback=|| {
+            view! { <ProfileSkeleton /> }
+        }>
+            {move || {
+                compte
+                    .get()
+                    .map(|compte| match compte {
+                        Some(compte) => view! { <ProfileView compte /> }.into_any(),
+                        None => view! { <SessionPerdue /> }.into_any(),
+                    })
+            }}
+        </Suspense>
     }
 }
 
-#[cfg(feature = "hydrate")]
-fn client() -> ApiClient {
-    ApiClient::from_context()
+/// Résumé du compte. Au SSR : la session du porteur, lue en process — la garde
+/// serveur a déjà exigé le cookie, `None` ne reste possible que si la session
+/// tombe entre les deux. En navigation SPA : `GET /internal/account`.
+async fn charger() -> Option<lj_dtos::AccountSummary> {
+    #[cfg(feature = "ssr")]
+    {
+        let state = use_context::<lj_api::state::AppState>()?;
+        let parts = use_context::<axum::http::request::Parts>()?;
+        let (token, _) = lj_api::session::from_parts(&parts)?;
+        match lj_api::session::resolve(&state, &token).await {
+            lj_api::session::Verdict::Porteur { sub, .. } => {
+                lj_api::account::resume(&state, &sub).await.ok()
+            }
+            _ => None,
+        }
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        crate::api::ApiClient::from_context()
+            .fetch_account()
+            .await
+            .ok()
+    }
+}
+
+/// Issue d'une action, lue dans la query au retour du 303.
+fn message_done(code: &str) -> &'static str {
+    match code {
+        "nom" => "Profil mis à jour.",
+        "google" => "Compte Google lié.",
+        "microsoft" => "Compte Microsoft lié.",
+        "deliaison" => "Connexion retirée.",
+        "email" => "Adresse email mise à jour.",
+        _ => "C'est fait.",
+    }
+}
+
+fn message_sent(code: &str) -> &'static str {
+    match code {
+        "password" => "Email envoyé : ouvrez le lien qu'il contient pour choisir le mot de passe.",
+        "email_change" => {
+            "Email envoyé à votre adresse actuelle : confirmez-y la demande de changement."
+        }
+        _ => "Email envoyé.",
+    }
 }
 
 #[component]
-fn ProfileView() -> impl IntoView {
-    // Profil charge cote client dans un signal mutable : il sert de cache de page
-    // (les mutations y poussent le profil renvoye, comme `setQueryData`). `loaded`
-    // bascule a la fin du fetch (succes ou echec) : tant qu'il est faux on rend le
-    // skeleton, jamais une zone vide.
-    let profile = RwSignal::new(None::<UserProfile>);
-    let loaded = RwSignal::new(false);
-    Effect::new(move |_| {
-        #[cfg(feature = "hydrate")]
-        leptos::task::spawn_local(async move {
-            if let Ok(p) = client().fetch_me().await {
-                profile.set(Some(p));
-            }
-            loaded.set(true);
-        });
-    });
-
-    let display_name = RwSignal::new(String::new());
-    // Etats de la mutation « update me ».
-    let update_pending = RwSignal::new(false);
-    let update_error = RwSignal::new(None::<String>);
-    let update_success = RwSignal::new(false);
-
-    let delete_confirm = RwSignal::new(String::new());
-    let delete_error = RwSignal::new(None::<String>);
-    let delete_pending = RwSignal::new(false);
-    let delete_api_error = RwSignal::new(None::<String>);
-
-    // Seed du champ a l'arrivee du profil (sur la valeur serveur uniquement,
-    // pour ne pas ecraser une saisie en cours).
-    Effect::new(move |_| {
-        if let Some(p) = profile.get() {
-            display_name.set(p.display_name.unwrap_or_default());
-        }
-    });
-
-    // `Callback` (Copy) : le formulaire vit dans la branche `<Show>` (ChildrenFn
-    // rappelable), un handler `move |_|` capturant `navigate` (non-Copy) y serait
-    // moved-out. Idem `on_profile_submit` pour l'homogeneite.
-    let on_profile_submit = Callback::new(move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        #[cfg(feature = "hydrate")]
-        {
-            let trimmed = display_name.get_untracked().trim().to_string();
-            let update = lj_dtos::UserProfileUpdate {
-                display_name: if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                },
-            };
-            update_pending.set(true);
-            update_error.set(None);
-            update_success.set(false);
-            leptos::task::spawn_local(async move {
-                match client().update_me(&update).await {
-                    Ok(updated) => {
-                        profile.set(Some(updated));
-                        update_success.set(true);
-                    }
-                    Err(e) => update_error.set(Some(e.message)),
-                }
-                update_pending.set(false);
-            });
-        }
-    });
-
-    #[cfg(feature = "hydrate")]
-    let navigate = leptos_router::hooks::use_navigate();
-
-    let on_delete_submit = Callback::new(move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        if delete_confirm.get_untracked() != DELETE_CONFIRM_WORD {
-            delete_error.set(Some(format!(
-                "Tapez « {DELETE_CONFIRM_WORD} » pour confirmer."
-            )));
-            return;
-        }
-        delete_error.set(None);
-        #[cfg(feature = "hydrate")]
-        {
-            let navigate = navigate.clone();
-            delete_pending.set(true);
-            delete_api_error.set(None);
-            leptos::task::spawn_local(async move {
-                match client().delete_account().await {
-                    Ok(()) => {
-                        crate::auth::sign_out().await;
-                        navigate(
-                            "/",
-                            leptos_router::NavigateOptions {
-                                replace: true,
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    Err(e) => {
-                        delete_api_error.set(Some(e.message));
-                        delete_pending.set(false);
-                    }
-                }
-            });
-        }
-    });
-
-    let email = move || {
-        profile
-            .get()
-            .and_then(|p: UserProfile| p.email)
-            .unwrap_or_else(|| "—".to_string())
+fn ProfileView(compte: AccountSummary) -> impl IntoView {
+    let query = leptos_router::hooks::use_query_map();
+    let notice = move || {
+        query.with(|q| {
+            q.get("done")
+                .map(|c| message_done(&c))
+                .or_else(|| q.get("sent").map(|c| message_sent(&c)))
+        })
     };
+    let error = move || query.with(|q| q.get("error").map(|c| translate_auth_error(Some(&c))));
+
+    let email = compte.email.clone().unwrap_or_else(|| "—".to_string());
+    let nom = compte.display_name.clone().unwrap_or_default();
+    let identites = compte.identities.clone();
+    let a_mot_de_passe = compte.has_password;
 
     view! {
-        <Show when=move || loaded.get() fallback=|| view! { <ProfileSkeleton /> }>
-            <div class="mx-auto flex max-w-lg flex-col gap-10 px-4 py-12">
-                <h1
-                    class="font-sans text-2xl text-[var(--color-ink)]"
-                    style="font-variation-settings: 'wght' 300"
-                >
-                    "Profil"
-                </h1>
+        <div class="mx-auto flex max-w-lg flex-col gap-10 px-4 py-12">
+            <h1
+                class="font-sans text-2xl text-[var(--color-ink)]"
+                style="font-variation-settings: 'wght' 300"
+            >
+                "Profil"
+            </h1>
 
-                <section class="flex flex-col gap-4">
-                    <h2 class="text-sm font-medium uppercase tracking-widest text-[var(--color-ink-subtle)]">
-                        "Identité"
-                    </h2>
-                    <div class="rounded-md border border-[var(--color-rule)] px-4 py-3">
-                        <p class="text-xs text-[var(--color-ink-subtle)]">"Adresse email"</p>
-                        <p class="mt-0.5 text-sm text-[var(--color-ink)]">{email}</p>
-                    </div>
+            {move || {
+                notice()
+                    .map(|m| {
+                        view! { <p class="text-sm text-[var(--color-ink-muted)]">{m}</p> }
+                    })
+            }}
+            {move || {
+                error()
+                    .map(|m| {
+                        view! { <p class="text-sm text-red-600">{m}</p> }
+                    })
+            }}
 
-                    <form on:submit=move |ev| on_profile_submit.run(ev) class="flex flex-col gap-3">
-                        <label for="displayName" class="text-xs text-[var(--color-ink-subtle)]">
-                            "Nom affiché"
-                        </label>
-                        <input
-                            id="displayName"
-                            type="text"
-                            maxlength="80"
-                            prop:value=move || display_name.get()
-                            on:input=move |ev| display_name.set(event_target_value(&ev))
-                            placeholder="Anonyme"
-                            class="rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] px-3 py-2 text-sm text-[var(--color-ink)] outline-none focus:border-[var(--color-accent)]"
-                        />
-                        <Show when=move || update_error.get().is_some()>
-                            <p class="text-sm text-red-600">
-                                {move || update_error.get().unwrap_or_default()}
-                            </p>
-                        </Show>
-                        <Show when=move || update_success.get()>
-                            <p class="text-sm text-[var(--color-ink-muted)]">"Profil mis à jour."</p>
-                        </Show>
-                        <button
-                            type="submit"
-                            disabled=move || update_pending.get()
-                            class="self-start rounded-md bg-[var(--color-accent)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-                        >
-                            {move || if update_pending.get() { "…" } else { "Enregistrer" }}
-                        </button>
-                    </form>
-                </section>
+            <section class="flex flex-col gap-4">
+                <h2 class=TITRE_SECTION>"Identité"</h2>
+                <div class="rounded-md border border-[var(--color-rule)] px-4 py-3">
+                    <p class=ETIQUETTE>"Adresse email"</p>
+                    <p class="mt-0.5 text-sm text-[var(--color-ink)]">{email}</p>
+                </div>
 
-                <section class="flex flex-col gap-4">
-                    <h2 class="text-sm font-medium uppercase tracking-widest text-[var(--color-ink-subtle)]">
-                        "Apparence"
-                    </h2>
+                <form method="post" action="/internal/account/display-name" class="flex flex-col gap-3">
+                    <label for="displayName" class=ETIQUETTE>
+                        "Nom affiché"
+                    </label>
+                    <input
+                        id="displayName"
+                        name="display_name"
+                        type="text"
+                        maxlength="80"
+                        value=nom
+                        placeholder="Anonyme"
+                        class=CHAMP
+                    />
+                    <button type="submit" class=BOUTON>
+                        "Enregistrer"
+                    </button>
+                </form>
+
+                <form method="post" action="/internal/account/email-change" class="flex flex-col gap-3">
+                    <label for="newEmail" class=ETIQUETTE>
+                        "Changer d'adresse email — un lien de confirmation part vers l'adresse actuelle, puis vers la nouvelle"
+                    </label>
+                    <input
+                        id="newEmail"
+                        name="email"
+                        type="email"
+                        autocomplete="email"
+                        required
+                        placeholder="nouvelle@adresse.fr"
+                        class=CHAMP
+                    />
+                    <button type="submit" class=BOUTON>
+                        "Demander le changement"
+                    </button>
+                </form>
+            </section>
+
+            <section class="flex flex-col gap-4">
+                <h2 class=TITRE_SECTION>"Apparence"</h2>
+                <ClientOnly fallback=|| {
+                    view! { <Skeleton class="h-16 w-full" /> }
+                }>
                     <ThemeSettings />
-                </section>
+                </ClientOnly>
+            </section>
 
-                <section class="flex flex-col gap-4 rounded-md border border-red-300 bg-red-50/50 p-4 dark:border-red-900/50 dark:bg-red-950/20">
-                    <h2 class="text-sm font-medium uppercase tracking-widest text-red-700 dark:text-red-400">
-                        "Supprimer mon compte"
-                    </h2>
-                    <p class="text-sm text-[var(--color-ink-muted)]">
-                        "Cette action supprime " <strong>"définitivement"</strong>
-                        " votre compte, vos signets et votre historique de recherche. Aucune restauration n'est possible."
-                    </p>
-                    <form on:submit=move |ev| on_delete_submit.run(ev) class="flex flex-col gap-3">
-                        <label for="deleteConfirm" class="text-xs text-[var(--color-ink-subtle)]">
-                            "Tapez " <strong>{DELETE_CONFIRM_WORD}</strong> " pour confirmer"
-                        </label>
-                        <input
-                            id="deleteConfirm"
-                            type="text"
-                            autocomplete="off"
-                            prop:value=move || delete_confirm.get()
-                            on:input=move |ev| delete_confirm.set(event_target_value(&ev))
-                            class="rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] px-3 py-2 text-sm text-[var(--color-ink)] outline-none focus:border-red-500"
-                        />
-                        <Show when=move || delete_error.get().is_some()>
-                            <p class="text-sm text-red-600">
-                                {move || delete_error.get().unwrap_or_default()}
-                            </p>
-                        </Show>
-                        <Show when=move || delete_api_error.get().is_some()>
-                            <p class="text-sm text-red-600">
-                                {move || delete_api_error.get().unwrap_or_default()}
-                            </p>
-                        </Show>
-                        <button
-                            type="submit"
-                            disabled=move || {
-                                delete_pending.get() || delete_confirm.get() != DELETE_CONFIRM_WORD
-                            }
-                            class="self-start rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
-                        >
-                            {move || {
-                                if delete_pending.get() {
-                                    "Suppression…"
-                                } else {
-                                    "Supprimer définitivement"
-                                }
-                            }}
+            <section class="flex flex-col gap-4">
+                <h2 class=TITRE_SECTION>"Clés d'API"</h2>
+                <ClientOnly fallback=|| {
+                    view! { <Skeleton class="h-24 w-full" /> }
+                }>
+                    <ApiKeysSettings />
+                </ClientOnly>
+            </section>
+
+            <section class="flex flex-col gap-4">
+                <h2 class=TITRE_SECTION>"Connexions"</h2>
+                {FOURNISSEURS
+                    .iter()
+                    .map(|&(cle, nom)| {
+                        let liee = identites.iter().find(|id| id.provider == cle).cloned();
+                        view! { <CarteFournisseur cle nom liee /> }
+                    })
+                    .collect_view()}
+
+                <div class=CARTE>
+                    <p class="text-sm text-[var(--color-ink)]">"Mot de passe"</p>
+                    <form method="post" action="/internal/account/password-link">
+                        <button type="submit" class=ACTION>
+                            {if a_mot_de_passe { "Changer" } else { "Créer" }}
                         </button>
                     </form>
-                </section>
-            </div>
-        </Show>
+                </div>
+            </section>
+
+            <section class="flex flex-col gap-4 rounded-md border border-red-300 bg-red-50/50 p-4 dark:border-red-900/50 dark:bg-red-950/20">
+                <h2 class="text-sm font-medium uppercase tracking-widest text-red-700 dark:text-red-400">
+                    "Supprimer mon compte"
+                </h2>
+                <p class="text-sm text-[var(--color-ink-muted)]">
+                    "Cette action supprime " <strong>"définitivement"</strong>
+                    " votre compte, vos signets et votre historique de recherche. Aucune restauration n'est possible."
+                </p>
+                <form method="post" action="/internal/account/delete" class="flex flex-col gap-3">
+                    <label for="deleteConfirm" class=ETIQUETTE>
+                        "Tapez " <strong>"SUPPRIMER"</strong> " pour confirmer"
+                    </label>
+                    <input
+                        id="deleteConfirm"
+                        name="confirm"
+                        type="text"
+                        autocomplete="off"
+                        required
+                        pattern="SUPPRIMER"
+                        class="rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] px-3 py-2 text-sm text-[var(--color-ink)] outline-none focus:border-red-500"
+                    />
+                    <button
+                        type="submit"
+                        class="self-start rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                    >
+                        "Supprimer définitivement"
+                    </button>
+                </form>
+            </section>
+        </div>
     }
 }
 
-/// Skeleton du profil : calque le conteneur, le titre et les trois sections
-/// (identité / apparence / zone danger). Affiché pendant la vérification de
-/// session (AuthGuard) puis le chargement du profil — la page ne blanchit jamais.
+/// « Délier » est offert sans condition : l'API refuse le retrait du dernier
+/// moyen d'accès et rend `error=dernier_acces`.
+#[component]
+fn CarteFournisseur(
+    cle: &'static str,
+    nom: &'static str,
+    liee: Option<LinkedIdentity>,
+) -> impl IntoView {
+    view! {
+        <div class=CARTE>
+            <p class="text-sm text-[var(--color-ink)]">{nom}</p>
+            {match liee {
+                Some(id) => {
+                    view! {
+                        <form method="post" action="/internal/account/unlink">
+                            <input type="hidden" name="provider" value=id.provider />
+                            <input type="hidden" name="provider_sub" value=id.provider_sub />
+                            <button type="submit" class=ACTION_RETRAIT>
+                                "Délier"
+                            </button>
+                        </form>
+                    }
+                        .into_any()
+                }
+                None => {
+                    view! {
+                        <a
+                            href=format!("/internal/auth/{cle}/start?link=1")
+                            rel="external nofollow"
+                            class=ACTION
+                        >
+                            "Lier"
+                        </a>
+                    }
+                        .into_any()
+                }
+            }}
+        </div>
+    }
+}
+
+/// La garde serveur a laissé passer mais la session est tombée entre-temps
+/// (navigation SPA après déconnexion dans un autre onglet).
+#[component]
+fn SessionPerdue() -> impl IntoView {
+    view! {
+        <div class="mx-auto flex max-w-lg flex-col gap-4 px-4 py-12">
+            <p class="text-sm text-[var(--color-ink-muted)]">"Votre session a expiré."</p>
+            <a
+                href="/login?next=%2Fprofile"
+                class="self-start text-sm text-[var(--color-accent)] underline hover:opacity-80"
+            >
+                "Se reconnecter"
+            </a>
+        </div>
+    }
+}
+
+/// Skeleton du profil : calque le conteneur, le titre et les quatre sections.
+/// Affiché le temps de la lecture du compte — la page ne blanchit jamais.
 #[component]
 fn ProfileSkeleton() -> impl IntoView {
     view! {
@@ -277,6 +332,12 @@ fn ProfileSkeleton() -> impl IntoView {
             <section class="flex flex-col gap-4">
                 <Skeleton class="h-4 w-24" />
                 <Skeleton class="h-16 w-full" />
+            </section>
+            <section class="flex flex-col gap-4">
+                <Skeleton class="h-4 w-28" />
+                <Skeleton class="h-12 w-full" />
+                <Skeleton class="h-12 w-full" />
+                <Skeleton class="h-12 w-full" />
             </section>
             <section class="flex flex-col gap-3 rounded-md border border-[var(--color-rule)] p-4">
                 <Skeleton class="h-4 w-40" />

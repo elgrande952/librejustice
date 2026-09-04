@@ -1,9 +1,8 @@
 //! Selecteur de theme (Systeme / Clair / Sombre).
 //!
-//! Pont localStorage `lj-theme` + `matchMedia` via le shim JS `theme.js`
-//! (web-sys indisponible sans feature dans le crate fige). L'anti-FOUC inline
-//! d'`app.rs` applique deja `.dark` avant le premier paint ; ce composant gere
-//! le choix explicite et le suivi de `prefers-color-scheme` en mode Systeme.
+//! Pont localStorage `lj-theme` + `matchMedia`. L'anti-FOUC inline d'`app.rs`
+//! applique deja `.dark` avant le premier paint ; ce composant gere le choix
+//! explicite et le suivi de `prefers-color-scheme` en mode Systeme.
 
 use leptos::prelude::*;
 
@@ -41,39 +40,97 @@ impl Theme {
 mod bridge {
     use wasm_bindgen::prelude::*;
 
-    #[wasm_bindgen(module = "/src/components/profile/theme.js")]
-    extern "C" {
-        #[wasm_bindgen(js_name = "readTheme")]
-        pub fn read_theme() -> String;
-        #[wasm_bindgen(js_name = "persistTheme")]
-        pub fn persist_theme(theme: &str);
-        #[wasm_bindgen(js_name = "applyTheme")]
-        pub fn apply_theme(theme: &str);
-        #[wasm_bindgen(js_name = "syncAuthTheme")]
-        pub fn sync_auth_theme(authenticated: bool);
-        #[wasm_bindgen(js_name = "onPrefersDarkChange")]
-        fn on_prefers_dark_change(cb: &Closure<dyn FnMut()>) -> JsValue;
+    const STORAGE_KEY: &str = "lj-theme";
+    const AUTH_FLAG: &str = "lj-auth";
+    const PREFERS_DARK: &str = "(prefers-color-scheme: dark)";
+
+    /// `localStorage`, ou `None` quand il est refuse (mode prive strict, cookies
+    /// bloques) : le theme retombe alors sur `System` a chaque chargement.
+    fn storage() -> Option<web_sys::Storage> {
+        web_sys::window()?.local_storage().ok().flatten()
+    }
+
+    fn prefers_dark() -> bool {
+        web_sys::window()
+            .and_then(|w| w.match_media(PREFERS_DARK).ok().flatten())
+            .is_some_and(|mq| mq.matches())
+    }
+
+    /// Theme persiste : `"light"` | `"dark"` | `"system"` (defaut).
+    pub fn read_theme() -> String {
+        let stocke = storage().and_then(|s| s.get_item(STORAGE_KEY).ok().flatten());
+        match stocke.as_deref() {
+            Some(v @ ("light" | "dark")) => v.to_string(),
+            _ => "system".to_string(),
+        }
+    }
+
+    /// Persiste le theme. `"system"` est l'absence de choix, donc un retrait.
+    pub fn persist_theme(theme: &str) {
+        let Some(storage) = storage() else {
+            return;
+        };
+        let _ = if theme == "system" {
+            storage.remove_item(STORAGE_KEY)
+        } else {
+            storage.set_item(STORAGE_KEY, theme)
+        };
+    }
+
+    fn basculer_dark(sombre: bool) {
+        if let Some(racine) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+        {
+            let _ = racine.class_list().toggle_with_force("dark", sombre);
+        }
+    }
+
+    /// Applique le theme : `.dark` selon `dark` | (`system` && prefers-dark).
+    pub fn apply_theme(theme: &str) {
+        basculer_dark(theme == "dark" || (theme == "system" && prefers_dark()));
+    }
+
+    /// Synchronise le flag d'auth `lj-auth` puis (re)applique le theme.
+    /// Semantique (cf. anti-FOUC d'`app.rs`) : le sombre est reserve aux
+    /// connectes — anonyme => flag retire + theme clair force.
+    pub fn sync_auth_theme(authenticated: bool) {
+        if let Some(storage) = storage() {
+            let _ = if authenticated {
+                storage.set_item(AUTH_FLAG, "1")
+            } else {
+                storage.remove_item(AUTH_FLAG)
+            };
+        }
+        if authenticated {
+            apply_theme(&read_theme());
+        } else {
+            basculer_dark(false);
+        }
     }
 
     /// Abonne au changement de `prefers-color-scheme`. `Drop` desabonne.
     pub fn subscribe_prefers_dark(cb: impl FnMut() + 'static) -> PrefersDarkSubscription {
-        let closure = Closure::new(cb);
-        let unsubscribe = on_prefers_dark_change(&closure);
-        PrefersDarkSubscription {
-            _closure: closure,
-            unsubscribe,
+        let closure = Closure::<dyn FnMut()>::new(cb);
+        let media = web_sys::window().and_then(|w| w.match_media(PREFERS_DARK).ok().flatten());
+        if let Some(mq) = &media {
+            let _ = mq.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref());
         }
+        PrefersDarkSubscription { closure, media }
     }
 
     pub struct PrefersDarkSubscription {
-        _closure: Closure<dyn FnMut()>,
-        unsubscribe: JsValue,
+        closure: Closure<dyn FnMut()>,
+        media: Option<web_sys::MediaQueryList>,
     }
 
     impl Drop for PrefersDarkSubscription {
         fn drop(&mut self) {
-            if let Ok(f) = self.unsubscribe.clone().dyn_into::<js_sys::Function>() {
-                let _ = f.call0(&JsValue::NULL);
+            if let Some(mq) = &self.media {
+                let _ = mq.remove_event_listener_with_callback(
+                    "change",
+                    self.closure.as_ref().unchecked_ref(),
+                );
             }
         }
     }

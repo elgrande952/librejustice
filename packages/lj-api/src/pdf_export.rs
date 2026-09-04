@@ -85,7 +85,11 @@ pub fn build_decision_story(detail: &DecisionDetail) -> Vec<PdfBlock> {
 
     let mut meta_lines: Vec<String> = Vec::new();
     if let Some(date) = detail.date_lecture.as_deref().filter(|s| !s.is_empty()) {
-        meta_lines.push(format!("Date de lecture : {date}"));
+        meta_lines.push(format!(
+            "{} : {}",
+            detail.jurisdiction_type.date_label(),
+            lj_dtos::format_date_fr(date)
+        ));
     }
     if let Some(seat) = detail.seat.as_deref().filter(|s| !s.is_empty()) {
         meta_lines.push(format!("Formation : {seat}"));
@@ -707,6 +711,7 @@ mod tests {
             id: "abc123".to_string(),
             jurisdiction_type: JurisdictionType::Cc,
             title: "ignored".to_string(),
+            case_name: None,
             paragraphs: vec!["Premier <para> & suite".to_string(), "Second".to_string()],
             paragraph_spans: Vec::new(),
             sections: None,
@@ -718,21 +723,23 @@ mod tests {
             procedure: None,
             office: None,
             legal_domain: None,
-            publication: None,
             publication_codes: Vec::new(),
             date_audience: None,
             docket_numbers: Some(vec!["24-17.384".to_string()]),
             seat: Some("Chambre sociale".to_string()),
-            chamber: None,
-            formation: None,
+            seat_path: None,
             legal_references: None,
             source_xml: None,
             themes: Vec::new(),
             nac: None,
             ecli: None,
             source: None,
+            official_url: None,
             chronology: Vec::new(),
             commentaires: vec![],
+            renvoyants: vec![],
+            citantes: vec![],
+            citantes_total: None,
         }
     }
 
@@ -755,7 +762,7 @@ mod tests {
         assert_eq!(story[1].style, PdfBlockStyle::Subtitle);
         assert_eq!(story[1].content, "24-17.384");
         assert_eq!(story[2].style, PdfBlockStyle::Meta);
-        assert_eq!(story[2].content, "Date de lecture : 2026-05-29");
+        assert_eq!(story[2].content, "Date de la décision : 29 mai 2026");
         assert_eq!(story[3].content, "Formation : Chambre sociale");
         assert_eq!(story[4].style, PdfBlockStyle::Spacer);
         assert_eq!(story[5].style, PdfBlockStyle::Body);

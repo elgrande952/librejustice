@@ -19,9 +19,6 @@
 --                  version MAX. 'manuel' = constante très grande (toujours gagnant).
 --   reason       : pourquoi (auditabilité).
 --   source       : 'human' | 'llm:<model>' | 'farm'.
---
--- SCOPE LÉGER : les colonnes id/offsets de `decision_citation` (22 M lignes) sont
--- reportées à Inc.3 — non touchées ici.
 
 CREATE TABLE citation_resolution_override (
     id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -38,6 +35,4 @@ CREATE TABLE citation_resolution_override (
 -- Lookup de l'override actif (version max) par couple (clé foldée, article).
 CREATE INDEX idx_cro_key ON citation_resolution_override (lower(text_key), article_key);
 
--- Certification de capture (ADR-plan Inc.2-bis, dormant) : NULLABLE, ne change rien
--- tant que NULL ; le setter + la règle de skip s'activent avec l'oracle d'Inc.2.
 ALTER TABLE decisions ADD COLUMN certified_version INT;

@@ -20,6 +20,7 @@ use crate::pages::law_page::data::{sendable, PageError};
 
 #[component]
 pub fn CodeCataloguePage() -> impl IntoView {
+    crate::pages::cache_public_5_min();
     // La page pose sa propre description (parfois depuis un `<Suspense>`) :
     // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
     own_page_description();

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::ApiClient;
 use crate::components::own_page_description;
-use crate::components::search::ResultCard;
+use crate::components::search::{CardView, ResultCard};
 use crate::helpers::{format_iso_date, group_thousands, split_entity_uid};
 use crate::pages::decision_page::data::{sendable, PageError};
 use crate::seo::CANONICAL_BASE;
@@ -1002,7 +1002,7 @@ fn decisions_view(resolved: EntityDecisionsResult, base_path: &str, page: i64) -
         .items
         .into_iter()
         .enumerate()
-        .map(|(index, item)| decision_result_card(item, index, page, total, hit_ids.clone()))
+        .map(|(index, item)| decision_result_card(item, index, page, hit_ids.clone()))
         .collect_view();
     let pagination = pagination_view(base_path, page, total_pages);
     view! {
@@ -1018,7 +1018,6 @@ fn decision_result_card(
     item: EntityDecisionHitDto,
     index: usize,
     page: i64,
-    total: i64,
     hit_ids: std::sync::Arc<Vec<String>>,
 ) -> AnyView {
     let role = role_label(item.side.as_deref(), &item.quality).map(str::to_string);
@@ -1028,10 +1027,9 @@ fn decision_result_card(
                 hit=item.hit
                 index=index
                 page=page as u32
-                total=total
                 page_size=PAGE_SIZE as u32
                 hit_ids=hit_ids
-                auto_load_summary=false
+                default_view=Signal::derive(|| CardView::Snippet)
                 animate=false
                 role_badge=role
             />

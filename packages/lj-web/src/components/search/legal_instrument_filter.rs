@@ -7,7 +7,7 @@ use lj_dtos::{LegalInstrumentFacet, SearchFacets};
 
 use crate::helpers::cn;
 
-use super::facet_widgets::{scroll_lock_ref, CheckboxOption, FilterSearchInput};
+use super::facet_widgets::{CheckboxOption, FilterSearchInput};
 
 #[component]
 pub fn LegalInstrumentPanel(
@@ -92,8 +92,7 @@ pub fn LegalInstrumentPanel(
             })
         />
         <div
-            node_ref=scroll_lock_ref()
-            class="filter-scroll flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto"
+            class="filter-scroll flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto overscroll-contain"
         >
             <Show when=move || can_add.get()>
                 <button

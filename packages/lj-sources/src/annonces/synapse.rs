@@ -1,12 +1,3 @@
-//! Synapse (`*.synapse-entreprises.com`, `synapse-consult.com`).
-//!
-//! Les portails Synapse ne sont qu'une façade : la dématérialisation est
-//! opérée par **EU-Supply**, qui expose la liste publique sur
-//! `eu.eu-supply.com/ctm/supplier/publictenders?B=SYNAPSE`, paginée par
-//! `SearchFilter.PagingInfo.PageNumber`. Le branding `SYNAPSE` couvre tous les
-//! acheteurs français de l'éditeur ; on s'arrête dès qu'une page n'apporte
-//! plus rien de neuf (le serveur rejoue la dernière au-delà du stock).
-
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -24,7 +15,8 @@ fn parse_page(html: &str) -> Vec<AnnonceBrute> {
     static LIEN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)href="(/app/rfq/rwlentrance_s\.asp\?PID=(\d+)[^"]*)""#).unwrap()
     });
-    static TITRE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r">([^<]{8,300})</a>").unwrap());
+    static CELLULE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<td[^>]*>(.*?)</td>").unwrap());
     static DATE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(\d{2}/\d{2}/\d{4})(?:\s+(\d{2}:\d{2}))?").unwrap());
 
@@ -34,80 +26,100 @@ fn parse_page(html: &str) -> Vec<AnnonceBrute> {
             continue;
         };
         let (href, pid) = (lien[1].replace("&amp;", "&"), lien[2].to_string());
-        let flat = txt(bloc);
-        let cellules: Vec<&str> = flat
-            .split('|')
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
+        // Colonnes du listing CTM : identifiant, référence de l'acheteur,
+        // objet, publication, limite, procédure, acheteur, pays.
+        let cellules: Vec<String> = CELLULE
+            .captures_iter(bloc)
+            .map(|c| txt(&c[1]).trim().to_string())
             .collect();
-        let dates: Vec<_> = DATE.captures_iter(&flat).collect();
-        let titre = TITRE
-            .captures(bloc)
-            .map(|c| txt(&c[1]))
-            .or_else(|| cellules.first().map(|c| c.to_string()))
-            .unwrap_or_default();
-        // Première date = publication, dernière = limite (une seule date ⇒
-        // publication seule, l'échéance reste inconnue).
-        let echeance = (dates.len() > 1)
-            .then(|| dates.last())
-            .flatten()
-            .and_then(|c| {
-                let d = parse_date_fr(&c[1])?;
-                Some(echeance_ts(
-                    d,
-                    c.get(2).and_then(|h| parse_heure(h.as_str())),
-                ))
-            });
+        let cellule = |i: usize| cellules.get(i).filter(|c| !c.is_empty()).cloned();
+        let jour = |i: usize| parse_date_fr(&DATE.captures(&cellule(i)?)?[1]);
+        let horodate = |i: usize| {
+            let texte = cellule(i)?;
+            let c = DATE.captures(&texte)?;
+            let heure = c.get(2).and_then(|h| parse_heure(h.as_str()));
+            Some(echeance_ts(parse_date_fr(&c[1])?, heure))
+        };
         out.push(AnnonceBrute {
             moteur: "synapse",
             source_uid: format!("synapse:{pid}"),
             cles_jointure: Vec::new(),
-            reference: None,
-            acheteur: cellules.get(1).map(|c| c.to_string()),
+            reference: cellule(1),
+            acheteur: cellule(6),
             siren: None,
-            objet: titre.chars().take(300).collect(),
+            objet: cellule(2).unwrap_or_default().chars().take(300).collect(),
             nature: None,
             cpv: None,
             departement: None,
-            date_publication: dates.first().and_then(|c| parse_date_fr(&c[1])),
-            echeance,
+            date_publication: jour(3),
+            echeance: horodate(4),
             url_avis: Some(format!("https://eu.eu-supply.com{href}")),
             url_rc: None,
             url_dce: Some(format!("https://eu.eu-supply.com{href}")),
             url_depot: None,
-            procedure: None,
+            procedure: cellule(5),
         });
     }
     out
 }
 
-/// Ré-énumère la liste publique. Pas de total déclaré exploitable.
-pub async fn enumerate() -> Result<MoteurRun> {
+/// Le branding d'un hôte de façade : son premier label, en capitales. Ni les
+/// hôtes de l'éditeur ni ceux d'EU-Supply nu n'en portent — [`BRANDING`] les
+/// couvre.
+fn branding(hote: &str) -> Option<String> {
+    if hote.ends_with("eu-supply.com") {
+        return None;
+    }
+    let label = hote.trim_start_matches("www.").split('.').next()?;
+    (!label.starts_with("synapse")).then(|| label.to_uppercase())
+}
+
+/// Ré-énumère la liste publique de l'éditeur et celle de chaque hôte recensé.
+/// Pas de total déclaré exploitable. Un branding en échec vaut un branding
+/// vide, pas l'échec de la moisson.
+pub async fn enumerate(hotes: &[String]) -> Result<MoteurRun> {
     let client = super::client();
+    let mut brandings: Vec<String> = hotes.iter().filter_map(|h| branding(h)).collect();
+    brandings.sort();
+    brandings.dedup();
+    brandings.insert(0, BRANDING.to_string());
+
     let mut rows: Vec<AnnonceBrute> = Vec::new();
-    let mut vus = std::collections::HashSet::new();
-    for p in 1..=MAX_PAGES {
-        let html = send_text(
-            client.get(BASE).query(&[
-                ("B", BRANDING.to_string()),
-                ("SearchFilter.PagingInfo.PageNumber", p.to_string()),
-            ]),
-            &format!("synapse page {p}"),
-        )
-        .await?;
-        let avant = vus.len();
-        for r in parse_page(&html) {
-            if vus.insert(r.source_uid.clone()) {
-                rows.push(r);
+    let mut echecs = 0;
+    for b in &brandings {
+        let mut vus = std::collections::HashSet::new();
+        for p in 1..=MAX_PAGES {
+            let html = match send_text(
+                client.get(BASE).query(&[
+                    ("B", b.clone()),
+                    ("SearchFilter.PagingInfo.PageNumber", p.to_string()),
+                ]),
+                &format!("synapse {b} page {p}"),
+            )
+            .await
+            {
+                Ok(html) => html,
+                Err(e) => {
+                    echecs += 1;
+                    tracing::warn!(branding = %b, page = p, error = %e, "synapse : page en échec, stock conservé");
+                    break;
+                }
+            };
+            let avant = vus.len();
+            for r in parse_page(&html) {
+                if vus.insert(r.source_uid.clone()) {
+                    rows.push(r);
+                }
             }
-        }
-        if vus.len() == avant {
-            break;
+            if vus.len() == avant {
+                break;
+            }
         }
     }
     Ok(MoteurRun {
         annonce: None,
-        echecs: 0,
+        echecs,
+        hotes: Vec::new(),
         rows: dedup_source_uid(rows),
     })
 }
@@ -223,5 +235,59 @@ mod tests {
                 </div></div></div>
             </div>"#;
         assert!(parse_detail(html).is_err());
+    }
+
+    /// Le listing CTM tient ses champs en colonnes de position, chacune dans un
+    /// `<div>` à infobulle : la référence de l'acheteur est la deuxième, le nom
+    /// de l'acheteur la septième. Les lire au rang près est la seule façon de
+    /// les distinguer — sur une ligne mise à plat, `2/2026` et `Amneville`
+    /// n'ont aucune marque qui les sépare du reste.
+    #[test]
+    fn la_ligne_de_listing_rend_la_reference_et_l_acheteur_a_leur_rang() {
+        let ligne = r#"<tr>
+            <td><div class="js-tooltip-content" title="200418950">200418950</div></td>
+            <td><div class="js-tooltip-content" title="2/2026">2/2026</div></td>
+            <td><a href="/app/rfq/rwlentrance_s.asp?PID=458418&amp;PP=ctm/Supplier/publictenders&amp;B=AMNEVILLE&amp;PS=1" target="_blank">PROTECTION SOCIALE COMPLEMENTAIRE</a></td>
+            <td><div class="js-tooltip-content" title="02/07/2026 15:32:00">02/07/2026</div></td>
+            <td><div class="js-tooltip-content" title="10/09/2026 12:00:00">10/09/2026 12:00</div></td>
+            <td><div class="js-tooltip-content" title="Appel d&#39;offres ouvert">Appel d&#39;offres ouvert</div></td>
+            <td><div class="js-tooltip-content" title="Amneville">Amneville</div></td>
+            <td><div class="js-tooltip-content" title="France">France</div></td>
+        </tr>"#;
+
+        let [row] = parse_page(ligne).try_into().expect("une ligne");
+        assert_eq!(row.source_uid, "synapse:458418");
+        assert_eq!(row.reference.as_deref(), Some("2/2026"));
+        assert_eq!(row.acheteur.as_deref(), Some("Amneville"));
+        assert_eq!(row.objet, "PROTECTION SOCIALE COMPLEMENTAIRE");
+        assert_eq!(row.procedure.as_deref(), Some("Appel d'offres ouvert"));
+        assert_eq!(
+            row.date_publication.map(|d| d.to_string()).as_deref(),
+            Some("2026-07-02")
+        );
+        assert!(row
+            .echeance
+            .is_some_and(|e| e.to_string().contains("2026-09-10")));
+    }
+
+    /// Le branding est le premier label de l'hôte de façade ; les hôtes de
+    /// l'éditeur n'en portent pas, `B=SYNAPSE` les couvre déjà.
+    #[test]
+    fn le_branding_vient_du_premier_label_de_l_hote() {
+        assert_eq!(
+            branding("amneville.synapse-entreprises.com").as_deref(),
+            Some("AMNEVILLE")
+        );
+        assert_eq!(
+            branding("cisn.synapse-consult.com").as_deref(),
+            Some("CISN")
+        );
+        assert_eq!(
+            branding("www.duranceluberon.fr").as_deref(),
+            Some("DURANCELUBERON")
+        );
+        assert_eq!(branding("synapse-entreprises.com"), None);
+        assert_eq!(branding("synapse-ouest.com"), None);
+        assert_eq!(branding("eu.eu-supply.com"), None);
     }
 }

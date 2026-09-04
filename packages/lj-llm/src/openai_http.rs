@@ -1,4 +1,4 @@
-//! Backend OpenAI-HTTP `/v1/embeddings` (vLLM compatible).
+//! Backend OpenAI-HTTP `/v1/embeddings`.
 
 use crate::backend::{format_query, Embedder, EMBEDDING_DIM, LEGAL_QUERY_INSTRUCTION};
 use crate::error::{EmbedError, Result};
@@ -8,10 +8,10 @@ use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde_json::Value;
 
 const DEFAULT_TIMEOUT_S: f64 = 600.0;
-/// Plafond de la phase d'établissement TCP. Sans lui, un backend injoignable
-/// (SYN sans réponse, pas de RST) fait pendre le connect sur le timeout TCP de l'OS
-/// avant que `AnyEmbedder::Auto` ne bascule sur Cloudflare. Le connect vLLM
-/// légitime (tailnet) est <100 ms.
+/// Cap on the TCP establishment phase. Without it, an unreachable backend (SYN
+/// with no reply, no RST) hangs the connect on the OS TCP timeout before
+/// `AnyEmbedder::Auto` falls back to Cloudflare. A legitimate local connect is
+/// under 100 ms.
 const CONNECT_TIMEOUT_S: f64 = 2.0;
 const DEFAULT_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 

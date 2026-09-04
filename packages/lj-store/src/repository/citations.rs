@@ -145,7 +145,7 @@ impl DecisionRepository<'_> {
         for row in &db_rows {
             let spans: serde_json::Value = row.get(1);
             let set = current.entry(row.get(0)).or_default();
-            for el in spans.as_array().expect("spans : tableau jsonb (ADR 0247)") {
+            for el in spans.as_array().expect("spans : tableau jsonb") {
                 let el = el.as_array().expect("span : tableau positionnel");
                 set.insert((
                     el[0].as_i64().expect("char_start") as i32,
@@ -753,23 +753,19 @@ impl DecisionRepository<'_> {
     /// même pagination et même tri que les citantes d'un article
     /// ([`Self::law_decisions_citing`]) : portée d'abord, puis date décroissante.
     ///
-    /// **Dédupliqué par construction** : `legal_citation` porte une ligne blob par
-    /// décision, donc une décision citant trois articles de la division sort une
-    /// fois — aucun `DISTINCT`, aucun tri supplémentaire. Ces trois articles
-    /// ressortent dans `cited_num_keys`, l'intersection du blob avec les termes
-    /// interrogés.
+    /// **Dédupliqué par construction** : `legal_citation` porte une ligne blob
+    /// par décision, donc citer trois articles de la division sort une fois,
+    /// sans `DISTINCT`. Les trois ressortent dans `cited_num_keys`.
     ///
-    /// Deux plans selon le volume d'union (somme des `citing_decision_counts`
-    /// des `num_keys`), même arbitrage que pour un article :
+    /// Deux plans selon le volume d'union :
     /// - union courante : bitmap GIN (`&&` = OR des postings, indexable) ;
     /// - union ≥ [`CITING_RECENCY_WALK_MIN_COUNT`] : marche descendante de
-    ///   `idx_decisions_date_lecture` avec filtre d'appartenance sur le blob —
-    ///   récence seule (trier par portée exigerait de visiter tous les postings).
+    ///   `idx_decisions_date_lecture`, récence seule — trier par portée
+    ///   exigerait de visiter tous les postings.
     ///
-    /// Pas de fenêtre de validité : une division n'en a pas une, chacun de ses
+    /// Pas de fenêtre de validité : une division n'en a pas, chacun de ses
     /// articles a la sienne. La date de consultation choisit la *composition* du
-    /// sous-arbre (l'énumération des `num_key` est datée), pas la fenêtre des
-    /// décisions.
+    /// sous-arbre, pas la fenêtre des décisions.
     #[tracing::instrument(name = "db.law_decisions_citing_any", skip(self, num_keys), fields(db.system = "postgresql", keys = num_keys.len()))]
     pub async fn law_decisions_citing_any(
         &self,
@@ -820,28 +816,9 @@ impl DecisionRepository<'_> {
                 )
                 .await?
         } else {
-            // Autorité d'abord : rang de portée dérivé de `publication_codes`
-            // (mêmes groupes que la facette, `lj_core::publication`), puis date
-            // décroissante. Les listes de codes sont des constantes du code — inlinées,
-            // pas des données.
-            let rank_expr = {
-                let arr = |group: &str| {
-                    let codes: Vec<String> = lj_core::publication::significance_codes(group)
-                        .iter()
-                        .map(|c| format!("'{c}'"))
-                        .collect();
-                    format!("ARRAY[{}]", codes.join(","))
-                };
-                format!(
-                    "CASE WHEN d.publication_codes && {maj} THEN 0 \
-                          WHEN d.publication_codes && {imp} THEN 1 \
-                          WHEN d.publication_codes && {lim} THEN 2 \
-                          ELSE 3 END",
-                    maj = arr("majeure"),
-                    imp = arr("importante"),
-                    lim = arr("limitee"),
-                )
-            };
+            // Autorité d'abord, puis date décroissante. Les paliers sont des
+            // constantes du code, inlinées, pas des données.
+            let rank_expr = super::support::authority_rank_sql("d.publication_codes");
             self.conn
                 .query(
                     &format!(
@@ -852,13 +829,13 @@ impl DecisionRepository<'_> {
                                ARRAY(SELECT DISTINCT split_part(t, '|', 2)
                                      FROM unnest(public.lj_cit_terms(lc.spans)) t
                                      WHERE t = ANY($1)),
-                               {rank_expr} AS significance_rank
+                               {rank_expr} AS authority_rank
                         FROM legal_citation lc
                         JOIN decisions d ON d.id = lc.decision_id
                         LEFT JOIN jurisdiction j ON j.code = d.jurisdiction_code
                         WHERE public.lj_cit_terms(lc.spans) && $1::text[]
                         -- Texte ISO 'YYYY-MM-DD' → tri == chronologique.
-                        ORDER BY significance_rank, d.date_lecture::text DESC NULLS LAST, d.id
+                        ORDER BY authority_rank, d.date_lecture::text DESC NULLS LAST, d.id
                         LIMIT $2 OFFSET $3
                         "
                     ),

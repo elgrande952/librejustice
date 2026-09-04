@@ -921,18 +921,19 @@ async fn backfill_textes_tarball(repo: &DecisionRepository<'_>, path: &Path) -> 
 
 /// Sync incrémental LEGI : télécharge les incréments `LEGI_*.tar.gz` postérieurs
 /// au watermark via [`lj_sources::dila::sync_dila`] (ordre lexicographique =
-/// chronologique), PUIS ingère chaque incrément fraîchement téléchargé via
-/// [`ingest_legi_tarball`].
+/// chronologique), PUIS ingère chaque incrément et **pose son filigrane derrière
+/// lui** — une passe tuée au milieu du lot laisse à reprendre exactement ce
+/// qu'elle n'a pas appliqué.
 ///
 /// **Auto-switch cold ↔ warm** : au 1er run (`stock_fetched == false`) `sync_dila`
 /// télécharge le **stock global** `Freemium_legi_global_*` (multi-Go) EN PREMIER,
-/// cale le watermark sur sa date, puis enchaîne les incréments ; ensuite il ne
-/// renvoie que les nouveaux. Un re-run ne re-télécharge ni ne ré-applique, et
-/// l'upsert article skippe les checksums inchangés. `Command::Legi { path }` reste
-/// pour ingérer un tarball isolé depuis le disque, sans toucher au watermark.
+/// puis les incréments postérieurs à sa date ; ensuite il ne renvoie que les
+/// nouveaux. Un re-run ne re-télécharge ni ne ré-applique, et l'upsert article
+/// skippe les checksums inchangés. `Command::Legi { path }` reste pour ingérer un
+/// tarball isolé depuis le disque, sans toucher au filigrane.
 pub async fn sync_legi() -> Result<()> {
     let settings = Settings::from_env()?;
-    let downloaded =
+    let mut batch =
         lj_sources::dila::sync_dila(&settings.cache_dir(), lj_sources::dila::DilaFond::Legi)
             .map_err(|e| anyhow!("sync_dila legi: {e}"))?;
 
@@ -945,11 +946,14 @@ pub async fn sync_legi() -> Result<()> {
     let repo = DecisionRepository::new(&conn);
 
     let (mut upserted, mut skipped, mut errors) = (0usize, 0usize, 0usize);
-    for path in &downloaded {
-        let (u, s, e) = ingest_legi_tarball(&repo, path).await?;
+    for archive in batch.archives.clone() {
+        let (u, s, e) = ingest_legi_tarball(&repo, &archive.path).await?;
         upserted += u;
         skipped += s;
         errors += e;
+        batch
+            .commit(&archive)
+            .map_err(|e| anyhow!("filigrane legi {}: {e}", archive.watermark))?;
     }
 
     // Collapse des coquilles LEGITEXT vides régénérées par les incréments : une
@@ -970,7 +974,7 @@ pub async fn sync_legi() -> Result<()> {
     let slugged = super::slugs::assign_text_slugs(&repo).await?;
 
     tracing::info!(
-        increments = downloaded.len(),
+        increments = batch.archives.len(),
         upserted,
         skipped,
         errors,

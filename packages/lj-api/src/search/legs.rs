@@ -82,8 +82,8 @@ pub(crate) async fn bm25_parse_leg(
     params.push(Box::new(translated_query.to_string()));
     let mut idx = 2usize;
     // `parse_with_field` : `decisions_bm25` porte DEUX champs texte (`full_text`
-    // + `search_title`) — un parse non qualifié chercherait dans les deux. Cette
-    // jambe ne score que le texte intégral.
+    // + `search_title`) et un parse non qualifié chercherait dans les deux.
+    // Cette jambe ne score que le texte intégral.
     let array_filters = build_array_filter_queries(req, &mut idx, &mut params);
     let query_expr =
         compose_tantivy_query("paradedb.parse_with_field('full_text', $1)", array_filters);
@@ -110,7 +110,8 @@ pub(crate) async fn bm25_parse_leg(
 }
 
 /// BM25 sur le champ `search_title` de `decisions_bm25`, au grain décision.
-/// Renvoie `{decision_id: score}`.
+/// Renvoie `{decision_id: score}`. Le titre porte le nom d'usage, absent du
+/// texte de sa propre décision et sans autre jambe pour le servir.
 ///
 /// Mêmes filtres que la jambe body : TOUS les filtres (article composite et
 /// instrument compris) s'appliquent ici aussi — la jambe titre ne peut pas
@@ -151,6 +152,67 @@ pub(crate) async fn title_leg(
     Ok(rows
         .iter()
         .map(|r| (r.get::<_, i64>(0), r.get::<_, f32>(1) as f64))
+        .collect())
+}
+
+/// Exact key leg: the decisions whose canonical docket key equals one of the
+/// query's, most cited first (resolved spans of `case_citation`, 39 ms for 21
+/// bearers) then most recent; the score is the inverted rank, [`fuse_ranks`]
+/// only needs an order. `within` restricts the bearers to the decisions a case
+/// name resolved to: 66145 alone is Cadot (1889) and a decision of 1988.
+///
+/// `lj_docket_keys(d.docket_numbers)` is spelled as in the expression index of
+/// migration 0212, or the planner ignores it. The `MATERIALIZED` CTE is an
+/// optimisation fence: `&&` has no selectivity estimator, so under `ORDER BY
+/// date_lecture LIMIT` the planner walked the date index calling the function
+/// on all 3.7 M rows. Measured in prod: 11 300 ms against 9 ms.
+#[tracing::instrument(skip(conn, req, keys, within), fields(leg_limit))]
+pub(crate) async fn docket_leg(
+    conn: &Client,
+    req: &SearchRequest,
+    keys: &[String],
+    within: Option<&[i64]>,
+    leg_limit: i64,
+) -> std::result::Result<HashMap<i64, f64>, StoreError> {
+    let mut params: Params = Vec::new();
+    params.push(Box::new(keys.to_vec()));
+    let mut idx = 2usize;
+    let within_filter = match within {
+        Some(ids) => {
+            params.push(Box::new(ids.to_vec()));
+            idx += 1;
+            format!(" AND d.id = ANY(${})", idx - 1)
+        }
+        None => String::new(),
+    };
+    let facet_filter = build_facet_filter(
+        req,
+        &mut idx,
+        &mut params,
+        ArrayFilters::AsSql,
+        FilterTable::Decisions,
+    );
+    let sql = format!(
+        "WITH cles AS MATERIALIZED ( \
+           SELECT d.id, d.date_lecture \
+           FROM decisions d \
+           WHERE lj_docket_keys(d.docket_numbers) && $1::text[] \
+             AND d.deleted_at IS NULL{af}{ff} \
+         ) \
+         SELECT c.id FROM cles c \
+         ORDER BY (SELECT count(*) FROM case_citation cc \
+                   WHERE cc.target_decision_id = c.id) DESC, \
+                  c.date_lecture DESC NULLS LAST, c.id DESC LIMIT {limit}",
+        af = within_filter,
+        ff = facet_filter,
+        limit = leg_limit,
+    );
+    let rows = conn.query(sql.as_str(), &as_refs(&params)).await?;
+    let n = rows.len() as f64;
+    Ok(rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.get::<_, i64>(0), n - i as f64))
         .collect())
 }
 
@@ -250,44 +312,57 @@ fn ranks_by_score<F: Fn(i64) -> f64>(ids: &[i64], score: F) -> HashMap<i64, usiz
         .collect()
 }
 
-/// Fusion RRF au grain décision. `bm25` et `title` sont des scores par décision
-/// (jambes `decisions_bm25`) ; `ann` porte le `LegHit` du chunk gagnant (seule
-/// jambe chunk-grain). Le chunk d'affichage du hit fusionné vient de la jambe
-/// ANN — il ancre la fenêtre du snippet sémantique
-/// ([`super::hydrate::assemble_page`]) — sinon un chunk synthétique (snippet
-/// depuis `full_text`).
-pub(crate) fn fuse_ranks(
-    bm25: &HashMap<i64, f64>,
-    ann: &HashMap<i64, LegHit>,
-    title: &HashMap<i64, f64>,
-    w_bm25: f64,
-    w_ann: f64,
-    w_title: f64,
-) -> Vec<(i64, f64, LegHit)> {
+/// Les quatre classements entrant en fusion. `bm25`, `title` et `docket` sont des
+/// scores par décision (jambes `decisions_bm25` et clé exacte) ; `ann` porte le
+/// `LegHit` du chunk gagnant, seule jambe au grain chunk.
+pub(crate) struct Legs<'a> {
+    pub(crate) bm25: &'a HashMap<i64, f64>,
+    pub(crate) ann: &'a HashMap<i64, LegHit>,
+    pub(crate) title: &'a HashMap<i64, f64>,
+    pub(crate) docket: &'a HashMap<i64, f64>,
+}
+
+/// Fusion RRF au grain décision, aux poids de [`crate::signals::Weights`]. Le
+/// chunk d'affichage du hit fusionné vient de la jambe ANN — il ancre la fenêtre
+/// du snippet sémantique ([`super::hydrate::assemble_page`]) — sinon un chunk
+/// synthétique (snippet depuis `full_text`).
+pub(crate) fn fuse_ranks(legs: Legs<'_>, w: crate::signals::Weights) -> Vec<(i64, f64, LegHit)> {
+    let Legs {
+        bm25,
+        ann,
+        title,
+        docket,
+    } = legs;
     let bm25_ids: Vec<i64> = bm25.keys().copied().collect();
     let ann_ids: Vec<i64> = ann.keys().copied().collect();
     let title_ids: Vec<i64> = title.keys().copied().collect();
+    let docket_ids: Vec<i64> = docket.keys().copied().collect();
     let bm25_rank = ranks_by_score(&bm25_ids, |d| bm25[&d]);
     let ann_rank = ranks_by_score(&ann_ids, |d| ann[&d].raw_score);
     let title_rank = ranks_by_score(&title_ids, |d| title[&d]);
+    let docket_rank = ranks_by_score(&docket_ids, |d| docket[&d]);
 
     let mut all: HashSet<i64> = HashSet::new();
     all.extend(bm25.keys());
     all.extend(ann.keys());
     all.extend(title.keys());
+    all.extend(docket.keys());
 
     let mut fused: Vec<(i64, f64, LegHit)> = all
         .into_iter()
         .map(|d| {
             let mut score = 0.0;
             if let Some(r) = bm25_rank.get(&d) {
-                score += w_bm25 / (*r as f64 + RRF_RANK_CONSTANT);
+                score += w.bm25 / (*r as f64 + RRF_RANK_CONSTANT);
             }
             if let Some(r) = ann_rank.get(&d) {
-                score += w_ann / (*r as f64 + RRF_RANK_CONSTANT);
+                score += w.ann / (*r as f64 + RRF_RANK_CONSTANT);
             }
             if let Some(r) = title_rank.get(&d) {
-                score += w_title / (*r as f64 + RRF_RANK_CONSTANT);
+                score += w.title / (*r as f64 + RRF_RANK_CONSTANT);
+            }
+            if let Some(r) = docket_rank.get(&d) {
+                score += w.docket / (*r as f64 + RRF_RANK_CONSTANT);
             }
             let chunk = ann
                 .get(&d)
@@ -305,11 +380,12 @@ pub(crate) fn fuse_ranks(
     fused
 }
 
+/// Coupe la queue faible, relativement au meilleur score.
 pub(crate) fn truncate_fused(fused: Vec<(i64, f64, LegHit)>) -> Vec<(i64, f64, LegHit)> {
-    if fused.is_empty() {
+    let Some(best) = fused.first().map(|r| r.1) else {
         return fused;
-    }
-    let threshold = fused[0].1 * RELATIVE_SCORE_THRESHOLD;
+    };
+    let threshold = best * RELATIVE_SCORE_THRESHOLD;
     fused
         .into_iter()
         .filter(|r| r.1 >= threshold)
@@ -320,6 +396,7 @@ pub(crate) fn truncate_fused(fused: Vec<(i64, f64, LegHit)>) -> Vec<(i64, f64, L
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signals;
 
     #[test]
     fn rrf_fusion_tiebreak_parity_oracle() {
@@ -333,7 +410,16 @@ mod tests {
         let bm25: HashMap<i64, f64> = HashMap::from([(1, 5.0), (2, 5.0), (3, 1.0)]);
         let ann = HashMap::from([(2, mk(2, 9.0)), (4, mk(4, 2.0))]);
         let title = HashMap::from([(1, 3.0), (4, 3.0)]);
-        let fused = fuse_ranks(&bm25, &ann, &title, 1.0, 1.0, 1.0);
+        let no_docket: HashMap<i64, f64> = HashMap::new();
+        let fused = fuse_ranks(
+            Legs {
+                bm25: &bm25,
+                ann: &ann,
+                title: &title,
+                docket: &no_docket,
+            },
+            crate::signals::BASE_WEIGHTS,
+        );
         let order: Vec<i64> = fused.iter().map(|(d, _, _)| *d).collect();
         assert_eq!(order, vec![1, 2, 4, 3], "ordre fusionné + tie-break");
         let scores: Vec<f64> = fused
@@ -364,7 +450,16 @@ mod tests {
         let bm25: HashMap<i64, f64> = HashMap::from([(1, 4.0)]);
         let ann = HashMap::from([(1, mk(1, 2.0)), (2, mk(2, 7.0))]);
         let title = HashMap::from([(5, 9.0)]);
-        let fused = fuse_ranks(&bm25, &ann, &title, 1.0, 1.0, 1.0);
+        let no_docket: HashMap<i64, f64> = HashMap::new();
+        let fused = fuse_ranks(
+            Legs {
+                bm25: &bm25,
+                ann: &ann,
+                title: &title,
+                docket: &no_docket,
+            },
+            crate::signals::BASE_WEIGHTS,
+        );
         let order: Vec<i64> = fused.iter().map(|(d, _, _)| *d).collect();
         assert_eq!(order, vec![1, 2, 5], "ordre + tie-break (2 avant 5)");
         let scores: Vec<f64> = fused
@@ -438,8 +533,39 @@ mod tests {
         let mut title = HashMap::new();
         title.insert(1i64, 3.0);
         title.insert(2i64, 1.0);
-        let fused = fuse_ranks(&bm25, &ann, &title, 1.0, 1.0, 1.0);
+        let no_docket: HashMap<i64, f64> = HashMap::new();
+        let fused = fuse_ranks(
+            Legs {
+                bm25: &bm25,
+                ann: &ann,
+                title: &title,
+                docket: &no_docket,
+            },
+            crate::signals::BASE_WEIGHTS,
+        );
         assert_eq!(fused[0].0, 1);
+    }
+
+    #[test]
+    fn la_jambe_cle_remonte_la_decision_exacte_en_mode_reference() {
+        let bm25: HashMap<i64, f64> = HashMap::new();
+        let ann: HashMap<i64, LegHit> = HashMap::new();
+        let title: HashMap<i64, f64> = HashMap::from([(2, 9.0), (3, 8.0), (7, 1.0)]);
+        let docket: HashMap<i64, f64> = HashMap::from([(7, 1.0)]);
+        let w = signals::Weights {
+            docket: signals::PURE_REFERENCE_DOCKET_WEIGHT,
+            ..signals::BASE_WEIGHTS
+        };
+        let fused = fuse_ranks(
+            Legs {
+                bm25: &bm25,
+                ann: &ann,
+                title: &title,
+                docket: &docket,
+            },
+            w,
+        );
+        assert_eq!(fused[0].0, 7, "la décision exacte passe devant le voisin");
     }
 
     #[test]

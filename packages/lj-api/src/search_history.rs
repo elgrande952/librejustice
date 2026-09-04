@@ -10,19 +10,21 @@ use crate::state::AppState;
 /// Borne haute de pagination de l'historique.
 pub const MAX_ITEMS: i64 = 100;
 
-/// Représentation chaîne d'un canal d'activité (`web` | `mcp`), pour les
+/// Représentation chaîne d'un canal d'activité (`web` | `api` | `mcp`), pour les
 /// colonnes TEXT.
 pub(crate) fn source_value(source: ActivitySource) -> &'static str {
     match source {
         ActivitySource::Web => "web",
+        ActivitySource::Api => "api",
         ActivitySource::Mcp => "mcp",
     }
 }
 
-/// Désérialise un TEXT `web`/`mcp` lu en base vers l'enum.
+/// Désérialise un TEXT `web`/`api`/`mcp` lu en base vers l'enum.
 fn parse_source(raw: &str) -> Result<ActivitySource, ApiError> {
     match raw {
         "web" => Ok(ActivitySource::Web),
+        "api" => Ok(ActivitySource::Api),
         "mcp" => Ok(ActivitySource::Mcp),
         other => Err(ApiError::Internal(format!("source invalide {other:?}"))),
     }
@@ -224,10 +226,9 @@ mod tests {
             office: None,
             legal_domain: None,
             jurisdiction_code: None,
-            chamber: None,
+            seat: None,
             legal_instrument: None,
             legal_article: None,
-            significance: None,
             publication: None,
             date_from: None,
             date_to: None,
@@ -290,6 +291,7 @@ mod tests {
     #[test]
     fn source_value_lowercase() {
         assert_eq!(source_value(ActivitySource::Web), "web");
+        assert_eq!(source_value(ActivitySource::Api), "api");
         assert_eq!(source_value(ActivitySource::Mcp), "mcp");
     }
 }

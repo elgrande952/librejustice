@@ -9,6 +9,7 @@ use leptos_meta::Title;
 
 #[component]
 pub fn SourcesPage() -> impl IntoView {
+    crate::pages::cache_public_5_min();
     view! {
         <Title text="Données & sources - LibreJustice" />
         <div class="mx-auto flex w-full max-w-2xl flex-1 flex-col px-4 py-16 sm:px-6 lg:px-8">

@@ -1,12 +1,3 @@
-//! SafeTender / Omnikles (`*.safetender.com` + domaines en marque blanche).
-//!
-//! SPA adossée à une API REST publique propre : `GET /tenderlink-rest/
-//! tenderlink/session/` pose le cookie, puis `/supplier_tender/search/` rend
-//! `{tenders: [...], size}`. Un portail par tenant — les hôtes viennent du
-//! recensement `profil_acheteur`. La fiche d'un avis se lit sur la même API
-//! (`/supplier_tender/tender_details/<id>`), sans session : c'est la recherche
-//! qui a besoin du cookie, pas la fiche.
-
 use futures::StreamExt;
 
 use lj_core::annonces::{ts_from_epoch_ms, AnnonceBrute};
@@ -50,7 +41,7 @@ async fn enumerate_host(host: &str) -> super::HoteRun {
             break size;
         }
         first += tenders.len() as u64;
-        rows.extend(tenders.iter().map(|t| row(t, host)));
+        rows.extend(tenders.iter().filter_map(|t| row(t, host)));
         if first >= size {
             break size;
         }
@@ -73,25 +64,38 @@ pub async fn enumerate(hosts: &[String]) -> Result<MoteurRun> {
     let mut run = MoteurRun {
         annonce: Some(0),
         echecs: 0,
+        hotes: Vec::new(),
         rows: Vec::new(),
     };
     for (host, res) in resultats {
+        let joignable = res.is_ok();
         match res {
             Ok((size, rows)) => {
                 run.annonce = run.annonce.map(|a| a + size);
                 run.rows.extend(rows);
             }
-            Err(e) => {
-                run.echecs += 1;
-                tracing::warn!(host, error = %e, "safetender : portail en échec");
-            }
+            Err(e) => tracing::warn!(host, error = %e, "safetender : portail en échec"),
         }
+        run.hotes.push(super::HoteVerdict { host, joignable });
     }
     run.rows = dedup_source_uid(run.rows);
     Ok(run)
 }
 
-fn row(t: &serde_json::Value, host: &str) -> AnnonceBrute {
+/// Identifiant d'un avis. Les portails passés au socle à UUID gardent leur
+/// entier d'origine en `tenderOldId` : le retenir en priorité tient le
+/// `source_uid` et l'URL stables des deux côtés de la migration.
+fn tender_id(t: &serde_json::Value) -> Option<String> {
+    ["tenderOldId", "tenderId"]
+        .into_iter()
+        .find_map(|k| match t.get(k) {
+            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+            Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        })
+}
+
+fn row(t: &serde_json::Value, host: &str) -> Option<AnnonceBrute> {
     let texte = |k: &str| {
         t.get(k)
             .and_then(|v| v.as_str())
@@ -99,12 +103,9 @@ fn row(t: &serde_json::Value, host: &str) -> AnnonceBrute {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
-    let id = t
-        .get("tenderId")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_default();
+    let id = tender_id(t)?;
     let url = format!("https://{host}/#/tender/{id}");
-    AnnonceBrute {
+    Some(AnnonceBrute {
         moteur: "safetender",
         source_uid: format!("safetender:{host}:{id}"),
         cles_jointure: Vec::new(),
@@ -125,7 +126,7 @@ fn row(t: &serde_json::Value, host: &str) -> AnnonceBrute {
         url_dce: Some(url),
         url_depot: None,
         procedure: texte("model"),
-    }
+    })
 }
 
 /// Hôte et identifiant portés par l'URL d'avis que [`row`] écrit
@@ -135,8 +136,10 @@ fn hote_et_id(url_avis: &str) -> Option<(&str, &str)> {
     let (hote, id) = url_avis
         .strip_prefix("https://")?
         .split_once("/#/tender/")?;
-    (!hote.is_empty() && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
-        .then_some((hote, id))
+    (!hote.is_empty()
+        && !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    .then_some((hote, id))
 }
 
 /// Champ texte non vide d'une réponse de l'API, par pointeur JSON.
@@ -196,9 +199,39 @@ mod tests {
             Some(("asf-consultations.safetender.com", "1744"))
         );
         assert_eq!(
+            hote_et_id("https://asf-consultations.safetender.com/#/tender/2b0ff31b-56e9-4df5-a950-88b0faca4ff4"),
+            Some((
+                "asf-consultations.safetender.com",
+                "2b0ff31b-56e9-4df5-a950-88b0faca4ff4"
+            ))
+        );
+        assert_eq!(
             hote_et_id("https://www.boamp.fr/pages/avis/?q=idweb:26-1"),
             None
         );
+    }
+
+    /// Lignes réelles des deux socles : `marchespublics-aude` sur l'entier,
+    /// `asf-consultations` migré, qui porte l'UUID et garde l'entier.
+    #[test]
+    fn l_entier_d_origine_prime_l_uuid_du_socle_migre() {
+        let ancien = serde_json::json!({"tenderId": 35873, "reference": "26MA-SMMAR"});
+        assert_eq!(tender_id(&ancien).as_deref(), Some("35873"));
+
+        let migre = serde_json::json!({
+            "tenderId": "2b0ff31b-56e9-4df5-a950-88b0faca4ff4",
+            "tenderOldId": 1572,
+            "reference": "222-2026-DMA-3007"
+        });
+        assert_eq!(tender_id(&migre).as_deref(), Some("1572"));
+
+        let sans_entier = serde_json::json!({"tenderId": "2b0ff31b-56e9-4df5-a950-88b0faca4ff4"});
+        assert_eq!(
+            tender_id(&sans_entier).as_deref(),
+            Some("2b0ff31b-56e9-4df5-a950-88b0faca4ff4")
+        );
+
+        assert_eq!(tender_id(&serde_json::json!({"reference": "x"})), None);
     }
 
     /// Réponses réelles (asf-consultations, avis 1744), réduites aux champs

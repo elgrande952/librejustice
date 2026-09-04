@@ -1,24 +1,30 @@
 //! Hubs juridiction : catalogue agrégé, années couvertes par une juridiction,
 //! page de décisions d'une année.
+//!
+//! The three aggregate reads live on `jurisdiction_year_counts` (2,491 rows),
+//! never on `decisions` (3.73 M rows), which the crawl asks for over 38,743
+//! pages. The listing itself stays on `decisions`.
 
-use super::types::{HubDecisionRow, JurisdictionHubRow};
+use super::types::{HubDecisionRow, JurisdictionHubPages, JurisdictionHubRow};
 use super::DecisionRepository;
 use crate::error::Result;
 
 impl DecisionRepository<'_> {
     /// Catalogue des juridictions avec volume de décisions actives
-    /// (`/juridictions`).
+    /// (`/juridictions`). Le total somme **toutes** les années du code, ligne
+    /// `year IS NULL` comprise : les décisions sans date comptent ici, et pas
+    /// dans l'histogramme.
     #[tracing::instrument(name = "db.jurisdiction_catalogue", skip(self), fields(db.system = "postgresql"))]
     pub async fn jurisdiction_catalogue(&self) -> Result<Vec<JurisdictionHubRow>> {
         let rows = self
             .conn
             .query(
-                "SELECT d.jurisdiction_code, j.jurisdiction_type, j.label, count(*) \
-                 FROM decisions d \
-                 JOIN jurisdiction j ON j.code = d.jurisdiction_code \
-                 WHERE d.deleted_at IS NULL AND d.public_id IS NOT NULL \
-                 GROUP BY 1, 2, 3 \
-                 ORDER BY 2, 3",
+                "SELECT c.jurisdiction_code, j.jurisdiction_type, j.label, c.n \
+                 FROM (SELECT jurisdiction_code, sum(decision_count)::bigint n \
+                       FROM jurisdiction_year_counts \
+                       GROUP BY 1) c \
+                 JOIN jurisdiction j ON j.code = c.jurisdiction_code \
+                 ORDER BY j.jurisdiction_type, j.label",
                 &[],
             )
             .await?;
@@ -40,43 +46,102 @@ impl DecisionRepository<'_> {
         let rows = self
             .conn
             .query(
-                "SELECT extract(year FROM date_lecture)::int, count(*) \
-                 FROM decisions \
-                 WHERE jurisdiction_code = $1 AND date_lecture IS NOT NULL \
-                   AND deleted_at IS NULL AND public_id IS NOT NULL \
-                 GROUP BY 1 ORDER BY 1 DESC",
+                "SELECT year, decision_count \
+                 FROM jurisdiction_year_counts \
+                 WHERE jurisdiction_code = $1 AND year IS NOT NULL \
+                 ORDER BY year DESC",
                 &[&code],
             )
             .await?;
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Couples `(code, années)` pour la section `juridictions` des sitemaps :
-    /// un hub par code + une URL par année, années récentes en tête.
+    /// Total d'un couple juridiction×année (`/juridiction/{code}/{annee}`).
+    /// `None` quand le couple est vide.
+    #[tracing::instrument(name = "db.jurisdiction_year_total", skip(self), fields(db.system = "postgresql"))]
+    pub async fn jurisdiction_year_total(&self, code: &str, year: i32) -> Result<Option<i64>> {
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT decision_count FROM jurisdiction_year_counts \
+                 WHERE jurisdiction_code = $1 AND year = $2",
+                &[&code, &year],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    /// Couples `(code, [(année, nombre de pages)])` pour la section
+    /// `juridictions` des sitemaps, années récentes en tête. `page_size` est
+    /// celui que sert l'API : au-delà du compte, la page rend un listing vide
+    /// en 200.
     #[tracing::instrument(name = "db.iter_jurisdiction_hubs_for_sitemap", skip(self), fields(db.system = "postgresql"))]
-    pub async fn iter_jurisdiction_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<i32>)>> {
+    pub async fn iter_jurisdiction_hubs_for_sitemap(
+        &self,
+        page_size: i64,
+    ) -> Result<JurisdictionHubPages> {
+        // `$1::bigint` avant le float8 : sous `$1::float8` seul, Postgres infère
+        // le paramètre en float8 et refuse d'y sérialiser l'i64.
         let rows = self
             .conn
             .query(
-                "SELECT d.jurisdiction_code, extract(year FROM d.date_lecture)::int \
-                 FROM decisions d \
-                 JOIN jurisdiction j ON j.code = d.jurisdiction_code \
-                 WHERE d.date_lecture IS NOT NULL \
-                   AND d.deleted_at IS NULL AND d.public_id IS NOT NULL \
-                 GROUP BY 1, 2 ORDER BY 1, 2 DESC",
-                &[],
+                "SELECT c.jurisdiction_code, c.year, \
+                        ceil(c.decision_count::float8 / $1::bigint::float8)::bigint \
+                 FROM jurisdiction_year_counts c \
+                 JOIN jurisdiction j ON j.code = c.jurisdiction_code \
+                 WHERE c.year IS NOT NULL \
+                 ORDER BY 1, 2 DESC",
+                &[&page_size],
             )
             .await?;
-        let mut out: Vec<(String, Vec<i32>)> = Vec::new();
+        let mut out: JurisdictionHubPages = Vec::new();
         for r in rows {
             let code: String = r.get(0);
-            let year: i32 = r.get(1);
+            let year = (r.get(1), r.get(2));
             match out.last_mut() {
                 Some((c, years)) if *c == code => years.push(year),
                 _ => out.push((code, vec![year])),
             }
         }
         Ok(out)
+    }
+
+    /// Rebuild intégral de `jurisdiction_year_counts`. Une seule instruction
+    /// (CTE modifiantes, même snapshot) : upsert des couples recomptés,
+    /// suppression des disparus, garde `<>` pour ne réécrire que les décomptes
+    /// changés. Renvoie le nombre de couples upsertés.
+    #[tracing::instrument(name = "db.rebuild_jurisdiction_year_counts", skip(self), fields(db.system = "postgresql"))]
+    pub async fn rebuild_jurisdiction_year_counts(&self) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "
+                WITH fresh AS (
+                    SELECT jurisdiction_code,
+                           extract(year FROM date_lecture)::int AS year,
+                           count(*) AS decision_count
+                    FROM decisions
+                    WHERE deleted_at IS NULL
+                    GROUP BY 1, 2
+                ), stale AS (
+                    DELETE FROM jurisdiction_year_counts c
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM fresh f
+                        WHERE f.jurisdiction_code = c.jurisdiction_code
+                          AND f.year IS NOT DISTINCT FROM c.year)
+                )
+                INSERT INTO jurisdiction_year_counts
+                            (jurisdiction_code, year, decision_count)
+                SELECT jurisdiction_code, year, decision_count FROM fresh
+                ON CONFLICT (jurisdiction_code, year) DO UPDATE
+                SET decision_count = excluded.decision_count
+                WHERE jurisdiction_year_counts.decision_count
+                      <> excluded.decision_count
+                ",
+                &[],
+            )
+            .await?;
+        Ok(n)
     }
 
     /// Page de décisions d'une juridiction×année, date décroissante
@@ -89,15 +154,19 @@ impl DecisionRepository<'_> {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<HubDecisionRow>> {
+        // L'alias `date_iso` est ce qui laisse `ORDER BY date_lecture` désigner
+        // la colonne de la TABLE : sans lui il se lie à la colonne de sortie,
+        // donc au texte, et l'index ne fournit plus l'ordre (Bitmap Heap Scan et
+        // tri parallèle sur 294 000 buffers, contre un Index Scan seul).
         let rows = self
             .conn
             .query(
-                "SELECT public_id, search_title, date_lecture::text \
+                "SELECT public_id, search_title, date_lecture::text AS date_iso \
                  FROM decisions \
                  WHERE jurisdiction_code = $1 \
                    AND date_lecture >= make_date($2, 1, 1) \
                    AND date_lecture < make_date($2 + 1, 1, 1) \
-                   AND deleted_at IS NULL AND public_id IS NOT NULL \
+                   AND deleted_at IS NULL \
                  ORDER BY date_lecture DESC, id \
                  LIMIT $3 OFFSET $4",
                 &[&code, &year, &limit, &offset],

@@ -100,10 +100,18 @@ pub struct Settings {
     pub grafana_cloud_api_key: Option<String>,
     pub otel_service_name: String,
     pub deployment_environment: Option<String>,
-    /// Plafond dur de durée d'une invocation `lj-ingest` (watchdog). Au-delà, le
-    /// process logge une erreur et abandonne avec un code non nul. `0` = watchdog
-    /// désactivé.
+    pub host_name: Option<String>,
+    pub container_name: Option<String>,
+    /// Plafond dur de durée d'une invocation `lj-ingest` directe (watchdog).
+    /// Au-delà, le process logge une erreur et abandonne avec un code non nul.
+    /// `0` = watchdog désactivé. Une chaîne cron n'en dépend pas : chaque étape
+    /// porte son propre délai (`chain.rs`).
     pub watchdog_secs: u64,
+    /// URL de base du pont d'egress, seul chemin du connecteur klekoon (TLS 1.2
+    /// legacy que rustls refuse). Défaut = pont local `http://127.0.0.1:8090`
+    /// (hôte/dev) ; en prod, le conteneur `cron` reçoit l'adresse interne par
+    /// son environnement.
+    pub egress_url: String,
 }
 
 impl Settings {
@@ -142,7 +150,10 @@ impl Settings {
             grafana_cloud_api_key: env_opt("LIBREJUSTICE_GRAFANA_CLOUD_API_KEY"),
             otel_service_name: env_or("LIBREJUSTICE_OTEL_SERVICE_NAME", "librejustice-ingest"),
             deployment_environment: env_opt("LIBREJUSTICE_DEPLOYMENT_ENVIRONMENT"),
+            host_name: env_opt("LIBREJUSTICE_HOST_NAME"),
+            container_name: env_opt("LIBREJUSTICE_CONTAINER_NAME"),
             watchdog_secs: parse_watchdog_secs(env_opt("LIBREJUSTICE_INGEST_WATCHDOG_SECS"))?,
+            egress_url: env_or("LIBREJUSTICE_EGRESS_URL", "http://127.0.0.1:8090"),
         })
     }
 
@@ -284,7 +295,10 @@ mod tests {
             grafana_cloud_api_key: None,
             otel_service_name: "librejustice-ingest".into(),
             deployment_environment: None,
+            host_name: None,
+            container_name: None,
             watchdog_secs: 14_400,
+            egress_url: "http://127.0.0.1:8090".into(),
         };
         assert_eq!(settings.cache_dir(), PathBuf::from("/data/lj/ingest/cache"));
     }

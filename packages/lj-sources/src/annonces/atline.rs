@@ -1,10 +1,3 @@
-//! Atline (`marches-securises.fr`).
-//!
-//! Un `POST ?module=consultation|script|selection_consultation_s` **arme** la
-//! recherche en session et rend la première page ; la pagination se fait
-//! ensuite en `GET ?module=liste_consultations&page=N`. Une ligne =
-//! `<table class="consultation …">`, clé métier `cle_dce`, 10 par page.
-
 use std::sync::LazyLock;
 
 use futures::StreamExt;
@@ -17,38 +10,50 @@ use lj_core::annonces::{
 use super::{apres_balise, dedup_source_uid, send_text, txt, DetailAnnonce, MoteurRun};
 use crate::error::Result;
 
-const BASE: &str = "https://www.marches-securises.fr";
-const ENTR: &str = "https://www.marches-securises.fr/entreprise/";
+const BASE: &str = "https://v2.marches-securises.fr";
+const ENTR: &str = "https://v2.marches-securises.fr/entreprise/";
 const PER_PAGE: u64 = 10;
 const SESSIONS: u64 = 12;
 
-/// Arme la recherche : rend (client en session, première page, total annoncé).
-async fn armer() -> Result<(reqwest::Client, String, u64)> {
-    let client = super::client();
+/// Poste le formulaire de recherche `rch_consult_ent` — ses champs exacts : les
+/// cinq cases de prestation valent `1`, `date_cloture_type=0` prend toutes les
+/// dates, et `mots_cles` est le seul terme. La recherche est un état de session,
+/// donc l'accueil d'abord, la requête ensuite.
+async fn recherche(client: &reqwest::Client, mots_cles: &str) -> Result<String> {
     send_text(client.get(format!("{BASE}/")), "atline accueil").await?;
-    let html = send_text(
+    send_text(
         client
             .post(format!(
                 "{ENTR}?module=consultation|script|selection_consultation_s"
             ))
             .header("Referer", format!("{BASE}/"))
             .form(&[
-                ("module", "consultation|script|selection_consultation_s"),
-                ("objet", ""),
-                ("mots_cles", ""),
-                ("presta_tx", "travaux"),
-                ("presta_se", "services"),
-                ("presta_fo", "fournitures"),
-                ("presta_au", "autres"),
+                ("module", "liste_consultations"),
+                ("mots_cles", mots_cles),
+                ("presta_tx", "1"),
+                ("presta_se", "1"),
+                ("presta_fo", "1"),
+                ("presta_au", "1"),
+                ("presta_et", "1"),
                 ("date_cloture_type", "0"),
-                ("dep_liste", ""),
-                ("type_marche", ""),
-                ("type_procedure", ""),
-                ("submit", "Rechercher"),
             ]),
         "atline recherche",
     )
-    .await?;
+    .await
+}
+
+/// Les consultations que la plateforme rend pour une référence de marché. Son
+/// index de recherche et sa liste énumérable ne couvrent pas le même ensemble :
+/// une consultation absente de la seconde sort de la première.
+pub async fn chercher(reference: &str) -> Result<Vec<AnnonceBrute>> {
+    let client = super::client();
+    Ok(parse_page(&recherche(&client, reference).await?))
+}
+
+/// Arme la recherche : rend (client en session, première page, total annoncé).
+async fn armer() -> Result<(reqwest::Client, String, u64)> {
+    let client = super::client();
+    let html = recherche(&client, "").await?;
     static TOTAL: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)(\d[\d\s]{0,7})\s*consultations?").unwrap());
     let total = TOTAL
@@ -73,6 +78,13 @@ fn parse_page(html: &str) -> Vec<AnnonceBrute> {
         Regex::new(r#"(?s)<tr class="tr_dept[^"]*">.*?<td[^>]*>\s*(\d{2,3})\b"#).unwrap()
     });
     static REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Référence\s+(\S+)").unwrap());
+    // La fiche porte deux références : « Référence », la clé maison d'Atline
+    // (`CSTB_77_A_20260730W2_3`), et « Référence interne », celle que l'acheteur
+    // a donnée à son marché (`27R004`) — la seule que le BOAMP publie aussi,
+    // donc la seule qui joigne les deux canaux.
+    static REF_INTERNE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?s)Référence interne\s*</th>\s*<td[^>]*>(.*?)</td>"#).unwrap()
+    });
     static OBJET: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r#"(?s)<tr class="tr_objet[^"]*">(.*?)</tr>"#).unwrap());
     static TYPE: LazyLock<Regex> = LazyLock::new(|| {
@@ -127,7 +139,11 @@ fn parse_page(html: &str) -> Vec<AnnonceBrute> {
             moteur: "atline",
             source_uid: format!("atline:{cle}"),
             cles_jointure: Vec::new(),
-            reference: REF.captures(&flat).map(|c| c[1].to_string()),
+            reference: REF_INTERNE
+                .captures(&utile)
+                .map(|c| txt(&c[1]).trim().to_string())
+                .filter(|r| !r.is_empty())
+                .or_else(|| REF.captures(&flat).map(|c| c[1].to_string())),
             acheteur: Some(DEPT.replace(&pa, "").trim().to_string()).filter(|a| !a.is_empty()),
             siren: None,
             objet: OBJET
@@ -192,6 +208,7 @@ pub async fn enumerate() -> Result<MoteurRun> {
     let mut run = MoteurRun {
         annonce: Some(total),
         echecs: 0,
+        hotes: Vec::new(),
         rows: parse_page(&premiere),
     };
     for res in resultats {
@@ -316,6 +333,19 @@ mod tests {
     </table>"#;
 
     const OBJET_LIGNE: &str = "REGIE ADMINISTRATIVE DANS LE CADRE DES MANIFESTATIONS CULTURELLES DEPARTEMENTALES DE VALORISATION DE LA LANGUE ET DE LA CULTURE CREOLES - LE MOIS DU KREYOL ÉDITION 2026";
+
+    /// Des deux références de la fiche, on retient celle de l'acheteur — c'est
+    /// la seule que le BOAMP publie aussi, donc la seule qui joigne les canaux.
+    #[test]
+    fn la_reference_retenue_est_celle_de_l_acheteur_pas_la_cle_maison() {
+        assert_eq!(parse_page(LIGNE)[0].reference.as_deref(), Some("2026_22"));
+        // Sans « Référence interne », la clé maison reste le seul identifiant.
+        let sans = LIGNE.replace("Référence interne", "Autre chose");
+        assert_eq!(
+            parse_page(&sans)[0].reference.as_deref(),
+            Some("CG_971_A_20260806W2_1")
+        );
+    }
 
     #[test]
     fn le_suffixe_de_departement_quitte_le_libelle_d_acheteur() {

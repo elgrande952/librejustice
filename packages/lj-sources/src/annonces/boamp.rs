@@ -145,6 +145,7 @@ pub async fn enumerate(plateformes: &HashSet<String>) -> Result<MoteurRun> {
     Ok(MoteurRun {
         annonce: Some(annonce),
         echecs: 0,
+        hotes: Vec::new(),
         rows: dedup_source_uid(rows),
     })
 }

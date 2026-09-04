@@ -3,7 +3,7 @@
 //!
 //! Les fetchers passent par [`ApiClient`] (transport aiguillé par cible, comme
 //! la fiche entité) : in-process `lj_api::entities` au SSR, HTTP
-//! `/api/entities/*` côté hydrate.
+//! `/internal/entities/*` côté hydrate.
 
 use leptos::prelude::*;
 use leptos_router::components::A;

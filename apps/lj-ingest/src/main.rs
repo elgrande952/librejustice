@@ -1,13 +1,17 @@
 //! Binaire `lj-ingest` : CLI d'ingest (clap).
 
+mod alias_candidats;
 mod analyze;
+mod case_names;
 mod chain;
 mod chunking;
 mod citations_maintenance;
 mod config;
 mod indexnow;
+mod invariants;
 mod logging;
 mod pipeline;
+mod renvois;
 mod reverses;
 mod sitemap;
 mod summary;
@@ -67,9 +71,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Déroule une chaîne planifiée (cron). Chaque étape a son propre watchdog
-    /// et un échec n'interrompt pas les suivantes ; la chaîne sort non-zéro
-    /// après un `error!` récapitulatif.
+    /// Déroule une chaîne planifiée (cron). Chaque étape a son propre délai de
+    /// watchdog et un échec n'interrompt pas les suivantes ; la chaîne sort
+    /// non-zéro après un `error!` récapitulatif.
     Chain {
         #[arg(value_enum)]
         kind: chain::ChainKind,
@@ -82,6 +86,16 @@ enum Command {
     Analyze,
     /// Applique les migrations Postgres.
     Migrate,
+    /// Projette les renvois des analyses du Conseil d'État en relation de
+    /// citation (`decision_renvoi`) et résout les cibles.
+    Renvois,
+    /// Remplit `alias_candidate` : surnoms d'arrêts et de lois minés depuis les
+    /// renvois du Conseil d'État et la locution « dite loi ». N'active rien.
+    AliasCandidats {
+        /// N'extrait rien : relit les N candidats de tête, par exclusivité.
+        #[arg(long, num_args = 0..=1, default_missing_value = "60")]
+        revue: Option<i64>,
+    },
     /// Matérialise le champ `legal_article.usage_terms` (sacs de n-grammes
     /// des contextes de citation + seeds curatés).
     UsageTerms {
@@ -119,11 +133,9 @@ enum Command {
     },
     /// Ré-extrait les champs structurés depuis les payloads stockés.
     ReextractFields {
-        #[arg(long)]
-        overwrite: bool,
-        /// Sonde : n'écrit RIEN, compte les lignes qu'un `--overwrite`
-        /// réécrirait (même comparaison NULL-safe que le skip-tuple de l'UPDATE) et
-        /// les couches satellites qu'il purgerait.
+        /// Sonde : n'écrit RIEN, compte les lignes que la passe réécrirait
+        /// (même comparaison NULL-safe que le skip-tuple de l'UPDATE) et les
+        /// couches satellites qu'elle purgerait.
         #[arg(long)]
         dry_run: bool,
         /// Passe intégrale : TOUT le fonds `extract_version < 1000`, même déjà à
@@ -148,6 +160,11 @@ enum Command {
         /// d'un instrument, sans bump global.
         #[arg(long)]
         citing_ref_uid: Option<String>,
+        /// Expression BM25 sur le texte (`parse_with_field`, termes pliés sans
+        /// accent : `pourvoi`, `"decision deferee"`), avec
+        /// `--jurisdiction-type` : ne repasse que le gisement du littéral.
+        #[arg(long, requires = "jurisdiction_type")]
+        text_query: Option<String>,
         /// Workers concurrents = connexions DB simultanées (chacun fait
         /// fetch→extract→write en parallèle). C'est le levier de pression sur la
         /// base : `--workers 2` reste doux sur une prod qui sert du trafic ; vide =
@@ -155,9 +172,16 @@ enum Command {
         #[arg(long)]
         workers: Option<usize>,
     },
+    /// Replays the room resolution on the stored seat, without parsing:
+    /// rewrites `seat_paths` where the court vocabulary moved.
+    ResolveSeats {
+        /// Counts the rows that would change, writes nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Re-embed ciblé des décisions orphelines (chunks sans embedding).
     /// Reconstruit depuis `(full_text, source_fields)` et ne remplit que les
-    /// embeddings manquants — vLLM strict.
+    /// embeddings manquants, local strict.
     EmbedMissing {
         /// Borne le nombre de décisions traitées (défaut : toutes).
         #[arg(long)]
@@ -185,6 +209,20 @@ enum Command {
     /// (réparation). Idempotent, lots autocommit ; en régime normal l'écrivain
     /// de citations tient les arrays à jour.
     ResyncLegalArrays,
+    /// Instantané unique du fonds : enchaîne les trois recomptes que rien ne
+    /// tient à l'écriture, compteurs par juridiction, référentiel `chamber` et
+    /// `corpus_counts`. Idempotent ; planifié dans la chaîne quotidienne.
+    Precompute,
+    /// Recompte `jurisdiction_year_counts` depuis `decisions` : les compteurs
+    /// que lisent les hubs juridiction et les nombres de pages du sitemap.
+    /// Idempotent.
+    ResyncJurisdictionCounts,
+    /// Recompte `corpus_counts` : total et facettes du fonds entier que sert le
+    /// mode parcours, et les trois totaux de la page d'accueil. Idempotent.
+    ResyncCorpusCounts,
+    /// Recompose le référentiel `chamber` depuis `decisions` : une chambre par
+    /// paire (cour, clé), sa spécialisation votée par le fonds. Idempotent.
+    ResyncChambers,
     /// Re-key one-shot du namespace cnb: vers l'identité CNBF : ponte les uids
     /// legacy {barreau}:{nom}-{prenom} vers cnb:{avCnbfCode} (snapshot courant),
     /// purge les entités pieds de fichier, réhydrate les liens danglants.
@@ -296,12 +334,30 @@ enum Command {
     /// incréments `KALI_*.tar.gz` postérieurs au watermark, chacun ingéré.
     /// Idempotent.
     SyncKali,
-    /// Moisson quotidienne du fond marchés du pot Annonces : les 12 canaux
-    /// (BOAMP Opendatasoft + 11 moteurs de profils d'acheteurs) ré-énumérés en
-    /// entier, réconciliés en lignes canoniques, upsertés. Aucun état stampé ni
+    /// Fait passer les conventions collectives à la clé qualifiée par la pièce :
+    /// requalification sur place puis entrée des articles que l'ancienne clé
+    /// refusait, un lot de recueils par passage. Reprenable et idempotent.
+    RequalifierKali {
+        /// Recueils traités par passage. Borne la mémoire du parcours du cache.
+        #[arg(long, default_value_t = 200)]
+        lot: i64,
+    },
+    /// Moisson quotidienne du fond marchés du pot Annonces : les 14 canaux
+    /// (BOAMP Opendatasoft, TED, 11 moteurs de profils d'acheteurs, et le dump
+    /// de presse quand une session en a laissé un) ré-énumérés en entier,
+    /// réconciliés en lignes canoniques, upsertés. Aucun état stampé ni
     /// supprimé : la moisson n'écrit que ce qu'elle voit, la fenêtre vivante se
     /// calcule à la lecture. Idempotent.
     Annonces,
+    /// Mesure la complétude de la moisson des plateformes : les consultations
+    /// ouvertes que seuls les canaux de publication portent (BOAMP, TED,
+    /// presse), classées par tenant et par cause — tenant non recensé, moteur
+    /// non connecté, ou faux négatif d'un connecteur. Rapport pur, n'écrit rien.
+    AnnoncesCouverture {
+        /// Tenants détaillés dans le rapport, les plus gros d'abord.
+        #[arg(long, default_value_t = 40)]
+        limite: usize,
+    },
     /// Backfill de l'historique BOAMP dans le fond `marche` : mois par mois,
     /// les avis de marché puis les résultats de la même fenêtre, depuis 2010.
     /// Manuel, jamais planifié. Idempotent et reprenable : relancer sur une
@@ -352,6 +408,21 @@ enum Command {
         #[arg(long)]
         formes: bool,
     },
+    /// Va chercher sur la plateforme, par la référence de marché que l'avis
+    /// publie, les consultations des lignes `marche` ouvertes qui n'ont que la
+    /// racine d'un hôte. L'énumération d'une instance et son index de recherche
+    /// ne couvrent pas le même ensemble : une consultation absente de
+    /// la liste sort de la recherche. Les lignes trouvées entrent par le chemin
+    /// d'écriture de la moisson ; c'est `annonces-jumeler` qui les rattache.
+    /// **Dry-run par défaut**. Idempotent.
+    AnnoncesResoudre {
+        /// Écrit réellement les lignes trouvées. Sans ce flag : dry-run.
+        #[arg(long)]
+        applique: bool,
+        /// Plafond de références interrogées (0 = pas de plafond).
+        #[arg(long, default_value_t = 0)]
+        limite: i64,
+    },
     /// Fusionne par leur jumelle les lignes `marche` ouvertes que seul le
     /// BOAMP publie et dont l'avis déclare une plateforme de dépôt **sans
     /// identifiant de dossier** : sans clé de jointure, la seule attache est
@@ -393,20 +464,27 @@ enum Command {
     /// concaténation dans l'ordre du document → `legal_text.body` des fiches
     /// sans articles ni corps. Aucun téléchargement. Idempotent.
     BackfillTreatyBodies,
-    /// Sync ArianeWeb : analyses AJCE + existence des conclusions du
-    /// rapporteur public (CRP) → bundles `commentaires[]` en `decision_sources`
-    /// (source `ariane-web`, une ligne par décision CE). Année par année,
-    /// reprend au manifeste, cache HTML sous state_dir. Idempotent.
+    /// Sync ArianeWeb, les trois fonds en un job : le recensement (une requête
+    /// par fond, facette d'année comptée serveur) désigne les décisions CE que le
+    /// fonds n'a pas et les années dont les commentaires ont bougé, et rien
+    /// d'autre n'est visité. Cache HTML sous state_dir. Idempotent.
     SyncAriane {
-        /// Années à traiter (défaut : toutes depuis 1960, années complètes
-        /// du manifeste skippées).
+        /// Années à traiter (défaut : celles que le recensement désigne).
         #[arg(long, value_delimiter = ',')]
         years: Vec<u16>,
-        /// Plafond de documents AJCE téléchargés (sonde) — le run s'arrête
-        /// proprement sans marquer d'année complète.
+        /// S'arrêter au tableau du recensement, sans rien télécharger.
+        #[arg(long)]
+        census_only: bool,
+        /// Plafond de documents AJCE téléchargés (sonde) : le run s'arrête
+        /// proprement sans marquer d'année au manifeste.
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// Sync des grandes décisions que le Conseil d'État publie : le titre de
+    /// l'entrée nomme la décision, le lien ArianeWeb de sa fiche l'ancre
+    /// → `decisions.case_name` en `case_name_source = 'ce-list'`. Cache des
+    /// fiches sous state_dir. Idempotent.
+    SyncCeList,
     /// Sync ADDE (plan commentaires généralisé) : analyses de jurisprudence de
     /// l'ADDE → commentaires doctrine web `kind:"note"` (liens sortants) des
     /// décisions rattachées par (dossier, date). Idempotent, non cherchable.
@@ -472,6 +550,14 @@ enum Command {
     /// `legal_toc_edge.child_num_key` vers la clé d'IDENTITÉ recalculée depuis
     /// le num source. One-shot, idempotent.
     RekeyIdentityKeys,
+    /// Retire l'astérisque Légifrance (`R*600-1`) des clés d'article, colonnes
+    /// porteuses et blobs de citation compris ; `num` la garde. **Dry-run par
+    /// défaut**. Idempotent.
+    DestarArticleKeys {
+        /// Applique réellement le désétoilage. Sans ce flag : dry-run.
+        #[arg(long)]
+        applique: bool,
+    },
     LoadLegalCorpus {
         /// Restreint le chargement aux datasets dont le nom contient cette sous-chaîne
         /// (chargement chirurgical, ex. `--only eu-rproc`). Défaut : tous les datasets.
@@ -489,6 +575,41 @@ enum Command {
     IngestEuCatalog {
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Balayage du registre EUR-Lex : tout règlement ou directive (secteur 3,
+    /// actes de base, délégués et d'exécution) publié depuis `--depuis` entre au
+    /// catalogue, cité ou non, en entrée catalogue-seul chargée dans la foulée.
+    /// C'est l'autre porte que `ingest-eu-catalog`, qui ne voit que ce que nos
+    /// décisions nomment. `--depuis` défaut à 90 jours : la fenêtre se recouvre
+    /// d'un jour sur l'autre, ce qui rattrape une passe manquée sans watermark.
+    /// Un rattrapage de fond se demande par une date ancienne. Idempotent.
+    SyncEuCatalog {
+        #[arg(long)]
+        depuis: Option<chrono::NaiveDate>,
+        #[arg(long = "jusqu-a")]
+        jusqu_a: Option<chrono::NaiveDate>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Third door onto the EU corpus, the one the French JO opens: every DILA
+    /// fiche of European nature is a shell, an act named with no body. Each is
+    /// paired with its EUR-Lex act by the number its title carries, that act is
+    /// minted at the catalogue when the corpus lacks it, then the shell
+    /// collapses into it, carrying over the date and the NOR that EUR-Lex does
+    /// not publish and leaving its slug as a redirect. `--limit` bounds the pass
+    /// (rodage). Idempotent, the merged shells leaving the source query.
+    SyncEuJorf {
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Merges the `EU/` fiches an old ingest left under two uids, number and year
+    /// swapped, the CELEX their articles carry naming the one that survives. The
+    /// other keeps its slug as a redirect, and its body moves when it is the one
+    /// that has it. Dry run listing the pairs unless `--apply`. One-off: no code
+    /// produces the swapped form any more.
+    MergeEuSwappedUids {
+        #[arg(long)]
+        apply: bool,
     },
     /// Sync quotidien du fond UE : chaque acte du registre (datasets
     /// `eu-*.json`) suit sa dernière version consolidée applicable, sourcée en
@@ -527,6 +648,10 @@ enum Command {
     /// re-confirme que la copie reflète le droit en vigueur. À lancer après
     /// chaque ingest LEGI/KALI/JORF (cron). Idempotent (une ligne par source).
     StampFreshness,
+    /// Joue les invariants de fin de chaîne : des contrôles de données qui
+    /// publient leur nombre de lignes fautives dans `ingest.invariant.breach`
+    /// et nomment chaque fautif au journal. Ne fait jamais échouer la chaîne.
+    Invariants,
     /// Recalcule l'ordre de lecture (`legal_article.reading_rank`) des textes
     /// sales — ceux dont un article a un rang `NULL`. Appelé en fin de chaque
     /// pipeline qui écrit des articles ; en manuel pour le rattrapage.
@@ -585,7 +710,7 @@ enum Command {
     /// sur opendata mais dont le `full_text` reste figé sur une provenance de
     /// rang inférieur (jade/constit/cedh/cjue/cnda). Re-parse leur payload
     /// opendata (seuls les ZIPs portant une cible sont ouverts) en mode All :
-    /// re-chunk + re-embed (vLLM strict) + réécriture du `full_text` opendata.
+    /// re-chunk + re-embed (local strict) + réécriture du `full_text` opendata.
     /// One-shot, hors cron. Idempotent.
     ReingestStaleOpendata,
     /// Analyse **read-only** des faux merges judilibre : recalcule
@@ -599,7 +724,7 @@ enum Command {
     /// reconstituer) et émet le PLAN sans **aucune** écriture. `--execute`
     /// (write, gaté JADE + GPU libre) : crée les décisions scindées, re-fetch
     /// les `source_uid` divergents + le groupe gardé + ré-ingère (re-chunk +
-    /// re-embed ciblé vLLM local). Transaction par cluster, reprise idempotente.
+    /// re-embed ciblé local). Transaction par cluster, reprise idempotente.
     /// `--limit` borne le 1ᵉʳ rollout (s'arrête après N clusters réparés).
     ResplitFalseMerges {
         /// Applique réellement le scinde (write). Sans ce flag : dry-run read-only.
@@ -615,7 +740,7 @@ enum Command {
     },
     /// Défait les faux merges **intra-source** judilibre : détache chaque
     /// provenance perdante (≥2 judilibre/décision) vers sa propre décision et la
-    /// re-matérialise **depuis le cache local** (re-chunk + re-embed vLLM).
+    /// re-matérialise **depuis le cache local** (re-chunk + re-embed local).
     UnmergeSameSource {
         /// Applique réellement (write + GPU). Sans ce flag : dry-run read-only.
         #[arg(long)]
@@ -627,7 +752,7 @@ enum Command {
     },
     /// Défait les faux merges **intra-source** `dila-jade` : analogue de
     /// `unmerge-same-source` pour le fond DILA JADE. Re-matérialise chaque
-    /// perdante depuis les **tarballs locaux** (streaming, re-embed vLLM).
+    /// perdante depuis les **tarballs locaux** (streaming, re-embed local).
     UnmergeSameSourceDila {
         /// Applique réellement (write + GPU). Sans ce flag : dry-run read-only.
         #[arg(long)]
@@ -737,6 +862,14 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+    /// Charge la vérité terrain du quantum en base, à `PC_GOLD_VERSION`. La
+    /// source reste les JSON versionnés en LFS. Idempotent.
+    LoadQuantumGold {
+        /// Répertoire des records, un JSON par décision nommé de son
+        /// `source_uid`, barre doublée en tirets bas.
+        #[arg(long)]
+        dir: std::path::PathBuf,
+    },
     /// Maintenance DB (sous-commandes).
     #[command(subcommand)]
     Db(DbCommand),
@@ -777,14 +910,21 @@ impl Command {
             Command::JudilibreRanges => "judilibre-ranges",
             Command::Analyze => "analyze",
             Command::Migrate => "migrate",
+            Command::Renvois => "renvois",
+            Command::AliasCandidats { .. } => "alias-candidats",
             Command::UsageTerms { .. } => "usage-terms",
             Command::Ingest { .. } => "ingest",
             Command::Refetch { .. } => "refetch",
             Command::ReextractFields { .. } => "reextract-fields",
+            Command::ResolveSeats { .. } => "resolve-seats",
             Command::EmbedMissing { .. } => "embed-missing",
             Command::PurgeReverses => "purge-reverses",
             Command::GenerateSummaries { .. } => "generate-summaries",
             Command::ResyncLegalArrays => "resync-legal-arrays",
+            Command::Precompute => "precompute",
+            Command::ResyncJurisdictionCounts => "resync-jurisdiction-counts",
+            Command::ResyncCorpusCounts => "resync-corpus-counts",
+            Command::ResyncChambers => "resync-chambers",
             Command::RekeyCnb { .. } => "rekey-cnb",
             Command::CnbHistory { .. } => "cnb-history",
             Command::PartiesReconcile { .. } => "parties-reconcile",
@@ -799,11 +939,14 @@ impl Command {
             Command::BackfillTextes { .. } => "backfill-textes",
             Command::Kali { .. } => "kali",
             Command::SyncKali => "sync-kali",
+            Command::RequalifierKali { .. } => "requalifier-kali",
             Command::Annonces => "annonces",
+            Command::AnnoncesCouverture { .. } => "annonces-couverture",
             Command::AnnoncesBackfill { .. } => "annonces-backfill",
             Command::AnnoncesEnrichir { .. } => "annonces-enrichir",
             Command::AnnoncesDiscover => "annonces-discover",
             Command::AnnoncesRegulariser { .. } => "annonces-regulariser",
+            Command::AnnoncesResoudre { .. } => "annonces-resoudre",
             Command::AnnoncesJumeler { .. } => "annonces-jumeler",
             Command::Bofip { .. } => "bofip",
             Command::SyncBofip => "sync-bofip",
@@ -811,6 +954,7 @@ impl Command {
             Command::SyncCirculairesBodies => "sync-circulaires-bodies",
             Command::BackfillTreatyBodies => "backfill-treaty-bodies",
             Command::SyncAriane { .. } => "sync-ariane",
+            Command::SyncCeList => "sync-ce-list",
             Command::SyncAdde => "sync-adde",
             Command::SeedArticleCommentaires => "seed-article-commentaires",
             Command::ExtractTextRefs => "extract-text-refs",
@@ -822,11 +966,16 @@ impl Command {
             Command::RenameTexts { .. } => "rename-texts",
             Command::RekeyArticleKeys => "rekey-article-keys",
             Command::RekeyIdentityKeys => "rekey-identity-keys",
+            Command::DestarArticleKeys { .. } => "destar-article-keys",
             Command::LoadLegalCorpus { .. } => "load-legal-corpus",
             Command::IngestEuCatalog { .. } => "ingest-eu-catalog",
+            Command::SyncEuCatalog { .. } => "sync-eu-catalog",
+            Command::SyncEuJorf { .. } => "sync-eu-jorf",
+            Command::MergeEuSwappedUids { .. } => "merge-eu-swapped-uids",
             Command::SyncEuLaw { .. } => "sync-eu-law",
             Command::IngestEuRproc { .. } => "ingest-eu-rproc",
             Command::StampFreshness => "stamp-freshness",
+            Command::Invariants => "invariants",
             Command::ReadingRanks => "reading-ranks",
             Command::RelabelSources => "relabel-sources",
             Command::CanonicalizeSourceLabels => "canonicalize-source-labels",
@@ -854,6 +1003,7 @@ impl Command {
             Command::BackfillCndaSolution { .. } => "backfill-cnda-solution",
             Command::Registries { .. } => "registries",
             Command::PartiesRelink { .. } => "parties-relink",
+            Command::LoadQuantumGold { .. } => "load-quantum-gold",
             Command::Db(DbCommand::Analyze) => "db:analyze",
             Command::Db(DbCommand::ReindexSearch) => "db:reindex-search",
             Command::Db(DbCommand::VacuumFull) => "db:vacuum-full",
@@ -873,7 +1023,7 @@ async fn main() -> Result<()> {
     install_panic_hook();
 
     let result = match cli.command {
-        Command::Chain { kind } => chain::run(kind, settings.watchdog_secs).await,
+        Command::Chain { kind } => chain::run(kind).await,
         command => run_with_watchdog(command, settings.watchdog_secs).await,
     };
     arm_teardown_sentinel();
@@ -1023,6 +1173,8 @@ fn init_telemetry(log_level: &str, settings: &Settings) -> Result<TelemetryGuard
         json: logging::json_format(),
         service_name: settings.otel_service_name.clone(),
         deployment_environment: settings.deployment_environment.clone(),
+        host_name: settings.host_name.clone(),
+        container_name: settings.container_name.clone(),
         // Ingest (cron, bas volume) : on ship INFO+ pour les breadcrumbs de phase.
         otlp_log_filter: Targets::new().with_default(LevelFilter::INFO),
         otlp,
@@ -1036,6 +1188,8 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::JudilibreRanges => cmd_judilibre_ranges().await,
         Command::Analyze => cmd_analyze(),
         Command::Migrate => cmd_migrate().await,
+        Command::Renvois => renvois::run().await,
+        Command::AliasCandidats { revue } => alias_candidats::run(revue).await,
         Command::UsageTerms {
             chunks,
             min_citations,
@@ -1050,25 +1204,26 @@ async fn dispatch(command: Command) -> Result<()> {
             with_embeddings,
         } => cmd_refetch(ids, with_embeddings).await,
         Command::ReextractFields {
-            overwrite,
             dry_run,
             full,
             jurisdiction_type,
             field,
             citing_ref_uid,
+            text_query,
             workers,
         } => {
             cmd_reextract_fields(
-                overwrite,
                 dry_run,
                 full,
                 jurisdiction_type,
                 field,
                 citing_ref_uid,
+                text_query,
                 workers,
             )
             .await
         }
+        Command::ResolveSeats { dry_run } => pipeline::resolve_seats(dry_run).await,
         Command::EmbedMissing { limit } => pipeline::embed_missing(limit).await,
         Command::PurgeReverses => cmd_purge_reverses().await,
         Command::GenerateSummaries {
@@ -1077,6 +1232,10 @@ async fn dispatch(command: Command) -> Result<()> {
             refresh_stale,
         } => summary_pipeline_generate(limit, concurrency, refresh_stale).await,
         Command::ResyncLegalArrays => citations_maintenance::resync_arrays().await,
+        Command::Precompute => pipeline::precompute_all().await,
+        Command::ResyncJurisdictionCounts => pipeline::resync_jurisdiction_counts().await,
+        Command::ResyncCorpusCounts => pipeline::resync_corpus_counts().await,
+        Command::ResyncChambers => pipeline::resync_chambers().await,
         Command::RekeyCnb { apply } => pipeline::rekey_cnb(apply).await,
         Command::CnbHistory { apply } => pipeline::replay_cnb_history(apply).await,
         Command::PartiesReconcile { workers } => pipeline::reconcile_parties(workers).await,
@@ -1094,7 +1253,9 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::BackfillTextes { paths } => pipeline::backfill_textes(&paths).await,
         Command::Kali { path } => pipeline::ingest_kali(&path).await,
         Command::SyncKali => pipeline::sync_kali().await,
+        Command::RequalifierKali { lot } => pipeline::requalifier_kali(lot).await,
         Command::Annonces => pipeline::annonces().await,
+        Command::AnnoncesCouverture { limite } => pipeline::annonces_couverture(limite).await,
         Command::AnnoncesBackfill { depuis, jusqu } => {
             let date = |s: &str| {
                 s.parse::<jiff::civil::Date>()
@@ -1110,13 +1271,21 @@ async fn dispatch(command: Command) -> Result<()> {
         } => pipeline::annonces_enrichir(limite, budget_min, sans_acheteur).await,
         Command::AnnoncesDiscover => pipeline::annonces_discover().await,
         Command::AnnoncesRegulariser { formes } => pipeline::annonces_regulariser(formes).await,
+        Command::AnnoncesResoudre { applique, limite } => {
+            pipeline::annonces_resoudre(limite, applique).await
+        }
         Command::AnnoncesJumeler { applique } => pipeline::annonces_jumeler(applique).await,
         Command::Bofip { path } => pipeline::ingest_bofip(&path).await,
         Command::SyncBofip => pipeline::sync_bofip().await,
         Command::SyncCirculaires => pipeline::sync_circulaires().await,
         Command::SyncCirculairesBodies => pipeline::sync_circulaires_bodies().await,
         Command::BackfillTreatyBodies => pipeline::backfill_treaty_bodies().await,
-        Command::SyncAriane { years, limit } => pipeline::sync_ariane(years, limit).await,
+        Command::SyncAriane {
+            years,
+            census_only,
+            limit,
+        } => pipeline::sync_ariane(years, census_only, limit).await,
+        Command::SyncCeList => pipeline::sync_ce_list().await,
         Command::SyncAdde => pipeline::sync_adde().await,
         Command::SeedArticleCommentaires => pipeline::seed_article_commentaires().await,
         Command::ExtractTextRefs => pipeline::extract_text_refs().await,
@@ -1130,8 +1299,20 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::RenameTexts { dataset } => pipeline::rename_texts(&dataset).await,
         Command::RekeyArticleKeys => pipeline::rekey_article_keys().await,
         Command::RekeyIdentityKeys => pipeline::rekey_identity_keys().await,
+        Command::DestarArticleKeys { applique } => pipeline::destar_article_keys(applique).await,
         Command::LoadLegalCorpus { only } => pipeline::load_legal_corpus(only.as_deref()).await,
         Command::IngestEuCatalog { limit } => pipeline::ingest_eu_catalog(limit).await,
+        Command::SyncEuCatalog {
+            depuis,
+            jusqu_a,
+            limit,
+        } => {
+            let aujourdhui = chrono::Utc::now().date_naive();
+            let depuis = depuis.unwrap_or(aujourdhui - chrono::Duration::days(90));
+            pipeline::sync_eu_catalog(depuis, jusqu_a.unwrap_or(aujourdhui), limit).await
+        }
+        Command::SyncEuJorf { limit } => pipeline::sync_eu_jorf(limit).await,
+        Command::MergeEuSwappedUids { apply } => pipeline::merge_eu_swapped_uids(apply).await,
         Command::SyncEuLaw {
             limit,
             only,
@@ -1140,6 +1321,7 @@ async fn dispatch(command: Command) -> Result<()> {
         } => pipeline::sync_eu_law(limit, only.as_deref(), force, full).await,
         Command::IngestEuRproc { dry_run } => pipeline::ingest_eu_rproc(dry_run).await,
         Command::StampFreshness => pipeline::stamp_freshness().await,
+        Command::Invariants => invariants::run().await,
         Command::ReadingRanks => pipeline::reading_ranks().await,
         Command::RelabelSources => pipeline::relabel_sources().await,
         Command::CanonicalizeSourceLabels => pipeline::canonicalize_source_labels().await,
@@ -1182,6 +1364,7 @@ async fn dispatch(command: Command) -> Result<()> {
             with_history,
         } => pipeline::load_registries(source, with_history).await,
         Command::PartiesRelink { full } => pipeline::relink_parties(full).await,
+        Command::LoadQuantumGold { dir } => pipeline::load_quantum_gold(&dir).await,
         Command::Db(db_command) => cmd_db(db_command).await,
     }
 }
@@ -1382,7 +1565,7 @@ async fn cmd_ingest(with_embeddings: bool, mode: pipeline::IngestMode) -> Result
 
 /// Re-ingest ciblé des décisions opendata à `full_text` figé sur une
 /// provenance de rang inférieur. Scanne le dossier opendata, mais ne
-/// ré-embed que les cibles (CAA/CE) ; vLLM strict.
+/// ré-embed que les cibles (CAA/CE) ; local strict.
 async fn cmd_reingest_stale_opendata() -> Result<()> {
     let settings = Settings::from_env()?;
     pipeline::reingest_stale_opendata(&settings.paths().opendata()).await
@@ -1398,23 +1581,23 @@ async fn cmd_reingest_stale_opendata() -> Result<()> {
 /// version ; `--citing-ref-uid` cible les décisions citant un texte donné ;
 /// `--full` = passe intégrale/relink hebdo (tout le fonds < 1000).
 async fn cmd_reextract_fields(
-    overwrite: bool,
     dry_run: bool,
     full: bool,
     jurisdiction_type: Vec<String>,
     field: Vec<String>,
     citing_ref_uid: Option<String>,
+    text_query: Option<String>,
     workers: Option<usize>,
 ) -> Result<()> {
     let jts = (!jurisdiction_type.is_empty()).then_some(jurisdiction_type);
     let fields = (!field.is_empty()).then_some(field);
     pipeline::reextract_fields(
         fields.as_deref(),
-        overwrite,
         dry_run,
         full,
         jts.as_deref(),
         citing_ref_uid.as_deref(),
+        text_query.as_deref(),
         workers,
     )
     .await
@@ -1504,9 +1687,9 @@ struct LoadedSitemapSource {
     decisions: Vec<(String, sitemap::SourceLastmod)>,
     referential: Vec<(String, String, sitemap::SourceLastmod)>,
     entities: Vec<(String, String, sitemap::SourceLastmod)>,
-    codes: Vec<(String, sitemap::SourceLastmod)>,
-    jurisdiction_hubs: Vec<(String, Vec<i32>)>,
-    norm_hubs: Vec<(String, Vec<String>)>,
+    texts: Vec<(String, sitemap::SourceLastmod)>,
+    jurisdiction_hubs: sitemap::JurisdictionHubPages,
+    norm_hubs: sitemap::NormHubPages,
     annonces: (Vec<(String, sitemap::SourceLastmod)>, Vec<String>),
 }
 
@@ -1522,13 +1705,13 @@ impl sitemap::SitemapSource for LoadedSitemapSource {
     fn iter_entities_for_sitemap(&self) -> Result<Vec<(String, String, sitemap::SourceLastmod)>> {
         Ok(self.entities.clone())
     }
-    fn iter_codes_for_sitemap(&self) -> Result<Vec<(String, sitemap::SourceLastmod)>> {
-        Ok(self.codes.clone())
+    fn iter_texts_for_sitemap(&self) -> Result<Vec<(String, sitemap::SourceLastmod)>> {
+        Ok(self.texts.clone())
     }
-    fn iter_jurisdiction_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<i32>)>> {
+    fn iter_jurisdiction_hubs_for_sitemap(&self) -> Result<sitemap::JurisdictionHubPages> {
         Ok(self.jurisdiction_hubs.clone())
     }
-    fn iter_norm_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<String>)>> {
+    fn iter_norm_hubs_for_sitemap(&self) -> Result<sitemap::NormHubPages> {
         Ok(self.norm_hubs.clone())
     }
     fn iter_annonces_for_sitemap(&self) -> Result<sitemap::AnnoncesSitemap> {
@@ -1546,8 +1729,9 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
     let settings = Settings::from_env()?;
 
     tracing::info!("=== build sitemaps ===");
+    let hub_page_size = i64::from(lj_dtos::HUB_PAGE_SIZE);
     let pool = pool_with_migrations(&settings).await?;
-    let (decisions, referential, entities, codes, jurisdiction_hubs, norm_hubs, annonces) = {
+    let (decisions, referential, entities, texts, jurisdiction_hubs, norm_hubs, annonces) = {
         let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
         let repo = lj_store::repository::DecisionRepository::new(&conn);
         let decisions = repo
@@ -1562,16 +1746,16 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
             .iter_entities_for_sitemap()
             .await
             .map_err(|e| anyhow!("iter_entities_for_sitemap: {e}"))?;
-        let codes = repo
-            .iter_codes_for_sitemap()
+        let texts = repo
+            .iter_texts_for_sitemap()
             .await
-            .map_err(|e| anyhow!("iter_codes_for_sitemap: {e}"))?;
+            .map_err(|e| anyhow!("iter_texts_for_sitemap: {e}"))?;
         let jurisdiction_hubs = repo
-            .iter_jurisdiction_hubs_for_sitemap()
+            .iter_jurisdiction_hubs_for_sitemap(hub_page_size)
             .await
             .map_err(|e| anyhow!("iter_jurisdiction_hubs_for_sitemap: {e}"))?;
         let norm_hubs = repo
-            .iter_norm_hubs_for_sitemap()
+            .iter_norm_hubs_for_sitemap(hub_page_size)
             .await
             .map_err(|e| anyhow!("iter_norm_hubs_for_sitemap: {e}"))?;
         // Annonces : la fenêtre ouverte + l'archive récente pour les fiches, et
@@ -1599,7 +1783,7 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
             decisions,
             referential,
             entities,
-            codes,
+            texts,
             jurisdiction_hubs,
             norm_hubs,
             (fiches, departements),
@@ -1609,7 +1793,7 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
         decisions,
         referential,
         entities,
-        codes,
+        texts,
         jurisdiction_hubs,
         norm_hubs,
         annonces,
@@ -1730,9 +1914,9 @@ const MAINTENANCE_STATEMENT_TIMEOUT: &str = "2h";
 /// exécutent du SQL de maintenance — pas de migrations.
 async fn cmd_db(command: DbCommand) -> Result<()> {
     let settings = Settings::from_env()?;
-    // 6 = connexion partagée ci-dessous + les 5 vacuums parallèles de
-    // `db vacuum-full` ; large pour les autres commandes.
-    let pool = pool_only(&settings, 6).await?;
+    // 7 = shared connection below + the 5 parallel tables of `db vacuum-full`
+    // and `db reindex-search` + the blocker sweep the latter holds throughout.
+    let pool = pool_only(&settings, 7).await?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
     // Relève le statement_timeout pour les ops lourdes. `gc-mcp` (DELETE borné)
     // garde le garde-fou 30 s.
@@ -1797,6 +1981,11 @@ async fn db_analyze(conn: &lj_store::db::Connection) -> Result<()> {
     conn.execute("ANALYZE legal_citation", &[]).await?;
     conn.execute("ANALYZE legal_text", &[]).await?;
     conn.execute("ANALYZE legal_article", &[]).await?;
+    // Le pot Annonces grossit de quelques milliers de lignes par jour sur 1,2 M :
+    // l'autoanalyze, qui attend 10 % de la table, ne déclenche jamais.
+    conn.execute("ANALYZE annonce", &[]).await?;
+    conn.execute("ANALYZE annonce_source", &[]).await?;
+    conn.execute("ANALYZE annonce_entity", &[]).await?;
     println!("ANALYZE terminé.");
     Ok(())
 }
@@ -1825,6 +2014,40 @@ async fn drop_invalid_indexes(conn: &lj_store::db::Connection, table: &str) -> R
     Ok(())
 }
 
+/// Pooled connections carry `statement_timeout=30s`: an older open transaction
+/// is a session out of pool, typically a `psql` whose client died unnoticed.
+const MAINTENANCE_XACT_GRACE: &str = "5 minutes";
+
+/// A blocker arriving mid-reindex costs as much as one already there.
+const MAINTENANCE_SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Cancels transactions older than [`MAINTENANCE_XACT_GRACE`], ours excepted.
+/// `REINDEX` and `DROP INDEX CONCURRENTLY` wait on every snapshot older than
+/// their own, any table: 30/08/2026, an orphan `psql` burned the 2 h of all five.
+async fn cancel_blocking_transactions(conn: &lj_store::db::Connection) -> Result<()> {
+    let rows = conn
+        .query(
+            "SELECT pid, application_name, \
+                    extract(epoch FROM now() - xact_start)::bigint \
+               FROM pg_stat_activity \
+              WHERE backend_type = 'client backend' \
+                AND pid <> pg_backend_pid() \
+                AND application_name IS DISTINCT FROM current_setting('application_name') \
+                AND xact_start < now() - $1::text::interval",
+            &[&MAINTENANCE_XACT_GRACE],
+        )
+        .await?;
+    for row in &rows {
+        let pid: i32 = row.get(0);
+        let app: String = row.get(1);
+        let age: i64 = row.get(2);
+        conn.execute("SELECT pg_cancel_backend($1)", &[&pid])
+            .await?;
+        println!("maintenance : transaction de {age} s annulée (pid {pid}, application {app}).");
+    }
+    Ok(())
+}
+
 /// Maintenance hebdomadaire des tables de recherche :
 /// `REINDEX TABLE CONCURRENTLY` puis `VACUUM`, table par table, en
 /// parallèle. Zéro indisponibilité.
@@ -1842,6 +2065,17 @@ async fn drop_invalid_indexes(conn: &lj_store::db::Connection, table: &str) -> R
 /// place restent valides et servent, l'orphelin est nettoyé, et la chaîne
 /// remonte `chain_failed`. Pas de retry.
 async fn db_reindex_search(pool: &deadpool_postgres::Pool) -> Result<()> {
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    cancel_blocking_transactions(&conn).await?;
+    let sweeper = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(MAINTENANCE_SWEEP).await;
+            if let Err(e) = cancel_blocking_transactions(&conn).await {
+                eprintln!("maintenance : filet anti-blocage en échec : {e}");
+            }
+        }
+    });
+
     let mut handles = Vec::new();
     for table in SEARCH_TABLES {
         let pool = pool.clone();
@@ -1883,6 +2117,7 @@ async fn db_reindex_search(pool: &deadpool_postgres::Pool) -> Result<()> {
             failures.push(format!("{table}: {e}"));
         }
     }
+    sweeper.abort();
     if !failures.is_empty() {
         return Err(anyhow!(
             "reindex-search en échec — {}",

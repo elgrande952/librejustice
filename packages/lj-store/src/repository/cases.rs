@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::types::CaseCitationRow;
+use super::types::{CaseCitationRow, CitingDecisionRow};
 use super::DecisionRepository;
 use crate::error::{Result, StoreError};
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
@@ -23,6 +23,10 @@ pub type CaseCitationWriteItem = (i64, Option<Vec<CaseCitationRow>>);
 /// target_ref)` — `target_decision_id` est un état de résolution, pas une
 /// donnée d'extraction, il ne re-déclenche pas d'écriture.
 type CaseFingerprint = (i32, i32, String);
+
+/// Couverture chronologie d'un type de juridiction : `(type, décisions,
+/// décisions portant au moins un lien amont, liens émis, liens résolus)`.
+pub type ChronoCoverageRow = (String, i64, i64, i64, i64);
 
 /// Clé du verrou advisory transactionnel de la sonde inversée
 /// ([`DecisionRepository::attract_pending_citations`]) — hors de la plage des
@@ -330,6 +334,110 @@ impl DecisionRepository<'_> {
         Ok(resolved)
     }
 
+    /// Décisions dont le texte cite celle-ci, autorité d'abord puis date
+    /// décroissante, comme les citantes d'un article. Une citante qui cite
+    /// plusieurs fois ne sort qu'une fois. `exclues` sort les étapes de la
+    /// chronologie, décision courante comprise. Rend `(total, page de tête)`.
+    #[tracing::instrument(name = "db.decisions_citing", skip(self, exclues), fields(db.system = "postgresql", exclues = exclues.len()))]
+    pub async fn decisions_citing(
+        &self,
+        decision_id: i64,
+        exclues: &[i64],
+        limite: i64,
+    ) -> Result<(i64, Vec<CitingDecisionRow>)> {
+        let rank = super::support::authority_rank_sql("d.publication_codes");
+        let rows = self
+            .conn
+            .query(
+                &format!(
+                    "WITH citantes AS ( \
+                         SELECT DISTINCT c.decision_id AS id FROM case_citation c \
+                         WHERE c.target_decision_id = $1 \
+                     ) \
+                     SELECT d.id, d.public_id, d.jurisdiction_type, j.label, \
+                            d.date_lecture::text, d.docket_numbers, \
+                            d.publication_codes, d.summary, count(*) OVER () \
+                     FROM citantes ci \
+                     JOIN decisions d ON d.id = ci.id AND d.deleted_at IS NULL \
+                     LEFT JOIN jurisdiction j ON j.code = d.jurisdiction_code \
+                     WHERE NOT (d.id = ANY($2)) \
+                     ORDER BY {rank}, d.date_lecture::text DESC NULLS LAST, d.id \
+                     LIMIT $3"
+                ),
+                &[&decision_id, &exclues, &limite],
+            )
+            .await?;
+        let total = rows.first().map_or(0, |r| r.get(8));
+        Ok((
+            total,
+            rows.iter()
+                .map(|r| CitingDecisionRow {
+                    id: r.get(0),
+                    public_id: r.get(1),
+                    jurisdiction_type: r.get(2),
+                    jurisdiction_name: r.get(3),
+                    date_lecture: r.get(4),
+                    docket_numbers: r.get(5),
+                    publication_codes: r.get(6),
+                    summary: r.get(7),
+                    cited_num_keys: Vec::new(),
+                })
+                .collect(),
+        ))
+    }
+
+    /// `source_uid` des décisions dont le greffe déclare lui-même la décision
+    /// attaquée (`contested` complet). Cet oracle ne doit rien au texte, donc la
+    /// voie texte se mesure contre lui sans circularité. Tri sur le `md5` du
+    /// `source_uid` : échantillon stable d'un run à l'autre et non corrélé à la
+    /// date, là où l'ordre naturel de l'uid Judilibre ne rendrait que les plus
+    /// anciennes.
+    #[tracing::instrument(name = "db.contested_oracle_uids", skip(self), fields(db.system = "postgresql"))]
+    pub async fn contested_oracle_uids(
+        &self,
+        jurisdiction_type: &str,
+        limite: i64,
+    ) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT s.source_uid FROM decisions d \
+                 JOIN decision_sources s ON s.decision_id = d.id AND s.deleted_at IS NULL \
+                 WHERE d.deleted_at IS NULL AND d.jurisdiction_type = $1 \
+                   AND s.source_fields #>> '{contested,jurisdiction}' IS NOT NULL \
+                   AND s.source_fields #>> '{contested,number}' IS NOT NULL \
+                   AND s.source_fields #>> '{contested,date}' IS NOT NULL \
+                 ORDER BY md5(s.source_uid) LIMIT $2",
+                &[&jurisdiction_type, &limite],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Panneau de couverture du banc, par type de juridiction.
+    #[tracing::instrument(name = "db.chrono_coverage", skip(self), fields(db.system = "postgresql"))]
+    pub async fn chrono_coverage(
+        &self,
+        jurisdiction_types: &[String],
+    ) -> Result<Vec<ChronoCoverageRow>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT d.jurisdiction_type, count(DISTINCT d.id), \
+                        count(DISTINCT l.decision_id), count(l.id), \
+                        count(l.target_decision_id) \
+                 FROM decisions d LEFT JOIN decision_links l ON l.decision_id = d.id \
+                 WHERE d.deleted_at IS NULL AND d.jurisdiction_type = ANY($1) \
+                 GROUP BY 1 ORDER BY 1",
+                &[&jurisdiction_types],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+            .collect())
+    }
+
     /// Clés pendantes effectivement présentes dans `table` parmi `keys` —
     /// index-only scan sur l'index partiel `(target_ref) WHERE
     /// target_decision_id IS NULL` (même prédicat que les résolveurs).
@@ -384,7 +492,7 @@ fn resolve_from_links_sql(scope: ResolveScope) -> String {
     )
 }
 
-/// Les sept UPDATE de résolution par famille — fonction pure (dumpable pour
+/// Les huit UPDATE de résolution par famille, fonction pure (dumpable pour
 /// validation psql). `scope` borne le pendant à un lot (`$1`).
 fn resolve_case_family_sqls(scope: ResolveScope) -> Vec<String> {
     let scope = match scope {
@@ -426,6 +534,25 @@ fn resolve_case_family_sqls(scope: ResolveScope) -> Vec<String> {
                  FROM pending p WHERE p.target_ref LIKE 'constit|%' \
                  {RESOLVE_UNIQUE_BY_TYPE}",
                 RESOLVE_UNIQUE_BY_TYPE = resolve_unique_by_type("CONSTIT"),
+            ),
+            // TC : le numéro stocké change d'époque (`00012` avant 2000, `3220`
+            // jusqu'en 2004, `C4174` ensuite) et les praticiens écrivent l'une pour
+            // l'autre. La clé porte l'ordinal nu (`tc_ordinal`), la sonde rejoue les
+            // trois graphies contre l'index d'expression `lj_docket_keys`. La graphie
+            // année-numéro des citations (`1403959`) ne résout pas, sa reconstitution
+            // dépendant de l'époque.
+            format!(
+                "{RESOLVE_HEAD} \
+                 SELECT p.target_ref, \
+                        ARRAY[split_part(p.target_ref, '|', 2), \
+                              lpad(split_part(p.target_ref, '|', 2), 5, '0'), \
+                              'c' || split_part(p.target_ref, '|', 2)] AS dockets \
+                 FROM pending p WHERE p.target_ref LIKE 'tc|%' \
+                 {RESOLVE_UNIQUE}",
+                RESOLVE_UNIQUE = resolve_unique_matching(
+                    "TC",
+                    "lj_docket_keys(d.docket_numbers) && r.dockets",
+                ),
             ),
             // RG (fond judiciaire) / AF (fond administratif TA/CAA) : même mécanique, scopée
             // au tribunal (jurisdiction_code de la clé). Les clés NUES `rg||NUM` (juridiction
@@ -517,13 +644,20 @@ fn resolve_by_jurisdiction_code(prefix: &str) -> String {
 }
 
 fn resolve_unique_by_type(jurisdiction_type: &str) -> String {
+    resolve_unique_matching(jurisdiction_type, "d.docket_numbers @> ARRAY[r.docket]")
+}
+
+/// Corps « match unique par `jurisdiction_type` ». `sonde` interroge l'index des
+/// numéros depuis la ligne `r` de `keys` ; elle est clôturée (`OFFSET 0`) pour
+/// que le planner s'en tienne au GIN.
+fn resolve_unique_matching(jurisdiction_type: &str, sonde: &str) -> String {
     format!(
         "), resolved AS ( \
            SELECT r.target_ref, \
                   (SELECT min(x.id) FROM \
                      (SELECT d.id, d.jurisdiction_type FROM decisions d \
                       WHERE d.deleted_at IS NULL \
-                        AND d.docket_numbers @> ARRAY[r.docket] \
+                        AND {sonde} \
                       OFFSET 0) x \
                    WHERE x.jurisdiction_type = '{jurisdiction_type}' \
                    HAVING count(*) = 1) AS tid \
@@ -536,16 +670,17 @@ mod tests {
     use super::*;
 
     /// `cargo test -p lj-store resolve_case_family -- --nocapture` dumpe les
-    /// sept UPDATE pour validation psql (table temporaire + clés sondes).
+    /// huit UPDATE pour validation psql (table temporaire + clés sondes).
     #[test]
     fn resolve_case_family_sqls_cover_families_and_scope() {
         let all = resolve_case_family_sqls(ResolveScope::All);
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         for fam in [
             "'cc|%'",
             "'ce|%'",
             "'cedh|%'",
             "'constit|%'",
+            "'tc|%'",
             "'rg|%'",
             "'af|%'",
             "'cjue|%'",

@@ -10,11 +10,14 @@
 //! répartis) ; ce `mod.rs` détient le struct, le constructeur et les
 //! réexports publics.
 
+mod alias;
 mod annonces;
 mod bench;
+mod case_names;
 mod cases;
 mod chunks;
 mod citations;
+mod corpus_counts;
 mod decisions;
 mod entities;
 mod identity;
@@ -26,8 +29,10 @@ mod links;
 mod llm_keys;
 mod norm_hubs;
 mod parties;
+mod quantum;
 mod referential;
 mod rekey;
+mod renvois;
 mod scopes;
 mod suggest;
 mod support;
@@ -36,34 +41,43 @@ mod usage_terms;
 
 use crate::db::Connection;
 
+pub use alias::{AliasCandidat, AliasRevue};
 pub use annonces::{
     AnnonceAEnrichir, AnnonceAJumeler, AnnonceAxe, AnnonceCanalOuvert, AnnonceCanalRow,
     AnnonceChamps, AnnonceEntiteRow, AnnonceFiltre, AnnonceOrdre, AnnonceOrpheline, AnnonceRow,
     AnnonceSourceWriteItem, AnnonceWriteItem, AnnonceWriteStats, DetailPose, EntityAnnonceRow,
-    ResultatPose, TableSize,
+    ResultatPose, TableSize, TrouCouverture,
 };
 pub use bench::{ManualFields, ManualUpsert};
-pub use cases::CaseCitationWriteItem;
+pub use cases::{CaseCitationWriteItem, ChronoCoverageRow};
 pub use citations::CitationWriteItem;
+pub use decisions::canonical_jurisdiction_code;
 pub use entities::{
     AffiliationEdge, CnbEntityState, CnbEntityUpdate, EntityHistoryWriteItem, EntityWriteItem,
 };
 pub use instrument_move::TextRenameCounts;
 pub use links::DecisionLinkWriteItem;
 pub use parties::DecisionPartyWriteItem;
+pub use quantum::{QuantumObservationRow, QuantumWriteItem};
+pub use referential::TransitRecueil;
+pub use rekey::StarConflict;
+pub use renvois::{
+    CaseNameMatch, ElectedCaseName, NamedDecision, Renvoi, RenvoiNomme, RenvoyantRow, TitleInputs,
+};
 pub use scopes::{ArticleScopeRow, CompteurArticleRow};
 pub use suggest::SUGGEST_FST_KEY;
 pub use support::source_from_source_uid;
 pub use types::{
-    ArticleCitationSpanRow, ArticleNeighborRow, ArticleRankHit, ArticleRrf, ArticleSearchRow,
-    ArticleSearchStats, ArticleTitleMode, BulkDecisionWrite, CaseCitationRow, ChunkWrite,
-    CitationOccurrenceRow, CitingDecisionRow, CoCitedArticleRow, DecisionLinkRow,
-    DecisionPartyReadRow, DecisionPartyRow, EntityContentieuxCounts, EntityCounselRow,
-    EntityDecisionRow, EntityDenominationReadRow, EntityDirectoryRow, EntityHeaderRow,
-    EntityJurisdictionCountRow, EntityYearCountRow, ExistingDecisionState, ExtractedFields,
-    FacetCount, FacetValueRow, GtDoc, HubDecisionRow, JurisdictionHubRow, JurisdictionRow,
+    ArticleBrowseFilters, ArticleCitationSpanRow, ArticleNeighborRow, ArticleRankHit, ArticleRrf,
+    ArticleSearchRow, ArticleSearchStats, ArticleTitleMode, BulkDecisionWrite, CaseCitationRow,
+    ChamberRow, ChunkWrite, CitationOccurrenceRow, CitingDecisionRow, CoCitedArticleRow,
+    DecisionLinkRow, DecisionPartyReadRow, DecisionPartyRow, EntityContentieuxCounts,
+    EntityCounselRow, EntityDecisionRow, EntityDenominationReadRow, EntityDirectoryRow,
+    EntityHeaderRow, EntityJurisdictionCountRow, EntityYearCountRow, EuTwin, ExistingDecisionState,
+    ExtractedFields, FacetCount, FacetValueRow, GtDoc, HubDecisionRow, InstrumentCandidate,
+    InstrumentResolution, JurisdictionHubPages, JurisdictionHubRow, JurisdictionRow,
     LawCodeSummaryRow, LawVersionRow, LegalArticleRow, LegalLinkOwner, LegalLinkRow,
-    LegalTextCatalogRow, LegalTextMeta, LegalTextRow, MissingSummaryRow, NormTextRow,
+    LegalTextCatalogRow, LegalTextMeta, LegalTextRow, MissingSummaryRow, NormHubPages, NormTextRow,
     ResolvedLegalLink, SitemapRow, SlugSourceRow, TextCaseCitationRow, TextLegalCitationRow,
     TocArticleRow, TocEdgeRow, TocOwner, TocReadingRow, TocTreeRow, UpsertResult, UpsertStatus,
 };

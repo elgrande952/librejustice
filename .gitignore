@@ -6,23 +6,8 @@ __pycache__/
 .pytest_cache/
 .ty_cache/
 .mypy_cache/
-data/
 infra/data/
-# Données embarquées (include_str!) du crate lj-core : snapshot codes Légifrance
-# + prompt de résumé. Versionnées (la règle `data/` ci-dessus les masquerait).
-!packages/lj-core/data/
-# Police embarquée (include_bytes!) du PDF export de lj-api : Liberation Sans
-# (OFL), versionnée en LFS. Idem, la règle `data/` la masquerait.
-!packages/lj-api/data/
-# Données embarquées (include_str!) du crate lj-extract : gazetteer CCN, alias
-# d'instruments et de liaison. Idem, la règle `data/` les masquerait.
-!packages/lj-extract/data/
 
-# GT de ranking : seule la GT finale est versionnée. Le scratch régénérable vit
-# hors du repo, sous `state_dir` ; ces règles restent un garde-fou.
-apps/lj-bench/gt/ranking/*
-!apps/lj-bench/gt/ranking/*.json
-apps/lj-bench/gt/ranking/_pool_*.json
 *.egg-info/
 dist/
 build/
@@ -37,18 +22,11 @@ node_modules/
 
 artifacts/
 
-# Notes de travail contenant des credentials bruts. Defense-in-depth.
-docs/working-notes/*.secrets
-docs/working-notes/*-credentials*
 repo.txt
 .env.local
 oom
-.claude/scheduled_tasks.lock
-.claude/scheduled_tasks.json
-.claude/worktrees/
-docs/working-notes/*-manifest.jsonl
 
-# vim swapfiles (ne jamais committer — peut contenir un snapshot de .env)
+# vim swapfiles (ne jamais committer, peut contenir un snapshot de .env)
 *.swp
 *.swo
 .*.swp
@@ -61,5 +39,5 @@ mise.local.toml
 # Archives sources des skills portés dans le plugin (référence locale, hors git)
 /plugins/sources/
 
-# zips des skills servis par /mcp-guide — générés par `mise run build-skill-zips`
+# zips des skills servis par /mcp-guide, générés par `mise run build-skill-zips`
 /packages/lj-web/public/skills/

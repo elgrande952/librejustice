@@ -1,27 +1,17 @@
-//! Parser PUR du fond KALI (conventions collectives nationales, bulk DILA) —
-//! `payload XML → KaliArticle / KaliConteneur`. Aucun I/O : les octets sont
-//! fournis par `lj-ingest`. Réutilise l'arbre XML minimal de
-//! [`lj_core::parsing`] et les helpers structurels du parser LEGI
-//! (`find_anywhere`, `clean_contenu`, `date_or_none`, `collect_titre_tm`) — la
-//! structure `<ARTICLE>` d'un `KALIARTI` est celle d'un `LEGIARTI` (mêmes
-//! `META_ARTICLE`/`CONTEXTE`/`BLOC_TEXTUEL`), seul le rattachement diffère.
+//! Parser PUR du fond KALI (conventions collectives) — XML → `KaliArticle` /
+//! `KaliConteneur`. La structure `<ARTICLE>` d'un `KALIARTI` est celle d'un
+//! `LEGIARTI`, d'où les helpers du parser LEGI ; seul le rattachement diffère.
 //!
-//! Deux écarts au modèle LEGI, propres à KALI :
-//! 1. **Rattachement au conteneur, pas au texte** : un `KALIARTI` porte dans son
-//!    `CONTEXTE` à la fois un `<TEXTE cid="KALITEXT…">` (le texte de base ou un
-//!    avenant) et un `<CONTENEUR cid="KALICONT…">` (la convention). On ancre le
-//!    `text_uid` sur le **conteneur** (KALICONT) : c'est la convention qu'on cite
-//!    (« art. X de la CCN des Y »), pas l'avenant.
-//! 2. **Articles sans numéro** : beaucoup de `KALIARTI` ont `<NUM/>` vide
-//!    (organisés par titre de section, pas numérotés). Le parseur les rend
-//!    quand même (`num_key` vide) : le référentiel citable les saute côté
-//!    pipeline d'ingest, mais l'assemblage du corps des TI les consomme — le
-//!    skip est une décision du consommateur, pas du parseur.
+//! Deux écarts au modèle LEGI :
+//! 1. **Rattachement au conteneur** : le `CONTEXTE` porte un `<TEXTE>` (base ou
+//!    avenant) ET un `<CONTENEUR cid="KALICONT…">`. Le `text_uid` s'ancre sur le
+//!    conteneur : c'est la convention qu'on cite, pas l'avenant.
+//! 2. **Articles sans numéro** : `<NUM/>` vide est fréquent. Le parseur les rend
+//!    (`num_key` vide) — les sauter est une décision du consommateur.
 //!
-//! Les `ETAT` étendus de KALI (`VIGUEUR_ETEN` convention étendue par arrêté,
-//! `VIGUEUR_NON_ETEN` en vigueur pour les seuls signataires) sont **repliés sur
-//! `VIGUEUR`** : ce sont des articles en vigueur, qui doivent compter comme tels
-//! pour le pick « texte vivant » et l'index partiel `status='VIGUEUR'`.
+//! Les `ETAT` étendus (`VIGUEUR_ETEN`, `VIGUEUR_NON_ETEN`) sont **repliés sur
+//! `VIGUEUR`** : ils doivent compter pour le pick « texte vivant » et l'index
+//! partiel `status='VIGUEUR'`.
 
 use crate::legi::{
     clean_contenu, collect_liens, collect_titre_tm, date_or_none, find_anywhere, LegiLien,
@@ -41,6 +31,10 @@ pub struct KaliArticle {
     /// sert à ordonner les blocs d'un conteneur. Absent sur certains articles
     /// ancrés directement au conteneur.
     pub kalitext: Option<String>,
+    /// Titre du texte porteur (`CONTEXTE/TEXTE/TITRE_TXT`) : « Annexe I -
+    /// Ouvriers ». Tête du fil d'Ariane, faute de quoi rien ne dit de quel
+    /// instrument du recueil l'article vient.
+    pub kalitext_titre: Option<String>,
     /// Vide pour les articles non numérotés (sections titrées) ; idem `num_key`.
     pub num: String,
     pub num_key: String,
@@ -119,10 +113,14 @@ pub fn parse_kali_article(raw: &[u8]) -> Result<KaliArticle, CoreError> {
         })?
         .to_string();
 
-    let kalitext = find_anywhere(&root, "CONTEXTE/TEXTE")
+    let texte_porteur = find_anywhere(&root, "CONTEXTE/TEXTE");
+    let kalitext = texte_porteur
         .and_then(|t| t.attr("cid"))
         .filter(|cid| !cid.is_empty())
         .map(str::to_string);
+    let kalitext_titre = texte_porteur
+        .and_then(|t| node_text(find_anywhere(t, "TITRE_TXT")))
+        .filter(|t| !t.is_empty());
 
     let etat =
         canon_etat(&node_text(find_anywhere(&root, "META_ARTICLE/ETAT")).unwrap_or_default());
@@ -133,6 +131,7 @@ pub fn parse_kali_article(raw: &[u8]) -> Result<KaliArticle, CoreError> {
         kaliarti,
         kalicont,
         kalitext,
+        kalitext_titre,
         num,
         num_key,
         titre_text,
@@ -227,6 +226,10 @@ mod tests {
         // TEXTE porteur reste capté, pour l'ordre des blocs.
         assert_eq!(a.kalicont, "KALICONT000005635585");
         assert_eq!(a.kalitext.as_deref(), Some("KALITEXT000024359407"));
+        assert_eq!(
+            a.kalitext_titre.as_deref(),
+            Some("Convention collective nationale des entreprises de propreté")
+        );
         assert_eq!(a.num, "5");
         assert_eq!(a.num_key, "5");
         // VIGUEUR_ETEN → VIGUEUR.
@@ -254,6 +257,7 @@ mod tests {
         let a = parse_kali_article(xml).expect("ok");
         assert!(a.num_key.is_empty());
         assert_eq!(a.kalitext, None);
+        assert_eq!(a.kalitext_titre, None);
         assert_eq!(a.texte.as_deref(), Some("Sans numero."));
     }
 

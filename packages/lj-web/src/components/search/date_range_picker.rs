@@ -99,6 +99,148 @@ fn to_iso(c: Civil) -> String {
     format!("{:04}-{:02}-{:02}", c.y, c.m, c.d)
 }
 
+/// Sans accent ni point final, minuscules : « Févr. » et « fevrier » se
+/// comparent au même mois.
+fn fold_month(s: &str) -> String {
+    s.trim()
+        .trim_end_matches('.')
+        .to_lowercase()
+        .chars()
+        .map(|c| match c {
+            'é' | 'è' | 'ê' => 'e',
+            'û' | 'ù' => 'u',
+            'à' | 'â' => 'a',
+            'ô' => 'o',
+            'ç' => 'c',
+            other => other,
+        })
+        .collect()
+}
+
+/// Mois nommé, sur les seules formes que nous affichons. Un préfixe partiel ne
+/// compte pas : « jui » n'a pas de réponse.
+fn month_from_name(token: &str) -> Option<u32> {
+    let t = fold_month(token);
+    if t.len() < 3 {
+        return None;
+    }
+    MONTHS_FR
+        .iter()
+        .chain(MONTHS_FR_SHORT.iter())
+        .position(|m| fold_month(m) == t)
+        .map(|i| (i % 12) as u32 + 1)
+}
+
+/// What a typed entry designates: a day, a whole month or a whole year. The
+/// field resolves the last two on its own bound ([`Typed::resolve`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Typed {
+    Day(Civil),
+    Month { y: i32, m: u32 },
+    Year(i32),
+}
+
+impl Typed {
+    /// `Du` takes the first day of the span, `Au` the last one.
+    fn resolve(self, bound: Focus) -> Civil {
+        match (self, bound) {
+            (Typed::Day(c), _) => c,
+            (Typed::Month { y, m }, Focus::From) => Civil { y, m, d: 1 },
+            (Typed::Month { y, m }, Focus::To) => Civil {
+                y,
+                m,
+                d: days_in_month(y, m),
+            },
+            (Typed::Year(y), Focus::From) => Civil { y, m: 1, d: 1 },
+            (Typed::Year(y), Focus::To) => Civil { y, m: 12, d: 31 },
+        }
+    }
+}
+
+/// A year is four digits, no less: while the year of `1 janv. 2023` is being
+/// edited, `202` is not a date and nothing must leave the field.
+fn year_token(t: &str) -> Option<i32> {
+    if t.len() != 4 || !t.bytes().all(|b| b.is_ascii_digit()) || t.starts_with('0') {
+        return None;
+    }
+    t.parse().ok()
+}
+
+fn month_token(t: &str) -> Option<u32> {
+    if let Some(m) = month_from_name(t) {
+        return Some(m);
+    }
+    if t.len() > 2 || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok().filter(|m| (1..=12).contains(m))
+}
+
+/// A hand-typed entry: `12/03/2024`, `12-03-2024`, `12032024`, the ISO
+/// `2024-03-12`, and the form the field displays, `12 mars 2024`. A month alone
+/// (`03/2024`, `mars 2024`) or a year alone (`2024`) designates its whole span.
+/// Anything else yields `None`, and the entry stays as typed.
+fn parse_typed(s: &str) -> Option<Typed> {
+    let tokens: Vec<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    match tokens[..] {
+        [y] => {
+            if let Some(y) = year_token(y) {
+                return Some(Typed::Year(y));
+            }
+        }
+        [m, y] => {
+            if let (Some(m), Some(y)) = (month_token(m), year_token(y)) {
+                return Some(Typed::Month { y, m });
+            }
+        }
+        [d, name, y] => {
+            if let (Some(m), Some(y)) = (month_from_name(name), year_token(y)) {
+                let d = d.parse::<u32>().ok()?;
+                return (1..=days_in_month(y, m))
+                    .contains(&d)
+                    .then_some(Typed::Day(Civil { y, m, d }));
+            }
+        }
+        _ => {}
+    }
+    let digits: Vec<u32> = s.chars().filter_map(|c| c.to_digit(10)).collect();
+    if digits.len() != 8 {
+        return None;
+    }
+    let num = |slice: &[u32]| slice.iter().fold(0i32, |acc, d| acc * 10 + *d as i32);
+    // Un groupe de 4 chiffres en tête ne peut être qu'une année.
+    let (y, m, d) = if s.trim_start().starts_with(|c: char| c.is_ascii_digit())
+        && s.split(|c: char| !c.is_ascii_digit()).next()?.len() == 4
+    {
+        (num(&digits[0..4]), num(&digits[4..6]), num(&digits[6..8]))
+    } else {
+        (num(&digits[4..8]), num(&digits[2..4]), num(&digits[0..2]))
+    };
+    let (m, d) = (u32::try_from(m).ok()?, u32::try_from(d).ok()?);
+    ((1..=12).contains(&m) && (1..=days_in_month(y, m)).contains(&d)).then_some(Typed::Day(Civil {
+        y,
+        m,
+        d,
+    }))
+}
+
+/// The range once `bound` takes `iso`. `None` when the bounds would end up in
+/// the wrong order: an inverted range answers nothing to every search, so it
+/// is emptied and starts over.
+fn range_with(bound: Focus, iso: &str, from: &str, to: &str) -> Option<(String, String)> {
+    let (f, t) = match bound {
+        Focus::From => (iso, to),
+        Focus::To => (from, iso),
+    };
+    match (parse_iso(f), parse_iso(t)) {
+        (Some(a), Some(b)) if a > b => None,
+        _ => Some((f.to_string(), t.to_string())),
+    }
+}
+
 fn format_short(c: Civil) -> String {
     format!("{} {} {}", c.d, MONTHS_FR_SHORT[(c.m - 1) as usize], c.y)
 }
@@ -218,18 +360,34 @@ pub fn DateRangePicker(
     let view_month = RwSignal::new(init_month);
     let end_year = current_year();
 
+    // A bound that crosses the other empties both, and the range starts over
+    // from `Du`.
+    let apply = move |bound: Focus, iso: &str| -> bool {
+        match range_with(bound, iso, &from.get_untracked(), &to.get_untracked()) {
+            Some(next) => {
+                on_change.run(next);
+                true
+            }
+            None => {
+                on_change.run((String::new(), String::new()));
+                focus.set(Focus::From);
+                false
+            }
+        }
+    };
+
     let select_day = move |c: Civil| {
         let iso = to_iso(c);
         match focus.get_untracked() {
             Focus::From => {
-                on_change.run((iso.clone(), to.get_untracked()));
-                if !iso.is_empty() {
+                if apply(Focus::From, &iso) {
                     focus.set(Focus::To);
                 }
             }
             Focus::To => {
-                on_change.run((from.get_untracked(), iso));
-                calendar_open.set(false);
+                if apply(Focus::To, &iso) {
+                    calendar_open.set(false);
+                }
             }
         }
     };
@@ -255,9 +413,6 @@ pub fn DateRangePicker(
     let at_start = move || view_month.get() <= (START_YEAR, 1);
     let at_end = move || view_month.get() >= (end_year, 12);
 
-    // Menus déroulants mois + année : saut direct à un mois ou une année.
-    // `DropdownSelect` (panneau thémé, capé + scrollable, positionné `fixed` pour
-    // échapper à l'`overflow-hidden` de l'accordéon du rail).
     let month_options = Signal::derive(|| {
         MONTHS_FR
             .iter()
@@ -291,51 +446,80 @@ pub fn DateRangePicker(
     };
 
     let field = move |label: &'static str, value: Signal<String>, this: Focus| {
-        let parsed = move || parse_iso(&value.get());
+        // `draft` = la frappe en cours. Tant qu'elle vit, elle prime sur la forme
+        // canonique, sinon reformater sous les doigts empêche de finir la saisie.
+        let draft = RwSignal::new(None::<String>);
         let active = move || calendar_open.get() && focus.get() == this;
+        let emit = move |iso: &str| {
+            apply(this, iso);
+        };
         let on_activate = move |_| {
             focus.set(this);
             calendar_open.set(true);
         };
-        // Le champ porte un bouton « effacer » : un `<button>` imbriqué dans un
-        // `<button>` est du HTML invalide (le parseur referme le bouton externe
-        // au bouton interne) → mismatch d'hydratation fatal côté SSR. Le champ est
-        // donc un `div[role=button]` (clic + Enter/Espace) ; le bouton interne
-        // reste valide.
-        let on_activate_key = move |ev: leptos::ev::KeyboardEvent| {
-            if ev.key() == "Enter" || ev.key() == " " {
-                ev.prevent_default();
-                focus.set(this);
-                calendar_open.set(true);
+        let on_input = move |ev: leptos::ev::Event| {
+            let raw = event_target_value(&ev);
+            if raw.trim().is_empty() {
+                draft.set(None);
+                emit("");
+                return;
+            }
+            draft.set(Some(raw.clone()));
+            if let Some(c) = parse_typed(&raw).map(|t| t.resolve(this)) {
+                let iso = to_iso(c);
+                if iso != value.get_untracked() {
+                    view_month.set((c.y, c.m));
+                    emit(&iso);
+                }
             }
         };
-        let on_clear = move |ev: leptos::ev::MouseEvent| {
-            ev.stop_propagation();
-            match this {
-                Focus::From => on_change.run((String::new(), to.get_untracked())),
-                Focus::To => on_change.run((from.get_untracked(), String::new())),
+        let on_blur = move |_| draft.set(None);
+        let on_key = move |ev: leptos::ev::KeyboardEvent| {
+            if ev.key() == "Enter" {
+                ev.prevent_default();
+                draft.set(None);
+                calendar_open.set(false);
             }
+        };
+        let on_clear = move |_| {
+            draft.set(None);
+            emit("");
             focus.set(this);
             calendar_open.set(false);
         };
+        let shown = move || match draft.get() {
+            Some(text) => text,
+            None => parse_iso(&value.get())
+                .map(format_short)
+                .unwrap_or_default(),
+        };
+        // `min-w-0` : sans lui la largeur minimale du champ est celle que
+        // l'`<input>` se donne, 181 px, et les deux débordent le panneau de 320.
         let class = move || {
             cn([
-                "flex flex-1 cursor-pointer items-center justify-between gap-1 rounded border px-2 py-1.5 text-left text-xs transition-colors",
+                "flex min-w-0 flex-1 items-center justify-between gap-1 rounded border px-2 py-1.5 text-xs transition-colors",
                 if active() {
-                    "border-[var(--color-accent)] bg-[var(--color-bordeaux-soft)] text-[var(--color-accent)]"
+                    "border-[var(--color-accent)] bg-[var(--color-bordeaux-soft)]"
                 } else {
-                    "border-[var(--color-rule)] text-[var(--color-ink-muted)] hover:border-[var(--color-ink-muted)]"
+                    "border-[var(--color-rule)] hover:border-[var(--color-ink-muted)]"
                 },
             ])
         };
         view! {
-            <div role="button" tabindex="0" on:click=on_activate on:keydown=on_activate_key class=class>
-                <span class="truncate">
-                    {move || match parsed() {
-                        Some(c) => view! { {format_short(c)} }.into_any(),
-                        None => view! { <span class="opacity-50">{label}</span> }.into_any(),
-                    }}
-                </span>
+            <div class=class>
+                <input
+                    type="text"
+                    inputmode="numeric"
+                    autocomplete="off"
+                    aria-label=format!("{label} (jour/mois/année)")
+                    placeholder=format!("{label} jj/mm/aaaa")
+                    prop:value=shown
+                    on:focus=on_activate
+                    on:input=on_input
+                    on:blur=on_blur
+                    on:keydown=on_key
+                    class="min-w-0 flex-1 bg-transparent text-xs text-[var(--color-ink)] outline-none placeholder:text-[var(--color-ink-muted)] placeholder:opacity-50"
+                />
                 <Show when=move || !value.get().is_empty()>
                     <button
                         type="button"
@@ -516,6 +700,116 @@ fn NavBtn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_date_accepts_the_forms_a_reader_writes() {
+        let expected = Civil {
+            y: 2024,
+            m: 3,
+            d: 12,
+        };
+        for s in ["12/03/2024", "12-03-2024", "12 03 2024", "12032024"] {
+            assert_eq!(
+                parse_typed(s),
+                Some(Typed::Day(expected)),
+                "forme refusée : {s}"
+            );
+        }
+        // Un groupe de 4 chiffres en tête se lit comme une année.
+        assert_eq!(parse_typed("2024-03-12"), Some(Typed::Day(expected)));
+        // Incomplet, hors calendrier, ou bruité : pas de date.
+        for s in [
+            "12/03",
+            "",
+            "32/03/2024",
+            "12/13/2024",
+            "30/02/2024",
+            "abcd",
+        ] {
+            assert_eq!(parse_typed(s), None, "forme acceptée à tort : {s}");
+        }
+        // Le 29 février n'existe qu'en année bissextile.
+        assert!(parse_typed("29/02/2024").is_some());
+        assert!(parse_typed("29/02/2023").is_none());
+    }
+
+    /// Le champ doit relire ce qu'il écrit, sinon retaper ce qu'on voit échoue.
+    #[test]
+    fn typed_date_reads_back_what_the_field_displays() {
+        for (m, day) in (1u32..=12).zip([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]) {
+            let c = Civil { y: 2019, m, d: day };
+            assert_eq!(
+                parse_typed(&format_short(c)),
+                Some(Typed::Day(c)),
+                "{}",
+                format_short(c)
+            );
+        }
+        assert_eq!(
+            parse_typed("5 juin 2019"),
+            Some(Typed::Day(Civil {
+                y: 2019,
+                m: 6,
+                d: 5
+            }))
+        );
+        // Nom complet et sans accent, puisque c'est ce qu'un lecteur tape.
+        assert_eq!(
+            parse_typed("5 fevrier 2019"),
+            Some(Typed::Day(Civil {
+                y: 2019,
+                m: 2,
+                d: 5
+            }))
+        );
+        // Un préfixe ambigu ne devine pas.
+        assert_eq!(parse_typed("5 jui 2019"), None);
+    }
+
+    #[test]
+    fn a_month_or_a_year_alone_spans_its_bound() {
+        let iso = |s: &str, bound: Focus| parse_typed(s).map(|t| to_iso(t.resolve(bound)));
+        assert_eq!(iso("2023", Focus::From).as_deref(), Some("2023-01-01"));
+        assert_eq!(iso("2023", Focus::To).as_deref(), Some("2023-12-31"));
+        assert_eq!(iso("02/2024", Focus::From).as_deref(), Some("2024-02-01"));
+        assert_eq!(iso("02/2024", Focus::To).as_deref(), Some("2024-02-29"));
+        assert_eq!(iso("mars 2023", Focus::To).as_deref(), Some("2023-03-31"));
+        assert_eq!(iso("12/03/2024", Focus::To).as_deref(), Some("2024-03-12"));
+    }
+
+    #[test]
+    fn a_bound_crossing_the_other_empties_the_range() {
+        assert_eq!(range_with(Focus::To, "2026-01-01", "2026-01-05", ""), None);
+        assert_eq!(
+            range_with(Focus::From, "2026-01-09", "", "2026-01-05"),
+            None
+        );
+        let same = Some(("2026-01-05".to_string(), "2026-01-05".to_string()));
+        assert_eq!(range_with(Focus::To, "2026-01-05", "2026-01-05", ""), same);
+        // Emptying a bound keeps the other one.
+        let kept = Some((String::new(), "2026-01-09".to_string()));
+        assert_eq!(
+            range_with(Focus::From, "", "2026-01-05", "2026-01-09"),
+            kept
+        );
+    }
+
+    /// Editing the year of `1 janv. 2023` passes through `202` and `2`: none of
+    /// those is a date, and nothing must leave the field meanwhile.
+    #[test]
+    fn a_partial_year_is_not_a_date() {
+        for s in [
+            "1 janv. 202",
+            "1 janv. 20",
+            "1 janv. 2",
+            "202",
+            "0202",
+            "03/202",
+            "13/2024",
+        ] {
+            assert_eq!(parse_typed(s), None, "forme acceptée à tort : {s}");
+        }
+    }
 
     #[test]
     fn weekday_known_dates() {

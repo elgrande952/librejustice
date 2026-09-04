@@ -1,18 +1,35 @@
-//! Tokenizer body — parité exacte avec le tokenizer de l'index `chunks_bm25`
-//! (ParadeDB `regex([\p{L}\p{N}-]+) + ascii_folding`, stopwords tantivy `French`
-//! + `a`/`à`).
+//! Tokenizer body — parité exacte avec le tokenizer des index BM25 (ParadeDB
+//! `regex([`TOKEN_PATTERN`]) + ascii_folding`, stopwords tantivy `French` +
+//! `a`/`à`).
 //!
-//! Vit ici (PUR) parce qu'il est partagé par DEUX chemins qui doivent folder
+//! Vit ici (PUR) parce qu'il est partagé par TROIS chemins qui doivent folder
 //! et segmenter à l'identique, sous peine de drift silencieux :
 //! - la jambe BM25 body de `lj-api` (génération de la query `paradedb.parse`),
-//! - le mineur de collocations de `lj-bench` (qui folde le corpus pour produire
-//!   le lexique embarqué par [`crate::collocations`]).
+//! - le tokenizer tantivy des snippets (`lj_api::snippets`),
+//! - le mineur de collocations hors ligne (qui folde le corpus pour produire le
+//!   lexique embarqué par [`crate::collocations`]).
 //!
-//! Si les deux foldent différemment, une entrée de lexique ne matche jamais la
-//! query correspondante.
+//! Si deux d'entre eux foldent différemment, une entrée de lexique ne matche
+//! jamais la query correspondante, et un snippet surligne à côté du terme trouvé.
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
+
+use regex::Regex;
+
+/// Pattern du tokenizer BM25, source unique : les `text_fields` des migrations,
+/// le tokenizer tantivy des snippets et [`tokenize`] portent tous celui-ci.
+/// `legal_article_usage_bm25.terms` y ajoute `_`, seule variation du dépôt.
+///
+/// La première alternative garde un numéro entier — `2008/115`, `19-20.312`,
+/// `3.000` — parce que sur un instrument européen le numéro EST l'identifiant,
+/// et que le découper divise la précision par deux. L'alternance est
+/// leftmost-first : à une position numérique, la forme collée gagne. Le tiret,
+/// lui, était déjà collé par la seconde alternative.
+pub const TOKEN_PATTERN: &str = r"\p{N}+(?:[./-]\p{N}+)+|[\p{L}\p{N}-]+";
+
+static TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(TOKEN_PATTERN).expect("TOKEN_PATTERN compile"));
 
 /// Stopwords du tokenizer de l'index `chunks_bm25` (liste tantivy `French` +
 /// `a`/`à`), foldés ascii comme la sortie de [`tokenize`]. Les lookups se font
@@ -46,7 +63,7 @@ pub fn is_stopword(folded: &str) -> bool {
 }
 
 /// Tokens body (Unicode-first puis ascii-fold + lowercase) — matche le
-/// body-tokenizer ParadeDB (`[\p{L}\p{N}-]+`). On tokenise AVANT de fold.
+/// body-tokenizer ParadeDB ([`TOKEN_PATTERN`]). On tokenise AVANT de fold.
 pub fn tokenize(query: &str) -> Vec<String> {
     tokenize_with(query, fold)
 }
@@ -58,31 +75,26 @@ pub fn tokenize_lower(query: &str) -> Vec<String> {
     tokenize_with(query, |s| s.to_lowercase())
 }
 
+/// Mêmes frontières que [`tokenize`], sur le texte brut : ni fold, ni minuscule.
+/// Pour les chemins qui recomposent une requête et doivent rendre la forme telle
+/// qu'elle a été tapée, tout en coupant comme l'index.
+pub fn tokens_raw(text: &str) -> Vec<&str> {
+    TOKEN_RE
+        .find_iter(text)
+        .map(|m| m.as_str())
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .collect()
+}
+
 fn tokenize_with(query: &str, norm: impl Fn(&str) -> String) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut chars = query.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch.is_alphanumeric() {
-            cur.push(ch);
-        } else if ch == '-' && !cur.is_empty() {
-            // Conserve les composés `[^\W_]+(?:-[^\W_]+)*` : un `-` n'est gardé
-            // que s'il est suivi d'un autre caractère mot.
-            if matches!(chars.peek(), Some(c) if c.is_alphanumeric()) {
-                cur.push('-');
-            } else if !cur.is_empty() {
-                tokens.push(norm(&cur));
-                cur.clear();
-            }
-        } else if !cur.is_empty() {
-            tokens.push(norm(&cur));
-            cur.clear();
-        }
-    }
-    if !cur.is_empty() {
-        tokens.push(norm(&cur));
-    }
-    tokens
+    TOKEN_RE
+        .find_iter(query)
+        .map(|m| m.as_str())
+        // Un tiret seul est un token de l'index comme un autre, mais il ne porte
+        // rien et la grammaire tantivy lit un `-` de tête comme une négation.
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .map(norm)
+        .collect()
 }
 
 /// NFKD ascii-fold + lowercase (réplique `unicodedata.NFKD + ascii ignore + lower`).
@@ -152,6 +164,24 @@ mod tests {
     fn tokenize_folds_and_keeps_hyphen() {
         assert_eq!(tokenize("Référé-suspension"), vec!["refere-suspension"]);
         assert_eq!(tokenize("l'instruction"), vec!["l", "instruction"]);
+    }
+
+    #[test]
+    fn un_numero_reste_entier() {
+        // L'instrument européen : le numéro EST l'identifiant de la norme.
+        assert_eq!(
+            tokenize("directive 2008/115/CE"),
+            vec!["directive", "2008/115", "ce"]
+        );
+        // Pourvoi, rôle, montant à la française.
+        assert_eq!(tokenize("pourvoi 19-20.312"), vec!["pourvoi", "19-20.312"]);
+        assert_eq!(tokenize("22/01772"), vec!["22/01772"]);
+        assert_eq!(tokenize("3.000 euros"), vec!["3.000", "euros"]);
+        // Une date à barres est avalée entière — c'est le prix mesuré du gain.
+        assert_eq!(tokenize("du 16/12/2008"), vec!["du", "16/12/2008"]);
+        // Un séparateur non encadré de chiffres ne colle rien.
+        assert_eq!(tokenize("fin. Alors"), vec!["fin", "alors"]);
+        assert_eq!(tokenize("article L. 423-7"), vec!["article", "l", "423-7"]);
     }
 
     #[test]

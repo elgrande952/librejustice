@@ -1,7 +1,6 @@
-//! Libellés des codes de publication bruts (`publication_codes`) et de la
-//! portée dérivée (groupes au rang le plus fort). Les autres libellés métier
-//! (solution, voie, office, domaine, juridictions) arrivent résolus par l'API
-//! en `FacetTag`.
+//! Libellés des codes de publication bruts (`publication_codes`). Les autres
+//! libellés métier (solution, voie, office, domaine, juridictions) arrivent
+//! résolus par l'API en `FacetTag`.
 
 /// Table `code → libellé` des publications.
 const PUBLICATION_LABELS: &[(&str, &str)] = &[
@@ -64,33 +63,6 @@ pub fn publication_badge(codes: &[String]) -> Option<String> {
     publication_label(&notable)
 }
 
-/// Groupes de portée, du rang le plus fort au plus faible — miroir de
-/// `significance_codes` de lj-core, que lj-web ne peut pas importer.
-const PORTEE_GROUPS: &[(&str, &[&str])] = &[
-    ("Majeure", &["r", "A"]),
-    ("Importante", &["b", "l", "c", "B", "C+", "R"]),
-    ("Limitée", &["n", "C", "D", "Z"]),
-];
-
-/// Libellé de portée au rang le plus fort (`{b,r}` → « Majeure »). `None` =
-/// indéterminée (aucun code classant) — on ne l'affiche pas.
-pub fn significance_label(codes: &[String]) -> Option<&'static str> {
-    PORTEE_GROUPS.iter().find_map(|(label, group)| {
-        codes
-            .iter()
-            .any(|c| group.contains(&c.as_str()))
-            .then_some(*label)
-    })
-}
-
-/// Badge de portée des cartes résultat : majeure/importante seulement, la
-/// portée limitée serait du bruit.
-pub fn significance_badge(codes: &[String]) -> Option<String> {
-    significance_label(codes)
-        .filter(|l| *l != "Limitée")
-        .map(|l| format!("Portée {}", l.to_lowercase()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,24 +91,5 @@ mod tests {
         // Que des inédits → None.
         let c = vec!["n".to_string(), "C".to_string()];
         assert_eq!(publication_badge(&c), None);
-    }
-
-    #[test]
-    fn significance_takes_strongest_rank_and_badge_hides_limitee() {
-        let c = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(significance_label(&c(&["b", "r"])), Some("Majeure"));
-        assert_eq!(significance_label(&c(&["l"])), Some("Importante"));
-        assert_eq!(significance_label(&c(&["n"])), Some("Limitée"));
-        assert_eq!(significance_label(&[]), None);
-        assert_eq!(
-            significance_badge(&c(&["A"])).as_deref(),
-            Some("Portée majeure")
-        );
-        assert_eq!(
-            significance_badge(&c(&["B"])).as_deref(),
-            Some("Portée importante")
-        );
-        assert_eq!(significance_badge(&c(&["C", "D"])), None);
-        assert_eq!(significance_badge(&[]), None);
     }
 }

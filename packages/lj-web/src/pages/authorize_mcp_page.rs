@@ -1,229 +1,167 @@
 //! Page `/authorize-mcp`.
 //!
-//! Callback OAuth client-only : ecran de consentement qui echange une session
-//! Supabase contre un code d'autorisation aupres de `/oauth/approve`, puis
-//! redirige vers le `redirect_uri` du client MCP. N'utilise PAS le cache de
-//! requetes : un `fetch` direct via le shim `browser` (web-sys indisponible).
+//! Écran de consentement OAuth rendu côté serveur, sans JavaScript : un
+//! formulaire POST vers `/oauth/approve`, qui répond 303 vers le client MCP
+//! (code émis ou refus). La session est exigée avant le rendu par une garde
+//! serveur qui redirige vers `/login?next=…` — installer un connecteur ne
+//! dépend plus du chargement du bundle WASM.
+//!
+//! Le demandeur se nomme : la query ne porte que le `client_id`, opaque, alors
+//! que l'enregistrement (RFC 7591) a déclaré un nom, lu en base au rendu. Ce
+//! nom est déclaratif — l'hôte affiché à côté est, lui, la cible réelle du
+//! retour, et `approve` refuse tout ce qui n'est pas enregistré pour ce client.
 
 use leptos::prelude::*;
 use leptos_meta::{Meta, Title};
 
+use crate::pages::decision_page::data::sendable;
+
+/// Nom déclaré par un tiers sur un enregistrement ouvert : coupé pour qu'il
+/// reste un nom, et non une phrase posée dans la nôtre.
+const NOM_MAX: usize = 60;
+
+const FORT: &str = "text-[var(--color-ink)]";
+
 #[component]
 pub fn AuthorizeMcpPage() -> impl IntoView {
-    let has_session = RwSignal::new(false);
-    let loading = RwSignal::new(false);
-    let error = RwSignal::new(None::<String>);
-
-    // Parametres OAuth (defauts `""`, comme `params.get(...) ?? ""`). `client_id`
-    // est lu dans la vue (affichage du consentement) ; les trois autres ne sont
-    // lus/ecrits que dans les chemins hydrate (Effect + on_approve/on_deny).
-    let client_id = RwSignal::new(String::new());
-
-    // Lien de secours du rendu SSR : `/connexion?next=<url courante>`, calculé
-    // sans JS. La page est un maillon d'un flux OAuth externe — si le bundle ne
-    // charge pas, l'utilisateur garde un chemin praticable.
-    let login_href = {
-        let location = leptos_router::hooks::use_location();
-        let path = location.pathname.get_untracked();
-        let search = location.search.get_untracked();
-        let self_url = if search.is_empty() {
-            path
-        } else {
-            format!("{path}?{search}")
-        };
-        format!(
-            "/connexion?next={}",
-            leptos_router::location::Url::escape(&self_url)
-        )
-    };
-    #[cfg(feature = "hydrate")]
-    let redirect_uri = RwSignal::new(String::new());
-    #[cfg(feature = "hydrate")]
-    let code_challenge = RwSignal::new(String::new());
-    #[cfg(feature = "hydrate")]
-    let state = RwSignal::new(String::new());
-
-    #[cfg(feature = "hydrate")]
-    {
-        use super::login_page::browser;
-        let query = leptos_router::hooks::use_query_map();
-        let navigate = leptos_router::hooks::use_navigate();
-        Effect::new(move |_| {
-            query.with(|q| {
-                client_id.set(q.get("client_id").unwrap_or_default());
-                redirect_uri.set(q.get("redirect_uri").unwrap_or_default());
-                code_challenge.set(q.get("code_challenge").unwrap_or_default());
-                state.set(q.get("state").unwrap_or_default());
-            });
-            // `self_url` capture au montage (avant tout await) : chemin + query
-            // courant, pour repointer vers `/connexion?next=` sans le perdre.
-            let self_url = {
-                let s = browser::location_path_search();
-                if s.is_empty() {
-                    "/authorize-mcp".to_string()
-                } else {
-                    s
-                }
-            };
-            let navigate = navigate.clone();
-            leptos::task::spawn_local(async move {
-                if browser::has_session().await {
-                    has_session.set(true);
-                } else {
-                    let next = String::from(js_sys::encode_uri_component(&self_url));
-                    navigate(&format!("/connexion?next={next}"), Default::default());
-                }
-            });
-        });
-    }
-
-    let on_approve = move |_| {
-        #[cfg(feature = "hydrate")]
-        {
-            use super::login_page::browser;
-            loading.set(true);
-            error.set(None);
-            let (cid, ruri, cc, st) = (
-                client_id.get_untracked(),
-                redirect_uri.get_untracked(),
-                code_challenge.get_untracked(),
-                state.get_untracked(),
-            );
-            leptos::task::spawn_local(async move {
-                let token = match browser::session_token().await {
-                    Some(t) => t,
-                    None => {
-                        loading.set(false);
-                        return;
-                    }
-                };
-                let body = serde_json::json!({
-                    "client_id": cid,
-                    "code_challenge": cc,
-                    "redirect_uri": ruri,
-                    "state": if st.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::Value::String(st.clone())
-                    },
-                })
-                .to_string();
-                match browser::oauth_approve(&root_base_url(), &token, &body).await {
-                    Ok(code) => {
-                        let mut pairs: Vec<(&str, &str)> = vec![("code", code.as_str())];
-                        if !st.is_empty() {
-                            pairs.push(("state", st.as_str()));
-                        }
-                        let pairs_json = serde_json::to_string(&pairs).unwrap_or_default();
-                        let dest = browser::build_url_with_params(&ruri, &pairs_json);
-                        browser::navigate_hard(&dest);
-                    }
-                    Err(msg) => {
-                        error.set(Some(msg));
-                        loading.set(false);
-                    }
-                }
-            });
-        }
-    };
-
-    let on_deny = move |_| {
-        #[cfg(feature = "hydrate")]
-        {
-            use super::login_page::browser;
-            let (ruri, st) = (redirect_uri.get_untracked(), state.get_untracked());
-            let mut pairs: Vec<(&str, &str)> = vec![("error", "access_denied")];
-            if !st.is_empty() {
-                pairs.push(("state", st.as_str()));
-            }
-            let pairs_json = serde_json::to_string(&pairs).unwrap_or_default();
-            let dest = browser::build_url_with_params(&ruri, &pairs_json);
-            browser::navigate_hard(&dest);
-        }
+    let query = leptos_router::hooks::use_query_map();
+    let champ = move |nom: &'static str| query.with(|q| q.get(nom).unwrap_or_default());
+    let declare = Resource::new_blocking(move || champ("client_id"), |id| sendable(nom_client(id)));
+    let annonce = move |nom: Option<String>| {
+        let (fort, hote) = demandeur(nom, &champ("redirect_uri"));
+        view! { <strong class=FORT>{fort}</strong>{hote.map(|hote| format!(" ({hote})"))} }
     };
 
     view! {
         <Title text="Autoriser l'accès MCP - LibreJustice" />
         <Meta name="robots" content="noindex" />
-        <Show
-            when=move || has_session.get()
-            fallback=move || {
-                let login_href = login_href.clone();
-                view! {
-                    <div class="mx-auto flex max-w-sm flex-col gap-6 px-4 py-16">
-                        <h1 class="font-sans text-2xl text-[var(--color-ink)]">
-                            "Autoriser l'accès MCP"
-                        </h1>
-                        <p class="text-sm text-[var(--color-ink-muted)]">
-                            "Une application demande l'accès en lecture à LibreJustice en votre nom. Vérification de votre session…"
-                        </p>
-                        <a
-                            href=login_href
-                            class="rounded-md border border-[var(--color-rule)] px-4 py-2.5 text-center text-sm text-[var(--color-ink-muted)] transition-colors hover:text-[var(--color-ink)]"
-                        >
-                            "Se connecter pour continuer"
-                        </a>
-                        <p class="text-xs text-[var(--color-ink-subtle)]">
-                            "Si cet écran ne change pas, votre navigateur n'a pas pu charger l'application. Rechargez la page en forçant le rafraîchissement : Ctrl+Maj+R, ou Cmd+Maj+R sur Mac."
-                        </p>
-                    </div>
-                }
-            }
-        >
-            <div class="mx-auto flex max-w-sm flex-col gap-8 px-4 py-16">
-                <div class="flex flex-col gap-2">
-                    <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Autoriser l'accès MCP"</h1>
-                    <p class="text-sm text-[var(--color-ink-muted)]">
-                        "L'application "
-                        <strong class="text-[var(--color-ink)]">
-                            {move || {
-                                let c = client_id.get();
-                                if c.is_empty() { "externe".to_string() } else { c }
-                            }}
-                        </strong> " demande l'accès en lecture à LibreJustice en votre nom."
-                    </p>
-                </div>
-
-                <div class="rounded-md border border-[var(--color-rule)] p-4 text-sm text-[var(--color-ink-muted)]">
-                    <p class="font-medium text-[var(--color-ink)]">"Accès accordé :"</p>
-                    <ul class="mt-2 list-inside list-disc">
-                        <li>"Recherche dans les décisions de justice"</li>
-                        <li>"Lecture du texte intégral des décisions"</li>
-                    </ul>
-                </div>
-
-                <Show when=move || error.get().is_some()>
-                    <p class="text-sm text-red-600">{move || error.get().unwrap_or_default()}</p>
-                </Show>
-
-                <div class="flex flex-col gap-3">
-                    <button
-                        type="button"
-                        on:click=on_approve
-                        disabled=move || loading.get()
-                        class="rounded-md bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-                    >
-                        {move || if loading.get() { "…" } else { "Autoriser" }}
-                    </button>
-                    <button
-                        type="button"
-                        on:click=on_deny
-                        disabled=move || loading.get()
-                        class="rounded-md border border-[var(--color-rule)] px-4 py-2.5 text-sm text-[var(--color-ink-muted)] transition-colors hover:text-[var(--color-ink)]"
-                    >
-                        "Refuser"
-                    </button>
-                </div>
+        <div class="mx-auto flex max-w-sm flex-col gap-8 px-4 py-16">
+            <div class="flex flex-col gap-2">
+                <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Autoriser l'accès MCP"</h1>
+                <p class="text-sm text-[var(--color-ink-muted)]">
+                    <Suspense fallback=move || annonce(None)>
+                        {move || declare.get().map(annonce)}
+                    </Suspense>
+                    " demande l'accès en lecture à LibreJustice en votre nom."
+                </p>
             </div>
-        </Show>
+
+            <div class="rounded-md border border-[var(--color-rule)] p-4 text-sm text-[var(--color-ink-muted)]">
+                <p class="font-medium text-[var(--color-ink)]">"Accès accordé :"</p>
+                <ul class="mt-2 list-inside list-disc">
+                    <li>"Recherche dans les décisions de justice"</li>
+                    <li>"Lecture du texte intégral des décisions"</li>
+                </ul>
+            </div>
+
+            <form method="post" action="/oauth/approve" class="flex flex-col gap-3">
+                <input type="hidden" name="client_id" value=move || champ("client_id") />
+                <input type="hidden" name="redirect_uri" value=move || champ("redirect_uri") />
+                <input type="hidden" name="code_challenge" value=move || champ("code_challenge") />
+                <input type="hidden" name="state" value=move || champ("state") />
+                <button
+                    type="submit"
+                    name="action"
+                    value="approve"
+                    class="rounded-md bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                >
+                    "Autoriser"
+                </button>
+                <button
+                    type="submit"
+                    name="action"
+                    value="deny"
+                    class="rounded-md border border-[var(--color-rule)] px-4 py-2.5 text-center text-sm text-[var(--color-ink-muted)] transition-colors hover:text-[var(--color-ink)]"
+                >
+                    "Refuser"
+                </button>
+            </form>
+            <crate::pages::login_page::SignalerDepuisEcranBloquant de="/authorize-mcp" />
+        </div>
     }
 }
 
-/// Base des endpoints montes a la racine (`/oauth/*`).
-/// Cote client = origine courante (chaine vide -> chemins relatifs same-origin).
-/// La page ne fetch QUE cote client (consentement OAuth), donc seule la branche
-/// `hydrate` existe.
-#[cfg(feature = "hydrate")]
-fn root_base_url() -> String {
-    String::new()
+/// Nom d'enregistrement du client. Lu en base au SSR, comme le profil ; en
+/// hydratation la valeur vient du payload sérialisé par la resource bloquante.
+async fn nom_client(client_id: String) -> Option<String> {
+    #[cfg(feature = "ssr")]
+    {
+        let state = use_context::<lj_api::state::AppState>()?;
+        lj_api::oauth::client_name(&state, &client_id).await.ok()?
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = client_id;
+        None
+    }
+}
+
+/// Qui demande, en deux morceaux : le nom mis en avant, et l'hôte de retour
+/// entre parenthèses quand un nom l'accompagne.
+fn demandeur(nom: Option<String>, redirect_uri: &str) -> (String, Option<String>) {
+    let hote = hote(redirect_uri);
+    match (nom.map(tronque), hote) {
+        (Some(nom), hote) => (nom, hote),
+        (None, Some(hote)) => (hote, None),
+        (None, None) => ("Une application externe".to_string(), None),
+    }
+}
+
+/// Hôte du `redirect_uri`, port compris : la cible du 303 après approbation.
+fn hote(redirect_uri: &str) -> Option<String> {
+    let sans_schema = redirect_uri
+        .split_once("://")
+        .map_or(redirect_uri, |(_, reste)| reste);
+    let hote = sans_schema
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    (!hote.is_empty()).then(|| hote.to_string())
+}
+
+fn tronque(nom: String) -> String {
+    if nom.chars().count() <= NOM_MAX {
+        return nom;
+    }
+    nom.chars().take(NOM_MAX).chain(['…']).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nom_declare_et_hote_de_retour() {
+        assert_eq!(
+            demandeur(
+                Some("Claude".to_string()),
+                "https://claude.ai/api/mcp/auth_callback"
+            ),
+            ("Claude".to_string(), Some("claude.ai".to_string()))
+        );
+    }
+
+    #[test]
+    fn sans_nom_l_hote_tient_lieu_de_nom() {
+        assert_eq!(
+            demandeur(None, "http://localhost:8080/cb"),
+            ("localhost:8080".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn sans_rien_d_exploitable() {
+        assert_eq!(
+            demandeur(None, ""),
+            ("Une application externe".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn nom_kilometrique_coupe() {
+        let (nom, _) = demandeur(Some("LibreJustice ".repeat(20)), "https://claude.ai/cb");
+        assert_eq!(nom.chars().count(), NOM_MAX + 1);
+        assert!(nom.ends_with('…'));
+    }
 }

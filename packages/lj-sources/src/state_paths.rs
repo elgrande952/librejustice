@@ -4,7 +4,7 @@
 //! Deux familles :
 //! - `ingest/` : tout ce que `lj-ingest` LIT (fonds auto-téléchargés sous
 //!   `ingest/cache/`, datasets légaux curés sous `ingest/corpus/`) ;
-//! - `bench/`, `analysis/` : scratch lu par `lj-bench`.
+//! - `bench/`, `analysis/` : scratch des bancs offline.
 //!
 //! `sources/` (matière première sourcée à la main), `tls/` et `pgdata/`
 //! (conteneur Postgres) restent hors code.
@@ -22,6 +22,7 @@ pub(crate) const CEDH_DIR: &str = "cedh";
 pub(crate) const CNDA_DIR: &str = "cnda";
 pub(crate) const CJUE_DIR: &str = "cjue";
 pub(crate) const EU_LAW_DIR: &str = "eu_law";
+pub(crate) const PRESSE_DIR: &str = "presse";
 
 /// Résout et compose les chemins sous `state_dir`.
 #[derive(Debug, Clone)]
@@ -116,6 +117,12 @@ impl StatePaths {
     /// versions futures en attente).
     pub fn eu_law(&self) -> PathBuf {
         self.cache().join(EU_LAW_DIR)
+    }
+
+    /// `ingest/cache/presse` — dumps NDJSON des sessions navigateur sur le
+    /// portail d'annonces légales, un fichier par session.
+    pub fn presse(&self) -> PathBuf {
+        self.cache().join(PRESSE_DIR)
     }
 }
 

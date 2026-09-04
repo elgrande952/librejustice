@@ -1,17 +1,17 @@
-//! Page `/connexion`.
+//! Page `/login`.
 //!
-//! Formulaire multi-actions (connexion, inscription, OAuth Google, renvoi de
-//! confirmation, mot de passe oublie). Tout le flux est client-side : la session
-//! Supabase vit en `localStorage`, absente au SSR. Le SSR rend la coquille ; un
-//! effet client lit le hash d'erreur eventuel, redirige si deja connecte, puis
-//! cable les handlers sur le shim auth.
+//! Connexion, inscription et mot de passe oublié en formulaires natifs, sans
+//! JavaScript : chaque action POST `/internal/auth/*` et répond 303. Une erreur
+//! attendue rebondit ici avec son code en query (`error=`), jamais l'adresse ;
+//! un mail parti affiche l'écran `sent=`. Le mode (`mode=signup|reset`) et la
+//! destination `next` vivent dans l'URL. Un porteur de session n'atteint pas la
+//! page : la garde serveur (`page_gates`) répond 303 vers `next` avant le rendu.
 //!
-//! Heberge aussi les modules partages de la tranche auth, reutilises par
-//! reset-password et authorize-mcp :
-//! - `auth_errors` : traduction FR des erreurs Supabase.
-//! - `browser` : bindings DOM + auth-gap (resend / updateUser / fetch OAuth).
+//! Héberge aussi les modules partagés de la tranche auth :
+//! - `auth_errors` : traduction FR des erreurs d'auth — module pur, compilé des
+//!   deux côtés : les pages auth traduisent au rendu SSR.
+//! - `browser` : bindings DOM page-level (hydrate seulement).
 
-#[cfg(any(feature = "hydrate", test))]
 #[path = "auth_errors.rs"]
 pub(crate) mod auth_errors;
 #[cfg(feature = "hydrate")]
@@ -21,227 +21,76 @@ pub(crate) mod browser;
 use leptos::prelude::*;
 use leptos_meta::{Meta, Title};
 
+use auth_errors::translate_auth_error;
+
 const PASSWORD_HINT: &str =
     "Au moins 8 caractères, dont une minuscule, une majuscule et un chiffre.";
+const CHAMP: &str = "rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] \
+     px-3 py-2 text-sm text-[var(--color-ink)] outline-none focus:border-[var(--color-accent)]";
+const BOUTON: &str = "rounded-md bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium \
+     text-white transition-opacity hover:opacity-90";
 
 #[component]
 pub fn LoginPage() -> impl IntoView {
-    let email = RwSignal::new(String::new());
-    let password = RwSignal::new(String::new());
-    let is_sign_up = RwSignal::new(false);
-    let error = RwSignal::new(None::<String>);
-    let loading = RwSignal::new(false);
-    let confirm_sent = RwSignal::new(false);
-    let reset_sent = RwSignal::new(false);
-    let resend_notice = RwSignal::new(None::<String>);
-    let show_resend = RwSignal::new(false);
-
-    #[cfg(feature = "hydrate")]
-    let navigate = leptos_router::hooks::use_navigate();
-    #[cfg(feature = "hydrate")]
     let query = leptos_router::hooks::use_query_map();
-
-    #[cfg(feature = "hydrate")]
-    {
-        let navigate = navigate.clone();
-        Effect::new(move |_| {
-            let next = next_url(query.with(|q| q.get("next")));
-            let navigate = navigate.clone();
-            if let Some(hash_err) = browser::read_auth_hash_error() {
-                error.set(Some(hash_err.message));
-                if hash_err.code == "otp_expired" || hash_err.code == "access_denied" {
-                    show_resend.set(true);
-                }
-                browser::clear_location_hash();
-                return;
-            }
-            leptos::task::spawn_local(async move {
-                if browser::has_session().await {
-                    navigate(&next, Default::default());
-                }
-            });
-        });
-    }
-
-    let on_submit = Callback::new(move |ev: leptos::ev::SubmitEvent| {
-        ev.prevent_default();
-        #[cfg(feature = "hydrate")]
-        {
-            let next = next_url(query.with_untracked(|q| q.get("next")));
-            let navigate = navigate.clone();
-            let (em, pw, signup) = (
-                email.get_untracked(),
-                password.get_untracked(),
-                is_sign_up.get_untracked(),
-            );
-            error.set(None);
-            loading.set(true);
-            leptos::task::spawn_local(async move {
-                if signup {
-                    match crate::auth::sign_up(&em, &pw, &signup_redirect(&next)).await {
-                        Ok(()) => confirm_sent.set(true),
-                        Err(msg) => error.set(Some(msg)),
-                    }
-                } else {
-                    match crate::auth::sign_in_password(&em, &pw).await {
-                        Ok(()) => navigate(&next, Default::default()),
-                        Err(msg) => {
-                            // Le shim a deja traduit : le cas
-                            // `email_not_confirmed` se detecte sur le message FR.
-                            if msg.starts_with("Email non confirmé") {
-                                show_resend.set(true);
-                            }
-                            error.set(Some(msg));
-                        }
-                    }
-                }
-                loading.set(false);
-            });
-        }
-    });
-
-    let on_oauth = Callback::new(move |_: leptos::ev::MouseEvent| {
-        #[cfg(feature = "hydrate")]
-        {
-            let next = next_url(query.with_untracked(|q| q.get("next")));
-            error.set(None);
-            leptos::task::spawn_local(async move {
-                let redirect_to = format!("{}{next}", browser::location_origin());
-                if let Err(msg) = crate::auth::sign_in_oauth("google", &redirect_to).await {
-                    error.set(Some(msg));
-                }
-            });
-        }
-    });
-
-    let on_resend = Callback::new(move |_: leptos::ev::MouseEvent| {
-        #[cfg(feature = "hydrate")]
-        {
-            let em = email.get_untracked();
-            if em.is_empty() {
-                error.set(Some(
-                    "Saisissez votre adresse email pour renvoyer le lien.".to_string(),
-                ));
-                return;
-            }
-            error.set(None);
-            resend_notice.set(None);
-            loading.set(true);
-            leptos::task::spawn_local(async move {
-                match browser::resend_signup(&em).await {
-                    Ok(()) => {
-                        resend_notice.set(Some(
-                            "Email de confirmation renvoyé. Vérifiez votre boîte (et le dossier indésirable)."
-                                .to_string(),
-                        ));
-                        show_resend.set(false);
-                    }
-                    Err(msg) => error.set(Some(msg)),
-                }
-                loading.set(false);
-            });
-        }
-    });
-
-    let on_reset = Callback::new(move |_: leptos::ev::MouseEvent| {
-        #[cfg(feature = "hydrate")]
-        {
-            let em = email.get_untracked();
-            if em.is_empty() {
-                error.set(Some(
-                    "Saisissez votre adresse email pour recevoir le lien de réinitialisation."
-                        .to_string(),
-                ));
-                return;
-            }
-            error.set(None);
-            loading.set(true);
-            leptos::task::spawn_local(async move {
-                let redirect_to =
-                    format!("{}/reinitialiser-mot-de-passe", browser::location_origin());
-                match crate::auth::reset_password(&em, &redirect_to).await {
-                    Ok(()) => reset_sent.set(true),
-                    Err(msg) => error.set(Some(msg)),
-                }
-                loading.set(false);
-            });
-        }
-    });
-
     view! {
         <Title text="Connexion - LibreJustice" />
         <Meta name="robots" content="noindex" />
-        <Show
-            when=move || confirm_sent.get() || reset_sent.get()
-            fallback=move || {
-                view! {
-                    <LoginForm
-                        email=email
-                        password=password
-                        is_sign_up=is_sign_up
-                        error=error
-                        loading=loading
-                        resend_notice=resend_notice
-                        show_resend=show_resend
-                        on_submit=on_submit
-                        on_oauth=on_oauth
-                        on_resend=on_resend
-                        on_reset=on_reset
-                    />
-                }
+        {move || {
+            let sent = query.with(|q| q.get("sent"));
+            let mode = query.with(|q| q.get("mode").unwrap_or_default());
+            let error = query.with(|q| q.get("error"));
+            let next = query.with(|q| q.get("next").unwrap_or_default());
+            match sent.as_deref() {
+                Some(genre) => view! { <MailEnvoye genre=genre.to_string() /> }.into_any(),
+                None if mode == "reset" => view! { <DemandeReset next error /> }.into_any(),
+                None if mode == "lien" => view! { <DemandeLien next error /> }.into_any(),
+                None => view! { <Identifiants signup=mode == "signup" next error /> }.into_any(),
             }
-        >
-            <div class="mx-auto flex max-w-sm flex-col gap-4 px-4 py-16">
-                <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Email envoyé"</h1>
-                <p class="text-[var(--color-ink-muted)]">
-                    {move || {
-                        if reset_sent.get() {
-                            "Si un compte existe pour cette adresse, un lien de réinitialisation vous a été envoyé. Ouvrez-le sur ce navigateur."
-                        } else {
-                            "Vérifiez votre boîte mail et cliquez sur le lien de confirmation pour activer votre compte."
-                        }
-                    }}
-                </p>
-            </div>
-        </Show>
+        }}
     }
 }
 
-/// Formulaire de connexion / inscription (le contenu hors ecran « Email envoyé »).
+/// Formulaire de connexion ou d'inscription, selon `signup`. Le POST natif porte
+/// `next` en champ caché ; l'erreur du rebond s'affiche traduite, et
+/// `email_not_confirmed` déplie le formulaire de renvoi du mail.
 #[component]
-fn LoginForm(
-    email: RwSignal<String>,
-    password: RwSignal<String>,
-    is_sign_up: RwSignal<bool>,
-    error: RwSignal<Option<String>>,
-    loading: RwSignal<bool>,
-    resend_notice: RwSignal<Option<String>>,
-    show_resend: RwSignal<bool>,
-    on_submit: Callback<leptos::ev::SubmitEvent>,
-    on_oauth: Callback<leptos::ev::MouseEvent>,
-    on_resend: Callback<leptos::ev::MouseEvent>,
-    on_reset: Callback<leptos::ev::MouseEvent>,
-) -> impl IntoView {
+fn Identifiants(signup: bool, next: String, error: Option<String>) -> impl IntoView {
+    let avec_next = |base: &str| {
+        if next.is_empty() {
+            base.to_string()
+        } else {
+            let sep = if base.contains('?') { '&' } else { '?' };
+            format!(
+                "{base}{sep}next={}",
+                leptos_router::location::Url::escape(&next)
+            )
+        }
+    };
+    let lien_reset = avec_next("/login?mode=reset");
+    let lien_magique = avec_next("/login?mode=lien");
+    let lien_bascule = if signup {
+        avec_next("/login")
+    } else {
+        avec_next("/login?mode=signup")
+    };
+    let renvoi = error.as_deref() == Some("email_not_confirmed");
+    let message = error.map(|code| translate_auth_error(Some(&code)));
+
     view! {
         <div class="mx-auto flex max-w-sm flex-col gap-8 px-4 py-16">
             <div class="flex flex-col gap-2">
                 <h1 class="font-sans text-2xl text-[var(--color-ink)]">
-                    {move || if is_sign_up.get() { "Créer un compte" } else { "Connexion" }}
+                    {if signup { "Créer un compte" } else { "Connexion" }}
                 </h1>
                 <p class="text-sm text-[var(--color-ink-muted)]">
                     "Accédez à l'ensemble des fonctionnalités LibreJustice."
                 </p>
             </div>
 
-            <div class="flex flex-col gap-3">
-                <button
-                    type="button"
-                    disabled=move || loading.get()
-                    on:click=move |ev| on_oauth.run(ev)
-                    class="flex items-center justify-center gap-2 rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] px-4 py-2.5 text-sm text-[var(--color-ink)] transition-colors hover:bg-[var(--color-rule)] disabled:opacity-50"
-                >
-                    "Continuer avec Google"
-                </button>
+            <div class="flex flex-col gap-2.5">
+                <GoogleButton />
+                <MicrosoftButton />
             </div>
 
             <div class="flex items-center gap-3">
@@ -250,17 +99,21 @@ fn LoginForm(
                 <div class="h-px flex-1 bg-[var(--color-rule)]"></div>
             </div>
 
-            <form on:submit=move |ev| on_submit.run(ev) class="flex flex-col gap-4">
+            <form
+                method="post"
+                action=if signup { "/internal/auth/signup" } else { "/internal/auth/login" }
+                class="flex flex-col gap-4"
+            >
+                <input type="hidden" name="next" value=next.clone() />
                 <div class="flex flex-col gap-1.5">
                     <label for="email" class="text-sm text-[var(--color-ink-muted)]">"Email"</label>
                     <input
                         id="email"
+                        name="email"
                         type="email"
                         autocomplete="email"
                         required
-                        prop:value=move || email.get()
-                        on:input=move |ev| email.set(event_target_value(&ev))
-                        class="rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] px-3 py-2 text-sm text-[var(--color-ink)] outline-none focus:border-[var(--color-accent)]"
+                        class=CHAMP
                     />
                 </div>
 
@@ -270,109 +123,274 @@ fn LoginForm(
                     </label>
                     <input
                         id="password"
+                        name="password"
                         type="password"
-                        autocomplete=move || {
-                            if is_sign_up.get() { "new-password" } else { "current-password" }
-                        }
+                        autocomplete=if signup { "new-password" } else { "current-password" }
                         required
-                        prop:value=move || password.get()
-                        on:input=move |ev| password.set(event_target_value(&ev))
-                        class="rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] px-3 py-2 text-sm text-[var(--color-ink)] outline-none focus:border-[var(--color-accent)]"
+                        class=CHAMP
                     />
-                    <Show when=move || is_sign_up.get()>
-                        <p class="text-xs text-[var(--color-ink-subtle)]">{PASSWORD_HINT}</p>
-                    </Show>
-                    <Show when=move || !is_sign_up.get()>
-                        <button
-                            type="button"
-                            disabled=move || loading.get()
-                            on:click=move |ev| on_reset.run(ev)
-                            class="self-end text-xs text-[var(--color-ink-muted)] hover:text-[var(--color-ink)] disabled:opacity-50"
-                        >
-                            "Mot de passe oublié ?"
-                        </button>
-                    </Show>
+                    {signup
+                        .then(|| {
+                            view! {
+                                <p class="text-xs text-[var(--color-ink-subtle)]">{PASSWORD_HINT}</p>
+                            }
+                        })}
+                    {(!signup)
+                        .then(|| {
+                            view! {
+                                <a
+                                    href=lien_reset
+                                    class="self-end text-xs text-[var(--color-ink-muted)] hover:text-[var(--color-ink)]"
+                                >
+                                    "Mot de passe oublié ?"
+                                </a>
+                            }
+                        })}
                 </div>
 
-                <Show when=move || error.get().is_some()>
-                    <div class="flex flex-col gap-2">
-                        <p class="text-sm text-red-600">{move || error.get().unwrap_or_default()}</p>
-                        <Show when=move || show_resend.get()>
-                            <button
-                                type="button"
-                                disabled=move || loading.get()
-                                on:click=move |ev| on_resend.run(ev)
-                                class="self-start text-sm text-[var(--color-accent)] underline hover:opacity-80 disabled:opacity-50"
-                            >
-                                "Renvoyer l'email de confirmation"
-                            </button>
-                        </Show>
-                    </div>
-                </Show>
-                <Show when=move || resend_notice.get().is_some()>
-                    <p class="text-sm text-[var(--color-ink-muted)]">
-                        {move || resend_notice.get().unwrap_or_default()}
-                    </p>
-                </Show>
+                {message
+                    .map(|m| {
+                        view! { <p class="text-sm text-red-600">{m}</p> }
+                    })}
 
-                <button
-                    type="submit"
-                    disabled=move || loading.get()
-                    class="rounded-md bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50"
-                >
-                    {move || {
-                        if loading.get() {
-                            "…"
-                        } else if is_sign_up.get() {
-                            "Créer le compte"
-                        } else {
-                            "Se connecter"
-                        }
-                    }}
+                <button type="submit" class=BOUTON>
+                    {if signup { "Créer le compte" } else { "Se connecter" }}
                 </button>
             </form>
 
-            <div class="flex flex-col gap-3 text-center text-sm text-[var(--color-ink-muted)]">
-                <button
-                    type="button"
-                    on:click=move |_| is_sign_up.update(|v| *v = !*v)
-                    class="hover:text-[var(--color-ink)]"
-                >
-                    {move || {
-                        if is_sign_up.get() {
-                            "Déjà un compte ? Se connecter"
-                        } else {
-                            "Pas encore de compte ? Créer"
-                        }
+            <div class="text-center text-sm text-[var(--color-ink-muted)]">
+                <a href=lien_magique class="hover:text-[var(--color-ink)]">
+                    "Recevoir un lien de connexion par email"
+                </a>
+            </div>
+
+            {renvoi
+                .then(|| {
+                    view! {
+                        <form method="post" action="/internal/auth/resend" class="flex flex-col gap-2">
+                            <input type="hidden" name="next" value=next.clone() />
+                            <label
+                                for="resend-email"
+                                class="text-sm text-[var(--color-ink-muted)]"
+                            >
+                                "Renvoyer l'email de confirmation"
+                            </label>
+                            <input
+                                id="resend-email"
+                                name="email"
+                                type="email"
+                                autocomplete="email"
+                                required
+                                class=CHAMP
+                            />
+                            <button
+                                type="submit"
+                                class="self-start text-sm text-[var(--color-accent)] underline hover:opacity-80"
+                            >
+                                "Renvoyer l'email"
+                            </button>
+                        </form>
+                    }
+                })}
+
+            <div class="text-center text-sm text-[var(--color-ink-muted)]">
+                <a href=lien_bascule class="hover:text-[var(--color-ink)]">
+                    {if signup {
+                        "Déjà un compte ? Se connecter"
+                    } else {
+                        "Pas encore de compte ? Créer"
                     }}
-                </button>
+                </a>
+            </div>
+            <SignalerDepuisEcranBloquant de="/login" />
+        </div>
+    }
+}
+
+/// Sortie de secours d'un écran où l'on peut rester coincé sans recours : la
+/// connexion et le consentement MCP sont les deux culs-de-sac où un utilisateur
+/// bloqué n'a rien d'autre à cliquer.
+#[component]
+pub fn SignalerDepuisEcranBloquant(de: &'static str) -> impl IntoView {
+    view! {
+        <div class="text-center text-xs text-[var(--color-ink-subtle)]">
+            <a href=format!("/feedback?from={de}") class="hover:text-[var(--color-ink)]">
+                "Un problème ? Le signaler"
+            </a>
+        </div>
+    }
+}
+
+/// Demande de lien de réinitialisation (`?mode=reset`) : l'adresse seule, la
+/// réponse est identique que le compte existe ou non.
+#[component]
+fn DemandeReset(next: String, error: Option<String>) -> impl IntoView {
+    let retour = if next.is_empty() {
+        "/login".to_string()
+    } else {
+        format!(
+            "/login?next={}",
+            leptos_router::location::Url::escape(&next)
+        )
+    };
+    let message = error.map(|code| translate_auth_error(Some(&code)));
+    view! {
+        <div class="mx-auto flex max-w-sm flex-col gap-8 px-4 py-16">
+            <div class="flex flex-col gap-2">
+                <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Mot de passe oublié"</h1>
+                <p class="text-sm text-[var(--color-ink-muted)]">
+                    "Recevez par email un lien de réinitialisation."
+                </p>
+            </div>
+            <form method="post" action="/internal/auth/reset-request" class="flex flex-col gap-4">
+                <input type="hidden" name="next" value=next.clone() />
+                <div class="flex flex-col gap-1.5">
+                    <label for="email" class="text-sm text-[var(--color-ink-muted)]">"Email"</label>
+                    <input
+                        id="email"
+                        name="email"
+                        type="email"
+                        autocomplete="email"
+                        required
+                        class=CHAMP
+                    />
+                </div>
+                {message
+                    .map(|m| {
+                        view! { <p class="text-sm text-red-600">{m}</p> }
+                    })}
+                <button type="submit" class=BOUTON>"Envoyer le lien"</button>
+            </form>
+            <div class="text-center text-sm text-[var(--color-ink-muted)]">
+                <a href=retour class="hover:text-[var(--color-ink)]">"Retour à la connexion"</a>
             </div>
         </div>
     }
 }
 
-/// Resout la destination de `?next=` : chemin interne relatif (`/` non suivi de
-/// `/`), sinon l'accueil. Les points d'entrée de la connexion posent tous
-/// `?next=` (page courante ou page protégée demandée) : le défaut ne sert que
-/// quand la destination est inconnue.
-#[cfg(feature = "hydrate")]
-pub(crate) fn next_url(raw: Option<String>) -> String {
-    let raw = raw.unwrap_or_else(|| "/".to_string());
-    let bytes = raw.as_bytes();
-    let internal = bytes.first() == Some(&b'/') && bytes.get(1) != Some(&b'/');
-    if internal {
-        raw
+/// Demande de lien de connexion (`?mode=lien`) : l'adresse seule. Le lien vaut
+/// mot de passe, donc la réponse ne dit pas si le compte existait.
+#[component]
+fn DemandeLien(next: String, error: Option<String>) -> impl IntoView {
+    let retour = if next.is_empty() {
+        "/login".to_string()
     } else {
-        "/".to_string()
+        format!(
+            "/login?next={}",
+            leptos_router::location::Url::escape(&next)
+        )
+    };
+    let message = error.map(|code| translate_auth_error(Some(&code)));
+    view! {
+        <div class="mx-auto flex max-w-sm flex-col gap-8 px-4 py-16">
+            <div class="flex flex-col gap-2">
+                <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Connexion par email"</h1>
+                <p class="text-sm text-[var(--color-ink-muted)]">
+                    "Recevez un lien qui ouvre votre session. Sans mot de passe à retenir."
+                </p>
+            </div>
+            <form method="post" action="/internal/auth/link-request" class="flex flex-col gap-4">
+                <input type="hidden" name="next" value=next.clone() />
+                <div class="flex flex-col gap-1.5">
+                    <label for="email" class="text-sm text-[var(--color-ink-muted)]">"Email"</label>
+                    <input
+                        id="email"
+                        name="email"
+                        type="email"
+                        autocomplete="email"
+                        required
+                        class=CHAMP
+                    />
+                </div>
+                {message
+                    .map(|m| {
+                        view! { <p class="text-sm text-red-600">{m}</p> }
+                    })}
+                <button type="submit" class=BOUTON>"Envoyer le lien"</button>
+            </form>
+            <div class="text-center text-sm text-[var(--color-ink-muted)]">
+                <a href=retour class="hover:text-[var(--color-ink)]">"Retour à la connexion"</a>
+            </div>
+        </div>
     }
 }
 
-/// Lien de redirection du mail de confirmation d'inscription : origine + la
-/// destination `?next=` (l'accueil par défaut, cf. `next_url`).
-///
-/// Le lien doit ramener là où l'inscription a commencé, paramètres OAuth de
-/// `/authorize-mcp` compris.
-#[cfg(feature = "hydrate")]
-fn signup_redirect(next: &str) -> String {
-    format!("{}{next}", browser::location_origin())
+/// Écran « Email envoyé » (`?sent=confirmation|recovery|connexion`).
+#[component]
+fn MailEnvoye(genre: String) -> impl IntoView {
+    view! {
+        <div class="mx-auto flex max-w-sm flex-col gap-4 px-4 py-16">
+            <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Email envoyé"</h1>
+            <p class="text-[var(--color-ink-muted)]">
+                {match genre.as_str() {
+                    "recovery" => {
+                        "Si un compte existe pour cette adresse, un lien de réinitialisation vous a été envoyé. Ouvrez-le sur ce navigateur."
+                    }
+                    "connexion" => {
+                        "Un lien de connexion vous a été envoyé. Ouvrez-le sur ce navigateur : il vaut mot de passe, une fois et pour une heure."
+                    }
+                    _ => {
+                        "Vérifiez votre boîte mail et cliquez sur le lien de confirmation pour activer votre compte."
+                    }
+                }}
+            </p>
+        </div>
+    }
+}
+
+const BOUTON_FOURNISSEUR: &str = "flex items-center justify-center gap-2.5 rounded-md border \
+     border-[var(--color-rule)] bg-[var(--color-parchment)] px-4 py-2.5 text-sm font-medium \
+     text-[var(--color-ink)] transition-colors hover:bg-[var(--color-vellum)]";
+
+fn lien_start(fournisseur: &'static str) -> impl Fn() -> String {
+    let query = leptos_router::hooks::use_query_map();
+    move || {
+        let next = query.with(|q| q.get("next").unwrap_or_default());
+        format!(
+            "/internal/auth/{fournisseur}/start?next={}",
+            leptos_router::location::Url::escape(&next)
+        )
+    }
+}
+
+#[component]
+fn GoogleButton() -> impl IntoView {
+    view! {
+        <a href=lien_start("google") rel="external nofollow" class=BOUTON_FOURNISSEUR>
+            <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true">
+                <path
+                    fill="#4285F4"
+                    d="M45.1 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h11.8c-.5 2.7-2.1 5-4.4 6.5v5.4h7.1c4.2-3.8 6.6-9.5 6.6-15.9z"
+                />
+                <path
+                    fill="#34A853"
+                    d="M24 46c5.7 0 10.5-1.9 14-5.1l-7.1-5.4c-1.9 1.3-4.4 2.1-6.9 2.1-5.5 0-10.2-3.7-11.8-8.7H5v5.6C8.6 41.7 15.7 46 24 46z"
+                />
+                <path
+                    fill="#FBBC05"
+                    d="M12.2 28.9c-.4-1.2-.7-2.5-.7-3.9s.2-2.7.7-3.9v-5.6H5C3.6 18.3 2.8 21 2.8 25s.8 6.7 2.2 9.5l7.2-5.6z"
+                />
+                <path
+                    fill="#EA4335"
+                    d="M24 11.4c3.1 0 5.9 1.1 8.1 3.2l6.2-6.2C34.5 4.8 29.7 3 24 3 15.7 3 8.6 7.3 5 15.5l7.2 5.6c1.6-5 6.3-8.7 11.8-8.7z"
+                />
+            </svg>
+            "Continuer avec Google"
+        </a>
+    }
+}
+
+#[component]
+fn MicrosoftButton() -> impl IntoView {
+    view! {
+        <a href=lien_start("microsoft") rel="external nofollow" class=BOUTON_FOURNISSEUR>
+            <svg width="18" height="18" viewBox="0 0 23 23" aria-hidden="true">
+                <path fill="#F25022" d="M1 1h10v10H1z" />
+                <path fill="#7FBA00" d="M12 1h10v10H12z" />
+                <path fill="#00A4EF" d="M1 12h10v10H1z" />
+                <path fill="#FFB900" d="M12 12h10v10H12z" />
+            </svg>
+            "Continuer avec Microsoft"
+        </a>
+    }
 }

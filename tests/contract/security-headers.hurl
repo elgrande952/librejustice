@@ -7,7 +7,7 @@
 # sortir le TLS du binaire l'aurait éteint sans un seul signal. D'où
 # ce contrat, joué contre la cible live après tout deploy.
 
-GET {{base}}/api/health
+GET {{base}}/admin/health
 HTTP 200
 [Asserts]
 # HSTS un an, sans includeSubDomains ni preload (irrévocables, cf. doc du
@@ -29,3 +29,7 @@ HTTP 200
 header "strict-transport-security" contains "max-age=31536000"
 header "x-content-type-options" == "nosniff"
 header "content-security-policy" contains "nonce-"
+# The identity detour navigates to our own `/internal/auth/google/start`: no
+# third-party origin is expected here, and one reappearing is worth explaining.
+header "content-security-policy" not contains "accounts.google.com"
+header "content-security-policy" contains "connect-src 'self';"

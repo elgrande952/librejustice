@@ -59,7 +59,6 @@ pub async fn juricaf_probe(dir: Option<std::path::PathBuf>) -> Result<()> {
                 .as_deref()
                 .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
             docket_numbers: parsed.decision.numero_dossiers.clone().unwrap_or_default(),
-            search_title: Some(parsed.title.clone()),
             ..Default::default()
         };
         extracted.jurisdiction = Some(JurisdictionRow {

@@ -2,10 +2,12 @@
 //! la lecture) et l'ingest (écriture de `search_title`) : une seule fonction, un
 //! seul format.
 //!
-//! Format : `<juridiction>[, <siège>], <date FR>, <premier numéro>` — p. ex.
-//! « Cour d'appel de Paris, pôle 5 — 3e chambre · formation à trois,
+//! Format : `<juridiction>[, <siège>], <date FR>[, <nom d'usage>],
+//! <premier numéro>`, p. ex.
+//! « Cour d'appel de Paris, pôle 5, 3e chambre · formation à trois,
 //! 25 février 2026, 21/04532 ». Le siège est recomposé depuis les axes
-//! structurés (`chamber_position` + labels `formation:*` / `office:*`), jamais
+//! structurés (`chamber_key` + `matiere_uid` + labels `formation:*` /
+//! `office:*`), jamais
 //! depuis une chaîne source.
 
 const FR_MONTHS: [&str; 12] = [
@@ -52,11 +54,6 @@ pub const FORMATION_LABELS: &[(&str, &str)] = &[
     ("formation:RESTREINTE", "Formation restreinte"),
     ("formation:SECTION", "Formation de section"),
     ("formation:PLENIERE", "Formation plénière"),
-    ("formation:MIXTE", "Formation mixte"),
-    ("formation:SSR", "Sous-sections réunies"),
-    ("formation:CHAMBRES_REUNIES", "Chambres réunies"),
-    ("formation:ASSEMBLEE", "Assemblée du contentieux"),
-    ("formation:SPECIALISEE", "Formation spécialisée"),
 ];
 
 /// Labels des offices `office:*` — miroir du référentiel.
@@ -68,11 +65,6 @@ pub const OFFICE_LABELS: &[(&str, &str)] = &[
     ("office:JUGE_ENFANTS", "Juge des enfants"),
     ("office:PREMIER_PRESIDENT", "Premier président"),
     ("office:MAGISTRAT_DESIGNE", "Magistrat désigné"),
-    ("office:JUGE_REFERES", "Juge des référés"),
-    (
-        "office:PRESIDENT_SECTION_CONTENTIEUX",
-        "Président de la section du contentieux",
-    ),
     ("office:JUGE_EXPROPRIATION", "Juge de l'expropriation"),
 ];
 
@@ -162,7 +154,7 @@ fn formation_redundant(base: &str, formation: &str) -> bool {
         .all(|t| base_tokens.contains(&t))
 }
 
-/// Siège recomposé depuis les axes structurés : `chamber_position`, qualifié
+/// Siège recomposé depuis les axes structurés : la chambre, qualifiée
 /// après un point médian par le type de formation ou à défaut l'office
 /// (« 7e chambre · juge des libertés et de la détention ») — le « · » évite les
 /// parenthèses imbriquées quand le titre est lui-même cité entre parenthèses ;
@@ -172,12 +164,12 @@ fn formation_redundant(base: &str, formation: &str) -> bool {
 /// « Sous-sections 2/6 réunies » n'est pas suffixée « (sous-sections réunies) ».
 pub fn seat_display(
     jurisdiction: &str,
-    chamber_position: Option<&str>,
+    chamber_label: Option<&str>,
     formation_label: Option<&str>,
     office_label: Option<&str>,
 ) -> Option<String> {
     let jur_folded = fold(jurisdiction);
-    let base = chamber_position
+    let base = chamber_label
         .map(str::trim)
         .filter(|p| !p.is_empty() && !jur_folded.contains(&fold(p)));
     let formation = formation_label.map(str::trim).filter(|f| {
@@ -210,13 +202,15 @@ pub fn seat_display(
     }
 }
 
-/// Titre canonique « <juridiction>[, <siège>], <date FR>, <numéro> ». La
-/// juridiction est le label référentiel déjà résolu par l'appelant ; le siège
-/// sort de [`seat_display`].
+/// Titre canonique « <juridiction>[, <siège>], <date FR>[, <nom d'usage>],
+/// <numéro> ». La juridiction est le label référentiel déjà résolu par
+/// l'appelant, le siège sort de [`seat_display`], et le nom d'usage précède le
+/// numéro comme le Conseil d'État cite ses propres arrêts.
 pub fn decision_title(
     jurisdiction: &str,
     seat: Option<&str>,
     date_lecture: Option<&str>,
+    case_name: Option<&str>,
     docket: Option<&str>,
 ) -> String {
     let mut parts = vec![jurisdiction.trim().to_string()];
@@ -225,6 +219,9 @@ pub fn decision_title(
     }
     if let Some(date) = date_lecture.filter(|d| !d.is_empty()) {
         parts.push(format_fr_date(date));
+    }
+    if let Some(nom) = case_name.map(str::trim).filter(|n| !n.is_empty()) {
+        parts.push(nom.to_string());
     }
     if let Some(n) = docket.map(str::trim).filter(|n| !n.is_empty()) {
         parts.push(n.to_string());
@@ -240,13 +237,13 @@ mod tests {
     fn seat_pole_chambre_avec_formation() {
         let seat = seat_display(
             "Cour d'appel de Paris",
-            Some("Pôle 5 — 3e chambre"),
+            Some("Pôle 5, 3e chambre"),
             Some("Formation à trois"),
             None,
         );
         assert_eq!(
             seat.as_deref(),
-            Some("pôle 5 — 3e chambre · formation à trois")
+            Some("pôle 5, 3e chambre · formation à trois")
         );
     }
 
@@ -338,16 +335,32 @@ mod tests {
     }
 
     #[test]
+    fn le_nom_dusage_precede_le_numero() {
+        let title = decision_title(
+            "Conseil d'État",
+            Some("formation de section"),
+            Some("2011-12-09"),
+            Some("Marcou"),
+            Some("337255"),
+        );
+        assert_eq!(
+            title,
+            "Conseil d'État, formation de section, 9 décembre 2011, Marcou, 337255"
+        );
+    }
+
+    #[test]
     fn titre_complet() {
         let title = decision_title(
             "Cour d'appel de Paris",
-            Some("pôle 5 — 3e chambre · formation à trois"),
+            Some("pôle 5, 3e chambre · formation à trois"),
             Some("2026-02-25"),
+            None,
             Some("21/04532"),
         );
         assert_eq!(
             title,
-            "Cour d'appel de Paris, pôle 5 — 3e chambre · formation à trois, 25 février 2026, 21/04532"
+            "Cour d'appel de Paris, pôle 5, 3e chambre · formation à trois, 25 février 2026, 21/04532"
         );
     }
 

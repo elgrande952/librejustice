@@ -14,7 +14,7 @@
 
 use crate::error::{Result, SourceError};
 use crate::html_strip::strip_html;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use regex::Regex;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
@@ -37,6 +37,11 @@ pub const THROTTLE: Duration = Duration::from_millis(300);
 const CJUE_RETRIES: u32 = 4;
 /// Page SPARQL (sous le cap OFFSET 10 000 par année).
 pub const PAGE_SIZE: usize = 1000;
+/// CELEX par requête de borne de validité. La contrainte est la longueur d'URL :
+/// mesuré, 200 CELEX (7,4 ko) passent, 300 (10,9 ko) rendent 400.
+const VALIDITY_CHUNK: usize = 150;
+/// Borne EUR-Lex d'un acte sans terme.
+const NO_END_OF_VALIDITY: &str = "9999-12-31";
 /// Cascade d'`Accept` du resource endpoint : certains arrêts ne sont servis qu'en
 /// xhtml, `text/html` répondant alors 404.
 pub const ACCEPT_CASCADE: [&str; 2] = ["application/xhtml+xml", "text/html"];
@@ -123,6 +128,85 @@ SELECT DISTINCT ?celex WHERE {{\n\
   FILTER(?created >= \"{since}\"^^<http://www.w3.org/2001/XMLSchema#date>)\n\
   ?w cdm:resource_legal_id_celex ?celex .\n\
 }}\nLIMIT {CONSOLIDATIONS_LIMIT}"
+    )
+}
+
+/// Réduit les lignes d'une page SPARQL de validité : par CELEX, la fin la plus
+/// tardive, et à part les CELEX que le sentinel déclare sans terme.
+fn reduire_bornes(
+    page: &Value,
+    ends: &mut std::collections::HashMap<String, NaiveDate>,
+    sans_terme: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    for row in page["results"]["bindings"].as_array().into_iter().flatten() {
+        let (Some(celex), Some(end)) =
+            (row["celex"]["value"].as_str(), row["end"]["value"].as_str())
+        else {
+            continue;
+        };
+        if end == NO_END_OF_VALIDITY {
+            sans_terme.insert(celex.to_string());
+            continue;
+        }
+        let fin = NaiveDate::parse_from_str(end, "%Y-%m-%d").map_err(|e| {
+            SourceError::Invalid(format!("borne de validité {celex} = {end:?}: {e}"))
+        })?;
+        ends.entry(celex.to_string())
+            .and_modify(|f: &mut NaiveDate| *f = (*f).max(fin))
+            .or_insert(fin);
+    }
+    Ok(())
+}
+
+/// Borne de validité d'un lot d'actes, par CELEX de base.
+fn validity_sparql(bases: &[String]) -> String {
+    let values = bases
+        .iter()
+        .map(|c| format!("\"{c}\"^^xsd:string"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+SELECT DISTINCT ?celex ?end WHERE {{\n\
+  VALUES ?celex {{ {values} }}\n\
+  ?w cdm:resource_legal_id_celex ?celex .\n\
+  ?w cdm:resource_legal_date_end-of-validity ?end .\n\
+}}"
+    )
+}
+
+/// Secondary-law resource types swept from the registry. The delegated and
+/// implementing acts weigh 10,104 of the 13,124 since 2015, and they cost the
+/// weekly net one CELLAR notice each, never the daily run, which asks a single
+/// SPARQL delta whatever the size of the registry. Left out, `DEC`, `DEC_IMPL`,
+/// `RECO`, `CORRIGENDUM` and the budgets.
+const LEGISLATION_TYPES: &[&str] = &["REG", "DIR", "REG_IMPL", "REG_DEL", "DIR_IMPL", "DIR_DEL"];
+
+/// SPARQL listing of one year of secondary law (sector 3), FR title and document
+/// date included. The title is joined here rather than asked act by act: a page
+/// of 1,000 comes back in ~0.6 s, a thousand notices cost a thousand requests.
+fn legislation_page_sparql(year: i32, offset: usize, limit: usize) -> String {
+    let types = LEGISLATION_TYPES
+        .iter()
+        .map(|t| format!("<http://publications.europa.eu/resource/authority/resource-type/{t}>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+SELECT DISTINCT ?celex ?date ?title WHERE {{\n\
+  ?work cdm:work_has_resource-type ?type .\n\
+  VALUES ?type {{ {types} }}\n\
+  ?work cdm:resource_legal_id_celex ?celex .\n\
+  FILTER(STRSTARTS(STR(?celex), \"3\") && !CONTAINS(STR(?celex), \"R(\"))\n\
+  ?work cdm:work_date_document ?date .\n\
+  FILTER(?date >= \"{year}-01-01\"^^xsd:date && ?date < \"{next}-01-01\"^^xsd:date)\n\
+  ?exp cdm:expression_belongs_to_work ?work .\n\
+  ?exp cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/FRA> .\n\
+  ?exp cdm:expression_title ?title .\n\
+}}\nORDER BY ?celex\nOFFSET {offset}\nLIMIT {limit}",
+        next = year + 1
     )
 }
 
@@ -246,6 +330,91 @@ impl CjueClient {
             )));
         }
         Ok(sonic_rs::from_str(&text)?)
+    }
+
+    /// One page of a year's legislative registry: `(celex, date, FR title)`, in
+    /// CELEX order. A full page means more remain, the caller advances `offset`.
+    pub async fn legislation_page(
+        &self,
+        year: i32,
+        offset: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        let params: [(&str, String); 2] = [
+            ("query", legislation_page_sparql(year, offset, PAGE_SIZE)),
+            ("format", "application/sparql-results+json".to_string()),
+        ];
+        let (status, text) = self
+            .get_with_retry(
+                &self.sparql_url,
+                &params,
+                "application/sparql-results+json",
+                None,
+                "sparql registre législatif",
+            )
+            .await?;
+        if status != 200 {
+            return Err(SourceError::Invalid(format!(
+                "eur-lex sparql registre statut {status}: {}",
+                text.chars().take(200).collect::<String>()
+            )));
+        }
+        let page: Value = sonic_rs::from_str(&text)?;
+        let mut out = Vec::new();
+        for row in page["results"]["bindings"].as_array().into_iter().flatten() {
+            let (Some(celex), Some(date), Some(title)) = (
+                row["celex"]["value"].as_str(),
+                row["date"]["value"].as_str(),
+                row["title"]["value"].as_str(),
+            ) else {
+                continue;
+            };
+            out.push((celex.to_string(), date.to_string(), title.to_string()));
+        }
+        Ok(out)
+    }
+
+    /// Date à laquelle chaque acte cesse d'être en vigueur, par CELEX de base ;
+    /// absent = sans terme. La clôture d'un acte est un **ensemble** qu'on
+    /// demande d'un coup — 3 740 CELEX en ~6 s, là où la même réponse coûte
+    /// autant de notices HTTP.
+    ///
+    /// `resource_legal_in-force` n'est pas lu : il contredit la borne sur 199
+    /// des 3 740 actes du fond (drapeau à 1, fin datée dans le passé).
+    ///
+    /// Un acte porte parfois plusieurs bornes, sentinel « sans terme » compris :
+    /// 68 actes sur 651 le mêlent à une date passée. Le sentinel oppose son veto,
+    /// et à défaut la fin la plus tardive gagne — sinon l'ordre des lignes décide.
+    pub async fn acts_end_of_validity(
+        &self,
+        bases: &[String],
+    ) -> Result<std::collections::HashMap<String, NaiveDate>> {
+        let mut ends = std::collections::HashMap::new();
+        let mut sans_terme = std::collections::HashSet::new();
+        for chunk in bases.chunks(VALIDITY_CHUNK) {
+            let params: [(&str, String); 2] = [
+                ("query", validity_sparql(chunk)),
+                ("format", "application/sparql-results+json".to_string()),
+            ];
+            let (status, text) = self
+                .get_with_retry(
+                    &self.sparql_url,
+                    &params,
+                    "application/sparql-results+json",
+                    None,
+                    "sparql borne de validité",
+                )
+                .await?;
+            if status != 200 {
+                return Err(SourceError::Invalid(format!(
+                    "eur-lex sparql validité statut {status}: {}",
+                    text.chars().take(200).collect::<String>()
+                )));
+            }
+            let page: Value = sonic_rs::from_str(&text)?;
+            reduire_bornes(&page, &mut ends, &mut sans_terme)?;
+        }
+        ends.retain(|celex, _| !sans_terme.contains(celex));
+        Ok(ends)
     }
 
     /// Texte d'un CELEX, **FR-prioritaire avec repli EN**. Pour chaque langue (`fra`
@@ -439,10 +608,12 @@ impl CjueClient {
     /// Formex 4 FR d'un CELEX (de base, ou consolidé `0{corps}-{AAAAMMJJ}`) :
     /// la manifestation `.FRA.fmx4` est un RDF qui liste les items cellar
     /// `DOC_n` ; chaque item est du Formex nu **ou un ZIP** (actes à figures).
-    /// Rend le document-acte (`<ACT>`/`<CONS.ACT>`, celui qui porte le plus
-    /// d'`<ARTICLE>` — les volumes d'annexes n'en portent pas) ; `Ok(None)` si
-    /// la manifestation n'existe pas (acte pré-Formex, directive modificative).
-    pub async fn formex_act_fr(&self, celex: &str) -> Result<Option<String>> {
+    /// Returns the act document (`<ACT>`/`<CONS.ACT>`, the one carrying the most
+    /// `<ARTICLE>`) first, then the annex volumes (`<ANNEX>`) a base act
+    /// publishes as separate documents; a consolidated one carries its own
+    /// inline, as `<CONS.ANNEX>`. Empty: no manifestation (pre-Formex act,
+    /// purely amending directive) or an act document with no article.
+    pub async fn formex_act_fr(&self, celex: &str) -> Result<Vec<String>> {
         let url = format!("{}/{celex}.FRA.fmx4", self.resource_base);
         let (status, rdf) = self
             .get_with_retry(
@@ -454,7 +625,7 @@ impl CjueClient {
             )
             .await?;
         if status == 404 || status == 406 || (300..400).contains(&status) {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         if status != 200 {
             return Err(SourceError::Invalid(format!(
@@ -470,7 +641,9 @@ impl CjueClient {
         docs.dedup();
 
         let act_root = Regex::new(r"<(CONS\.ACT|ACT)[\s>]").expect("regex racine acte");
+        let annex_root = Regex::new(r"<ANNEX[\s>]").expect("regex racine annexe");
         let mut best: Option<(usize, String)> = None;
+        let mut annexes: Vec<String> = Vec::new();
         for doc in &docs {
             let (status, bytes) = self
                 .get_bytes_with_retry(doc, &format!("cellar item {doc}"))
@@ -485,16 +658,22 @@ impl CjueClient {
                 vec![String::from_utf8_lossy(&bytes).into_owned()]
             };
             for body in bodies {
-                if !act_root.is_match(&body) {
-                    continue;
-                }
-                let n = body.matches("<ARTICLE").count();
-                if n > 0 && best.as_ref().is_none_or(|(bn, _)| n > *bn) {
-                    best = Some((n, body));
+                if act_root.is_match(&body) {
+                    let n = body.matches("<ARTICLE").count();
+                    if n > 0 && best.as_ref().is_none_or(|(bn, _)| n > *bn) {
+                        best = Some((n, body));
+                    }
+                } else if annex_root.is_match(&body) {
+                    annexes.push(body);
                 }
             }
         }
-        Ok(best.map(|(_, b)| b))
+        let Some((_, act)) = best else {
+            return Ok(Vec::new());
+        };
+        let mut out = vec![act];
+        out.append(&mut annexes);
+        Ok(out)
     }
 
     /// GET binaire avec le même retry borné que [`Self::get_with_retry`] — les
@@ -1069,6 +1248,63 @@ Notion de \u{201c}mineur non accompagné\u{201d} » Dans l'affaire C-560/20, aya
         assert!(q.contains("cdm:act_consolidated_date"));
         assert!(q.contains(&format!("LIMIT {CONSOLIDATIONS_LIMIT}")));
         assert!(q.contains("DISTINCT"));
+    }
+
+    #[test]
+    fn validity_sparql_types_each_celex_and_stays_under_the_url_cap() {
+        let bases: Vec<String> = (0..VALIDITY_CHUNK).map(|i| format!("3196{i:07}")).collect();
+        let q = validity_sparql(&bases);
+        assert!(q.contains("cdm:resource_legal_date_end-of-validity ?end"));
+        // Sans le type, le VALUES ne joint rien : la propriété CELEX est un
+        // `xsd:string` typé, et un littéral nu ne l'égale pas.
+        assert!(q.contains("\"31960000000\"^^xsd:string"));
+        assert!(!q.contains("in-force"));
+        // Le lot passe en GET ; CELLAR rend 400 au-delà de ~10 ko d'URL.
+        assert!(q.len() < 8_000, "requête de {} octets", q.len());
+    }
+
+    /// Forme rendue par CELLAR pour 31994L0022 : une directive de 1994 y porte
+    /// une fin au 30/06/1993 ET le sentinel sans terme. Le sentinel tranche,
+    /// sinon l'acte, en vigueur, sort du fond servi.
+    #[test]
+    fn le_sentinel_sans_terme_oppose_son_veto_a_une_fin_datee() {
+        let page: Value = sonic_rs::from_str(
+            r#"{"results":{"bindings":[
+                 {"celex":{"value":"31994L0022"},"end":{"value":"1993-06-30"}},
+                 {"celex":{"value":"31994L0022"},"end":{"value":"9999-12-31"}},
+                 {"celex":{"value":"31964L0433"},"end":{"value":"2005-12-31"}}]}}"#,
+        )
+        .expect("page json");
+        let mut ends = std::collections::HashMap::new();
+        let mut sans_terme = std::collections::HashSet::new();
+        reduire_bornes(&page, &mut ends, &mut sans_terme).expect("réduction");
+        ends.retain(|celex, _| !sans_terme.contains(celex));
+
+        assert!(!ends.contains_key("31994L0022"));
+        assert_eq!(
+            ends.get("31964L0433"),
+            Some(&NaiveDate::from_ymd_opt(2005, 12, 31).unwrap())
+        );
+    }
+
+    /// Plusieurs fins datées sans sentinel : la plus tardive, jamais la dernière
+    /// ligne arrivée.
+    #[test]
+    fn plusieurs_fins_datees_retiennent_la_plus_tardive() {
+        let page: Value = sonic_rs::from_str(
+            r#"{"results":{"bindings":[
+                 {"celex":{"value":"31967R0422"},"end":{"value":"2010-01-01"}},
+                 {"celex":{"value":"31967R0422"},"end":{"value":"1975-06-30"}}]}}"#,
+        )
+        .expect("page json");
+        let mut ends = std::collections::HashMap::new();
+        let mut sans_terme = std::collections::HashSet::new();
+        reduire_bornes(&page, &mut ends, &mut sans_terme).expect("réduction");
+
+        assert_eq!(
+            ends.get("31967R0422"),
+            Some(&NaiveDate::from_ymd_opt(2010, 1, 1).unwrap())
+        );
     }
 
     #[test]

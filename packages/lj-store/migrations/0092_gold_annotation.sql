@@ -1,6 +1,6 @@
 -- Migration 0092 — couche GOLD unifiée (vérité-terrain en base, version=1000).
 --
--- Porte les ground-truths du bench (jadis fichiers `apps/lj-bench/gt/*`) DANS la
+-- Porte les ground-truths du bench (jadis des fichiers) DANS la
 -- base, attachés à leur décision, à `version=1000` (couche gold/LLM distincte
 -- d'`EXTRACT_VERSION`). Couvre TOUS les champs d'extraction (outcome, parties,
 -- juridiction, domaine, facettes, sections…), pas seulement les citations — les

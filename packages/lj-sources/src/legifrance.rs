@@ -11,6 +11,7 @@
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use serde_json::{json, Value};
+use std::time::Duration;
 
 use crate::error::{Result, SourceError};
 use crate::piste::PisteOAuth;
@@ -39,6 +40,8 @@ impl LegifranceClient {
         let client = ClientBuilder::new(
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120))
                 .build()
                 .expect("reqwest client build"),
         )

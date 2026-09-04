@@ -1,9 +1,9 @@
 //! Référentiels facettes côté extraction.
 //!
 //! Les scanners émettent les uids `solution:*`/`procedure:*`/`office:*`/
-//! `legal_domain:*` directement aux sites de classification. Restent les
-//! dérivations transverses : `publication_uid` (codes source → rang le plus
-//! fort) et le référentiel `jurisdiction` (code + ligne à la volée).
+//! `legal_domain:*` directement aux sites de classification. Reste la
+//! dérivation transverse du référentiel `jurisdiction` (code + ligne à la
+//! volée).
 //!
 //! Chaque uid émis par les scanners existe dans le seed des référentiels de
 //! facettes (FK) — le test `emitted_uids_exist_in_seed` le garantit. Valeur
@@ -20,34 +20,6 @@ pub struct JurisdictionRef {
     pub label: String,
 }
 
-/// Codes de publication source (judiciaire minuscules, admin majuscules, cf.
-/// `lj-core::publication`) → clé `publication:*`-6, au rang le plus fort.
-/// Mapping TOTAL : pas de code → `AUTRE` (toute décision est facettable).
-pub fn publication_key(codes: &[String]) -> &'static str {
-    let mut best: (u8, &'static str) = (0, "AUTRE");
-    for code in codes {
-        let (rank, key) = match code.as_str() {
-            "A" => (6, "PUBLIE_LEBON"),
-            "B" => (5, "MENTIONNE_LEBON"),
-            // Signalées : importance au rang des tables (cf. significance_codes).
-            "C+" | "R" => (4, "MENTIONNE_LEBON"),
-            "C" | "D" | "Z" => (3, "INEDIT_LEBON"),
-            "b" | "r" => (6, "PUBLIE_BULLETIN"),
-            "n" => (3, "INEDIT_BULLETIN"),
-            _ => continue,
-        };
-        if rank > best.0 {
-            best = (rank, key);
-        }
-    }
-    best.1
-}
-
-/// Uid complet `publication:*` (mapping TOTAL — toute décision est facettable).
-pub fn publication_uid(codes: &[String]) -> String {
-    format!("publication:{}", publication_key(codes))
-}
-
 // ============================================================
 // Référentiel jurisdiction — code + ligne à la volée.
 // ============================================================
@@ -62,8 +34,8 @@ pub fn publication_uid(codes: &[String]) -> String {
 ///   ([`canonical_label`]), jamais recopié brut.
 ///
 /// `jurisdiction` = la cour, pour tous les ordres : la Cassation est une
-/// juridiction unique `cc`, la chambre vit dans les axes `chamber_position` /
-/// `chamber_uid`, jamais dans l'identité de juridiction.
+/// juridiction unique `cc`, la chambre vit dans les axes `chamber_key` /
+/// `matiere_uid`, jamais dans l'identité de juridiction.
 pub fn jurisdiction_ref(
     jurisdiction_type: &str,
     location: Option<&str>,
@@ -253,7 +225,18 @@ const NAME_PREFIXES: &[(&str, &str)] = &[
         "tribunal des activités économiques",
         "Tribunal des activités économiques",
     ),
+    ("tribunal mixte de commerce", "Tribunal mixte de commerce"),
     ("tribunal de commerce", "Tribunal de commerce"),
+    // Papeete écrit les deux formes ; c'est la même juridiction, canonisée sur
+    // la désignation officielle — celle que Nouméa emploie seule.
+    (
+        "tribunal civil de première instance",
+        "Tribunal de première instance",
+    ),
+    (
+        "tribunal de première instance",
+        "Tribunal de première instance",
+    ),
     ("tribunal administratif", "Tribunal administratif"),
     ("cour administrative d'appel", "Cour administrative d'appel"),
     ("cour d'appel", "Cour d'appel"),
@@ -351,18 +334,6 @@ fn deaccent(c: char) -> char {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-
-    #[test]
-    fn publication_ranking() {
-        let c = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert_eq!(publication_key(&c(&["b", "r"])), "PUBLIE_BULLETIN");
-        assert_eq!(publication_key(&c(&["n"])), "INEDIT_BULLETIN");
-        assert_eq!(publication_key(&c(&["C", "B"])), "MENTIONNE_LEBON");
-        assert_eq!(publication_key(&c(&["A", "B"])), "PUBLIE_LEBON");
-        assert_eq!(publication_key(&c(&["C+"])), "MENTIONNE_LEBON");
-        assert_eq!(publication_key(&[]), "AUTRE");
-        assert_eq!(publication_key(&c(&["xyz"])), "AUTRE");
-    }
 
     #[test]
     fn jurisdiction_ref_grains() {
@@ -487,6 +458,39 @@ mod tests {
         assert_eq!(j.city.as_deref(), Some("Paris"));
     }
 
+    /// Outre-mer : sans ces formes au vocabulaire, le type n'est pas reconnu et
+    /// le label retombe sur le type nu — Papeete devenait « Tribunal
+    /// judiciaire », une juridiction qui n'existe pas là-bas.
+    #[test]
+    fn overseas_forms_keep_their_city() {
+        let j = jurisdiction_ref(
+            "TJ",
+            Some("tj98735"),
+            Some("Tribunal civil de première instance de Papeete"),
+        )
+        .unwrap();
+        assert_eq!(j.label, "Tribunal de première instance de Papeete");
+        assert_eq!(j.city.as_deref(), Some("Papeete"));
+
+        let j = jurisdiction_ref(
+            "TJ",
+            Some("tj98818"),
+            Some("Tribunal de première instance de Nouméa"),
+        )
+        .unwrap();
+        assert_eq!(j.label, "Tribunal de première instance de Nouméa");
+        assert_eq!(j.city.as_deref(), Some("Nouméa"));
+
+        let j = jurisdiction_ref(
+            "TCOM",
+            Some("9721"),
+            Some("Tribunal mixte de commerce de Fort-de-France"),
+        )
+        .unwrap();
+        assert_eq!(j.label, "Tribunal mixte de commerce de Fort-de-France");
+        assert_eq!(j.city.as_deref(), Some("Fort-de-France"));
+    }
+
     #[test]
     fn location_from_canonical_ref_variants() {
         assert_eq!(
@@ -507,42 +511,72 @@ mod tests {
         );
     }
 
-    /// Chaque uid que les scanners peuvent émettre existe dans le seed (FK
-    /// `facet_value`). Listes = sites d'émission de `judilibre_outcome/special`,
-    /// `opendata_outcome` et `cnda`.
-    #[test]
-    fn emitted_uids_exist_in_seed() {
-        let sql = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../lj-store/migrations/0100_facet_referentiels.sql"
-        ))
-        .unwrap();
-        // Le seed initial est immuable ; une migration a renommé les namespaces en
-        // base — on applique le même renommage aux uids lus.
-        let rename = |uid: String| -> String {
+    /// The `facet_value` seed as the migrations leave it: every uid inserted,
+    /// minus what a later one deletes, by uid, by prefix or by whole facet. A
+    /// seeded row is immutable, so a namespace renamed in base is renamed here.
+    fn seeded_uids() -> BTreeSet<String> {
+        let rename = |uid: &str| -> String {
             for (old, new) in [
                 ("juridiction:", "jurisdiction_type:"),
                 ("domaine:", "legal_domain:"),
-                ("chambre:", "chamber:"),
+                ("chambre:", "matiere:"),
                 ("voie:", "procedure:"),
-                ("portee:", "significance:"),
             ] {
                 if let Some(suffix) = uid.strip_prefix(old) {
                     return format!("{new}{suffix}");
                 }
             }
-            uid
+            uid.to_string()
         };
-        let seed: BTreeSet<String> = sql
-            .lines()
-            .filter_map(|l| {
-                let rest = l.trim_start().strip_prefix("('")?;
-                Some(rest[..rest.find('\'')?].to_string())
-            })
-            .filter(|u| u.contains(':'))
-            .map(rename)
-            .collect();
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lj-store/migrations"
+        ))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+        files.sort();
+        let mut seed: BTreeSet<String> = BTreeSet::new();
+        for file in files {
+            let read = std::fs::read_to_string(&file).unwrap();
+            // Comments out first: an apostrophe in the prose pairs with the
+            // quotes of the statement and shifts every literal read below.
+            let sql: String = read
+                .lines()
+                .filter_map(|l| l.split("--").next())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for statement in sql.split(';') {
+                if statement.contains("INSERT INTO facet_value") {
+                    for line in statement.lines() {
+                        if let Some(uid) = line
+                            .trim_start()
+                            .strip_prefix("('")
+                            .and_then(|r| r.split('\'').next())
+                            .filter(|u| u.contains(':'))
+                        {
+                            seed.insert(rename(uid));
+                        }
+                    }
+                } else if statement.contains("DELETE FROM facet_value") {
+                    for literal in statement.split('\'').skip(1).step_by(2) {
+                        let prefix = match literal.contains(':') {
+                            true => literal.trim_end_matches('%').to_string(),
+                            false => format!("{literal}:"),
+                        };
+                        seed.retain(|u| !u.starts_with(&prefix));
+                    }
+                }
+            }
+        }
+        seed
+    }
 
+    /// Every uid the scanners can emit exists in the seed, which the
+    /// `facet_value` FK requires. The lists below are the emission sites.
+    #[test]
+    fn emitted_uids_exist_in_seed() {
+        let seed = seeded_uids();
         let mut emitted: Vec<String> = Vec::new();
         for s in [
             "REJET",
@@ -572,6 +606,7 @@ mod tests {
             "REFERE_SUSPENSION",
             "REFERE_CIVIL",
             "RECTIFICATION_INTERPRETATION",
+            "CHAMBRE_DU_CONSEIL",
         ] {
             emitted.push(format!("procedure:{v}"));
         }
@@ -587,20 +622,19 @@ mod tests {
         ] {
             emitted.push(format!("legal_domain:{d}"));
         }
-        for codes in [
-            vec!["A".to_string()],
-            vec!["B".to_string()],
-            vec!["C".to_string()],
-            vec!["C+".to_string()],
-            vec!["b".to_string()],
-            vec!["n".to_string()],
-            vec![],
-        ] {
-            emitted.push(publication_uid(&codes));
+        // The formation parse emits from its tables, and the two label tables
+        // of lj-core mirror the referential the API renders from.
+        for (uid, _) in crate::formation::FORMATION_SEED
+            .iter()
+            .chain(crate::formation::OFFICE_SEED_EXTRA)
+            .chain(lj_core::titles::FORMATION_LABELS)
+            .chain(lj_core::titles::OFFICE_LABELS)
+        {
+            emitted.push((*uid).to_string());
         }
 
         for uid in &emitted {
-            assert!(seed.contains(uid), "uid émis absent du seed 0100 : {uid}");
+            assert!(seed.contains(uid), "uid émis absent du seed : {uid}");
         }
     }
 }

@@ -1,5 +1,5 @@
 {
-  "_provenance": "généré depuis l'oracle Python (apps/api signals.compute_weights). NE PAS éditer à la main. Asservi par lj-api::signals::tests.",
+  "_provenance": "oracle des poids de fusion. Le générateur Python d'origine a disparu avec l'API Python : un cas s'ajoute à la main, et lj-api::signals::tests l'asservit.",
   "cases": [
     {
       "name": "empty_no_signal",
@@ -8,7 +8,8 @@
       "bm25_emb": [],
       "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "plain_no_signal",
@@ -17,106 +18,118 @@
       "bm25_emb": [],
       "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "article_L",
       "query": "article L 531-1 du CESEDA",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 0.2,
+      "title": 1.0,
       "bm25": 1.5,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "article_R",
       "query": "R. 222-1",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 0.2,
+      "title": 1.0,
       "bm25": 1.5,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "docket_cc_new",
       "query": "pourvoi 19-23.664",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 6.0,
+      "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "docket_admin",
       "query": "requête 2202166",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 6.0,
+      "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "date_fr",
       "query": "13 février 2024",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 1.5,
+      "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "date_iso",
       "query": "2024-02-13",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 1.5,
+      "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "date_only_cc_label",
       "query": "Cour de cassation 22 novembre 2000",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 1.5,
+      "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "docket_plus_date",
       "query": "arrêt 19-23.664 du 13 février 2024",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 9.0,
+      "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "article_plus_docket",
       "query": "article L 531-1 pourvoi 19-23.664",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 1.2000000000000002,
+      "title": 1.0,
       "bm25": 1.5,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "article_plus_date",
       "query": "article L 531-1 du 13 février 2024",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 0.30000000000000004,
+      "title": 1.0,
       "bm25": 1.5,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "article_docket_date",
       "query": "art. L 531-1 n° 19-23.664 du 13 février 2024",
       "ann_emb": [],
       "bm25_emb": [],
-      "title": 1.8000000000000003,
+      "title": 1.0,
       "bm25": 1.5,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "boost_ann",
@@ -147,7 +160,8 @@
       ],
       "title": 1.0,
       "bm25": 0.4,
-      "ann": 2.5
+      "ann": 2.5,
+      "docket": 0.0
     },
     {
       "name": "boost_ann_plus_docket",
@@ -176,9 +190,10 @@
           0.0
         ]
       ],
-      "title": 6.0,
+      "title": 1.0,
       "bm25": 0.4,
-      "ann": 2.5
+      "ann": 2.5,
+      "docket": 0.0
     },
     {
       "name": "no_boost_centroids_same",
@@ -209,7 +224,8 @@
       ],
       "title": 1.0,
       "bm25": 1.0,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
     },
     {
       "name": "article_excludes_boost",
@@ -238,9 +254,30 @@
           0.0
         ]
       ],
-      "title": 0.2,
+      "title": 1.0,
       "bm25": 1.5,
-      "ann": 1.0
+      "ann": 1.0,
+      "docket": 0.0
+    },
+    {
+      "name": "nom d'arret seul",
+      "query": "danthony",
+      "ann_emb": [],
+      "bm25_emb": [],
+      "title": 1.0,
+      "bm25": 1.0,
+      "ann": 1.0,
+      "docket": 0.0
+    },
+    {
+      "name": "nom d'arret noye dans la prose",
+      "query": "un detenu nomme Marie conteste une sanction disciplinaire prise par le chef d etablissement sans consultation de la commission",
+      "ann_emb": [],
+      "bm25_emb": [],
+      "title": 1.0,
+      "bm25": 1.0,
+      "ann": 1.0,
+      "docket": 0.0
     }
   ]
 }

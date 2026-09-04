@@ -30,6 +30,16 @@ pub(crate) fn is_boolean_query(query: &str) -> bool {
     BOOL_RE.is_match(query)
 }
 
+/// `BOOL_RE` minus the quote: what the caller can only have typed on purpose.
+/// A quote is how a docket number is usually written, an operator never is.
+static OPERATOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:ET|OU|SAUF|AND|OR|NOT)\b|\b(?:PROCHE|NEAR)\d+\b|\*").unwrap()
+});
+
+pub(crate) fn has_boolean_operator(query: &str) -> bool {
+    OPERATOR_RE.is_match(query)
+}
+
 /// Collapse les guillemets doublés `""x""` → `"x"` : deux quotes de chaque
 /// côté, pas trois.
 static DOUBLE_QUOTE_RE: LazyLock<Regex> =
@@ -229,8 +239,8 @@ pub(crate) fn phrase_combo_parse(query: &str) -> String {
     body_query_for_arm(query, BodyArm::Split)
 }
 
-/// Bras de construction de la jambe body BM25, pour l'A/B de ranking offline
-/// (`lj-bench rank-arms`). `Split` est le chemin prod : sac OR + phrase entière +
+/// Bras de construction de la jambe body BM25, pour l'A/B de ranking offline.
+/// `Split` est le chemin prod : sac OR + phrase entière +
 /// runs de contenu découpés aux stopwords (le gazetteer reste hors chemin).
 /// `Bag` ne garde que le sac OR (aucune clause phrase). `Weighted(w)` part de
 /// `Split` et pondère chaque clause phrase par `^w` (`w < 1` ⇒
@@ -475,6 +485,8 @@ mod tests {
             let mode = match detect_query_mode(&c.query) {
                 QueryMode::Lexical => "lexical",
                 QueryMode::Hybrid => "hybrid",
+                QueryMode::Reference => "reference",
+                QueryMode::Browse => "browse",
             };
             assert_eq!(mode, c.mode, "detect_query_mode({:?})", c.query);
             assert_eq!(

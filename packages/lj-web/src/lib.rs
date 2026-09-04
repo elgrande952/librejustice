@@ -17,6 +17,7 @@ pub mod components;
 pub mod config;
 pub mod dom;
 pub mod helpers;
+pub mod incident;
 pub mod pages;
 pub mod query;
 pub mod seo;

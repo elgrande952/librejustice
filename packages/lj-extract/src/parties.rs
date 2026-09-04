@@ -601,6 +601,33 @@ fn counsel_role(folded: &[char], start: usize, end: usize) -> Option<&'static st
 /// premier marqueur `me`/`maitre` — « Me X de la SCP Y, Me Z » ne rattache pas
 /// Z au cabinet. Renvoie `[début, fin)` de la zone où le span d'un `law_firm`
 /// vaut apposition.
+/// Jeu toléré entre la fin du nom de la partie et le connecteur : la virgule,
+/// et un qualificatif court que le trim de valeur a laissé dehors.
+const PARTY_GAP: usize = 12;
+
+/// Connecteur de représentation devant le conseil (« <partie>, représentée par
+/// Me X ») : rend la position où le nom de la partie doit finir, juste avant le
+/// connecteur. La fenêtre porte à 72 caractères, un cabinet pouvant s'intercaler.
+fn party_window(folded: &[char], start: usize) -> Option<usize> {
+    const CONN: [&str; 11] = [
+        "represente par",
+        "representee par",
+        "representes par",
+        "representees par",
+        "assiste de",
+        "assistee de",
+        "assiste par",
+        "assistee par",
+        "ayant pour avocat",
+        "comparant par",
+        "rep/assistant",
+    ];
+    let from = start.saturating_sub(72);
+    let w: String = folded[from..start].iter().collect();
+    let at = CONN.iter().filter_map(|c| w.rfind(c)).max()?;
+    Some(from + w[..at].chars().count())
+}
+
 fn firm_window(folded: &[char], end: usize) -> Option<(usize, usize)> {
     const LIENS: [&str; 6] = [" de la ", " de l'", " du ", " de ", " - ", " – "];
     let to = (end + 64).min(folded.len());
@@ -751,13 +778,49 @@ pub struct ActorRow {
     /// `ord` de la ligne `law_firm` apposée au conseil, `None` hors counsel ou sans
     /// apposition lisible.
     pub firm_ord: Option<i32>,
+    /// `ord` de la ligne partie que ce conseil représente. C'est l'arête dont
+    /// `side` est dérivé ; `None` quand aucun connecteur ne la nomme.
+    pub party_ord: Option<i32>,
+    /// `ord` de la ligne conseil substituée, posée sur le `substituant`.
+    pub sub_ord: Option<i32>,
     pub char_starts: Vec<i32>,
     pub char_ends: Vec<i32>,
 }
 
-/// Cellule NER plate : (qualité, côté, valeurs) — l'ordre des cellules définit
-/// `ord` intra-décision.
-pub type Cell<'a> = (&'static str, Option<&'static str>, &'a [String]);
+/// Cellule NER plate ; l'ordre des cellules définit `ord` intra-décision.
+/// `nature` la force quand la cellule la connaît : un pseudonyme n'a aucune tête
+/// de dénomination que [`nature`] puisse classer.
+#[derive(Debug, Clone, Copy)]
+pub struct Cell<'a> {
+    pub quality: &'static str,
+    pub side: Option<&'static str>,
+    pub nature: Option<Nature>,
+    pub values: &'a [String],
+}
+
+impl<'a> Cell<'a> {
+    pub fn new(quality: &'static str, side: Option<&'static str>, values: &'a [String]) -> Self {
+        Self {
+            quality,
+            side,
+            nature: None,
+            values,
+        }
+    }
+
+    pub fn physique(
+        quality: &'static str,
+        side: Option<&'static str>,
+        values: &'a [String],
+    ) -> Self {
+        Self {
+            quality,
+            side,
+            nature: Some(Nature::Physique),
+            values,
+        }
+    }
+}
 
 /// Construit les lignes acteur d'une décision depuis ses cellules plates.
 /// Le texte est plié UNE fois ; chaque valeur reçoit ses spans-évidences,
@@ -771,23 +834,25 @@ pub fn actor_rows(full_text: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
 pub fn actor_rows_folded(folded: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
     let folded: Vec<char> = folded.chars().collect();
     let mut rows = Vec::new();
-    for (quality, side, values) in cells {
-        for value in *values {
+    for cell in cells {
+        for value in cell.values {
             let (char_starts, char_ends) = evidence_spans(&folded, value);
-            let (key, barreau, role) = if *quality == "counsel_name" {
+            let (key, barreau, role) = if cell.quality == "counsel_name" {
                 counsel_evidence(&folded, value, &char_starts, &char_ends)
             } else {
                 (resolve_key(value), None, None)
             };
             rows.push(ActorRow {
-                quality,
-                side: *side,
+                quality: cell.quality,
+                side: cell.side,
                 value: value.clone(),
                 resolve_key: key,
-                nature: nature(quality, value),
+                nature: cell.nature.or_else(|| nature(cell.quality, value)),
                 barreau,
                 role,
                 firm_ord: None,
+                party_ord: None,
+                sub_ord: None,
                 char_starts,
                 char_ends,
             });
@@ -845,6 +910,55 @@ pub fn actor_rows_folded(folded: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
                 })
                 .min()
                 .map(|(_, j)| j);
+        }
+    }
+    // Arête de représentation : la partie dont un span finit juste avant le
+    // connecteur qui ouvre ce conseil. `ord` EST l'index de la ligne.
+    let parties: Vec<(usize, i32)> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.quality == "party")
+        .flat_map(|(i, r)| r.char_ends.iter().map(move |e| (i, *e)))
+        .collect();
+    if !parties.is_empty() {
+        for row in out
+            .iter_mut()
+            .filter(|r| matches!(r.quality, "counsel_name" | "law_firm"))
+        {
+            row.party_ord = row
+                .char_starts
+                .iter()
+                .filter_map(|s| party_window(&folded, *s as usize))
+                .filter_map(|fin| {
+                    parties
+                        .iter()
+                        .filter(|(_, e)| (*e as usize) <= fin && (*e as usize) + PARTY_GAP > fin)
+                        .max_by_key(|(_, e)| *e)
+                        .map(|(j, e)| (fin - *e as usize, *j as i32))
+                })
+                .min()
+                .map(|(_, j)| j);
+        }
+    }
+    // Substitution : le `substituant` pointe la ligne `substitue` la plus proche
+    // dans le texte, le connecteur pouvant précéder ou suivre selon la tournure
+    // (« Me X, substituant Me Y » / « Me X substitué par Me Z »).
+    let substitues: Vec<(usize, i32)> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.role == Some("substitue"))
+        .flat_map(|(i, r)| r.char_starts.iter().map(move |s| (i, *s)))
+        .collect();
+    if !substitues.is_empty() {
+        for row in out
+            .iter_mut()
+            .filter(|r| r.role == Some("substituant") && !r.char_starts.is_empty())
+        {
+            let ancre = row.char_starts[0];
+            row.sub_ord = substitues
+                .iter()
+                .min_by_key(|(_, s)| (s - ancre).abs())
+                .map(|(j, _)| *j as i32);
         }
     }
     out
@@ -922,6 +1036,40 @@ mod tests {
         let folded: Vec<char> = fold_stable("aucun rapport ici").chars().collect();
         let (s, e) = evidence_spans(&folded, "Me Ludivine Pontmercy");
         assert!(s.is_empty() && e.is_empty());
+    }
+
+    /// L'arête `party_ord` : le conseil pointe la partie que le connecteur qui
+    /// l'ouvre nomme à sa gauche, et la nature de cellule prime la lecture de
+    /// la tête de dénomination, qu'un pseudonyme n'a pas.
+    #[test]
+    fn l_arete_pointe_la_partie_du_connecteur() {
+        let texte = "APPELANTE : SAS Gondrand, représentée par Me Javert INTIMÉE : \
+                     SA Verrerie du Nord, représentée par Me Bouyssou";
+        let app = vec!["SAS Gondrand".to_string()];
+        let def = vec!["SA Verrerie du Nord".to_string()];
+        let ca = vec!["Javert".to_string()];
+        let cd = vec!["Bouyssou".to_string()];
+        let cells = [
+            Cell::new("party", Some("applicant"), &app),
+            Cell::new("party", Some("defendant"), &def),
+            Cell::new("counsel_name", Some("applicant"), &ca),
+            Cell::new("counsel_name", Some("defendant"), &cd),
+        ];
+        let rows = actor_rows(texte, &cells);
+        let de = |v: &str| {
+            rows.iter()
+                .find(|r| r.value == v)
+                .map(|r| r.party_ord)
+                .unwrap()
+        };
+        assert_eq!(de("Javert"), Some(0));
+        assert_eq!(de("Bouyssou"), Some(1));
+        assert_eq!(de("SAS Gondrand"), None);
+
+        let indiv = vec!["A B".to_string()];
+        let cells = [Cell::physique("party", Some("applicant"), &indiv)];
+        let rows = actor_rows("Par une requête, M. A B, représenté par Me Airiau", &cells);
+        assert_eq!(rows[0].nature, Some(Nature::Physique));
     }
 
     fn counsel(text: &str, value: &str) -> (String, Option<String>, Option<&'static str>) {
@@ -1037,8 +1185,8 @@ mod tests {
         let applicant = vec!["Chenildieu".to_string()];
         let defendant = vec!["CHENILDIEU".to_string(), "Brevet".to_string()];
         let cells: Vec<Cell<'_>> = vec![
-            ("counsel_name", Some("applicant"), &applicant),
-            ("counsel_name", Some("defendant"), &defendant),
+            Cell::new("counsel_name", Some("applicant"), &applicant),
+            Cell::new("counsel_name", Some("defendant"), &defendant),
         ];
         let rows = actor_rows(
             "les observations de Me Brevet, substituant Me Chenildieu",
@@ -1062,8 +1210,8 @@ mod tests {
         let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         let firms: Vec<String> = firms.iter().map(|s| s.to_string()).collect();
         let cells: Vec<Cell<'_>> = vec![
-            ("law_firm", Some("applicant"), &firms),
-            ("counsel_name", Some("applicant"), &names),
+            Cell::new("law_firm", Some("applicant"), &firms),
+            Cell::new("counsel_name", Some("applicant"), &names),
         ];
         let rows = actor_rows(text, &cells);
         rows.iter()

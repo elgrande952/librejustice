@@ -66,7 +66,7 @@ pub fn DecisionHeader(detail: DecisionDetail) -> impl IntoView {
 #[component]
 pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
     let references = build_decision_references(&detail);
-    let pdf_href = format!("/api/decision/{}/download.pdf", detail.id);
+    let pdf_href = format!("/internal/decision/{}/download.pdf", detail.id);
     let pdf_filename = references.filename.clone();
     let decision_id = detail.id.clone();
 
@@ -91,7 +91,7 @@ pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
                 >
                     <PrintIcon />
                 </button>
-                // `rel="nofollow"` : la cible est sous `/api/`, que le `robots.txt` refuse à
+                // `rel="nofollow"` : la cible est sous `/internal/`, que le `robots.txt` refuse à
                 // tous les crawlers et que le WAF bloque.
                 <a
                     href=pdf_href
@@ -110,11 +110,11 @@ pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
 }
 
 /// Bouton « signet », gated par l'auth : masqué tant que la session n'est pas
-/// résolue (token absent au SSR), et masqué si l'enregistrement d'activité est
+/// résolue (jamais au SSR), et masqué si l'enregistrement d'activité est
 /// coupé (mode ZDR). Bascule optimiste add/remove avec rollback en erreur.
 #[component]
 fn BookmarkButton(decision_id: String) -> impl IntoView {
-    let has_token = RwSignal::new(None::<bool>);
+    let authed = RwSignal::new(None::<bool>);
     // `None` = profil non chargé (affiché).
     let track_activity = RwSignal::new(None::<bool>);
     let is_on = RwSignal::new(false);
@@ -129,9 +129,9 @@ fn BookmarkButton(decision_id: String) -> impl IntoView {
     #[cfg(feature = "hydrate")]
     Effect::new(move |_| {
         leptos::task::spawn_local(async move {
-            let token = crate::auth::get_access_token().await;
-            has_token.set(Some(token.is_some()));
-            if token.is_some() {
+            let session = crate::auth::has_session().await;
+            authed.set(Some(session));
+            if session {
                 let client = ApiClient::from_context();
                 if let Ok(profile) = client.fetch_me().await {
                     track_activity.set(Some(profile.track_activity));
@@ -179,7 +179,7 @@ fn BookmarkButton(decision_id: String) -> impl IntoView {
 
     view! {
         <Show when=move || {
-            has_token.get() == Some(true) && track_activity.get() != Some(false)
+            authed.get() == Some(true) && track_activity.get() != Some(false)
         }>
             <button
                 type="button"

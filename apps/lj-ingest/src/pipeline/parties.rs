@@ -1,10 +1,16 @@
 //! Filet de dérive + résolution des acteurs par décision.
 //! L'écriture nominale est au fil de l'eau (`update_extracted_fields` /
 //! ingest, patron `case_citation`) ; `parties-reconcile` re-dérive la
-//! relation depuis les colonnes NER plates de `decisions` — mêmes lignes que
-//! le fil de l'eau (spans-évidences, nature, `resolve_key` via
-//! `lj_extract::parties`) — et n'écrit que ce qui a changé. Unique
-//! rattrapage de la relation.
+//! relation depuis le `full_text`, mêmes lignes que le fil de l'eau, et
+//! n'écrit que ce qui a changé. Unique rattrapage de la relation.
+//!
+//! Le texte entre en plus des six colonnes NER, qui ne portent ni la partie
+//! personne physique, absente du schéma plat, ni les arêtes de
+//! représentation, qu'aucune colonne ne peut exprimer. Les six cellules
+//! restent lues dans les colonnes : ce sont les valeurs FINALES du fil de
+//! l'eau, fusion de `Avocat_Requerant` et recasse comprises, que
+//! `scan.counsel()` seul ne rend pas. Un second extracteur ferait diverger le
+//! filet de ce qu'il surveille.
 
 use crate::config::Settings;
 use anyhow::{anyhow, Result};
@@ -13,9 +19,10 @@ use lj_store::repository::{DecisionPartyRow, DecisionRepository};
 /// Décisions lues par lot (keyset id).
 const READ_BATCH: i64 = 1_000;
 
-/// (colonne, qualité, côté) — l'ordre définit `ord` intra-décision, identique
-/// aux cellules du fil de l'eau (`lj_ingest::extract`). La colonne
-/// `intervenors` est gatée : pas d'émission relation en prod.
+/// (colonne, qualité, côté) : l'ordre définit `ord` intra-décision, avec les
+/// deux cellules de personne physique intercalées comme au fil de l'eau
+/// (`lj_ingest::extract`). La colonne `intervenors` est gatée : pas d'émission
+/// relation en prod.
 const COLUMNS: &[(&str, &str, Option<&str>)] = &[
     ("applicant_companies", "party", Some("applicant")),
     ("defendant_companies", "party", Some("defendant")),
@@ -25,8 +32,8 @@ const COLUMNS: &[(&str, &str, Option<&str>)] = &[
     ("defendant_counsel_names", "counsel_name", Some("defendant")),
 ];
 
-/// Filet de dérive des acteurs : re-dérive la relation depuis les colonnes
-/// plates de `decisions` et **n'écrit que ce qui a changé** —
+/// Filet de dérive des acteurs : re-dérive la relation depuis le texte et
+/// **n'écrit que ce qui a changé**.
 /// `replace_decision_parties_bulk` porte déjà le skip-diff par empreinte (un
 /// set inchangé garde ses `entity_uid`), la garde jamais-dégrader du gold et
 /// la résolution at-write scopée au lot.
@@ -36,8 +43,9 @@ const COLUMNS: &[(&str, &str, Option<&str>)] = &[
 /// concernées divergent et sont réécrites.
 ///
 /// Le périmètre est plus large que celui de `reextract-fields --full`, qui
-/// exclut `full_text IS NULL` et les révisions manuelles : ici toute décision
-/// portant des valeurs NER **ou** des lignes acteur est vue.
+/// exclut les révisions manuelles : ici toute décision portant un texte est
+/// vue. Une décision dont la seule partie est une personne physique n'a ni
+/// valeur NER ni ligne acteur, donc l'ancien périmètre ne l'atteignait pas.
 pub async fn reconcile_parties(workers: Option<usize>) -> Result<()> {
     let settings = Settings::from_env()?;
     let workers = workers.map(|w| w.max(1)).unwrap_or_else(|| {
@@ -54,21 +62,14 @@ pub async fn reconcile_parties(workers: Option<usize>) -> Result<()> {
         .map_err(|e| anyhow!("migrations: {e}"))?;
     conn.batch_execute("SET statement_timeout = 0").await?;
 
-    let non_empty = COLUMNS
-        .iter()
-        .map(|(c, _, _)| format!("COALESCE(cardinality({c}), 0)"))
-        .collect::<Vec<_>>()
-        .join(" + ");
-    // Union avec les décisions AYANT des lignes acteur : celles dont toutes les
-    // valeurs NER ont disparu doivent rendre un set vide, que
-    // `replace_decision_parties_bulk` matérialise en DELETE.
+    // Union avec les décisions AYANT des lignes acteur : celles dont le texte a
+    // disparu doivent rendre un set vide, que `replace_decision_parties_bulk`
+    // matérialise en DELETE.
     let ids: Vec<i64> = conn
         .query(
-            &format!(
-                "SELECT id FROM decisions WHERE {non_empty} > 0 \
-                 UNION SELECT DISTINCT decision_id FROM decision_party \
-                 ORDER BY id"
-            ),
+            "SELECT id FROM decisions WHERE full_text IS NOT NULL AND deleted_at IS NULL \
+             UNION SELECT DISTINCT decision_id FROM decision_party \
+             ORDER BY id",
             &[],
         )
         .await?
@@ -137,15 +138,10 @@ async fn reconcile_worker(
             .map(|row| {
                 let id: i64 = row.get(0);
                 let full_text: String = row.get::<_, Option<String>>(1).unwrap_or_default();
-                let lists: Vec<Vec<String>> = (0..COLUMNS.len())
+                let plates: Vec<Vec<String>> = (0..COLUMNS.len())
                     .map(|i| row.get::<_, Option<Vec<String>>>(i + 2).unwrap_or_default())
                     .collect();
-                let cells: Vec<lj_extract::parties::Cell<'_>> = COLUMNS
-                    .iter()
-                    .zip(&lists)
-                    .map(|((_, quality, side), values)| (*quality, *side, values.as_slice()))
-                    .collect();
-                (id, Some(actor_rows(&full_text, &cells)))
+                (id, Some(actor_rows(&full_text, &plates)))
             })
             .collect();
 
@@ -171,10 +167,26 @@ async fn reconcile_worker(
     Ok(())
 }
 
-/// Lignes acteur d'une décision — même dérivation que le fil de l'eau, un
-/// seul endroit qui la porte.
-fn actor_rows(full_text: &str, cells: &[lj_extract::parties::Cell<'_>]) -> Vec<DecisionPartyRow> {
-    lj_extract::parties::actor_rows(full_text, cells)
+/// Lignes acteur d'une décision, du texte à la relation : mêmes cellules et
+/// même ordre que le fil de l'eau (`lj_ingest::extract`), un seul endroit qui
+/// porte la dérivation. `intervenors` est gatée : pas d'émission relation.
+fn actor_rows(full_text: &str, plates: &[Vec<String>]) -> Vec<DecisionPartyRow> {
+    use lj_extract::parties::Cell;
+    if full_text.is_empty() {
+        return Vec::new();
+    }
+    let scan = lj_extract::scan::scan(full_text);
+    let ai = lj_extract::extract::applicant_individuals_scanned(Some(&scan)).unwrap_or_default();
+    let di = lj_extract::extract::defendant_individuals_scanned(Some(&scan)).unwrap_or_default();
+    let mut cells: Vec<Cell<'_>> = Vec::with_capacity(COLUMNS.len() + 2);
+    for ((_, quality, side), values) in COLUMNS.iter().zip(plates) {
+        cells.push(Cell::new(quality, *side, values.as_slice()));
+        if *quality == "party" && *side == Some("defendant") {
+            cells.push(Cell::physique("party", Some("applicant"), &ai));
+            cells.push(Cell::physique("party", Some("defendant"), &di));
+        }
+    }
+    lj_extract::parties::actor_rows_folded(scan.folded(), &cells)
         .into_iter()
         .map(|r| DecisionPartyRow {
             quality: r.quality.to_string(),
@@ -185,6 +197,8 @@ fn actor_rows(full_text: &str, cells: &[lj_extract::parties::Cell<'_>]) -> Vec<D
             barreau: r.barreau,
             role: r.role.map(str::to_string),
             firm_ord: r.firm_ord,
+            party_ord: r.party_ord,
+            sub_ord: r.sub_ord,
             char_starts: r.char_starts,
             char_ends: r.char_ends,
         })

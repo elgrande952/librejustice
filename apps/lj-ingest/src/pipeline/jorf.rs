@@ -1,26 +1,21 @@
 //! JORF (Journal officiel, bulk DILA) : ingest tarball stock/incrément du fond
 //! complet → référentiel versionné `referential_texts`/`referential_articles`.
 //!
-//! Le fond JORF partage la structure XML de LEGI : on réutilise le parser pur
-//! factorisé [`lj_extract::jorf`]. Deux divergences pilotent ce pipeline :
-//! - **Identité native, traités par curation seulement** : tout texte JORF entre
-//!   avec l'identité du XML (`jurisdiction='FR'`, nature native), et le `source`
-//!   reste le diffuseur `jorf` (DILA). Un traité nouveau se lève par curation.
-//!   L'ingestion est **en deux passes** : 1) les textes, 2) les articles. La
-//!   passe articles ne persiste que les `JORFARTI` d'un véhicule cible d'une
-//!   arête `publie` — **routés vers la fiche instrument** qui possède l'arête —
-//!   et seulement les annexes (`num` non numérique : le texte de l'instrument
-//!   publié en annexe du décret ; le dispositif reste du texte de véhicule).
-//!   Rien d'autre du JO n'entre au référentiel versionné : LEGI consolide les
-//!   décrets comme tout TNC.
-//! - **Articles sans numéro ignorés** : JORF contient des `JORFARTI` `NUM` vide
-//!   (annonces, actes `TYPE=AUTONOME`) ; non citables par numéro d'article, ils
-//!   n'alimentent pas le référentiel versionné. Les `referential_texts` restent,
-//!   eux, complets.
+//! Structure XML de LEGI, d'où le parser pur [`lj_extract::jorf`]. Trois
+//! divergences pilotent ce pipeline :
+//! - **Deux passes**, textes puis articles. La passe articles ne persiste que
+//!   les `JORFARTI` d'un véhicule cible d'une arête `publie`, routés vers la
+//!   fiche instrument, et seulement les annexes (`num` non numérique). Le reste
+//!   du JO n'entre pas au référentiel versionné : LEGI consolide les décrets.
+//! - **Articles sans numéro ignorés** : `NUM` vide n'est pas citable. Les
+//!   `referential_texts`, eux, restent complets.
+//! - **Deux séries d'articles dans un même JORFTEXT**, quand une annexe
+//!   renumérote à partir de 1 : la passe textes lit les `texte/struct` pour
+//!   connaître le dispositif propre de chaque texte, et la passe articles
+//!   qualifie par sa section la clé de qui rejoue un de ses numéros.
 //!
-//! Le corps des accords **anciens** (franco-algérien 1968 & co) est absent du
-//! bulk (pré-numérisation) : leurs `referential_articles` viennent d'un track
-//! distinct (OCR/extraction hors bulk), pas d'ici.
+//! Le corps des accords antérieurs à la numérisation est absent du bulk : leurs
+//! `referential_articles` viennent d'un track OCR distinct.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -35,13 +30,14 @@ use crate::config::Settings;
 /// Taille de batch des upserts JORF (textes puis articles).
 const JORF_BATCH_SIZE: usize = 512;
 
-/// Classe d'un membre XML du fond JORF, déduite de son chemin. Seuls
-/// `texte/version` (TEXTE_VERSION) et `article` (JORFARTI) sont ingérés ;
-/// `texte/struct`, `conteneur` (sommaires JO) et `eli/` sont hors-périmètre (le
-/// fil d'Ariane vient du `TM` porté par chaque article).
+/// Classe d'un membre XML du fond JORF, déduite de son chemin. `texte/version`
+/// (TEXTE_VERSION), `article` (JORFARTI) et `texte/struct` (TEXTELR, dispositif
+/// propre du texte) sont lus ; `conteneur` (sommaires JO) et `eli/` sont
+/// hors-périmètre (le fil d'Ariane vient du `TM` porté par chaque article).
 enum JorfMember {
     Article,
     Texte,
+    Struct,
     Ignore,
 }
 
@@ -49,6 +45,9 @@ enum JorfMember {
 fn classify_jorf_member(name: &str) -> JorfMember {
     let lower = name.to_lowercase();
     let stem = name.rsplit('/').next().unwrap_or(name);
+    if lower.contains("/texte/struct/") && stem.starts_with("JORFTEXT") {
+        return JorfMember::Struct;
+    }
     if lower.contains("/struct/") || lower.contains("/conteneur/") || lower.contains("/eli/") {
         return JorfMember::Ignore;
     }
@@ -229,6 +228,31 @@ fn jorf_article_row(
     }))
 }
 
+/// Créneau `(texte, numéro)` occupé par le dispositif propre d'un JORFTEXT, tel
+/// que sa `STRUCT` le déclare.
+fn dispositif_slot(text_uid: &str, num_key: &str) -> String {
+    format!("{text_uid}/{num_key}")
+}
+
+/// Clé d'identité d'un article dans son texte. Le dispositif garde son numéro
+/// nu ; l'article de section qui rejoue un numéro du dispositif porte sa
+/// section dans sa clé (`1` sous « Annexe » donne `annexe-1`), sans quoi les
+/// deux séries se disputent la PK `(text_uid, num_key, date_debut)` et la
+/// seconde n'entre jamais.
+fn article_num_key(
+    text_uid: &str,
+    num_key: &str,
+    title_path: Option<&str>,
+    dispositif: &HashSet<String>,
+) -> String {
+    match title_path.filter(|p| !p.is_empty()) {
+        Some(path) if dispositif.contains(&dispositif_slot(text_uid, num_key)) => {
+            format!("{}-{num_key}", lj_core::article_key::article_key(path))
+        }
+        _ => num_key.to_string(),
+    }
+}
+
 /// Ingère un stock ou un incrément JORF (`tar.gz` bulk DILA) en deux passes sur
 /// l'archive :
 /// 1. **textes** → `referential_texts` (tag `treaty`/`jorf`) ;
@@ -237,8 +261,9 @@ fn jorf_article_row(
 ///
 /// `paths` = chemins locaux de `Freemium_jorf_global_*.tar.gz` (stock) et/ou
 /// d'incréments `JORF_*.tar.gz` — traités dans l'ordre, finisseurs **une fois**
-/// en fin de lot. Streaming borné par canal (RAM ~constante), comme
-/// [`super::legi`].
+/// en fin de lot. Streaming borné par canal comme [`super::legi`] ; la seule
+/// mémoire qui suit la taille de l'archive est l'index du dispositif, ~1 M de
+/// créneaux sur le stock complet.
 pub async fn ingest_jorf(paths: &[std::path::PathBuf]) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -268,7 +293,8 @@ async fn ingest_jorf_archive(
     path: &Path,
 ) -> Result<HashSet<String>> {
     // Passe 1 : textes.
-    let texts = ingest_jorf_texts(repo, path).await?;
+    let mut texts = ingest_jorf_texts(repo, path).await?;
+    let dispositif = std::mem::take(&mut texts.dispositif);
 
     // Routes véhicule → fiche instrument, par arête `publie`. Un véhicule publié
     // par deux instruments rendrait le routage ambigu : erreur franche.
@@ -291,7 +317,7 @@ async fn ingest_jorf_archive(
     // Passe 2 : articles (routés par arête publie) + suppressions `.dat`.
     let routes = publie_routes.len();
     let (upserted, skipped, no_num, errors, deleted) =
-        ingest_jorf_articles(repo, path, publie_routes).await?;
+        ingest_jorf_articles(repo, path, publie_routes, dispositif).await?;
 
     tracing::info!(
         source = %path.display(),
@@ -367,18 +393,18 @@ async fn finish_jorf(
 pub async fn sync_jorf() -> Result<()> {
     let settings = Settings::from_env()?;
     let cache_dir = settings.cache_dir();
-    let downloaded = tokio::task::spawn_blocking(move || {
+    let mut batch = tokio::task::spawn_blocking(move || {
         lj_sources::dila::sync_dila(&cache_dir, lj_sources::dila::DilaFond::Jorf)
     })
     .await
     .map_err(|e| anyhow!("sync_dila join (jorf): {e}"))?
     .map_err(|e| anyhow!("sync_dila (jorf): {e}"))?;
-    if downloaded.is_empty() {
+    if batch.archives.is_empty() {
         tracing::info!("sync_jorf : rien de neuf (≤ watermark)");
         return Ok(());
     }
     tracing::info!(
-        downloaded = downloaded.len(),
+        downloaded = batch.archives.len(),
         "sync_jorf : ingestion des archives fraîches"
     );
     let pool =
@@ -393,8 +419,11 @@ pub async fn sync_jorf() -> Result<()> {
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
     let repo = DecisionRepository::new(&conn);
     let mut touched = HashSet::new();
-    for path in &downloaded {
-        touched.extend(ingest_jorf_archive(&repo, path).await?);
+    for archive in batch.archives.clone() {
+        touched.extend(ingest_jorf_archive(&repo, &archive.path).await?);
+        batch
+            .commit(&archive)
+            .map_err(|e| anyhow!("filigrane jorf {}: {e}", archive.watermark))?;
     }
     finish_jorf(&repo, Some(&touched)).await
 }
@@ -410,6 +439,9 @@ struct JorfTextCounts {
     existing: usize,
     links: u64,
     touched: HashSet<String>,
+    /// Créneaux `(texte, numéro)` du dispositif propre, lus des `texte/struct`
+    /// de l'archive : ce que la passe articles oppose aux séries de section.
+    dispositif: HashSet<String>,
 }
 
 /// Passe 1 — textes JORF → `legal_text`, **fond complet** : les véhicules
@@ -432,21 +464,36 @@ async fn ingest_jorf_texts(repo: &DecisionRepository<'_>, path: &Path) -> Result
     );
     let (tx, mut rx) = tokio::sync::mpsc::channel::<JorfTexteMsg>(JORF_BATCH_SIZE * 4);
     let tar_path = path.to_path_buf();
-    let reader = tokio::task::spawn_blocking(move || -> Result<()> {
-        lj_sources::tar_reader::for_each_member(&tar_path, |name, raw| {
-            if !matches!(classify_jorf_member(&name), JorfMember::Texte) {
-                return Ok(());
-            }
-            match lj_extract::jorf::parse_jorf_texte(&raw) {
-                Ok(t) => tx
-                    .blocking_send(jorf_texte_msg(t, &vehicles))
-                    .map_err(|_| anyhow!("canal JORF textes fermé")),
-                Err(e) => {
-                    tracing::error!(member = %name, error = %e, "jorf texte: parse échec");
-                    Ok(())
-                }
-            }
-        })
+    let reader = tokio::task::spawn_blocking(move || -> Result<HashSet<String>> {
+        let mut dispositif = HashSet::new();
+        lj_sources::tar_reader::for_each_member(
+            &tar_path,
+            |name, raw| match classify_jorf_member(&name) {
+                JorfMember::Struct => match lj_extract::jorf::parse_jorf_struct(&raw) {
+                    Ok(s) => {
+                        dispositif.extend(s.articles.into_iter().filter_map(|a| {
+                            Some(dispositif_slot(&s.jorftext, a.num_key.as_deref()?))
+                        }));
+                        Ok(())
+                    }
+                    Err(e) => {
+                        tracing::error!(member = %name, error = %e, "jorf struct: parse échec");
+                        Ok(())
+                    }
+                },
+                JorfMember::Texte => match lj_extract::jorf::parse_jorf_texte(&raw) {
+                    Ok(t) => tx
+                        .blocking_send(jorf_texte_msg(t, &vehicles))
+                        .map_err(|_| anyhow!("canal JORF textes fermé")),
+                    Err(e) => {
+                        tracing::error!(member = %name, error = %e, "jorf texte: parse échec");
+                        Ok(())
+                    }
+                },
+                _ => Ok(()),
+            },
+        )?;
+        Ok(dispositif)
     });
 
     let mut batch: Vec<JorfTexteMsg> = Vec::new();
@@ -457,7 +504,7 @@ async fn ingest_jorf_texts(repo: &DecisionRepository<'_>, path: &Path) -> Result
             flush_jorf_texts(repo, std::mem::take(&mut batch), &mut counts).await?;
         }
     }
-    reader
+    counts.dispositif = reader
         .await
         .map_err(|e| anyhow!("tâche lecture JORF textes {}: {e}", path.display()))??;
     if !batch.is_empty() {
@@ -472,6 +519,7 @@ async fn ingest_jorf_articles(
     repo: &DecisionRepository<'_>,
     path: &Path,
     publie_routes: HashMap<String, String>,
+    dispositif: HashSet<String>,
 ) -> Result<(usize, usize, usize, usize, usize)> {
     enum ArtMsg {
         Row(Box<lj_store::repository::LegalArticleRow>),
@@ -508,11 +556,17 @@ async fn ingest_jorf_articles(
                     let checksum = xxhash_rust::xxh3::xxh3_64(&raw);
                     match jorf_article_row(art, checksum) {
                         Ok(Some(mut row)) => {
-                            // Le routage véhicule → instrument s'applique d'abord :
-                            // sur un cid véhicule, le texte de l'instrument
-                            // publié en annexe (num non numérique) dépose
-                            // sur la fiche instrument. Le dispositif du
-                            // véhicule (nums numériques) reste sur la sienne.
+                            row.num_key = article_num_key(
+                                &row.text_uid,
+                                &row.num_key,
+                                row.title_path.as_deref(),
+                                &dispositif,
+                            );
+                            // Le routage véhicule → instrument : sur un cid
+                            // véhicule, le texte de l'instrument publié en annexe
+                            // (num non numérique) dépose sur la fiche instrument.
+                            // Le dispositif du véhicule (nums numériques) reste
+                            // sur la sienne.
                             if let Some(instrument) = route {
                                 if !row.num_key.bytes().all(|b| b.is_ascii_digit()) {
                                     row.text_uid = instrument;
@@ -653,4 +707,73 @@ async fn flush_jorf_articles(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn les_deux_series_d_un_meme_jorftext_gardent_deux_identites() {
+        // Arrêté du 31 juillet 2026 (JORFTEXT000054750162, permis de lithium
+        // « Bassin de Limagne ») : six articles au dispositif, et une annexe
+        // « cahier des charges » qui renumérote de 1 à 3.
+        let texte = "JORFTEXT000054750162";
+        let dispositif: HashSet<String> = ["1", "2", "3", "4", "5", "6"]
+            .iter()
+            .map(|n| dispositif_slot(texte, n))
+            .collect();
+
+        assert_eq!(article_num_key(texte, "1", None, &dispositif), "1");
+        assert_eq!(
+            article_num_key(texte, "1", Some("Annexe"), &dispositif),
+            "annexe-1"
+        );
+        assert_eq!(
+            article_num_key(texte, "3", Some("Annexe"), &dispositif),
+            "annexe-3"
+        );
+    }
+
+    #[test]
+    fn l_article_d_une_section_qui_ne_rejoue_rien_garde_son_numero_nu() {
+        // Le dispositif d'un texte à chapitres court d'un chapitre à l'autre :
+        // sa numérotation est celle du texte, et les clés publiques du fond ne
+        // bougent pas.
+        let texte = "JORFTEXT000054483646";
+        let dispositif: HashSet<String> = ["1", "2"]
+            .iter()
+            .map(|n| dispositif_slot(texte, n))
+            .collect();
+        assert_eq!(
+            article_num_key(
+                texte,
+                "3",
+                Some("Chapitre II : Dispositions finales"),
+                &dispositif
+            ),
+            "3"
+        );
+    }
+
+    #[test]
+    fn deux_sections_qui_rejouent_le_meme_numero_prennent_deux_cles() {
+        // Décret 2003-462 (JORFTEXT000000412528) : trois articles « 1 », un au
+        // dispositif et un dans chacune de deux parties du code annexé.
+        let texte = "JORFTEXT000000412528";
+        let dispositif: HashSet<String> = [dispositif_slot(texte, "1")].into_iter().collect();
+        assert_eq!(
+            article_num_key(
+                texte,
+                "1",
+                Some("Chapitre V : Dispositions pénales"),
+                &dispositif
+            ),
+            "chapitre-v-dispositions-penales-1"
+        );
+        assert_eq!(
+            article_num_key(texte, "1", Some("Livre VII : Prévention"), &dispositif),
+            "livre-vii-prevention-1"
+        );
+    }
 }

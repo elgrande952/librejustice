@@ -10,8 +10,8 @@
 //! Ce ne sont **pas** des entités nommées : un NER les raterait. C'est de la
 //! terminologie — d'où un lexique miné, pas un modèle.
 //!
-//! Le lexique est produit par `lj-bench mine-collocations` (qui folde le corpus
-//! via [`crate::body_tok`], le MÊME tokenizer qu'à la query) et écrit dans
+//! Le lexique est miné hors ligne (en foldant le corpus via [`crate::body_tok`],
+//! le MÊME tokenizer qu'à la query) et écrit dans
 //! `data/collocations_fr.json`. Le matcher charge ce lexique, en construit un
 //! automate Aho-Corasick et reconnaît les spans dans une requête déjà
 //! tokenisée/foldée.
@@ -22,7 +22,7 @@ use std::sync::LazyLock;
 use aho_corasick::{AhoCorasick, MatchKind};
 use serde::Deserialize;
 
-/// JSON brut embarqué (produit par `lj-bench mine-collocations`).
+/// JSON brut embarqué, produit hors ligne.
 pub const COLLOCATIONS_JSON: &str = include_str!("../data/collocations_fr.json");
 
 #[derive(Debug, Clone, Deserialize)]

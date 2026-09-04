@@ -16,38 +16,43 @@ use axum::extract::OriginalUri;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 
-/// Gabarits de tous les chemins servis (segments littéraux + `{param}`
-/// mono-segment). Miroir des routes montées dans [`crate::routes::create_app`],
-/// [`crate::oauth`] et [`crate::mcp`] — toute nouvelle route doit y être ajoutée
-/// pour bénéficier de la redirection de slash.
-const SERVED_TEMPLATES: &[&str] = &[
-    // /api (nest)
-    "/api/health",
-    "/api/search",
-    "/api/search-textes",
-    "/api/decision/{p}",
-    "/api/decision/{p}/similar",
-    "/api/decision/{p}/download.pdf",
-    "/api/me",
-    "/api/me/activity-tracking",
-    "/api/me/bookmarks",
-    "/api/me/bookmarks/{p}",
-    "/api/me/search-history",
-    "/api/me/search-history/{p}",
-    "/api/me/decision-views",
-    "/api/me/decision-views/{p}",
-    // oauth
+/// The prefixes carrying the nest, so a template below is written once. The
+/// public surface serves a subset of them, and a slash redirect toward a path
+/// it does not serve lands on its own refusal, which is the right answer.
+const NEST_PREFIXES: [&str; 2] = ["/api", "/internal"];
+
+/// Templates served under each nest prefix, written without it. Mirror of the
+/// routes mounted in [`crate::routes::create_app`]: a new route is added here to
+/// get the slash redirect.
+const NESTED_TEMPLATES: &[&str] = &[
+    "/health",
+    "/search",
+    "/search-textes",
+    "/decision/{p}",
+    "/decision/{p}/similar",
+    "/decision/{p}/download.pdf",
+    "/me",
+    "/me/activity-tracking",
+    "/me/bookmarks",
+    "/me/bookmarks/{p}",
+    "/me/search-history",
+    "/me/search-history/{p}",
+    "/me/decision-views",
+    "/me/decision-views/{p}",
+];
+
+/// Templates served at the root, mirror of [`crate::oauth`] and [`crate::mcp`].
+const ROOT_TEMPLATES: &[&str] = &[
     "/oauth/register",
     "/oauth/authorize",
     "/oauth/approve",
     "/oauth/token",
-    // .well-known
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
     "/.well-known/oauth-protected-resource/mcp",
     "/mcp/.well-known/oauth-authorization-server",
     "/mcp/.well-known/oauth-protected-resource",
-    // mcp (servi avec et sans slash, cf. `mcp::mcp_router`)
+    // Served with and without the slash, see `mcp::mcp_router`.
     "/mcp/",
     "/mcp",
 ];
@@ -70,7 +75,13 @@ fn template_matches(template: &str, path: &str) -> bool {
 }
 
 fn route_exists(path: &str) -> bool {
-    SERVED_TEMPLATES.iter().any(|t| template_matches(t, path))
+    if ROOT_TEMPLATES.iter().any(|t| template_matches(t, path)) {
+        return true;
+    }
+    NEST_PREFIXES.iter().any(|prefixe| {
+        path.strip_prefix(prefixe)
+            .is_some_and(|reste| NESTED_TEMPLATES.iter().any(|t| template_matches(t, reste)))
+    })
 }
 
 /// Bascule le slash final : `/x/` → `/x`, `/x` → `/x/`. `None` pour la racine.
@@ -124,6 +135,16 @@ mod tests {
         assert!(route_exists("/mcp"));
         assert!(route_exists("/api/me/bookmarks/xyz"));
         assert!(!route_exists("/api/health/"));
+    }
+
+    #[test]
+    fn le_nid_est_servi_sous_les_deux_prefixes() {
+        for prefixe in NEST_PREFIXES {
+            assert!(route_exists(&format!("{prefixe}/health")));
+            assert!(route_exists(&format!("{prefixe}/me/bookmarks/xyz")));
+        }
+        assert!(!route_exists("/internal/health/"));
+        assert!(!route_exists("/apihealth"));
     }
 
     #[test]

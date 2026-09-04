@@ -5,6 +5,28 @@ use leptos_router::components::A;
 use crate::components::app_shell::SuppressSiteDescription;
 use crate::seo::not_found_meta;
 
+/// Signale une 404 atteinte par navigation interne : un lien du site ne mène
+/// nulle part, ou le routeur a intercepté un clic qui lui échappait.
+///
+/// `__LJ_HYDRATED` fait le tri, et l'ordre dans `hydrate()` est ce qui le
+/// permet : le témoin est posé APRÈS `hydrate_body`, donc il est absent quand
+/// cette page vient du premier rendu — URL tapée, lien externe périmé, crawler —,
+/// ce que le journal d'accès porte déjà.
+#[cfg(feature = "hydrate")]
+fn signaler_lien_mort() {
+    use wasm_bindgen::JsValue;
+
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let hydratee = js_sys::Reflect::get(&window, &JsValue::from_str("__LJ_HYDRATED"))
+        .is_ok_and(|v| v.is_truthy());
+    if !hydratee {
+        return;
+    }
+    crate::incident::signaler("route_404", &JsValue::UNDEFINED);
+}
+
 #[component]
 pub fn NotFound() -> impl IntoView {
     #[cfg(feature = "ssr")]
@@ -14,6 +36,8 @@ pub fn NotFound() -> impl IntoView {
         let response = expect_context::<ResponseOptions>();
         response.set_status(StatusCode::NOT_FOUND);
     }
+    #[cfg(feature = "hydrate")]
+    signaler_lien_mort();
 
     // Le 404 pose `robots noindex` sans description : on supprime la
     // `<meta description>` générique du shell, rétablie au démontage.

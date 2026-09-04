@@ -1,8 +1,8 @@
-//! Pages `/activite/{recherches,lectures,signets}`.
+//! Pages `/activity/{searches,readings,bookmarks}`.
 //!
 //! Un seul composant `ActivityPage`, le panneau actif est choisi via le path
-//! (`ActivePanel`). Tout est client-side (token Supabase en localStorage, absent
-//! au SSR) ; les listes ne fetchent qu'apres hydratation, derriere `AuthGuard`.
+//! (`ActivePanel`). Tout est client-side ; les listes ne fetchent qu'apres
+//! hydratation, derriere `AuthGuard`.
 //! Les listes paginees (historique, lectures) montent un scroll infini ; les
 //! signets sont une liste simple.
 
@@ -121,9 +121,9 @@ fn ActivePanel() -> impl IntoView {
     let pathname = current_pathname();
     move || {
         let path = pathname.get();
-        if path.starts_with("/activite/signets") {
+        if path.starts_with("/activity/bookmarks") {
             view! { <BookmarksPanel /> }.into_any()
-        } else if path.starts_with("/activite/lectures") {
+        } else if path.starts_with("/activity/readings") {
             view! { <ViewsPanel /> }.into_any()
         } else {
             view! { <HistoryPanel /> }.into_any()

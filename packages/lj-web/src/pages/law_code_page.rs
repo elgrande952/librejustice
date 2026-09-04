@@ -24,7 +24,7 @@ use crate::pages::law_page::data::{
     chrono_date, code_param, fetch_code_summary, fetch_toc, sendable, PageError, TocResult,
 };
 use crate::pages::law_page::top_cited::top_cited_block;
-use crate::pages::law_page::{rail_block, rail_item, ChronoDatePicker};
+use crate::pages::law_page::{rail_block, rail_item, redirection_permanente, ChronoDatePicker};
 use crate::seo::law::code_canonical_url;
 use crate::seo::OG_IMAGE;
 
@@ -53,6 +53,11 @@ pub fn LawCodePage() -> impl IntoView {
             {move || Suspend::new(async move {
                 match summary.await {
                     Ok(summary) => {
+                        // Slug renommé : l'API a rendu le code sous son slug
+                        // d'aujourd'hui, l'URL doit suivre.
+                        if code.get_untracked() != summary.code {
+                            redirection_permanente(&format!("/texte/{}", summary.code));
+                        }
                         set_cache_control(200);
                         Either::Left(view! { <LawCodeLoaded summary=summary toc=toc /> })
                     }
@@ -163,9 +168,6 @@ fn LawCodeLoaded(summary: LawCodeSummary, toc: Resource<TocResult>) -> impl Into
         "legislationIdentifier": summary.legitext,
     });
     let jsonld = serde_json::to_string(&json).unwrap_or_else(|_| "{}".to_string());
-    // Fil d'Ariane structuré vers le catalogue des normes — absent si le texte est
-    // hors catalogue (acte individuel). Le fond `codes` pointe sur son catalogue dédié
-    // `/normes/codes`.
     let fond_hub = summary.fond.clone().map(|fond| {
         let label = summary.fond_label.clone().unwrap_or_else(|| fond.clone());
         let href = format!("/normes/{fond}");
@@ -584,7 +586,7 @@ fn plan_rail(items: &[lj_dtos::TocNode]) -> Option<AnyView> {
 }
 
 /// Contexte de matérialisation en place d'une division (accordéon de lecture) : de
-/// quoi fetcher sa vue-lecture (`/api/texte/{code}/section/{cid}`) à la date de
+/// quoi fetcher sa vue-lecture (`/internal/texte/{code}/section/{cid}`) à la date de
 /// consultation. `cid` n'est lu que par le fetch et l'alignement du fragment, côté
 /// client uniquement.
 #[derive(Clone)]
@@ -755,6 +757,9 @@ fn materialize(
             .fetch_law_section(&ctx.code, &ctx.cid, ctx.date.as_deref())
             .await
         {
+            // Bornée par le serveur : les corps ne sont pas là, les chips
+            // disent déjà la même chose. La page section reste la lecture.
+            Ok(resp) if resp.omitted.is_some() => open_reading.set(false),
             Ok(resp) => reading.set(Some(resp.items)),
             Err(_) => {
                 loading.set_value(false);
@@ -1058,7 +1063,7 @@ fn article_flow(entries: Vec<&TocEntry>, code: &str, date: Option<&str>) -> AnyV
                 code,
                 entry.num_key.clone(),
                 label,
-                entry.status != "VIGUEUR",
+                entry.status != "VIGUEUR" || entry.expired,
                 date,
             )
         })
@@ -1076,6 +1081,7 @@ mod tests {
             num_key: num.to_string(),
             title_path: path.map(str::to_string),
             status: "VIGUEUR".to_string(),
+            expired: false,
         }
     }
 

@@ -1,10 +1,7 @@
-//! Diff de deux rédactions d'un article (comparateur de versions).
+//! Diff de deux rédactions d'un article, en vis-à-vis.
 //!
-//! Deux passes : diff **ligne** (alinéa) pour ancrer la structure du texte,
-//! puis diff **mot Unicode** (UAX #29) à l'intérieur des blocs remplacés. Le
-//! texte se reconstruit en concaténant les segments d'un même côté
-//! (Equal+Delete = ancien, Equal+Insert = nouveau) ; les sauts de ligne restent
-//! dans les segments (rendu `whitespace-pre-line`).
+//! Deux passes : diff **ligne** (alinéa) pour ancrer la structure, puis diff
+//! **mot Unicode** (UAX #29) dans les blocs réécrits.
 
 use similar::{ChangeTag, DiffTag, TextDiff};
 
@@ -23,47 +20,93 @@ pub struct CompareSegment {
     pub text: String,
 }
 
-/// Diff des deux rédactions, en segments contigus (adjacents de même op
-/// fusionnés, aucun segment vide).
-pub fn compare_texts(old: &str, new: &str) -> Vec<CompareSegment> {
+/// Nature d'une ligne alignée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    Equal,
+    /// Bloc réécrit : les deux colonnes portent du texte, la différence est au
+    /// mot à l'intérieur.
+    Changed,
+    /// Alinéas apparus dans la nouvelle rédaction, colonne gauche vide.
+    Added,
+    /// Alinéas disparus de l'ancienne, colonne droite vide.
+    Removed,
+}
+
+/// Une ligne du vis-à-vis, au grain du bloc d'alinéas. Concaténer `left` sur
+/// toutes les lignes reconstruit l'ancienne rédaction, `right` la nouvelle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompareRow {
+    pub kind: RowKind,
+    pub left: Vec<CompareSegment>,
+    pub right: Vec<CompareSegment>,
+}
+
+/// Vis-à-vis des deux rédactions, en lignes alignées (aucun segment vide,
+/// adjacents de même op fusionnés). Vide si les deux textes sont vides.
+pub fn align_texts(old: &str, new: &str) -> Vec<CompareRow> {
     let line_diff = TextDiff::from_lines(old, new);
-    let mut segments: Vec<CompareSegment> = Vec::new();
+    let mut rows: Vec<CompareRow> = Vec::new();
     for op in line_diff.ops() {
+        let block = |tag: ChangeTag| -> String {
+            line_diff
+                .iter_changes(op)
+                .filter(|c| c.tag() == tag)
+                .map(|c| c.value())
+                .collect()
+        };
         match op.tag() {
-            DiffTag::Equal | DiffTag::Delete | DiffTag::Insert => {
-                let text: String = line_diff.iter_changes(op).map(|c| c.value()).collect();
-                let seg_op = match op.tag() {
-                    DiffTag::Equal => CompareOp::Equal,
-                    DiffTag::Delete => CompareOp::Delete,
-                    _ => CompareOp::Insert,
-                };
-                push(&mut segments, seg_op, &text);
+            DiffTag::Equal => {
+                let side = vec![CompareSegment {
+                    op: CompareOp::Equal,
+                    text: block(ChangeTag::Equal),
+                }];
+                rows.push(CompareRow {
+                    kind: RowKind::Equal,
+                    left: side.clone(),
+                    right: side,
+                });
             }
-            // Bloc remplacé : les deux côtés existent, on descend au mot.
+            DiffTag::Delete => rows.push(CompareRow {
+                kind: RowKind::Removed,
+                left: vec![CompareSegment {
+                    op: CompareOp::Delete,
+                    text: block(ChangeTag::Delete),
+                }],
+                right: Vec::new(),
+            }),
+            DiffTag::Insert => rows.push(CompareRow {
+                kind: RowKind::Added,
+                left: Vec::new(),
+                right: vec![CompareSegment {
+                    op: CompareOp::Insert,
+                    text: block(ChangeTag::Insert),
+                }],
+            }),
             DiffTag::Replace => {
-                let old_block: String = line_diff
-                    .iter_changes(op)
-                    .filter(|c| c.tag() == ChangeTag::Delete)
-                    .map(|c| c.value())
-                    .collect();
-                let new_block: String = line_diff
-                    .iter_changes(op)
-                    .filter(|c| c.tag() == ChangeTag::Insert)
-                    .map(|c| c.value())
-                    .collect();
+                let (old_block, new_block) = (block(ChangeTag::Delete), block(ChangeTag::Insert));
                 let word_diff = TextDiff::from_unicode_words(&old_block, &new_block);
+                let mut left = Vec::new();
+                let mut right = Vec::new();
                 for change in word_diff.iter_all_changes() {
-                    let seg_op = match change.tag() {
-                        ChangeTag::Equal => CompareOp::Equal,
-                        ChangeTag::Delete => CompareOp::Delete,
-                        ChangeTag::Insert => CompareOp::Insert,
-                    };
-                    push(&mut segments, seg_op, change.value());
+                    match change.tag() {
+                        ChangeTag::Equal => {
+                            push(&mut left, CompareOp::Equal, change.value());
+                            push(&mut right, CompareOp::Equal, change.value());
+                        }
+                        ChangeTag::Delete => push(&mut left, CompareOp::Delete, change.value()),
+                        ChangeTag::Insert => push(&mut right, CompareOp::Insert, change.value()),
+                    }
                 }
+                rows.push(CompareRow {
+                    kind: RowKind::Changed,
+                    left,
+                    right,
+                });
             }
         }
     }
-    segments
+    rows
 }
 
 /// Ajoute un tronçon en fusionnant avec le précédent s'il porte la même op.
@@ -82,84 +125,99 @@ fn push(segments: &mut Vec<CompareSegment>, op: CompareOp, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_texts, CompareOp};
+    use super::*;
 
-    fn old_side(segments: &[super::CompareSegment]) -> String {
-        segments
-            .iter()
-            .filter(|s| s.op != CompareOp::Insert)
+    fn side(rows: &[CompareRow], left: bool) -> String {
+        rows.iter()
+            .flat_map(|r| if left { &r.left } else { &r.right })
             .map(|s| s.text.as_str())
             .collect()
     }
 
-    fn new_side(segments: &[super::CompareSegment]) -> String {
-        segments
-            .iter()
-            .filter(|s| s.op != CompareOp::Delete)
-            .map(|s| s.text.as_str())
-            .collect()
+    fn changed(rows: &[CompareRow]) -> usize {
+        rows.iter().filter(|r| r.kind != RowKind::Equal).count()
     }
 
     #[test]
-    fn identical_texts_yield_single_equal_segment() {
+    fn identical_texts_yield_one_equal_row() {
         let text = "Chacun a droit au respect de sa vie privée.\nLes juges peuvent prescrire toutes mesures.";
-        let segments = compare_texts(text, text);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].op, CompareOp::Equal);
-        assert_eq!(segments[0].text, text);
+        let rows = align_texts(text, text);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, RowKind::Equal);
+        assert_eq!(changed(&rows), 0);
+        assert_eq!(side(&rows, true), text);
+        assert_eq!(side(&rows, false), text);
     }
 
+    /// Chaque colonne rend UNE rédaction : aucun segment de l'autre côté ne s'y
+    /// intercale, sans quoi le vis-à-vis ne se lit pas.
     #[test]
-    fn word_change_is_diffed_inside_the_alinea() {
+    fn each_column_reads_as_one_redaction() {
         let old = "Nul ne peut faire l'objet de discriminations en raison de ses caractéristiques génétiques.";
         let new = "Nul ne peut faire l'objet d'une discrimination en raison de ses caractéristiques génétiques.";
-        let segments = compare_texts(old, new);
-        assert_eq!(old_side(&segments), old);
-        assert_eq!(new_side(&segments), new);
-        let equal_len: usize = segments
-            .iter()
-            .filter(|s| s.op == CompareOp::Equal)
-            .map(|s| s.text.len())
-            .sum();
-        assert!(equal_len > old.len() / 2, "segments: {segments:?}");
-        assert!(segments.iter().any(|s| s.op == CompareOp::Delete));
-        assert!(segments.iter().any(|s| s.op == CompareOp::Insert));
+        let rows = align_texts(old, new);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, RowKind::Changed);
+        assert_eq!(side(&rows, true), old);
+        assert_eq!(side(&rows, false), new);
+        assert!(rows[0].left.iter().all(|s| s.op != CompareOp::Insert));
+        assert!(rows[0].right.iter().all(|s| s.op != CompareOp::Delete));
     }
 
     #[test]
-    fn inserted_alinea_is_a_single_insert_block() {
+    fn inserted_alinea_leaves_the_left_column_empty() {
         let old = "Premier alinéa.\nDernier alinéa.";
         let new = "Premier alinéa.\nAlinéa nouveau.\nDernier alinéa.";
-        let segments = compare_texts(old, new);
-        assert_eq!(old_side(&segments), old);
-        assert_eq!(new_side(&segments), new);
-        let inserts: Vec<_> = segments
-            .iter()
-            .filter(|s| s.op == CompareOp::Insert)
-            .collect();
-        assert_eq!(inserts.len(), 1);
-        assert_eq!(inserts[0].text, "Alinéa nouveau.\n");
+        let rows = align_texts(old, new);
+        assert_eq!(side(&rows, true), old);
+        assert_eq!(side(&rows, false), new);
+        let added: Vec<_> = rows.iter().filter(|r| r.kind == RowKind::Added).collect();
+        assert_eq!(added.len(), 1);
+        assert!(added[0].left.is_empty());
+        assert_eq!(added[0].right[0].text, "Alinéa nouveau.\n");
     }
 
     #[test]
-    fn deleted_alinea_is_a_single_delete_block() {
+    fn deleted_alinea_leaves_the_right_column_empty() {
         let old = "Premier alinéa.\nAlinéa condamné.\nDernier alinéa.";
         let new = "Premier alinéa.\nDernier alinéa.";
-        let segments = compare_texts(old, new);
-        assert_eq!(old_side(&segments), old);
-        assert_eq!(new_side(&segments), new);
-        let deletes: Vec<_> = segments
-            .iter()
-            .filter(|s| s.op == CompareOp::Delete)
-            .collect();
-        assert_eq!(deletes.len(), 1);
-        assert_eq!(deletes[0].text, "Alinéa condamné.\n");
+        let rows = align_texts(old, new);
+        assert_eq!(side(&rows, true), old);
+        assert_eq!(side(&rows, false), new);
+        let removed: Vec<_> = rows.iter().filter(|r| r.kind == RowKind::Removed).collect();
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].right.is_empty());
+        assert_eq!(removed[0].left[0].text, "Alinéa condamné.\n");
+    }
+
+    /// Le compte des lignes non-Equal est ce dont se sert la navigation.
+    #[test]
+    fn changes_are_countable_and_ordered() {
+        let old = "Un.\nDeux.\nTrois.\nQuatre.";
+        let new = "Un.\nDeux bis.\nTrois.\nCinq.\nQuatre.";
+        let rows = align_texts(old, new);
+        assert_eq!(side(&rows, true), old);
+        assert_eq!(side(&rows, false), new);
+        assert_eq!(changed(&rows), 2);
+        let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                RowKind::Equal,
+                RowKind::Changed,
+                RowKind::Equal,
+                RowKind::Added,
+                RowKind::Equal
+            ]
+        );
     }
 
     #[test]
-    fn empty_old_text_is_a_full_insert() {
-        let segments = compare_texts("", "Texte créé.");
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].op, CompareOp::Insert);
+    fn empty_old_text_is_a_full_addition() {
+        let rows = align_texts("", "Texte créé.");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, RowKind::Added);
+        assert_eq!(side(&rows, false), "Texte créé.");
+        assert!(align_texts("", "").is_empty());
     }
 }

@@ -1,13 +1,3 @@
-//! achatpublic.com — salle des marchés.
-//!
-//! `POST /sdm/ent2/gen/rechercheCsl.action` avec **exactement** les 8 champs
-//! que sérialise le formulaire `initalFormSearch` : tout champ en plus
-//! (`searchCslBean.marche`, cases à cocher, `CSRFToken`) route vers le
-//! parcours d'inscription. `searchCslBean.page` pagine **dans le corps du
-//! POST** (inopérant en GET), 10 consultations par page. Clé métier `PCSLID` ;
-//! les dates sont éclatées avec le mois en toutes lettres, tantôt abrégé avec
-//! point (« 01 Sept. 2026 »).
-
 use std::sync::LazyLock;
 
 use futures::StreamExt;
@@ -178,6 +168,7 @@ pub async fn enumerate() -> Result<MoteurRun> {
     let mut run = MoteurRun {
         annonce: Some(total),
         echecs: 0,
+        hotes: Vec::new(),
         rows: parse_page(&premiere),
     };
     for res in resultats {

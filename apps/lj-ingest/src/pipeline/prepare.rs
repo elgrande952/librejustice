@@ -264,15 +264,17 @@ pub(super) fn extract_write(
     if prepared.write_mode == WriteMode::SourceXmlOnly {
         return Ok(prepared);
     }
-    let full = lj_ingest::extract::extracted_fields(
-        &prepared.decision,
-        &ctx.link,
-        &ctx.vocab,
-        &ctx.chrono,
-        &ctx.jur_labels,
-    )
-    .map_err(|e| anyhow!("extract {}: {e}", prepared.decision.source_uid))?;
-    prepared.extracted = Some(match prepared.prebuilt_extracted.take() {
+    let full = lj_ingest::extract::extracted_fields(&prepared.decision, &ctx.snapshots())
+        .map_err(|e| anyhow!("extract {}: {e}", prepared.decision.source_uid))?;
+    // Ce qui ne vit que dans `source_fields` (le nom d'affaire du docname CEDH)
+    // se relit ici comme à la ré-extraction.
+    let prebuilt = prepared.prebuilt_extracted.take().or_else(|| {
+        lj_ingest::extract::prebuilt_from_source_fields(
+            &prepared.decision.source_uid,
+            &prepared.source_fields,
+        )
+    });
+    prepared.extracted = Some(match prebuilt {
         Some(pre) => lj_ingest::extract::merge_prebuilt(pre, full),
         None => full,
     });

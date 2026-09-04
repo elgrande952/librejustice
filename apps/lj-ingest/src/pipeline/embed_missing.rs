@@ -9,8 +9,8 @@
 //! création ni changement d'identité, uniquement le remplissage des embeddings
 //! manquants.
 //!
-//! Embedder **vLLM strict** ([`build_vllm_strict`]) : jamais de repli Cloudflare,
-//! erreur franche si vLLM est injoignable.
+//! Embedder **local strict** ([`build_local_strict`]) : jamais de repli Cloudflare,
+//! erreur franche s'il est injoignable.
 
 use anyhow::{anyhow, Result};
 
@@ -18,7 +18,7 @@ use lj_core::decision::Decision;
 use lj_store::repository::DecisionRepository;
 
 use super::batch::drain_batch;
-use super::embed::build_vllm_strict;
+use super::embed::build_local_strict;
 use super::{Candidate, IngestCounts, IngestMode, WriteMode, BATCH_SIZE};
 use crate::config::Settings;
 
@@ -27,8 +27,8 @@ use crate::config::Settings;
 /// reprise transparente.
 pub async fn embed_missing(limit: Option<usize>) -> Result<()> {
     let settings = Settings::from_env()?;
-    // Embedder vLLM strict : refuse Cloudflare et erreur si vLLM est injoignable.
-    let embedder = build_vllm_strict(&settings).await?;
+    // Embedder local strict : refuse Cloudflare et erreur s'il est injoignable.
+    let embedder = build_local_strict(&settings).await?;
 
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;

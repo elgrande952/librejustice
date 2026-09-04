@@ -1,16 +1,7 @@
-//! Pondération RRF dynamique.
-//!
-//! La fusion RRF a 3 jambes (BM25 body, ANN, BM25 titre). On part d'une base à
-//! parité `BASE = (title=1.0, bm25=1.0, ann=1.0)` puis on applique des
-//! multiplicateurs cumulatifs selon des signaux détectés sur la query (regex) ou
-//! la géométrie des embeddings (centroïdes BM25 vs ANN).
-//!
-//! - article-in-query (`L 531-1`, `R. 222-1`…)  : title ×0.2, bm25 ×1.5
-//! - docket-in-query (numéro de rôle, tous formats) : title ×6.0
-//! - date-in-query (FR/ISO)                          : title ×1.5
-//! - `d_centroids > 0.06` ET `pair_mu < 0.18`        : bm25 ×0.4, ann ×2.5
-//!
-//! Article et boost_ann sont mutuellement exclusifs ; docket/date se cumulent.
+//! Adaptive RRF weights. The base is parity `(title=1.0, bm25=1.0, ann=1.0)`,
+//! the key leg at 0 outside `reference` mode, then one of two multipliers read
+//! on the query or on the embedding geometry: an article in the query, bm25
+//! x1.5; `d_centroids > 0.06` and `pair_mu < 0.18`, bm25 x0.4 and ann x2.5.
 
 use std::sync::LazyLock;
 
@@ -27,66 +18,43 @@ const PAIR_MU_THRESHOLD: f64 = 0.18;
 static ARTICLE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b[LRD]\.?\s*\d+(?:-\d+)+").unwrap());
 
-/// Numéro de rôle, toutes juridictions. Faux positifs tolérés (boost titre seul).
-///   - CC ancien    `07-11.687` / `74-11.869`
-///   - CC nouveau   `19-23664` (pourvoi)
-///   - CA / TJ      `23/01001`
-///   - TA / CAA / CE `2202166` (6-8 chiffres contigus)
-static DOCKET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(concat!(
-        r"\b\d{2}-\d{2}\.\d{3,4}\b",
-        r"|\b\d{2}-\d{4,5}\b",
-        r"|\b\d{2}/\d{5}\b",
-        r"|\b\d{6,8}\b",
-    ))
-    .unwrap()
-});
-
-/// Date FR (« 13 février 2024 », « février 2024 ») ou ISO (« 2024-02-13 »).
-static DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    let months = "janvier|f[ée]vrier|mars|avril|mai|juin|juillet|ao[uû]t|septembre|octobre|novembre|d[ée]cembre";
-    let pat = format!(
-        r"(?i)\b(?:\d{{1,2}}\s+(?:{m})(?:\s+\d{{4}})?|(?:{m})\s+\d{{4}}|\d{{4}}-\d{{2}}-\d{{2}})\b",
-        m = months
-    );
-    Regex::new(&pat).unwrap()
-});
-
-/// Poids RRF par jambe. Tous strictement positifs (sauf cas extrême).
+/// RRF weight per leg. `docket` is 0 outside `reference` mode, where the leg
+/// does not enter the fusion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Weights {
     pub title: f64,
     pub bm25: f64,
     pub ann: f64,
+    pub docket: f64,
 }
 
 impl Weights {
-    fn scale(self, title: f64, bm25: f64, ann: f64) -> Weights {
+    fn scale(self, bm25: f64, ann: f64) -> Weights {
         Weights {
-            title: self.title * title,
+            title: self.title,
             bm25: self.bm25 * bm25,
             ann: self.ann * ann,
+            docket: self.docket,
         }
     }
 }
 
-/// Base par défaut : 3 jambes à parité.
+/// Base par défaut : 3 jambes à parité, la clé inerte.
 pub const BASE_WEIGHTS: Weights = Weights {
     title: 1.0,
     bm25: 1.0,
     ann: 1.0,
+    docket: 0.0,
 };
+
+/// Key-leg weight in `reference` mode, the only mode the leg enters. Above the
+/// sum of the three other legs, so the exact decision comes up, without
+/// crushing the fusion: the 4.1 % of numbers borne by more than thirty
+/// decisions are still separated by the title and the date.
+pub const PURE_REFERENCE_DOCKET_WEIGHT: f64 = 8.0;
 
 pub fn has_article_reference(query: &str) -> bool {
     ARTICLE_RE.is_match(query)
-}
-
-pub fn has_docket_reference(query: &str) -> bool {
-    DOCKET_RE.is_match(query)
-}
-
-pub fn has_date_reference(query: &str) -> bool {
-    DATE_RE.is_match(query)
 }
 
 /// Distance cosinus (1 − cos) entre les centroïdes des deux jeux d'embeddings.
@@ -159,28 +127,18 @@ fn l2_norm_f32(v: &[f32]) -> f64 {
         .sqrt()
 }
 
-/// Composition multiplicative des signaux à partir de [`BASE_WEIGHTS`].
+/// Content-mode weights: [`BASE_WEIGHTS`] scaled by the one signal that fires.
 pub fn compute_weights(query: &str, ann_emb: &[Vec<f32>], bm25_emb: &[Vec<f32>]) -> Weights {
     let mut w = BASE_WEIGHTS;
-
     if has_article_reference(query) {
-        w = w.scale(0.2, 1.5, 1.0);
+        w = w.scale(1.5, 1.0);
     } else {
         let d_cent = compute_d_centroids(ann_emb, bm25_emb);
         let p_mu = compute_pair_mu(ann_emb);
         if d_cent > D_CENTROIDS_THRESHOLD && p_mu < PAIR_MU_THRESHOLD {
-            w = w.scale(1.0, 0.4, 2.5);
+            w = w.scale(0.4, 2.5);
         }
     }
-
-    if has_docket_reference(query) {
-        w = w.scale(6.0, 1.0, 1.0);
-    }
-
-    if has_date_reference(query) {
-        w = w.scale(1.5, 1.0, 1.0);
-    }
-
     w
 }
 
@@ -196,37 +154,32 @@ mod tests {
         assert!(!has_article_reference("congés payés"));
     }
 
+    fn designates_a_number(query: &str) -> bool {
+        !lj_core::docket_key::query_docket_keys(query).is_empty()
+    }
+
     #[test]
     fn docket_signal_all_formats() {
-        assert!(has_docket_reference("pourvoi 07-11.687"));
-        assert!(has_docket_reference("19-23.664"));
-        assert!(has_docket_reference("19-23664"));
-        assert!(has_docket_reference("23/01001"));
-        assert!(has_docket_reference("requête 2202166"));
-        assert!(!has_docket_reference("juste du texte"));
+        assert!(designates_a_number("pourvoi 07-11.687"));
+        assert!(designates_a_number("19-23.664"));
+        assert!(designates_a_number("19-23664"));
+        assert!(designates_a_number("23/01001"));
+        assert!(designates_a_number("requête 2202166"));
+        assert!(designates_a_number("CAA Paris 21PA01295"));
+        assert!(designates_a_number("CJUE C-369/90"));
+        assert!(designates_a_number("SAN-2022-019"));
+        assert!(!designates_a_number("juste du texte"));
+        assert!(!designates_a_number("article L761-1"));
+        assert!(!designates_a_number("décret 2020-1310"));
     }
 
     #[test]
-    fn date_signal_fr_and_iso() {
-        assert!(has_date_reference("13 février 2024"));
-        assert!(has_date_reference("février 2024"));
-        assert!(has_date_reference("2024-02-13"));
-        assert!(has_date_reference("Cour de cassation 22 novembre 2000"));
-        assert!(!has_date_reference("pas de date"));
-    }
-
-    #[test]
-    fn article_scales_title_down_bm25_up() {
+    fn article_scales_bm25_up_and_leaves_the_rest() {
         let w = compute_weights("article L 531-1", &[], &[]);
-        assert_eq!(w.title, 0.2);
         assert_eq!(w.bm25, 1.5);
+        assert_eq!(w.title, 1.0);
         assert_eq!(w.ann, 1.0);
-    }
-
-    #[test]
-    fn docket_and_date_cumulate() {
-        let w = compute_weights("Cour de cassation 22 novembre 2000", &[], &[]);
-        assert_eq!(w.title, 1.5);
+        assert_eq!(w.docket, 0.0);
     }
 
     #[test]
@@ -249,7 +202,6 @@ mod tests {
         query: String,
         article: bool,
         docket: bool,
-        date: bool,
     }
     #[derive(serde::Deserialize)]
     struct SigFixture {
@@ -268,12 +220,11 @@ mod tests {
                 c.query
             );
             assert_eq!(
-                has_docket_reference(&c.query),
+                designates_a_number(&c.query),
                 c.docket,
                 "docket {:?}",
                 c.query
             );
-            assert_eq!(has_date_reference(&c.query), c.date, "date {:?}", c.query);
         }
     }
 
@@ -298,6 +249,7 @@ mod tests {
         title: f64,
         bm25: f64,
         ann: f64,
+        docket: f64,
     }
     #[derive(serde::Deserialize)]
     struct WeightFixture {
@@ -330,6 +282,13 @@ mod tests {
                 c.name,
                 w.ann,
                 c.ann
+            );
+            assert!(
+                (w.docket - c.docket).abs() < 1e-12,
+                "{} docket {} != {}",
+                c.name,
+                w.docket,
+                c.docket
             );
         }
     }

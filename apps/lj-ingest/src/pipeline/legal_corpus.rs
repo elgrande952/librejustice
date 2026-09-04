@@ -1,25 +1,14 @@
 //! Loader générique de corpus de loi curé → `legal_text` + `legal_article`.
 //!
-//! Source-agnostique : la moitié **adaptative** (OCR, choix du document,
-//! juridiction/nature/statut, **segmentation**) vit dans les scripts Python
-//! jetables de curation, qui produisent un dataset JSON par texte sous
-//! `<state_dir>/ingest/corpus/`, articles déjà découpés ET déjà nettoyés. Ce
-//! module n'est qu'un **pur inséreur** : il upsert le texte et insère les articles
-//! fournis, `texte` inséré **VERBATIM**. Les seules dérivations tolérées sont des
-//! clés calculées à partir des champs fournis (`num_key`, `status`,
-//! `instrument_key`) — jamais une modification du contenu.
+//! Source-agnostique et **pur inséreur** : le dataset arrive sous
+//! `<state_dir>/ingest/corpus/`, articles déjà découpés et nettoyés, et `texte`
+//! est inséré **VERBATIM**. Les seules dérivations sont des clés calculées à
+//! partir des champs fournis (`num_key`, `status`, `instrument_key`).
 //!
-//! ⛔ RÈGLE ABSOLUE — AUCUN NETTOYAGE NI NORMALISATION DE TEXTE DANS CE FICHIER.
-//! Tout traitement du CORPS (glyphes PUA, césures, en-têtes et pieds de page,
-//! mojibake, cruft de navigation, reflux de paragraphes, `replace`/`strip`/regex
-//! sur `texte`…) se fait dans les scripts Python de curation. Toute logique de
-//! cleaning ajoutée ici est un bug, à corriger côté producteur puis recharger.
-//! Même chose pour une commande de nettoyage in-place en SQL.
-//!
-//! La règle vise la curation **adaptative par texte**, celle qui grossit d'un cas
-//! à chaque source, pas le normaliseur caractères unique et invariant
-//! `lj_core::normalizer::normalize_chars`, appliqué à toutes les sources au point
-//! d'écriture unique du référentiel.
+//! ⛔ Aucun nettoyage ni normalisation de texte ici : glyphes PUA, césures,
+//! en-têtes, mojibake, reflux de paragraphes se corrigent chez le producteur du
+//! dataset, qui recharge. Seul `lj_core::normalizer::normalize_chars`, invariant
+//! et commun à toutes les sources, s'applique en aval.
 //!
 //! Chaque article du dataset est **mono-version** (`texte` : forme consolidée,
 //! `effect_date` = `date_debut` commun) ou **multi-versions** (`versions[]` :

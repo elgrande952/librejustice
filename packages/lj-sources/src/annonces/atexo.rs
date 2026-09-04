@@ -1,16 +1,4 @@
-//! Atexo MPE — PLACE (`marches-publics.gouv.fr`) et ses marques blanches.
-//!
-//! Chaque instance expose la même API publique `/api/v2/consultations`
-//! (API Platform / Hydra) : **`Accept: application/ld+json` obligatoire**
-//! (`application/json` rend un array nu sans totaux), 46 filtres serveur,
-//! `itemsPerPage=250`, `properties[]=` ignoré. Les grosses pages sont lentes
-//! côté serveur : on tire les pages 2..N en parallèle. Sonder l'hôte **et**
-//! `www.<hôte>` en suivant les redirections (`marches-publics.gouv.fr` exige
-//! `www.`). Le référentiel `organismes` est sous JWT : l'acheteur n'est
-//! exploitable que si l'instance l'embarque en objet `{denomination}` — la
-//! jointure avec le BOAMP passe par l'URL de consultation (`cles_jointure`),
-//! pas par l'acheteur.
-
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use futures::StreamExt;
@@ -95,6 +83,58 @@ async fn enumerate_host(client: &reqwest::Client, host: &str) -> super::HoteRun 
     Ok((total, rows))
 }
 
+/// Les consultations que l'instance rend pour une référence de marché. L'API
+/// `/api/v2/consultations` n'a aucun filtre déclaré : c'est la recherche du site
+/// (`keyWord`) qui résout la référence en identifiants, et l'API qui rend
+/// ensuite la ligne complète. Son index et sa liste ne couvrent pas le même
+/// ensemble — une consultation absente de l'énumération sort de la recherche.
+pub async fn chercher(host: &str, reference: &str) -> Result<Vec<AnnonceBrute>> {
+    static CONSULT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"app\.php/entreprise/consultation/(\d{1,12})\?orgAcronyme=").unwrap()
+    });
+    let client = super::client();
+    // L'hôte nu peut ne pas répondre (PLACE exige `www.`), comme à l'énumération.
+    let requete = |base: String| {
+        client.get(format!("{base}/")).query(&[
+            ("page", "entreprise.EntrepriseAdvancedSearch"),
+            ("AllCons", ""),
+            ("keyWord", reference),
+        ])
+    };
+    let mut base = format!("https://{host}");
+    let html = match send_text(requete(base.clone()), &format!("atexo recherche {host}")).await {
+        Ok(h) => h,
+        Err(_) if !host.starts_with("www.") => {
+            base = format!("https://www.{host}");
+            send_text(
+                requete(base.clone()),
+                &format!("atexo recherche www.{host}"),
+            )
+            .await?
+        }
+        Err(e) => return Err(e),
+    };
+    let ids: HashSet<&str> = CONSULT
+        .captures_iter(&html)
+        .map(|c| c.get(1).expect("groupe capturant").as_str())
+        .collect();
+    let canon = host.trim_start_matches("www.");
+    let mut rows = Vec::new();
+    for id in ids {
+        let body = send_text(
+            client
+                .get(format!("{base}/api/v2/consultations/{id}"))
+                .header("Accept", "application/ld+json"),
+            &format!("atexo consultation {id}"),
+        )
+        .await?;
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| SourceError::Invalid(format!("atexo {host}: consultation {id}: {e}")))?;
+        rows.push(row(&v, canon));
+    }
+    Ok(rows)
+}
+
 /// Ré-énumère toutes les instances recensées (`profil_acheteur`).
 pub async fn enumerate(hosts: &[String]) -> Result<MoteurRun> {
     let client = super::client();
@@ -108,19 +148,19 @@ pub async fn enumerate(hosts: &[String]) -> Result<MoteurRun> {
     let mut run = MoteurRun {
         annonce: Some(0),
         echecs: 0,
+        hotes: Vec::new(),
         rows: Vec::new(),
     };
     for (host, res) in resultats {
+        let joignable = res.is_ok();
         match res {
             Ok((total, rows)) => {
                 run.annonce = run.annonce.map(|a| a + total);
                 run.rows.extend(rows);
             }
-            Err(e) => {
-                run.echecs += 1;
-                tracing::warn!(host, error = %e, "atexo : hôte en échec");
-            }
+            Err(e) => tracing::warn!(host, error = %e, "atexo : hôte en échec"),
         }
+        run.hotes.push(super::HoteVerdict { host, joignable });
     }
     run.rows = dedup_source_uid(run.rows);
     Ok(run)
@@ -168,6 +208,7 @@ fn row(m: &serde_json::Value, host: &str) -> AnnonceBrute {
         .and_then(|l| normalise_departement(&l));
     let url_avis = texte("urlConsultation")
         .unwrap_or_else(|| format!("https://www.{host}/entreprise/consultation/{id}"));
+    let url_dce = retrait_dce(&url_avis, &id);
     AnnonceBrute {
         moteur: "atexo",
         source_uid: format!("atexo:{host}:{id}"),
@@ -187,10 +228,23 @@ fn row(m: &serde_json::Value, host: &str) -> AnnonceBrute {
             .and_then(|s| parse_ts_iso(&s)),
         url_avis: Some(url_avis),
         url_rc: None,
-        url_dce: None,
+        url_dce,
         url_depot: None,
         procedure: None,
     }
+}
+
+/// Le formulaire de retrait du DCE, que MPE sert sans compte et qui propose le
+/// téléchargement anonyme. Sans `orgAcronyme` l'entité n'est pas résolue et la
+/// page ne rend rien : pas de lien plutôt qu'un lien mort.
+fn retrait_dce(url_avis: &str, id: &str) -> Option<String> {
+    static ACRONYME: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"orgAcronyme=([A-Za-z0-9]+)").unwrap());
+    let hote = super::discover::hote_de(url_avis)?;
+    let acronyme = ACRONYME.captures(url_avis)?.get(1)?.as_str();
+    Some(format!(
+        "https://{hote}/index.php?page=Entreprise.EntrepriseDemandeTelechargementDce&id={id}&orgAcronyme={acronyme}"
+    ))
 }
 
 /// Lit les trois champs sur la fiche MPE — même gabarit sur toutes les marques
@@ -245,7 +299,7 @@ pub async fn detail(url_avis: &str) -> Result<DetailAnnonce> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_detail, DetailAnnonce};
+    use super::{parse_detail, retrait_dce, DetailAnnonce};
 
     const FICHE_RECIA: &str = r#"
                                    href="/?page=Entreprise.EntrepriseAdvancedSearch&amp;searchAnnCons&type=restreinte">
@@ -342,5 +396,24 @@ mod tests {
     fn une_fiche_muette_rend_un_detail_vide() {
         let sans_cpv = FICHE_MAXIMILIEN.split("Code CPV").next().unwrap();
         assert_eq!(parse_detail(sans_cpv), DetailAnnonce::default());
+    }
+
+    #[test]
+    fn le_retrait_dce_suit_l_hote_de_la_fiche_et_tombe_sans_acronyme() {
+        assert_eq!(
+            retrait_dce(
+                "https://marches.maximilien.fr/entreprise/consultation/941833?orgAcronyme=o6a",
+                "941833"
+            )
+            .as_deref(),
+            Some("https://marches.maximilien.fr/index.php?page=Entreprise.EntrepriseDemandeTelechargementDce&id=941833&orgAcronyme=o6a")
+        );
+        assert_eq!(
+            retrait_dce(
+                "https://www.marches-publics.gouv.fr/entreprise/consultation/3040064",
+                "3040064"
+            ),
+            None
+        );
     }
 }

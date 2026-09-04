@@ -9,13 +9,10 @@ use crate::state::AppState;
 use lj_dtos::{
     JurisdictionCatalogueResponse, JurisdictionHubDecision, JurisdictionHubEntry,
     JurisdictionHubResponse, JurisdictionTypeGroup, JurisdictionYearCount,
-    JurisdictionYearResponse,
+    JurisdictionYearResponse, HUB_PAGE_SIZE,
 };
 use lj_store::repository::DecisionRepository;
 use std::sync::Arc;
-
-/// Décisions par page hub juridiction×année.
-pub const HUB_PAGE_SIZE: u32 = 100;
 
 /// Ordre éditorial des familles du catalogue : ordre administratif, ordre
 /// judiciaire, juridictions spécialisées, cours européennes. Une famille
@@ -25,7 +22,8 @@ const TYPE_ORDER: &[&str] = &[
 ];
 
 /// Catalogue des juridictions groupé par famille. Une seule entrée de cache
-/// (clé `()`), TTL 12 h : l'agrégat pleine table ne se recalcule pas par requête.
+/// (clé `()`), TTL 12 h : le DTO des 376 juridictions groupées ne se réassemble
+/// pas par requête.
 pub async fn catalogue(state: &AppState) -> Result<Arc<JurisdictionCatalogueResponse>> {
     state
         .jurisdiction_catalogue_cache
@@ -121,11 +119,8 @@ pub async fn year_page(
     let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
     let total = repo
-        .jurisdiction_years(code)
+        .jurisdiction_year_total(code, year)
         .await?
-        .into_iter()
-        .find(|(y, _)| *y == year)
-        .map(|(_, c)| c)
         .ok_or(ApiError::NotFound)?;
 
     let page = page.max(1);

@@ -1,123 +1,102 @@
 # LibreJustice
 
-**[librejustice.fr](https://librejustice.fr)** : moteur de recherche libre
-sur le droit français et européen. Jurisprudence des deux ordres et textes
-consolidés, reliés entre eux et interrogeables en langage naturel, sur le
-web comme depuis les assistants IA (**MCP**).
+**[librejustice.fr](https://librejustice.fr)**: a free search engine for French and European law, plus current public notices. It links case law from France's administrative and judicial courts to consolidated legal texts and makes them searchable in plain language on the web and through **MCP**.
 
-## Ce qu'on y cherche
+Free and open source. **~3.7 million decisions and ~3.6 million legal articles** in one database, linked article by article, resynchronised daily. That is the whole point: texts and case law live together, so there is no second server to plug in for the codes and no third one for the citation graph.
 
-- **Jurisprudence** : Conseil d'État, Cour de cassation, cours d'appel,
-  tribunaux administratifs et judiciaires, CNDA, Conseil constitutionnel,
-  CEDH, CJUE — filtres par juridiction, date, issue et articles cités.
-- **Textes** : codes et lois **tels qu'en vigueur à n'importe quelle date**
-  (versions consolidées et historique des articles), droit de l'UE, traités
-  et accords bilatéraux, conventions collectives, BOFiP, circulaires, codes
-  étrangers (59 pays).
-- **Annuaire** : avocats, entreprises et juridictions, reliés à leur
-  contentieux.
+## What you search
 
-Corpus mis à jour quotidiennement depuis les sources ouvertes (Judilibre,
-DILA/Légifrance, EUR-Lex…).
+- **Case law**: Conseil d'État, Cour de cassation, cours d'appel, administrative and judicial first-instance courts, Conseil constitutionnel, CNIL, CNDA (publicly released decisions only), Tribunal des conflits, ECHR, CJEU. Filters by court, date, outcome and cited articles.
+- **Legal texts**: codes and statutes **as they stood on any date** (consolidated versions with per-article history), the full Journal officiel, EU law, treaties and bilateral accords, collective agreements, BOFiP, circulaires, and the codes of 59 foreign countries.
+- **Public notices**: open public procurement opportunities from BOAMP and buyer platforms, deduplicated with submission links and deadlines.
+- **Directory**: lawyers, companies and courts, linked to their litigation.
 
-## Ce que les sources officielles n'offrent pas
+Corpus refreshed daily from open sources (Judilibre, DILA/Légifrance, EUR-Lex...).
 
-Les bases publiques sont des silos, chacun avec son moteur borné à son fonds
-(Judilibre = ordre judiciaire seul ; l'open data de la justice administrative
-= mots-clés, juridiction et dates sur CE/CAA/TA ; Légifrance = les textes).
-LibreJustice les consolide et ajoute la couche qui manque :
+## What the official sources do not offer
 
-- **recherche en langage naturel** (hybride lexicale + sémantique) avec
-  rerank IA, facettes dynamiques et décisions similaires ;
-- **le graphe** : citations extraites et résolues — d'une décision vers les
-  articles exacts qu'elle cite (à la bonne version), et d'un article vers
-  les décisions qui le citent ;
-- **dédoublonnage inter-sources** (une décision, une fiche) et récupération
-  de décisions absentes des canaux officiels ;
-- **résumés IA** par décision, toujours distingués des extraits verbatim ;
-- **un accès MCP remote** pour les assistants IA.
+Public databases are silos, each with a search engine bounded by its own fonds (Judilibre covers the judicial courts only; the administrative open data searches CE/CAA/TA by keyword, court and date; Légifrance holds the texts). LibreJustice consolidates them and adds the missing layer:
 
-## Utiliser LibreJustice depuis un assistant IA
+- **plain-language search** (hybrid lexical + semantic) with AI reranking, dynamic facets and similar decisions;
+- **the graph**: citations extracted and resolved, from a decision to the exact articles it cites at the right version, and from an article back to the decisions that cite it;
+- **cross-source deduplication** (one decision, one page) and recovery of decisions missing from the official channels;
+- **AI summaries** per decision, always kept distinct from verbatim excerpts;
+- **a remote MCP endpoint** for AI assistants.
 
-Le serveur MCP public est `https://librejustice.fr/mcp` (OAuth 2.1 avec
-enregistrement dynamique de client : aucune clé à configurer). Cinq outils :
-`search_decisions`, `get_decision`, `search_legal_texts`, `get_legal_text`,
-`list_my_activity`.
+## Using LibreJustice from an AI assistant
 
-Avec Claude Code, le plugin installe le connecteur et les skills d'usage :
+The public MCP server is `https://librejustice.fr/mcp` (OAuth 2.1 with dynamic client registration: no API key to configure). Five tools: `search_decisions`, `get_decision`, `search_legal_texts`, `get_legal_text`, `list_my_activity`.
+
+With Claude Code, the plugin installs the connector and the usage skills:
 
 ```
 /plugin marketplace add librejustice/librejustice
 /plugin install librejustice@librejustice
 ```
 
-Les skills seuls (sans le connecteur MCP) s'installent dans n'importe quel
-agent compatible via [skills](https://skills.sh) :
+The skills alone (without the MCP connector) install into any compatible agent through [skills](https://skills.sh):
 
 ```
 npx skills add librejustice/librejustice
 ```
 
-Sur claude.ai, LibreJustice est listé dans le répertoire des connecteurs :
-[claude.ai/directory/connectors/librejustice](https://claude.ai/directory/connectors/librejustice).
-Un clic, puis l'autorisation OAuth. Avec ChatGPT, Le Chat ou Perplexity :
-ajouter un connecteur custom pointant sur `https://librejustice.fr/mcp`.
+On claude.ai, LibreJustice is listed in the [connector directory](https://claude.ai/directory/connectors/librejustice). One click, then the OAuth authorisation. With ChatGPT, Le Chat or Perplexity, add a custom connector pointing at `https://librejustice.fr/mcp`.
+
+## Using LibreJustice from your own code
+
+The same corpus in REST, described by [`openapi.json`](https://librejustice.fr/openapi.json) (OpenAPI 3.1). The key is free: create an account, then a key from your profile. Guide at [librejustice.fr/api-guide](https://librejustice.fr/api-guide).
+
+```bash
+curl -H 'Authorization: Bearer ljk_your_key' \
+  'https://librejustice.fr/api/search?q=trouble+anormal+de+voisinage&limit=3'
+```
+
+Five routes: `/api/search`, `/api/search-textes`, `/api/decision/{id}`, `/api/texte/{code}/{article}` and the same with a trailing `/{date}` for the version in force that day.
 
 ## Stack
 
-Nœud mono-serveur **Postgres + ParadeDB + VectorChord** (recherche hybride
-BM25 + vecteurs), API et front en Rust.
+A single-server node, **Postgres + ParadeDB + VectorChord** (hybrid BM25 + vector search), API and front end in Rust.
 
-Workspace Cargo **pur Rust**, scindé en deux racines :
+A **pure Rust** Cargo workspace, split in two roots:
 
-- `packages/` — bibliothèques :
-  - `lj-core` — cœur pur : parsing / normalisation / extraction, résumé, refs légales.
-  - `lj-extract` — extraction des champs et citations des décisions.
-  - `lj-sources` — I/O sources (Judilibre JSON, ZIP/XML opendata).
-  - `lj-store` — accès Postgres (tokio-postgres + deadpool) + migrations.
-  - `lj-llm` — backends embedding + cache + quantisation + client Mistral (chat/OCR).
-  - `lj-dtos` — contrats API ↔ web (serde).
-  - `lj-telemetry` — tracing + export OTLP.
-  - `lj-api` — couche API (Axum + MCP rmcp + OAuth).
-  - `lj-web` — front Leptos (SSR + hydratation WASM), Tailwind.
-- `apps/` — binaires livrables :
-  - `lj-server` — déploiement unique : API + MCP/OAuth + SSR.
-  - `lj-ingest` — CLI d'ingestion + runner cron.
+- `packages/` libraries:
+  - `lj-core` pure core: parsing, normalisation, extraction, summary, legal refs.
+  - `lj-extract` field and citation extraction from decisions.
+  - `lj-sources` source I/O (Judilibre JSON, opendata ZIP/XML).
+  - `lj-store` Postgres access (tokio-postgres + deadpool) and migrations.
+  - `lj-llm` embedding backends, cache, quantisation, Mistral client (chat/OCR).
+  - `lj-dtos` api to web contracts (serde).
+  - `lj-telemetry` tracing and OTLP export.
+  - `lj-api` API layer (Axum + MCP rmcp + OAuth).
+  - `lj-web` Leptos front end (SSR + WASM hydration), Tailwind.
+- `apps/` shippable binaries:
+  - `lj-server` single deployment: API + MCP/OAuth + SSR.
+  - `lj-ingest` ingest CLI and cron runner.
 
-## Build & dev
+## Build and dev
 
-La toolchain Rust est épinglée par `rust-toolchain.toml`. On utilise
-[`mise`](https://mise.jdx.dev) pour les tâches :
+The Rust toolchain is pinned by `rust-toolchain.toml`. Tasks run through [`mise`](https://mise.jdx.dev):
 
 ```bash
 mise run test      # rustfmt --check + clippy -D warnings + cargo test --workspace
-mise run dev       # lj-server fusionné (cargo leptos watch, :3000)
+mise run dev       # merged lj-server (cargo leptos watch, :3000)
 ```
 
-Pour une base locale : `mise run dbs`. La tâche prépare l'état de Postgres sous
-`LIBREJUSTICE_STATE_DIR` — propriétaire du répertoire de données, et copie de la
-configuration montée par le conteneur — avant de le démarrer.
+For a local database: `mise run dbs`. The task prepares the Postgres state under `LIBREJUSTICE_STATE_DIR`, owning the data directory and copying the configuration mounted by the container, before starting it.
 
-## Déploiement
+## Deployment
 
-Mono-serveur via **podman compose** (`infra/docker-compose.yml`) : Postgres
-(ParadeDB + VectorChord), le binaire fusionné `lj-server`, un front `caddy` et
-le cron d'ingestion. Renseigner `.env` (voir `.env.example`), puis :
+Single server through **podman compose** (`infra/docker-compose.yml`): Postgres (ParadeDB + VectorChord), the merged `lj-server` binary, a `caddy` front end and the ingest cron. Fill in `.env` (see `.env.example`), then:
 
 ```bash
-mise run ensure-pg                                                          # état + conf Postgres
+mise run ensure-pg                                                          # Postgres state and conf
 podman compose -f infra/docker-compose.yml --profile prod up -d --build
 podman compose -f infra/docker-compose.yml exec -T cron lj-ingest migrate   # migrations
 ```
 
-`lj-server` sert l'API, le MCP/OAuth, le SSR et les assets. Il écoute en clair ;
-c'est `caddy` qui tient `:443` et termine le TLS, de sorte que la socket reste
-liée quand le conteneur applicatif est recréé.
+`lj-server` serves the API, MCP/OAuth, SSR and the assets. It listens in clear; `caddy` holds `:443` and terminates TLS, so the socket stays bound when the application container is recreated.
 
-La configuration Postgres livrée (`infra/pg-conf/`) porte ce que l'application
-exige — extensions, réglages ParadeDB, compression — avec un dimensionnement de
-machine de développement. Une instance de production relève `shared_buffers` et
-`effective_cache_size` selon son matériel.
+The shipped Postgres configuration (`infra/pg-conf/`) carries what the application requires (extensions, ParadeDB settings, compression) sized for a development machine. A production instance raises `shared_buffers` and `effective_cache_size` to match its hardware.
 
 ## Licence
 

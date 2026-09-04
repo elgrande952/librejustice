@@ -10,6 +10,7 @@ use crate::piste::PisteOAuth;
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::TracingMiddleware;
 use serde_json::Value;
+use std::time::Duration;
 
 /// URL de base par défaut de l'API Judilibre (PISTE).
 pub const BASE_URL: &str = "https://api.piste.gouv.fr/cassation/judilibre/v1.0";
@@ -35,6 +36,8 @@ impl JudilibreClient {
         let client = ClientBuilder::new(
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120))
                 .build()
                 .expect("reqwest client build"),
         )

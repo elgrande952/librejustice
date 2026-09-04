@@ -21,14 +21,14 @@ pub(crate) fn as_refs(params: &Params) -> Vec<&(dyn ToSql + Sync)> {
         .collect()
 }
 
-fn jt_codes(types: &[JurisdictionType]) -> Vec<String> {
+pub(crate) fn jt_codes(types: &[JurisdictionType]) -> Vec<String> {
     types.iter().map(|t| jt_to_str(*t).to_string()).collect()
 }
 
 /// Un tableau de filtre vide n'est pas un filtre : `= ANY('{}')` ne matche rien,
 /// donc `{"jurisdiction_type": []}` rendrait zéro résultat sans erreur.
 /// [`nonempty`] pose la même règle pour les filtres de chaînes.
-fn present<T>(v: &Option<Vec<T>>) -> Option<&[T]> {
+pub(crate) fn present<T>(v: &Option<Vec<T>>) -> Option<&[T]> {
     v.as_deref().filter(|s| !s.is_empty())
 }
 
@@ -59,7 +59,7 @@ fn enum_code<T: serde::Serialize>(v: &T) -> String {
 }
 
 /// Uids complets `facet_value` d'une sélection d'enums : `prefix:<CODE>`.
-fn enum_uids<T: serde::Serialize>(prefix: &str, vs: &[T]) -> Vec<String> {
+pub(crate) fn enum_uids<T: serde::Serialize>(prefix: &str, vs: &[T]) -> Vec<String> {
     vs.iter()
         .map(|v| format!("{prefix}:{}", enum_code(v)))
         .collect()
@@ -68,7 +68,7 @@ fn enum_uids<T: serde::Serialize>(prefix: &str, vs: &[T]) -> Vec<String> {
 /// Expansion domaine : une racine sélectionnée matche elle-même et toutes ses
 /// feuilles (codes préfixés `<RACINE>_` dans `Domain::ALL`) ; une racine sans
 /// feuille (FISCAL, EUROPEEN…) ou une feuille matche elle seule.
-fn legal_domain_uids(selected: &[Domain]) -> Vec<String> {
+pub(crate) fn legal_domain_uids(selected: &[Domain]) -> Vec<String> {
     let mut out: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for d in selected {
         let code = enum_code(d);
@@ -142,11 +142,12 @@ pub(crate) fn build_facet_filter(
                 Box::new(values),
             );
         }
-        // Portée : `publication_codes` est dénormalisée sur les deux tables — clause
-        // directe sur l'alias local. Côté jambes BM25 (`Tantivy`), le filtre est composé
-        // DANS le `@@@` par [`build_array_filter_queries`].
-        if let Some(v) = present(&req.significance) {
-            if let Some(clause) = significance_clause(alias, v) {
+        // `publication_codes` est dénormalisée sur les deux tables : clause directe
+        // sur l'alias local, aucun `EXISTS` vers `decisions`. Côté jambes BM25
+        // (`Tantivy`), le filtre est composé DANS le `@@@` par
+        // [`build_array_filter_queries`].
+        if let Some(v) = nonempty(&req.publication) {
+            if let Some(clause) = publication_clause(alias, &v) {
                 clauses.push(clause);
             }
         }
@@ -220,32 +221,19 @@ pub(crate) fn build_facet_filter(
             Box::new(v),
         );
     }
-    // Chambre : catégorie contrôlée uniforme, suffixes → `chamber:*`.
-    if let Some(v) = nonempty(&req.chamber) {
-        add_clause(
-            &mut ref_clauses,
-            params,
-            next_idx,
-            &format!("{ref_alias}.chamber_uid = ANY($?)"),
-            Box::new(
-                v.into_iter()
-                    .map(|s| format!("chamber:{s}"))
-                    .collect::<Vec<String>>(),
-            ),
-        );
-    }
-    if let Some(v) = nonempty(&req.publication) {
-        add_clause(
-            &mut ref_clauses,
-            params,
-            next_idx,
-            &format!("{ref_alias}.publication_uid = ANY($?)"),
-            Box::new(
-                v.into_iter()
-                    .map(|s| format!("publication:{s}"))
-                    .collect::<Vec<String>>(),
-            ),
-        );
+    // Seat: an overlap of paths, the GIN serving the SQL leg. The BM25 legs
+    // pass it as a `term_set` inside the `@@@`, where the multi-valued fast
+    // field answers without touching the table.
+    if arrays == ArrayFilters::AsSql {
+        if let Some(v) = nonempty(&req.seat) {
+            add_clause(
+                &mut ref_clauses,
+                params,
+                next_idx,
+                &format!("{ref_alias}.seat_paths && $?::text[]"),
+                Box::new(v),
+            );
+        }
     }
     if !ref_clauses.is_empty() {
         match table {
@@ -260,107 +248,6 @@ pub(crate) fn build_facet_filter(
         String::new()
     } else {
         format!(" AND {}", clauses.join(" AND "))
-    }
-}
-
-/// Littéral SQL `ARRAY['r','A']` d'un groupe de portée (codes constants du
-/// référentiel lj-core, jamais d'entrée utilisateur — pas de paramètre).
-fn significance_sql_array(groups: &[&str]) -> String {
-    let codes: Vec<String> = groups
-        .iter()
-        .flat_map(|g| lj_core::publication::significance_codes(g))
-        .map(|c| format!("'{c}'"))
-        .collect();
-    format!("ARRAY[{}]", codes.join(","))
-}
-
-/// `term_set` tantivy d'un groupe de portée sur `publication_codes` (champ
-/// `pdb.literal` de `decisions_bm25` : termes exacts, pas de lowercasing —
-/// `r`≠`R`, `C+` intact).
-fn significance_term_set(groups: &[&str]) -> String {
-    let terms: Vec<String> = groups
-        .iter()
-        .flat_map(|g| lj_core::publication::significance_codes(g))
-        .map(|c| format!("paradedb.term('publication_codes', '{c}')"))
-        .collect();
-    if terms.len() == 1 {
-        terms.into_iter().next().expect("non vide")
-    } else {
-        format!("paradedb.term_set(terms => ARRAY[{}])", terms.join(", "))
-    }
-}
-
-/// Filtre `portee` composé dans le `@@@` des jambes BM25 (mêmes sémantiques
-/// rang-le-plus-fort que [`significance_clause`], mais en requêtes tantivy
-/// indexées). `None` si la sélection est vide.
-fn significance_tantivy(selected: &[lj_dtos::Significance]) -> Option<String> {
-    use lj_dtos::Significance;
-    let majeure = || significance_term_set(&["majeure"]);
-    let importante = || significance_term_set(&["importante"]);
-    let limitee = || significance_term_set(&["limitee"]);
-    let mut branches: Vec<String> = Vec::new();
-    for p in selected {
-        let branch = match p {
-            Significance::Majeure => majeure(),
-            Significance::Importante => format!(
-                "paradedb.boolean(must => ARRAY[{}], must_not => ARRAY[{}])",
-                importante(),
-                majeure()
-            ),
-            Significance::Limitee => format!(
-                "paradedb.boolean(must => ARRAY[{}], must_not => ARRAY[{}])",
-                limitee(),
-                significance_term_set(&["majeure", "importante"])
-            ),
-            Significance::Indeterminee => format!(
-                "paradedb.boolean(must => ARRAY[paradedb.all()], must_not => ARRAY[{}])",
-                significance_term_set(&["majeure", "importante", "limitee"])
-            ),
-        };
-        if !branches.contains(&branch) {
-            branches.push(branch);
-        }
-    }
-    match branches.len() {
-        0 => None,
-        1 => branches.into_iter().next(),
-        _ => Some(format!(
-            "paradedb.boolean(should => ARRAY[{}])",
-            branches.join(", ")
-        )),
-    }
-}
-
-/// Clause `portee` : sémantique rang le plus fort — une décision `{b,r}` est
-/// majeure, pas importante. Chaque groupe matche son overlap MOINS les groupes
-/// plus forts ; `INDETERMINEE` = aucun code classant. Sélections OR-ées.
-/// `None` si la sélection est vide (aucune contrainte).
-fn significance_clause(alias: &str, selected: &[lj_dtos::Significance]) -> Option<String> {
-    use lj_dtos::Significance;
-    let col = format!("{alias}.publication_codes");
-    let majeure = significance_sql_array(&["majeure"]);
-    let importante = significance_sql_array(&["importante"]);
-    let limitee = significance_sql_array(&["limitee"]);
-    let classant = significance_sql_array(&["majeure", "importante", "limitee"]);
-    let m_i = significance_sql_array(&["majeure", "importante"]);
-    let mut ors: Vec<String> = Vec::new();
-    for p in selected {
-        let cond = match p {
-            Significance::Majeure => format!("{col} && {majeure}"),
-            Significance::Importante => {
-                format!("({col} && {importante} AND NOT {col} && {majeure})")
-            }
-            Significance::Limitee => format!("({col} && {limitee} AND NOT {col} && {m_i})"),
-            Significance::Indeterminee => format!("NOT {col} && {classant}"),
-        };
-        if !ors.contains(&cond) {
-            ors.push(cond);
-        }
-    }
-    if ors.is_empty() {
-        None
-    } else {
-        Some(format!("({})", ors.join(" OR ")))
     }
 }
 
@@ -389,9 +276,56 @@ fn array_filter_values(req: &SearchRequest) -> Vec<(&'static str, Vec<String>)> 
     .collect()
 }
 
-/// Requêtes tantivy des filtres tableau — `paradedb.term` (1 valeur) ou
-/// `paradedb.term_set` (overlap = ANY) — plus le filtre portée composé
-/// ([`significance_tantivy`]). À AND-er dans le `@@@` via [`compose_tantivy_query`].
+/// Codes source des valeurs de publication sélectionnées, dédupliqués. Ce sont
+/// des constantes du référentiel compilé, jamais de l'entrée utilisateur (la
+/// frontière la valide en 422) : inlinées, pas de paramètre.
+fn publication_selected_codes(keys: &[String]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for key in keys {
+        for code in lj_core::publication::publication_codes_of(key) {
+            if !out.contains(code) {
+                out.push(code);
+            }
+        }
+    }
+    out
+}
+
+/// Clause SQL de publication : appartenance multiple, l'union des codes des
+/// valeurs cochées. `None` si la sélection est vide.
+fn publication_clause(alias: &str, keys: &[String]) -> Option<String> {
+    let codes = publication_selected_codes(keys);
+    if codes.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = codes.iter().map(|c| format!("'{c}'")).collect();
+    Some(format!(
+        "{alias}.publication_codes && ARRAY[{}]",
+        list.join(",")
+    ))
+}
+
+/// Même filtre en requête tantivy, pour les jambes BM25. `publication_codes` est
+/// un champ `pdb.literal` de `decisions_bm25` : termes exacts, pas de
+/// lowercasing (`r` != `R`, `C+` intact).
+fn publication_tantivy(keys: &[String]) -> Option<String> {
+    let terms: Vec<String> = publication_selected_codes(keys)
+        .iter()
+        .map(|c| format!("paradedb.term('publication_codes', '{c}')"))
+        .collect();
+    match terms.len() {
+        0 => None,
+        1 => terms.into_iter().next(),
+        _ => Some(format!(
+            "paradedb.term_set(terms => ARRAY[{}])",
+            terms.join(", ")
+        )),
+    }
+}
+
+/// Requêtes tantivy des filtres tableau, `paradedb.term` (1 valeur) ou
+/// `paradedb.term_set` (overlap = ANY), plus le filtre de publication
+/// ([`publication_tantivy`]). À AND-er dans le `@@@` via [`compose_tantivy_query`].
 pub(crate) fn build_array_filter_queries(
     req: &SearchRequest,
     next_idx: &mut usize,
@@ -414,12 +348,38 @@ pub(crate) fn build_array_filter_queries(
             format!("paradedb.term_set(terms => ARRAY[{}])", terms.join(", "))
         });
     }
-    if let Some(v) = &req.significance {
-        if let Some(expr) = significance_tantivy(v) {
+    if let Some(v) = nonempty(&req.seat) {
+        out.push(term_any("seat_paths", &v, next_idx, params));
+    }
+    if let Some(v) = &req.publication {
+        if let Some(expr) = publication_tantivy(v) {
             out.push(expr);
         }
     }
     out
+}
+
+/// `paradedb.term` d'une valeur, `term_set` de plusieurs.
+pub(crate) fn term_any(
+    field: &str,
+    values: &[String],
+    next_idx: &mut usize,
+    params: &mut Params,
+) -> String {
+    let terms: Vec<String> = values
+        .iter()
+        .map(|v| {
+            params.push(Box::new(v.clone()) as Box<dyn ToSql + Sync + Send>);
+            let expr = format!("paradedb.term('{field}', ${next_idx}::text)");
+            *next_idx += 1;
+            expr
+        })
+        .collect();
+    if terms.len() == 1 {
+        terms.into_iter().next().expect("non vide")
+    } else {
+        format!("paradedb.term_set(terms => ARRAY[{}])", terms.join(", "))
+    }
 }
 
 /// Compose l'expression `@@@` d'une jambe BM25 : la requête primaire seule,
@@ -477,7 +437,7 @@ mod tests {
             "procedure": [],
             "office": [],
             "legalDomain": [],
-            "significance": [],
+            "publication": [],
             "jurisdictionCode": [],
         }))
         .unwrap();
@@ -494,11 +454,59 @@ mod tests {
         assert!(params.is_empty());
     }
 
+    /// The seat filters by an overlap of paths: the BM25 legs pass it inside
+    /// the `@@@`, the ANN leg through the array, never both.
     #[test]
-    fn significance_filter_routes_by_leg_with_strongest_rank_semantics() {
+    fn seat_filter_recouvre_les_chemins_selon_la_jambe() {
         let req: SearchRequest = serde_json::from_value(serde_json::json!({
             "query": "x",
-            "significance": ["IMPORTANTE", "INDETERMINEE"],
+            "seat": ["CC.SOCIALE", "CA.PARIS.C1"],
+        }))
+        .unwrap();
+
+        let mut params: Params = Vec::new();
+        let mut idx = 1usize;
+        let bm25 = build_facet_filter(
+            &req,
+            &mut idx,
+            &mut params,
+            ArrayFilters::Tantivy,
+            FilterTable::Decisions,
+        );
+        assert_eq!(bm25, "", "le chemin part dans le `@@@`, pas en SQL");
+        let index_query = build_array_filter_queries(&req, &mut idx, &mut params);
+        assert_eq!(index_query.len(), 1);
+        assert!(
+            index_query[0].contains("paradedb.term_set"),
+            "{index_query:?}"
+        );
+        assert!(
+            index_query[0].contains("paradedb.term('seat_paths', $1::text)"),
+            "{index_query:?}"
+        );
+        assert_eq!(params.len(), 2);
+
+        let mut params: Params = Vec::new();
+        let mut idx = 1usize;
+        let ann = build_facet_filter(
+            &req,
+            &mut idx,
+            &mut params,
+            ArrayFilters::AsSql,
+            FilterTable::Chunks,
+        );
+        assert!(ann.contains("fd.seat_paths && $1::text[]"), "{ann}");
+        assert!(ann.contains("EXISTS (SELECT 1 FROM decisions fd"), "{ann}");
+        assert_eq!(params.len(), 1);
+    }
+
+    /// Appartenance multiple : la sélection est l'union des codes cochés, sans
+    /// exclusion d'un palier par un autre.
+    #[test]
+    fn publication_filter_routes_by_leg_on_source_codes() {
+        let req: SearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "publication": ["PUBLIE_RAPPORT", "LETTRE_CHAMBRE"],
         }))
         .unwrap();
         // Jambes BM25 : composé DANS le `@@@` (index inversé), absent du fragment SQL.
@@ -514,15 +522,15 @@ mod tests {
         assert!(!frag.contains("publication_codes"));
         let queries = build_array_filter_queries(&req, &mut idx, &mut params);
         assert_eq!(queries.len(), 1);
-        let q = &queries[0];
-        assert!(q.contains("paradedb.term('publication_codes', 'b')"));
-        assert!(q.contains("must_not => ARRAY[paradedb.term_set(terms => ARRAY[paradedb.term('publication_codes', 'r'), paradedb.term('publication_codes', 'A')])]"));
-        assert!(q.contains("paradedb.all()"));
-        assert!(q.starts_with("paradedb.boolean(should => ARRAY["));
+        assert_eq!(
+            queries[0],
+            "paradedb.term_set(terms => ARRAY[paradedb.term('publication_codes', 'r'), \
+             paradedb.term('publication_codes', 'l')])"
+        );
         assert!(params.is_empty());
 
-        // Jambe ANN : clause SQL directe sur la colonne dénormalisée du chunk
-        // (pas d'EXISTS vers `decisions`).
+        // Jambe ANN : clause SQL directe sur la colonne dénormalisée du chunk,
+        // aucun `EXISTS` vers `decisions`.
         let mut params: Params = Vec::new();
         let mut idx = 1usize;
         let frag = build_facet_filter(
@@ -532,13 +540,7 @@ mod tests {
             ArrayFilters::AsSql,
             FilterTable::Chunks,
         );
-        assert!(frag.contains(
-            "(c.publication_codes && ARRAY['b','l','c','B','C+','R'] \
-             AND NOT c.publication_codes && ARRAY['r','A'])"
-        ));
-        assert!(frag.contains(
-            "NOT c.publication_codes && ARRAY['r','A','b','l','c','B','C+','R','n','C','D','Z']"
-        ));
+        assert!(frag.contains("c.publication_codes && ARRAY['r','l']"));
         assert!(!frag.contains("EXISTS"));
         assert!(params.is_empty());
     }
@@ -564,8 +566,10 @@ mod tests {
         assert!(frag.contains("EXISTS (SELECT 1 FROM decisions fd WHERE fd.id = c.decision_id"));
         assert!(frag.contains("fd.solution_uid = ANY($1)"));
         assert!(frag.contains("fd.jurisdiction_code = ANY($2)"));
-        assert!(frag.contains("fd.publication_uid = ANY($3)"));
-        assert_eq!(params.len(), 3);
+        // La publication ne passe plus par l'`EXISTS` : `publication_codes` est
+        // dénormalisée sur le chunk.
+        assert!(frag.contains("c.publication_codes && ARRAY['b']"));
+        assert_eq!(params.len(), 2);
 
         // Même requête côté decisions : clauses directes sur `d`.
         let mut params: Params = Vec::new();

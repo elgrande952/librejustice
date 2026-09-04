@@ -1,13 +1,15 @@
 //! ArianeWeb (Conseil d'État, moteur Sinequa `engine2`) — commentaires
-//! institutionnels des décisions CE : analyses AJCE (sommaires doctrinaux) +
-//! existence des conclusions CRP.
+//! institutionnels des décisions CE (analyses AJCE, existence des conclusions
+//! CRP) et fond des décisions elles-mêmes.
 //!
 //! Deux canaux, sans auth :
 //! - `xsearch?type=json` filtré `SourceStr4=<FOND>&SourceInt1=<année>` et paginé
 //!   par `PageNumber` (20 hits/page servis par le serveur ; `PageSize`/`SkipCount`
 //!   sont ignorés). L'année d'un hit est celle de la date de lecture de la
 //!   décision parente : analyses et conclusions d'une même décision tombent dans
-//!   la même tranche annuelle.
+//!   la même tranche annuelle. Sans filtre d'année, la réponse porte la facette
+//!   `anneeDateDeLecture` comptée sur la sélection entière : le fond se recense
+//!   en une requête.
 //! - `downloadFilePagePlugin` pour l'HTML plein d'une analyse AJCE (le hit JSON
 //!   ne porte que les titres analytiques tronqués à 1 544 car. ; les sommaires
 //!   complets ne sont que dans l'HTML). L'`Id` garde son pipe non URL-encodé.
@@ -16,6 +18,7 @@
 //! pour l'HTML) + nettoyage du `0x19` (apostrophe Windows-1252 mal mappée). Le
 //! PDF CRP n'est jamais téléchargé : seule son existence est stockée.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -31,14 +34,15 @@ pub const USER_AGENT: &str = "librejustice-ariane/0.1 (+https://librejustice.fr)
 /// Throttle de courtoisie entre requêtes réseau (appliqué par l'appelant).
 pub const THROTTLE: Duration = Duration::from_millis(500);
 
-/// Fonds ArianeWeb énumérés. `AW_DCE` (décisions) n'est pas un fond d'ingest :
-/// son id ne sert que de pivot de fratrie (`source_uid = ariane-web/<DCE>`).
+/// Fonds ArianeWeb énumérés.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArianeFond {
     /// Analyses du CE (~108 k, HTML).
     Ajce,
     /// Conclusions du rapporteur public (~9 k, PDF — jamais téléchargé).
     Crp,
+    /// Décisions elles-mêmes (~166 k, HTML).
+    Dce,
 }
 
 impl ArianeFond {
@@ -46,6 +50,7 @@ impl ArianeFond {
         match self {
             Self::Ajce => "AW_AJCE",
             Self::Crp => "AW_CRP",
+            Self::Dce => "AW_DCE",
         }
     }
 }
@@ -61,6 +66,31 @@ pub struct ArianeSearchPage {
     pub current_page: u32,
     #[serde(rename = "Documents")]
     pub documents: Vec<ArianeHit>,
+    /// Facettes comptées par le serveur sur la sélection entière, pas sur la
+    /// page servie.
+    #[serde(rename = "Boxes", default)]
+    pub boxes: Vec<ArianeBox>,
+}
+
+/// Une facette `xsearch` et ses nœuds comptés.
+#[derive(Debug, Deserialize)]
+pub struct ArianeBox {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Nodes", default)]
+    pub nodes: Vec<ArianeNode>,
+}
+
+/// Nœud de facette. Sur `anneeDateDeLecture`, `level` 1 est la décennie et 2
+/// l'année.
+#[derive(Debug, Deserialize)]
+pub struct ArianeNode {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Level")]
+    pub level: u32,
+    #[serde(rename = "Count")]
+    pub count: u32,
 }
 
 /// Hit `xsearch` — sous-ensemble des champs `SourceStrN`/`SourceCsvN` utilisés.
@@ -188,6 +218,47 @@ pub fn http_client() -> Result<reqwest::blocking::Client> {
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(SourceError::from)
+}
+
+/// Recensement d'un fond, année par année, en **une** requête : la facette
+/// `anneeDateDeLecture` est comptée par le serveur sur la sélection entière, pas
+/// sur les 20 hits servis. Les nœuds hors plage sont des années fautives du
+/// fond (`211341`), écartées ici.
+pub fn census_by_year(
+    client: &reqwest::blocking::Client,
+    fond: ArianeFond,
+) -> Result<BTreeMap<u16, u32>> {
+    let url = format!(
+        "{BASE_URL}/xsearch?type=json&SourceStr4={}&PageNumber=1",
+        fond.as_str()
+    );
+    let (status, _, body) = get_with_body_retrying(&url, || client.get(&url).send())?;
+    if status != 200 {
+        return Err(SourceError::Invalid(format!(
+            "recensement {}: statut {status}",
+            fond.as_str()
+        )));
+    }
+    let body = body.expect("statut 200 → corps lu");
+    let page: ArianeSearchPage = serde_json::from_slice(&body)
+        .map_err(|e| SourceError::Invalid(format!("recensement {}: {e}", fond.as_str())))?;
+    let box_ = page
+        .boxes
+        .iter()
+        .find(|b| b.name == "anneeDateDeLecture")
+        .ok_or_else(|| {
+            SourceError::Invalid(format!(
+                "recensement {}: facette anneeDateDeLecture absente",
+                fond.as_str()
+            ))
+        })?;
+    Ok(box_
+        .nodes
+        .iter()
+        .filter(|n| n.level == 2)
+        .filter_map(|n| n.name.parse::<u16>().ok().map(|y| (y, n.count)))
+        .filter(|(y, _)| (1780..=2100).contains(y))
+        .collect())
 }
 
 /// Une page d'énumération d'un fond pour une année (`PageNumber` 1-based).

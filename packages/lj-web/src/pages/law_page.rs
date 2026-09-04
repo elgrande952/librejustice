@@ -28,6 +28,7 @@ use cited_by::CitedBySection;
 use crate::components::decision::DecisionLayout;
 use crate::components::own_page_description;
 use crate::components::search::compact_search::highlight::CitedBlock;
+use crate::components::ui::ProvenanceBlock;
 use crate::helpers::{format_article_num, format_iso_date};
 use crate::seo::law::{article_canonical_url, article_meta_description, build_article_json_ld};
 use crate::seo::OG_IMAGE;
@@ -70,6 +71,15 @@ pub fn LawArticlePage() -> impl IntoView {
             {move || Suspend::new(async move {
                 match article.await {
                     Ok(article) => {
+                        // L'API résout par clé d'identité : le slug renommé et la
+                        // forme non canonique du numéro rendent le même article,
+                        // sous une seule URL indexable.
+                        let k = key.get_untracked();
+                        if k.code != article.code || k.num != article.num_key {
+                            redirection_permanente(
+                                &article_url(&article.code, &article.num_key, k.date.as_deref()),
+                            );
+                        }
                         set_cache_control(200);
                         Either::Left(
                             view! { <LawArticleLoaded article=article citing=citing related=related /> },
@@ -84,6 +94,30 @@ pub fn LawArticlePage() -> impl IntoView {
         </Suspense>
     }
 }
+
+/// URL d'article, `num` et date de la route préservés — seul le slug bouge.
+fn article_url(code: &str, num: &str, date: Option<&str>) -> String {
+    match date {
+        Some(d) => format!("/texte/{code}/{num}/{d}"),
+        None => format!("/texte/{code}/{num}"),
+    }
+}
+
+/// Pose un 301 vers l'URL canonique : un slug retiré par un renommage lègue son
+/// indexation au nouveau. No-op côté hydrate, le client a déjà suivi.
+#[cfg(feature = "ssr")]
+pub(crate) fn redirection_permanente(cible: &str) {
+    use axum::http::{header::LOCATION, HeaderValue, StatusCode};
+    if let Some(resp) = use_context::<leptos_axum::ResponseOptions>() {
+        resp.set_status(StatusCode::MOVED_PERMANENTLY);
+        if let Ok(hv) = HeaderValue::from_str(cible) {
+            resp.insert_header(LOCATION, hv);
+        }
+    }
+}
+
+#[cfg(not(feature = "ssr"))]
+pub(crate) fn redirection_permanente(_cible: &str) {}
 
 /// Pose le statut HTTP et le `Cache-Control` de la réponse document SSR. No-op
 /// côté hydrate (200 → 7 j ; erreurs client → 5 min ; 5xx → no-store).
@@ -190,13 +224,21 @@ fn LawArticleLoaded(
     // « entrera en vigueur » la porte.
     let served_is_upcoming = !article.date_debut.is_empty()
         && article.upcoming_version_date.as_deref() == Some(article.date_debut.as_str());
-    let in_force = (!article.date_debut.is_empty() && !served_is_upcoming).then(|| {
-        let since = format_iso_date(Some(&article.date_debut));
-        view! {
-            <p class="text-sm text-[var(--color-ink-muted)]">
-                {format!("En vigueur depuis le {since}")}
-            </p>
-        }
+    let validity = (!article.date_debut.is_empty() && !served_is_upcoming).then(|| {
+        let label = validity_label(
+            &article.date_debut,
+            article.date_fin.as_deref(),
+            article.expired,
+        );
+        view! { <p class="text-sm text-[var(--color-ink-muted)]">{label}</p> }
+    });
+    // L'API sert la version en vigueur quand la route ne porte pas de date : une
+    // version close en réponse dit alors qu'aucune ne s'applique plus.
+    let expired_notice = (article.expired && !article.date_debut.is_empty()).then(|| {
+        expired_banner(match article_key().get_untracked().date {
+            None => "Cet article n'est plus en vigueur",
+            Some(_) => "Cette version n'est plus en vigueur",
+        })
     });
     let code_href = format!("/texte/{}", article.code);
     let code_name = code_display_name(&article);
@@ -235,7 +277,8 @@ fn LawArticleLoaded(
                     {code_name}
                 </A>
                 <h1 class="font-sans text-3xl text-[var(--color-ink)]">{title.clone()}</h1>
-                {in_force}
+                {validity}
+                {expired_notice}
                 {upcoming}
                 {neighbor_nav}
             </header>
@@ -246,6 +289,7 @@ fn LawArticleLoaded(
                 .commentaires
                 .clone() />
             <ArticleMeta article=article.clone() />
+            <ProvenanceBlock rows=article_provenance_rows(&article) />
         </article>
     }
     .into_any();
@@ -440,6 +484,65 @@ fn source_descriptor(source: &str) -> (String, &'static str) {
     (href, label)
 }
 
+/// Libellé lisible des sources nommées, hôte de `source_url` sinon : les
+/// libellés machine (`official-fr`, `eu-law`, `ecoi`) y renvoient tous.
+fn diffuser_name(article: &LawArticleResponse) -> String {
+    let named = match article.source.as_str() {
+        "legifrance" | "kali" | "jorf" => Some("Légifrance"),
+        "bofip" => Some("BOFiP-Impôts"),
+        "eur-lex" | "eu-law" => Some("EUR-Lex"),
+        _ => None,
+    };
+    named.map(str::to_string).unwrap_or_else(|| {
+        article
+            .source_url
+            .as_deref()
+            .and_then(url_host)
+            .unwrap_or_else(|| article.source.clone())
+    })
+}
+
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest.split(['/', '?', '#']).next()?;
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then(|| host.strip_prefix("www.").unwrap_or(host).to_string())
+}
+
+fn diffuser_link_label(name: &str) -> String {
+    let elide = name
+        .chars()
+        .next()
+        .is_some_and(|c| "aeiouAEIOUéÉèÈ".contains(c));
+    let de = if elide { "d'" } else { "de " };
+    format!("Voir sur le site {de}{name}")
+}
+
+/// Pendant de [`lj_dtos::provenance_rows`] pour un article.
+fn article_provenance_rows(article: &LawArticleResponse) -> Vec<(&'static str, String)> {
+    let mut rows = vec![("Diffuseur", diffuser_name(article))];
+    if let Some(url) = article.source_url.as_deref().filter(|u| !u.is_empty()) {
+        let label = if article.source_official {
+            "Page officielle"
+        } else {
+            "Page du diffuseur"
+        };
+        rows.push((label, url.to_string()));
+    }
+    if let Some(url) = article
+        .source_upstream_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+    {
+        rows.push(("Source d'origine", url.to_string()));
+    }
+    rows.push((
+        "Permalien",
+        article_canonical_url(&article.code, &article.num_key),
+    ));
+    rows
+}
+
 /// Bloc méta : état, dates de validité, identifiant LEGIARTI, lien Légifrance
 /// versionné.
 #[component]
@@ -455,6 +558,7 @@ fn ArticleMeta(article: LawArticleResponse) -> impl IntoView {
         .as_deref()
         .map(|d| format_iso_date(Some(d)));
     let source_authority = article.source_authority.clone();
+    let diffuser_link = diffuser_link_label(&diffuser_name(&article));
     let source_url = article.source_url.clone().filter(|u| !u.is_empty());
     let source_upstream = article
         .source_upstream_url
@@ -478,7 +582,7 @@ fn ArticleMeta(article: LawArticleResponse) -> impl IntoView {
                 <MetaField label="Identifiant" value=article.legiarti mono=true />
                 {freshness
                     .map(|f| view! { <MetaField label="Fraîcheur de la source" value=f mono=false /> })}
-                <MetaField label="Diffuseur" value=source_authority mono=false />
+                <MetaField label="Autorité" value=source_authority mono=false />
             </dl>
             <div class="mt-5 flex flex-wrap items-center gap-x-6 gap-y-2 border-t border-[var(--color-rule)] pt-4">
                 {source_url
@@ -490,7 +594,7 @@ fn ArticleMeta(article: LawArticleResponse) -> impl IntoView {
                                 rel="noopener noreferrer"
                                 class="inline-flex items-center gap-1.5 text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)]"
                             >
-                                "Voir la source"
+                                {diffuser_link}
                                 <span aria-hidden="true">"↗"</span>
                             </a>
                         }
@@ -869,6 +973,27 @@ pub(crate) fn upcoming_banner(subject: &str, date: &str) -> AnyView {
     .into_any()
 }
 
+/// Fenêtre de validité de la version servie : bornée dès qu'elle a cessé de
+/// s'appliquer, ouverte tant qu'elle court.
+fn validity_label(date_debut: &str, date_fin: Option<&str>, expired: bool) -> String {
+    let debut = format_iso_date(Some(date_debut));
+    match date_fin.filter(|_| expired) {
+        Some(fin) => format!("En vigueur du {debut} au {}", format_iso_date(Some(fin))),
+        None => format!("En vigueur depuis le {debut}"),
+    }
+}
+
+/// Bandeau : la version servie a cessé de s'appliquer.
+fn expired_banner(subject: &'static str) -> AnyView {
+    view! {
+        <p class="mt-1 w-fit rounded-md border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-3 py-1.5 text-sm text-[var(--color-ink)]">
+            <span aria-hidden="true" class="mr-1.5">"⚠"</span>
+            {subject}
+        </p>
+    }
+    .into_any()
+}
+
 /// Libellé FR d'un état DILA ; état inconnu rendu brut.
 pub(crate) fn status_label(etat: &str) -> String {
     lj_dtos::article_status_label(etat)
@@ -1114,4 +1239,27 @@ fn related_item(item: CoCitedArticle) -> AnyView {
         </li>
     }
     .into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validity_label;
+
+    /// KALI laisse `status` à `VIGUEUR` sur des versions dépassées : c'est la
+    /// fenêtre, et elle seule, qui dit ce qui s'applique.
+    #[test]
+    fn une_fenetre_close_ne_sannonce_pas_en_vigueur() {
+        assert_eq!(
+            validity_label("2010-06-01", Some("2010-07-19"), true),
+            "En vigueur du 1 juin 2010 au 19 juillet 2010"
+        );
+        assert_eq!(
+            validity_label("2010-06-01", Some("2027-12-31"), false),
+            "En vigueur depuis le 1 juin 2010"
+        );
+        assert_eq!(
+            validity_label("2010-06-01", None, false),
+            "En vigueur depuis le 1 juin 2010"
+        );
+    }
 }

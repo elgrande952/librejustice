@@ -1,6 +1,6 @@
 //! `lj-llm` — backends d'inférence modèle : embeddings + client Mistral (chat/OCR).
 //!
-//! Embeddings : Cloudflare Workers AI, OpenAI-HTTP (vLLM compatible), cache
+//! Embeddings : Cloudflare Workers AI, OpenAI-HTTP, cache
 //! in-process (`moka`), quantisation L2 + sérialisation vector JSON. Client
 //! Mistral (`mistral`) : chat completions + OCR document, rotation de clés et
 //! registre de quota (`ratelimit`), partagé entre l'ingest (résumés, OCR CNDA),

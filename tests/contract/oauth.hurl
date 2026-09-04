@@ -2,7 +2,7 @@
 # OAuth 2.1 (Authorization Code + PKCE S256 + DCR) — contract tests
 # Oracle: apps/api/src/librejustice_api/oauth.py + main.py (well-known)
 # Rust:   packages/lj-api/src/oauth.rs
-# Host root via {{base}} (e.g. GET {{base}}/api/health)
+# Host root via {{base}} (e.g. GET {{base}}/admin/health)
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -100,6 +100,8 @@ Content-Type: application/json
   "client_name": "Claude Connector"
 }
 HTTP 201
+[Captures]
+approve_client_id: jsonpath "$.client_id"
 [Asserts]
 jsonpath "$.client_id" exists
 jsonpath "$.client_id" isString
@@ -232,19 +234,48 @@ HTTP *
 status >= 400
 
 # -----------------------------------------------------------------------------
-# 7. POST /oauth/approve — auth=jwt. Unauthenticated 401 contract.
-#   Python: HTTPException(401, detail="auth_required") -> {"detail":"auth_required"}
-#   Rust:   ApiError::Unauthorized -> 401 plain-text body "unauthorized"
-#   DIVERGENCE: status parity OK (401), body shape DIVERGES. Asserting status only.
+# 7. POST /oauth/approve — formulaire de consentement.
+#    Sans session, approve renvoie à la connexion, le consentement complet en
+#    next ; deny retourne au client validé sans exiger de session ; un client
+#    inconnu est refusé avant tout.
 # -----------------------------------------------------------------------------
+# 7a. approve sans session -> 303 /login?next=%2Fauthorize-mcp…
 POST {{base}}/oauth/approve
-Content-Type: application/json
-{
-  "client_id": "lj_x",
-  "code_challenge": "abc",
-  "redirect_uri": "https://claude.ai/cb"
-}
-HTTP 401
+Content-Type: application/x-www-form-urlencoded
+[FormParams]
+action: approve
+client_id: {{approve_client_id}}
+code_challenge: E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+redirect_uri: https://claude.ai/api/mcp/auth_callback
+state: xyz
+HTTP 303
+[Asserts]
+header "Location" startsWith "/login?next=%2Fauthorize-mcp"
+
+# 7b. deny -> 303 vers le redirect_uri validé, error=access_denied, state gardé
+POST {{base}}/oauth/approve
+Content-Type: application/x-www-form-urlencoded
+[FormParams]
+action: deny
+client_id: {{approve_client_id}}
+code_challenge: E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+redirect_uri: https://claude.ai/api/mcp/auth_callback
+state: xyz
+HTTP 303
+[Asserts]
+header "Location" startsWith "https://claude.ai/api/mcp/auth_callback"
+header "Location" contains "error=access_denied"
+header "Location" contains "state=xyz"
+
+# 7c. client inconnu -> 400 invalid_client_or_redirect_uri
+POST {{base}}/oauth/approve
+Content-Type: application/x-www-form-urlencoded
+[FormParams]
+action: approve
+client_id: lj_does_not_exist
+code_challenge: abc
+redirect_uri: https://claude.ai/cb
+HTTP 400
 
 # -----------------------------------------------------------------------------
 # 8. POST /oauth/revoke — form-urlencoded; RFC 7009. Public client, no client
@@ -279,16 +310,5 @@ HTTP 400
 [Asserts]
 jsonpath "$.detail" == "invalid_request"
 
-# --- AUTHED assertions (runner injects {{token}}) ---------------------------
-# With a valid Supabase bearer token AND a registered client whose redirect_uri
-# matches, /oauth/approve returns 200 with:
-#   jsonpath "$.code" isString          (secrets.token_urlsafe(32) -> 43 chars)
-#   jsonpath "$.redirect_uri" == <the request redirect_uri>
-# With a valid token but UNREGISTERED client/redirect:
-#   HTTP 400  (invalid_client_or_redirect_uri)
-# Example (commented; uncomment in authed run):
-# POST {{base}}/oauth/approve
-# Authorization: Bearer {{token}}
-# Content-Type: application/json
-# { "client_id": "lj_x", "code_challenge": "abc", "redirect_uri": "https://claude.ai/cb" }
-# HTTP 400
+# Le chemin approuvé (session + client enregistré -> 303 avec code, puis
+# échange PKCE) est couvert par authed.hurl §4-5, qui porte la session.

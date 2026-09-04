@@ -20,7 +20,7 @@ use super::{PreparedDecision, WriteMode};
 /// être filtré par l'appelant : le pipeline n'instancie pas d'embedder dans ce
 /// cas.
 ///
-/// `auto` sonde vLLM (`embed_url`) : joignable → `openai-http` (GPU local,
+/// `auto` sonde le local (`embed_url`) : joignable → `openai-http` (GPU local,
 /// gratuit) ; sinon repli sur Cloudflare Workers AI. Le cap
 /// `ingest_neuron_budget` s'applique sur tout chemin Cloudflare.
 pub(super) async fn build_embedder(settings: &Settings) -> Result<AnyEmbedder> {
@@ -40,7 +40,7 @@ pub(super) async fn build_embedder(settings: &Settings) -> Result<AnyEmbedder> {
 
 /// Embedder « par défaut » des sources qui embeddent à l'ingest : `None` si
 /// `embed_backend == "none"`, sinon l'embedder du backend configuré (`auto` →
-/// vLLM/Cloudflare). Renvoie `(embedder, require_embeddings)`.
+/// local/Cloudflare). Renvoie `(embedder, require_embeddings)`.
 pub(super) async fn build_embedder_opt(settings: &Settings) -> Result<(Option<AnyEmbedder>, bool)> {
     if settings.embed_backend == "none" {
         return Ok((None, false));
@@ -48,30 +48,26 @@ pub(super) async fn build_embedder_opt(settings: &Settings) -> Result<(Option<An
     Ok((Some(build_embedder(settings).await?), true))
 }
 
-/// Embedder vLLM **strict**, jamais de repli Cloudflare : pour les ops de
-/// maintenance qui ne doivent jamais basculer sur un backend payant. Probe vLLM et
-/// erreur franche s'il est injoignable. `dummy` accepté (tests) ; `cloudflare`
-/// refusé.
-pub(super) async fn build_vllm_strict(settings: &Settings) -> Result<AnyEmbedder> {
+pub(super) async fn build_local_strict(settings: &Settings) -> Result<AnyEmbedder> {
     match settings.embed_backend.as_str() {
         "dummy" => Ok(AnyEmbedder::Dummy(DummyEmbedder::default())),
         "cloudflare" => Err(anyhow!(
-            "re-embed maintenance refuse backend=cloudflare (coût) — configure vLLM (openai-http/auto)"
+            "re-embed maintenance refuse backend=cloudflare (coût) : configure le local (openai-http/auto)"
         )),
         _ => {
-            if !probe_vllm(settings).await {
+            if !probe_local(settings).await {
                 return Err(anyhow!(
-                    "re-embed maintenance : vLLM injoignable ({}) — pas de repli Cloudflare (coût)",
+                    "re-embed maintenance : backend local injoignable ({}), pas de repli Cloudflare (coût)",
                     settings.embed_url
                 ));
             }
-            tracing::info!(url = %settings.embed_url, "re-embed maintenance : vLLM joignable → openai-http (strict)");
+            tracing::info!(url = %settings.embed_url, "re-embed maintenance : openai-http joignable → openai-http (strict)");
             Ok(build_openai_http(settings))
         }
     }
 }
 
-/// Embedder vLLM (`/v1/embeddings` OpenAI-compatible).
+/// Embedder local (`/v1/embeddings` OpenAI-compatible).
 fn build_openai_http(settings: &Settings) -> AnyEmbedder {
     AnyEmbedder::OpenAiHttp(OpenAIHttpEmbedder::new(
         settings.embed_url.clone(),
@@ -80,16 +76,6 @@ fn build_openai_http(settings: &Settings) -> AnyEmbedder {
     ))
 }
 
-/// Backend `auto` : disjoncteur vLLM ↔ Cloudflare, pas une sonde unique au
-/// démarrage.
-///
-/// [`AnyEmbedder::Auto`] latch `degraded` au premier échec vLLM, sert la requête
-/// par Cloudflare, puis fait courir les deux backends jusqu'à ce que vLLM regagne
-/// — ré-armement automatique. Le cap neurons de `Settings` s'applique au volet
-/// Cloudflare.
-///
-/// Sans identifiants Cloudflare il n'y a pas de repli possible : on garde vLLM
-/// seul plutôt que d'échouer au démarrage.
 async fn build_auto(settings: &Settings) -> Result<AnyEmbedder> {
     let (Some(account_id), Some(token)) = (
         settings.cloudflare_account_id.clone(),
@@ -97,16 +83,16 @@ async fn build_auto(settings: &Settings) -> Result<AnyEmbedder> {
     ) else {
         tracing::warn!(
             url = %settings.embed_url,
-            "backend=auto sans identifiants Cloudflare : vLLM seul, aucun repli"
+            "backend=auto sans identifiants Cloudflare : openai-http seul, aucun repli"
         );
         return Ok(build_openai_http(settings));
     };
     tracing::info!(
         url = %settings.embed_url,
-        "backend=auto : disjoncteur vLLM ↔ Cloudflare armé"
+        "backend=auto : disjoncteur local ↔ Cloudflare armé"
     );
     Ok(AnyEmbedder::Auto {
-        vllm: OpenAIHttpEmbedder::new(
+        local: OpenAIHttpEmbedder::new(
             settings.embed_url.clone(),
             settings.embed_api_key.clone(),
             String::new(),
@@ -140,11 +126,11 @@ fn build_cloudflare(settings: &Settings) -> Result<AnyEmbedder> {
     ))
 }
 
-/// Sonde la disponibilité de vLLM : GET `…/v1/models` (dérivé de `embed_url`),
+/// Sonde la disponibilité du local : GET `…/v1/models` (dérivé de `embed_url`),
 /// timeout court. Un 2xx ⇒ backend local utilisable. Toute erreur (réseau,
 /// timeout, statut non-2xx) ⇒ `false`. Aucun retry : le repli Cloudflare est la
 /// stratégie de robustesse.
-async fn probe_vllm(settings: &Settings) -> bool {
+async fn probe_local(settings: &Settings) -> bool {
     let base = settings
         .embed_url
         .trim_end_matches('/')

@@ -44,9 +44,8 @@ ALTER TABLE referential_articles RENAME TO legal_article;
 ALTER TABLE legal_article RENAME COLUMN text_source_uid TO text_uid;
 ALTER TABLE legal_article ADD COLUMN position INTEGER;  -- ordre de lecture réel (≠ tri lexical 26<26-1<26-2) ; rempli au (ré)ingest
 ALTER TABLE legal_article ADD COLUMN source_url TEXT;   -- URL provider NON dérivable du source_uid (gisti/onu rehosté) ; NULL si template-dérivable
--- `source` (provenance) et `source_uid` (= identifiant natif provider : LEGIARTI/
--- JORFARTI/treaty/… ; le « CID » d'où l'URL Légifrance se dérive, ADR §Principe 3)
--- sont CONSERVÉS, mais HORS identité.
+-- `source` and `source_uid` (the provider's native id: LEGIARTI, JORFARTI,
+-- treaty…) are KEPT, but out of the identity.
 
 -- date_debut : sentinelle pour les NULL (la PK l'interdit).
 UPDATE legal_article SET date_debut = DATE '0001-01-01' WHERE date_debut IS NULL;

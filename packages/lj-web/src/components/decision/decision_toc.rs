@@ -1,9 +1,9 @@
 //! Sommaire ancré de la décision (scroll-spy).
 //!
 //! Rendu statique (SSR) : liens `#ancre`, première section active, rail + barre
-//! à la hauteur d'init (10px). Sous `hydrate`, le spy est branché : un shim JS
-//! (`toc_spy.js`) mesure le DOM, Rust résout via `resolve_scroll_spy` et pose
-//! les signals qui pilotent le markup.
+//! à la hauteur d'init (10px). Sous `hydrate`, le spy est branché :
+//! `toc_spy_dom` mesure le DOM, `resolve_scroll_spy` résout, et les signals
+//! pilotent le markup.
 use leptos::prelude::*;
 use lj_dtos::ChronologyEntry;
 
@@ -148,8 +148,22 @@ fn chronology_block(chronology: Vec<ChronologyEntry>) -> Option<impl IntoView> {
                 } else {
                     "absolute left-[3px] top-[5px] h-[10px] w-[10px] rounded-full border-2 border-[var(--color-rule)] bg-[var(--color-parchment)]"
                 };
-                let body = if entry.current {
-                    view! {
+                let body = match entry.id.filter(|_| !entry.current) {
+                    Some(id) => {
+                        let href = format!("/decision/{id}");
+                        view! {
+                            <HoverPreview kind=PreviewKind::Decision { id }>
+                                <a href=href class="group block no-underline">
+                                    <span class="block text-sm leading-snug text-[var(--color-accent)] group-hover:underline">
+                                        {entry.label}
+                                    </span>
+                                    {date}
+                                </a>
+                            </HoverPreview>
+                        }
+                        .into_any()
+                    }
+                    None if entry.current => view! {
                         <span aria-current="page" class="block">
                             <span class="block text-sm font-medium leading-snug text-[var(--color-ink)]">
                                 {entry.label}
@@ -157,22 +171,16 @@ fn chronology_block(chronology: Vec<ChronologyEntry>) -> Option<impl IntoView> {
                             {date}
                         </span>
                     }
-                    .into_any()
-                } else {
-                    let href = format!("/decision/{}", entry.id);
-                    view! {
-                        <HoverPreview kind=PreviewKind::Decision {
-                            id: entry.id,
-                        }>
-                            <a href=href class="group block no-underline">
-                                <span class="block text-sm leading-snug text-[var(--color-accent)] group-hover:underline">
-                                    {entry.label}
-                                </span>
-                                {date}
-                            </a>
-                        </HoverPreview>
+                    .into_any(),
+                    None => view! {
+                        <span class="block" title="Décision non disponible">
+                            <span class="block text-sm leading-snug text-[var(--color-ink-muted)]">
+                                {entry.label}
+                            </span>
+                            {date}
+                        </span>
                     }
-                    .into_any()
+                    .into_any(),
                 };
                 let relation = entry.link.as_deref().and_then(link_label).map(|l| {
                     view! {
@@ -211,73 +219,31 @@ fn chronology_block(chronology: Vec<ChronologyEntry>) -> Option<impl IntoView> {
 mod spy {
     use leptos::prelude::*;
     use leptos::reactive::owner::LocalStorage;
-    use wasm_bindgen::prelude::*;
 
+    use crate::components::decision::toc_spy_dom::{
+        observe_scroll_spy, scroll_to_section, SpyHandle,
+    };
     use crate::pages::decision_page::toc_spy::{
         resolve_scroll_spy, SpyMetric, ANCHOR_SCROLL_MARGIN_PX, SCROLL_SPY_OFFSET_PX,
     };
 
-    #[wasm_bindgen(module = "/src/components/decision/toc_spy.js")]
-    extern "C" {
-        #[wasm_bindgen(js_name = "observeScrollSpy")]
-        fn observe_scroll_spy(
-            list_el: &JsValue,
-            section_ids: Vec<JsValue>,
-            marker_offset: f64,
-            on_resolve: &Closure<dyn FnMut(f64, js_sys::Float64Array, js_sys::Float64Array, bool)>,
-            on_animate_off: &Closure<dyn FnMut()>,
-        ) -> JsValue;
-
-        #[wasm_bindgen(js_name = "scrollToSection")]
-        fn scroll_to_section(
-            id: &str,
-            list_el: &JsValue,
-            section_ids: Vec<JsValue>,
-            marker_offset: f64,
-            anchor_margin: f64,
-            handle: &JsValue,
-            on_landing: &Closure<dyn FnMut(f64, js_sys::Float64Array, js_sys::Float64Array, bool)>,
-        );
-    }
-
-    // Construit les `SpyMetric` à partir des `Float64Array` parallèles aux ids
-    // connus, puis résout et pose `active`/`progress_px`. Les ids non mesurés
-    // (NaN) sont filtrés. Barre bornée à 10px.
+    /// Résout et pose `active`/`progress_px`. Barre bornée à 10px.
     fn apply(
-        section_ids: &[String],
         active: RwSignal<Option<String>>,
         progress_px: RwSignal<f64>,
         marker_y: f64,
-        anchor_tops: &js_sys::Float64Array,
-        centers: &js_sys::Float64Array,
+        metrics: Vec<SpyMetric>,
         at_bottom: bool,
     ) {
-        let mut metrics: Vec<SpyMetric> = Vec::with_capacity(section_ids.len());
-        for (i, id) in section_ids.iter().enumerate() {
-            let anchor_top = anchor_tops.get_index(i as u32);
-            let center = centers.get_index(i as u32);
-            if anchor_top.is_nan() || center.is_nan() {
-                continue;
-            }
-            metrics.push(SpyMetric {
-                id: id.clone(),
-                anchor_top,
-                center,
-            });
-        }
         if let Some(result) = resolve_scroll_spy(&metrics, marker_y, at_bottom) {
             active.set(Some(result.id));
             progress_px.set(result.progress.max(10.0));
         }
     }
 
-    fn ids_to_js(section_ids: &[String]) -> Vec<JsValue> {
-        section_ids.iter().map(|id| JsValue::from_str(id)).collect()
-    }
-
     /// Branche le spy (observateur scroll/resize) et renvoie le handler de clic
-    /// d'une entrée. Les handles JS (non `Send`) vivent dans des slots
-    /// `LocalStorage` ; l'observateur est déconnecté à chaque re-branchement.
+    /// d'une entrée. L'observateur (non `Send`) vit dans un slot `LocalStorage` ;
+    /// son `Drop` retire les écouteurs à chaque re-branchement.
     pub fn wire(
         list_ref: NodeRef<leptos::html::Ul>,
         section_ids: Vec<String>,
@@ -285,94 +251,49 @@ mod spy {
         progress_px: RwSignal<f64>,
         animate: RwSignal<bool>,
     ) -> impl Fn(leptos::ev::MouseEvent, String) + 'static {
-        type ResolveClosure =
-            Closure<dyn FnMut(f64, js_sys::Float64Array, js_sys::Float64Array, bool)>;
-
-        let disconnect_slot: StoredValue<Option<JsValue>, LocalStorage> =
+        let handle_slot: StoredValue<Option<SpyHandle>, LocalStorage> =
             StoredValue::new_local(None);
-        let resolve_slot: StoredValue<Option<ResolveClosure>, LocalStorage> =
-            StoredValue::new_local(None);
-        let animate_off_slot: StoredValue<Option<Closure<dyn FnMut()>>, LocalStorage> =
-            StoredValue::new_local(None);
-        // Handle de l'observateur courant : passé à `scrollToSection` pour geler
-        // le même observateur pendant le scroll programmé.
-        let handle_slot: StoredValue<JsValue, LocalStorage> = StoredValue::new_local(JsValue::NULL);
-
         let ids = StoredValue::new_local(section_ids);
 
         Effect::new(move |_| {
-            if let Some(prev) = disconnect_slot.try_update_value(Option::take).flatten() {
-                if let Ok(f) = prev.clone().dyn_into::<js_sys::Function>() {
-                    let _ = f.call0(&JsValue::NULL);
-                }
-            }
+            handle_slot.try_update_value(Option::take);
             let Some(node) = list_ref.get() else {
                 return;
             };
-            let ids_vec = ids.get_value();
-            let on_resolve: ResolveClosure =
-                Closure::new(move |marker_y, anchor_tops, centers, at_bottom| {
-                    apply(
-                        &ids.with_value(|v| v.clone()),
-                        active,
-                        progress_px,
-                        marker_y,
-                        &anchor_tops,
-                        &centers,
-                        at_bottom,
-                    );
-                });
-            let on_animate_off: Closure<dyn FnMut()> = Closure::new(move || animate.set(false));
-
-            let node_js: JsValue = node.into();
+            let liste: web_sys::Element = node.clone().into();
             let handle = observe_scroll_spy(
-                &node_js,
-                ids_to_js(&ids_vec),
+                liste,
+                ids.get_value(),
                 SCROLL_SPY_OFFSET_PX,
-                &on_resolve,
-                &on_animate_off,
+                move |marker_y, metrics, at_bottom| {
+                    apply(active, progress_px, marker_y, metrics, at_bottom)
+                },
+                move || animate.set(false),
             );
-            handle_slot.set_value(handle.clone());
-            disconnect_slot.set_value(Some(handle));
-            resolve_slot.set_value(Some(on_resolve));
-            animate_off_slot.set_value(Some(on_animate_off));
+            handle_slot.set_value(handle);
         });
 
         move |ev: leptos::ev::MouseEvent, id: String| {
             ev.prevent_default();
             animate.set(true);
-            // Repli si la cible n'est pas mesurable (le shim ne rappellera pas
-            // `on_landing`) : on pose au moins la section active.
+            // Repli si la cible n'est pas mesurable (`on_landing` ne sera pas
+            // appelé) : on pose au moins la section active.
             active.set(Some(id.clone()));
             let Some(node) = list_ref.get() else {
                 return;
             };
-            let ids_vec = ids.get_value();
-            let on_landing: ResolveClosure =
-                Closure::new(move |marker_y, anchor_tops, centers, at_bottom| {
-                    apply(
-                        &ids.with_value(|v| v.clone()),
-                        active,
-                        progress_px,
-                        marker_y,
-                        &anchor_tops,
-                        &centers,
-                        at_bottom,
-                    );
-                });
-            let node_js: JsValue = node.into();
-            // `scroll_to_section` rappelle `on_landing` de façon synchrone (une
-            // fois) avant de rendre la main : le closure peut être déposé sur la
-            // pile et droppé à la sortie, pas besoin de le conserver.
+            let liste: web_sys::Element = node.clone().into();
             handle_slot.with_value(|handle| {
                 scroll_to_section(
+                    handle.as_ref(),
                     &id,
-                    &node_js,
-                    ids_to_js(&ids_vec),
+                    &liste,
+                    &ids.get_value(),
                     SCROLL_SPY_OFFSET_PX,
                     ANCHOR_SCROLL_MARGIN_PX,
-                    handle,
-                    &on_landing,
+                    |marker_y, metrics, at_bottom| {
+                        apply(active, progress_px, marker_y, metrics, at_bottom)
+                    },
                 );
             });
         }

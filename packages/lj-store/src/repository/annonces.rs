@@ -57,9 +57,12 @@ pub struct AnnonceChamps {
     pub titre: String,
     pub acteur_libelle: String,
     pub echeance: Option<chrono::DateTime<chrono::Utc>>,
+    pub departement: Option<String>,
     /// L'entité acheteur de la ligne, quand elle en porte une seule — deux
     /// arêtes `acheteur` ne désignent personne.
     pub acheteur_uid: Option<String>,
+    /// `details.reference` — la référence que l'acheteur a donnée au marché.
+    pub reference: Option<String>,
 }
 
 /// Une ligne ouverte que seul le BOAMP publie, avec la plateforme de dépôt que
@@ -70,11 +73,14 @@ pub struct AnnonceAJumeler {
     pub titre: String,
     pub acteur_libelle: String,
     pub echeance: Option<chrono::DateTime<chrono::Utc>>,
+    pub departement: Option<String>,
     /// `details.depot` — l'URL de la plateforme, sans identifiant de dossier.
     pub depot: String,
     pub urls: Vec<String>,
     /// Voir [`AnnonceChamps::acheteur_uid`].
     pub acheteur_uid: Option<String>,
+    /// Voir [`AnnonceChamps::reference`].
+    pub reference: Option<String>,
 }
 
 /// Un canal de plateforme d'une annonce ouverte, avec les champs
@@ -115,6 +121,19 @@ pub struct DetailPose {
     pub detail: serde_json::Value,
     /// Acheteur lu sur la fiche. Ne comble qu'un libellé vide.
     pub acheteur: Option<String>,
+}
+
+/// Un trou de moisson : des lignes ouvertes qu'un canal de publication a vues
+/// et qu'aucune plateforme moissonnée ne porte, avec le dépôt qu'elles
+/// déclarent.
+#[derive(Debug)]
+pub struct TrouCouverture {
+    /// L'URL de la plateforme déclarée par l'avis — vide quand il n'en nomme
+    /// aucune.
+    pub depot: String,
+    /// Les canaux qui les portent, séparés par des virgules (`boamp,ted`).
+    pub canaux: String,
+    pub lignes: i64,
 }
 
 /// Récapitulatif d'un run d'écriture.
@@ -280,6 +299,17 @@ fn ouverte(alias: &str) -> String {
     )
 }
 
+/// La fenêtre « ferme sous N jours ». Elle porte sa propre borne basse au lieu
+/// de la tenir d'[`ouverte`] : `closes` retire cette dernière, et la fenêtre
+/// compterait alors tout l'historique clos — sur ce fond, 725 k lignes au lieu
+/// de 10 k. `jours` est un placeholder ou une colonne de l'appelant.
+fn fenetre_echeance(alias: &str, jours: &str) -> String {
+    format!(
+        "{alias}.echeance > NOW() \
+         AND {alias}.echeance <= NOW() + make_interval(days => {jours})"
+    )
+}
+
 /// L'entité acheteur d'une ligne, quand elle en porte une seule. L'arête vient
 /// du SIRET déclaré par la source ou de la dénomination pliée résolue sans
 /// ambiguïté (`relier_annonces_par_denomination`) ; deux arêtes `acheteur` sur la
@@ -433,8 +463,8 @@ impl Filtre {
         if let Some(jours) = f.echeance_jours.filter(|_| fenetre) {
             let ph = me.push(Box::new(jours));
             me.clauses.push_str(&format!(
-                " AND a.echeance IS NOT NULL \
-                  AND a.echeance <= NOW() + make_interval(days => ${ph})"
+                " AND {}",
+                fenetre_echeance("a", &format!("${ph}"))
             ));
         }
         me
@@ -851,7 +881,8 @@ impl DecisionRepository<'_> {
             .conn
             .query(
                 &format!(
-                    "SELECT a.uid, a.titre, a.acteur_libelle, a.echeance, {} \
+                    "SELECT a.uid, a.titre, a.acteur_libelle, a.echeance, a.departement, {}, \
+                            NULLIF(TRIM(a.details->>'reference'), '') \
                      FROM annonce a WHERE a.uid = ANY($1::text[])",
                     acheteur_unique("a")
                 ),
@@ -865,7 +896,9 @@ impl DecisionRepository<'_> {
                 titre: r.get(1),
                 acteur_libelle: r.get(2),
                 echeance: r.get(3),
-                acheteur_uid: r.get(4),
+                departement: r.get(4),
+                acheteur_uid: r.get(5),
+                reference: r.get(6),
             })
             .collect())
     }
@@ -894,9 +927,10 @@ impl DecisionRepository<'_> {
             .conn
             .query(
                 &format!(
-                "SELECT a.uid, a.titre, a.acteur_libelle, a.echeance, a.details->>'depot', \
+                "SELECT a.uid, a.titre, a.acteur_libelle, a.echeance, a.departement, \
+                        a.details->>'depot', \
                         COALESCE(array_agg(u.url) FILTER (WHERE u.url IS NOT NULL), '{{}}'), \
-                        {} \
+                        {}, NULLIF(TRIM(a.details->>'reference'), '') \
                  FROM annonce a \
                  LEFT JOIN LATERAL ( \
                    SELECT unnest(ARRAY[el->>'avis', el->>'rc', el->>'dce']) AS url \
@@ -920,9 +954,11 @@ impl DecisionRepository<'_> {
                 titre: r.get(1),
                 acteur_libelle: r.get(2),
                 echeance: r.get(3),
-                depot: r.get(4),
-                urls: r.get(5),
-                acheteur_uid: r.get(6),
+                departement: r.get(4),
+                depot: r.get(5),
+                urls: r.get(6),
+                acheteur_uid: r.get(7),
+                reference: r.get(8),
             })
             .collect())
     }
@@ -936,7 +972,9 @@ impl DecisionRepository<'_> {
             .conn
             .query(
                 &format!(
-                    "SELECT s.source_uid, a.uid, a.titre, a.acteur_libelle, a.echeance, {} \
+                    "SELECT s.source_uid, a.uid, a.titre, a.acteur_libelle, a.echeance, \
+                            a.departement, {}, \
+                            NULLIF(TRIM(a.details->>'reference'), '') \
                      FROM annonce a JOIN annonce_source s ON s.annonce_uid = a.uid \
                      WHERE a.fond = $1 AND a.echeance > NOW() \
                        AND s.source_uid NOT LIKE 'boamp:%'",
@@ -954,8 +992,49 @@ impl DecisionRepository<'_> {
                     titre: r.get(2),
                     acteur_libelle: r.get(3),
                     echeance: r.get(4),
-                    acheteur_uid: r.get(5),
+                    departement: r.get(5),
+                    acheteur_uid: r.get(6),
+                    reference: r.get(7),
                 },
+            })
+            .collect())
+    }
+
+    /// Les lignes ouvertes qu'aucun canal de plateforme ne porte : un canal de
+    /// publication les a vues (BOAMP, TED, presse), la moisson des profils
+    /// d'acheteurs non. C'est la mesure de complétude de la moisson, tenant par
+    /// tenant — `plateformes` liste les moteurs effectivement moissonnés.
+    #[tracing::instrument(name = "db.annonces_sans_plateforme", skip(self, plateformes), fields(db.system = "postgresql"))]
+    pub async fn annonces_sans_plateforme(
+        &self,
+        fond: &str,
+        plateformes: &[&str],
+    ) -> Result<Vec<TrouCouverture>> {
+        let plateformes: Vec<String> = plateformes.iter().map(|m| (*m).to_string()).collect();
+        let rows = self
+            .conn
+            .query(
+                "WITH ouvertes AS ( \
+                   SELECT a.uid, NULLIF(a.details->>'depot', '') AS depot, \
+                          array_agg(DISTINCT split_part(s.source_uid, ':', 1)) AS canaux \
+                   FROM annonce a JOIN annonce_source s ON s.annonce_uid = a.uid \
+                   WHERE a.fond = $1 AND a.echeance > NOW() \
+                   GROUP BY a.uid, 2 \
+                 ) \
+                 SELECT COALESCE(depot, ''), array_to_string(canaux, ','), count(*)::bigint \
+                 FROM ouvertes \
+                 WHERE NOT (canaux && $2::text[]) \
+                 GROUP BY 1, 2 \
+                 ORDER BY 3 DESC",
+                &[&fond, &plateformes],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| TrouCouverture {
+                depot: r.get(0),
+                canaux: r.get(1),
+                lignes: r.get(2),
             })
             .collect())
     }
@@ -1248,6 +1327,44 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
+    /// Les hôtes recensés qui n'ont plus rien rendu depuis `seuil` tentatives
+    /// consécutives : entrées mortes du recensement, pas pannes du jour.
+    #[tracing::instrument(name = "db.hotes_muets", skip(self), fields(db.system = "postgresql"))]
+    pub async fn hotes_muets(&self, seuil: i32) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT host FROM profil_acheteur WHERE echecs_consecutifs >= $1",
+                &[&seuil],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Enregistre le verdict d'une tentative par hôte : le compteur repart de
+    /// zéro dès que l'hôte répond.
+    #[tracing::instrument(name = "db.enregistrer_verdicts_hotes", skip_all, fields(db.system = "postgresql", n = verdicts.len()))]
+    pub async fn enregistrer_verdicts_hotes(&self, verdicts: &[(String, bool)]) -> Result<u64> {
+        if verdicts.is_empty() {
+            return Ok(0);
+        }
+        let host: Vec<&str> = verdicts.iter().map(|(h, _)| h.as_str()).collect();
+        let joignable: Vec<bool> = verdicts.iter().map(|(_, j)| *j).collect();
+        Ok(self
+            .conn
+            .execute(
+                "
+                UPDATE profil_acheteur AS p
+                SET echecs_consecutifs =
+                      CASE WHEN v.joignable THEN 0 ELSE p.echecs_consecutifs + 1 END
+                FROM unnest($1::text[], $2::bool[]) AS v(host, joignable)
+                WHERE p.host = v.host
+                ",
+                &[&host, &joignable],
+            )
+            .await?)
+    }
+
     /// Tous les hôtes recensés et classés par moteur — les plateformes avérées,
     /// validateurs du dépôt de dernier ressort. Jamais les hôtes non classés : un
     /// avis cite aussi le site institutionnel de son acheteur.
@@ -1356,11 +1473,10 @@ impl DecisionRepository<'_> {
         let sql = format!(
             "SELECT j, count(a.uid)::bigint AS n \
              FROM unnest(${ph}::int[]) AS j \
-             LEFT JOIN annonce a ON a.fond = $1{} \
-                  AND a.echeance IS NOT NULL \
-                  AND a.echeance <= NOW() + make_interval(days => j) \
+             LEFT JOIN annonce a ON a.fond = $1{} AND {} \
              GROUP BY j ORDER BY j",
-            filtre.clauses
+            filtre.clauses,
+            fenetre_echeance("a", "j")
         );
         let rows = self.conn.query(&sql, &filtre.refs()).await?;
         Ok(rows.iter().map(|r| (r.get("j"), r.get("n"))).collect())

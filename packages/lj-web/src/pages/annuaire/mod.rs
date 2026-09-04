@@ -14,7 +14,7 @@
 //! résultats de recherche et listing sont des ressources **bloquantes** (dans le
 //! HTML initial) ; les compteurs (rail + cartes) sont streamés (non bloquants).
 //! Transport des données via [`crate::api::ApiClient`] (in-process au SSR, HTTP
-//! `/api/entities/*` côté hydrate).
+//! `/internal/entities/*` côté hydrate).
 
 mod common;
 mod directory;

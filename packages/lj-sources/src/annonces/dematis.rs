@@ -1,12 +1,3 @@
-//! Dematis (`e-marchespublics.com`) — recherche à état de session.
-//!
-//! Jeton CSRF `_token` sur `/appel-offre`, puis `POST /notices/search/update`
-//! (un champ à la fois, dont `page`) → JSON `{view, nbResult}`. `per_page` est
-//! plafonné à 10 côté serveur : on parallélise en N sessions, chacune avec son
-//! curseur. `nbResult` compte aussi les avis clos, d'où `annonce: None`. Les
-//! `href` sont non quotés dans le HTML, et l'acheteur se dérive de l'ordre du
-//! texte de la carte (objet → acheteur → « CP Commune » → nature).
-
 use std::sync::LazyLock;
 
 use futures::StreamExt;
@@ -174,6 +165,7 @@ pub async fn enumerate() -> Result<MoteurRun> {
     let mut run = MoteurRun {
         annonce: None,
         echecs: 0,
+        hotes: Vec::new(),
         rows: premiere,
     };
     for res in resultats {

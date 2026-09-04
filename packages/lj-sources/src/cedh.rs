@@ -1,22 +1,15 @@
 //! Downloader HUDOC (CEDH) — I/O réseau au bord lj-sources.
 //!
-//! API publique sans auth sur `hudoc.echr.coe.int`, deux endpoints :
-//! - liste `GET /app/query/results` — `sort` obligatoire (sinon 404), `length`
-//!   cappé <500, fenêtre globale 10 000 → partition par année
-//!   (`kpdate:[YYYY-01-01T00:00:00.0Z TO …]`). Filtre bilingue FR-prioritaire :
-//!   `contentsitename=ECHR AND NOT (doctype=PR OR HFCOMOLD OR HECOMOLD) AND
-//!   (languageisocode="FRE" OR languageisocode="ENG")`. HUDOC publie un document
+//! API publique sans auth, deux endpoints :
+//! - **liste** : `sort` obligatoire (sinon 404), `length` cappé sous 500,
+//!   fenêtre globale de 10 000 → partition par année. HUDOC publie un document
 //!   par version linguistique : l'orchestrateur regroupe par affaire et retient
-//!   la version FR si elle existe, sinon EN. `select` = CSV des colonnes voulues
-//!   (projection serveur, sérialisation creuse : seules les clés non vides
-//!   reviennent).
-//! - corps `GET /app/conversion/docx/html/body?...&id={itemid}` → HTML (DOCX
-//!   converti), strippé en texte au bord par [`crate::html_strip::strip_html`].
+//!   le FR s'il existe, sinon l'EN. `select` projette côté serveur, et la
+//!   sérialisation est creuse — seules les clés non vides reviennent ;
+//! - **corps** : HTML converti du DOCX, strippé au bord.
 //!
-//! Le parsing métier vit dans `lj-core` (reçoit colonnes désérialisées + texte
-//! strippé). Throttle de courtoisie (~0,25 s), User-Agent de contact. Le
-//! watermark (dernière année traitée) est persisté par fond façon
-//! [`crate::dila::DilaManifest`].
+//! Le parsing métier vit dans `lj-core`. Le watermark est persisté par fond
+//! façon [`crate::dila::DilaManifest`].
 
 use crate::error::{Result, SourceError};
 use crate::html_strip::strip_html;
@@ -35,9 +28,10 @@ pub const BASE_URL: &str = "https://hudoc.echr.coe.int";
 pub const USER_AGENT: &str = "librejustice-cedh/0.1 (+https://github.com/)";
 /// Throttle de courtoisie entre fetchs.
 pub const THROTTLE: Duration = Duration::from_millis(250);
-/// Nombre de tentatives sur le corps (body) face aux 5xx/429 transitoires de
-/// HUDOC avant de différer (skip). Backoff = `THROTTLE << attempt`.
-const CEDH_BODY_RETRIES: u32 = 4;
+/// Tentatives face aux transitoires HUDOC, backoff `THROTTLE << attempt`.
+/// Épuisées, un corps est différé (skip) ; une page de liste est une erreur
+/// franche, la sauter trouerait l'année en silence.
+const CEDH_RETRIES: u32 = 4;
 /// `length` par page (cappé <500 côté serveur).
 pub const PAGE_SIZE: usize = 200;
 /// Colonnes projetées dans `select`, séparées par virgule (CSV). HUDOC
@@ -63,6 +57,12 @@ AND (kpdate:[{year}-01-01T00:00:00.0Z TO {year}-12-31T23:59:59.0Z])"
     )
 }
 
+/// 429 et 5xx de passerelle : ce que HUDOC rend sous charge et qui repasse au
+/// retry. Tout autre statut est structurel.
+fn is_transient(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
+
 /// Client HUDOC (reqwest async + TracingMiddleware, comme `judilibre.rs`).
 pub struct CedhClient {
     base_url: String,
@@ -86,6 +86,14 @@ impl CedhClient {
         let client = ClientBuilder::new(
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
+                // Sans borne, une connexion que HUDOC accepte sans jamais honorer parque
+                // `send().await` : le 28/08/2026, `sync-cedh` a tenu ses 3 600 s de watchdog
+                // sans écrire une ligne. Au-delà, la requête erreur et le retry repart.
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120))
+                // A pooled connection freezes on this path: 31/08/2026, bodies lost in
+                // waves of 5 within one second, spaced by the exact timeout, no 429.
+                .pool_max_idle_per_host(0)
                 .build()
                 .expect("reqwest client build"),
         )
@@ -125,23 +133,48 @@ impl CedhClient {
             ("start", start.to_string()),
             ("length", PAGE_SIZE.to_string()),
         ];
-        let resp = self
-            .client
-            .get(&url)
-            .header("accept", "application/json")
-            .query(&params)
-            .send()
-            .await
-            .map_err(|e| SourceError::Invalid(format!("requête hudoc results {url}: {e}")))?;
-        let status = resp.status().as_u16();
-        let text = resp.text().await?;
-        if status != 200 {
-            return Err(SourceError::Invalid(format!(
-                "hudoc results statut {status} {url}: {}",
-                text.chars().take(200).collect::<String>()
-            )));
+        let mut last = (0u16, String::new());
+        for attempt in 0..CEDH_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(THROTTLE * (1 << attempt)).await;
+            }
+            let envoi = self
+                .client
+                .get(&url)
+                .header("accept", "application/json")
+                .query(&params)
+                .send()
+                .await;
+            let resp = match envoi {
+                Ok(resp) => resp,
+                Err(e) if attempt + 1 < CEDH_RETRIES => {
+                    tracing::warn!(%url, attempt, error = %e, "requête hudoc results échouée (envoi/timeout), retry");
+                    continue;
+                }
+                Err(e) => {
+                    return Err(SourceError::Invalid(format!(
+                        "requête hudoc results {url}: {e}"
+                    )))
+                }
+            };
+            let status = resp.status().as_u16();
+            let text = resp.text().await?;
+            if status == 200 {
+                return Ok(sonic_rs::from_str(&text)?);
+            }
+            if !is_transient(status) {
+                return Err(SourceError::Invalid(format!(
+                    "hudoc results statut {status} {url}: {}",
+                    text.chars().take(200).collect::<String>()
+                )));
+            }
+            last = (status, text);
         }
-        Ok(sonic_rs::from_str(&text)?)
+        Err(SourceError::Invalid(format!(
+            "hudoc results statut {} après {CEDH_RETRIES} tentatives {url}: {}",
+            last.0,
+            last.1.chars().take(200).collect::<String>()
+        )))
     }
 
     /// Corps texte d'un document (`itemid`) : DOCX converti en HTML, strippé en
@@ -169,19 +202,31 @@ impl CedhClient {
         // persiste, on diffère (corps vide → skip → re-fetch au prochain sync), même
         // philosophie que le 204.
         let mut last_status = 0u16;
-        for attempt in 0..CEDH_BODY_RETRIES {
+        for attempt in 0..CEDH_RETRIES {
             // Throttle de courtoisie au réseau seul : payé ici, après le cache — un hit
             // disque ne dort pas. `<< attempt` = backoff des retries (250 ms, 500 ms, 1 s,
             // 2 s).
             tokio::time::sleep(THROTTLE * (1 << attempt)).await;
-            let resp = self
+            let envoi = self
                 .client
                 .get(&url)
                 .header("accept", "text/html")
                 .query(&params)
                 .send()
-                .await
-                .map_err(|e| SourceError::Invalid(format!("requête hudoc body {url}: {e}")))?;
+                .await;
+            let resp = match envoi {
+                Ok(resp) => resp,
+                Err(e) if attempt + 1 < CEDH_RETRIES => {
+                    tracing::warn!(itemid, attempt, error = %e, "requête hudoc body échouée (envoi/timeout), retry");
+                    continue;
+                }
+                // Même philosophie que le transitoire persistant : un corps injoignable se
+                // diffère, il ne fait pas tomber l'année entière.
+                Err(e) => {
+                    tracing::warn!(itemid, error = %e, "hudoc body injoignable après retries (envoi/timeout), différé (skip)");
+                    return Ok(String::new());
+                }
+            };
             let status = resp.status().as_u16();
             last_status = status;
             // 204 No Content = corps DOCX pas encore converti (lag, surtout arrêts de
@@ -202,9 +247,7 @@ impl CedhClient {
                 }
                 return Ok(strip_html(&raw));
             }
-            // 429 / 5xx = transitoire → on retente. Tout autre code est structurel →
-            // erreur franche immédiate.
-            if status != 429 && !(500..600).contains(&status) {
+            if !is_transient(status) {
                 return Err(SourceError::Invalid(format!(
                     "hudoc body statut {status} {itemid}"
                 )));

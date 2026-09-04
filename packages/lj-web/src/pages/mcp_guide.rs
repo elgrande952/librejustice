@@ -9,22 +9,29 @@ use crate::seo::CANONICAL_BASE;
 /// Desktop, Claude Desktop…) : une ligne pointant vers le guide agent
 /// `llms-install.md` du dépôt public (convention popularisée par Cline,
 /// suivie par le catalogue MCP de Microsoft, Magic MCP, Firebase MCP…).
-const UNIVERSAL_PROMPT: &str = "Installe LibreJustice (MCP + skills) en suivant ce guide : https://github.com/librejustice/librejustice/blob/main/llms-install.md";
+const UNIVERSAL_PROMPT: &str = "Installe LibreJustice (MCP + compétences) en suivant ce guide : https://github.com/librejustice/librejustice/blob/main/llms-install.md";
 
 /// Fiche du connecteur dans le répertoire officiel claude.ai : installation en
 /// un clic, sans saisie de l'URL de l'endpoint.
 const CLAUDE_DIRECTORY_URL: &str = "https://claude.ai/directory/connectors/librejustice";
 
-/// Prompts d'exemple a copier dans un client IA.
-const TEST_PROMPTS: [&str; 4] = [
-    "Trouve 5 décisions sur l'annulation d'un permis de construire.",
-    "Cherche en mode lexical : OQTF SAUF rétention.",
-    "Trouve une décision sur le harcèlement moral dans la fonction publique puis donne-moi son texte intégral.",
-    "Quelles sont les conditions posées par le Conseil d'État pour engager la responsabilité de l'État sans faute ?",
+const CHATGPT_DIRECTORY_URL: &str =
+    "https://chatgpt.com/plugins/plugin_asdk_app_6a053194fe5c81918e1a3b98ab1f4d63";
+
+/// Prompts d'exemple a copier dans un client IA. Nommer LibreJustice dans la
+/// question est ce qui declenche l'appel du connecteur.
+const TEST_PROMPTS: [&str; 6] = [
+    "En t'appuyant sur LibreJustice, est-ce que tu peux me donner sous quelles conditions le Conseil d'État admet la responsabilité sans faute de l'État ?",
+    "En t'appuyant sur LibreJustice, peux-tu me donner les conditions dans lesquelles le juge statuant en référé-liberté fait droit à la requête lorsque le préfet n'a pas exécuté l'injonction prononcée par une ordonnance de référé suspension rendue au préalable",
+    "Peux-tu chercher sur LibreJustice quelle valeur du point de déficit fonctionnel permanent les cours d'appel retiennent pour une victime de trente ans avec un taux de 10 %, et dans quelle fourchette ?",
+    "En t'appuyant sur LibreJustice, à quelles conditions la responsabilité d'un établissement de santé est-elle engagée pour une infection nosocomiale ? Cite les décisions sur lesquelles tu t'appuies.",
+    "En t'appuyant sur LibreJustice, ouvre les arrêts de cour d'appel sur l'aliénation parentale et dis-moi comment ils l'articulent avec l'intérêt de l'enfant.",
+    "En t'appuyant sur LibreJustice, dis-moi si un mécanicien licencié en 2015 avec dix mois d'ancienneté avait droit à l'indemnité de licenciement de la convention collective de l'automobile, et si la réponse serait la même aujourd'hui.",
 ];
 
 #[component]
 pub fn McpGuide() -> impl IntoView {
+    crate::pages::cache_public_5_min();
     let mcp_url = format!("{CANONICAL_BASE}/mcp/");
     let prompts = TEST_PROMPTS
         .iter()
@@ -36,7 +43,7 @@ pub fn McpGuide() -> impl IntoView {
             // Hero
             <section class="flex flex-col gap-6">
                 <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
-                    "Remote MCP"
+                    "Connecteur MCP"
                 </p>
                 <h1
                     class="text-balance font-sans text-3xl leading-[1.05] tracking-tight text-[var(--color-ink)] sm:text-5xl lg:text-[3.5rem]"
@@ -53,14 +60,24 @@ pub fn McpGuide() -> impl IntoView {
                 <p class="text-lg leading-relaxed text-[var(--color-ink-muted)]">
                     "Connectez Claude, ChatGPT ou votre propre agent au droit français (jurisprudence et textes) via le protocole MCP. La recherche sémantique et lexicale, directement dans le contexte de votre IA."
                 </p>
-                <a
-                    href=CLAUDE_DIRECTORY_URL
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    class="self-start rounded-md bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
-                >
-                    "Ajouter à Claude"
-                </a>
+                <div class="flex flex-wrap items-center gap-3">
+                    <a
+                        href=CLAUDE_DIRECTORY_URL
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="rounded-md bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                    >
+                        "Ajouter à Claude"
+                    </a>
+                    <a
+                        href=CHATGPT_DIRECTORY_URL
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="rounded-md bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                    >
+                        "Ajouter à ChatGPT"
+                    </a>
+                </div>
             </section>
 
             // Démo
@@ -83,69 +100,12 @@ pub fn McpGuide() -> impl IntoView {
             <section class="flex flex-col gap-8">
                 <SectionLabel>"Installation par client"</SectionLabel>
 
-                <ClientHowto title="Claude">
-                    <Step n=1>
-                        "Ouvrez la fiche LibreJustice dans le répertoire des connecteurs (connexion à votre compte Claude requise) : "
-                        <a
-                            href=CLAUDE_DIRECTORY_URL
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            class="underline underline-offset-2"
-                        >
-                            "claude.ai/directory/connectors/librejustice"
-                        </a>
-                        "."
-                    </Step>
-                    <Step n=2>
-                        "Cliquez sur "
-                        <strong>"Connect"</strong>
-                        " : Claude vous redirige vers LibreJustice pour valider l'accès via OAuth."
-                    </Step>
-                    <Step n=3>
-                        "Une fois autorisé, le connecteur est actif dans vos conversations et vos projets."
-                    </Step>
-                </ClientHowto>
-
                 <div class="flex flex-col gap-3">
                     <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Les clients suivants n'ont pas encore de fiche LibreJustice dans leur répertoire : ils l'ajoutent comme connecteur personnalisé, à partir de l'URL de l'endpoint."
+                        "Claude et ChatGPT s'installent par les boutons en haut de page. Les autres clients n'ont pas encore de fiche LibreJustice dans leur répertoire : ils l'ajoutent comme connecteur personnalisé, à partir de l'URL de l'endpoint."
                     </p>
                     <CopyEndpoint url=mcp_url />
                 </div>
-
-                <ClientHowto title="ChatGPT Web">
-                    <Step n=1>
-                        "Connectez-vous sur "
-                        <a
-                            href="https://chatgpt.com"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            class="underline underline-offset-2"
-                        >
-                            "chatgpt.com"
-                        </a>
-                        " (compte Business, Enterprise ou Edu requis, avec Developer mode activé)."
-                    </Step>
-                    <Step n=2>
-                        "Allez dans "
-                        <strong>"Paramètres → Applications"</strong>
-                        ", ouvrez "
-                        <strong>"Paramètres avancés"</strong>
-                        " et activez le "
-                        <strong>"Developer mode"</strong>
-                        "."
-                    </Step>
-                    <Step n=3>
-                        "Revenez dans "
-                        <strong>"Paramètres → Applications"</strong>
-                        ", cliquez sur "
-                        <strong>"Ajouter une application"</strong>
-                        " et collez l'URL de l'endpoint."
-                    </Step>
-                    <Step n=4>
-                        "Autorisez l'accès sur la page LibreJustice qui s'ouvre. Le connecteur est prêt dans vos conversations."
-                    </Step>
-                </ClientHowto>
 
                 <ClientHowto title="Le Chat (Mistral)">
                     <Step n=1>
@@ -214,20 +174,20 @@ pub fn McpGuide() -> impl IntoView {
                 </ClientHowto>
             </section>
 
-            // Skills : la méthode de recherche, en plus du connecteur
+            // Compétences : la méthode de recherche, en plus du connecteur
             <section class="flex flex-col gap-8">
-                <SectionLabel>"Skills"</SectionLabel>
+                <SectionLabel>"Compétences"</SectionLabel>
                 <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                    "Deux skills accompagnent le connecteur : "
+                    "Deux compétences accompagnent le connecteur : "
                     <strong>"recherche-jurisprudence"</strong>
                     " et "
                     <strong>"recherche-normes"</strong>
-                    ". Une skill est un mode d'emploi que votre agent lit avant de chercher : lire une décision en intégralité avant de la citer, viser la version d'un texte à la date du litige, éviter les pièges du corpus. Le connecteur fonctionne sans, mais les réponses sont nettement plus fiables avec."
+                    ". Une compétence est un mode d'emploi que votre agent lit avant de chercher : lire une décision en intégralité avant de la citer, viser la version d'un texte à la date du litige, éviter les pièges du corpus. Le connecteur fonctionne sans, mais les réponses sont nettement plus fiables avec."
                 </p>
 
                 <ClientHowto title="Claude Web">
                     <Step n=1>
-                        "Téléchargez la skill : "
+                        "Téléchargez la compétence : "
                         <a
                             href="/skills/recherche-jurisprudence.zip"
                             download
@@ -247,46 +207,19 @@ pub fn McpGuide() -> impl IntoView {
                     </Step>
                     <Step n=2>
                         "Sur Claude Web : avatar en bas à gauche → "
-                        <strong>"Paramètres → Personnaliser → Skills"</strong>
+                        <strong>"Paramètres → Personnaliser → Compétences"</strong>
                         " (tous les plans)."
                     </Step>
                     <Step n=3>
-                        <strong>"Upload skill"</strong>
-                        " et sélectionnez le zip. La skill s'active dans vos conversations (le connecteur MCP ajouté ci-dessus reste nécessaire)."
+                        <strong>"Ajouter → Téléverser une compétence"</strong>
+                        ", puis sélectionnez le zip. Elle s'active dans vos conversations (le connecteur MCP ajouté ci-dessus reste nécessaire)."
                     </Step>
                 </ClientHowto>
 
-                <ClientHowto title="ChatGPT Web">
-                    <Step n=1>
-                        "Téléchargez la skill : "
-                        <a
-                            href="/skills/recherche-jurisprudence.zip"
-                            download
-                            class="underline underline-offset-2"
-                        >
-                            "recherche-jurisprudence.zip"
-                        </a>
-                        " ou "
-                        <a
-                            href="/skills/recherche-normes.zip"
-                            download
-                            class="underline underline-offset-2"
-                        >
-                            "recherche-normes.zip"
-                        </a>
-                        "."
-                    </Step>
-                    <Step n=2>
-                        "Sur chatgpt.com, dans la barre latérale : "
-                        <strong>"Plugins"</strong>
-                        ", puis l'onglet "
-                        <strong>"Skills"</strong>
-                        " (plans Business, Enterprise ou Edu ; sur Enterprise et Edu, l'administrateur doit avoir activé les skills)."
-                    </Step>
-                    <Step n=3>
-                        <strong>"Create → Upload from your computer"</strong>
-                        " et sélectionnez le zip. ChatGPT scanne la skill puis l'active (le connecteur MCP ajouté ci-dessus reste nécessaire)."
-                    </Step>
+                <ClientHowto title="ChatGPT">
+                    <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
+                        "Le plugin du répertoire installe les deux compétences avec le connecteur."
+                    </p>
                 </ClientHowto>
             </section>
 
@@ -299,13 +232,13 @@ pub fn McpGuide() -> impl IntoView {
                 <ul class="flex flex-col gap-2">{prompts.collect_view()}</ul>
             </section>
 
-            // Installation par prompt : le plugin complet (connecteur MCP + skills)
+            // Installation par prompt : le plugin complet (connecteur MCP + compétences)
             <section class="flex flex-col gap-8">
                 <SectionLabel>"Installation par prompt"</SectionLabel>
 
                 <ClientHowto title="ChatGPT Desktop, Claude Desktop…">
                     <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Ces applications peuvent installer LibreJustice elles-mêmes, connecteur MCP et skills d'un coup : collez ce prompt, l'assistant suit le guide "
+                        "Ces applications peuvent installer LibreJustice elles-mêmes, connecteur MCP et compétences d'un coup : collez ce prompt, l'assistant suit le guide "
                         <a
                             href="https://github.com/librejustice/librejustice/blob/main/llms-install.md"
                             target="_blank"
@@ -318,6 +251,17 @@ pub fn McpGuide() -> impl IntoView {
                     </p>
                     <CopyBlock text=UNIVERSAL_PROMPT label="Prompt d'installation" />
                 </ClientHowto>
+            </section>
+
+            <section class="flex flex-col gap-4">
+                <SectionLabel>"Plutôt du code ?"</SectionLabel>
+                <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
+                    "Si le consommateur est votre programme et non une IA, le même fonds se lit en REST : "
+                    <a href="/api-guide" class="underline underline-offset-2">
+                        "l'API publique"
+                    </a>
+                    ", clé gratuite et contrat OpenAPI."
+                </p>
             </section>
         </div>
     }
@@ -415,8 +359,9 @@ fn CopyBlock(text: &'static str, label: &'static str) -> impl IntoView {
     }
 }
 
-/// Prompt d'exemple sur une ligne + bouton copier (même pattern clipboard
-/// que `CopyBlock`).
+/// Prompt d'exemple + bouton copier (même pattern clipboard que `CopyBlock`).
+/// Le texte se replie : tronqué, un prompt long ne se relit pas et ne dit plus
+/// ce qu'il copie.
 #[component]
 fn CopyPrompt(text: &'static str) -> impl IntoView {
     let copied = RwSignal::new(false);
@@ -437,8 +382,8 @@ fn CopyPrompt(text: &'static str) -> impl IntoView {
     };
 
     view! {
-        <li class="flex items-center gap-2 border-l-2 border-[var(--color-accent)] py-1 pl-4">
-            <span class="min-w-0 flex-1 truncate text-sm text-[var(--color-ink-muted)]">
+        <li class="flex items-start gap-2 border-l-2 border-[var(--color-accent)] py-1 pl-4">
+            <span class="min-w-0 flex-1 text-sm leading-relaxed text-[var(--color-ink-muted)]">
                 {text}
             </span>
             <button

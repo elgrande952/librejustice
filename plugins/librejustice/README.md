@@ -1,41 +1,33 @@
-# Plugin LibreJustice
+# LibreJustice plugin
 
-Connecte votre agent (Claude Code ou Codex) au moteur de recherche de
-jurisprudence et de législation françaises
-[librejustice.fr](https://librejustice.fr) : cinq outils MCP et deux skills
-qui encadrent l'usage — de la recherche du texte applicable à la citation
-vérifiée.
+Free and open source, [librejustice.fr](https://librejustice.fr) gives your agent **~3.7 million French and European decisions and ~3.6 million legal articles**, linked article by article. Five MCP tools and two skills that frame their use, from finding the applicable text to the verified citation.
 
 ## Installation
 
-Claude Code :
+Claude Code:
 
 ```
 /plugin marketplace add librejustice/librejustice
 /plugin install librejustice@librejustice
 ```
 
-Codex :
+Codex:
 
 ```
 codex plugin marketplace add librejustice/librejustice
 codex plugin add librejustice@librejustice
 ```
 
-À la première utilisation, l'agent ouvre le navigateur pour connecter (ou
-créer) un compte librejustice.fr. OAuth 2.1 avec enregistrement dynamique de
-client : aucune clé à configurer.
+On first use, the agent opens the browser to connect (or create) a librejustice.fr account. OAuth 2.1 with dynamic client registration: no API key to configure, and the account is free.
 
-## Contenu
+## Contents
 
-| Composant | Rôle |
-|---|---|
-| Serveur MCP `librejustice` | `https://librejustice.fr/mcp` : `search_decisions`, `get_decision`, `get_legal_text`, `search_legal_texts`, `list_my_activity` |
-| Skill `recherche-jurisprudence` | trouver, vérifier et citer les décisions (deux ordres), avec lien systématique |
-| Skill `recherche-normes` | le texte applicable à date : codes FR versionnés, traités, droit UE, codes étrangers, conventions collectives, BOFiP |
+| Component | Role |
+| -- | -- |
+| MCP server `librejustice` | `https://librejustice.fr/mcp`: `search_decisions`, `get_decision`, `get_legal_text`, `search_legal_texts`, `list_my_activity` |
+| Skill `recherche-jurisprudence` | find, verify and cite decisions from France's administrative and judicial courts, every one of them linked |
+| Skill `recherche-normes` | the text as it applied on the relevant date: versioned French codes, treaties, EU law, foreign codes, collective agreements, BOFiP |
 
-Le serveur MCP est aussi utilisable seul. Sur claude.ai, il s'ajoute depuis le
-répertoire des connecteurs :
-[claude.ai/directory/connectors/librejustice](https://claude.ai/directory/connectors/librejustice).
-Ailleurs (ChatGPT, Le Chat, Perplexity…), en connecteur custom : URL
-`https://librejustice.fr/mcp`.
+Five tools cover both case law and legislation, rather than one tool per fonds: every connected tool takes room in the agent's context and enters its choice at each turn.
+
+The MCP server also works on its own. On claude.ai it is added from the [connector directory](https://claude.ai/directory/connectors/librejustice). Elsewhere (ChatGPT, Le Chat, Perplexity...), add it as a custom connector with the URL `https://librejustice.fr/mcp`.

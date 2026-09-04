@@ -13,21 +13,14 @@
 //!   Polynésie française : / 1° Les articles R. 561-1 à R. 561-38-9 ; … ».
 //!
 //! La morphologie « tableau ci-après » a son parser dédié
-//! ([`parse_compteur_table`]) : le rendu LEGI aplatit le tableau en une
-//! cellule par ligne — ligne de références (colonne de gauche), puis ligne
-//! de rédaction optionnelle (colonne de droite), divisions structurelles
-//! intercalées (« Au titre II »), ancre globale d'en-tête « sauf mention
-//! contraire ». Le tableau se ferme sur une section romaine (« II. - »), un
-//! item d'adaptation (« 1° … ») ou un NOTA. [`compteur_has_table`] signale
-//! la morphologie à l'appelant, qui lance les deux parsers.
+//! ([`parse_compteur_table`]) : LEGI aplatit le tableau en une cellule par
+//! ligne. Il se ferme sur une section romaine, un item d'adaptation ou un NOTA,
+//! et [`compteur_has_table`] signale la morphologie à l'appelant.
 //!
-//! Le parser rend les cibles en clé [`crate::article_key::article_key`],
-//! les plages non dépliées (le dépliage exige la liste des articles du code,
-//! côté I/O), et l'ancre de rédaction en date ISO. Les exceptions
-//! infra-article (« du II de l'article X », « de son troisième alinéa »)
-//! restent de la prose — le modèle pose la portée au grain de l'article,
-//! l'exception se lit dans `source`. Seules les exclusions d'article ENTIER
-//! (« à l'exception des articles X et Y ») sont soustraites.
+//! Les cibles sortent en clé [`crate::article_key::article_key`], plages non
+//! dépliées — le dépliage exige la liste des articles du code, côté I/O. Les
+//! exceptions infra-article restent de la prose : le modèle pose la portée au
+//! grain de l'article. Seules les exclusions d'article ENTIER sont soustraites.
 
 use std::sync::LazyLock;
 

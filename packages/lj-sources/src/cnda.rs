@@ -1,23 +1,15 @@
 //! Downloader CNDA (Cour nationale du droit d'asile) — I/O réseau au bord
 //! lj-sources.
 //!
-//! La CNDA est absente de Judilibre/JADE/opendata : seule source = scraping
-//! du site `cnda.fr`. Deux niveaux fusionnés côté pipeline (une ligne
-//! `decisions` par numéro) :
-//! - fiche HTML éditoriale (liste paginée `?page=1..N`, 30 fiches/page,
-//!   sous-ensemble curé « jurisprudentiel ») : titre éditorial, `content_type`,
-//!   abstract/analyse rédigé par la Cour (1300–2700 car.), lien « Voir la
-//!   décision » (slug PDF sans extension sous `/Media/mediatheque-cnda/…`),
-//!   date de mise en ligne.
-//! - PDF Word lié (texte intégral) : octets bruts → extraction côté pipeline
-//!   `lj-ingest`, avec cache local du markdown OCR (`ocr/<numero>.md`), l'OCR
-//!   Mistral étant payant et non déterministe.
+//! La CNDA est absente de Judilibre, de JADE et de l'opendata : la seule source
+//! est le site. Deux niveaux, fusionnés en une ligne `decisions` par numéro :
+//! - la **fiche HTML** éditoriale (liste paginée, sous-ensemble curé) : titre,
+//!   `content_type`, analyse rédigée par la Cour, lien vers le PDF ;
+//! - le **PDF** lié, texte intégral, dont l'extraction est côté `lj-ingest`
+//!   avec cache local du markdown : l'OCR est payant et non déterministe.
 //!
-//! Le parsing métier (sections, ECLI fabriqué, `source_fields`) vit dans
-//! `lj-core::parse_cnda`, qui reçoit le markdown OCR nettoyé
-//! (`clean_ocr_markdown`) et les métadonnées fiche désérialisées. Throttle de
-//! courtoisie + User-Agent de contact. Le watermark (dernière page drainée /
-//! dernier numéro vu) est persisté façon [`crate::dila::DilaManifest`].
+//! Le parsing métier vit dans `lj-core::parse_cnda`. Le watermark est persisté
+//! façon [`crate::dila::DilaManifest`].
 
 use crate::error::{Result, SourceError};
 use crate::html_strip::strip_html;
@@ -34,9 +26,9 @@ use std::time::Duration;
 
 /// Base du site CNDA.
 pub const BASE_URL: &str = "https://www.cnda.fr";
-/// User-Agent de contact (scraping courtois d'un site public sans API).
+/// User-Agent de contact : le site n'a pas d'API, l'opérateur sait qui appelle.
 pub const USER_AGENT: &str = "librejustice-cnda/0.1 (+https://github.com/)";
-/// Throttle de courtoisie entre fetchs (site public, scraping respectueux).
+/// Throttle entre fetchs : la source est un site vitrine, pas une API dimensionnée.
 pub const THROTTLE: Duration = Duration::from_millis(500);
 /// Chemin de la liste jurisprudentielle paginée.
 pub const LIST_PATH: &str = "/decisions-de-justice/jurisprudence/decisions-jurisprudentielles";
@@ -66,6 +58,8 @@ impl CndaClient {
         let client = ClientBuilder::new(
             reqwest::Client::builder()
                 .user_agent(USER_AGENT)
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(120))
                 .build()
                 .expect("reqwest client build"),
         )

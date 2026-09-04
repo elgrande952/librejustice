@@ -104,6 +104,7 @@ pub async fn fetch_bookmarks(
             jurisdiction_name.as_deref(),
             None,
             date_lecture.as_deref(),
+            None,
             docket_numbers.as_deref(),
         );
         items.push(BookmarkItem {

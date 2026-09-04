@@ -21,7 +21,7 @@ use lj_core::annonces::{
     LotAttribue, ResultatMarche,
 };
 use lj_dtos::ANNONCE_FOND_MARCHE;
-use lj_sources::annonces::{self, MoteurRun};
+use lj_sources::annonces::{self, HoteVerdict, MoteurRun};
 use lj_store::repository::{
     AnnonceAEnrichir, AnnonceChamps, AnnonceSourceWriteItem, AnnonceWriteItem, AnnonceWriteStats,
     DecisionRepository, DetailPose, ResultatPose,
@@ -33,11 +33,36 @@ use crate::config::Settings;
 /// laisse la marge du churn normal sans laisser passer une casse de parseur.
 const RATIO_MIN: f64 = 0.90;
 
-fn degrade(run: &MoteurRun) -> bool {
+/// Tentatives consécutives sans réponse au-delà desquelles un hôte recensé
+/// cesse de compter comme un échec : sept nuits, une panne d'éditeur qui couche
+/// 35 portails le temps d'un run n'en déclassant alors aucun. L'hôte muet reste
+/// tenté chaque nuit, et revient au compte le jour où il répond.
+const NUITS_MUETTES: i32 = 7;
+
+/// Les hôtes en échec d'un run, répartis entre panne du jour et entrée morte du
+/// recensement, celle-ci lue dans `muets`.
+fn echecs_et_muets(hotes: &[HoteVerdict], muets: &HashSet<String>) -> (u32, u32) {
+    hotes
+        .iter()
+        .filter(|h| !h.joignable)
+        .fold((0, 0), |(echecs, morts), h| match muets.contains(&h.host) {
+            true => (echecs, morts + 1),
+            false => (echecs + 1, morts),
+        })
+}
+
+/// Share of the live fleet down past which a multi-host engine is degraded. The
+/// collected/announced ratio is blind to it: the announced total only sums over
+/// hosts that ANSWERED. 40 % sits above the census floor not yet aged into muet
+/// (12 of 49 on Safetender, 9 of 49 on Atexo) and under the 46 of 49 of 27/08/2026.
+const ECHECS_MAX: f64 = 0.40;
+
+fn degrade(run: &MoteurRun, echecs_hotes: u32, hotes_vivants: usize) -> bool {
     run.rows.is_empty()
         || run
             .annonce
             .is_some_and(|a| a > 0 && (run.rows.len() as f64) < a as f64 * RATIO_MIN)
+        || (hotes_vivants > 0 && f64::from(echecs_hotes) > hotes_vivants as f64 * ECHECS_MAX)
 }
 
 /// Moisson quotidienne : tous les canaux, puis réconciliation et écriture.
@@ -67,6 +92,10 @@ pub async fn annonces() -> Result<()> {
         .hotes_profil_acheteur("safetender")
         .await
         .map_err(|e| anyhow!("hotes safetender: {e}"))?;
+    let hotes_synapse = repo
+        .hotes_profil_acheteur("synapse")
+        .await
+        .map_err(|e| anyhow!("hotes synapse: {e}"))?;
     // Les plateformes avérées (tous moteurs), validateurs du dépôt de
     // dernier ressort du connecteur BOAMP.
     let plateformes: HashSet<String> = repo
@@ -78,6 +107,7 @@ pub async fn annonces() -> Result<()> {
     tracing::info!(
         atexo = hotes_atexo.len(),
         safetender = hotes_safetender.len(),
+        synapse = hotes_synapse.len(),
         plateformes = plateformes.len(),
         "annonces : profils recensés"
     );
@@ -87,6 +117,7 @@ pub async fn annonces() -> Result<()> {
     // moisson.
     let (
         boamp,
+        ted,
         atexo,
         safetender,
         aws,
@@ -100,21 +131,23 @@ pub async fn annonces() -> Result<()> {
         modula,
     ) = tokio::join!(
         annonces::boamp::enumerate(&plateformes),
+        annonces::ted::enumerate(),
         annonces::atexo::enumerate(&hotes_atexo),
         annonces::safetender::enumerate(&hotes_safetender),
         annonces::aws::enumerate(),
         annonces::dematis::enumerate(),
         annonces::achatpublic::enumerate(),
         annonces::atline::enumerate(),
-        annonces::synapse::enumerate(),
+        annonces::synapse::enumerate(&hotes_synapse),
         annonces::xmarches::enumerate(),
         annonces::aji::enumerate(),
-        annonces::klekoon::enumerate(),
+        annonces::klekoon::enumerate(&settings.egress_url),
         annonces::modula::enumerate(),
     );
 
-    let runs: Vec<(&'static str, MoteurRun)> = [
+    let mut runs: Vec<(&'static str, MoteurRun)> = [
         ("boamp", boamp),
+        ("ted", ted),
         ("atexo", atexo),
         ("safetender", safetender),
         ("aws", aws),
@@ -137,15 +170,40 @@ pub async fn annonces() -> Result<()> {
     })
     .collect();
 
+    // La presse n'a pas de porte HTTP : sa session navigateur laisse un dump,
+    // que la moisson consomme s'il est là. Pas de dump = pas de canal, sans
+    // erreur — le portail n'est pas une dépendance du run.
+    match dernier_dump(&settings.paths().presse()) {
+        Some(f) => match annonces::presse::enumerate(&f).await {
+            Ok(run) => {
+                tracing::info!(dump = %f.display(), "annonces : dump de presse");
+                runs.push(("presse", run));
+            }
+            Err(e) => tracing::error!(error = %e, "annonces : dump de presse illisible"),
+        },
+        None => tracing::info!("annonces : aucun dump de presse"),
+    }
+
+    let muets: HashSet<String> = repo
+        .hotes_muets(NUITS_MUETTES)
+        .await
+        .map_err(|e| anyhow!("hotes muets: {e}"))?
+        .into_iter()
+        .collect();
+
     let mut degrades: Vec<&'static str> = Vec::new();
     let mut brutes: Vec<AnnonceBrute> = Vec::new();
+    let mut verdicts: Vec<(String, bool)> = Vec::new();
     for (moteur, run) in runs {
-        let sain = !degrade(&run);
+        let (echecs_hotes, hotes_muets) = echecs_et_muets(&run.hotes, &muets);
+        verdicts.extend(run.hotes.iter().map(|h| (h.host.clone(), h.joignable)));
+        let sain = !degrade(&run, echecs_hotes, run.hotes.len() - hotes_muets as usize);
         tracing::info!(
             moteur,
             collecte = run.rows.len(),
             annonce = run.annonce,
-            echecs = run.echecs,
+            echecs = run.echecs + echecs_hotes,
+            hotes_muets,
             sain,
             "annonces : moteur"
         );
@@ -154,6 +212,9 @@ pub async fn annonces() -> Result<()> {
         }
         brutes.extend(run.rows);
     }
+    repo.enregistrer_verdicts_hotes(&verdicts)
+        .await
+        .map_err(|e| anyhow!("verdicts hôtes: {e}"))?;
 
     let aujourdhui = Timestamp::now()
         .to_zoned(TimeZone::get("Europe/Paris").expect("tzdb embarquée"))
@@ -210,6 +271,19 @@ pub async fn annonces() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Le dump de presse le plus récent, quand une session en a laissé un. Le nom
+/// porte la date de la session (`2026-08-15.ndjson`) : l'ordre lexicographique
+/// suffit à désigner le dernier.
+fn dernier_dump(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut fichiers: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "ndjson"))
+        .collect();
+    fichiers.sort();
+    fichiers.pop()
 }
 
 /// Le dataset BOAMP ne porte pas d'avis paru avant.
@@ -632,11 +706,51 @@ const MULTI_TENANTS: [&str; 3] = ["atexo", "safetender", "modula"];
 /// Le canal que désigne un dépôt : le moteur pour les plateformes nationales,
 /// l'instance pour les multi-tenants — soit exactement le préfixe des
 /// `source_uid` que son connecteur produit.
+/// L'hôte de dépôt et le moteur qui le sert. Quand le recensement ne connaît
+/// pas l'hôte exact, on retombe sur son domaine parent : une marque blanche
+/// (`alm.marches-securises.fr`, `agysoft.marches-publics.info`) est servie par
+/// le moteur de l'instance mère, et ses consultations vivent dans le même
+/// vivier. Un parent inconnu du recensement ne rend rien — on n'invente pas de
+/// moteur.
+fn hote_et_moteur(depot: &str, moteurs: &HashMap<String, String>) -> Option<(String, String)> {
+    let hote = hote_de(depot)?;
+    if let Some(m) = moteurs.get(&hote) {
+        return Some((hote, m.clone()));
+    }
+    let parent = hote.split_once('.')?.1.to_string();
+    let m = moteurs.get(&parent)?.clone();
+    Some((parent, m))
+}
+
 fn canal_de_depot(moteur: &str, hote: &str) -> String {
     if MULTI_TENANTS.contains(&moteur) {
         format!("{moteur}:{hote}")
     } else {
         moteur.to_string()
+    }
+}
+
+/// Le canal du stock que désigne un canal déclaré : lui-même quand il a des
+/// lignes, sinon l'unique canal du même moteur dont l'hôte est un sous-domaine
+/// du sien. L'avis déclare l'hôte de façade (`alsacemarchespublics.eu`,
+/// `megalis.bretagne.bzh`), le connecteur range le stock sous l'hôte de service
+/// (`plateforme.…`, `marches.…`).
+fn canal_du_stock<T>(canal: String, vivier: &HashMap<String, T>) -> String {
+    if vivier.contains_key(&canal) {
+        return canal;
+    }
+    let Some((moteur, hote)) = canal.split_once(':') else {
+        return canal;
+    };
+    let suffixe = format!(".{hote}");
+    let mut sous = vivier.keys().filter(|k| {
+        k.strip_prefix(moteur)
+            .and_then(|r| r.strip_prefix(':'))
+            .is_some_and(|h| h.ends_with(&suffixe))
+    });
+    match (sous.next(), sous.next()) {
+        (Some(seul), None) => seul.clone(),
+        _ => canal,
     }
 }
 
@@ -710,6 +824,338 @@ fn jumelle_de_depot<'a>(
     }
 }
 
+/// La jumelle par la seule référence de marché, quand elle désigne **une seule**
+/// ligne plateforme de tout le stock ouvert et qu'aucune autre candidate ne la
+/// porte. C'est la clé quand l'acheteur ne peut pas servir : sur une instance
+/// multi-locataire la plateforme nomme le groupe (« Ministère de la Transition
+/// Écologique ») là où l'avis nomme l'acheteur (« Office français de la
+/// biodiversité »), et le prédicat titre + acheteur ne peut jamais jouer.
+///
+/// L'index est global, pas par canal : la référence désigne le marché, pas
+/// l'hôte, et l'avis se trompe parfois de plateforme.
+fn jumelle_par_reference<'a>(
+    ligne: &lj_store::repository::AnnonceAJumeler,
+    index: &HashMap<String, Vec<&'a AnnonceChamps>>,
+    portees: &HashMap<String, usize>,
+    canal_de_cible: &HashMap<&str, String>,
+    canal_declare: Option<&str>,
+) -> Jumelage<'a> {
+    let Some(reference) = ligne.reference.as_deref().map(plie) else {
+        return Jumelage::Aucune;
+    };
+    // Une référence que deux candidates portent ne départage rien, et une
+    // « référence » égale au nom de l'acheteur est un champ mal extrait.
+    if reference.is_empty()
+        || reference == plie(&ligne.acteur_libelle)
+        || portees.get(&reference).copied().unwrap_or(0) > 1
+    {
+        return Jumelage::Aucune;
+    }
+    let Some(cibles) = index.get(&reference) else {
+        return Jumelage::Aucune;
+    };
+    // Plusieurs lignes portent la référence : c'est le même marché publié sur
+    // deux plateformes, et l'avis en nomme une. Le canal déclaré départage —
+    // exactement, sans rien approcher.
+    let retenues: Vec<&&AnnonceChamps> = match cibles.as_slice() {
+        [_] => cibles.iter().collect(),
+        _ => {
+            let Some(canal) = canal_declare else {
+                return Jumelage::Ambigue;
+            };
+            cibles
+                .iter()
+                .filter(|c| {
+                    canal_de_cible
+                        .get(c.uid.as_str())
+                        .is_some_and(|k| k == canal)
+                })
+                .collect()
+        }
+    };
+    let [seule] = retenues.as_slice() else {
+        return Jumelage::Ambigue;
+    };
+    match (ligne.acheteur_uid.as_deref(), seule.acheteur_uid.as_deref()) {
+        // Deux entités acheteur résolues et différentes refusent la paire.
+        (Some(a), Some(b)) if a != b => Jumelage::Aucune,
+        _ => Jumelage::Une(&seule.uid),
+    }
+}
+
+/// La date d'une échéance en heure de Paris : deux canaux du même marché
+/// publient la même date limite avec des heures divergentes (12 h ici, 16 h là).
+fn date_paris(e: chrono::DateTime<chrono::Utc>) -> Option<jiff::civil::Date> {
+    static PARIS: std::sync::LazyLock<TimeZone> =
+        std::sync::LazyLock::new(|| TimeZone::get("Europe/Paris").expect("tzdb embarquée"));
+    Some(
+        Timestamp::from_second(e.timestamp())
+            .ok()?
+            .to_zoned(PARIS.clone())
+            .date(),
+    )
+}
+
+/// La jumelle par titre et date d'échéance, sur tout le stock ouvert : même
+/// titre plié, même date limite, et une seule ligne qui satisfait les deux. Le
+/// canal déclaré ne borne rien — l'avis se trompe parfois de plateforme, et
+/// l'hôte déclaré n'a parfois aucun moteur connecté. Là où le titre seul
+/// collisionne (« entretien des espaces verts »), le département et l'entité
+/// acheteur récusent quand ils sont connus des deux côtés, et l'ambiguïté
+/// refuse le reste.
+fn jumelle_par_titre_echeance<'a>(
+    ligne: &lj_store::repository::AnnonceAJumeler,
+    index: &HashMap<String, Vec<&'a AnnonceChamps>>,
+) -> Jumelage<'a> {
+    let Some(echeance) = ligne.echeance.and_then(date_paris) else {
+        return Jumelage::Aucune;
+    };
+    let titre = plie(&ligne.titre);
+    let Some(cibles) = (!titre.is_empty()).then(|| index.get(&titre)).flatten() else {
+        return Jumelage::Aucune;
+    };
+    let compatible = |a: Option<&str>, b: Option<&str>| match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
+    let retenues: Vec<&&AnnonceChamps> = cibles
+        .iter()
+        .filter(|c| c.echeance.and_then(date_paris) == Some(echeance))
+        .filter(|c| compatible(ligne.departement.as_deref(), c.departement.as_deref()))
+        .filter(|c| compatible(ligne.acheteur_uid.as_deref(), c.acheteur_uid.as_deref()))
+        .collect();
+    match retenues.as_slice() {
+        [seule] => Jumelage::Une(&seule.uid),
+        [] => Jumelage::Aucune,
+        _ => Jumelage::Ambigue,
+    }
+}
+
+/// Résout par la recherche de la plateforme les lignes ouvertes qui n'ont que
+/// la racine d'un hôte.
+///
+/// L'énumération d'une instance et son index de recherche ne couvrent pas le
+/// même ensemble : `marches-securises.fr` annonce 1 493 consultations dans sa
+/// liste, on en moissonne autant, et une consultation ouverte peut n'être dans
+/// aucune des deux — sa seule porte est la recherche par référence. On la
+/// pousse donc, annonce par annonce, avec la référence que l'avis publie.
+///
+/// La ligne trouvée entre par le chemin d'écriture de la moisson, et la passe
+/// apparie elle-même : une référence qui ne rend qu'une consultation sur l'hôte
+/// que l'avis déclare désigne cette consultation. Le plus souvent elle est déjà
+/// en stock — la recherche ne l'écrit pas, elle la nomme.
+pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
+    let debut = std::time::Instant::now();
+    let settings = Settings::from_env()?;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    conn.batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
+    lj_store::migrator::apply_migrations(&conn)
+        .await
+        .map_err(|e| anyhow!("migrations: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+
+    let moteurs: HashMap<String, String> = repo
+        .moteurs_par_hote()
+        .await
+        .map_err(|e| anyhow!("moteurs par hôte: {e}"))?
+        .into_iter()
+        .collect();
+    let candidates = repo
+        .annonces_a_jumeler(ANNONCE_FOND_MARCHE)
+        .await
+        .map_err(|e| anyhow!("candidates: {e}"))?;
+
+    // Une candidate résoluble : pas de clé de jointure (sinon la moisson l'a
+    // déjà jouée), une référence, et un hôte dont on sait interroger le moteur.
+    let mut travail: Vec<(&lj_store::repository::AnnonceAJumeler, &str, String, String)> =
+        Vec::new();
+    for ligne in &candidates {
+        let (Some(reference), true) = (
+            ligne
+                .reference
+                .as_deref()
+                .filter(|r| r.chars().count() >= 4),
+            lj_core::annonces::cles_jointure_depuis_urls(
+                ligne
+                    .urls
+                    .iter()
+                    .map(String::as_str)
+                    .chain(std::iter::once(ligne.depot.as_str())),
+            )
+            .is_empty(),
+        ) else {
+            continue;
+        };
+        let Some((hote, moteur)) = hote_et_moteur(&ligne.depot, &moteurs) else {
+            continue;
+        };
+        travail.push((ligne, reference, hote, moteur));
+    }
+    travail.sort_by(|a, b| (a.1, &a.2, &a.3).cmp(&(b.1, &b.2, &b.3)));
+    let a_faire = travail.len();
+    if limite > 0 {
+        travail.truncate(limite as usize);
+    }
+
+    let mut brutes: Vec<AnnonceBrute> = Vec::new();
+    // Une recherche par clé, pas par candidate : deux avis d'un même marché
+    // portent la même référence sur le même hôte.
+    let mut cache: HashMap<(&str, &str), Vec<String>> = HashMap::new();
+    let mut paires: Vec<(String, String)> = Vec::new();
+    let (mut trouvees, mut vides, mut echecs, mut sans_adaptateur) =
+        (0usize, 0usize, 0usize, 0usize);
+    let mut par_moteur: BTreeMap<&str, usize> = BTreeMap::new();
+    for (ligne, reference, hote, moteur) in &travail {
+        let cle = (*reference, hote.as_str());
+        let trouvailles = match cache.get(&cle) {
+            Some(deja) => deja.clone(),
+            None => {
+                let rows = match moteur.as_str() {
+                    "atline" => Some(annonces::atline::chercher(reference).await),
+                    "atexo" => Some(annonces::atexo::chercher(hote, reference).await),
+                    _ => None,
+                };
+                let uids = match rows {
+                    Some(Ok(rows)) if !rows.is_empty() => {
+                        trouvees += 1;
+                        *par_moteur.entry(moteur_statique(moteur)).or_default() += 1;
+                        // Le moteur rend la page de résultat entière, pas la seule
+                        // consultation cherchée. Celles qui portent la référence
+                        // demandée départagent la page ; quand aucune ne la porte
+                        // — Atline sert sa clé maison quand l'acheteur n'a pas
+                        // saisi la sienne —, la page entière fait foi, et il faut
+                        // alors qu'elle n'ait qu'une ligne.
+                        let cherchee = reference_nue(reference);
+                        let uid = |r: &AnnonceBrute| r.source_uid.clone();
+                        let exactes: Vec<String> = rows
+                            .iter()
+                            .filter(|r| {
+                                r.reference
+                                    .as_deref()
+                                    .is_some_and(|r| reference_nue(r) == cherchee)
+                            })
+                            .map(uid)
+                            .collect();
+                        let uids = if exactes.is_empty() {
+                            rows.iter().map(uid).collect()
+                        } else {
+                            exactes
+                        };
+                        brutes.extend(rows);
+                        uids
+                    }
+                    Some(Ok(_)) => {
+                        vides += 1;
+                        Vec::new()
+                    }
+                    Some(Err(e)) => {
+                        echecs += 1;
+                        tracing::warn!(reference, hote, moteur, error = %e, "annonces_resoudre : recherche en échec");
+                        Vec::new()
+                    }
+                    None => {
+                        sans_adaptateur += 1;
+                        Vec::new()
+                    }
+                };
+                cache.insert(cle, uids.clone());
+                if moteur.as_str() == "atline" || moteur.as_str() == "atexo" {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                uids
+            }
+        };
+        // Une référence qui ne rend qu'une consultation sur l'hôte que l'avis
+        // lui-même déclare désigne cette consultation : c'est la jumelle, et
+        // cette preuve-là est plus étroite que l'index de références global du
+        // jumelage — elle porte l'hôte en plus de la clé.
+        if let [source_uid] = trouvailles.as_slice() {
+            paires.push((ligne.uid.clone(), source_uid.clone()));
+        }
+    }
+
+    // Deux références peuvent rendre la même consultation, et une page de
+    // résultat Atline en rend dix : le lot d'upsert ne supporte pas deux fois
+    // la même clé.
+    let brutes = annonces::dedup_source_uid(brutes);
+    let ecrites = if applique && !brutes.is_empty() {
+        let aujourdhui = Timestamp::now()
+            .to_zoned(jiff::tz::TimeZone::get("Europe/Paris").expect("tzdb embarquée"))
+            .date();
+        let (_, stats, _) = reconcilier_et_ecrire(&repo, brutes, aujourdhui).await?;
+        stats.canaux
+    } else {
+        0
+    };
+
+    // La consultation trouvée est déjà en stock le plus souvent : la recherche
+    // ne l'écrit pas, elle la nomme. La fusion se lit après l'écriture, pour
+    // que les lignes neuves du lot aient leur uid.
+    let cibles: HashMap<String, String> = repo
+        .annonces_par_source(&paires.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>())
+        .await
+        .map_err(|e| anyhow!("cibles des paires: {e}"))?
+        .into_iter()
+        .collect();
+    let fusions: Vec<(String, String)> = paires
+        .iter()
+        .filter_map(|(boamp, source)| {
+            cibles
+                .get(source)
+                .map(|cible| (boamp.clone(), cible.clone()))
+        })
+        .filter(|(boamp, cible)| boamp != cible)
+        .collect();
+    let absorbees = if applique && !fusions.is_empty() {
+        repo.fusionner_annonces(&fusions)
+            .await
+            .map_err(|e| anyhow!("fusions: {e}"))?
+    } else {
+        0
+    };
+
+    tracing::info!(
+        applique,
+        a_faire,
+        tentees = travail.len(),
+        recherches = cache.len(),
+        trouvees,
+        vides,
+        echecs,
+        sans_adaptateur,
+        canaux_ecrits = ecrites,
+        paires = fusions.len(),
+        absorbees,
+        moteurs = %par_moteur.iter().map(|(m, n)| format!("{m}={n}")).collect::<Vec<_>>().join(","),
+        elapsed_s = debut.elapsed().as_secs(),
+        "annonces_resoudre"
+    );
+    Ok(())
+}
+
+/// Une référence de marché réduite à ses alphanumériques, en minuscules. Les
+/// deux côtés la ponctuent à leur guise — `26/AO/014` ici, `26-AO-014` là.
+fn reference_nue(reference: &str) -> String {
+    reference
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Le nom du moteur en `'static`, pour la clé de comptage.
+fn moteur_statique(moteur: &str) -> &'static str {
+    match moteur {
+        "atline" => "atline",
+        "atexo" => "atexo",
+        _ => "autre",
+    }
+}
+
 /// Fusion par jumelles des lignes ouvertes que seul le BOAMP publie.
 ///
 /// Quand l'avis BOAMP déclare une plateforme de dépôt sans identifiant de
@@ -761,11 +1207,53 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
         lignes.dedup_by(|a, b| a.uid == b.uid);
     }
 
+    // L'index des références est global : la référence désigne le marché, pas
+    // l'hôte. Une ligne à deux canaux n'y entre qu'une fois.
+    let mut par_reference: HashMap<String, Vec<&AnnonceChamps>> = HashMap::new();
+    for c in &canaux {
+        if let Some(r) = c.annonce.reference.as_deref().map(plie) {
+            if !r.is_empty() && r != plie(&c.annonce.acteur_libelle) {
+                par_reference.entry(r).or_default().push(&c.annonce);
+            }
+        }
+    }
+    for lignes in par_reference.values_mut() {
+        lignes.sort_by(|a, b| a.uid.cmp(&b.uid));
+        lignes.dedup_by(|a, b| a.uid == b.uid);
+    }
+    // L'index des titres est global lui aussi : la jumelle vit parfois sur un
+    // autre canal que celui que l'avis déclare. La date d'échéance fait le
+    // second facteur de la clé.
+    let mut par_titre: HashMap<String, Vec<&AnnonceChamps>> = HashMap::new();
+    for c in &canaux {
+        let t = plie(&c.annonce.titre);
+        if !t.is_empty() {
+            par_titre.entry(t).or_default().push(&c.annonce);
+        }
+    }
+    for lignes in par_titre.values_mut() {
+        lignes.sort_by(|a, b| a.uid.cmp(&b.uid));
+        lignes.dedup_by(|a, b| a.uid == b.uid);
+    }
+    let canal_de_cible: HashMap<&str, String> = canaux
+        .iter()
+        .map(|c| (c.annonce.uid.as_str(), canal_de_source(&c.source_uid)))
+        .collect();
+
     let candidates = repo
         .annonces_a_jumeler(ANNONCE_FOND_MARCHE)
         .await
         .map_err(|e| anyhow!("candidates au jumelage: {e}"))?;
     let total = candidates.len();
+    // Combien de candidates portent chaque référence : à deux, elle ne
+    // départage plus rien.
+    let portees: HashMap<String, usize> = candidates
+        .iter()
+        .filter_map(|l| l.reference.as_deref().map(plie))
+        .fold(HashMap::new(), |mut m, r| {
+            *m.entry(r).or_default() += 1;
+            m
+        });
     let mut compte = CompteJumelage::default();
     let mut paires: Vec<(&lj_store::repository::AnnonceAJumeler, &str, String)> = Vec::new();
     for ligne in &candidates {
@@ -784,9 +1272,29 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
             compte.avec_cle += 1;
             continue;
         }
-        let Some(canal) =
-            hote_de(&ligne.depot).and_then(|h| moteurs.get(&h).map(|m| canal_de_depot(m, &h)))
-        else {
+        // La référence d'abord : c'est la clé la plus forte, et la seule qui
+        // n'a besoin ni du libellé d'acheteur ni de l'hôte déclaré.
+        let declare = hote_et_moteur(&ligne.depot, &moteurs)
+            .map(|(h, m)| canal_du_stock(canal_de_depot(&m, &h), &vivier));
+        if let Jumelage::Une(uid) = jumelle_par_reference(
+            ligne,
+            &par_reference,
+            &portees,
+            &canal_de_cible,
+            declare.as_deref(),
+        ) {
+            let canal = canal_de_cible.get(uid).cloned().unwrap_or_default();
+            paires.push((ligne, uid, canal));
+            continue;
+        }
+        // Le titre avant le dépôt : il voit tout le stock, quand le vivier du
+        // dépôt est borné au canal déclaré et exige un acheteur concordant.
+        if let Jumelage::Une(uid) = jumelle_par_titre_echeance(ligne, &par_titre) {
+            let canal = canal_de_cible.get(uid).cloned().unwrap_or_default();
+            paires.push((ligne, uid, canal));
+            continue;
+        }
+        let Some(canal) = declare else {
             compte.hote_inconnu += 1;
             continue;
         };
@@ -1211,6 +1719,7 @@ pub async fn annonces_enrichir(limite: i64, budget_min: u64, sans_acheteur: bool
             .push(ligne);
     }
 
+    let egress: &str = &settings.egress_url;
     let lus =
         futures::future::join_all(par_moteur.into_iter().map(|(moteur, lignes)| async move {
             let debut_moteur = std::time::Instant::now();
@@ -1224,7 +1733,7 @@ pub async fn annonces_enrichir(limite: i64, budget_min: u64, sans_acheteur: bool
                 if i > 0 {
                     tokio::time::sleep(POLITESSE).await;
                 }
-                match annonces::detail(&moteur, &ligne.url_avis).await {
+                match annonces::detail(&moteur, &ligne.url_avis, egress).await {
                     Ok(d) => poses.push(DetailPose {
                         annonce_uid: ligne.uid.clone(),
                         cpv_uid: d.cpv.as_deref().and_then(cpv_division_uid),
@@ -1274,10 +1783,11 @@ pub async fn annonces_enrichir(limite: i64, budget_min: u64, sans_acheteur: bool
     Ok(())
 }
 
-/// Recensement des profils d'acheteurs : les hôtes cités par les avis BOAMP
-/// actifs, classés par moteur. Alimente `profil_acheteur`, dont dépendent les
-/// moteurs multi-tenants (Atexo, Safetender). Hebdomadaire : le parc de
-/// profils bouge en mois, pas en jours.
+/// Recensement des profils d'acheteurs : les hôtes cités par les avis actifs du
+/// BOAMP et de TED, plus ceux que les acheteurs déclarent sur data.gouv, classés
+/// par moteur. Alimente `profil_acheteur`, dont dépendent les moteurs
+/// multi-tenants (Atexo, Safetender). Hebdomadaire : le parc de profils bouge en
+/// mois, pas en jours.
 pub async fn annonces_discover() -> Result<()> {
     let debut = std::time::Instant::now();
     let settings = Settings::from_env()?;
@@ -1289,7 +1799,7 @@ pub async fn annonces_discover() -> Result<()> {
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
 
-    let recensement = annonces::discover::recenser_depuis_boamp()
+    let recensement = annonces::discover::recenser_profils()
         .await
         .map_err(|e| anyhow!("recensement: {e}"))?;
     let items: Vec<(String, Option<String>, i32)> = recensement
@@ -1301,13 +1811,31 @@ pub async fn annonces_discover() -> Result<()> {
         .upsert_profils_acheteurs(&items)
         .await
         .map_err(|e| anyhow!("upsert profils: {e}"))?;
-    // La couverture du fond, mesurée par avis : sa dérive est le signal qu'un
-    // moteur a changé d'interface ou qu'un nouvel éditeur prend des parts.
-    let couverture = if recensement.avis > 0 {
-        100.0 * recensement.avis_couverts as f64 / recensement.avis as f64
-    } else {
-        0.0
+    // La couverture du fond, mesurée par avis et par témoin : sa dérive est le
+    // signal qu'un moteur a changé d'interface ou qu'un nouvel éditeur prend des
+    // parts ; l'écart entre témoins dit lequel voit un gisement que l'autre
+    // ignore.
+    let avis: usize = recensement.temoins.iter().map(|t| t.avis).sum();
+    let avis_couverts: usize = recensement.temoins.iter().map(|t| t.couverts).sum();
+    let pct = |couverts: usize, avis: usize| {
+        format!(
+            "{:.1}",
+            if avis > 0 {
+                100.0 * couverts as f64 / avis as f64
+            } else {
+                0.0
+            }
+        )
     };
+    for t in &recensement.temoins {
+        tracing::info!(
+            canal = t.canal,
+            avis = t.avis,
+            couverts = t.couverts,
+            couverture_pct = pct(t.couverts, t.avis),
+            "annonces_discover_temoin"
+        );
+    }
     tracing::info!(
         hotes = recensement.profils.len(),
         ecrits,
@@ -1316,9 +1844,10 @@ pub async fn annonces_discover() -> Result<()> {
             .iter()
             .filter(|p| p.moteur.is_some())
             .count(),
-        avis = recensement.avis,
-        avis_couverts = recensement.avis_couverts,
-        couverture_pct = format!("{couverture:.1}"),
+        avis,
+        avis_couverts,
+        couverture_pct = pct(avis_couverts, avis),
+        declares_seuls = recensement.declares_seuls,
         elapsed_s = debut.elapsed().as_secs(),
         "annonces_discover"
     );
@@ -1330,15 +1859,87 @@ mod tests {
     use super::*;
     use lj_store::repository::{AnnonceAJumeler, AnnonceOrpheline};
 
+    /// La nuit du 27/08 sur Safetender, réduite : trois portails vivants, un
+    /// hôte déjà muet depuis des semaines, un qui tombe pour la première fois.
+    #[test]
+    fn l_hote_deja_muet_sort_du_compte_des_echecs_celui_qui_tombe_y_entre() {
+        let verdict = |host: &str, joignable| HoteVerdict {
+            host: host.into(),
+            joignable,
+        };
+        let hotes = [
+            verdict("marchespublics-aude.safetender.com", true),
+            verdict("achat-sante.safetender.com", true),
+            verdict("asf-consultations.safetender.com", true),
+            verdict("marchespublicscalvados.safetender.com", false),
+            verdict("ght06.safetender.com", false),
+        ];
+        let muets = HashSet::from(["marchespublicscalvados.safetender.com".to_string()]);
+        assert_eq!(echecs_et_muets(&hotes, &muets), (1, 1));
+
+        // Le jour où le mort répond, il rentre au compte sans rien y ajouter.
+        let ressuscite = [verdict("marchespublicscalvados.safetender.com", true)];
+        assert_eq!(echecs_et_muets(&ressuscite, &muets), (0, 0));
+    }
+
+    /// Safetender on 26 and 27/08/2026, at the figures from the journal: a normal
+    /// night collects everything it announces, the vendor outage leaves three
+    /// portals standing which serve theirs cleanly.
+    #[test]
+    fn la_flotte_qui_tombe_degrade_meme_quand_les_survivants_servent_tout() {
+        let brute = AnnonceBrute {
+            moteur: "safetender",
+            source_uid: "safetender:h:1".into(),
+            cles_jointure: Vec::new(),
+            reference: None,
+            acheteur: None,
+            siren: None,
+            objet: "objet".into(),
+            nature: None,
+            cpv: None,
+            departement: None,
+            date_publication: None,
+            echeance: None,
+            url_avis: None,
+            url_rc: None,
+            url_dce: None,
+            url_depot: None,
+            procedure: None,
+        };
+        let run = |collecte: usize, annonce: u64| MoteurRun {
+            annonce: Some(annonce),
+            echecs: 0,
+            hotes: Vec::new(),
+            rows: vec![brute.clone(); collecte],
+        };
+
+        let normale = run(389, 389);
+        assert!(!degrade(&normale, 0, 37), "une nuit normale est saine");
+        assert!(
+            !degrade(&normale, 12, 49),
+            "le socle du recensement pas encore muet ne dégrade pas"
+        );
+        assert!(
+            degrade(&run(51, 51), 34, 37),
+            "la flotte à terre dégrade, collecté et annoncé fussent-ils égaux"
+        );
+        assert!(
+            !degrade(&run(389, 389), 0, 0),
+            "un moteur à point d'entrée unique n'a pas de flotte à juger"
+        );
+    }
+
     fn a_jumeler(titre: &str, acteur: &str, echeance: Option<&str>) -> AnnonceAJumeler {
         AnnonceAJumeler {
             uid: "marche:b".into(),
             titre: titre.into(),
             acteur_libelle: acteur.into(),
             echeance: echeance.map(|e| e.parse().expect("timestamp valide")),
+            departement: None,
             depot: "https://www.marches-securises.fr".into(),
             urls: Vec::new(),
             acheteur_uid: None,
+            reference: None,
         }
     }
 
@@ -1371,8 +1972,202 @@ mod tests {
             titre: titre.into(),
             acteur_libelle: acteur.into(),
             echeance: echeance.map(|e| e.parse().expect("timestamp valide")),
+            departement: None,
             acheteur_uid: None,
+            reference: None,
         }
+    }
+
+    /// La référence de marché est la clé quand l'acheteur ne peut pas servir :
+    /// sur une instance multi-locataire la plateforme nomme le groupe.
+    #[test]
+    fn la_reference_unique_apparie_malgre_deux_acheteurs_sans_rapport() {
+        fn index<'a>(cibles: &[&'a AnnonceChamps]) -> HashMap<String, Vec<&'a AnnonceChamps>> {
+            let mut m: HashMap<String, Vec<&'a AnnonceChamps>> = HashMap::new();
+            for c in cibles {
+                m.entry(plie(c.reference.as_deref().unwrap_or_default()))
+                    .or_default()
+                    .push(c);
+            }
+            m
+        }
+        let une = |n| HashMap::from([("2026-mapa14".to_string(), n)]);
+        let ligne = AnnonceAJumeler {
+            reference: Some("2026-MAPA14".into()),
+            ..a_jumeler(
+                "Fourniture d'équipements",
+                "OFFICE FRANCAIS DE LA BIODIVERSITE",
+                None,
+            )
+        };
+        let plateforme = AnnonceChamps {
+            reference: Some("2026-mapa14".into()),
+            ..cible(
+                "marche:p",
+                "Le présent marché a pour objet",
+                "Ministère de la Transition Écologique",
+                None,
+            )
+        };
+        let pair = |l: &AnnonceAJumeler, c: &[&AnnonceChamps], p| matches!(jumelle_par_reference(l, &index(c), &p, &HashMap::new(), None), Jumelage::Une(u) if u == "marche:p");
+        assert!(pair(&ligne, &[&plateforme], une(1)));
+
+        // Deux candidates portent la référence : elle ne départage plus rien.
+        assert!(!pair(&ligne, &[&plateforme], une(2)));
+
+        // Deux lignes plateforme la portent : ambiguë, aucune paire.
+        let autre = AnnonceChamps {
+            uid: "marche:q".into(),
+            ..AnnonceChamps {
+                reference: Some("2026-MAPA14".into()),
+                ..cible("marche:q", "Autre", "Autre acheteur", None)
+            }
+        };
+        assert!(matches!(
+            jumelle_par_reference(
+                &ligne,
+                &index(&[&plateforme, &autre]),
+                &une(1),
+                &HashMap::new(),
+                None
+            ),
+            Jumelage::Ambigue
+        ));
+
+        // Deux entités acheteur résolues et différentes refusent la paire.
+        let ligne_e = AnnonceAJumeler {
+            acheteur_uid: Some("siren:1".into()),
+            ..ligne
+        };
+        let plateforme_e = AnnonceChamps {
+            acheteur_uid: Some("siren:2".into()),
+            ..plateforme
+        };
+        assert!(!pair(&ligne_e, &[&plateforme_e], une(1)));
+
+        // Une « référence » égale au nom de l'acheteur est un champ mal extrait.
+        let mal = AnnonceAJumeler {
+            reference: Some("OFFICE FRANCAIS DE LA BIODIVERSITE".into()),
+            ..a_jumeler("T", "OFFICE FRANCAIS DE LA BIODIVERSITE", None)
+        };
+        assert!(matches!(
+            jumelle_par_reference(
+                &mal,
+                &index(&[&plateforme_e]),
+                &une(1),
+                &HashMap::new(),
+                None
+            ),
+            Jumelage::Aucune
+        ));
+    }
+
+    /// Le titre et la date d'échéance font clé sans acheteur ni canal : c'est
+    /// la voie des avis dont l'hôte déclaré n'a pas de moteur connecté, ou dont
+    /// la plateforme nomme le groupe tenant. L'heure ne compte pas, le jour si ;
+    /// département et entité récusent quand les deux côtés les portent.
+    #[test]
+    fn le_titre_et_la_date_d_echeance_apparient_sans_acheteur_ni_canal() {
+        fn index<'a>(cibles: &[&'a AnnonceChamps]) -> HashMap<String, Vec<&'a AnnonceChamps>> {
+            let mut m: HashMap<String, Vec<&'a AnnonceChamps>> = HashMap::new();
+            for c in cibles {
+                m.entry(plie(&c.titre)).or_default().push(c);
+            }
+            m
+        }
+        let ligne = a_jumeler(
+            "Fourniture de pièces détachées",
+            "SDIS du Gard",
+            Some("2026-09-08T14:00:00Z"),
+        );
+        // Heures divergentes, même jour de Paris : la paire tient.
+        let plateforme = cible(
+            "marche:p",
+            "FOURNITURE DE PIECES DETACHEES",
+            "SDIS",
+            Some("2026-09-08T10:00:00Z"),
+        );
+        assert!(matches!(
+            jumelle_par_titre_echeance(&ligne, &index(&[&plateforme])),
+            Jumelage::Une("marche:p")
+        ));
+
+        // Un jour d'écart refuse ; une échéance absente d'un côté aussi.
+        let veille = cible("marche:v", &ligne.titre, "", Some("2026-09-07T14:00:00Z"));
+        assert!(matches!(
+            jumelle_par_titre_echeance(&ligne, &index(&[&veille])),
+            Jumelage::Aucune
+        ));
+        let sans = cible("marche:s", &ligne.titre, "", None);
+        assert!(matches!(
+            jumelle_par_titre_echeance(&ligne, &index(&[&sans])),
+            Jumelage::Aucune
+        ));
+
+        // Deux prétendantes au même jour : le département départage, et deux
+        // départements résolus et différents récusent.
+        let gard = AnnonceChamps {
+            departement: Some("30".into()),
+            ..cible("marche:g", &ligne.titre, "", Some("2026-09-08T10:00:00Z"))
+        };
+        let aude = AnnonceChamps {
+            departement: Some("11".into()),
+            ..cible("marche:a", &ligne.titre, "", Some("2026-09-08T10:00:00Z"))
+        };
+        let ligne_gard = AnnonceAJumeler {
+            departement: Some("30".into()),
+            ..a_jumeler(&ligne.titre, "", Some("2026-09-08T14:00:00Z"))
+        };
+        assert!(matches!(
+            jumelle_par_titre_echeance(&ligne_gard, &index(&[&gard, &aude])),
+            Jumelage::Une("marche:g")
+        ));
+        assert!(matches!(
+            jumelle_par_titre_echeance(&ligne_gard, &index(&[&aude])),
+            Jumelage::Aucune
+        ));
+        assert!(matches!(
+            jumelle_par_titre_echeance(&ligne, &index(&[&gard, &aude])),
+            Jumelage::Ambigue
+        ));
+    }
+
+    /// L'avis déclare l'hôte de façade, le stock vit sous l'hôte de service :
+    /// le canal se résout vers l'unique sous-domaine peuplé, et deux
+    /// sous-domaines ne se départagent pas.
+    #[test]
+    fn le_canal_declare_se_resout_vers_l_hote_de_service_du_stock() {
+        let vivier: HashMap<String, ()> = [
+            ("atexo:plateforme.alsacemarchespublics.eu".to_string(), ()),
+            ("atexo:marches.megalis.bretagne.bzh".to_string(), ()),
+            ("safetender:marches.megalis.bretagne.bzh".to_string(), ()),
+            ("atexo:marchespublics.eure.fr".to_string(), ()),
+        ]
+        .into();
+        let r = |c: &str| canal_du_stock(c.to_string(), &vivier);
+        assert_eq!(
+            r("atexo:alsacemarchespublics.eu"),
+            "atexo:plateforme.alsacemarchespublics.eu"
+        );
+        assert_eq!(
+            r("atexo:megalis.bretagne.bzh"),
+            "atexo:marches.megalis.bretagne.bzh",
+            "le moteur borne la résolution, safetender ne compte pas"
+        );
+        assert_eq!(
+            r("atexo:marchespublics.eure.fr"),
+            "atexo:marchespublics.eure.fr"
+        );
+        assert_eq!(r("atexo:inconnu.fr"), "atexo:inconnu.fr");
+        let deux: HashMap<String, ()> = [
+            ("atexo:a.exemple.fr".to_string(), ()),
+            ("atexo:b.exemple.fr".to_string(), ()),
+        ]
+        .into();
+        assert_eq!(
+            canal_du_stock("atexo:exemple.fr".into(), &deux),
+            "atexo:exemple.fr"
+        );
     }
 
     /// La même cible, rattachée à une entité acheteur.

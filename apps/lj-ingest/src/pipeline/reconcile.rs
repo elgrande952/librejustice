@@ -9,17 +9,40 @@
 //! hebdo du registre CNB dont il dépend. Tout nouveau filet de dérive DOIT
 //! s'enregistrer ici.
 
+use std::future::Future;
+use std::time::Instant;
+
 use anyhow::{anyhow, Result};
 use lj_store::repository::DecisionRepository;
 
 use crate::config::Settings;
 
+/// Encadre un filet de son nom et de sa durée. Chaque passe ne logue que son
+/// compte final, et plusieurs tiennent des minutes sur une seule requête : sans
+/// ces bornes, leur silence ne se distingue pas d'un blocage.
+async fn filet<T, E>(nom: &'static str, f: impl Future<Output = Result<T, E>>) -> Result<T, E> {
+    tracing::info!(filet = nom, "filet de dérive : début");
+    let started = Instant::now();
+    let out = f.await;
+    tracing::info!(
+        filet = nom,
+        elapsed_s = started.elapsed().as_secs(),
+        ok = out.is_ok(),
+        "filet de dérive : fin"
+    );
+    out
+}
+
 /// Commande `reconcile` : rejoue tous les filets de dérive. Idempotent.
 pub async fn reconcile_all() -> Result<()> {
     // Rôles des textes + dénorm articles (pleine table, dérive attendue ~0).
-    super::backfill_text_roles().await?;
+    filet("rôles de textes", super::backfill_text_roles()).await?;
     // Arrays légaux dénormalisés (garde IS DISTINCT FROM, warn si dérive > 0).
-    crate::citations_maintenance::resync_arrays().await?;
+    filet(
+        "arrays légaux",
+        crate::citations_maintenance::resync_arrays(),
+    )
+    .await?;
 
     // Liens/citations pendants : rejoue les résolveurs pleine-table. En régime
     // ils sont résolus à l'écriture (côté source dans la transaction du lot,
@@ -32,11 +55,23 @@ pub async fn reconcile_all() -> Result<()> {
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
     let repo = DecisionRepository::new(&conn);
-    let resolved = repo.resolve_pending_decision_links().await?;
+    let resolved = filet(
+        "chronologie pendante",
+        repo.resolve_pending_decision_links(),
+    )
+    .await?;
     tracing::info!(resolved, "liens de chronologie pendants résolus");
-    let resolved = repo.resolve_pending_case_citations().await?;
+    let resolved = filet(
+        "citations jurisprudence",
+        repo.resolve_pending_case_citations(),
+    )
+    .await?;
     tracing::info!(resolved, "citations de jurisprudence pendantes résolues");
-    let resolved = repo.resolve_pending_text_case_citations().await?;
+    let resolved = filet(
+        "citations texte→jurisprudence",
+        repo.resolve_pending_text_case_citations(),
+    )
+    .await?;
     tracing::info!(resolved, "citations texte→jurisprudence pendantes résolues");
 
     // Liens conseils devenus ambigus à date : le delta du reload CNB ne voit que le
@@ -44,8 +79,12 @@ pub async fn reconcile_all() -> Result<()> {
     // Dé-liage puis re-résolution des SEULES clés libérées — nul en régime,
     // proportionnel à la dérive sinon. Une clé restée ambiguë demeure pendante ; une
     // clé dont le dé-liage révèle le bon porteur se relie ici.
-    let freed = repo.cnb_unlink_ambiguous().await?;
-    let relinked = repo.resolve_pending_counsel_by_keys(&freed).await?;
+    let freed = filet("conseils ambigus", repo.cnb_unlink_ambiguous()).await?;
+    let relinked = filet(
+        "conseils re-résolus",
+        repo.resolve_pending_counsel_by_keys(&freed),
+    )
+    .await?;
     tracing::info!(
         keys = freed.len(),
         relinked,
@@ -56,7 +95,11 @@ pub async fn reconcile_all() -> Result<()> {
     // vérité, rejoué ici pour que le retrait d'une entrée et la correction d'une ancre
     // morte se propagent sans intervention. L'ancre étant le slug, la dérive attendue
     // est nulle ; `dangling > 0` = dataset à corriger.
-    let report = super::reconcile_article_commentaires().await?;
+    let report = filet(
+        "commentaires de norme",
+        super::reconcile_article_commentaires(),
+    )
+    .await?;
     tracing::info!(
         entries = report.entries,
         upserted = report.upserted,
@@ -64,5 +107,24 @@ pub async fn reconcile_all() -> Result<()> {
         dangling = report.dangling,
         "commentaires de norme curés réconciliés"
     );
+
+    // Versions d'article mal situées : sentinelle doublonnée, version qu'aucune
+    // suivante ne ferme. L'upsert situe la version entre ses voisines à
+    // l'écriture, donc cette passe est un no-op en régime — et ce qu'elle répare,
+    // elle le signale en échec plutôt qu'en compteur, parce que le temps qu'elle
+    // couvre, la lecture a servi une version sur deux sans le dire.
+    let (purgees, fermees) = filet(
+        "versions d'article mal situées",
+        repo.situer_versions_articles(),
+    )
+    .await?;
+    if purgees + fermees > 0 {
+        return Err(anyhow!(
+            "versions d'article mal situées et réparées ici : {purgees} sentinelles \
+             doublonnées, {fermees} versions qu'aucune suivante ne fermait — \
+             l'écriture aurait dû s'en charger, un écrivain a fui"
+        ));
+    }
+    tracing::info!("versions d'article : rien à situer");
     Ok(())
 }

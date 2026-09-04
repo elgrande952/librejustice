@@ -12,19 +12,25 @@
 //! Clients publics uniquement : pas de `client_secret`, la sécurité repose sur
 //! PKCE.
 
-use crate::auth::RequiredUser;
+use crate::auth::OptionalUser;
 use crate::error::{validation, ApiError, Result};
 use crate::state::AppState;
 use axum::extract::{Form, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
+
+/// Unique scope de la surface MCP : annoncé par la discovery, et rendu par le
+/// endpoint jeton (RFC 6749 §5.1).
+const SCOPE_MCP: &str = "mcp";
 
 /// RFC 7591 §2 — métadonnées client envoyées par Claude.ai / ChatGPT.
 #[derive(Debug, Deserialize)]
@@ -70,11 +76,18 @@ fn default_s256() -> String {
     "S256".to_string()
 }
 
+/// Formulaire de consentement posté par `/authorize-mcp` (HTML pur, sans JS).
+/// Champs requis en `Option` pour le 422 de validation, comme [`TokenForm`].
 #[derive(Debug, Deserialize)]
-pub struct ApproveRequest {
-    pub client_id: String,
-    pub code_challenge: String,
-    pub redirect_uri: String,
+pub struct ApproveForm {
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub code_challenge: Option<String>,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
 }
@@ -106,6 +119,7 @@ pub struct TokenResponse {
     pub token_type: String,
     pub expires_in: i64,
     pub refresh_token: String,
+    pub scope: String,
 }
 
 /// RFC 7009 §2.1 — corps de `POST /oauth/revoke`. Seul `token` est lu ;
@@ -130,11 +144,17 @@ pub fn router() -> Router<AppState> {
         .layer(axum::middleware::from_fn(step_span))
 }
 
-/// Pose un span par étape OAuth franchie, sur le modèle de `pageview_span`.
+/// Pose un span **et une ligne de log** par étape OAuth franchie.
 ///
 /// Ni `client_id` ni jeton : l'étape se compte, elle ne se relie à personne.
-/// Ce que ça donne, et rien de plus : à quelle étape ça casse, avec quel
-/// statut, et combien de fois.
+/// L'agent nomme le moteur, pas la personne, et c'est lui qui tranche la classe
+/// de panne où l'installation casse chez un visiteur et passe chez le suivant —
+/// le 15/08/2026, une CSP `form-action` coupait Chrome et laissait passer
+/// WebKit, invisible faute de cette colonne.
+///
+/// La ligne double le span parce que les deux ne se lisent pas au même endroit :
+/// le span part dans Tempo, où l'on fouille après coup, la ligne dans Loki, où
+/// les règles d'alerte savent compter.
 async fn step_span(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -146,13 +166,24 @@ async fn step_span(
         .next()
         .unwrap_or_default()
         .to_owned();
+    let agent: String = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect();
     let response = next.run(req).await;
+    let status = response.status().as_u16();
     let _span = tracing::info_span!(
         "oauth_step",
         librejustice.oauth.step = %step,
-        librejustice.oauth.status = response.status().as_u16(),
+        librejustice.oauth.status = status,
+        librejustice.oauth.agent = %agent,
     )
     .entered();
+    tracing::info!(agent = %agent, "étape oauth : {step} → {status}");
     response
 }
 
@@ -339,21 +370,79 @@ async fn authorize(
     Ok(Redirect::to(&format!("{web_base}/authorize-mcp?{qs}")).into_response())
 }
 
-/// Génère un code d'autorisation éphémère (60 s) après approbation utilisateur.
+/// Consentement : formulaire HTML → 303 vers le client MCP, code émis (5 min)
+/// ou refus. Le même défi rend le même code tant qu'il vit : un navigateur
+/// mobile rejoue la soumission quand le retour n'aboutit pas, 33 fois en 32 s
+/// le 28/08/2026.
+///
+/// `deny` n'exige pas de session — refuser n'émet rien, et le retour est validé
+/// contre le client enregistré. `approve` sans session (expirée entre le rendu
+/// de l'écran et le clic) renvoie à la connexion, le consentement complet en
+/// `next`. Un POST cross-site n'emporte pas le cookie (`SameSite=Lax`) : il
+/// retombe sur ce chemin-là, jamais sur une émission de code.
 async fn approve(
     State(state): State<AppState>,
-    RequiredUser(user_id): RequiredUser,
-    Json(body): Json<ApproveRequest>,
-) -> Result<Json<serde_json::Value>> {
-    if !redirect_uri_allowed(&state, &body.client_id, &body.redirect_uri).await? {
+    OptionalUser(user): OptionalUser,
+    Form(body): Form<ApproveForm>,
+) -> Result<Response> {
+    let missing = |f: &'static str| ApiError::Unprocessable(validation::missing(&["body", f]));
+    let client_id = body.client_id.ok_or_else(|| missing("client_id"))?;
+    let code_challenge = body
+        .code_challenge
+        .ok_or_else(|| missing("code_challenge"))?;
+    let redirect_uri = body.redirect_uri.ok_or_else(|| missing("redirect_uri"))?;
+    let action = body.action.ok_or_else(|| missing("action"))?;
+    let etat = body.state.as_deref().filter(|s| !s.is_empty());
+
+    if !redirect_uri_allowed(&state, &client_id, &redirect_uri).await? {
         return Err(ApiError::BadRequest(
             "invalid_client_or_redirect_uri".into(),
         ));
     }
+    match action.as_str() {
+        "deny" => return retour_client(&redirect_uri, ("error", "access_denied"), etat),
+        "approve" => {}
+        _ => return Err(ApiError::BadRequest("invalid_action".into())),
+    }
+
+    let Some(user_id) = user else {
+        let mut qs = form_urlencode(&[
+            ("client_id", &client_id),
+            ("redirect_uri", &redirect_uri),
+            ("code_challenge", &code_challenge),
+        ]);
+        if let Some(st) = etat {
+            qs.push('&');
+            qs.push_str(&form_urlencode(&[("state", st)]));
+        }
+        let next = quote_plus(&format!("/authorize-mcp?{qs}"));
+        return Ok(Redirect::to(&format!("/login?next={next}")).into_response());
+    };
+
+    let conn = pool_conn(&state).await?;
+    let rejeu = conn
+        .query_opt(
+            "SELECT code, created_at FROM mcp_auth_codes \
+              WHERE user_id = $1 AND client_id = $2 AND code_challenge = $3 \
+                AND redirect_uri = $4 AND expires_at > now() \
+              ORDER BY created_at DESC LIMIT 1",
+            &[&user_id, &client_id, &code_challenge, &redirect_uri],
+        )
+        .await
+        .map_err(store_err)?;
+    if let Some(ligne) = rejeu {
+        let code: String = ligne.get(0);
+        let emis: chrono::DateTime<Utc> = ligne.get(1);
+        tracing::warn!(
+            librejustice.oauth.rejeu = true,
+            age_ms = (Utc::now() - emis).num_milliseconds(),
+            "consentement rejoué : même défi, le code déjà émis repart"
+        );
+        return retour_client(&redirect_uri, ("code", &code), etat);
+    }
 
     let code = token_urlsafe(32);
-    let expires_at = Utc::now() + Duration::seconds(60);
-    let conn = pool_conn(&state).await?;
+    let expires_at = Utc::now() + Duration::minutes(5);
     conn.execute(
         "INSERT INTO mcp_auth_codes \
            (code, user_id, client_id, code_challenge, code_challenge_method, redirect_uri, expires_at) \
@@ -361,18 +450,32 @@ async fn approve(
         &[
             &code,
             &user_id,
-            &body.client_id,
-            &body.code_challenge,
-            &body.redirect_uri,
+            &client_id,
+            &code_challenge,
+            &redirect_uri,
             &expires_at,
         ],
     )
     .await
     .map_err(store_err)?;
 
-    Ok(Json(
-        json!({"code": code, "redirect_uri": body.redirect_uri}),
-    ))
+    retour_client(&redirect_uri, ("code", &code), etat)
+}
+
+/// 303 vers le `redirect_uri` (déjà validé) du client, paramètre et `state`
+/// ajoutés à la query existante.
+fn retour_client(
+    redirect_uri: &str,
+    (cle, valeur): (&str, &str),
+    etat: Option<&str>,
+) -> Result<Response> {
+    let mut url = url::Url::parse(redirect_uri)
+        .map_err(|_| ApiError::BadRequest("invalid_client_or_redirect_uri".into()))?;
+    url.query_pairs_mut().append_pair(cle, valeur);
+    if let Some(st) = etat {
+        url.query_pairs_mut().append_pair("state", st);
+    }
+    Ok(Redirect::to(url.as_str()).into_response())
 }
 
 /// Point d'entrée `POST /oauth/token` : dispatch sur `grant_type`.
@@ -380,7 +483,17 @@ async fn approve(
 /// RFC 6749 §4.1.3 / §6 — corps en `application/x-www-form-urlencoded`.
 /// Claude.ai et ChatGPT envoient strictement ce format. Deux grants supportés :
 /// `authorization_code` (échange du code + PKCE) et `refresh_token` (rotation).
-async fn token(State(state): State<AppState>, Form(body): Form<TokenForm>) -> Result<Response> {
+///
+/// Le `client_id` est aussi lu dans un `Authorization: Basic` (RFC 6749 §2.3.1) :
+/// `golang.org/x/oauth2` sonde le endpoint sous cette forme avant le corps.
+async fn token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(mut body): Form<TokenForm>,
+) -> Result<Response> {
+    if body.client_id.is_none() {
+        body.client_id = client_id_basic(&headers);
+    }
     let missing = |f: &'static str| ApiError::Unprocessable(validation::missing(&["body", f]));
     let grant_type = body
         .grant_type
@@ -391,6 +504,19 @@ async fn token(State(state): State<AppState>, Form(body): Form<TokenForm>) -> Re
         "refresh_token" => token_refresh(&state, body).await,
         _ => Err(ApiError::BadRequest("unsupported_grant_type".into())),
     }
+}
+
+/// `client_id` porté par un en-tête `Authorization: Basic` : partie avant `:`
+/// du couple base64. Nos `client_id` sont url-safe, donc jamais percent-encodés
+/// par le client (RFC 6749 §2.3.1).
+fn client_id_basic(headers: &HeaderMap) -> Option<String> {
+    let (scheme, credentials) = headers.get(AUTHORIZATION)?.to_str().ok()?.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = String::from_utf8(STANDARD.decode(credentials).ok()?).ok()?;
+    let (client_id, _) = decoded.split_once(':')?;
+    (!client_id.is_empty()).then(|| client_id.to_string())
 }
 
 /// Grant `authorization_code` : échange un code (+ PKCE S256) contre une paire
@@ -509,9 +635,10 @@ async fn issue_token_pair(
 
     Ok(TokenResponse {
         access_token,
-        token_type: "bearer".to_string(),
+        token_type: "Bearer".to_string(),
         expires_in: 2_592_000, // 30 jours
         refresh_token,
+        scope: SCOPE_MCP.to_string(),
     })
 }
 
@@ -567,7 +694,7 @@ async fn oauth_as_metadata(State(state): State<AppState>) -> Json<serde_json::Va
         // Annoncé explicitement : le défaut de la RFC 8414 en l'absence du champ est
         // `client_secret_basic`, que nos clients publics ne peuvent pas produire.
         "revocation_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": ["mcp"],
+        "scopes_supported": [SCOPE_MCP],
     }))
 }
 
@@ -578,7 +705,7 @@ async fn oauth_protected_resource_metadata(
     Json(json!({
         "resource": format!("{base}/mcp"),
         "authorization_servers": [base],
-        "scopes_supported": ["mcp"],
+        "scopes_supported": [SCOPE_MCP],
         "bearer_methods_supported": ["header"],
     }))
 }
@@ -613,8 +740,25 @@ fn store_err(e: deadpool_postgres::tokio_postgres::Error) -> ApiError {
     ApiError::Internal(format!("db: {}", lj_store::error::pg_detail(&e)))
 }
 
+/// Nom déclaré par le client à son enregistrement (RFC 7591 §2), pour l'écran
+/// de consentement — la query d'autorisation ne porte que le `client_id`, qui
+/// n'apprend rien à personne. `None` si le client n'en a pas déclaré.
+pub async fn client_name(state: &AppState, client_id: &str) -> Result<Option<String>> {
+    let conn = pool_conn(state).await?;
+    let row = conn
+        .query_opt(
+            "SELECT name FROM mcp_clients WHERE client_id = $1",
+            &[&client_id],
+        )
+        .await
+        .map_err(store_err)?;
+    Ok(row
+        .and_then(|row| row.get::<_, Option<String>>(0))
+        .filter(|nom| !nom.trim().is_empty()))
+}
+
 /// Le `redirect_uri` est-il enregistré pour ce `client_id` ?
-async fn redirect_uri_allowed(
+pub(crate) async fn redirect_uri_allowed(
     state: &AppState,
     client_id: &str,
     redirect_uri: &str,
@@ -657,14 +801,14 @@ fn base64_url_no_pad(data: &[u8]) -> String {
 
 /// Token aléatoire URL-safe : `n` octets de hasard cryptographique encodés en
 /// base64url sans padding.
-fn token_urlsafe(n_bytes: usize) -> String {
+pub(crate) fn token_urlsafe(n_bytes: usize) -> String {
     base64_url_no_pad(&random_bytes(n_bytes))
 }
 
 /// Octets aléatoires d'origine OS via `getrandom` (syscall `getrandom(2)` sous
 /// Linux) — pas de file descriptor, pas de read bloquant sur le thread async.
 /// Panique si la source d'entropie de l'OS échoue.
-fn random_bytes(n: usize) -> Vec<u8> {
+pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     let mut buf = vec![0u8; n];
     getrandom::fill(&mut buf).expect("getrandom OS entropy");
     buf
@@ -765,7 +909,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// Encode `application/x-www-form-urlencoded` : espace → `+` (`quote_plus`).
-fn form_urlencode(pairs: &[(&str, &str)]) -> String {
+pub(crate) fn form_urlencode(pairs: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (i, (k, v)) in pairs.iter().enumerate() {
         if i > 0 {
@@ -780,7 +924,7 @@ fn form_urlencode(pairs: &[(&str, &str)]) -> String {
 
 /// `urllib.parse.quote_plus` : caractères non réservés inchangés, espace → `+`,
 /// reste en `%XX` majuscule.
-fn quote_plus(s: &str) -> String {
+pub(crate) fn quote_plus(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
         match b {
@@ -867,6 +1011,28 @@ mod tests {
         assert_eq!(base64_url_no_pad(b"fo"), "Zm8");
         assert_eq!(base64_url_no_pad(b"f"), "Zg");
         assert_eq!(base64_url_no_pad(&[0xfb, 0xff, 0xfe]), "-__-");
+    }
+
+    #[test]
+    fn client_id_lu_dans_authorization_basic() {
+        let basic = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(AUTHORIZATION, v.parse().unwrap());
+            client_id_basic(&h)
+        };
+        // `golang.org/x/oauth2` : client public, donc secret vide après le `:`.
+        assert_eq!(
+            basic("Basic bGpfYUJjRGVGOg=="),
+            Some("lj_aBcDeF".to_string())
+        );
+        assert_eq!(
+            basic("basic bGpfYUJjRGVGOnNlY3JldA=="),
+            Some("lj_aBcDeF".into())
+        );
+        assert_eq!(basic("Bearer bGpfYUJjRGVGOg=="), None);
+        assert_eq!(basic("Basic Og=="), None);
+        assert_eq!(basic("Basic pas-du-base64!"), None);
+        assert_eq!(client_id_basic(&HeaderMap::new()), None);
     }
 
     #[test]

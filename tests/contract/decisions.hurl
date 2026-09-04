@@ -1,8 +1,8 @@
 # ============================================================================
 # CONTRACT TESTS — route group: decisions
-#   GET /api/decision/{id}
-#   GET /api/decision/{id}/similar
-#   GET /api/decision/{id}/preview
+#   GET /internal/decision/{id}
+#   GET /internal/decision/{id}/similar
+#   GET /internal/decision/{id}/preview
 # All public (auth=none). {{base}} = host root — the ONLY variable this file
 # needs: {{decision_id}} is captured below from a live search, so the suite runs
 # as one command against any environment (placeholders like "does-not-exist-xyz"
@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 # health sanity (anchors {{base}} + Cache shape)
 # ---------------------------------------------------------------------------
-GET {{base}}/api/health
+GET {{base}}/admin/health
 HTTP 200
 [Asserts]
 jsonpath "$.status" == "ok"
@@ -25,7 +25,7 @@ jsonpath "$.version" isString
 # le runner — une variable externe non fournie fait échouer le fichier sur
 # « Undefined variable » au lieu de tester quoi que ce soit.
 # ---------------------------------------------------------------------------
-GET {{base}}/api/search?q=usufruit&limit=1
+GET {{base}}/internal/search?q=usufruit&limit=1
 HTTP 200
 [Captures]
 decision_id: jsonpath "$.hits[0].id"
@@ -34,9 +34,9 @@ jsonpath "$.hits" count == 1
 
 
 # ===========================================================================
-# GET /api/decision/{id} — detail, known-good id
+# GET /internal/decision/{id}: detail, known-good id
 # ===========================================================================
-GET {{base}}/api/decision/{{decision_id}}
+GET {{base}}/internal/decision/{{decision_id}}
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -66,15 +66,15 @@ jsonpath "$.publicationCodes" isCollection
 # We assert the status only (the body shape DIVERGES — see notes). The differ
 # will flag the body; status parity is the contract that must hold.
 # ---------------------------------------------------------------------------
-GET {{base}}/api/decision/does-not-exist-xyz-0000
+GET {{base}}/internal/decision/does-not-exist-xyz-0000
 HTTP 404
 
 
 # ===========================================================================
-# GET /api/decision/{id}/similar — deux volets (principe / espece), default
+# GET /internal/decision/{id}/similar: deux volets (principe / espece), default
 # limit (4) par volet
 # ===========================================================================
-GET {{base}}/api/decision/{{decision_id}}/similar
+GET {{base}}/internal/decision/{{decision_id}}/similar
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -87,7 +87,7 @@ jsonpath "$.espece" count <= 4
 
 
 # similar — explicit limit within bounds
-GET {{base}}/api/decision/{{decision_id}}/similar?limit=12
+GET {{base}}/internal/decision/{{decision_id}}/similar?limit=12
 HTTP 200
 [Asserts]
 jsonpath "$.decisionId" == "{{decision_id}}"
@@ -96,7 +96,7 @@ jsonpath "$.espece" isCollection
 jsonpath "$.principe" count <= 12
 jsonpath "$.espece" count <= 12
 
-GET {{base}}/api/decision/{{decision_id}}/similar?limit=1
+GET {{base}}/internal/decision/{{decision_id}}/similar?limit=1
 HTTP 200
 [Asserts]
 jsonpath "$.principe" count <= 1
@@ -104,30 +104,30 @@ jsonpath "$.espece" count <= 1
 
 
 # similar — limit below bound (0) → 422 (parité FastAPI, cf. routes.rs SimilarQuery)
-GET {{base}}/api/decision/{{decision_id}}/similar?limit=0
+GET {{base}}/internal/decision/{{decision_id}}/similar?limit=0
 HTTP 422
 
 # similar — limit above bound (13) → 422 (parité FastAPI)
-GET {{base}}/api/decision/{{decision_id}}/similar?limit=13
+GET {{base}}/internal/decision/{{decision_id}}/similar?limit=13
 HTTP 422
 
 # similar — non-numeric limit → 4xx (Rust BadRequest 400 / FastAPI 422 — see notes)
-GET {{base}}/api/decision/{{decision_id}}/similar?limit=abc
+GET {{base}}/internal/decision/{{decision_id}}/similar?limit=abc
 HTTP *
 [Asserts]
 status >= 400
 status < 500
 
 # similar — non-existent id → 404 (no source decision)
-GET {{base}}/api/decision/does-not-exist-xyz-0000/similar
+GET {{base}}/internal/decision/does-not-exist-xyz-0000/similar
 HTTP 404
 
 
 # ===========================================================================
-# GET /api/decision/{id}/preview — hover card : identité légère,
+# GET /internal/decision/{id}/preview: hover card : identité légère,
 # jamais le corps (pas de paragraphs/sections).
 # ===========================================================================
-GET {{base}}/api/decision/{{decision_id}}/preview
+GET {{base}}/internal/decision/{{decision_id}}/preview
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -137,7 +137,7 @@ jsonpath "$.publicationCodes" isCollection
 jsonpath "$.paragraphs" not exists
 
 # preview — non-existent id → 404
-GET {{base}}/api/decision/does-not-exist-xyz-0000/preview
+GET {{base}}/internal/decision/does-not-exist-xyz-0000/preview
 HTTP 404
 
 
@@ -145,5 +145,5 @@ HTTP 404
 # AUTHED SECTION (none in this group — all decision routes are public).
 # All endpoints of this group take no JWT. There is therefore NO 401 contract to
 # assert here: an unauthenticated call is the normal, expected case.
-# (Contrast with /api/me/* which are RequiredUser → 401 unauthenticated.)
+# (Contrast with /internal/me/* which are RequiredUser → 401 unauthenticated.)
 # ===========================================================================

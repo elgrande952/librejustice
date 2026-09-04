@@ -18,8 +18,9 @@ pub fn router() -> Router<AppState> {
 
 async fn robots_txt(State(state): State<AppState>) -> Response {
     let sitemap = format!(
-        "{}/sitemap.xml",
-        state.settings.public_base_url.trim_end_matches('/')
+        "{}{}",
+        state.settings.public_base_url.trim_end_matches('/'),
+        lj_core::crawlers::SITEMAP_PATH
     );
     (
         [

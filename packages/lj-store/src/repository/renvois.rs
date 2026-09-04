@@ -1,0 +1,313 @@
+//! Renvois officiels (`decision_renvoi`) : l'analyse d'une décision cite une
+//! autre décision. La résolution exige la date en plus du numéro, les numéros se
+//! recyclant entre époques (66145 rend Cadot, 1889, et une décision de 1988).
+
+use chrono::NaiveDate;
+
+use super::DecisionRepository;
+use crate::error::Result;
+
+/// `renvoi_no` est le rang du renvoi dans le bundle : il regroupe les numéros
+/// co-cités d'une même citation. `nom` est vide quand la source a caviardé la
+/// désignation des parties.
+#[derive(Debug, Clone)]
+pub struct Renvoi {
+    pub decision_id: i64,
+    pub renvoi_no: i16,
+    pub target_ref: String,
+    pub target_date: Option<NaiveDate>,
+    pub nom: Option<String>,
+}
+
+/// Une voix pour un surnom : la décision citante, le nom qu'elle emploie, et la
+/// cible telle que le fonds la porte.
+#[derive(Debug, Clone)]
+pub struct RenvoiNomme {
+    pub citante: i64,
+    pub nom: String,
+    pub target_ref: String,
+    pub target_date: NaiveDate,
+}
+
+/// A decision a case name designates, as the exact key leg queries it.
+#[derive(Debug, Clone)]
+pub struct NamedDecision {
+    pub id: i64,
+    pub docket_numbers: Vec<String>,
+}
+
+/// The longest case-name key a query carries that the corpus knows, and its bearers.
+#[derive(Debug, Clone)]
+pub struct CaseNameMatch {
+    pub key: String,
+    pub decisions: Vec<NamedDecision>,
+}
+
+/// Un nom d'usage à poser : la décision, sa forme affichable, et toutes les
+/// graphies repliées sous lesquelles la requête peut le demander.
+#[derive(Debug, Clone)]
+pub struct ElectedCaseName {
+    pub decision_id: i64,
+    /// `None` quand le nom désigne plusieurs décisions : il n'est celui
+    /// d'aucune, mais chacune doit répondre quand on le tape.
+    pub name: Option<String>,
+    pub keys: Vec<String>,
+    /// La valeur de `case_name_source` que porte ce nom, dont
+    /// `lj_case_name_rank` décide s'il l'emporte sur l'écrivain en place.
+    pub source: &'static str,
+}
+
+/// De quoi recomposer le titre hors du chemin d'extraction : les axes
+/// structurés que `lj_core::titles` attend, le nom d'usage, et le titre stocké
+/// pour n'écrire que ce qui bouge.
+#[derive(Debug, Clone)]
+pub struct TitleInputs {
+    pub decision_id: i64,
+    pub jurisdiction_label: Option<String>,
+    pub jurisdiction_type: String,
+    pub date_lecture: Option<String>,
+    pub docket_numbers: Vec<String>,
+    pub case_name: Option<String>,
+    pub search_title: Option<String>,
+}
+
+/// Décision citante telle que la page décision l'affiche. Le nom porté par le
+/// renvoi n'y est pas : il désigne la cible, donc la décision de la page.
+#[derive(Debug, Clone)]
+pub struct RenvoyantRow {
+    pub public_id: String,
+    pub jurisdiction_code: Option<String>,
+    pub jurisdiction_type: String,
+    pub date_lecture: Option<String>,
+    pub docket_numbers: Option<Vec<String>>,
+}
+
+impl DecisionRepository<'_> {
+    /// Remplace les renvois d'un lot de décisions commentées : le bundle est la
+    /// source, la table sa projection.
+    pub async fn replace_renvois(&self, decisions: &[i64], lot: &[Renvoi]) -> Result<u64> {
+        self.conn
+            .execute(
+                "DELETE FROM decision_renvoi WHERE decision_id = ANY($1)",
+                &[&decisions],
+            )
+            .await?;
+        if lot.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<i64> = lot.iter().map(|r| r.decision_id).collect();
+        let nos: Vec<i16> = lot.iter().map(|r| r.renvoi_no).collect();
+        let refs: Vec<&str> = lot.iter().map(|r| r.target_ref.as_str()).collect();
+        let dates: Vec<Option<NaiveDate>> = lot.iter().map(|r| r.target_date).collect();
+        let noms: Vec<Option<&str>> = lot.iter().map(|r| r.nom.as_deref()).collect();
+        let n = self
+            .conn
+            .execute(
+                "INSERT INTO decision_renvoi
+                     (decision_id, renvoi_no, target_ref, target_date, nom)
+                 SELECT i, no, r, d, nom
+                 FROM unnest($1::int8[], $2::int2[], $3::text[], $4::date[], $5::text[])
+                      AS t(i, no, r, d, nom)
+                 ON CONFLICT (decision_id, renvoi_no, target_ref) DO NOTHING",
+                &[&ids, &nos, &refs, &dates, &noms],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    /// Pose `target_decision_id` sur les renvois pendants.
+    pub async fn resolve_pending_renvois(&self) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE decision_renvoi r
+                 SET target_decision_id = c.id
+                 FROM (
+                     SELECT p.decision_id, p.renvoi_no, p.target_ref, min(d.id) AS id
+                     FROM decision_renvoi p
+                     JOIN decisions d
+                       ON d.jurisdiction_code = split_part(p.target_ref, '|', 1)
+                      AND d.date_lecture = p.target_date
+                      AND d.deleted_at IS NULL
+                      AND lj_docket_keys(d.docket_numbers)
+                          && lj_docket_keys(array[split_part(p.target_ref, '|', 2)])
+                     WHERE p.target_decision_id IS NULL
+                       AND p.target_date IS NOT NULL
+                       AND split_part(p.target_ref, '|', 2) <> ''
+                     GROUP BY p.decision_id, p.renvoi_no, p.target_ref
+                 ) c
+                 WHERE r.decision_id = c.decision_id
+                   AND r.renvoi_no = c.renvoi_no
+                   AND r.target_ref = c.target_ref",
+                &[],
+            )
+            .await?;
+        Ok(n)
+    }
+
+    /// Renvois nommés dont la cible est au fonds, dédupliqués : les numéros
+    /// co-cités d'une affaire jointe tombent sur la même décision, donc sur une
+    /// seule voix.
+    pub async fn renvois_nommes(&self) -> Result<Vec<RenvoiNomme>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT r.decision_id, r.nom,
+                        d.jurisdiction_code || '|' || array_to_string(d.docket_numbers, ','),
+                        d.date_lecture
+                 FROM decision_renvoi r
+                 JOIN decisions d ON d.id = r.target_decision_id AND d.deleted_at IS NULL
+                 WHERE r.nom IS NOT NULL
+                   AND d.date_lecture IS NOT NULL",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| RenvoiNomme {
+                citante: r.get(0),
+                nom: r.get(1),
+                target_ref: r.get(2),
+                target_date: r.get(3),
+            })
+            .collect())
+    }
+
+    /// Décisions dont l'analyse renvoie à celle-ci, la plus récente d'abord. Une
+    /// décision citante ne compte qu'une fois, même quand deux de ses sommaires
+    /// renvoient à la même cible.
+    pub async fn renvoyants(&self, decision_id: i64, limite: i64) -> Result<Vec<RenvoyantRow>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT d.public_id, d.jurisdiction_code, d.jurisdiction_type,
+                        d.date_lecture::text, d.docket_numbers
+                 FROM decision_renvoi r
+                 JOIN decisions d ON d.id = r.decision_id AND d.deleted_at IS NULL
+                 WHERE r.target_decision_id = $1
+                 ORDER BY d.date_lecture::text DESC NULLS LAST, d.public_id
+                 LIMIT $2",
+                &[&decision_id, &limite],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| RenvoyantRow {
+                public_id: r.get(0),
+                jurisdiction_code: r.get(1),
+                jurisdiction_type: r.get(2),
+                date_lecture: r.get(3),
+                docket_numbers: r.get(4),
+            })
+            .collect())
+    }
+
+    /// Le nom que les renvois donnent à chaque décision citée : celui que le
+    /// plus de citantes emploient, la forme la plus longue départageant
+    /// (« Société Tropic Travaux Signalisation » nomme mieux que « Tropic »).
+    pub async fn elected_case_names(&self) -> Result<Vec<(i64, String)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT ON (r.target_decision_id)
+                        r.target_decision_id, r.nom
+                 FROM decision_renvoi r
+                 JOIN decisions d ON d.id = r.target_decision_id AND d.deleted_at IS NULL
+                 WHERE r.target_decision_id IS NOT NULL AND r.nom IS NOT NULL
+                 GROUP BY r.target_decision_id, r.nom
+                 ORDER BY r.target_decision_id,
+                          count(DISTINCT r.decision_id) DESC,
+                          length(r.nom) DESC,
+                          r.nom",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    /// Les décisions dont la passe possède le titre : celles qui portent un nom
+    /// d'usage, et toute cible de renvoi, qui en portait peut-être un hier. La
+    /// passe les relit toutes et n'écrit que ce qui bouge, ce qui rattrape des
+    /// deux côtés : une ré-extraction réécrit `search_title` sans connaître le
+    /// nom, un nom écarté le laisse dans le titre.
+    pub async fn case_name_title_inputs(&self) -> Result<Vec<TitleInputs>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT d.id, j.label, d.jurisdiction_type, d.date_lecture::text,
+                        d.docket_numbers, d.case_name, d.search_title
+                 FROM decisions d
+                 LEFT JOIN jurisdiction j ON j.code = d.jurisdiction_code
+                 WHERE (d.case_name IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM decision_renvoi r
+                                   WHERE r.target_decision_id = d.id))
+                   AND d.deleted_at IS NULL",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| TitleInputs {
+                decision_id: r.get(0),
+                jurisdiction_label: r.get(1),
+                jurisdiction_type: r.get(2),
+                date_lecture: r.get(3),
+                docket_numbers: r.get(4),
+                case_name: r.get(5),
+                search_title: r.get(6),
+            })
+            .collect())
+    }
+
+    /// Réécrit `search_title` là où le nom d'usage l'a fait bouger, par lots :
+    /// l'index BM25 de `decisions` coûte 1,6 ms par ligne réécrite, et la
+    /// première passe en porte 30 000, bien au-delà du `statement_timeout`.
+    pub async fn set_search_titles(&self, titles: &[(i64, String)]) -> Result<u64> {
+        let mut n = 0;
+        for lot in titles.chunks(2_000) {
+            let ids: Vec<i64> = lot.iter().map(|(id, _)| *id).collect();
+            let composed: Vec<&str> = lot.iter().map(|(_, t)| t.as_str()).collect();
+            n += self
+                .conn
+                .execute(
+                    "UPDATE decisions d SET search_title = t.titre
+                     FROM unnest($1::int8[], $2::text[]) AS t(id, titre)
+                     WHERE d.id = t.id",
+                    &[&ids, &composed],
+                )
+                .await?;
+        }
+        Ok(n)
+    }
+
+    /// The longest of `keys` that names a decision, with every bearer; `None`
+    /// when no key designates anything.
+    pub async fn case_name_match(&self, keys: &[String]) -> Result<Option<CaseNameMatch>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT k.cle, d.id, d.docket_numbers
+                 FROM decisions d, unnest(d.case_name_keys) AS k(cle)
+                 WHERE d.case_name_keys && $1 AND k.cle = ANY($1)
+                   AND d.deleted_at IS NULL",
+                &[&keys],
+            )
+            .await?;
+        let Some(key) = rows
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .max_by_key(String::len)
+        else {
+            return Ok(None);
+        };
+        let decisions = rows
+            .iter()
+            .filter(|r| r.get::<_, String>(0) == key)
+            .map(|r| NamedDecision {
+                id: r.get(1),
+                docket_numbers: r.get(2),
+            })
+            .collect();
+        Ok(Some(CaseNameMatch { key, decisions }))
+    }
+}

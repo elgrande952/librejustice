@@ -8,6 +8,7 @@ pub mod adde;
 pub mod annonces;
 pub mod ariane;
 pub mod bofip;
+pub mod ce_list;
 pub mod cedh;
 pub mod circulaires;
 pub mod cjue;

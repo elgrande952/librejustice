@@ -63,7 +63,8 @@ fn location_table() -> &'static [(&'static str, &'static str)] {
             "tj97411",
             "Tribunal judiciaire de Saint-Denis de la Réunion",
         ),
-        ("tj98735", "Tribunal civil de première instance de Papeete"),
+        ("tj98735", "Tribunal de première instance de Papeete"),
+        ("tj98818", "Tribunal de première instance de Nouméa"),
         // Tribunaux de commerce (code département)
         ("0602", "Tribunal de commerce de Cannes"),
         ("0605", "Tribunal de commerce de Nice"),
@@ -95,6 +96,7 @@ fn location_table() -> &'static [(&'static str, &'static str)] {
         ("8602", "Tribunal de commerce de Poitiers"),
         ("9201", "Tribunal de commerce de Nanterre"),
         ("9301", "Tribunal de commerce de Bobigny"),
+        ("9721", "Tribunal mixte de commerce de Fort-de-France"),
         ("ca_chambery", "Cour d'appel de Chambéry"),
         ("ca_dijon", "Cour d'appel de Dijon"),
         ("tj01053", "Tribunal judiciaire de Bourg-en-Bresse"),

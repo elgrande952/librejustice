@@ -18,7 +18,7 @@ use lj_dtos::{LawSectionItem, LawSectionRef, LawSectionResponse, TopCitedArticle
 use crate::components::decision::DecisionLayout;
 use crate::components::layout::SHELL;
 use crate::components::own_page_description;
-use crate::helpers::format_article_num;
+use crate::helpers::{format_article_num, group_thousands};
 use crate::pages::law_page::cited_by::{
     decisions_href, section as cited_by_section, CitedBySubject, CitedText,
 };
@@ -266,6 +266,17 @@ fn LawSectionLoaded(
     };
     let top_cited = top_cited_block(&code, section.top_cited);
 
+    let trop_longue = section.omitted.map(|n| {
+        view! {
+            <p class="rounded-md border border-[var(--color-rule)] bg-[var(--color-vellum)]/50 px-3 py-2 text-sm text-[var(--color-ink-subtle)]">
+                {format!(
+                    "Division trop longue pour être lue d'un bloc : ses {} articles sont listés, \
+                     chacun s'ouvre sur sa page.",
+                    group_thousands(n as i64),
+                )}
+            </p>
+        }
+    });
     let items = section
         .items
         .into_iter()
@@ -273,6 +284,7 @@ fn LawSectionLoaded(
         .collect_view();
     let reading = view! {
         <div class="flex flex-col" class:abroges-masques=move || hide_abroges.get()>
+            {trop_longue}
             {items}
         </div>
     };

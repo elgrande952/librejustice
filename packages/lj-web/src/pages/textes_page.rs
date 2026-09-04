@@ -17,6 +17,7 @@ use crate::components::search::TextesView;
 
 #[component]
 pub fn TextesPage() -> impl IntoView {
+    crate::pages::cache_public_5_min();
     let query_map = use_query_map();
     // `leptos_meta` garde cette clôture dans un contexte de durée de vie
     // applicative et la réévalue APRÈS le démontage de la route, pour restaurer

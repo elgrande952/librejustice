@@ -19,8 +19,6 @@ pub struct JuricafParsed {
     pub jurisdiction_code: String,
     /// Libellé affichable (« Cour suprême (Sénégal) »).
     pub jurisdiction_label: String,
-    /// Titre de la page (« Sénégal, Cour suprême, 14 novembre 2024, 57 »).
-    pub title: String,
 }
 
 /// Décode les octets d'une page JuriCAF : UTF-8 nominal, chaque octet
@@ -410,7 +408,6 @@ pub fn parse_juricaf(slug: &str, raw: &[u8]) -> Result<JuricafParsed> {
         decision,
         source_fields,
         jurisdiction_label,
-        title,
     })
 }
 

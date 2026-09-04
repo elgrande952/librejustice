@@ -39,7 +39,7 @@
 	# L'amont se joint par son nom de service sur le réseau `infra_default` ;
 	# `app` n'a aucun port publié sur l'hôte, donc il n'est joignable que d'ici.
 	# Une bascule blue/green ne demande alors que de démarrer la couleur neuve,
-	# d'attendre son `/api/health`, puis de recharger.
+	# d'attendre son `/admin/health`, puis de recharger.
 	reverse_proxy {$LIBREJUSTICE_CADDY_UPSTREAM:app:8300} {
 		# 10 s couvre le pire trou d'amont avec de la marge, et le plafond est
 		# dur : au-delà, l'expiration rend 502. 250 ms borne les rejeux à 40 sur

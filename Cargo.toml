@@ -37,10 +37,8 @@ serde_json = { version = "1", features = ["raw_value", "alloc"] }
 sonic-rs = "0.5"
 schemars = { version = "1", features = ["chrono04"] }
 
-# HTTP client. `native-tls-vendored` : OpenSSL compile dans le binaire (aucune
-# libssl runtime), pour le seul connecteur annonces/klekoon — son hote ne
-# negocie que des suites TLS 1.2 CBC-SHA1, que rustls n'implemente pas.
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "form", "rustls", "native-tls-vendored", "gzip", "blocking", "cookies"] }
+# HTTP client, backend rustls uniquement : aucun OpenSSL dans le workspace.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "form", "rustls", "gzip", "blocking", "cookies"] }
 # Parsing d'URL. Un controle de redirect_uri OAuth compare un HOST, pas un prefixe
 # de chaine : `starts_with("http://localhost")` matche `localhost.attaquant.tld`.
 url = "2"
@@ -49,6 +47,21 @@ url = "2"
 # epinglerait une vieille version d'otel) -> capte par la couche tracing-opentelemetry.
 reqwest-middleware = { version = "0.5", features = ["json", "query"] }
 reqwest-tracing = "0.7"
+# Client SMTP du signalement. Pas de backend TLS : le lien vers le relais est
+# deja chiffre sous lui. Ce qu'on ne refait pas a la main : l'encodage MIME, le
+# point-stuffing de DATA, et surtout le refus d'un CRLF dans une adresse -- un
+# `Reply-To` non valide ouvrirait un relais a spam sur un formulaire anonyme.
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1", "pool"] }
+
+# Relève IMAP. async-imap est agnostique du TLS (il accepte n'importe quel
+# Read+Write) : tokio-rustls le chiffre avec le fournisseur déjà dans l'arbre,
+# et rustls-platform-verifier tire les racines de l'OS comme reqwest.
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+rustls-platform-verifier = "0.7"
+# MIME entrant : RFC 2047 des sujets, quoted-printable, multipart, jeux de
+# caractères. Ce qui ne se réécrit pas à la main.
+mail-parser = "0.11"
 
 # Postgres (tokio-postgres + deadpool, PAS sqlx)
 # pgvector = codec client du type vector(1024) (analogue de register_vector côté
@@ -104,18 +117,30 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 # Bridge logs tracing -> OpenTelemetry Logs (export OTLP direct).
 opentelemetry-appender-tracing = "0.32"
 # Layer axum : spans serveur HTTP nommes {method} {route} + semconv OTel
-# (http.route / http.response.status_code) attendus par le cockpit.
+# (http.route / http.response.status_code) attendus par l'observabilité.
 axum-tracing-opentelemetry = "0.38"
 # base64 : en-tete Authorization Basic des exporteurs OTLP/HTTP Grafana Cloud.
 base64 = "0.22"
+# libc : `statvfs(3)` pour l'occupation du disque dans `host_metrics`. Seule des
+# six mesures hote a n'avoir aucune source dans /proc, qui ne publie pas l'espace
+# libre d'un systeme de fichiers.
+libc = "0.2"
 
 # Auth / MCP
 # jsonwebtoken 10 exige un CryptoProvider explicite. On choisit aws_lc_rs :
 # deja tire par reqwest/rustls (un seul provider crypto dans le binaire), ARM ok.
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+# aws-lc-rs en direct pour la seule signature Ed25519 du relais de courrier :
+# c'est le fournisseur crypto déjà dans l'arbre (rustls, jsonwebtoken), donc
+# aucune seconde implémentation ne s'ajoute au binaire.
+aws-lc-rs = "1"
 # getrandom : octets CSPRNG de l'OS (syscall getrandom(2)) pour les secrets
 # OAuth — remplace un read bloquant de /dev/urandom sur le thread async.
 getrandom = "0.4"
+# argon2 aux parametres OWASP de `Argon2::default()` (19 Mio, t=2, p=1). bcrypt
+# ne verifie plus que les `$2a$10$` herites, reecrits en argon2id a la connexion.
+argon2 = "0.5"
+bcrypt = "0.17"
 rmcp = { version = "1", features = ["server", "macros"] }
 
 # Cache in-process (mono-serveur axum) : remplace le conteneur Valkey. moka
@@ -132,6 +157,9 @@ ttf-parser = "0.25"
 # Extraction texte PDF born-digital, crate pur Rust : aucune dépendance native.
 pdf-extract = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh64"] }
+# blake3 : MAC à clé (`keyed_hash`) des pseudonymes d'usage. xxh3, déjà là, est
+# non cryptographique et n'offre aucune résistance en clé.
+blake3 = "1"
 flate2 = "1"
 csv = "1"
 # Lecteur d'archives `.tar`, combiné à flate2 pour les `.tar.gz` DILA.
@@ -218,6 +246,10 @@ js-minify = true
 # brut plus petit mais un brotli plus gros, l'optimiseur troquant de la
 # redondance contre des séquences plus courtes.
 lib-profile-release = "wasm-release"
+# Le target dir wasm32, séparé pour que builds serveur et front tournent en
+# parallèle sans se disputer le verrou cargo. Nommé pour ce qu'il contient —
+# chaque profil y a son sous-répertoire — plutôt que « front », le défaut.
+front-target-dir = "target/wasm"
 
 # Projet de développement, sans hashing : les rebuilds incrémentaux de
 # `cargo leptos watch` écrivent des noms non hashés sans rafraîchir `hash.txt`
@@ -242,35 +274,7 @@ reload-port = 3001
 lib-features = ["hydrate"]
 lib-default-features = false
 hash-files = false
-
-# Projet de la vérification locale, qui ne builde le front que pour
-# wasm-bindgen. Il reprend la sélection, les features et les RUSTFLAGS du
-# `cargo test --workspace` qui précède : sinon chaque crate partagé a un second
-# exemplaire compilé, recompilé à chaque run.
-[[workspace.metadata.leptos]]
-name = "librejustice-ci"
-bin-package = "lj-server"
-lib-package = "lj-web"
-output-name = "lj-web"
-site-root = "target/site-ci"
-site-pkg-dir = "pkg"
-tailwind-input-file = "packages/lj-web/style/main.css"
-assets-dir = "packages/lj-web/public"
-site-addr = "127.0.0.1:3000"
-reload-port = 3001
-lib-features = ["hydrate"]
-lib-default-features = false
-hash-files = false
-bin-default-features = true
-bin-cargo-args = ["--workspace"]
-# Profil à lui : `cargo test` réécrit le mtime des unités partagées à contenu
-# identique, ce qui salit tout ce qui en dépend. Un profil sépare les unités
-# sans second `target`.
-bin-profile-dev = "ci"
-# `--cfg erase_components`, posé par défaut en debug, entre dans l'empreinte mais
-# pas dans le nom des unités : mêmes fichiers, deux empreintes, invalidation
-# mutuelle à chaque run.
-disable-erase-components = true
+front-target-dir = "target/wasm"
 
 # Profil des binaires. `codegen-units = 16` et `lto = false` donnent la priorité
 # à l'itération sur l'hôte de build, qui compile et déploie sur deux cœurs, le
@@ -281,6 +285,12 @@ disable-erase-components = true
 [profile.release]
 lto = false
 codegen-units = 16
+# La vérification tourne sur ce profil, et le deploy repart de l'instantané que
+# la beta a servi — jamais d'un rebuild comparé au bit près : l'incrémental est
+# donc permis. Les débordements d'entier claquent ici comme ils claquaient dans
+# le profil de test.
+incremental = true
+overflow-checks = true
 
 # opt-0 sur les deux crates serveur les plus lourds à recompiler : un changement
 # en amont de `lj-web` force le recodegen release de cette clôture, qui passe de
@@ -301,6 +311,8 @@ opt-level = 0
 inherits = "release"
 opt-level = "z"
 lto = "fat"
+# L'incrémental hérité de `release` est incompatible avec le lto fat.
+incremental = false
 codegen-units = 1
 panic = "abort"
 strip = true
@@ -330,9 +342,3 @@ tachys = { git = "https://github.com/librejustice/tachys", rev = "d71bd744216275
 # besoin des numéros passe `CARGO_PROFILE_DEV_DEBUG=line-tables-only`.
 [profile.dev]
 debug = 0
-
-# Sélectionné par `bin-profile-dev` du projet `librejustice-ci` ci-dessus. Il
-# n'en reste que le nom : c'est lui qui range les unités à part, les réglages
-# sont ceux de `dev`.
-[profile.ci]
-inherits = "dev"

@@ -1,6 +1,5 @@
 //! Types publics du repository : structs/enums de contrat (lignes de résultat,
-//! bundles d'écriture, statuts d'upsert) consommés par `lj-api`, `lj-ingest` et
-//! `lj-bench`. Réexportés tels quels par [`super`].
+//! bundles d'écriture, statuts d'upsert). Réexportés tels quels par [`super`].
 
 use chrono::NaiveDate;
 use lj_core::decision::Decision;
@@ -40,8 +39,7 @@ pub struct MissingSummaryRow {
     pub docket_numbers: Option<Vec<String>>,
 }
 
-/// Corps + métadonnées grain décision d'une décision poolée pour le GT
-/// (`lj-bench gt-pool`).
+/// Corps + métadonnées grain décision d'une décision poolée pour le GT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GtDoc {
     pub id: i64,
@@ -103,6 +101,16 @@ pub struct SlugSourceRow {
     pub jurisdiction: String,
     pub date_texte: Option<String>,
     pub nor: Option<String>,
+}
+
+/// One side of a pair of `EU/` fiches whose uids differ only by the order of the
+/// number and the year. The CELEX its articles carry says which of the two names
+/// the act; the count says which holds the body, and it is not always the same.
+#[derive(Debug, Clone)]
+pub struct EuTwin {
+    pub text_uid: String,
+    pub celex: Option<String>,
+    pub articles: i64,
 }
 
 /// Ligne `legal_article` (une version datée d'un article de loi).
@@ -266,8 +274,7 @@ pub struct CitingDecisionRow {
     pub jurisdiction_name: Option<String>,
     pub date_lecture: Option<String>,
     pub docket_numbers: Option<Vec<String>>,
-    /// Codes de publication (`b`, `A`…) — portée jurisprudentielle côté `lj-api`
-    /// (`lj_core::publication::significance_key`).
+    /// Codes de publication source (`b`, `A`…), dont `lj-api` tire le libellé.
     pub publication_codes: Option<Vec<String>>,
     /// Résumé de la décision (carte citante, première phrase côté front).
     pub summary: Option<String>,
@@ -307,7 +314,19 @@ pub struct ArticleSearchRow {
     pub score: f32,
 }
 
-/// Un hit du banc de ranking articles (`lj-bench article-rank-eval`) :
+/// Filtres du parcours d'articles, aux axes de la barre `/textes`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ArticleBrowseFilters<'a> {
+    pub text_uid: Option<&'a str>,
+    pub jurisdiction: Option<&'a str>,
+    pub nature: Option<&'a str>,
+    pub source: Option<&'a str>,
+    /// `(liste, true)` = nature dans la liste, `(liste, false)` = hors liste.
+    pub nature_set: Option<(&'a [String], bool)>,
+    pub at: Option<NaiveDate>,
+}
+
+/// Un hit du banc de ranking articles :
 /// identité publique du doc (`slug` + `num`, `num` vide = jambe « textes à
 /// corps ») + matière de jugement (titre, chemin de division, corps).
 #[derive(Debug, Clone, PartialEq)]
@@ -435,6 +454,34 @@ pub struct LegalTextCatalogRow {
     pub article_count: i64,
 }
 
+/// Un candidat de catalogue proposé pour une valeur d'instrument inconnue
+/// (`suggest_instruments`). Le titre sert le message « did you mean », le slug
+/// et l'uid servent le rattrapage quand le candidat EST le texte demandé.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentCandidate {
+    pub slug: String,
+    pub title: String,
+    pub text_uid: String,
+}
+
+/// Issue d'une résolution de nom de texte (`resolve_instrument`). `Rattrape`
+/// nomme la règle qui a tranché : l'appelant la journalise, le banc la compte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstrumentResolution {
+    /// Le slug demandé est au catalogue, tel quel ou par alias d'usage.
+    Direct { slug: String, text_uid: String },
+    /// Un candidat unique porte le texte demandé, sous une autre graphie.
+    Rattrape {
+        slug: String,
+        text_uid: String,
+        regle: lj_core::instrument_match::Rule,
+    },
+    /// Aucune cible unique : les candidats partent dans l'erreur corrective.
+    Inconnu {
+        candidates: Vec<InstrumentCandidate>,
+    },
+}
+
 /// Une entrée de la table des matières d'un code : version en vigueur par
 /// `num_key`, sans corps (clic = navigation `/texte/{slug}/{num}`).
 /// `position` = ordre de lecture réel (≠ tri lexical).
@@ -445,6 +492,8 @@ pub struct TocArticleRow {
     pub title_path: Option<String>,
     pub status: String,
     pub position: Option<i32>,
+    /// Fenêtre de la version rendue close : l'article ne s'applique plus.
+    pub expired: bool,
 }
 
 /// Un article voisin pour le contexte de lecture : numéro + état, sans corps
@@ -522,6 +571,12 @@ pub struct CitationOccurrenceRow {
 /// 2000-1093 …` → `2000-1093`, `None` si non numéroté).
 pub type LegalTextMeta = (String, Option<String>, Option<String>);
 
+/// Hubs de crawl pour les sitemaps : par clé de hub (code juridiction, fond),
+/// les buckets `(année, nombre de pages de listing)`.
+pub type JurisdictionHubPages = Vec<(String, Vec<(i32, i64)>)>;
+/// Le pendant côté normes, dont le bucket est un token (`2026`, `sans-date`).
+pub type NormHubPages = Vec<(String, Vec<(String, i64)>)>;
+
 /// Champs structurés extraits d'une décision, prêts à persister. Construits à
 /// l'ingest (`lj_ingest::extract`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -529,13 +584,23 @@ pub struct ExtractedFields {
     pub date_lecture: Option<NaiveDate>,
     pub date_audience: Option<NaiveDate>,
     pub docket_numbers: Vec<String>,
-    /// Formation structurée : position recomposée affichable + uids référentiels
-    /// `chamber:*` / `formation:*` (FK `facet_value`).
-    pub chamber_position: Option<String>,
-    pub chamber_uid: Option<String>,
+    /// Formation structurée : clé canonique du siège
+    /// ([`lj_core::chamber::Seat`]) + uid référentiel `formation:*`
+    /// (FK `facet_value`).
+    pub chamber_key: Option<String>,
     pub formation_uid: Option<String>,
+    /// Column `decisions.seat` (jsonb): what the source wrote, never resolved,
+    /// the resolution reaching only the paths derived from it.
+    pub seat: Option<lj_core::chamber::Seat>,
+    /// Column `decisions.seat_paths` (text[]), unfolded ancestors included. The
+    /// court code in it is the canonical one, never the source's.
+    pub seat_paths: Vec<String>,
+    /// Nom d'usage porté par la source de la décision (docname CEDH, ligne de
+    /// titre EUR-Lex) : colonne `decisions.case_name`, écrite avec
+    /// `case_name_source = 'source'`.
+    pub case_name: Option<String>,
     /// Titre canonique persistant : composé à l'ingest via `lj_core::titles`
-    /// (juridiction, siège, date FR, premier numéro) — colonne
+    /// (juridiction, siège, date FR, nom d'usage, premier numéro) : colonne
     /// `decisions.search_title`, champ indexé BM25.
     pub search_title: Option<String>,
     pub publication_codes: Vec<String>,
@@ -544,7 +609,6 @@ pub struct ExtractedFields {
     pub procedure_uid: Option<String>,
     pub office_uid: Option<String>,
     pub legal_domain_uid: Option<String>,
-    pub publication_uid: Option<String>,
     /// Matrice NER {applicant, defendant} × {counsel_names, law_firms,
     /// companies}.
     pub applicant_counsel_names: Vec<String>,
@@ -595,6 +659,11 @@ pub struct DecisionPartyRow {
     /// `ord` de la ligne `law_firm` apposée au conseil dans la même décision
     /// (`counsel_name`) — `None` = aucune apposition lisible.
     pub firm_ord: Option<i32>,
+    /// `ord` de la ligne partie que ce conseil représente : l'arête dont `side`
+    /// est dérivé.
+    pub party_ord: Option<i32>,
+    /// `ord` de la ligne conseil substituée, posée sur le `substituant`.
+    pub sub_ord: Option<i32>,
     pub char_starts: Vec<i32>,
     pub char_ends: Vec<i32>,
 }
@@ -707,6 +776,14 @@ pub struct JurisdictionRow {
     pub label: String,
 }
 
+/// Ligne du référentiel `chamber` : une chambre sous sa cour. Le libellé n'y
+/// est pas stocké, c'est une fonction pure des deux autres colonnes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChamberRow {
+    pub jurisdiction_code: String,
+    pub chamber_key: String,
+}
+
 /// Ligne du référentiel `facet_value` : uid namespacé (`solution:REJET`…),
 /// libellé FR, hiérarchie (`parent_uid`) et ordre d'affichage (`sort` du seed).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -717,6 +794,8 @@ pub struct FacetValueRow {
     pub abbr: Option<String>,
     pub parent_uid: Option<String>,
     pub sort: i32,
+    /// Ce que la valeur recouvre quand elle en regroupe plusieurs.
+    pub hint: Option<String>,
 }
 
 // ── Fiche entité (lecture) ───────────────────────────────────────────────────
@@ -810,6 +889,9 @@ pub struct DecisionPartyReadRow {
     pub nature: Option<String>,
     pub barreau: Option<String>,
     pub entity_uid: Option<String>,
+    pub ord: i32,
+    /// `ord` de la partie que ce conseil représente.
+    pub party_ord: Option<i32>,
 }
 
 /// Bundle d'écriture pour une décision (utilisé par le pipeline).

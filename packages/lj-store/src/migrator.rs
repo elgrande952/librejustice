@@ -1061,6 +1061,464 @@ pub fn embedded_migrations() -> Vec<Migration> {
             name: "0207_legal_article_usage_bm25_bascule_num_key.sql",
             sql: include_str!("../migrations/0207_legal_article_usage_bm25_bascule_num_key.sql"),
         },
+        Migration {
+            version: 208,
+            name: "0208_decisions_public_id_not_null.sql",
+            sql: include_str!("../migrations/0208_decisions_public_id_not_null.sql"),
+        },
+        Migration {
+            version: 209,
+            name: "0209_decisions_public_id_not_null_valide.sql",
+            sql: include_str!("../migrations/0209_decisions_public_id_not_null_valide.sql"),
+        },
+        Migration {
+            version: 210,
+            name: "0210_auth_maison_sessions_et_jetons.sql",
+            sql: include_str!("../migrations/0210_auth_maison_sessions_et_jetons.sql"),
+        },
+        Migration {
+            version: 211,
+            name: "0211_docket_keys_fonction_canonique.sql",
+            sql: include_str!("../migrations/0211_docket_keys_fonction_canonique.sql"),
+        },
+        Migration {
+            version: 212,
+            name: "0212_docket_keys_index_gin.sql",
+            sql: include_str!("../migrations/0212_docket_keys_index_gin.sql"),
+        },
+        Migration {
+            version: 213,
+            name: "0213_decisions_bm25_v2_numero_entier.sql",
+            sql: include_str!("../migrations/0213_decisions_bm25_v2_numero_entier.sql"),
+        },
+        Migration {
+            version: 214,
+            name: "0214_decisions_bm25_bascule_numero_entier.sql",
+            sql: include_str!("../migrations/0214_decisions_bm25_bascule_numero_entier.sql"),
+        },
+        Migration {
+            version: 215,
+            name: "0215_legal_text_slug_redirect.sql",
+            sql: include_str!("../migrations/0215_legal_text_slug_redirect.sql"),
+        },
+        Migration {
+            version: 216,
+            name: "0216_slugs_de_codes_sans_artefact.sql",
+            sql: include_str!("../migrations/0216_slugs_de_codes_sans_artefact.sql"),
+        },
+        Migration {
+            version: 217,
+            name: "0217_identites_liees_et_jeton_avec_adresse.sql",
+            sql: include_str!("../migrations/0217_identites_liees_et_jeton_avec_adresse.sql"),
+        },
+        Migration {
+            version: 218,
+            name: "0218_legal_article_bm25_v2_numero_entier.sql",
+            sql: include_str!("../migrations/0218_legal_article_bm25_v2_numero_entier.sql"),
+        },
+        Migration {
+            version: 219,
+            name: "0219_legal_text_body_bm25_v2_numero_entier.sql",
+            sql: include_str!("../migrations/0219_legal_text_body_bm25_v2_numero_entier.sql"),
+        },
+        Migration {
+            version: 220,
+            name: "0220_legal_article_usage_bm25_v2_numero_entier.sql",
+            sql: include_str!("../migrations/0220_legal_article_usage_bm25_v2_numero_entier.sql"),
+        },
+        Migration {
+            version: 221,
+            name: "0221_moteur_textes_bascule_numero_entier.sql",
+            sql: include_str!("../migrations/0221_moteur_textes_bascule_numero_entier.sql"),
+        },
+        Migration {
+            version: 222,
+            name: "0222_drop_users_google_sub.sql",
+            sql: include_str!("../migrations/0222_drop_users_google_sub.sql"),
+        },
+        Migration {
+            version: 223,
+            name: "0223_legal_text_norm_browse_actes_individuels.sql",
+            sql: include_str!("../migrations/0223_legal_text_norm_browse_actes_individuels.sql"),
+        },
+        Migration {
+            version: 224,
+            name: "0224_libelles_juridictions_ultramarines.sql",
+            sql: include_str!("../migrations/0224_libelles_juridictions_ultramarines.sql"),
+        },
+        Migration {
+            version: 225,
+            name: "0225_jurisdiction_year_counts.sql",
+            sql: include_str!("../migrations/0225_jurisdiction_year_counts.sql"),
+        },
+        Migration {
+            version: 226,
+            name: "0226_idx_decisions_jur_code_date_v2.sql",
+            sql: include_str!("../migrations/0226_idx_decisions_jur_code_date_v2.sql"),
+        },
+        Migration {
+            version: 227,
+            name: "0227_idx_decisions_jur_code_date_bascule.sql",
+            sql: include_str!("../migrations/0227_idx_decisions_jur_code_date_bascule.sql"),
+        },
+        Migration {
+            version: 228,
+            name: "0228_search_title_porte_la_cle_collee_des_articles_etoiles.sql",
+            sql: include_str!(
+                "../migrations/0228_search_title_porte_la_cle_collee_des_articles_etoiles.sql"
+            ),
+        },
+        Migration {
+            version: 229,
+            name: "0229_publication_au_grain_de_la_cour.sql",
+            sql: include_str!("../migrations/0229_publication_au_grain_de_la_cour.sql"),
+        },
+        Migration {
+            version: 230,
+            name: "0230_le_rapport_annuel_ouvre_le_menu_publication.sql",
+            sql: include_str!("../migrations/0230_le_rapport_annuel_ouvre_le_menu_publication.sql"),
+        },
+        Migration {
+            version: 231,
+            name: "0231_decision_facet_counts.sql",
+            sql: include_str!("../migrations/0231_decision_facet_counts.sql"),
+        },
+        Migration {
+            version: 232,
+            name: "0232_idx_decisions_date_lecture.sql",
+            sql: include_str!("../migrations/0232_idx_decisions_date_lecture.sql"),
+        },
+        Migration {
+            version: 233,
+            name: "0233_publication_uid_et_portee_sortent.sql",
+            sql: include_str!("../migrations/0233_publication_uid_et_portee_sortent.sql"),
+        },
+        Migration {
+            version: 234,
+            name: "0234_chambre_clef_canonique.sql",
+            sql: include_str!("../migrations/0234_chambre_clef_canonique.sql"),
+        },
+        Migration {
+            version: 235,
+            name: "0235_le_quantum_du_prejudice_corporel_entre_en_base.sql",
+            sql: include_str!(
+                "../migrations/0235_le_quantum_du_prejudice_corporel_entre_en_base.sql"
+            ),
+        },
+        Migration {
+            version: 236,
+            name: "0236_la_matiere_libere_le_nom_de_chambre.sql",
+            sql: include_str!("../migrations/0236_la_matiere_libere_le_nom_de_chambre.sql"),
+        },
+        Migration {
+            version: 237,
+            name: "0237_le_quantum_tient_en_une_ligne_et_ses_observations.sql",
+            sql: include_str!(
+                "../migrations/0237_le_quantum_tient_en_une_ligne_et_ses_observations.sql"
+            ),
+        },
+        Migration {
+            version: 238,
+            name: "0238_les_surnoms_candidats_avant_activation.sql",
+            sql: include_str!("../migrations/0238_les_surnoms_candidats_avant_activation.sql"),
+        },
+        Migration {
+            version: 239,
+            name: "0239_la_chambre_de_rendu_et_son_ancien_nom_sortent.sql",
+            sql: include_str!(
+                "../migrations/0239_la_chambre_de_rendu_et_son_ancien_nom_sortent.sql"
+            ),
+        },
+        Migration {
+            version: 240,
+            name: "0240_lissue_de_la_victime_directe_entre_dans_lobservation.sql",
+            sql: include_str!(
+                "../migrations/0240_lissue_de_la_victime_directe_entre_dans_lobservation.sql"
+            ),
+        },
+        Migration {
+            version: 241,
+            name: "0241_ce_qui_reclasse_une_observation_sans_relire_larret.sql",
+            sql: include_str!(
+                "../migrations/0241_ce_qui_reclasse_une_observation_sans_relire_larret.sql"
+            ),
+        },
+        Migration {
+            version: 242,
+            name: "0242_le_grain_manquant_dune_categorie_descend_aussi.sql",
+            sql: include_str!(
+                "../migrations/0242_le_grain_manquant_dune_categorie_descend_aussi.sql"
+            ),
+        },
+        Migration {
+            version: 243,
+            name: "0243_la_chambre_porte_son_nom_complet.sql",
+            sql: include_str!("../migrations/0243_la_chambre_porte_son_nom_complet.sql"),
+        },
+        Migration {
+            version: 244,
+            name: "0244_les_renvois_officiels_sont_une_relation_de_citation.sql",
+            sql: include_str!(
+                "../migrations/0244_les_renvois_officiels_sont_une_relation_de_citation.sql"
+            ),
+        },
+        Migration {
+            version: 245,
+            name: "0245_decisions_bm25_v3_axes_de_facettes.sql",
+            sql: include_str!("../migrations/0245_decisions_bm25_v3_axes_de_facettes.sql"),
+        },
+        Migration {
+            version: 246,
+            name: "0246_decisions_bm25_bascule_axes_de_facettes.sql",
+            sql: include_str!("../migrations/0246_decisions_bm25_bascule_axes_de_facettes.sql"),
+        },
+        Migration {
+            version: 247,
+            name: "0247_la_fiche_dce_porte_une_decision_le_commentaire_non.sql",
+            sql: include_str!(
+                "../migrations/0247_la_fiche_dce_porte_une_decision_le_commentaire_non.sql"
+            ),
+        },
+        Migration {
+            version: 248,
+            name: "0248_la_donnee_de_compte_passe_dans_son_schema.sql",
+            sql: include_str!("../migrations/0248_la_donnee_de_compte_passe_dans_son_schema.sql"),
+        },
+        Migration {
+            version: 249,
+            name: "0249_decisions_bm25_v4_procedure.sql",
+            sql: include_str!("../migrations/0249_decisions_bm25_v4_procedure.sql"),
+        },
+        Migration {
+            version: 250,
+            name: "0250_decisions_bm25_bascule_procedure.sql",
+            sql: include_str!("../migrations/0250_decisions_bm25_bascule_procedure.sql"),
+        },
+        Migration {
+            version: 251,
+            name: "0251_la_decision_porte_le_nom_sous_lequel_on_la_cite.sql",
+            sql: include_str!(
+                "../migrations/0251_la_decision_porte_le_nom_sous_lequel_on_la_cite.sql"
+            ),
+        },
+        Migration {
+            version: 252,
+            name: "0252_les_cles_de_docket_nattendent_pas_dans_la_liste.sql",
+            sql: include_str!(
+                "../migrations/0252_les_cles_de_docket_nattendent_pas_dans_la_liste.sql"
+            ),
+        },
+        Migration {
+            version: 253,
+            name: "0253_le_bareme_dautorite_rendu_a_la_cnil.sql",
+            sql: include_str!("../migrations/0253_le_bareme_dautorite_rendu_a_la_cnil.sql"),
+        },
+        Migration {
+            version: 254,
+            name: "0254_la_matiere_generale_regroupe_ses_specialites.sql",
+            sql: include_str!(
+                "../migrations/0254_la_matiere_generale_regroupe_ses_specialites.sql"
+            ),
+        },
+        Migration {
+            version: 255,
+            name: "0255_les_decisions_notables_ont_leur_index.sql",
+            sql: include_str!("../migrations/0255_les_decisions_notables_ont_leur_index.sql"),
+        },
+        Migration {
+            version: 256,
+            name: "0256_le_nom_dusage_dit_qui_lui_a_donne_ce_nom.sql",
+            sql: include_str!("../migrations/0256_le_nom_dusage_dit_qui_lui_a_donne_ce_nom.sql"),
+        },
+        Migration {
+            version: 257,
+            name: "0257_le_nom_dusage_se_retrouve_sans_balayer_le_fonds.sql",
+            sql: include_str!(
+                "../migrations/0257_le_nom_dusage_se_retrouve_sans_balayer_le_fonds.sql"
+            ),
+        },
+        Migration {
+            version: 258,
+            name: "0258_la_specialisation_est_un_fait_de_chambre.sql",
+            sql: include_str!("../migrations/0258_la_specialisation_est_un_fait_de_chambre.sql"),
+        },
+        Migration {
+            version: 259,
+            name: "0259_la_partie_repliee_departage_deux_arrets_du_meme_jour.sql",
+            sql: include_str!(
+                "../migrations/0259_la_partie_repliee_departage_deux_arrets_du_meme_jour.sql"
+            ),
+        },
+        Migration {
+            version: 260,
+            name: "0260_la_relation_porte_l_arete_de_representation.sql",
+            sql: include_str!("../migrations/0260_la_relation_porte_l_arete_de_representation.sql"),
+        },
+        Migration {
+            version: 261,
+            name: "0261_decisions_bm25_v5_sans_matiere.sql",
+            sql: include_str!("../migrations/0261_decisions_bm25_v5_sans_matiere.sql"),
+        },
+        Migration {
+            version: 262,
+            name: "0262_decisions_bm25_bascule_sans_matiere.sql",
+            sql: include_str!("../migrations/0262_decisions_bm25_bascule_sans_matiere.sql"),
+        },
+        Migration {
+            version: 263,
+            name: "0263_la_matiere_quitte_la_decision.sql",
+            sql: include_str!("../migrations/0263_la_matiere_quitte_la_decision.sql"),
+        },
+        Migration {
+            version: 264,
+            name: "0264_le_desabonnement_a_sa_table_du_cote_du_produit.sql",
+            sql: include_str!(
+                "../migrations/0264_le_desabonnement_a_sa_table_du_cote_du_produit.sql"
+            ),
+        },
+        Migration {
+            version: 265,
+            name: "0265_la_langue_de_l_utilisateur_est_retenue_a_la_connexion.sql",
+            sql: include_str!(
+                "../migrations/0265_la_langue_de_l_utilisateur_est_retenue_a_la_connexion.sql"
+            ),
+        },
+        Migration {
+            version: 266,
+            name: "0266_le_lien_de_connexion_est_un_quatrieme_usage_de_jeton.sql",
+            sql: include_str!(
+                "../migrations/0266_le_lien_de_connexion_est_un_quatrieme_usage_de_jeton.sql"
+            ),
+        },
+        Migration {
+            version: 267,
+            name: "0267_la_table_du_desabonnement_prend_son_nom_anglais.sql",
+            sql: include_str!(
+                "../migrations/0267_la_table_du_desabonnement_prend_son_nom_anglais.sql"
+            ),
+        },
+        Migration {
+            version: 268,
+            name: "0268_l_ordre_des_juridictions_suit_l_autorite.sql",
+            sql: include_str!("../migrations/0268_l_ordre_des_juridictions_suit_l_autorite.sql"),
+        },
+        Migration {
+            version: 269,
+            name: "0269_chaque_palier_de_publication_dit_ce_qu_il_est.sql",
+            sql: include_str!(
+                "../migrations/0269_chaque_palier_de_publication_dit_ce_qu_il_est.sql"
+            ),
+        },
+        Migration {
+            version: 270,
+            name: "0270_la_matiere_nomme_une_chambre_pas_un_sujet.sql",
+            sql: include_str!("../migrations/0270_la_matiere_nomme_une_chambre_pas_un_sujet.sql"),
+        },
+        Migration {
+            version: 271,
+            name: "0271_le_recueil_nomme_sa_piece_de_tete.sql",
+            sql: include_str!("../migrations/0271_le_recueil_nomme_sa_piece_de_tete.sql"),
+        },
+        Migration {
+            version: 272,
+            name: "0272_le_recensement_compte_les_nuits_sans_reponse.sql",
+            sql: include_str!(
+                "../migrations/0272_le_recensement_compte_les_nuits_sans_reponse.sql"
+            ),
+        },
+        Migration {
+            version: 273,
+            name: "0273_le_libelle_de_chambre_se_recompose.sql",
+            sql: include_str!("../migrations/0273_le_libelle_de_chambre_se_recompose.sql"),
+        },
+        Migration {
+            version: 274,
+            name: "0274_le_libelle_de_chambre_a_un_defaut_vide.sql",
+            sql: include_str!("../migrations/0274_le_libelle_de_chambre_a_un_defaut_vide.sql"),
+        },
+        Migration {
+            version: 275,
+            name: "0275_les_compteurs_du_fonds_tiennent_dans_une_table.sql",
+            sql: include_str!(
+                "../migrations/0275_les_compteurs_du_fonds_tiennent_dans_une_table.sql"
+            ),
+        },
+        Migration {
+            version: 276,
+            name: "0276_le_libelle_de_chambre_n_est_plus_une_colonne.sql",
+            sql: include_str!(
+                "../migrations/0276_le_libelle_de_chambre_n_est_plus_une_colonne.sql"
+            ),
+        },
+        Migration {
+            version: 277,
+            name: "0277_les_cles_d_api_vivent_a_cote_des_sessions.sql",
+            sql: include_str!("../migrations/0277_les_cles_d_api_vivent_a_cote_des_sessions.sql"),
+        },
+        Migration {
+            version: 278,
+            name: "0278_le_nom_ancien_des_compteurs_du_fonds_tombe.sql",
+            sql: include_str!("../migrations/0278_le_nom_ancien_des_compteurs_du_fonds_tombe.sql"),
+        },
+        Migration {
+            version: 279,
+            name: "0279_la_table_du_desabonnement_tombe.sql",
+            sql: include_str!("../migrations/0279_la_table_du_desabonnement_tombe.sql"),
+        },
+        Migration {
+            version: 280,
+            name: "0280_la_matiere_quitte_la_ligne_de_chambre.sql",
+            sql: include_str!("../migrations/0280_la_matiere_quitte_la_ligne_de_chambre.sql"),
+        },
+        Migration {
+            version: 281,
+            name: "0281_la_chambre_du_conseil_est_une_procedure.sql",
+            sql: include_str!("../migrations/0281_la_chambre_du_conseil_est_une_procedure.sql"),
+        },
+        Migration {
+            version: 282,
+            name: "0282_le_siege_entre_en_base_avec_ses_chemins.sql",
+            sql: include_str!("../migrations/0282_le_siege_entre_en_base_avec_ses_chemins.sql"),
+        },
+        Migration {
+            version: 283,
+            name: "0283_le_verdict_du_tableur_descend_a_la_cellule.sql",
+            sql: include_str!("../migrations/0283_le_verdict_du_tableur_descend_a_la_cellule.sql"),
+        },
+        Migration {
+            version: 284,
+            name: "0284_le_quantum_tient_une_lecture_par_decision.sql",
+            sql: include_str!("../migrations/0284_le_quantum_tient_une_lecture_par_decision.sql"),
+        },
+        Migration {
+            version: 285,
+            name: "0285_l_observation_porte_son_origine_et_les_indemnites_acquises.sql",
+            sql: include_str!(
+                "../migrations/0285_l_observation_porte_son_origine_et_les_indemnites_acquises.sql"
+            ),
+        },
+        Migration {
+            version: 286,
+            name: "0286_decisions_bm25_v6_sur_les_chemins_de_siege.sql",
+            sql: include_str!("../migrations/0286_decisions_bm25_v6_sur_les_chemins_de_siege.sql"),
+        },
+        Migration {
+            version: 287,
+            name: "0287_les_chemins_de_siege_ont_leur_index.sql",
+            sql: include_str!("../migrations/0287_les_chemins_de_siege_ont_leur_index.sql"),
+        },
+        Migration {
+            version: 288,
+            name: "0288_l_historique_de_recherche_suit_l_axe_du_siege.sql",
+            sql: include_str!(
+                "../migrations/0288_l_historique_de_recherche_suit_l_axe_du_siege.sql"
+            ),
+        },
+        Migration {
+            version: 289,
+            name: "0289_bascule_sur_l_index_des_chemins_de_siege.sql",
+            sql: include_str!("../migrations/0289_bascule_sur_l_index_des_chemins_de_siege.sql"),
+        },
     ]
 }
 
@@ -1108,22 +1566,43 @@ async fn acquire_migration_lock(conn: &Connection) -> Result<()> {
     }
 }
 
-/// Crée la table `schema_migrations` si absente.
-async fn ensure_schema_migrations(conn: &Connection) -> Result<()> {
-    conn.batch_execute(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (\
+/// Table de suivi du produit.
+pub const SCHEMA_MIGRATIONS: &str = "schema_migrations";
+
+/// Crée la table de suivi si absente, et son schéma quand le nom est qualifié :
+/// la table précède la première migration, qui ne peut donc pas le créer.
+///
+/// L'existence est testée avant le `CREATE` : `IF NOT EXISTS` vérifie d'abord
+/// le droit `CREATE` sur la base, que le propriétaire du schéma n'a pas besoin
+/// d'avoir. Sûr sous le verrou de migration, tenu par l'appelant.
+async fn ensure_schema_migrations(conn: &Connection, table: &str) -> Result<()> {
+    if let Some((schema, _)) = table.split_once('.') {
+        let existe: bool = conn
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)",
+                &[&schema],
+            )
+            .await?
+            .get(0);
+        if !existe {
+            conn.batch_execute(&format!("CREATE SCHEMA {schema}"))
+                .await?;
+        }
+    }
+    conn.batch_execute(&format!(
+        "CREATE TABLE IF NOT EXISTS {table} (\
            version INTEGER PRIMARY KEY,\
            applied_at TIMESTAMPTZ NOT NULL\
-         )",
-    )
+         )"
+    ))
     .await?;
     Ok(())
 }
 
 /// Versions déjà appliquées.
-async fn applied_versions(conn: &Connection) -> Result<Vec<i32>> {
+async fn applied_versions(conn: &Connection, table: &str) -> Result<Vec<i32>> {
     let rows = conn
-        .query("SELECT version FROM schema_migrations", &[])
+        .query(&format!("SELECT version FROM {table}"), &[])
         .await?;
     Ok(rows.iter().map(|row| row.get::<_, i32>(0)).collect())
 }
@@ -1135,8 +1614,20 @@ async fn applied_versions(conn: &Connection) -> Result<Vec<i32>> {
 /// (cf. doc de module), puis délègue à [`apply_migrations_locked`]. Le verrou est
 /// **toujours relâché** au retour, succès comme erreur.
 pub async fn apply_migrations(conn: &Connection) -> Result<Vec<i32>> {
+    apply_migrations_with(conn, embedded_migrations(), SCHEMA_MIGRATIONS).await
+}
+
+/// Applique une **autre** série, suivie dans sa propre table : deux séries qui
+/// partageraient la table se refuseraient l'une l'autre, chacune levant sur une
+/// version absente de son disque. Le verrou reste commun, les deux touchant la
+/// même base. `table` est un nom d'objet SQL, d'où le `&'static`.
+pub async fn apply_migrations_with(
+    conn: &Connection,
+    migrations: Vec<Migration>,
+    table: &'static str,
+) -> Result<Vec<i32>> {
     acquire_migration_lock(conn).await?;
-    let result = apply_migrations_locked(conn).await;
+    let result = apply_migrations_locked(conn, migrations, table).await;
     // Relâche le verrou de session sur tous les chemins.
     let _ = conn
         .execute(
@@ -1157,14 +1648,17 @@ pub async fn apply_migrations(conn: &Connection) -> Result<Vec<i32>> {
 /// 4. applique chaque migration en attente, chacune dans sa propre transaction
 ///    (`BEGIN`/`COMMIT`, `ROLLBACK` sur erreur), puis insère la ligne
 ///    `schema_migrations`.
-async fn apply_migrations_locked(conn: &Connection) -> Result<Vec<i32>> {
-    ensure_schema_migrations(conn).await?;
+async fn apply_migrations_locked(
+    conn: &Connection,
+    available: Vec<Migration>,
+    table: &str,
+) -> Result<Vec<i32>> {
+    ensure_schema_migrations(conn, table).await?;
 
     // `available` est déjà trié par version croissante (cf. embedded_migrations).
-    let available = embedded_migrations();
     let available_versions: Vec<i32> = available.iter().map(|m| m.version).collect();
 
-    let applied = applied_versions(conn).await?;
+    let applied = applied_versions(conn, table).await?;
 
     let missing: Vec<i32> = applied
         .iter()
@@ -1197,7 +1691,7 @@ async fn apply_migrations_locked(conn: &Connection) -> Result<Vec<i32>> {
             "application migration"
         );
         let started = std::time::Instant::now();
-        if let Err(err) = apply_one(conn, migration).await {
+        if let Err(err) = apply_one(conn, migration, table).await {
             // best-effort rollback avant de remonter l'erreur d'origine.
             let _ = conn.batch_execute("ROLLBACK").await;
             return Err(err);
@@ -1222,9 +1716,9 @@ const SANS_TRANSACTION: &str = "-- lj:sans-transaction";
 
 /// Applique une migration dans une transaction explicite. `applied_at` est posé
 /// par `now()` côté Postgres, sans dépendre de l'horloge du client.
-async fn apply_one(conn: &Connection, migration: &Migration) -> Result<()> {
+async fn apply_one(conn: &Connection, migration: &Migration, table: &str) -> Result<()> {
     if migration.sql.starts_with(SANS_TRANSACTION) {
-        return apply_one_sans_transaction(conn, migration).await;
+        return apply_one_sans_transaction(conn, migration, table).await;
     }
     conn.batch_execute("BEGIN").await?;
     // Les migrations sont du SQL de maintenance de confiance ; certaines
@@ -1241,7 +1735,7 @@ async fn apply_one(conn: &Connection, migration: &Migration) -> Result<()> {
     conn.batch_execute("SET LOCAL lock_timeout = '5s'").await?;
     conn.batch_execute(migration.sql).await?;
     conn.execute(
-        "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, now())",
+        &format!("INSERT INTO {table} (version, applied_at) VALUES ($1, now())"),
         &[&migration.version],
     )
     .await?;
@@ -1252,31 +1746,31 @@ async fn apply_one(conn: &Connection, migration: &Migration) -> Result<()> {
 /// Applique une migration marquée [`SANS_TRANSACTION`] : la DDL puis la ligne
 /// de `schema_migrations`, chacune en autocommit.
 ///
-/// Trois conséquences de l'absence de transaction, toutes assumées :
+/// Trois conséquences, toutes assumées :
 ///
-/// - **Un seul statement dans le fichier.** Un message simple-query qui en
-///   porte plusieurs est lui aussi un bloc transactionnel : le `CONCURRENTLY`
-///   y serait rejeté. Une bascule d'index se découpe donc en deux migrations
-///   (création concurrente, puis `DROP`/`RENAME` transactionnels).
-/// - **Pas de rollback.** Un `CREATE INDEX CONCURRENTLY` interrompu laisse un
-///   index INVALIDE et la version non enregistrée ; le run suivant rejoue la
-///   migration et échoue sur « already exists ». La reprise passe par un
-///   `DROP INDEX` explicite de l'opérateur.
-/// - **Pas de `lock_timeout`.** `CONCURRENTLY` ne prend qu'un `SHARE UPDATE
-///   EXCLUSIVE` : il ne fait la queue devant personne, il attend seulement la
-///   fin des transactions en cours.
+/// - **Un seul statement par fichier** : un simple-query qui en porte plusieurs
+///   est lui aussi un bloc transactionnel, où `CONCURRENTLY` est rejeté. Une
+///   bascule d'index se découpe donc en deux migrations.
+/// - **Pas de rollback** : un `CREATE INDEX CONCURRENTLY` interrompu laisse un
+///   index INVALIDE et la version non enregistrée, donc le run suivant échoue
+///   sur « already exists ». La reprise est un `DROP INDEX` de l'opérateur.
+/// - **Pas de `lock_timeout`** : `CONCURRENTLY` ne prend qu'un `SHARE UPDATE
+///   EXCLUSIVE`, il ne fait la queue devant personne.
 ///
 /// `SET LOCAL` n'a pas de portée hors transaction : le `statement_timeout` est
-/// posé au niveau session, puis `RESET` — qui restaure le `-c
-/// statement_timeout=30s` du pool (`db::SESSION_OPTIONS`), non le défaut
-/// serveur — avant de propager le sort de la DDL.
-async fn apply_one_sans_transaction(conn: &Connection, migration: &Migration) -> Result<()> {
+/// posé en session puis `RESET`, ce qui restaure celui du pool et non le défaut
+/// serveur.
+async fn apply_one_sans_transaction(
+    conn: &Connection,
+    migration: &Migration,
+    table: &str,
+) -> Result<()> {
     conn.batch_execute("SET statement_timeout = 0").await?;
     let ddl = conn.batch_execute(migration.sql).await;
     conn.batch_execute("RESET statement_timeout").await?;
     ddl?;
     conn.execute(
-        "INSERT INTO schema_migrations (version, applied_at) VALUES ($1, now())",
+        &format!("INSERT INTO {table} (version, applied_at) VALUES ($1, now())"),
         &[&migration.version],
     )
     .await?;
@@ -1296,6 +1790,38 @@ mod tests {
         for (i, m) in migs.iter().enumerate() {
             assert_eq!(m.version, (i + 1) as i32, "version contiguë");
         }
+    }
+
+    /// Un `.sql` déposé dans `migrations/` sans sa ligne dans
+    /// `embedded_migrations` ne casse aucune compilation et aucun autre test :
+    /// le migrateur l'ignore en silence, et le code qui en dépend part en prod
+    /// sans son schéma. C'est ce qui a mis `lj_docket_keys` en 500 le
+    /// 14/08/2026 — les 0211 à 0214 étaient sur disque, absentes de la liste.
+    #[test]
+    fn every_sql_file_is_embedded() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut sur_disque: Vec<String> = std::fs::read_dir(&dir)
+            .expect("dossier migrations lisible")
+            .map(|e| {
+                e.expect("entrée lisible")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|n| n.ends_with(".sql"))
+            .collect();
+        sur_disque.sort();
+
+        let mut embarquees: Vec<String> = embedded_migrations()
+            .iter()
+            .map(|m| m.name.to_string())
+            .collect();
+        embarquees.sort();
+
+        assert_eq!(
+            sur_disque, embarquees,
+            "migrations/ et embedded_migrations() divergent — ajouter la ligne manquante"
+        );
     }
 
     #[test]

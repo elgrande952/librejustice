@@ -1,8 +1,8 @@
 //! Rail gauche de `/decisions` : synthèse cliquable des résultats
-//! (histogramme des années, textes les plus cités, juridictions, dispositif).
-//! Rendu par la page pour une requête seulement — sans requête le rail porte le
-//! bloc corpus (`corpus_intro::JuridictionsRail`).
-//! Desktop uniquement — le conteneur `aside` de la page est `hidden lg:block` ;
+//! (histogramme des années, textes les plus cités, juridictions, solution).
+//! Rendu dans tous les états, la requête vide comprise : le mode parcours sert
+//! les facettes du fonds. Desktop uniquement, le conteneur `aside` de la page
+//! étant `hidden lg:block` ;
 //! sur mobile la volumétrie vit dans la rangée tri de la colonne résultats.
 //! La volumétrie desktop, l'aide à la recherche et le pont croisé vivent dans
 //! la colonne DROITE de la page (`search_page.rs`).
@@ -10,18 +10,23 @@
 //! Chaque clic passe par la MÊME mutation d'URL que les dropdowns de la barre
 //! de filtres (`query_state` + `Nav`) : chip active, nettoyage par la chip ou
 //! « Tout effacer », retour page 1. Les blocs lisent les facettes remontées de
-//! la réponse (mises à jour sur Ok seulement) : pendant un refetch ils restent
-//! affichés et interactifs, comme la barre de filtres.
+//! la réponse (mises à jour sur Ok seulement) : pendant un refetch de filtre,
+//! de tri ou de page ils restent affichés et interactifs, comme la barre de
+//! filtres. Question changée en revanche (`loading`), le rail passe en attente :
+//! les facettes en main résument les résultats de la question précédente. Leurs
+//! nombres se taisent dès que le décompte porte sur d'autres filtres
+//! (`StaleCounts`), histogramme compris : une hauteur de barre est un compte.
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_query_map;
 use leptos_router::params::ParamsMap;
 use lj_dtos::SearchFacets;
 
+use crate::components::ui::Skeleton;
 use crate::helpers::group_thousands;
 
 use super::compact_search::{query_state, DraftQuery};
-use super::facet_widgets::Nav;
+use super::facet_widgets::{stale_counts, Nav};
 
 /// Lignes par bloc de facettes.
 const ROWS: usize = 5;
@@ -31,7 +36,7 @@ const YEARS: usize = 20;
 /// Map courante avec `q` réécrit par le texte (non soumis) de la barre — même
 /// mécanique que `DecisionsFilterBar` : une mutation depuis le rail applique
 /// requête et filtre d'un seul geste.
-fn effective_map(map: ParamsMap, draft: Option<RwSignal<String>>) -> ParamsMap {
+pub(super) fn effective_map(map: ParamsMap, draft: Option<RwSignal<String>>) -> ParamsMap {
     let mut map = map;
     if let Some(draft) = draft {
         let q = draft.get_untracked().trim().to_string();
@@ -45,10 +50,14 @@ fn effective_map(map: ParamsMap, draft: Option<RwSignal<String>>) -> ParamsMap {
 }
 
 #[component]
-pub fn SearchRail(#[prop(into)] facets: Signal<Option<SearchFacets>>) -> impl IntoView {
+pub fn SearchRail(
+    #[prop(into)] facets: Signal<Option<SearchFacets>>,
+    #[prop(into)] loading: Signal<bool>,
+) -> impl IntoView {
     let query_map = use_query_map();
     let nav = Nav::new();
     let draft = use_context::<DraftQuery>().map(|d| d.0);
+    let stale = stale_counts();
 
     let toggle = Callback::new(move |(key, value): (&'static str, String)| {
         nav.go(query_state::toggle_multi(
@@ -60,6 +69,13 @@ pub fn SearchRail(#[prop(into)] facets: Signal<Option<SearchFacets>>) -> impl In
 
     // ── Histogramme des années ────────────────────────────────────────────────
     let years = move || {
+        // Une barre EST son compte : sa hauteur ment comme mentirait le nombre.
+        if stale.get() {
+            return skeleton_block(
+                "Années",
+                view! { <Skeleton class="h-10 w-full" /> }.into_any(),
+            );
+        }
         let Some(f) = facets.get() else {
             return ().into_any();
         };
@@ -145,19 +161,21 @@ pub fn SearchRail(#[prop(into)] facets: Signal<Option<SearchFacets>>) -> impl In
                 value: i.value,
             })
             .collect();
-        rail_list("Textes les plus cités", "legalInstrument", rows, toggle)
+        rail_list(
+            stale,
+            "Textes les plus cités",
+            "legalInstrument",
+            rows,
+            toggle,
+        )
     };
 
     let jurisdictions = move || {
         let Some(f) = facets.get() else {
             return ().into_any();
         };
-        let picked = selected("jurisdictionType");
-        let mut roots: Vec<_> = f
-            .jurisdiction
-            .into_iter()
-            .filter(|c| c.parent.is_none())
-            .collect();
+        let picked = selected("seat");
+        let mut roots: Vec<_> = f.seat.into_iter().filter(|c| c.parent.is_none()).collect();
         roots.sort_by_key(|c| std::cmp::Reverse(c.count));
         let rows: Vec<RailRow> = roots
             .into_iter()
@@ -169,7 +187,7 @@ pub fn SearchRail(#[prop(into)] facets: Signal<Option<SearchFacets>>) -> impl In
                 value: c.value,
             })
             .collect();
-        rail_list("Juridictions", "jurisdictionType", rows, toggle)
+        rail_list(stale, "Juridictions", "seat", rows, toggle)
     };
 
     let solutions = move || {
@@ -189,19 +207,64 @@ pub fn SearchRail(#[prop(into)] facets: Signal<Option<SearchFacets>>) -> impl In
                 value: c.value,
             })
             .collect();
-        rail_list("Dispositif", "solution", rows, toggle)
+        rail_list(stale, "Solution", "solution", rows, toggle)
     };
 
-    // Le premier bloc rendu perd son filet haut (pas de séparateur au-dessus
-    // du premier bloc d'une colonne) ; les suivants gardent le leur.
+    move || {
+        if loading.get() {
+            return rail_skeleton();
+        }
+        view! {
+            <div class=RAIL_COLUMN>
+                {years}
+                {cited}
+                {jurisdictions}
+                {solutions}
+            </div>
+        }
+        .into_any()
+    }
+}
+
+/// Rail en attente : mêmes titres, même gabarit, lignes muettes le temps que la
+/// nouvelle question réponde.
+fn rail_skeleton() -> AnyView {
     view! {
-        <div class="flex flex-col gap-4 [&>div:first-child]:border-t-0 [&>div:first-child]:pt-0">
-            {years}
-            {cited}
-            {jurisdictions}
-            {solutions}
+        <div class=RAIL_COLUMN>
+            {skeleton_block("Années", view! { <Skeleton class="h-10 w-full" /> }.into_any())}
+            {skeleton_block("Textes les plus cités", skeleton_rows(ROWS))}
+            {skeleton_block("Juridictions", skeleton_rows(ROWS))}
+            {skeleton_block("Solution", skeleton_rows(ROWS))}
         </div>
     }
+    .into_any()
+}
+
+/// Colonne de rail : le premier bloc perd son filet haut (pas de séparateur au
+/// sommet d'une colonne), les suivants gardent le leur.
+pub(super) const RAIL_COLUMN: &str =
+    "flex flex-col gap-4 [&>div:first-child]:border-t-0 [&>div:first-child]:pt-0";
+
+/// Bloc de rail en attente : le titre, qui ne dépend pas de la réponse, et un
+/// corps muet. Partagé par les deux moteurs — même gabarit de colonne.
+pub(super) fn skeleton_block(title: &'static str, body: AnyView) -> AnyView {
+    view! {
+        <div class="flex flex-col gap-1.5 border-t border-[var(--color-rule)] pt-4">
+            <p class="pb-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                {title}
+            </p>
+            {body}
+        </div>
+    }
+    .into_any()
+}
+
+/// `n` lignes muettes au gabarit d'une ligne de facette.
+pub(super) fn skeleton_rows(n: usize) -> AnyView {
+    (0..n)
+        .map(|_| view! { <Skeleton class="h-4 w-full" /> })
+        .collect_view()
+        .into_any()
 }
 
 struct RailRow {
@@ -211,8 +274,10 @@ struct RailRow {
     active: bool,
 }
 
-/// Bloc liste du rail : titre + lignes `libellé … compte`, cliquables.
+/// Bloc liste du rail : titre + lignes `libellé … compte`, cliquables. Le compte
+/// se tait quand il porte sur l'ensemble d'avant le clic.
 fn rail_list(
+    stale: Signal<bool>,
     title: &'static str,
     key: &'static str,
     rows: Vec<RailRow>,
@@ -225,6 +290,7 @@ fn rail_list(
         .into_iter()
         .map(|row| {
             let value = row.value;
+            let count = row.count;
             let label_class = if row.active {
                 "truncate text-[13px] leading-snug font-medium text-[var(--color-bordeaux)]"
             } else {
@@ -238,9 +304,11 @@ fn rail_list(
                     on:click=move |_| toggle.run((key, value.clone()))
                 >
                     <span class=label_class>{row.label.clone()}</span>
-                    <span class="shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]">
-                        {group_thousands(row.count)}
-                    </span>
+                    <Show when=move || !stale.get()>
+                        <span class="shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]">
+                            {group_thousands(count)}
+                        </span>
+                    </Show>
                 </button>
             }
         })

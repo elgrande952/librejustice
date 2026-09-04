@@ -1,7 +1,9 @@
 //! Binaire `librejustice-api` (axum).
 
 use anyhow::Result;
-use lj_api::{config::Settings, pg_metrics, routes, state::AppState, telemetry};
+use lj_api::{
+    cache_metrics, config::Settings, host_metrics, pg_metrics, routes, state::AppState, telemetry,
+};
 use lj_store::db;
 use std::sync::Arc;
 
@@ -22,14 +24,18 @@ async fn main() -> Result<()> {
     let pool = db::build_pool(&settings.db_url, settings.pool_max)?;
     let state = AppState::build(Arc::new(settings.clone()), pool);
 
-    // Scraper de métriques Postgres. Inutile sans export OTLP : on l'aligne sur
-    // la condition d'activation de `init_telemetry` (les trois credentials Grafana
-    // Cloud présents → MeterProvider installé).
-    if settings.grafana_otlp_endpoint.is_some()
-        && settings.grafana_otlp_user.is_some()
-        && settings.grafana_cloud_api_key.is_some()
-    {
+    tokio::spawn(cache_metrics::run(state.clone()));
+    if settings.scrapes_shared_resources() {
         tokio::spawn(pg_metrics::run(state.pool.clone()));
+        tokio::spawn(host_metrics::run());
+    } else {
+        tracing::info!(
+            env = settings
+                .deployment_environment
+                .as_deref()
+                .unwrap_or("(absent)"),
+            "scrapers de ressources partagées inactifs"
+        );
     }
 
     let app = routes::create_app(state, true);

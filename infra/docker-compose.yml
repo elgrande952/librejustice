@@ -80,7 +80,7 @@ services:
       - ${LIBREJUSTICE_STATE_DIR}/caddy:/data
 
   # Conteneur applicatif unique : le binaire `lj-server` sert l'API REST
-  # (/api/*), OAuth/MCP (/oauth/*, /mcp, /.well-known/*), le SSR Leptos et ses
+  # (/internal/*, /api/* a cle, /admin/*), OAuth/MCP (/oauth/*, /mcp, /.well-known/*), le SSR Leptos et ses
   # assets. Le TLS d'origine est terminé par le front `caddy`.
   app:
     build:
@@ -106,6 +106,12 @@ services:
       LIBREJUSTICE_GRAFANA_CLOUD_API_KEY: ${LIBREJUSTICE_GRAFANA_CLOUD_API_KEY}
       LIBREJUSTICE_API_OTEL_SERVICE_NAME: librejustice-api
       LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT: ${LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT}
+      LIBREJUSTICE_API_VERSION: ${LIBREJUSTICE_API_VERSION}
+      # `host.name` vaut sinon l'identifiant du conteneur, qui change à chaque
+      # recréation ; `container.name` est ce qui distingue ce processus d'un
+      # lancement sur l'hôte, où il est absent.
+      LIBREJUSTICE_HOST_NAME: ${LIBREJUSTICE_HOST_NAME}
+      LIBREJUSTICE_CONTAINER_NAME: librejustice-app
       LIBREJUSTICE_API_DB_APPLICATION_NAME: ${LIBREJUSTICE_API_DB_APPLICATION_NAME}
       LIBREJUSTICE_API_WEB_BASE_URL: ${LIBREJUSTICE_API_WEB_BASE_URL:-https://librejustice.fr}
       # Override explicite : `.env` porte l'URL de dev, et les metadata
@@ -141,12 +147,15 @@ services:
     env_file: ../.env
     environment:
       LIBREJUSTICE_DB_URL: postgresql://librejustice:${LIBREJUSTICE_PG_PASSWORD}@postgres:5432/librejustice
+      LIBREJUSTICE_EGRESS_URL: ${LIBREJUSTICE_EGRESS_URL}
       LIBREJUSTICE_STATE_DIR: /var/lib/librejustice
       LOG_FORMAT: json
       LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT: ${LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT}
       LIBREJUSTICE_GRAFANA_OTLP_USER: ${LIBREJUSTICE_GRAFANA_OTLP_USER}
       LIBREJUSTICE_GRAFANA_CLOUD_API_KEY: ${LIBREJUSTICE_GRAFANA_CLOUD_API_KEY}
       LIBREJUSTICE_DEPLOYMENT_ENVIRONMENT: prod
+      LIBREJUSTICE_HOST_NAME: ${LIBREJUSTICE_HOST_NAME}
+      LIBREJUSTICE_CONTAINER_NAME: librejustice-cron
     volumes:
       - ${LIBREJUSTICE_STATE_DIR}/ingest:/var/lib/librejustice/ingest
     depends_on:

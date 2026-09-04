@@ -1,6 +1,6 @@
 # ============================================================================
 # CONTRACT TESTS — contexte de lecture d'un article
-#   GET /api/texte/{code}/{num}[/{date}] → $.context
+#   GET /internal/texte/{code}/{num}[/{date}] → $.context
 # {{base}} = host root. La sélection est adaptative et se fait en SQL sur
 # l'ordre de lecture persisté (`reading_rank`) : ce fichier exerce ses TROIS
 # branches sur des textes stables, un par branche, plus la vue à date. Il
@@ -9,11 +9,11 @@
 # ============================================================================
 
 # Branche « texte court » (≤ CONTEXT_FULL_MAX = 40 articles) : tout le texte,
-# l'article courant marqué une seule fois. 30 articles ici.
-GET {{base}}/api/texte/reglement-ue-n-1025-2012-du-parlement-europeen-et-du-conseil-du-25-octobre-2012/2
+# the current article marked once. 34 articles here, the four annexes included.
+GET {{base}}/internal/texte/reglement-ue-n-1025-2012-du-parlement-europeen-et-du-conseil-du-25-octobre-2012/2
 HTTP 200
 [Asserts]
-jsonpath "$.context" count == 30
+jsonpath "$.context" count == 34
 jsonpath "$.context[?(@.current == true)]" count == 1
 jsonpath "$.context[?(@.current == true)].num" nth 0 == "2"
 jsonpath "$.context[0].num" isString
@@ -22,7 +22,7 @@ jsonpath "$.context[0].etat" isString
 # Branche « division enclosante » (texte long, division ≤ CONTEXT_DIVISION_MAX
 # = 80) : les 8 articles de la section, et rien du reste des 11 438 articles
 # du code du travail.
-GET {{base}}/api/texte/code-du-travail/L1234-5
+GET {{base}}/internal/texte/code-du-travail/L1234-5
 HTTP 200
 [Asserts]
 jsonpath "$.context" count == 8
@@ -34,7 +34,7 @@ jsonpath "$.context[7].num" == "L1234-8"
 # Branche « fenêtre » (texte long, pas de division exploitable) : exactement
 # 2 × CONTEXT_WINDOW + 1 = 13 articles, le courant au centre. L'accord EEE :
 # 129 articles, aucun arbre structurel.
-GET {{base}}/api/texte/accord-sur-l-espace-economique-europeen/65
+GET {{base}}/internal/texte/accord-sur-l-espace-economique-europeen/65
 HTTP 200
 [Asserts]
 jsonpath "$.context" count == 13
@@ -46,7 +46,7 @@ jsonpath "$.context[6].num" == "65"
 # compris ses membres abrogés/transférés depuis — dispersés hors de la plage
 # de rangs du jour, ils n'existent que par l'agrégation globale. En 2003,
 # L4413-1 voisine avec L4413-2/3/4, tous sortis de l'arbre actuel.
-GET {{base}}/api/texte/code-de-la-sante-publique/L4413-1/2003-06-03
+GET {{base}}/internal/texte/code-de-la-sante-publique/L4413-1/2003-06-03
 HTTP 200
 [Asserts]
 jsonpath "$.context" count == 4
@@ -56,5 +56,5 @@ jsonpath "$.context[1].etat" == "TRANSFERE"
 jsonpath "$.context[3].numKey" == "l4413-4"
 
 # Article inexistant dans le texte : pas de contexte inventé.
-GET {{base}}/api/texte/code-du-travail/L9999-99
+GET {{base}}/internal/texte/code-du-travail/L9999-99
 HTTP 404

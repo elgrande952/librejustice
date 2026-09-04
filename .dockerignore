@@ -2,7 +2,7 @@
 .direnv/
 node_modules/
 **/node_modules/
-docs/working-notes/
+docs/
 *.log
 
 # Le contexte de build est la racine du repo, mais l'image ne copie que les

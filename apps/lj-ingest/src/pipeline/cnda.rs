@@ -78,11 +78,6 @@ fn pdf_has_text_layer(extracted: &str) -> bool {
     extracted.chars().filter(|c| !c.is_whitespace()).count() >= PDF_TEXT_LAYER_FLOOR
 }
 
-/// Repli OCR pour un PDF CNDA scanné. Cache-first : relit le markdown caché
-/// (`<cache_dir>/cnda/ocr/<numero>.md`), sinon OCR Mistral si une clé est
-/// disponible (puis cache + throttle, l'IP datacenter se fait flaguer en rafale).
-/// `None` si pas de cache ET pas de clé/échec OCR → l'appelant skippe la
-/// décision, le PDF restant caché pour un retry ultérieur.
 async fn scanned_ocr_fallback(
     client: Option<&MistralClient>,
     cache_dir: &std::path::Path,
@@ -109,25 +104,16 @@ async fn scanned_ocr_fallback(
     }
 }
 
-/// Crawl + ingest des décisions CNDA. Calqué sur [`run_cedh`] : on pagine la
-/// liste jurisprudentielle (`list_page`), énumère les URL de fiches
-/// (`enumerate_fiche_urls`), et pour chaque fiche : parse la fiche HTML
-/// (`parse_fiche`), fetch le PDF lié (`fetch_pdf`) → extraction texte
-/// déterministe (`pdftotext` + `reflow_cnda_pdf_text` ; OCR Mistral en repli
-/// marginal pour les scannés, [`scanned_ocr_fallback`]) → `parse_cnda` →
-/// `drain_batch` (chemin upsert existant, `payload_format = "pdf"`,
-/// `source_uid = cnda/{numero}`, `prebuilt_source_fields`/`prebuilt_extracted`).
-/// Décision sans PDF accessible (lien mort) ⇒ fiche-only (`payload_format =
-/// "html"`, checksum sur l'HTML de fiche). Idempotent (`source_uid`/
-/// `content_checksum`). Throttle de courtoisie entre fetchs. Manifeste :
-/// dernière page drainée + dernier numéro.
+/// Crawl + ingest des décisions CNDA, calqué sur [`run_cedh`] : pagination de la
+/// liste, puis par fiche parse HTML → PDF → extraction déterministe
+/// (`pdftotext`, OCR en repli pour les scannés) → `parse_cnda` → `drain_batch`.
+/// PDF inaccessible ⇒ fiche-only. Idempotent, manifeste en dernière page +
+/// dernier numéro.
 ///
-/// `start_page` = première page à balayer (toujours 1 : la liste est antichrono,
-/// les nouvelles décisions arrivent en tête). `stop_at` = watermark d'early-exit
-/// du sync incrémental (`Some(numero)` = la plus récente déjà chargée) : on
-/// s'arrête dès qu'on la retombe, le reste de la liste étant plus ancien donc
-/// déjà ingéré. `None` (bootstrap) balaye toute la liste jusqu'à épuisement de la
-/// pagination (page sans fiche), borné par [`CNDA_MAX_PAGES`].
+/// `start_page` vaut toujours 1 : la liste est antichrono. `stop_at` est le
+/// watermark d'early-exit du sync incrémental — on s'arrête dès qu'on le
+/// retombe, le reste étant plus ancien. `None` balaye jusqu'à la première page
+/// sans fiche, borné par [`CNDA_MAX_PAGES`].
 ///
 /// [`run_cedh`]: super::europe
 async fn run_cnda(

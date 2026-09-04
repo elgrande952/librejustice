@@ -30,6 +30,132 @@ const LEGAL_ARTICLE_FACET_LIMIT: usize = 20;
 
 // ── Facettes ─────────────────────────────────────────────────────────────
 
+/// Compteurs bruts d'une réponse de facettes, avant résolution des libellés.
+/// Deux chemins les remplissent, le parcours d'un jeu de hits et les agrégats
+/// du fonds filtré ; passer par la même structure est ce qui garantit une forme
+/// de réponse identique.
+#[derive(Default)]
+pub(crate) struct FacetCounters {
+    /// Unfolded seat paths (`CA`, `CA.PARIS`, `CA.PARIS.P5.C3`), the whole
+    /// tree: a path carries its own depth, so one map is enough.
+    pub(crate) seats: HashMap<String, i64>,
+    pub(crate) office: HashMap<String, i64>,
+    pub(crate) domain: HashMap<String, i64>,
+    pub(crate) solution: HashMap<String, i64>,
+    pub(crate) procedure: HashMap<String, i64>,
+    /// Clés déjà préfixées `publication:`.
+    pub(crate) publication: HashMap<String, i64>,
+    /// Années en texte, telles qu'elles sortent en `value` de facette.
+    pub(crate) year: HashMap<String, i64>,
+    pub(crate) instrument: InstrumentCounters,
+}
+
+/// Compteurs de « Textes cités ». Vides, ils rendent une facette vide : c'est
+/// ainsi que le mode parcours s'en dispense.
+#[derive(Default)]
+pub(crate) struct InstrumentCounters {
+    pub(crate) counts: HashMap<String, i64>,
+    pub(crate) labels: HashMap<String, String>,
+    pub(crate) slugs: HashMap<String, Option<String>>,
+    pub(crate) articles: HashMap<String, HashMap<String, i64>>,
+}
+
+/// Résout les libellés et l'ordre : compteurs bruts vers réponse de facettes.
+pub(crate) fn facets_from_counters(c: &FacetCounters, refs: &Referential) -> SearchFacets {
+    let li_facets: Vec<LegalInstrumentFacet> =
+        most_common(&c.instrument.counts, LEGAL_INSTRUMENT_FACET_LIMIT)
+            .into_iter()
+            .map(|(uid, count)| {
+                let articles = c
+                    .instrument
+                    .articles
+                    .get(&uid)
+                    .map(|a| {
+                        most_common(a, LEGAL_ARTICLE_FACET_LIMIT)
+                            .into_iter()
+                            .map(|(value, count)| FacetChoice {
+                                label: value.clone(),
+                                value,
+                                count,
+                                parent: None,
+                                hint: None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                LegalInstrumentFacet {
+                    label: c
+                        .instrument
+                        .labels
+                        .get(&uid)
+                        .cloned()
+                        .unwrap_or_else(|| uid.clone()),
+                    slug: c.instrument.slugs.get(&uid).cloned().flatten(),
+                    value: uid,
+                    count,
+                    articles,
+                }
+            })
+            .collect();
+
+    SearchFacets {
+        seat: seat_choices(&c.seats, refs),
+        office: uid_choices(&c.office, refs),
+        legal_domain: group_choices(&c.domain, refs),
+        solution: uid_choices(&c.solution, refs),
+        procedure: uid_choices(&c.procedure, refs),
+        publication: scale_choices(&c.publication, refs),
+        date_lecture_year: ranked(&c.year)
+            .into_iter()
+            .map(|(y, count)| FacetChoice {
+                label: y.clone(),
+                value: y,
+                count,
+                parent: None,
+                hint: None,
+            })
+            .collect(),
+        legal_instrument: li_facets,
+    }
+}
+
+/// Clé de tri naturelle d'un libellé, chiffres comparés en nombres : « 2e
+/// chambre » avant « 10e chambre », et les formations numérotées avant les
+/// nommées, leur première suite de texte étant vide.
+fn label_sort_key(label: &str) -> Vec<(String, u64)> {
+    let folded = lj_core::normalizer::strip_accents(label).to_lowercase();
+    let mut out: Vec<(String, u64)> = Vec::new();
+    let mut rest = folded.as_str();
+    while !rest.is_empty() {
+        let digit = rest
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let (text, tail) = rest.split_at(digit);
+        let end = tail
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(tail.len());
+        let (digits, tail) = tail.split_at(end);
+        out.push((text.to_string(), digits.parse().unwrap_or(0)));
+        rest = tail;
+    }
+    out
+}
+
+/// Clé de tri d'une cour : sa ville, obtenue en retirant le libellé du type puis
+/// l'article. Sur le libellé entier, l'apostrophe précède toute lettre et range
+/// « Cour d'appel d'Orléans » entre Angers et Basse-Terre.
+fn court_sort_key(label: &str, type_label: Option<&str>) -> Vec<(String, u64)> {
+    let reste = type_label
+        .and_then(|t| label.strip_prefix(t))
+        .map(str::trim_start)
+        .unwrap_or(label);
+    let ville = ["de la ", "des ", "du ", "de ", "d'", "l'"]
+        .iter()
+        .find_map(|a| reste.strip_prefix(a))
+        .unwrap_or(reste);
+    label_sort_key(ville)
+}
+
 /// Tri d'un compteur en `(clé, count)` : count décroissant, tie-break par clé.
 fn ranked(counter: &HashMap<String, i64>) -> Vec<(String, i64)> {
     let mut items: Vec<(String, i64)> = counter.iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -42,13 +168,29 @@ fn ranked(counter: &HashMap<String, i64>) -> Vec<(String, i64)> {
 fn uid_choices(counter: &HashMap<String, i64>, refs: &Referential) -> Vec<FacetChoice> {
     ranked(counter)
         .into_iter()
-        .map(|(uid, count)| FacetChoice {
-            value: uid_suffix(&uid).to_string(),
-            label: refs.label(&uid).to_string(),
-            count,
-            parent: None,
-        })
+        .map(|(uid, count)| choice(uid, count, refs))
         .collect()
+}
+
+/// Les mêmes choix, mais dans l'ordre du référentiel : une facette dont les
+/// valeurs forment une échelle se lit du plus fort au plus faible, là où le
+/// compteur mettrait l'inédit devant le rapport annuel.
+fn scale_choices(counter: &HashMap<String, i64>, refs: &Referential) -> Vec<FacetChoice> {
+    let mut uids: Vec<&String> = counter.keys().collect();
+    uids.sort_by_key(|uid| (refs.rank(uid), uid.as_str()));
+    uids.into_iter()
+        .map(|uid| choice(uid.clone(), counter[uid], refs))
+        .collect()
+}
+
+fn choice(uid: String, count: i64, refs: &Referential) -> FacetChoice {
+    FacetChoice {
+        value: uid_suffix(&uid).to_string(),
+        label: refs.label(&uid).to_string(),
+        count,
+        parent: None,
+        hint: refs.hint(&uid),
+    }
 }
 
 // ── DB hydration / facets ────────────────────────────────────────────────────
@@ -69,226 +211,86 @@ pub(crate) struct DecisionMeta {
     pub(crate) chars: Option<i64>,
     /// Axes formation : position recomposée + type de formation, pour le siège du
     /// titre des hits.
-    pub(crate) chamber_position: Option<String>,
+    pub(crate) seat: Option<lj_core::chamber::Seat>,
+    pub(crate) seat_paths: Vec<String>,
     pub(crate) formation_uid: Option<String>,
-    pub(crate) chamber_uid: Option<String>,
-    pub(crate) publication_uid: Option<String>,
+    pub(crate) official_url: Option<String>,
+    pub(crate) case_name: Option<String>,
 }
 
-pub(crate) async fn fetch_pub_ids_and_facets(
+/// Identifiants publics de la page.
+pub(crate) async fn fetch_pub_ids(
     conn: &Client,
     decision_ids: &[i64],
-    refs: &Referential,
-) -> std::result::Result<(HashMap<i64, String>, SearchFacets), StoreError> {
+) -> std::result::Result<HashMap<i64, String>, StoreError> {
     if decision_ids.is_empty() {
-        return Ok((HashMap::new(), SearchFacets::default()));
+        return Ok(HashMap::new());
     }
     let rows = conn
         .query(
-            "SELECT d.id, d.public_id, d.jurisdiction_type, d.jurisdiction_code, \
-             d.office_uid, d.legal_domain_uid, d.solution_uid, d.publication_uid, \
-             EXTRACT(YEAR FROM d.date_lecture)::int AS y, d.publication_codes, \
-             d.chamber_uid \
-             FROM decisions d WHERE d.id = ANY($1)",
+            "SELECT d.id, d.public_id FROM decisions d WHERE d.id = ANY($1)",
             &[&decision_ids],
         )
         .await?;
-    // Facettes instruments/articles depuis la relation du domaine : token =
-    // ref_text_uid / ref_num_key, identiques aux valeurs des arrays de filtre
-    // legal_instruments/composite ; libellé = titre catalogue, résolu ici. Seul le
-    // lié est facettable — le non-lié (`ref_text_uid` NULL) n'a ni token ni
-    // libellé.
-    let refs_rows = conn
-        .query(
-            "SELECT el->>2, lt.title, el->>3, \
-             COUNT(DISTINCT lc.decision_id) AS n, lt.slug \
-             FROM legal_citation lc \
-             CROSS JOIN LATERAL jsonb_array_elements(lc.spans) AS el \
-             JOIN legal_text lt ON lt.text_uid = el->>2 \
-             WHERE lc.decision_id = ANY($1) \
-             GROUP BY el->>2, lt.title, el->>3, lt.slug",
-            &[&decision_ids],
-        )
-        .await?;
-
     let mut pub_ids: HashMap<i64, String> = HashMap::new();
-    // Facette juridiction : niveau 1 = tokens `jurisdiction_type`
-    // (`TJ`), niveau 2 = codes `jurisdiction` (`parent` = token du type). L'office
-    // est un axe séparé (`office:*`), en miroir du filtrage (`office_uid`) —
-    // chaque décision compte sous son tribunal ET sous son office éventuel.
-    let mut jur_roots: HashMap<String, i64> = HashMap::new();
-    let mut jur_children: HashMap<(String, String), i64> = HashMap::new();
-    let mut chamber_counter: HashMap<String, i64> = HashMap::new();
-    let mut office_counter: HashMap<String, i64> = HashMap::new();
-    let mut domain_counter: HashMap<String, i64> = HashMap::new();
-    let mut solution_counter: HashMap<String, i64> = HashMap::new();
-    let mut significance_counter: HashMap<String, i64> = HashMap::new();
-    let mut publication_counter: HashMap<String, i64> = HashMap::new();
-    let mut year_counter: HashMap<String, i64> = HashMap::new();
-
     for row in &rows {
-        let id: i64 = row.get(0);
-        let public_id: Option<String> = row.get(1);
-        if let Some(pid) = &public_id {
-            pub_ids.insert(id, pid.clone());
-        }
-        let jt: String = row.get(2);
-        let code: Option<String> = row.get(3);
-        let office: Option<String> = row.get(4);
-        let domain: Option<String> = row.get(5);
-        let solution: Option<String> = row.get(6);
-        let publication: Option<String> = row.get(7);
-        let year: Option<i32> = row.get(8);
-        let publication_codes: Vec<String> = row.get(9);
-        let chamber: Option<String> = row.get(10);
-        if let Some(uid) = chamber {
-            *chamber_counter.entry(uid).or_insert(0) += 1;
-        }
-        // Portée dérivée des codes (mapping total) — pas de colonne.
-        *significance_counter
-            .entry(format!(
-                "significance:{}",
-                lj_core::publication::significance_key(&publication_codes)
-            ))
-            .or_insert(0) += 1;
-        if let Some(code) = code {
-            *jur_children.entry((jt.clone(), code)).or_insert(0) += 1;
-        }
-        *jur_roots.entry(jt).or_insert(0) += 1;
-        for (counter, val) in [
-            (&mut office_counter, office),
-            (&mut domain_counter, domain),
-            (&mut solution_counter, solution),
-            (&mut publication_counter, publication),
-        ] {
-            if let Some(uid) = val {
-                *counter.entry(uid).or_insert(0) += 1;
-            }
-        }
-        if let Some(y) = year {
-            *year_counter.entry(y.to_string()).or_insert(0) += 1;
-        }
+        pub_ids.insert(row.get(0), row.get(1));
     }
-
-    // Agrégation par uid : le token est canonique. Le libellé (titre) accompagne
-    // le token pour l'affichage.
-    let mut li_counter: HashMap<String, i64> = HashMap::new();
-    let mut li_labels: HashMap<String, String> = HashMap::new();
-    let mut li_slugs: HashMap<String, Option<String>> = HashMap::new();
-    let mut li_article_counter: HashMap<String, HashMap<String, i64>> = HashMap::new();
-    for row in &refs_rows {
-        let uid: String = row.get(0);
-        let title: String = row.get(1);
-        let num_key: Option<String> = row.get(2);
-        let n: i64 = row.get(3);
-        let slug: Option<String> = row.get(4);
-        *li_counter.entry(uid.clone()).or_insert(0) += n;
-        li_labels.entry(uid.clone()).or_insert(title);
-        li_slugs.entry(uid.clone()).or_insert(slug);
-        if let Some(k) = num_key {
-            *li_article_counter
-                .entry(uid)
-                .or_default()
-                .entry(k)
-                .or_insert(0) += n;
-        }
-    }
-
-    // legal_instrument : most_common(limit), articles most_common(limit).
-    let li_facets: Vec<LegalInstrumentFacet> =
-        most_common(&li_counter, LEGAL_INSTRUMENT_FACET_LIMIT)
-            .into_iter()
-            .map(|(uid, count)| {
-                let articles = li_article_counter
-                    .get(&uid)
-                    .map(|c| {
-                        most_common(c, LEGAL_ARTICLE_FACET_LIMIT)
-                            .into_iter()
-                            .map(|(value, count)| FacetChoice {
-                                label: value.clone(),
-                                value,
-                                count,
-                                parent: None,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let label = li_labels.get(&uid).cloned().unwrap_or_else(|| uid.clone());
-                let slug = li_slugs.get(&uid).cloned().flatten();
-                LegalInstrumentFacet {
-                    value: uid,
-                    label,
-                    slug,
-                    count,
-                    articles,
-                }
-            })
-            .collect();
-
-    let facets = SearchFacets {
-        jurisdiction: jurisdiction_choices(&jur_roots, &jur_children, refs),
-        chamber: uid_choices(&chamber_counter, refs),
-        office: uid_choices(&office_counter, refs),
-        legal_domain: domain_choices(&domain_counter, refs),
-        solution: uid_choices(&solution_counter, refs),
-        significance: uid_choices(&significance_counter, refs),
-        publication: uid_choices(&publication_counter, refs),
-        date_lecture_year: ranked(&year_counter)
-            .into_iter()
-            .map(|(y, count)| FacetChoice {
-                label: y.clone(),
-                value: y,
-                count,
-                parent: None,
-            })
-            .collect(),
-        legal_instrument: li_facets,
-    };
-    Ok((pub_ids, facets))
+    Ok(pub_ids)
 }
 
-/// Facette juridiction : racines (tokens `jurisdiction_type`, `TA`/`CC`…)
-/// triées par count, puis enfants (`value` = code `jurisdiction`, `parent` =
-/// token racine) — le front reconstruit l'arbre par `parent`.
-fn jurisdiction_choices(
-    roots: &HashMap<String, i64>,
-    children: &HashMap<(String, String), i64>,
-    refs: &Referential,
-) -> Vec<FacetChoice> {
-    let mut out: Vec<FacetChoice> = ranked(roots)
-        .into_iter()
-        .map(|(token, count)| FacetChoice {
-            label: refs
-                .jurisdiction_type_label(&token)
-                .unwrap_or(&token)
-                .to_string(),
-            value: token,
-            count,
-            parent: None,
+/// Seat facet: one choice per path, `parent` being the path minus its last
+/// segment. Roots and courts take their label from the referential, which names
+/// them better than their segment does; rooms take theirs from the grammar of
+/// the path.
+fn seat_choices(seats: &HashMap<String, i64>, refs: &Referential) -> Vec<FacetChoice> {
+    let mut rows: Vec<(&String, &i64)> = seats.iter().collect();
+    rows.sort_by_cached_key(|(path, _)| {
+        let depth = path.split('.').count();
+        let racine = path.split('.').next().unwrap_or_default().to_string();
+        let libelle = seat_label(path, refs);
+        let ordre = match depth {
+            1 => Vec::new(),
+            2 => court_sort_key(&libelle, None),
+            _ => label_sort_key(&libelle),
+        };
+        (
+            refs.rank(&format!("jurisdiction_type:{racine}")),
+            depth.min(3),
+            ordre,
+            path.to_string(),
+        )
+    });
+    rows.into_iter()
+        .map(|(path, count)| FacetChoice {
+            label: seat_label(path, refs),
+            value: path.clone(),
+            count: *count,
+            parent: path.rsplit_once('.').map(|(parent, _)| parent.to_string()),
+            hint: None,
         })
-        .collect();
-    let mut kids: Vec<((String, String), i64)> =
-        children.iter().map(|(k, v)| (k.clone(), *v)).collect();
-    kids.sort_by(|a, b| b.1.cmp(&a.1).then(a.0 .1.cmp(&b.0 .1)));
-    out.extend(kids.into_iter().map(|((root_token, code), count)| {
-        let label = refs
-            .jurisdiction(&code)
-            .map(|j| j.label.clone())
-            .unwrap_or_else(|| code.clone());
-        FacetChoice {
-            value: code,
-            label,
-            count,
-            parent: Some(root_token),
-        }
-    }));
-    out
+        .collect()
 }
 
-/// Facette domaine (arbre 2 niveaux) : le count d'une racine agrège ses
-/// annotations directes + celles de ses feuilles ; `value` = suffixe d'uid,
-/// `parent` (feuilles) = suffixe de la racine.
-fn domain_choices(counter: &HashMap<String, i64>, refs: &Referential) -> Vec<FacetChoice> {
+/// Label of a seat node, folded back onto its segment when nothing names it.
+fn seat_label(path: &str, refs: &Referential) -> String {
+    if path.find('.').is_none() {
+        return refs
+            .jurisdiction_type_label(path)
+            .unwrap_or(path)
+            .to_string();
+    }
+    if let Some(label) = refs.court_label_of_path(path) {
+        return label.to_string();
+    }
+    lj_core::chamber::seat_path_label(path)
+        .unwrap_or_else(|| path.rsplit('.').next().unwrap_or(path).to_string())
+}
+
+/// Facette hiérarchisée (arbre 2 niveaux, domaine et matière) : le count d'un
+/// groupe agrège ses annotations directes + celles de ses membres ; `value` =
+/// suffixe d'uid, `parent` (membres) = suffixe du groupe.
+fn group_choices(counter: &HashMap<String, i64>, refs: &Referential) -> Vec<FacetChoice> {
     let mut root_counts: HashMap<String, i64> = HashMap::new();
     let mut leaf_counts: HashMap<String, i64> = HashMap::new();
     for (uid, count) in counter {
@@ -307,6 +309,7 @@ fn domain_choices(counter: &HashMap<String, i64>, refs: &Referential) -> Vec<Fac
             label: refs.label(&uid).to_string(),
             count,
             parent: None,
+            hint: refs.hint(&uid),
         })
         .collect();
     out.extend(ranked(&leaf_counts).into_iter().map(|(uid, count)| {
@@ -319,6 +322,7 @@ fn domain_choices(counter: &HashMap<String, i64>, refs: &Referential) -> Vec<Fac
             label: refs.label(&uid).to_string(),
             count,
             parent,
+            hint: refs.hint(&uid),
         }
     }));
     out
@@ -345,20 +349,28 @@ pub(crate) async fn hydrate_decisions(
              d.date_lecture, d.solution_uid, d.procedure_uid, d.office_uid, \
              d.legal_domain_uid, d.publication_codes, \
              d.docket_numbers, d.summary, c.chars, \
-             d.chamber_position, d.formation_uid, d.chamber_uid, d.publication_uid \
+             d.seat, d.seat_paths, d.formation_uid, \
+             src.source, src.source_uid, \
+             src.source_fields->'Dossier'->>'Code_Juridiction', \
+             COALESCE(src.source_fields->'META_JURI_CONSTIT'->>'URL_CC', \
+                      src.source_fields->>'fiche_url'), \
+             src.source_fields->>'decision_date', \
+             src.source_fields->'numbers'->>0, \
+             d.case_name \
              FROM decisions d \
              LEFT JOIN LATERAL (SELECT max(char_end) AS chars FROM decision_chunks \
                WHERE decision_id = d.id) c ON true \
+             LEFT JOIN LATERAL (SELECT source, source_uid, source_fields \
+               FROM decision_sources WHERE decision_id = d.id AND deleted_at IS NULL \
+               ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC \
+               LIMIT 1) src ON true \
              WHERE d.id = ANY($1)",
             &[&decision_ids],
         )
         .await?;
     let mut out = HashMap::new();
     for r in &rows {
-        let public_id: Option<String> = r.get(1);
-        let Some(public_id) = public_id else {
-            continue;
-        };
+        let public_id: String = r.get(1);
         let date_raw: Option<chrono::NaiveDate> = r.get(4);
         let chars: Option<i32> = r.get(12);
         out.insert(
@@ -372,14 +384,30 @@ pub(crate) async fn hydrate_decisions(
                 procedure_uid: r.get(6),
                 office_uid: r.get(7),
                 legal_domain_uid: r.get(8),
-                publication_codes: r.try_get(9).unwrap_or_default(),
-                docket_numbers: r.try_get(10).ok(),
+                publication_codes: r.get(9),
+                docket_numbers: r.get(10),
                 summary: r.get(11),
                 chars: chars.map(|c| c as i64),
-                chamber_position: r.get(13),
-                formation_uid: r.get(14),
-                chamber_uid: r.get(15),
-                publication_uid: r.get(16),
+                seat: r
+                    .get::<_, Option<tokio_postgres::types::Json<lj_core::chamber::Seat>>>(13)
+                    .map(|j| j.0),
+                seat_paths: r.get::<_, Option<Vec<String>>>(14).unwrap_or_default(),
+                formation_uid: r.get(15),
+                official_url: r
+                    .get::<_, Option<&str>>(16)
+                    .zip(r.get::<_, Option<&str>>(17))
+                    .and_then(|(source, source_uid)| {
+                        lj_core::official_url::official_url(&lj_core::official_url::SourceRef {
+                            source,
+                            source_uid,
+                            court_code: r.get(18),
+                            published_url: r.get(19),
+                            ariane_ref: r
+                                .get::<_, Option<&str>>(20)
+                                .zip(r.get::<_, Option<&str>>(21)),
+                        })
+                    }),
+                case_name: r.get(22),
             },
         );
     }
@@ -493,6 +521,7 @@ pub(crate) fn display_title(m: &DecisionMeta, refs: &Referential) -> String {
         &jur_display,
         None,
         m.date_lecture.as_deref(),
+        m.case_name.as_deref(),
         m.docket_numbers
             .as_deref()
             .and_then(|d| d.first())
@@ -506,7 +535,10 @@ pub(crate) fn display_seat(m: &DecisionMeta, refs: &Referential) -> Option<Strin
     let jur_display = display_jurisdiction(m, refs);
     crate::titles::decision_seat(
         &jur_display,
-        m.chamber_position.as_deref(),
+        m.seat
+            .as_ref()
+            .and_then(lj_core::chamber::Seat::label)
+            .as_deref(),
         m.formation_uid.as_deref(),
         m.office_uid.as_deref(),
     )
@@ -538,8 +570,7 @@ fn make_hit(
         procedure: opt_tag(&m.procedure_uid, refs),
         office: opt_tag(&m.office_uid, refs),
         legal_domain: opt_tag(&m.legal_domain_uid, refs),
-        chamber: opt_tag(&m.chamber_uid, refs),
-        publication: opt_tag(&m.publication_uid, refs),
+        seat_path: crate::titles::seat_path_tag(&m.seat_paths),
         publication_codes: m.publication_codes.clone(),
         best_chunk: BestChunk {
             chunk_index: chunk.chunk_index,
@@ -547,6 +578,7 @@ fn make_hit(
         },
         chars: m.chars,
         summary,
+        official_url: m.official_url.clone(),
     }
 }
 
@@ -684,6 +716,56 @@ mod tests {
     use super::*;
     use lj_store::repository::FacetValueRow;
 
+    /// Le tri lexical mettait « 10e chambre » avant « 2e chambre », et le tri par
+    /// compteur intercalait les nommées entre les numérotées.
+    #[test]
+    fn label_sort_key_compte_les_chiffres_en_nombres() {
+        let mut labels = vec![
+            "Étrangers et rétention",
+            "10e chambre",
+            "Pôle 6, 8e chambre",
+            "2e chambre",
+            "Chambre sociale",
+            "Pôle 1, 11e chambre",
+            "1re chambre",
+        ];
+        labels.sort_by_key(|l| label_sort_key(l));
+        assert_eq!(
+            labels,
+            [
+                "1re chambre",
+                "2e chambre",
+                "10e chambre",
+                "Chambre sociale",
+                "Étrangers et rétention",
+                "Pôle 1, 11e chambre",
+                "Pôle 6, 8e chambre",
+            ]
+        );
+    }
+
+    #[test]
+    fn court_sort_key_range_les_cours_par_leur_ville() {
+        let mut labels = vec![
+            "Cour d'appel de Nîmes",
+            "Cour d'appel d'Agen",
+            "Cour d'appel de Paris",
+            "Cour d'appel d'Orléans",
+            "Cour d'appel de Basse-Terre",
+        ];
+        labels.sort_by_key(|l| court_sort_key(l, Some("Cour d'appel")));
+        assert_eq!(
+            labels,
+            [
+                "Cour d'appel d'Agen",
+                "Cour d'appel de Basse-Terre",
+                "Cour d'appel de Nîmes",
+                "Cour d'appel d'Orléans",
+                "Cour d'appel de Paris",
+            ]
+        );
+    }
+
     #[test]
     fn snippet_truncation_adds_ellipsis() {
         let long = "a".repeat(400);
@@ -700,11 +782,127 @@ mod tests {
             abbr: None,
             parent_uid: parent.map(str::to_string),
             sort: 0,
+            hint: None,
         }
     }
 
+    fn jr(code: &str, jt: &str, label: &str) -> lj_store::repository::JurisdictionRow {
+        lj_store::repository::JurisdictionRow {
+            code: code.to_string(),
+            source_code: code.to_uppercase(),
+            jurisdiction_type: jt.to_string(),
+            city: None,
+            label: label.to_string(),
+        }
+    }
+
+    /// Une cour seule sous son type et homonyme de lui n'est pas un étage : elle
+    /// se replie et rend ses formations à la racine. Une cour parmi d'autres, ou
+    /// nommée autrement, tient sa place.
     #[test]
-    fn domain_facet_aggregates_leaves_under_root() {
+    fn la_cour_unique_homonyme_de_son_type_se_replie() {
+        let refs = Referential::new(
+            vec![
+                FacetValueRow {
+                    sort: 1,
+                    ..fv("jurisdiction_type:CC", "Cour de cassation", None)
+                },
+                FacetValueRow {
+                    sort: 2,
+                    ..fv("jurisdiction_type:CA", "Cour d'appel", None)
+                },
+                FacetValueRow {
+                    sort: 12,
+                    ..fv(
+                        "jurisdiction_type:CNDA",
+                        "Cour nationale du droit d'asile",
+                        None,
+                    )
+                },
+            ],
+            vec![
+                jr("cc", "CC", "Cour de cassation"),
+                jr("ca_paris", "CA", "Cour d'appel de Paris"),
+                jr("cnda", "CNDA", "CNDA"),
+            ],
+            Vec::new(),
+        );
+        let choices = seat_choices(
+            &HashMap::from([
+                ("CA".to_string(), 178_074i64),
+                ("CC".to_string(), 119_525),
+                ("CNDA".to_string(), 71),
+                ("CC.SOCIALE".to_string(), 30_907),
+                ("CA.PARIS".to_string(), 40_000),
+                ("CA.PARIS.C3".to_string(), 900),
+            ]),
+            &refs,
+        );
+        let roots: Vec<&str> = choices
+            .iter()
+            .filter(|c| c.parent.is_none())
+            .map(|c| c.value.as_str())
+            .collect();
+        assert_eq!(roots, ["CC", "CA", "CNDA"], "l'ordre vient du référentiel");
+        let at = |value: &str| {
+            choices
+                .iter()
+                .find(|c| c.value == value)
+                .unwrap_or_else(|| panic!("{value} absent"))
+        };
+        assert!(
+            !choices.iter().any(|c| c.value == "CC.CC"),
+            "une cour homonyme de son type n'ouvre pas de niveau"
+        );
+        assert_eq!(at("CC.SOCIALE").parent.as_deref(), Some("CC"));
+        assert_eq!(at("CA.PARIS").parent.as_deref(), Some("CA"));
+        assert_eq!(at("CA.PARIS").label, "Cour d'appel de Paris");
+        assert_eq!(at("CA.PARIS.C3").parent.as_deref(), Some("CA.PARIS"));
+        assert_eq!(at("CA.PARIS.C3").label, "3e chambre");
+    }
+
+    /// La publication est une échelle : le rang du référentiel gagne sur le
+    /// compteur, sinon l'inédit ouvre le menu parce qu'il est le plus nombreux.
+    #[test]
+    fn publication_facet_reads_in_referential_order() {
+        let refs = Referential::new(
+            vec![
+                FacetValueRow {
+                    sort: 1,
+                    ..fv("publication:PUBLIE_RAPPORT", "Publié au rapport", None)
+                },
+                FacetValueRow {
+                    sort: 2,
+                    ..fv("publication:PUBLIE_BULLETIN", "Publié au bulletin", None)
+                },
+                FacetValueRow {
+                    sort: 5,
+                    ..fv("publication:INEDIT_BULLETIN", "Inédit au bulletin", None)
+                },
+            ],
+            vec![],
+            Vec::new(),
+        );
+        let counter = HashMap::from([
+            ("publication:INEDIT_BULLETIN".to_string(), 4000i64),
+            ("publication:PUBLIE_BULLETIN".to_string(), 300),
+            ("publication:PUBLIE_RAPPORT".to_string(), 2),
+        ]);
+        let scaled = scale_choices(&counter, &refs);
+        let values: Vec<&str> = scaled.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(
+            values,
+            ["PUBLIE_RAPPORT", "PUBLIE_BULLETIN", "INEDIT_BULLETIN"]
+        );
+        assert_eq!(
+            uid_choices(&counter, &refs)[0].value,
+            "INEDIT_BULLETIN",
+            "les facettes plates gardent l'ordre du compteur"
+        );
+    }
+
+    #[test]
+    fn group_facet_aggregates_members_under_group() {
         let refs = Referential::new(
             vec![
                 fv("legal_domain:CIVIL", "Civil", None),
@@ -716,13 +914,14 @@ mod tests {
                 fv("legal_domain:FISCAL", "Fiscal", None),
             ],
             Vec::new(),
+            Vec::new(),
         );
         let counter = HashMap::from([
             ("legal_domain:CIVIL_DROIT_LOCATIF".to_string(), 3i64),
             ("legal_domain:CIVIL".to_string(), 1),
             ("legal_domain:FISCAL".to_string(), 2),
         ]);
-        let choices = domain_choices(&counter, &refs);
+        let choices = group_choices(&counter, &refs);
         let civil = choices.iter().find(|c| c.value == "CIVIL").unwrap();
         assert_eq!((civil.count, civil.parent.clone()), (4, None));
         let fiscal = choices.iter().find(|c| c.value == "FISCAL").unwrap();
@@ -738,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn juridiction_facet_nests_codes_under_types() {
+    fn juridiction_facet_nests_types_codes_et_formations() {
         let refs = Referential::new(
             vec![fv("jurisdiction_type:TJ", "Tribunal judiciaire", None)],
             vec![lj_store::repository::JurisdictionRow {
@@ -748,14 +947,57 @@ mod tests {
                 city: Some("Le Havre".to_string()),
                 label: "Tribunal judiciaire du Havre".to_string(),
             }],
+            Vec::new(),
         );
-        let roots = HashMap::from([("TJ".to_string(), 5i64)]);
-        let children = HashMap::from([(("TJ".to_string(), "tj_le_havre".to_string()), 4i64)]);
-        let choices = jurisdiction_choices(&roots, &children, &refs);
+        let choices = seat_choices(
+            &HashMap::from([
+                ("TJ".to_string(), 5i64),
+                ("TJ.LE_HAVRE".to_string(), 4),
+                ("TJ.LE_HAVRE.C3".to_string(), 2),
+            ]),
+            &refs,
+        );
         assert_eq!(choices[0].value, "TJ");
         assert_eq!(choices[0].label, "Tribunal judiciaire");
-        let child = choices.iter().find(|c| c.value == "tj_le_havre").unwrap();
+        let child = choices.iter().find(|c| c.value == "TJ.LE_HAVRE").unwrap();
         assert_eq!(child.parent.as_deref(), Some("TJ"));
         assert_eq!(child.label, "Tribunal judiciaire du Havre");
+        let chambre = choices
+            .iter()
+            .find(|c| c.value == "TJ.LE_HAVRE.C3")
+            .unwrap();
+        assert_eq!(chambre.parent.as_deref(), Some("TJ.LE_HAVRE"));
+        assert_eq!((chambre.label.as_str(), chambre.count), ("3e chambre", 2));
+    }
+
+    #[test]
+    fn le_referentiel_qualifie_le_libelle_de_chambre() {
+        let refs = Referential::new(
+            vec![fv("jurisdiction_type:CC", "Cour de cassation", None)],
+            vec![lj_store::repository::JurisdictionRow {
+                code: "cc".to_string(),
+                source_code: "cc".to_string(),
+                jurisdiction_type: "CC".to_string(),
+                city: None,
+                label: "Cour de cassation".to_string(),
+            }],
+            Vec::new(),
+        );
+        let choices = seat_choices(
+            &HashMap::from([
+                ("CC".to_string(), 9i64),
+                ("CC.C2_CIVILE".to_string(), 5),
+                ("CC.SOCIALE".to_string(), 4),
+            ]),
+            &refs,
+        );
+        let label = |v: &str| {
+            choices
+                .iter()
+                .find(|c| c.value == v)
+                .map(|c| c.label.as_str())
+        };
+        assert_eq!(label("CC.C2_CIVILE"), Some("2e chambre civile"));
+        assert_eq!(label("CC.SOCIALE"), Some("Chambre sociale"));
     }
 }

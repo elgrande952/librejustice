@@ -1,7 +1,7 @@
 # ============================================================================
 # CONTRACT TESTS — pot Annonces
 # ----------------------------------------------------------------------------
-# GET /api/annonces, /api/annonces/catalogue, /api/annonces/{uid} et les flux
+# GET /internal/annonces, /internal/annonces/catalogue, /internal/annonces/{uid} et les flux
 # d'alerte /annonces.rss + /annonces.ics.
 # Asserts HTTP status + JSON STRUCTURAL invariants only.
 # Variable: {{base}} = host root (e.g. http://localhost:3000).
@@ -13,7 +13,7 @@
 # ============================================================================
 
 # ── 1. Baseline : la fenêtre ouverte, tous fonds ─────────────────────────────
-GET {{base}}/api/annonces
+GET {{base}}/internal/annonces
 HTTP 200
 [Asserts]
 header "Content-Type" contains "application/json"
@@ -36,7 +36,7 @@ jsonpath "$.axes[0].choices" count >= 2
 
 
 # ── 2. Un seul fond : ses axes propres apparaissent ──────────────────────────
-GET {{base}}/api/annonces?fond=marche
+GET {{base}}/internal/annonces?fond=marche
 HTTP 200
 [Asserts]
 jsonpath "$.groupes" count == 1
@@ -54,7 +54,7 @@ dept: jsonpath "$.axes[1].choices[0].value"
 
 
 # ── 3. Hit shape (assert sur le premier hit du fond `marche`) ────────────────
-GET {{base}}/api/annonces?fond=marche&limit=5
+GET {{base}}/internal/annonces?fond=marche&limit=5
 HTTP 200
 [Asserts]
 jsonpath "$.groupes[0].hits" count <= 5
@@ -71,7 +71,7 @@ jsonpath "$.groupes[0].hits[0].canaux" isCollection
 
 
 # ── 4. Le fond `bodacc` est servi en proxy live, mêmes champs ────────────────
-GET {{base}}/api/annonces?fond=bodacc&limit=3
+GET {{base}}/internal/annonces?fond=bodacc&limit=3
 HTTP 200
 [Asserts]
 jsonpath "$.groupes" count == 1
@@ -88,7 +88,7 @@ jsonpath "$.axes[2].key" == "departement"
 
 
 # ── 5. Le fond `joafe` est servi en proxy live, mêmes champs ─────────────────
-GET {{base}}/api/annonces?fond=joafe&limit=3
+GET {{base}}/internal/annonces?fond=joafe&limit=3
 HTTP 200
 [Asserts]
 jsonpath "$.groupes" count == 1
@@ -106,7 +106,7 @@ jsonpath "$.axes[2].key" == "departement"
 # ── 6. Le statut est dérivé, pas un fond ────────────────────────────────────
 # Un marché attribué reste une ligne du fond `marche` : même uid, même acteur,
 # `attribue` en plus de `closed`. Le stock clos porte les attributions.
-GET {{base}}/api/annonces?fond=marche&closes=true&limit=3
+GET {{base}}/internal/annonces?fond=marche&closes=true&limit=3
 HTTP 200
 [Asserts]
 jsonpath "$.groupes" count == 1
@@ -119,7 +119,7 @@ jsonpath "$.groupes[0].hits[0].attribue" isBoolean
 
 
 # ── 7. Filtre département (code canonique, capturé de l'axe) ─────────────────
-GET {{base}}/api/annonces?fond=marche&departement={{dept}}
+GET {{base}}/internal/annonces?fond=marche&departement={{dept}}
 HTTP 200
 [Asserts]
 jsonpath "$.groupes[0].hits" isCollection
@@ -128,22 +128,42 @@ jsonpath "$.groupes[0].hits[0].departementLabel" isString
 
 
 # ── 8. Fenêtre d'échéance + tri nouveautés ───────────────────────────────────
-GET {{base}}/api/annonces?fond=marche&echeanceJours=30&sort=nouveautes
+GET {{base}}/internal/annonces?fond=marche&echeanceJours=30&sort=nouveautes
 HTTP 200
 [Asserts]
 jsonpath "$.sort" == "nouveautes"
 jsonpath "$.groupes" isCollection
 
+# La fenêtre garde sa borne basse même quand `closes` retire le prédicat
+# « ouverte » : « ferme sous 7 jours » ne parle que de délais qui courent
+# encore. Sans cette borne, la facette comptait tout l'historique clos.
+GET {{base}}/internal/annonces?fond=marche&closes=true&echeanceJours=7&limit=3
+HTTP 200
+[Asserts]
+jsonpath "$.groupes[0].hits[0].closed" == false
+jsonpath "$.groupes[0].hits[2].closed" == false
+jsonpath "$.axes[4].key" == "echeanceJours"
+jsonpath "$.axes[4].choices[0].value" == "7"
+[Captures]
+ferme7: jsonpath "$.total"
+
+# Le compte de la facette est celui des résultats du même filtre : l'axe se
+# calcule sans la fenêtre courante, la fenêtre est le seul filtre posé.
+GET {{base}}/internal/annonces?fond=marche&closes=true&echeanceJours=7&limit=3
+HTTP 200
+[Asserts]
+jsonpath "$.axes[4].choices[0].count" == {{ferme7}}
+
 
 # ── 9. Filtre par mot sur titre + acteur ─────────────────────────────────────
-GET {{base}}/api/annonces?q=travaux
+GET {{base}}/internal/annonces?q=travaux
 HTTP 200
 [Asserts]
 jsonpath "$.groupes" isCollection
 
 
 # ── 10. Fond inconnu ⇒ 4xx (un jeton qui filtrerait dans le vide) ─────────────
-GET {{base}}/api/annonces?fond=inconnu
+GET {{base}}/internal/annonces?fond=inconnu
 HTTP *
 [Asserts]
 status >= 400
@@ -151,7 +171,7 @@ status < 500
 
 # `attribution` a été un fond avant de devenir un statut.
 # Le jeton mort est refusé comme n'importe quel inconnu : pas d'alias.
-GET {{base}}/api/annonces?fond=attribution
+GET {{base}}/internal/annonces?fond=attribution
 HTTP *
 [Asserts]
 status >= 400
@@ -159,19 +179,19 @@ status < 500
 
 
 # ── 11. Bornes : limit et offset hors plage ⇒ 4xx ─────────────────────────────
-GET {{base}}/api/annonces?limit=101
+GET {{base}}/internal/annonces?limit=101
 HTTP *
 [Asserts]
 status >= 400
 status < 500
 
-GET {{base}}/api/annonces?offset=5001
+GET {{base}}/internal/annonces?offset=5001
 HTTP *
 [Asserts]
 status >= 400
 status < 500
 
-GET {{base}}/api/annonces?sort=pertinence
+GET {{base}}/internal/annonces?sort=pertinence
 HTTP *
 [Asserts]
 status >= 400
@@ -179,7 +199,7 @@ status < 500
 
 
 # ── 12. Catalogue : les chemins de crawl du fond `marche` ────────────────────
-GET {{base}}/api/annonces/catalogue
+GET {{base}}/internal/annonces/catalogue
 HTTP 200
 [Asserts]
 jsonpath "$.fond" == "marche"
@@ -192,7 +212,7 @@ jsonpath "$.familles" isCollection
 
 
 # ── 13. Fiche : la consultation capturée en 2 ────────────────────────────────
-GET {{base}}/api/annonces/{{uid}}
+GET {{base}}/internal/annonces/{{uid}}
 HTTP 200
 [Asserts]
 jsonpath "$.annonce.uid" == "{{uid}}"
@@ -205,7 +225,7 @@ jsonpath "$.entites" isCollection
 
 
 # ── 14. Fiche inconnue ⇒ 404 ─────────────────────────────────────────────────
-GET {{base}}/api/annonces/marche:0000000000000000
+GET {{base}}/internal/annonces/marche:0000000000000000
 HTTP 404
 
 

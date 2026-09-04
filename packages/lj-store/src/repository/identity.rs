@@ -840,6 +840,27 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
+    /// Décisions CE actives comptées par année de lecture : le côté « fonds » du
+    /// recensement, à comparer à celui d'ArianeWeb.
+    #[tracing::instrument(name = "db.ce_counts_by_year", skip(self), fields(db.system = "postgresql"))]
+    pub async fn ce_counts_by_year(&self) -> Result<Vec<(i32, i64)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT extract(year from date_lecture)::int, count(*) \
+                 FROM decisions \
+                 WHERE jurisdiction_type = 'CE' AND deleted_at IS NULL \
+                   AND date_lecture IS NOT NULL \
+                 GROUP BY 1",
+                &[],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<_, i32>(0), r.get::<_, i64>(1)))
+            .collect())
+    }
+
     /// Index de rattachement ArianeWeb : une entrée par (n° de dossier, date de
     /// lecture ISO) des décisions CE actives — `docket_numbers` dénesté. Chargé une
     /// fois par run `sync-ariane`, la jointure se fait en mémoire.

@@ -233,10 +233,10 @@ enum PdfMsg {
     Unreadable,
 }
 
-/// Appels OCR Mistral en vol simultanément. Une clé doc ne vit que ~30 min
-/// après sa 1ʳᵉ utilisation depuis l'IP datacenter, quel que soit le volume :
-/// on sature la fenêtre au lieu de la laisser s'écouler entre deux appels.
-/// Les 429 éventuels sont absorbés par le back-off d'[`ocr_with_retry`].
+/// Mistral OCR calls in flight at once. A doc key lives ~30 min from its first
+/// use whatever the volume, so the window is saturated rather than left to
+/// drain between two calls. Any 429 is absorbed by the back-off of
+/// [`ocr_with_retry`].
 const OCR_CONCURRENCY: usize = 8;
 
 /// Un membre PDF résolu en corps (ou compté) par le pipeline concurrent.

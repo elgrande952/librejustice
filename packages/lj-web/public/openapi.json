@@ -1,0 +1,2473 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "API publique LibreJustice",
+    "version": "1",
+    "summary": "Recherche de jurisprudence française et européenne et de textes normatifs.",
+    "description": "La même base que le site librejustice.fr et que le connecteur MCP, en REST.\n\nLa clé est gratuite : créez un compte, puis une clé depuis https://librejustice.fr/profile. Le guide d'intégration est sur https://librejustice.fr/api-guide.\n\nLes autres chemins de librejustice.fr ne sont pas une API : ils servent le front, changent sans préavis et ne sont pas décrits ici. Une rupture de contrat sur les chemins ci-dessous prendra un `/api/v2`.\n\nLes requêtes s'écrivent en français : le fonds est en langue française.",
+    "contact": {
+      "name": "LibreJustice",
+      "url": "https://librejustice.fr/feedback"
+    },
+    "license": {
+      "name": "Apache-2.0",
+      "identifier": "Apache-2.0"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://librejustice.fr"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    },
+    {
+      "apiKeyHeader": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Jurisprudence",
+      "description": "Décisions des juridictions françaises et européennes."
+    },
+    {
+      "name": "Normes",
+      "description": "Articles du référentiel de textes, à leur version en vigueur ou à une date passée."
+    }
+  ],
+  "paths": {
+    "/api/search": {
+      "get": {
+        "operationId": "searchDecisions",
+        "tags": [
+          "Jurisprudence"
+        ],
+        "summary": "Rechercher des décisions",
+        "description": "Recherche hybride sens + mots-clés sur le fonds de décisions, avec filtres structurés et comptes par facette.\n\nLes valeurs des axes à vocabulaire (`solution`, `procedure`, `office`, `legalDomain`, `publication`, `jurisdictionCode`, `chamber`) ne sont pas listées ici : elles bougent avec le référentiel. Sur les axes fermés (`solution`, `procedure`, `office`, `legalDomain`, `publication`), un token inconnu rend un 422 dont `ctx` porte les valeurs acceptées ; sur `jurisdictionCode` et `chamber`, il nomme les plus proches. Dans tous les cas `facets` renvoie celles qui portent des résultats sous la requête courante, réutilisables telles quelles en filtre.",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "description": "Requête en français, 512 caractères au plus. Les guillemets et les opérateurs `ET` / `OU` / `SAUF` / `PROCHE<n>` basculent en appariement littéral.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "example": "trouble anormal de voisinage"
+          },
+          {
+            "name": "jurisdictionType",
+            "in": "query",
+            "description": "Catégorie de juridiction. Répétable, valeurs cumulées en OU.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "TJ",
+                  "CA",
+                  "CC",
+                  "TCOM",
+                  "TA",
+                  "CAA",
+                  "CE",
+                  "CNDA",
+                  "CONSTIT",
+                  "TC",
+                  "CNIL",
+                  "CEDH",
+                  "CJUE"
+                ]
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "jurisdictionCode",
+            "in": "query",
+            "description": "Cour précise par son code de référentiel : `cc`, `ce`, `cnda`, `cedh`, `cjue`, ou `<type>_<ville>` (`ca_paris`, `ta_marseille`, `tj_paris`, `tcom_lyon`). Répétable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 40
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "seat",
+            "in": "query",
+            "description": "Siège, en chemin pointé du type de juridiction à la salle : `CC`, `CC.SOCIALE`, `CA.PARIS`, `CA.PARIS.P5.C6`. Un chemin matche lui-même et tout ce qui est dessous, et dit à lui seul ce que `jurisdictionType` et `jurisdictionCode` disent à ses deux premières profondeurs. Répétable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 60
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "solution",
+            "in": "query",
+            "description": "Sens du dispositif (référentiel solution). Répétable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "procedure",
+            "in": "query",
+            "description": "Voie procédurale (référés, QPC, renvoi préjudiciel, révision…). Répétable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "office",
+            "in": "query",
+            "description": "Juge spécialisé (JLD, JAF, JEX, juge des enfants…). Répétable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "legalDomain",
+            "in": "query",
+            "description": "Domaine juridique de l'arbre curaté : 9 racines et leurs feuilles. Sélectionner une racine prend aussi ses feuilles. Répétable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "publication",
+            "in": "query",
+            "description": "Niveau de publication, au grain des juridictions elles-mêmes (bulletin, rapport annuel, Lebon…). Les juridictions du fond n'en portent pas et ne répondent à aucune valeur. Répétable.",
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "legalInstrument",
+            "in": "query",
+            "description": "Décisions citant un code ou une loi, par slug (`code-civil`) ou par nom exact (`Code civil`). Répétable, 10 valeurs au plus.",
+            "schema": {
+              "type": "array",
+              "maxItems": 10,
+              "items": {
+                "type": "string",
+                "maxLength": 100
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "legalArticle",
+            "in": "query",
+            "description": "Décisions citant un article précis, en clé composite `<texte>|<article>` (`code-civil|1240`). Le préfixe de texte est obligatoire : le même numéro existe dans plusieurs codes. Répétable, 20 valeurs au plus.",
+            "schema": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "string",
+                "maxLength": 140
+              }
+            },
+            "style": "form",
+            "explode": true
+          },
+          {
+            "name": "dateFrom",
+            "in": "query",
+            "description": "Date de lecture minimale, incluse.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "name": "dateTo",
+            "in": "query",
+            "description": "Date de lecture maximale, incluse.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "name": "mode",
+            "in": "query",
+            "description": "`auto` arbitre seul entre sens et mots-clés. `lexical` force l'appariement littéral, seul moyen de viser une formulation exacte, l'appariement sémantique ignorant les négations. `semantic` force le sens.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "auto",
+                "lexical",
+                "semantic"
+              ],
+              "default": "auto"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "relevance",
+                "date_desc",
+                "date_asc"
+              ],
+              "default": "relevance"
+            }
+          },
+          {
+            "name": "aiMode",
+            "in": "query",
+            "description": "Réordonne la tête de liste par pertinence réelle avec un reranker LLM. Améliore nettement la qualité de la sélection, contre quelques secondes de latence.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 50,
+              "default": 20
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rang du premier résultat servi, borné à 99. C'est une recherche, pas un export : affinez les filtres plutôt que de paginer loin.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 99,
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Résultats, comptes par facette et total.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "facets": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "filterRewritten": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "hits": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "aiSummary": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "chars": {
+                            "type": "integer"
+                          },
+                          "dateLecture": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "docketNumbers": {
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "type": "string"
+                                },
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "jurisdictionCode": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "jurisdictionType": {
+                            "type": "string"
+                          },
+                          "legalDomain": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "office": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "officialUrl": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "procedure": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "publication": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "seat": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "snippet": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "solution": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "title",
+                          "url",
+                          "chars",
+                          "jurisdictionType"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "pinned": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "title": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "title",
+                          "url"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "query": {
+                      "type": "string"
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "query",
+                    "total",
+                    "hits"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/search-textes": {
+      "get": {
+        "operationId": "searchLegalTexts",
+        "tags": [
+          "Normes"
+        ],
+        "summary": "Rechercher des articles de textes",
+        "description": "Retrouve un article à partir de son objet ou de sa formulation quand le numéro est inconnu. Apparie les intitulés (survalorisés) et les corps.",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "description": "Requête en français, 512 caractères au plus.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "example": "responsabilité du fait des choses"
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "description": "Borne la recherche à un texte, par slug d'URL (`code-civil`, tel qu'il apparaît dans `facets.code`) ou par nom exact.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "jurisdiction",
+            "in": "query",
+            "description": "Pays ou ordre juridique, en code ISO 3166 alpha-2 (`FR`, `SN`, `MA`…), plus `UE` pour le droit de l'Union et `INTL` pour les traités.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "date",
+            "in": "query",
+            "description": "Date de consultation : cherche dans les versions valides ce jour-là. Absente, cherche dans celles en vigueur aujourd'hui.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "description": "Rang du premier résultat servi, borné à 99 comme sur les décisions.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 99,
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Articles appariés, comptes par facette et total.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "facets": {
+                      "additionalProperties": true,
+                      "type": "object"
+                    },
+                    "hits": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "snippet": {
+                            "type": "string"
+                          },
+                          "source": {
+                            "type": "string"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "titlePath": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "url": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "title",
+                          "url",
+                          "snippet",
+                          "source"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "query": {
+                      "type": "string"
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "query",
+                    "total",
+                    "hits",
+                    "facets"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/decision/{id}": {
+      "get": {
+        "operationId": "getDecision",
+        "tags": [
+          "Jurisprudence"
+        ],
+        "summary": "Lire une décision entière",
+        "description": "Texte intégral et métadonnées. L'identifiant est celui que porte chaque résultat de recherche et chaque URL `/decision/{id}` ; il est opaque et ne s'énumère pas.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "HrsWxKX8KYyC"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Décision entière.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "appellateFate": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "caseChronology": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "current": {
+                            "type": "boolean"
+                          },
+                          "linkToNext": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "solution": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          }
+                        },
+                        "required": [
+                          "title",
+                          "current"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "commentaires": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "access": {
+                            "anyOf": [
+                              {
+                                "enum": [
+                                  "libre",
+                                  "abonnes"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "author": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "body": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "kind": {
+                            "enum": [
+                              "analyse",
+                              "conclusions",
+                              "note"
+                            ],
+                            "type": "string"
+                          },
+                          "publisher": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "renvois": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "rubriques": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "title": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "dateLecture": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "docketNumbers": {
+                      "anyOf": [
+                        {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "jurisdictionCode": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "jurisdictionType": {
+                      "type": "string"
+                    },
+                    "legalDomain": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "office": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "officialUrl": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "procedure": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "publication": {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    "seat": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "solution": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "title",
+                    "url",
+                    "jurisdictionType",
+                    "text"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/texte/{code}": {
+      "get": {
+        "summary": "Lire un texte sans passer par un article",
+        "description": "Un texte sans articles (circulaire, décret de publication, lignes directrices) rend son corps ; un texte qui en porte rend son sommaire, les corps courts attachés dessous.",
+        "tags": [
+          "Normes"
+        ],
+        "operationId": "getLegalTextRoot",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CodeSlug"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Le corps du texte, ou son sommaire.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "articleCount": {
+                      "type": "integer"
+                    },
+                    "articles": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "article",
+                              "section"
+                            ],
+                            "type": "string"
+                          },
+                          "num": {
+                            "type": "string"
+                          },
+                          "section": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "num",
+                          "url"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "commentaires": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "access": {
+                            "anyOf": [
+                              {
+                                "enum": [
+                                  "libre",
+                                  "abonnes"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "author": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "body": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "kind": {
+                            "enum": [
+                              "analyse",
+                              "conclusions",
+                              "note"
+                            ],
+                            "type": "string"
+                          },
+                          "publisher": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "renvois": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "rubriques": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "title": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "dateDebut": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "dateFin": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "etat": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "nota": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "num": {
+                      "type": "string"
+                    },
+                    "omitted": {
+                      "type": "integer"
+                    },
+                    "sourceUrl": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "text": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "versions": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "dateDebut": {
+                            "format": "date",
+                            "type": "string"
+                          },
+                          "dateFin": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "etat": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "etat",
+                          "dateDebut"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "title",
+                    "url",
+                    "versions"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/texte/{code}/section/{cid}": {
+      "get": {
+        "summary": "Lire une division d'un texte",
+        "description": "La division qu'un sommaire adresse, ses articles attachés. Sans elle, lire un chapitre coûte un appel par article.",
+        "tags": [
+          "Normes"
+        ],
+        "operationId": "getLegalTextSection",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CodeSlug"
+          },
+          {
+            "name": "cid",
+            "in": "path",
+            "required": true,
+            "description": "Identifiant de division, tel qu'il apparaît dans les URL `/texte/{code}/section/{cid}`.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "LEGISCTA000006117617"
+          },
+          {
+            "name": "date",
+            "in": "query",
+            "description": "Version en vigueur à cette date. Absente, la version en vigueur aujourd'hui. Aucune version à cette date rend un 404.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "example": "2015-06-01"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "La division et ses articles.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "articleCount": {
+                      "type": "integer"
+                    },
+                    "articles": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "article",
+                              "section"
+                            ],
+                            "type": "string"
+                          },
+                          "num": {
+                            "type": "string"
+                          },
+                          "section": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "num",
+                          "url"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "commentaires": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "access": {
+                            "anyOf": [
+                              {
+                                "enum": [
+                                  "libre",
+                                  "abonnes"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "author": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "body": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "kind": {
+                            "enum": [
+                              "analyse",
+                              "conclusions",
+                              "note"
+                            ],
+                            "type": "string"
+                          },
+                          "publisher": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "renvois": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "rubriques": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "title": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "dateDebut": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "dateFin": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "etat": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "nota": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "num": {
+                      "type": "string"
+                    },
+                    "omitted": {
+                      "type": "integer"
+                    },
+                    "sourceUrl": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "text": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "versions": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "dateDebut": {
+                            "format": "date",
+                            "type": "string"
+                          },
+                          "dateFin": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "etat": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "etat",
+                          "dateDebut"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "title",
+                    "url",
+                    "versions"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/texte/{code}/{article}": {
+      "get": {
+        "summary": "Lire un article",
+        "description": "Un article dans sa version en vigueur, ou telle qu'elle était à la date passée en `date`.",
+        "tags": [
+          "Normes"
+        ],
+        "operationId": "getLegalArticle",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CodeSlug"
+          },
+          {
+            "$ref": "#/components/parameters/ArticleKey"
+          },
+          {
+            "name": "date",
+            "in": "query",
+            "description": "Version en vigueur à cette date. Absente, la version en vigueur aujourd'hui. Aucune version à cette date rend un 404.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "example": "2015-06-01"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "L'article, son état et ses versions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "articleCount": {
+                      "type": "integer"
+                    },
+                    "articles": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "article",
+                              "section"
+                            ],
+                            "type": "string"
+                          },
+                          "num": {
+                            "type": "string"
+                          },
+                          "section": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "num",
+                          "url"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "commentaires": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "access": {
+                            "anyOf": [
+                              {
+                                "enum": [
+                                  "libre",
+                                  "abonnes"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "author": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "body": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "kind": {
+                            "enum": [
+                              "analyse",
+                              "conclusions",
+                              "note"
+                            ],
+                            "type": "string"
+                          },
+                          "publisher": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "renvois": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "rubriques": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "title": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "dateDebut": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "dateFin": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "etat": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "nota": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "num": {
+                      "type": "string"
+                    },
+                    "omitted": {
+                      "type": "integer"
+                    },
+                    "sourceUrl": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "text": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "versions": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "dateDebut": {
+                            "format": "date",
+                            "type": "string"
+                          },
+                          "dateFin": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "etat": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "etat",
+                          "dateDebut"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "title",
+                    "url",
+                    "versions"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/article/{uid}": {
+      "get": {
+        "summary": "Lire un article par son identifiant Légifrance",
+        "description": "Toutes les versions d'un article partagent leur `LEGIARTI…`, donc l'identifiant en désigne presque toujours un seul ; ce qui en désigne plusieurs, ou aucun, rend un 404. Les identifiants `LEGITEXT` et les CID ne sont pas des articles.",
+        "tags": [
+          "Normes"
+        ],
+        "operationId": "getLegalArticleById",
+        "parameters": [
+          {
+            "name": "uid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^LEGIARTI[0-9]+$"
+            },
+            "example": "LEGIARTI000006419282"
+          },
+          {
+            "name": "date",
+            "in": "query",
+            "description": "Version en vigueur à cette date. Absente, la version en vigueur aujourd'hui. Aucune version à cette date rend un 404.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            },
+            "example": "2015-06-01"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "L'article, son état et ses versions.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "articleCount": {
+                      "type": "integer"
+                    },
+                    "articles": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "article",
+                              "section"
+                            ],
+                            "type": "string"
+                          },
+                          "num": {
+                            "type": "string"
+                          },
+                          "section": {
+                            "type": "string"
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "num",
+                          "url"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "commentaires": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "access": {
+                            "anyOf": [
+                              {
+                                "enum": [
+                                  "libre",
+                                  "abonnes"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "author": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "body": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "kind": {
+                            "enum": [
+                              "analyse",
+                              "conclusions",
+                              "note"
+                            ],
+                            "type": "string"
+                          },
+                          "publisher": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "renvois": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "rubriques": {
+                            "items": {
+                              "type": "string"
+                            },
+                            "type": "array"
+                          },
+                          "title": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "dateDebut": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "dateFin": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null,
+                      "format": "date"
+                    },
+                    "etat": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "nota": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "num": {
+                      "type": "string"
+                    },
+                    "omitted": {
+                      "type": "integer"
+                    },
+                    "sourceUrl": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "text": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "default": null
+                    },
+                    "title": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "versions": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "dateDebut": {
+                            "format": "date",
+                            "type": "string"
+                          },
+                          "dateFin": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "etat": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "etat",
+                          "dateDebut"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "title",
+                    "url",
+                    "versions"
+                  ],
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "`Authorization: Bearer <clé>`. La clé se crée depuis https://librejustice.fr/profile."
+      },
+      "apiKeyHeader": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-lj-api-key",
+        "description": "Accepté à la place du Bearer."
+      }
+    },
+    "parameters": {
+      "CodeSlug": {
+        "name": "code",
+        "in": "path",
+        "required": true,
+        "description": "Le texte, par son slug d'URL (`code-civil`), son nom (`Code civil`) ou son sigle (`cgi`, `ceseda`). Le slug est celui que portent les `url` servies.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "code-civil"
+      },
+      "ArticleKey": {
+        "name": "article",
+        "in": "path",
+        "required": true,
+        "description": "Le numéro d'article, dans n'importe quelle graphie : `1240`, `L. 761-1`, `Article L761-1`. Il est normalisé en clé, celle que portent les `url` servies.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "1240"
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Clé absente ou invalide. L'en-tête `Link` pointe le guide.",
+        "headers": {
+          "Link": {
+            "description": "`<https://librejustice.fr/api-guide>; rel=\"help\"`",
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string",
+                  "enum": [
+                    "api_key_required",
+                    "api_key_invalid"
+                  ]
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "Ressource inconnue.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string",
+                  "const": "not_found"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "Paramètre invalide. `detail` liste les erreurs ; sur un axe fermé, `ctx` porte les valeurs acceptées.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "type": {
+                        "type": "string",
+                        "examples": [
+                          "enum",
+                          "less_than_equal",
+                          "string_too_long"
+                        ]
+                      },
+                      "loc": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "examples": [
+                          [
+                            "query",
+                            "limit"
+                          ]
+                        ]
+                      },
+                      "msg": {
+                        "type": "string"
+                      },
+                      "input": {
+                        "type": "string"
+                      },
+                      "ctx": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "Budget dépassé. Une identité, un budget : les appels API, les appels MCP et les recherches sur le site s'imputent au même compteur.",
+        "headers": {
+          "Retry-After": {
+            "description": "Secondes à attendre.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "detail": {
+                  "type": "string",
+                  "const": "rate_limited"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

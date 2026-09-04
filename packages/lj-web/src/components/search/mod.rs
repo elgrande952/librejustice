@@ -12,6 +12,7 @@ pub mod filter_dropdown;
 pub mod hero_search;
 pub mod legal_instrument_filter;
 pub mod pagination;
+pub mod query_length;
 pub mod result_card;
 pub mod result_empty;
 pub mod result_error;
@@ -23,20 +24,19 @@ pub mod sort_select;
 pub mod suggest_box;
 pub mod syntax_hint;
 pub mod text_results;
+pub mod view_prefs;
 
 pub use active_filters::ActiveFilterChips;
 pub use annonce_results::AnnoncesView;
 pub use compact_search::CompactSearch;
-pub use corpus_intro::{
-    corpus_stats, DecisionsCorpusLine, DecisionsCorpusSummary, DecisionsCorpusTeaser,
-    DecisionsExamples, JuridictionsRail, NormesRail, TextesCorpusLine, TextesCorpusSummary,
-    TextesCorpusTeaser, TextesExamples,
-};
+pub use corpus_intro::{corpus_stats, DecisionsCorpusTeaser, TextesCorpusTeaser};
 pub use cross_teaser::{DecisionsTeaser, TextesTeaser};
 pub use date_range_picker::DateRangePicker;
+pub use facet_widgets::StaleCounts;
 pub use filter_bar::DecisionsFilterBar;
 pub use hero_search::HeroSearch;
 pub use pagination::Pagination;
+pub use query_length::{truncate_to_cap, QueryLengthNotice};
 pub use result_card::ResultCard;
 pub use result_empty::ResultEmpty;
 pub use result_error::ResultError;
@@ -47,3 +47,4 @@ pub use search_submit::SearchSubmit;
 pub use sort_select::SortSelect;
 pub use syntax_hint::{HelpCorpus, SyntaxHint};
 pub use text_results::TextesView;
+pub use view_prefs::{effective_card_view, provide_card_view_pref, CardView, ViewControls};

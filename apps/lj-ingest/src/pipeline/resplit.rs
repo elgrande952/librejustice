@@ -1,25 +1,18 @@
 //! Réparation des faux merges judilibre.
 //!
-//! La dédup historique (clé `identity_key` sans `location`) a fusionné des
-//! décisions distinctes partageant un RG. `fuse_cluster` a conservé les
-//! `decision_sources` des membres supprimés (re-pointés vers le canonique) : une
-//! décision faussement fusionnée porte donc ≥2 provenances actives dont les
-//! `canonical_ref` divergent. Le `full_text`/chunks/embeddings des membres
-//! supprimés sont perdus, d'où le re-fetch.
+//! Une clé `identity_key` sans `location` a fusionné des décisions distinctes
+//! partageant un RG. La fusion a re-pointé les `decision_sources` des perdants
+//! vers le canonique : une décision faussement fusionnée porte donc ≥2
+//! provenances dont les `canonical_ref` divergent. Leur texte est perdu, d'où le
+//! re-fetch.
 //!
-//! Cette passe :
-//! 1. recalcule `canonical_ref` par provenance (`Decision::from_source_fields`,
-//!    full_text vide — les discriminants vivent dans les champs structurés) ;
-//! 2. planifie le scinde (logique pure, testée) : groupe par `canonical_ref`,
-//!    désigne un groupe gardé (clé minimale, déterministe) qui réutilise la ligne
-//!    canonique, et les groupes divergents à reconstituer ; tout `None` ⇒ ambigu,
-//!    jamais scindé ;
-//! 3. en `--execute` (write, gaté) : crée une décision séparée par groupe
-//!    divergent (re-pointe ses provenances), puis re-fetch chaque groupe — gardé
-//!    inclus — et ré-ingère (re-chunk + re-embed ciblé vLLM local). Chaque
-//!    décision récupère ainsi son propre contenu depuis la source : la ligne
-//!    `decisions` ne porte ni `source_uid` ni `location` qui certifierait à qui
-//!    appartient son contenu.
+//! 1. recalcule `canonical_ref` par provenance (full_text vide — les
+//!    discriminants vivent dans les champs structurés) ;
+//! 2. planifie le scinde (pur, testé) : groupe par `canonical_ref`, garde le
+//!    groupe de clé minimale sur la ligne canonique ; tout `None` ⇒ jamais
+//!    scindé ;
+//! 3. en `--execute` : une décision par groupe divergent, puis re-fetch et
+//!    ré-ingest de chaque groupe.
 //!
 //! `--dry-run` (défaut) : émet le PLAN exact sans aucune écriture.
 
@@ -34,7 +27,7 @@ use lj_sources::judilibre::JudilibreClient;
 use lj_store::db::Connection;
 use lj_store::repository::DecisionRepository;
 
-use super::embed::build_vllm_strict;
+use super::embed::build_local_strict;
 use super::generate_public_id;
 use super::opendata::refetch_into;
 use crate::config::Settings;
@@ -162,14 +155,12 @@ struct Stats {
     split_decisions_created: u64,
 }
 
-/// Réparation des faux merges judilibre.
+/// Repairs the judilibre false merges.
 ///
-/// `dry_run` (défaut côté CLI) : émet le PLAN exact, aucune écriture (ni DB, ni
-/// réseau, ni GPU) — `client` est ignoré.
-/// `execute = !dry_run` : crée les décisions scindées, re-fetch via `client` +
-/// ré-ingère leur contenu (re-chunk + re-embed ciblé vLLM local). SAVEPOINT par
-/// cluster, reprise idempotente. À NE PAS lancer pendant l'ingest JADE (écritures
-/// concurrentes + contention GPU vLLM).
+/// `dry_run` emits the plan and writes nothing, neither DB, network nor GPU,
+/// and ignores `client`. Otherwise the split decisions are created and
+/// re-ingested, one SAVEPOINT per cluster, idempotent on resume. Not to be run
+/// during a JADE ingest: concurrent writes, and both contend for the same GPU.
 pub async fn resplit_false_merges(
     client: Option<&JudilibreClient>,
     dry_run: bool,
@@ -185,16 +176,13 @@ pub async fn resplit_false_merges(
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
     let repo = DecisionRepository::new(&conn);
 
-    // Embedder seulement en mode execute (le dry-run ne touche ni réseau ni GPU).
-    // Re-embed ciblé via `build_vllm_strict` : vLLM local uniquement, erreur franche
-    // si vLLM est injoignable.
     let embedder = if dry_run {
         None
     } else {
         if client.is_none() {
             return Err(anyhow!("mode --execute requiert un client Judilibre"));
         }
-        Some(build_vllm_strict(&settings).await?)
+        Some(build_local_strict(&settings).await?)
     };
 
     let mut last_id: i64 = 0;

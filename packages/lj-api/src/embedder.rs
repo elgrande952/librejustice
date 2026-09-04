@@ -1,8 +1,5 @@
-//! Sélection du backend d'embedding côté API.
-//!
-//! L'embedder est partagé pour toute la durée du process : pas de coût d'init
-//! par requête (Cloudflare ouvre un pool HTTP `reqwest`, vLLM est un simple
-//! POST HTTP). On ne le ré-instancie jamais en réponse à une requête.
+//! The embedder is shared for the whole process life, never re-instantiated in
+//! response to a request.
 
 use crate::config::Settings;
 use lj_llm::backend::{AnyEmbedder, DummyEmbedder};
@@ -17,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 /// signature est infaillible et l'embedder est construit une fois au démarrage,
 /// une config invalide doit faire échouer le boot, pas une requête.
 ///
-/// Mode `auto` : vLLM (OpenAI-HTTP) à l'URL résolue (`embed_url` ou
+/// Mode `auto` : le local (OpenAI-HTTP) à l'URL résolue (`embed_url` ou
 /// `http://localhost:8400/v1/embeddings`) primaire, repli Cloudflare Workers AI
 /// en disjoncteur binaire (`degraded`). Les creds Cloudflare sont requises car
 /// elles servent au repli.
@@ -53,26 +50,26 @@ pub fn build_query_embedder(settings: &Settings) -> AnyEmbedder {
         }
         "auto" => {
             // `auto` valide les creds Cloudflare (fallback) avant de construire
-            // le backend vLLM primaire.
+            // le backend local primaire.
             let (account_id, token) = require_cloudflare(
                 settings,
                 "embed_backend=auto nécessite \
                  LIBREJUSTICE_CLOUDFLARE_ACCOUNT_ID + \
                  LIBREJUSTICE_CLOUDFLARE_BACKEND_TOKEN pour le fallback cloudflare.",
             );
-            let vllm_url = settings
+            let local_url = settings
                 .embed_url
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .unwrap_or("http://localhost:8400/v1/embeddings");
-            let vllm = OpenAIHttpEmbedder::new(vllm_url, settings.embed_api_key.clone(), "");
+            let local = OpenAIHttpEmbedder::new(local_url, settings.embed_api_key.clone(), "");
             let cloudflare = CloudflareWorkersAIEmbedder::new(
                 account_id,
                 token,
                 CloudflareWorkersAIEmbedder::DEFAULT_MODEL,
             );
             AnyEmbedder::Auto {
-                vllm,
+                local,
                 cloudflare,
                 degraded: AtomicBool::new(false),
             }

@@ -18,8 +18,8 @@ use leptos_router::hooks::use_navigate;
 
 use crate::helpers::encode_query;
 
-use super::compact_search::ai_mode::use_ai_mode;
 use super::compact_search::query_state;
+use super::query_length::{truncate_to_cap, QueryLengthNotice};
 use super::search_submit::{SearchSubmit, SubmitSize};
 use super::suggest_box::{SuggestController, SuggestPanel};
 use super::syntax_hint::{HelpCorpus, SyntaxHint};
@@ -124,14 +124,13 @@ pub fn HeroSearch() -> impl IntoView {
     let navigate = use_navigate();
     let query = RwSignal::new(String::new());
     let scope = RwSignal::new(Scope::Decisions);
-    let (ai_mode, set_ai_mode) = use_ai_mode();
     // Autocomplétion : le mode suit le sélecteur de portée.
     let suggest = SuggestController::new(query, Signal::derive(move || scope.get().suggest_mode()));
 
     // Soumission : route vers le moteur de la portée. Depuis la landing, pas
-    // de filtres existants à conserver — `q` seul (+ `aiMode`, décisions).
+    // de filtres existants à conserver, donc `q` seul.
     let submit = move |value: String, target: Scope| {
-        let trimmed = value.trim().to_string();
+        let trimmed = truncate_to_cap(value.trim());
         // Le pot d'annonces répond sans requête — « ce qui est ouvert en ce
         // moment » est un résultat. Les autres portées n'ont rien à dire sans
         // mots.
@@ -140,10 +139,12 @@ pub fn HeroSearch() -> impl IntoView {
         }
         let href = match target {
             Scope::Decisions => {
+                // Reclassement au défaut : la landing ne le règle pas, et son
+                // absence de param vaut actif.
                 let qs = query_state::with_query(
                     &leptos_router::params::ParamsMap::new(),
                     &trimmed,
-                    Some(ai_mode.get_untracked()),
+                    None,
                 );
                 format!("/decisions?{qs}")
             }
@@ -213,13 +214,9 @@ pub fn HeroSearch() -> impl IntoView {
                     />
                     <SuggestPanel ctrl=suggest />
                 </div>
-                <SearchSubmit
-                    ai_mode=ai_mode
-                    on_toggle=set_ai_mode
-                    size=SubmitSize::Lg
-                    show_ai=Signal::derive(move || scope.get() == Scope::Decisions)
-                />
+                <SearchSubmit size=SubmitSize::Lg />
             </div>
+            <QueryLengthNotice query=query.into() />
             // Le pied de barre suit la portée : aide du moteur sélectionné
             // (l'annuaire n'en a pas), lien vers sa page pleine.
             <div class="flex flex-wrap items-center gap-x-4 gap-y-2">

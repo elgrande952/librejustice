@@ -21,10 +21,6 @@ fn re_body_pole() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| ci(r"\bp[ôo]le\s*(\d+)\s*-\s*chambre\s*(\d+)\b"))
 }
-fn re_body_conseil() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| ci(r"\bchambre\s+du\s+conseil\s*\("))
-}
 fn re_body_named_chamber() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     // Lookahead négatif interne `(?!(?:stop)\b)` retiré, rejoué par
@@ -120,11 +116,27 @@ fn is_label_word(tok: &str) -> bool {
         && core.chars().any(|c| c.is_alphabetic())
 }
 
-/// Épluche la traîne de ligne capturée par [`re_body_chamber_line`] :
-/// ordinal optionnel + « chambre » + connecteur optionnel + 0..3 mots de
-/// libellé (« et » de liste non compté), bornés au premier stopword d'acte
-/// ou token non-mot (RG, dates, séparateurs). Une « chambre » nue sans
-/// ordinal ni mot ne fait pas un libellé.
+/// A separator the registry writes inside a seat, « Chambre 9 - B ».
+fn is_separator(tok: &str) -> bool {
+    !tok.is_empty() && tok.chars().all(|c| matches!(c, '-' | '.'))
+}
+
+/// A numbering the position patterns read: number, ordinal, composed numbering
+/// (« 2-5 »), section letter glued to it (« 9b »). A docket carries a slash and
+/// is none of those.
+fn is_number_token(tok: &str) -> bool {
+    let core = tok.trim_end_matches(',');
+    core.chars().any(|c| c.is_ascii_digit())
+        && core
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '.' | '°'))
+}
+
+/// Slices the line captured by [`re_body_chamber_line`] down to what the
+/// position patterns read: optional ordinal, « chambre », optional connector,
+/// then matter words (0..3), numbering, section letters and their separators,
+/// stopped at the first act stopword or unreadable token. A bare « chambre »
+/// names no seat.
 fn chamber_line_label(tail: &str) -> Option<String> {
     let toks: Vec<&str> = tail.split_whitespace().collect();
     let mut out: Vec<&str> = Vec::new();
@@ -155,9 +167,24 @@ fn chamber_line_label(tail: &str) -> Option<String> {
         }
     }
     let mut nwords = 0;
-    while i < toks.len() && nwords < 3 {
+    let mut carried = false;
+    while i < toks.len() {
         let t = toks[i];
-        if is_body_stop(t) || !is_label_word(t) {
+        if is_body_stop(t) {
+            break;
+        }
+        if is_separator(t) {
+            out.push(t);
+            i += 1;
+            continue;
+        }
+        if is_number_token(t) {
+            out.push(t);
+            carried = true;
+            i += 1;
+            continue;
+        }
+        if !is_label_word(t) || nwords == 3 {
             break;
         }
         if t.to_lowercase() == "et" {
@@ -174,12 +201,13 @@ fn chamber_line_label(tail: &str) -> Option<String> {
         }
         out.push(t);
         nwords += 1;
+        carried = true;
         i += 1;
     }
-    if nwords < 1 && !ordinal {
+    if !carried && !ordinal {
         return None;
     }
-    Some(out.join(" ").trim_end_matches(',').to_string())
+    Some(out.join(" ").trim_end_matches([',', '-', ' ']).to_string())
 }
 
 /// Repli casse+accents ASCII d'un token (comparaison de mot-clé).
@@ -204,9 +232,6 @@ fn fold_ascii(tok: &str) -> String {
 pub(super) fn chamber_from_body(bandeau: &str) -> Option<String> {
     if let Some(c) = re_body_pole().captures(bandeau) {
         return Some(format!("Pôle {} - Chambre {}", &c[1], &c[2]));
-    }
-    if re_body_conseil().is_match(bandeau) {
-        return Some("Chambre du conseil".to_string());
     }
     for c in re_body_chamber_line().captures_iter(bandeau) {
         if let Some(label) = chamber_line_label(&c[1]) {
@@ -268,6 +293,27 @@ mod tests {
         assert_eq!(
             chamber_from_body("COUR D'APPEL DE X \n CHAMBRE \n ARRET no 12"),
             None
+        );
+    }
+
+    /// The line carries the whole seat, letter and section included: what the
+    /// position patterns read must reach them.
+    #[test]
+    fn chambre_de_bandeau_numerotee_lettree_sectionnee() {
+        assert_eq!(
+            chamber_from_body(
+                "COUR D'APPEL DE DOUAI \n CHAMBRE SOCIALE - A - Section 2 \n ARRET DU 5 MARS"
+            )
+            .as_deref(),
+            Some("CHAMBRE SOCIALE - A - Section 2")
+        );
+        assert_eq!(
+            chamber_from_body("COUR D'APPEL DE PARIS \n CHAMBRE 5 B \n ARRET DU").as_deref(),
+            Some("CHAMBRE 5 B")
+        );
+        assert_eq!(
+            chamber_from_body("COUR D'APPEL DE PARIS \n CHAMBRE 2-5 \n ARRET DU").as_deref(),
+            Some("CHAMBRE 2-5")
         );
     }
 }

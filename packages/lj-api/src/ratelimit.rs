@@ -1,28 +1,23 @@
-//! Budget de coût par appelant : seau à jetons borné, clé identité ou réseau.
+//! Per-caller allowance: a bounded token bucket, keyed by account or by network.
 //!
-//! Ce qu'on compte n'est pas la requête HTTP mais la dépense : un appel
-//! d'embedding, un rerank Mistral. Tout ce que les caches moka servent est gratuit
-//! et ne prélève rien. Corollaire à tenir quand un cache s'ajoute : le prélèvement
-//! descend avec lui.
+//! Invariant: a handler that touches the database, hashes a password or sends a
+//! mail takes one token from exactly one [`Cost`] class first, so `grep
+//! budgets.take` is the complete map of what the application bounds. The edge
+//! bounds the rest by IP, for the whole host.
 //!
-//! Les plafonds vivent dans l'environnement
-//! (`LIBREJUSTICE_API_SEARCH_BUDGET_PER_MIN`, `…_RERANK_BUDGET_PER_MIN`,
-//! `…_SEARCH_BUDGET_ENFORCE`) ; ceux de `config.rs` sont des défauts génériques.
-//!
-//! Fail-open : un appelant qu'on ne sait pas nommer n'est pas limité
-//! ([`caller_key`] rend `None`). Et le refus n'appartient pas à ce module — il rend
-//! un verdict, l'appelant décide quoi en faire.
+//! Fail-open: a caller that cannot be named is not limited ([`caller_key`] returns
+//! `None`). The refusal is the caller's: this module returns a verdict.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
+
+use crate::identity::Identity;
 use moka::future::Cache;
 use tokio::sync::Mutex;
 
-/// Cible tracing des dépassements, ouverte à `INFO` dans le bridge logs de l'API
-/// (`crate::telemetry`). La changer ici sans la changer là coupe le signal.
+/// Cible tracing des dépassements de budget.
 pub const LOG_TARGET: &str = "lj_api::ratelimit";
 
 /// Nombre de seaux gardés en mémoire. Au-delà, moka évince les moins récemment
@@ -30,12 +25,50 @@ pub const LOG_TARGET: &str = "lj_api::ratelimit";
 /// évincé serait de toute façon revenu plein.
 const MAX_KEYS: u64 = 100_000;
 
-/// Sondes d'hydratation par appelant et par minute. Pas de réglage
-/// d'environnement.
-pub const HYDRATION_PROBES_PER_MIN: u32 = 5;
+/// What a handler spends. The key is the caller's choice: account when one is
+/// known, network otherwise; `Auth` and `Porte` run before any account exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cost {
+    /// A computed search on either engine: Postgres CPU, lexical as much as hybrid.
+    Search,
+    /// A Mistral rerank on a `rerank_cache` miss.
+    Rerank,
+    /// One row by identifier on the machine surfaces (API, MCP), where loops run.
+    Read,
+    /// A password hash, a row created or a mail sent, before any session exists.
+    Auth,
+    /// An unauthenticated crossing of `/api` or `/mcp`: the `SELECT` of a refusal.
+    Porte,
+    /// A client incident report.
+    ClientIncident,
+    /// A support report, which is a mail.
+    Signalement,
+}
 
-/// Rafale tolérée, en multiple du débit par minute. Seul le régime soutenu
-/// rencontre la recharge.
+impl Cost {
+    fn surface(self) -> &'static str {
+        match self {
+            Cost::Search => "search",
+            Cost::Rerank => "rerank",
+            Cost::Read => "read",
+            Cost::Auth => "auth",
+            Cost::Porte => "porte",
+            Cost::ClientIncident => "client",
+            Cost::Signalement => "signalement",
+        }
+    }
+}
+
+// Sustained allowance per minute of the classes without an environment setting.
+// Read: 2 rows/s leaves an agent its shortlist and stops a corpus loop.
+// Auth: 20 keeps an office behind one NAT logging in at 9am, and caps argon2.
+pub const READ_PER_MIN: u32 = 120;
+pub const AUTH_PER_MIN: u32 = 20;
+pub const PORTE_PER_MIN: u32 = 120;
+pub const CLIENT_INCIDENTS_PER_MIN: u32 = 5;
+pub const SIGNALEMENTS_PER_MIN: u32 = 3;
+
+/// Burst tolerated, in minutes of allowance: only the sustained regime meets the refill.
 const BURST_FACTOR: f64 = 2.0;
 
 /// Verdict d'un prélèvement.
@@ -84,25 +117,17 @@ impl CallerKey {
 /// `None` = appelant non identifiable, donc non limité. Le seul cas est l'appel
 /// in-process du rendu SSR (`lj_web::api::client`), qui n'a pas de socket client.
 pub fn caller_key(user: Option<&str>, headers: &HeaderMap) -> Option<CallerKey> {
-    if let Some(sub) = user {
-        return Some(CallerKey(format!("u:{sub}")));
-    }
-    client_network(headers).map(CallerKey)
+    key_of(&Identity::resolve(user, headers))
 }
 
-/// Réseau de l'appelant. L'IPv6 est ramenée à son `/64` : un hôte v6 s'en voit
-/// attribuer un entier et change d'adresse dedans sans rien payer.
-fn client_network(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get("cf-connecting-ip")?.to_str().ok()?;
-    match raw.parse::<IpAddr>().ok()? {
-        IpAddr::V4(v4) => Some(format!("n:{v4}")),
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            Some(format!(
-                "n:{:x}:{:x}:{:x}:{:x}::/64",
-                s[0], s[1], s[2], s[3]
-            ))
-        }
+/// Projection « quota » d'une identité déjà résolue. Grossière par construction :
+/// l'User-Agent n'y entre pas, sinon un seau neuf s'obtiendrait en changeant
+/// d'en-tête. C'est ce qui la sépare du pseudonyme de télémétrie.
+pub fn key_of(id: &Identity) -> Option<CallerKey> {
+    match id {
+        Identity::Account(sub) => Some(CallerKey(format!("u:{sub}"))),
+        Identity::Network(network) => Some(CallerKey(format!("n:{network}"))),
+        Identity::Unknown => None,
     }
 }
 
@@ -112,10 +137,51 @@ struct Bucket {
     last: Instant,
 }
 
-/// Budget partagé d'une surface (recherche, rerank…). Un seau par appelant,
-/// recharge continue.
+/// One [`Budget`] per [`Cost`]. Built once in `AppState`, taken from everywhere.
 #[derive(Clone)]
-pub struct Budget {
+pub struct Budgets {
+    search: Budget,
+    rerank: Budget,
+    read: Budget,
+    auth: Budget,
+    porte: Budget,
+    client: Budget,
+    signalement: Budget,
+}
+
+impl Budgets {
+    pub fn new(search_per_min: u32, rerank_per_min: u32) -> Self {
+        let budget = |cost: Cost, per_min| Budget::new(cost.surface(), per_min);
+        Self {
+            search: budget(Cost::Search, search_per_min),
+            rerank: budget(Cost::Rerank, rerank_per_min),
+            read: budget(Cost::Read, READ_PER_MIN),
+            auth: budget(Cost::Auth, AUTH_PER_MIN),
+            porte: budget(Cost::Porte, PORTE_PER_MIN),
+            client: budget(Cost::ClientIncident, CLIENT_INCIDENTS_PER_MIN),
+            signalement: budget(Cost::Signalement, SIGNALEMENTS_PER_MIN),
+        }
+    }
+
+    /// Takes one token of `cost` for `key`. `None` (unidentifiable caller) always
+    /// passes.
+    pub async fn take(&self, cost: Cost, key: Option<&CallerKey>) -> Verdict {
+        let budget = match cost {
+            Cost::Search => &self.search,
+            Cost::Rerank => &self.rerank,
+            Cost::Read => &self.read,
+            Cost::Auth => &self.auth,
+            Cost::Porte => &self.porte,
+            Cost::ClientIncident => &self.client,
+            Cost::Signalement => &self.signalement,
+        };
+        budget.take(key).await
+    }
+}
+
+/// The bucket store of one cost class: one bucket per caller, continuous refill.
+#[derive(Clone)]
+struct Budget {
     surface: &'static str,
     buckets: Cache<String, Arc<Mutex<Bucket>>>,
     capacity: f64,
@@ -123,10 +189,7 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// Construit un budget à `per_min` dépenses par minute en régime soutenu, avec
-    /// [`BURST_FACTOR`] minutes de rafale accumulable. `surface` nomme le poste de
-    /// dépense dans la télémétrie (`search`, `rerank`…).
-    pub fn new(surface: &'static str, per_min: u32) -> Self {
+    fn new(surface: &'static str, per_min: u32) -> Self {
         let refill_per_sec = f64::from(per_min) / 60.0;
         let capacity = f64::from(per_min) * BURST_FACTOR;
         Self {
@@ -140,9 +203,7 @@ impl Budget {
         }
     }
 
-    /// Prélève un jeton pour `key`. `None` (appelant non identifiable) passe
-    /// toujours.
-    pub async fn take(&self, key: Option<&CallerKey>) -> Verdict {
+    async fn take(&self, key: Option<&CallerKey>) -> Verdict {
         self.take_at(key, Instant::now()).await
     }
 

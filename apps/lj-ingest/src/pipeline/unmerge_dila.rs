@@ -1,30 +1,19 @@
 //! Réparation rétroactive des faux merges **intra-source** `dila-jade` —
 //! analogue de [`super::unmerge`] (judilibre) pour le fond DILA JADE.
 //!
-//! La dédup historique (axe `canonical_ref`) a fusionné des décisions distinctes
-//! d'un même fond `dila-jade` partageant la clé → le texte du **perdant** a été
-//! détruit (la ligne `decisions` ne garde que l'autorité). Pour le re-créer il
-//! faut son XML source : on le relit du **cache local DILA** (tarballs
-//! `<cache>/dila/jade/tarballs/*.tar.gz`), sans appel réseau.
+//! Même réparation, mais les tarballs DILA ne sont pas indexés par décision, là
+//! où le cache judilibre se range par mois. D'où **un seul passage streamé** sur
+//! les tarballs, qui re-matérialise les seuls membres dont l'ID est une
+//! perdante : passe 1 en mémoire (CPU dans `spawn_blocking`), passe 2 en DB
+//! async. Un membre présent dans plusieurs tarballs (stock + incrément) ne
+//! donne qu'**une seule** scission, garantie par `done`.
 //!
-//! Les tarballs DILA ne sont pas indexés par décision, là où le cache judilibre
-//! est rangé par mois (`<jur>/<AAAAMM>.jsonl.gz`, lookup direct). On fait donc
-//! **un seul passage streamé** sur les tarballs (comme [`super::dila`]), en
-//! re-matérialisant les seuls membres dont l'ID DILA est une perdante. Le jeu de
-//! perdantes est petit → on collecte les `Candidate` matchés en mémoire (passe 1,
-//! CPU dans `spawn_blocking`), puis on scinde + matérialise (passe 2, DB async).
-//! Un membre peut apparaître dans plusieurs tarballs (stock + incrément) →
-//! `done` garantit **une seule** scission par perdante.
+//! Passe 2, une transaction par perdante : `create_split_decision` détache la
+//! provenance vers une décision squelette, puis `drain_batch_in_txn` la
+//! matérialise (re-chunk + re-embed **local strict**). Échec ⇒ rollback, la
+//! perdante reste fusionnée.
 //!
-//! Passe 2, par perdante (inverse d'une fusion) : `create_split_decision`
-//! (détache la provenance perdante vers une nouvelle décision squelette ;
-//! l'autorité reste sur l'origine, son texte y est déjà) puis
-//! `drain_batch_in_txn` (`IngestMode::All`, re-chunk + re-embed **vLLM strict**,
-//! jamais Cloudflare) — le tout dans une transaction par perdante (échec →
-//! rollback, laissée fusionnée).
-//!
-//! `--dry-run` (défaut CLI) : stream + comptage (cache-hit/miss), aucune
-//! écriture, aucun GPU. `--limit N` : rollout borné.
+//! `--dry-run` (défaut) : stream + comptage, aucune écriture, aucun GPU.
 
 use std::collections::{HashMap, HashSet};
 
@@ -34,7 +23,7 @@ use lj_store::repository::DecisionRepository;
 
 use super::batch::drain_batch_in_txn;
 use super::dila::{classify_dila, dila_member_id, ClassifiedDila, Fond};
-use super::embed::build_vllm_strict;
+use super::embed::build_local_strict;
 use super::files::collect_tar_gz;
 use super::{generate_public_id, Candidate, IngestCounts, IngestMode};
 use crate::config::Settings;
@@ -73,9 +62,8 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
 
-    // Re-embed vLLM **strict** (jamais Cloudflare, coût) — seulement en execute.
     let embedder = if execute {
-        Some(build_vllm_strict(&settings).await?)
+        Some(build_local_strict(&settings).await?)
     } else {
         None
     };
@@ -227,7 +215,7 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
     } else {
         "DRY-RUN (read-only)"
     };
-    println!("\n=== unmerge-same-source-dila [{mode}] (ADR 0104) ===");
+    println!("\n=== unmerge-same-source-dila [{mode}] ===");
     println!(
         "perdantes dila-jade (rn>1)            : {}",
         stats.losers_total

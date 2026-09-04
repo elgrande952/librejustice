@@ -1,19 +1,3 @@
-//! Klekoon (`klekoon.com`).
-//!
-//! `POST /rechercher-une-annonce-ou-un-dce-dematerialise-sur-klekoon`
-//! (`type_recherche=1`, `per_page=100`) rend les DCE dématérialisés de la
-//! plateforme — **toute l'archive**, triée par parution décroissante. Une ligne
-//! = `<div class="row no-gutters mb-3" id="<ID>">`, clé métier
-//! `consultation_ID`.
-//!
-//! La liste ne porte ni référence, ni heure de clôture, ni CPV, et tronque les
-//! objets longs : on complète chaque ligne par sa fiche. Une fiche en échec
-//! garde sa ligne de liste.
-//!
-//! Deux singularités, portées par les doc-comments de [`client`] et
-//! [`POLITESSE`] : l'hôte n'offre que des suites TLS que rustls refuse, et il
-//! coupe l'IP qui l'interroge trop vite.
-
 use std::sync::LazyLock;
 
 use jiff::Timestamp;
@@ -25,7 +9,7 @@ use lj_core::annonces::{
 };
 use lj_core::referential_labels::departement_label;
 
-use super::{apres_balise, dedup_source_uid, send_text, txt, DetailAnnonce, MoteurRun};
+use super::{apres_balise, client, dedup_source_uid, send_text, txt, DetailAnnonce, MoteurRun};
 use crate::error::Result;
 
 const BASE: &str = "https://www.klekoon.com";
@@ -33,34 +17,17 @@ const RECHERCHE: &str =
     "https://www.klekoon.com/rechercher-une-annonce-ou-un-dce-dematerialise-sur-klekoon";
 const PER_PAGE: &str = "100";
 
-/// Débit du connecteur : une requête à la fois, une par seconde.
-///
-/// Klekoon coupe l'IP appelante au-delà d'un certain débit — toutes ses pages
-/// répondent alors 200 avec un corps de 136 octets, « Merci de prendre contact
-/// d'URGENCE avec nous […] ». La coupure vise l'IP de sortie et se lève seule au
-/// bout de quelques heures. Ce connecteur travaille donc en série, à la cadence
-/// d'un lecteur humain.
 const POLITESSE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Le seul client du projet à ne pas passer par rustls.
-///
-/// `www.klekoon.com` ne négocie que TLS 1.2 avec `ECDHE-RSA-AES256-SHA` —
-/// CBC + HMAC-SHA1, aucune suite AEAD, pas de TLS 1.3. rustls n'implémente
-/// aucune suite CBC par construction, donc le client partagé de
-/// `super::client()` ne peut pas ouvrir la connexion. D'où un second stack TLS,
-/// borné à ce connecteur : `native-tls-vendored` compile OpenSSL dans le
-/// binaire, sans libssl runtime.
-///
-/// Les POST de recherche sont sans état — la même page rendue avec ou sans
-/// cookie de session ASP —, donc pas de jar ici.
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(super::UA_NAVIGATEUR)
-        .use_native_tls()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .expect("reqwest client build")
+/// Réécrit une URL klekoon.com vers le pont d'egress, seul chemin de sortie du
+/// connecteur : le pont est un reverse-proxy à upstream figé, donc seul le
+/// chemin (+query) compte. Une URL hors `BASE` (déjà relative, ou étrangère)
+/// passe inchangée. Les URLs stockées et servies, elles, restent klekoon.com.
+fn via_egress(url: &str, egress: &str) -> String {
+    match url.strip_prefix(BASE) {
+        Some(rest) => format!("{}{}", egress.trim_end_matches('/'), rest),
+        None => url.to_string(),
+    }
 }
 
 /// Pages consécutives sans aucune consultation ouverte avant d'arrêter.
@@ -77,21 +44,24 @@ const MAX_PAGES: u64 = 10;
 
 /// Une page de résultats. Le formulaire poste ses dix champs ; `page` et
 /// `per_page` sont les seuls qui varient.
-async fn page(client: &reqwest::Client, p: u64) -> Result<String> {
+async fn page(client: &reqwest::Client, p: u64, egress: &str) -> Result<String> {
     let p = p.to_string();
     send_text(
-        client.post(RECHERCHE).header("Referer", RECHERCHE).form(&[
-            ("type_recherche", "1"),
-            ("page", &p),
-            ("per_page", PER_PAGE),
-            ("motcle", ""),
-            ("source", "1"),
-            ("list_region", ""),
-            ("selection_list", ""),
-            ("retour", "0"),
-            ("id_retour", ""),
-            ("critere_emetteur", ""),
-        ]),
+        client
+            .post(via_egress(RECHERCHE, egress))
+            .header("Referer", RECHERCHE)
+            .form(&[
+                ("type_recherche", "1"),
+                ("page", &p),
+                ("per_page", PER_PAGE),
+                ("motcle", ""),
+                ("source", "1"),
+                ("list_region", ""),
+                ("selection_list", ""),
+                ("retour", "0"),
+                ("id_retour", ""),
+                ("critere_emetteur", ""),
+            ]),
         &format!("klekoon page {p}"),
     )
     .await
@@ -314,9 +284,13 @@ fn champs_fiche(html: &str) -> Fiche {
 
 /// Complète une ligne par sa fiche. Une fiche en échec garde la ligne de
 /// liste.
-async fn completer_par_fiche(client: &reqwest::Client, mut row: AnnonceBrute) -> AnnonceBrute {
+async fn completer_par_fiche(
+    client: &reqwest::Client,
+    mut row: AnnonceBrute,
+    egress: &str,
+) -> AnnonceBrute {
     let url = row.url_avis.clone().unwrap_or_default();
-    let html = match send_text(client.get(&url), "klekoon fiche").await {
+    let html = match send_text(client.get(via_egress(&url, egress)), "klekoon fiche").await {
         Ok(h) => h,
         Err(e) => {
             tracing::debug!(url = %url, error = %e, "klekoon : fiche en échec");
@@ -348,7 +322,7 @@ async fn completer_par_fiche(client: &reqwest::Client, mut row: AnnonceBrute) ->
 /// Ré-énumère le stock ouvert, puis complète chaque ligne par sa fiche.
 /// Tout se fait en série, à `POLITESSE` d'intervalle : ~5 pages + une fiche par
 /// consultation ouverte, en parallèle des autres moteurs.
-pub async fn enumerate() -> Result<MoteurRun> {
+pub async fn enumerate(egress: &str) -> Result<MoteurRun> {
     let client = client();
     let maintenant = Timestamp::now();
     let mut rows: Vec<AnnonceBrute> = Vec::new();
@@ -358,7 +332,7 @@ pub async fn enumerate() -> Result<MoteurRun> {
         if p > 1 {
             tokio::time::sleep(POLITESSE).await;
         }
-        let html = page(&client, p).await?;
+        let html = page(&client, p, egress).await?;
         if p == 1 {
             declare = total_declare(&html);
         }
@@ -381,13 +355,14 @@ pub async fn enumerate() -> Result<MoteurRun> {
     let mut completes = Vec::with_capacity(rows.len());
     for row in rows {
         tokio::time::sleep(POLITESSE).await;
-        completes.push(completer_par_fiche(&client, row).await);
+        completes.push(completer_par_fiche(&client, row, egress).await);
     }
     let rows = completes;
 
     Ok(MoteurRun {
         annonce: (declare > 0).then_some(declare),
         echecs: 0,
+        hotes: Vec::new(),
         rows: dedup_source_uid(rows),
     })
 }
@@ -396,12 +371,9 @@ pub async fn enumerate() -> Result<MoteurRun> {
 /// (« Classe 45 »), et « Mode de passation » est vide sur les fiches — la
 /// procédure d'une consultation Klekoon se lit en liste, sous « Source :
 /// Klekoon - … ».
-///
-/// L'enrichisseur sérialise ses fiches par moteur à 300 ms, un débit dans la
-/// plage qui coupe l'IP. La seconde due se paie donc ici.
-pub async fn detail(url_avis: &str) -> Result<DetailAnnonce> {
+pub async fn detail(egress: &str, url_avis: &str) -> Result<DetailAnnonce> {
     tokio::time::sleep(POLITESSE).await;
-    let html = send_text(client().get(url_avis), "klekoon détail").await?;
+    let html = send_text(client().get(via_egress(url_avis, egress)), "klekoon détail").await?;
     Ok(parse_detail(&html))
 }
 

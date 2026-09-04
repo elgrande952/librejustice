@@ -44,6 +44,15 @@ impl SourceAuthority {
             SourceAuthority::Inconnu => "source non vérifiée",
         }
     }
+
+    /// Diffuseur officiel : l'État ou l'institution dont le texte émane. Une
+    /// republication reste non officielle, si fidèle soit-elle.
+    pub fn is_official(self) -> bool {
+        matches!(
+            self,
+            SourceAuthority::Gouvernemental | SourceAuthority::Institutionnel
+        )
+    }
 }
 
 /// Classe l'autorité du diffuseur à partir du **libellé** `legal_article.source`.

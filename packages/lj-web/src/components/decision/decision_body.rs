@@ -1,10 +1,9 @@
 //! Corps structuré de la décision (sections + paragraphes) + toolbar flottante
 //! de sélection de texte.
 //!
-//! La géométrie de la sélection (`window.getSelection`, `Range`, `DomRect`),
-//! non exposée par les features web-sys du crate, passe par le shim JS
-//! `selection.js` bindé inline (cf. `InfiniteSentinel`). En SSR : article
-//! statique, toolbar absente (interop gatée `hydrate`).
+//! La géométrie de la sélection (`window.getSelection`, `Range`, `DomRect`) vit
+//! dans `crate::dom`. En SSR : article statique, toolbar absente (interop gatée
+//! `hydrate`).
 use leptos::prelude::*;
 use lj_dtos::DecisionDetail;
 
@@ -42,49 +41,30 @@ pub fn DecisionBody(detail: DecisionDetail, sections: Vec<RenderSection>) -> imp
 
     #[cfg(feature = "hydrate")]
     {
-        use wasm_bindgen::prelude::*;
-
         use crate::pages::decision_page::reference::normalize_selection_text;
 
-        // Closure JS recevant (texte, top, left) de l'observateur de sélection.
-        type SelectionClosure = Closure<dyn FnMut(JsValue, f64, f64)>;
-
-        #[wasm_bindgen(module = "/src/components/decision/selection.js")]
-        extern "C" {
-            #[wasm_bindgen(js_name = "observeSelection")]
-            fn observe_selection(article: &JsValue, on_change: &SelectionClosure) -> JsValue;
-        }
-
-        // L'observateur et son `Closure` tiennent des handles JS (pas `Send`) :
-        // gardés dans des slots `LocalStorage`, l'observateur précédent est
-        // déconnecté à chaque passage.
-        let disconnect_slot: StoredValue<Option<JsValue>, leptos::reactive::owner::LocalStorage> =
-            StoredValue::new_local(None);
-        let closure_slot: StoredValue<
-            Option<SelectionClosure>,
+        // L'abonnement tient des handles JS (pas `Send`) : gardé dans un slot
+        // `LocalStorage`, le précédent est déconnecté à chaque passage — son
+        // `Drop` retire les écouteurs.
+        let subscription_slot: StoredValue<
+            Option<crate::dom::SelectionSubscription>,
             leptos::reactive::owner::LocalStorage,
         > = StoredValue::new_local(None);
         Effect::new(move |_| {
-            if let Some(prev) = disconnect_slot.try_update_value(Option::take).flatten() {
-                if let Ok(f) = prev.dyn_into::<js_sys::Function>() {
-                    let _ = f.call0(&JsValue::NULL);
-                }
-            }
+            subscription_slot.try_update_value(Option::take);
             let Some(node) = article_ref.get() else {
                 return;
             };
+            let article: web_sys::Element = node.clone().into();
             // Normalisation côté Rust : texte vide après normalisation → None.
-            let closure = Closure::new(move |text: JsValue, top: f64, left: f64| {
-                let next = text.as_string().and_then(|raw| {
+            let subscription = crate::dom::observe_selection(article, move |mesure| {
+                let next = mesure.and_then(|(raw, top, left)| {
                     let text = normalize_selection_text(&raw);
                     (!text.is_empty()).then_some(SelState { text, top, left })
                 });
                 selection_state.set(next);
             });
-            let node_js: JsValue = node.into();
-            let disconnect = observe_selection(&node_js, &closure);
-            disconnect_slot.set_value(Some(disconnect));
-            closure_slot.set_value(Some(closure));
+            subscription_slot.set_value(subscription);
         });
     }
 
@@ -233,13 +213,5 @@ fn ToolbarButton(
 /// Vide la sélection courante.
 #[cfg(feature = "hydrate")]
 fn clear_selection() {
-    use wasm_bindgen::prelude::*;
-
-    #[wasm_bindgen(module = "/src/components/decision/selection.js")]
-    extern "C" {
-        #[wasm_bindgen(js_name = "clearSelection")]
-        fn js_clear_selection();
-    }
-
-    js_clear_selection();
+    crate::dom::clear_selection();
 }

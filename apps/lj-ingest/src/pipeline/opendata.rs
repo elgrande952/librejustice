@@ -14,7 +14,7 @@ use lj_store::repository::DecisionRepository;
 use crate::config::Settings;
 
 use super::batch::{drain_batch, drain_batch_in_txn, run_stream};
-use super::embed::{build_embedder, build_vllm_strict};
+use super::embed::{build_embedder, build_local_strict};
 use super::files::{collect_jsonl_gz, collect_zip_paths, read_jsonl_gz_lines};
 use super::prepare::{classify_judilibre, classify_xml};
 use super::{Candidate, IngestCounts, IngestMode};
@@ -192,7 +192,7 @@ async fn drain_zip<E: Embedder>(
 /// opendata mais dont le `full_text` reste figé sur une provenance de rang
 /// inférieur. Re-parse leur payload opendata depuis les ZIPs (seuls ceux
 /// contenant une cible sont ouverts ; le `source_uid` porte le nom du ZIP) en
-/// [`IngestMode::All`] : re-chunk + re-embed (vLLM **strict**) + réécriture du
+/// [`IngestMode::All`] : re-chunk + re-embed (local **strict**) + réécriture du
 /// `full_text` canonique sur le texte opendata.
 pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
     let settings = Settings::from_env()?;
@@ -227,8 +227,7 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
         })
         .collect();
 
-    // Re-embed maintenance : vLLM strict, erreur franche si injoignable.
-    let embedder = build_vllm_strict(&settings).await?;
+    let embedder = build_local_strict(&settings).await?;
 
     tracing::info!(
         targets = targets.len(),
@@ -460,10 +459,8 @@ pub async fn refetch_judilibre(
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
 
-    // Re-fetch de maintenance : re-embed vLLM local **strict**, erreur franche si
-    // vLLM injoignable.
     let embedder = if with_embeddings {
-        Some(build_vllm_strict(&settings).await?)
+        Some(build_local_strict(&settings).await?)
     } else {
         None
     };
@@ -508,7 +505,7 @@ pub async fn refetch_judilibre(
 /// Re-fetch ciblé de quelques décisions Judilibre par ObjectId puis ré-ingest
 /// sur une **connexion et un embedder fournis**. [`IngestMode::All`] : UPDATE
 /// complet inconditionnel — le triage résout l'id par `source_uid`.
-/// `require_embeddings = true` : re-chunk + re-embed ciblé (vLLM local,
+/// `require_embeddings = true` : re-chunk + re-embed ciblé (local,
 /// l'embedder est construit par l'appelant). Renvoie une erreur si **aucune**
 /// décision n'a été reconnue.
 pub(super) async fn refetch_into<E: Embedder>(

@@ -1,25 +1,31 @@
-//! Ingestion catalogue EUR-Lex (droit dérivé UE).
+//! EUR-Lex catalogue ingest (EU secondary law).
 //!
-//! Peuple `legal_text` avec les règlements/directives UE **cités mais absents**
-//! du catalogue, en **entrées catalogue-seul** (métadonnées, `articles: []`).
-//! Piloté PAR LA DEMANDE : on n'ingère que les slashnums réellement cités
-//! (spans non liés de `legal_citation`, retranchés de `full_text`).
+//! Fills `legal_text` with EU regulations and directives, as catalogue-only
+//! entries (metadata, `articles: []`), through three doors:
 //!
-//! Ce module est un GÉNÉRATEUR de datasets : il écrit un JSON par acte sous
-//! `<state_dir>/ingest/corpus/`, consommé ensuite par le loader
-//! `load_legal_corpus`. Idempotent : un dataset déjà présent n'est pas
-//! re-fetché.
+//! - BY DEMAND ([`ingest_eu_catalog`]): the slashnums our decisions actually
+//!   cite and the corpus lacks (unlinked `legal_citation` spans, cut out of
+//!   `full_text`). Catches the old or repealed acts a decision still invokes.
+//! - BY THE REGISTRY ([`sync_eu_catalog`]): base acts published since a date,
+//!   cited or not. The only door for an act nobody has cited yet.
+//! - BY THE FRENCH JO ([`sync_eu_jorf`]): the DILA fiches of European nature,
+//!   which name an act and never carry its body. Each is paired with its
+//!   EUR-Lex act, then collapses into it, leaving one identity per act.
 //!
-//! Le CELEX est reconstruit du couple (nature, slashnum) — la numérotation UE
-//! est incohérente (règlements pré-2015 = `seq/année`, directives =
-//! `année/seq`, unifiée `année/seq` post-2015). On teste les interprétations
-//! plausibles et l'entrée n'est écrite que si le titre FR récupéré porte
-//! EXACTEMENT le slashnum cité.
+//! This module is a dataset GENERATOR: one JSON per act under
+//! `<state_dir>/ingest/corpus/`, read back by the `load_legal_corpus` loader.
+//! Idempotent: a dataset already there is not re-fetched.
+//!
+//! The CELEX is rebuilt from the (nature, slashnum) pair, EU numbering being
+//! inconsistent (pre-2015 regulations = `seq/year`, directives = `year/seq`,
+//! unified to `year/seq` after 2015). Plausible readings are tried and the entry
+//! is written only if the FR title fetched carries EXACTLY the cited slashnum.
 
 use anyhow::{anyhow, Result};
+use chrono::{Datelike, NaiveDate};
 
 use lj_sources::cjue::CjueClient;
-use lj_store::repository::DecisionRepository;
+use lj_store::repository::{DecisionRepository, EuTwin};
 
 use crate::config::Settings;
 
@@ -107,6 +113,9 @@ fn text_uid_from_celex(celex: &str) -> Option<String> {
     let year: String = ch[1..5].iter().collect();
     let letter = ch[5];
     let seq: String = ch[6..].iter().collect();
+    if !year.chars().all(|c| c.is_ascii_digit()) || !seq.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     let seq_trim = seq.trim_start_matches('0');
     let seq_trim = if seq_trim.is_empty() { "0" } else { seq_trim };
     let kind = match letter {
@@ -115,6 +124,40 @@ fn text_uid_from_celex(celex: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!("EU/{kind}/{seq_trim}-{year}"))
+}
+
+/// Dataset path of an act: one file per `text_uid`, stable name, the only shape
+/// the on-disk registry of `sync-eu-law` can read back.
+fn dataset_path(dir: &std::path::Path, text_uid: &str) -> std::path::PathBuf {
+    dir.join(format!(
+        "eu-{}.json",
+        text_uid.replace('/', "-").to_lowercase()
+    ))
+}
+
+/// Writes a catalogue-only entry: metadata and `articles: []`, the body coming
+/// later from `sync-eu-law` through the consolidated Formex.
+fn ecrire_dataset(
+    path: &std::path::Path,
+    text_uid: &str,
+    title: &str,
+    date: Option<&str>,
+    nature_db: &str,
+    celex: &str,
+) -> Result<()> {
+    let doc = serde_json::json!({
+        "text_uid": text_uid,
+        "source": "eur-lex",
+        "jurisdiction": "UE",
+        "title": title,
+        "nature": nature_db,
+        "translation": "officiel",
+        "source_url": format!("http://publications.europa.eu/resource/celex/{celex}"),
+        "date_texte": date,
+        "articles": [],
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&doc)?)
+        .map_err(|e| anyhow!("write {}: {e}", path.display()))
 }
 
 /// Génère les datasets EUR-Lex pour les slashnums cités-absents. `limit`
@@ -153,10 +196,7 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
             let Some(text_uid) = text_uid_from_celex(celex) else {
                 continue;
             };
-            let path = dir.join(format!(
-                "eu-{}.json",
-                text_uid.replace('/', "-").to_lowercase()
-            ));
+            let path = dataset_path(&dir, &text_uid);
             if path.exists() {
                 skipped_existing += 1;
                 done = true;
@@ -174,19 +214,7 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
             } else {
                 "DIRECTIVE_EURO"
             };
-            let doc = serde_json::json!({
-                "text_uid": text_uid,
-                "source": "eur-lex",
-                "jurisdiction": "UE",
-                "title": title,
-                "nature": nature_db,
-                "translation": "officiel",
-                "source_url": format!("http://publications.europa.eu/resource/celex/{celex}"),
-                "date_texte": date,
-                "articles": [],
-            });
-            std::fs::write(&path, serde_json::to_vec_pretty(&doc)?)
-                .map_err(|e| anyhow!("write {}: {e}", path.display()))?;
+            ecrire_dataset(&path, &text_uid, &title, date.as_deref(), nature_db, celex)?;
             tracing::debug!(celex, %text_uid, edges, "acte UE récupéré");
             written += 1;
             done = true;
@@ -216,9 +244,427 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
     Ok(())
 }
 
+/// Sweeps the EUR-Lex registry from `depuis` and brings in every act the corpus
+/// lacks. The only door through which an uncited act arrives, since
+/// [`ingest_eu_catalog`] sees only what our decisions name. Loads right away, one
+/// file per transaction, otherwise nothing exists in the database.
+pub async fn sync_eu_catalog(
+    depuis: NaiveDate,
+    jusqu_a: NaiveDate,
+    limit: Option<usize>,
+) -> Result<()> {
+    let settings = Settings::from_env()?;
+    let dir = settings.legal_corpus_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("mkdir {}: {e}", dir.display()))?;
+
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+    // Disk alone would lie: an act loaded from another machine has no dataset
+    // here, and would be rewritten then reloaded on every pass.
+    let en_base: std::collections::HashSet<String> = repo
+        .eu_law_registry()
+        .await
+        .map_err(|e| anyhow!("eu_law_registry: {e}"))?
+        .into_iter()
+        .map(|(uid, ..)| uid)
+        .collect();
+
+    let client = CjueClient::new();
+    let (plancher, plafond) = (depuis.to_string(), jusqu_a.to_string());
+    let (mut vus, mut deja) = (0usize, 0usize);
+    let mut ecrits: Vec<std::path::PathBuf> = Vec::new();
+    'balayage: for annee in depuis.year()..=jusqu_a.year() {
+        let mut offset = 0usize;
+        loop {
+            let page = client.legislation_page(annee, offset).await?;
+            let pleine = page.len() >= lj_sources::cjue::PAGE_SIZE;
+            for (celex, date, title) in &page {
+                if date.as_str() < plancher.as_str() || date.as_str() > plafond.as_str() {
+                    continue;
+                }
+                let Some(text_uid) = text_uid_from_celex(celex) else {
+                    continue; // corrigendum, unnumbered act: not a corpus text
+                };
+                vus += 1;
+                let path = dataset_path(&dir, &text_uid);
+                if path.exists() || en_base.contains(&text_uid) {
+                    deja += 1;
+                    continue;
+                }
+                let nature_db = if text_uid.starts_with("EU/REG/") {
+                    "REGLEMENT"
+                } else {
+                    "DIRECTIVE_EURO"
+                };
+                ecrire_dataset(&path, &text_uid, title, Some(date), nature_db, celex)?;
+                tracing::debug!(celex, %text_uid, "acte UE découvert au registre");
+                ecrits.push(path);
+                if limit.is_some_and(|n| ecrits.len() >= n) {
+                    break 'balayage;
+                }
+            }
+            if !pleine {
+                break;
+            }
+            offset += lj_sources::cjue::PAGE_SIZE;
+        }
+    }
+
+    let mut publie_targets = std::collections::HashSet::new();
+    for path in &ecrits {
+        conn.batch_execute("BEGIN")
+            .await
+            .map_err(|e| anyhow!("BEGIN: {e}"))?;
+        match super::legal_corpus::load_dataset_file(&repo, path, &mut publie_targets).await {
+            Ok(()) => conn
+                .batch_execute("COMMIT")
+                .await
+                .map_err(|e| anyhow!("COMMIT: {e}"))?,
+            Err(e) => {
+                let _ = conn.batch_execute("ROLLBACK").await;
+                return Err(e);
+            }
+        }
+    }
+    if !ecrits.is_empty() {
+        super::legal_corpus::run_corpus_finishers(&repo, publie_targets).await?;
+    }
+
+    tracing::info!(
+        depuis = %depuis,
+        jusqu_a = %jusqu_a,
+        vus,
+        deja,
+        ecrits = ecrits.len(),
+        "sync-eu-catalog : registre EUR-Lex balayé"
+    );
+    println!(
+        "sync-eu-catalog : {vus} actes au registre du {depuis} au {jusqu_a}, {deja} déjà au fonds, \
+         {n} entrés et chargés.",
+        n = ecrits.len()
+    );
+    Ok(())
+}
+
+/// Nature the DILA title announces, in the vocabulary [`celex_candidates`]
+/// reads. The column says `DIRECTIVE_EURO` on regulations too, the title alone
+/// is right.
+fn nature_of_title(title: &str) -> Option<&'static str> {
+    let head = title.trim_start();
+    if head.starts_with("Directive") {
+        Some("directive")
+    } else if head.starts_with("Règlement") {
+        Some("reglement")
+    } else {
+        None
+    }
+}
+
+/// Pairs the JO fiches of European nature with their EUR-Lex act and collapses
+/// them into it: the act is minted at the catalogue when the corpus lacks it,
+/// which is the only way its body ever arrives.
+///
+/// Self-repairing rather than watermarked: a fiche already collapsed is gone
+/// from the source query, and one DILA republishes is paired again next pass.
+pub async fn sync_eu_jorf(limit: Option<usize>) -> Result<()> {
+    let settings = Settings::from_env()?;
+    let dir = settings.legal_corpus_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("mkdir {}: {e}", dir.display()))?;
+
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    conn.batch_execute("SET statement_timeout = 0").await?;
+    let repo = DecisionRepository::new(&conn);
+
+    let mut shells = repo.jorf_eu_shells().await?;
+    let total = shells.len();
+    if let Some(n) = limit {
+        shells.truncate(n);
+    }
+    let mut en_base: std::collections::HashSet<String> =
+        repo.eu_text_uids().await?.into_iter().collect();
+
+    let client = CjueClient::new();
+    let (mut fusionnees, mut frappees, mut sans_acte) = (0usize, 0usize, 0usize);
+    let mut publie_targets = std::collections::HashSet::new();
+    for (jorf_uid, title, _nature) in &shells {
+        let (Some(nature), Some(slashnum)) = (nature_of_title(title), first_slashnum(title)) else {
+            sans_acte += 1;
+            continue;
+        };
+        let candidates = celex_candidates(nature, &slashnum);
+        let uids: Vec<(String, String)> = candidates
+            .iter()
+            .filter_map(|c| text_uid_from_celex(c).map(|u| (c.clone(), u)))
+            .collect();
+        // The corpus has both numbering conventions on `EU/…`: an act already
+        // there under either form is the target, minting would open a second.
+        let mut target = uids.iter().find(|(_, u)| en_base.contains(u)).cloned();
+        if target.is_none() {
+            for (celex, uid) in &uids {
+                let Some((titre_ue, date)) = client.legislation_meta_fr(celex).await? else {
+                    continue;
+                };
+                if first_slashnum(&titre_ue).as_deref() != Some(slashnum.as_str()) {
+                    continue;
+                }
+                let nature_db = if nature == "reglement" {
+                    "REGLEMENT"
+                } else {
+                    "DIRECTIVE_EURO"
+                };
+                let path = dataset_path(&dir, uid);
+                if !path.exists() {
+                    ecrire_dataset(&path, uid, &titre_ue, date.as_deref(), nature_db, celex)?;
+                }
+                conn.batch_execute("BEGIN").await?;
+                match super::legal_corpus::load_dataset_file(&repo, &path, &mut publie_targets)
+                    .await
+                {
+                    Ok(()) => conn.batch_execute("COMMIT").await?,
+                    Err(e) => {
+                        let _ = conn.batch_execute("ROLLBACK").await;
+                        return Err(e);
+                    }
+                }
+                en_base.insert(uid.clone());
+                frappees += 1;
+                target = Some((celex.clone(), uid.clone()));
+                break;
+            }
+        }
+        let Some((_, uid)) = target else {
+            sans_acte += 1;
+            continue;
+        };
+        if repo.collapse_legal_text(jorf_uid, &uid).await?.is_some() {
+            fusionnees += 1;
+            tracing::debug!(from = jorf_uid, to = uid, "coquille JO fusionnée");
+        }
+    }
+    // On `frappees`, not on `publie_targets`: a catalogue entry has no article,
+    // so it opens no `publie` edge, and the finishers are what gives it a slug.
+    // A redirect posed towards a fiche with none makes the read crash.
+    if frappees > 0 {
+        super::legal_corpus::run_corpus_finishers(&repo, publie_targets).await?;
+    }
+    let denorm = repo.refresh_article_denorm().await?;
+    let (ranked_texts, _) = repo.refresh_reading_ranks().await?;
+
+    tracing::info!(
+        total,
+        fusionnees,
+        frappees,
+        sans_acte,
+        denorm,
+        ranked_texts,
+        "sync-eu-jorf : coquilles du JO appariées à EUR-Lex"
+    );
+    println!(
+        "sync-eu-jorf : {total} coquilles du JO, {fusionnees} fusionnées dans leur acte EUR-Lex \
+         (dont {frappees} actes frappés au catalogue), {sans_acte} sans acte identifiable.\n\
+         Suite : sync-eu-law pour les corps, puis reextract-fields --full --field legal_references."
+    );
+    Ok(())
+}
+
+/// Base CELEX of a notice: a consolidated series is `0{corps}-{AAAAMMJJ}` and
+/// only the sector 3 form names an act, which is what `text_uid_from_celex`
+/// reads.
+fn canonical_uid_from_notice(celex: &str) -> Option<String> {
+    match lj_sources::cjue::parse_consolidated_celex(celex) {
+        Some(r) => text_uid_from_celex(&format!("3{}", r.body)),
+        None => text_uid_from_celex(celex),
+    }
+}
+
+/// Of two uids differing only by the order of number and year, the one the CELEX
+/// names, and `None` unless the pair really holds one act twice. Two four-digit
+/// numbers make a legitimate pair of **distinct** acts, 2015/2016 and 2016/2015
+/// both existing: proof of duplication is that both sides answer the same CELEX,
+/// or that the side carrying none is empty and is exactly what the other's CELEX
+/// should have named.
+pub(crate) fn canonical_of(twins: &(EuTwin, EuTwin)) -> Option<String> {
+    let (a, b) = twins;
+    let named = |t: &EuTwin| t.celex.as_deref().and_then(canonical_uid_from_notice);
+    match (named(a), named(b)) {
+        (Some(ca), Some(cb)) => (ca == cb && (ca == a.text_uid || ca == b.text_uid)).then_some(ca),
+        (Some(c), None) => (c == b.text_uid && b.articles == 0).then_some(c),
+        (None, Some(c)) => (c == a.text_uid && a.articles == 0).then_some(c),
+        (None, None) => None,
+    }
+}
+
+/// Datasets that would re-seed a uid the base no longer holds, while their own
+/// CELEX names a fiche it does hold. The loader keys on the `text_uid` inside the
+/// file and not on its name, 342 of the EU datasets being named after the
+/// JORFTEXT they came from: a deletion keyed on the name misses those, and the
+/// next sweep reopens the identity that was just closed.
+pub(crate) fn datasets_a_retirer(
+    dir: &std::path::Path,
+    en_base: &std::collections::HashSet<String>,
+) -> Result<Vec<(std::path::PathBuf, String, String)>> {
+    #[derive(serde::Deserialize)]
+    struct SeedUid {
+        text_uid: String,
+        source_url: Option<String>,
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| anyhow!("lecture {}: {e}", dir.display()))? {
+        let path = entry.map_err(|e| anyhow!("readdir: {e}"))?.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if !name.starts_with("eu-") || !name.ends_with(".json") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow!("lecture {}: {e}", path.display()))?;
+        let doc: SeedUid = serde_json::from_str(&raw)
+            .map_err(|e| anyhow!("dataset invalide {}: {e}", path.display()))?;
+        if en_base.contains(&doc.text_uid) {
+            continue;
+        }
+        let Some(nomme) = doc
+            .source_url
+            .as_deref()
+            .and_then(|u| u.rsplit_once("/celex/").map(|(_, c)| c.to_string()))
+            .and_then(|c| canonical_uid_from_notice(&c))
+        else {
+            continue;
+        };
+        if nomme != doc.text_uid && en_base.contains(&nomme) {
+            out.push((path, doc.text_uid, nomme));
+        }
+    }
+    Ok(out)
+}
+
+/// Merges the `EU/` fiches held twice under swapped number and year, keeping the
+/// uid the CELEX names. Legacy of an ingest no longer in the code, so a one-off
+/// on the base; the disk pass, itself a net, runs on every call. Dry run unless
+/// `apply`.
+pub async fn merge_eu_swapped_uids(apply: bool) -> Result<()> {
+    let settings = Settings::from_env()?;
+    let dir = settings.legal_corpus_dir();
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    conn.batch_execute("SET statement_timeout = 0").await?;
+    let repo = DecisionRepository::new(&conn);
+
+    let twins = repo.eu_uid_twins().await?;
+    let mut plan: Vec<(&EuTwin, &EuTwin, bool)> = Vec::new();
+    let mut laissees = 0usize;
+    for pair in &twins {
+        let Some(canonical) = canonical_of(pair) else {
+            laissees += 1;
+            tracing::info!(
+                gauche = %pair.0.text_uid,
+                gauche_celex = ?pair.0.celex,
+                droite = %pair.1.text_uid,
+                droite_celex = ?pair.1.celex,
+                "uid permutés non prouvés doublons, laissés en place"
+            );
+            continue;
+        };
+        let (garde, meurt) = if canonical == pair.0.text_uid {
+            (&pair.0, &pair.1)
+        } else {
+            (&pair.1, &pair.0)
+        };
+        // The body is not always on the uid the CELEX names. When it is not, the
+        // empty canonical dies into the fiche that has it, which then takes the
+        // canonical uid: two moves rather than a migration of every child row.
+        let corps_a_deplacer = garde.articles == 0 && meurt.articles > 0;
+        plan.push((garde, meurt, corps_a_deplacer));
+    }
+
+    let (mut fusionnees, mut deplacees) = (0usize, 0usize);
+    for (garde, meurt, corps_a_deplacer) in &plan {
+        if !apply {
+            println!(
+                "{} <- {} ({} articles{})",
+                garde.text_uid,
+                meurt.text_uid,
+                meurt.articles,
+                if *corps_a_deplacer {
+                    ", corps à déplacer"
+                } else {
+                    ""
+                }
+            );
+            continue;
+        }
+        if *corps_a_deplacer {
+            repo.collapse_legal_text(&garde.text_uid, &meurt.text_uid)
+                .await?;
+            repo.rename_legal_text(&meurt.text_uid, &garde.text_uid, None)
+                .await?;
+            deplacees += 1;
+        } else {
+            repo.collapse_legal_text(&meurt.text_uid, &garde.text_uid)
+                .await?;
+            fusionnees += 1;
+        }
+        tracing::info!(garde = %garde.text_uid, meurt = %meurt.text_uid, corps_a_deplacer, "uid permuté fusionné");
+    }
+
+    // Read after the merges, so the disk pass sees the state a regeneration
+    // would start from. In a dry run the uids about to die are subtracted, which
+    // is the same state without writing it.
+    let mut en_base: std::collections::HashSet<String> =
+        repo.eu_text_uids().await?.into_iter().collect();
+    if !apply {
+        for (_, meurt, _) in &plan {
+            en_base.remove(&meurt.text_uid);
+        }
+    }
+    let orphelins = datasets_a_retirer(&dir, &en_base)?;
+    for (path, uid, nomme) in &orphelins {
+        if apply {
+            std::fs::remove_file(path).map_err(|e| anyhow!("rm {}: {e}", path.display()))?;
+        }
+        tracing::info!(dataset = %path.display(), uid, nomme, apply, "dataset ressemant un uid fermé");
+    }
+
+    let (n, s) = (orphelins.len(), if orphelins.len() > 1 { "s" } else { "" });
+    if !apply {
+        println!(
+            "merge-eu-swapped-uids : {} paires, {laissees} non prouvées doublons, {n} dataset{s} à \
+             retirer. Rien écrit, --apply pour fusionner.",
+            twins.len()
+        );
+        return Ok(());
+    }
+    println!(
+        "merge-eu-swapped-uids : {} paires, {fusionnees} fusionnées, {deplacees} dont le corps a \
+         changé d'uid, {laissees} laissées en place, {n} dataset{s} retiré{s}.",
+        twins.len()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nature_vient_du_titre_pas_de_la_colonne() {
+        assert_eq!(
+            nature_of_title("Directive 2011/65/UE du Parlement"),
+            Some("directive")
+        );
+        assert_eq!(
+            nature_of_title("Règlement (UE) 2016/679"),
+            Some("reglement")
+        );
+        assert_eq!(nature_of_title("Décision 2010/87/UE"), None);
+    }
 
     #[test]
     fn first_slashnum_extracts_head_number() {
@@ -246,6 +692,70 @@ mod tests {
         assert_eq!(celex_candidates("reglement", "44/2001"), vec!["32001R0044"]);
         assert_eq!(celex_candidates("directive", "77/388"), vec!["31977L0388"]);
         assert_eq!(celex_candidates("directive", "2003/86"), vec!["32003L0086"]);
+    }
+
+    fn twin(uid: &str, celex: Option<&str>, articles: i64) -> EuTwin {
+        EuTwin {
+            text_uid: uid.into(),
+            celex: celex.map(Into::into),
+            articles,
+        }
+    }
+
+    #[test]
+    fn celex_settles_the_swap_even_when_consolidated() {
+        assert_eq!(
+            canonical_of(&(
+                twin("EU/REG/2016-679", Some("02016R0679-20160504"), 99),
+                twin("EU/REG/679-2016", Some("02016R0679-20160504"), 99),
+            ))
+            .as_deref(),
+            Some("EU/REG/679-2016")
+        );
+        assert_eq!(
+            canonical_of(&(
+                twin("EU/DIR/115-2008", None, 0),
+                twin("EU/DIR/2008-115", Some("32008L0115"), 23),
+            ))
+            .as_deref(),
+            Some("EU/DIR/115-2008")
+        );
+        assert_eq!(
+            canonical_of(&(
+                twin("EU/DIR/1-2000", None, 0),
+                twin("EU/DIR/2000-1", None, 3)
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn two_real_acts_are_not_a_swap() {
+        // 2016/2017 and 2017/2016 both exist. The two CELEX differ, so the pair
+        // holds two acts and not one act twice.
+        assert_eq!(
+            canonical_of(&(
+                twin("EU/REG/2016-2017", Some("32017R2016"), 15),
+                twin("EU/REG/2017-2016", Some("32016R2017"), 3),
+            )),
+            None
+        );
+        // A single CELEX, but it names its own side: nothing says the empty twin
+        // is the same act, it may simply not be loaded yet.
+        assert_eq!(
+            canonical_of(&(
+                twin("EU/REG/2015-2016", Some("32016R2015"), 4),
+                twin("EU/REG/2016-2015", None, 0),
+            )),
+            None
+        );
+        assert_eq!(
+            canonical_of(&(
+                twin("EU/REG/2019-2024", None, 0),
+                twin("EU/REG/2024-2019", Some("02019R2024-20210501"), 14),
+            )),
+            None
+        );
     }
 
     #[test]

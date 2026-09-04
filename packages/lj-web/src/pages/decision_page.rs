@@ -19,9 +19,9 @@ use leptos::prelude::*;
 use leptos_meta::{Link, Meta, Script, Title};
 
 use crate::components::decision::{
-    DecisionActions, DecisionBody, DecisionCommentaires, DecisionHeader, DecisionLayout,
-    DecisionMeta, DecisionParties, DecisionProvenance, DecisionSimilar, DecisionSkeleton,
-    DecisionToc,
+    DecisionActions, DecisionBody, DecisionCitantes, DecisionCommentaires, DecisionHeader,
+    DecisionLayout, DecisionMeta, DecisionParties, DecisionProvenance, DecisionRenvoyants,
+    DecisionSimilar, DecisionSkeleton, DecisionToc,
 };
 use crate::components::own_page_description;
 use crate::seo::decision::{build_json_ld, meta_description};
@@ -140,7 +140,7 @@ fn DecisionLoaded(
         Effect::new(move |_| {
             let id = id.clone();
             leptos::task::spawn_local(async move {
-                if crate::auth::get_access_token().await.is_some() {
+                if crate::auth::has_session().await {
                     let _ = crate::api::ApiClient::from_context()
                         .record_decision_view(&id)
                         .await;
@@ -250,6 +250,11 @@ fn DecisionLoaded(
             </div>
             <DecisionBody detail=detail_body sections=body_sections />
             <DecisionCommentaires commentaires=detail.commentaires.clone() />
+            <DecisionCitantes
+                citantes=detail.citantes.clone()
+                total=detail.citantes_total
+            />
+            <DecisionRenvoyants renvoyants=detail.renvoyants.clone() />
             <DecisionProvenance detail=detail_provenance />
         </article>
     }

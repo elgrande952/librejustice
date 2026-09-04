@@ -14,6 +14,7 @@ use regex::Regex;
 
 mod adde;
 mod ariane;
+mod ce_list;
 mod cnda;
 mod dila;
 mod european;
@@ -23,6 +24,10 @@ pub use ariane::{
     analyse_body, build_ariane_source_fields, parse_ajce_html, parse_dce_html, AjceAnalysis,
     AjceEntry, AjceRubrique, DceParsed,
 };
+pub use ce_list::{
+    ce_list_names, is_pseudonymised, parse_ce_list_anchors, parse_ce_list_page, split_joint_name,
+    CeListAnchor, CeListEntry, CeListName,
+};
 use cnda::source_uid_is_cnda;
 pub use cnda::{
     clean_ocr_markdown, cnda_solution_uid_from_source_fields, parse_cnda, reflow_cnda_pdf_text,
@@ -31,7 +36,7 @@ pub use cnda::{
 use dila::source_fields_is_dila;
 pub use dila::{build_source_fields_dila, parse_dila_doc, parse_dila_xml, DilaDoc, DilaFond};
 use european::source_uid_is_html_europe;
-pub use european::{parse_cedh, parse_cjue};
+pub use european::{cedh_case_name, cjue_case_name, parse_cedh, parse_cjue};
 pub use juricaf::{parse_juricaf, JuricafParsed};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -689,7 +694,7 @@ pub(crate) mod vocab {
         ("ce", "CE"),
     ];
 
-    const CHAMBER_LABELS: &[(&str, &str)] = &[
+    const CASSATION_CHAMBER_LABELS: &[(&str, &str)] = &[
         ("civ1", "Première chambre civile"),
         ("civ2", "Deuxième chambre civile"),
         ("civ3", "Troisième chambre civile"),
@@ -758,7 +763,11 @@ pub(crate) mod vocab {
     /// Libellé de chambre ; le code brut si inconnu.
     pub fn chamber_label(code: Option<&str>) -> Option<String> {
         let code = code.filter(|c| !c.is_empty())?;
-        Some(lookup(CHAMBER_LABELS, code).unwrap_or(code).to_string())
+        Some(
+            lookup(CASSATION_CHAMBER_LABELS, code)
+                .unwrap_or(code)
+                .to_string(),
+        )
     }
 
     /// Libellé de formation ; le code en majuscules si inconnu.

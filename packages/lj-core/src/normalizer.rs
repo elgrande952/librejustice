@@ -102,7 +102,7 @@ static SUFFIX_WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwra
 /// Strip les diacritiques combinables des lettres latines (équivalent
 /// fonctionnel de `unicodedata.normalize("NFKD")` + filtrage `combining` sur
 /// la plage utile aux libellés de codes français).
-fn strip_accents(s: &str) -> String {
+pub fn strip_accents(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',

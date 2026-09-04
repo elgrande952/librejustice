@@ -3,16 +3,17 @@
 //! création, et mise à jour batchée des champs ré-extractibles.
 
 use super::support::{
-    as_param_refs, extracted_column_type, extracted_field_value, now, CASE_CITATIONS_FIELD,
-    DECISION_LINKS_FIELD, LEGAL_REFS_FIELD, PARTIES_FIELD, REEXTRACTABLE_FIELDS,
+    as_param_refs, extracted_column_type, extracted_field_value, is_routed_field, now,
+    CASE_CITATIONS_FIELD, CASE_NAME_FIELD, DECISION_LINKS_FIELD, LEGAL_REFS_FIELD, PARTIES_FIELD,
+    REEXTRACTABLE_FIELDS,
 };
 use super::types::{ExtractedFields, JurisdictionRow, UpsertResult, UpsertStatus};
-use super::DecisionRepository;
+use super::{DecisionRepository, ElectedCaseName};
 use crate::error::{Result, StoreError};
 use lj_core::decision::Decision;
 use lj_core::EXTRACT_VERSION;
 use serde_json::Value;
-use tokio_postgres::types::ToSql;
+use tokio_postgres::types::{Json, ToSql};
 
 impl DecisionRepository<'_> {
     #[tracing::instrument(name = "db.count_decisions", skip(self), fields(db.system = "postgresql"))]
@@ -20,21 +21,6 @@ impl DecisionRepository<'_> {
         let row = self
             .conn
             .query_one("SELECT COUNT(*) FROM decisions", &[])
-            .await?;
-        Ok(row.get::<_, i64>(0))
-    }
-
-    /// Nombre de décisions **actives** (non soft-deleted) = corpus réellement
-    /// indexé et cherchable. Compte exact : `pg_class.reltuples` ne peut pas
-    /// filtrer `deleted_at`. Servi via cache 12 h (stats accueil).
-    #[tracing::instrument(name = "db.count_active_decisions", skip(self), fields(db.system = "postgresql"))]
-    pub async fn count_active_decisions(&self) -> Result<i64> {
-        let row = self
-            .conn
-            .query_one(
-                "SELECT count(*) FROM decisions WHERE deleted_at IS NULL",
-                &[],
-            )
             .await?;
         Ok(row.get::<_, i64>(0))
     }
@@ -204,6 +190,8 @@ impl DecisionRepository<'_> {
             )
             .await?;
             if let Some(e) = extracted {
+                self.set_source_case_names(&[(decision_id, e.case_name.as_deref())])
+                    .await?;
                 self.replace_citations(decision_id, e.citation_occurrences.as_deref())
                     .await?;
                 self.replace_decision_links(decision_id, e.decision_links.as_deref())
@@ -254,14 +242,15 @@ impl DecisionRepository<'_> {
                   extract_version = $9,
                   full_text = $10, embed_version = $11, ecli = $12, canonical_ref = $13,
                   solution_uid = $14, procedure_uid = $15, office_uid = $16,
-                  legal_domain_uid = $17, publication_uid = $18,
-                  jurisdiction_code = $19,
-                  applicant_counsel_names = $20, applicant_law_firms = $21,
-                  applicant_companies = $22, defendant_counsel_names = $23,
-                  defendant_law_firms = $24, defendant_companies = $25,
-                  intervenors = $26, themes = $27,
-                  chamber_position = $28, chamber_uid = $29, formation_uid = $30,
-                  search_title = $31
+                  legal_domain_uid = $17,
+                  jurisdiction_code = $18,
+                  applicant_counsel_names = $19, applicant_law_firms = $20,
+                  applicant_companies = $21, defendant_counsel_names = $22,
+                  defendant_law_firms = $23, defendant_companies = $24,
+                  intervenors = $25, themes = $26,
+                  chamber_key = $27, formation_uid = $28,
+                  search_title = $29,
+                  seat = $30, seat_paths = $31
                 WHERE id = $8
                   AND (extract_version IS NULL OR extract_version <= $9)
                 ",
@@ -283,7 +272,6 @@ impl DecisionRepository<'_> {
                     &e.and_then(|e| e.procedure_uid.clone()),
                     &e.and_then(|e| e.office_uid.clone()),
                     &e.and_then(|e| e.legal_domain_uid.clone()),
-                    &e.and_then(|e| e.publication_uid.clone()),
                     &jurisdiction_code,
                     &e.map(|e| e.applicant_counsel_names.clone())
                         .unwrap_or_default(),
@@ -295,14 +283,41 @@ impl DecisionRepository<'_> {
                     &e.map(|e| e.defendant_companies.clone()).unwrap_or_default(),
                     &e.map(|e| e.intervenors.clone()).unwrap_or_default(),
                     &e.map(|e| e.themes.clone()).unwrap_or_default(),
-                    &e.and_then(|e| e.chamber_position.clone()),
-                    &e.and_then(|e| e.chamber_uid.clone()),
+                    &e.and_then(|e| e.chamber_key.clone()),
                     &e.and_then(|e| e.formation_uid.clone()),
                     &e.and_then(|e| e.search_title.clone()),
+                    &e.and_then(|e| e.seat.clone()).map(Json),
+                    &e.map(|e| e.seat_paths.clone()).unwrap_or_default(),
                 ],
             )
             .await?;
         Ok(())
+    }
+
+    /// Le nom que la source de la décision porte elle-même, posé par
+    /// [`Self::put_case_names`]. Une décision que la source ne nomme plus perd
+    /// le sien : la ré-extraction la laisserait autrement sur un nom que sa
+    /// source ne donne plus.
+    async fn set_source_case_names(&self, items: &[(i64, Option<&str>)]) -> Result<u64> {
+        let elected: Vec<ElectedCaseName> = items
+            .iter()
+            .filter_map(|(decision_id, name)| {
+                let name = (*name)?;
+                Some(ElectedCaseName {
+                    decision_id: *decision_id,
+                    keys: vec![lj_core::case_names::case_name_key(name)],
+                    name: Some(name.to_string()),
+                    source: "source",
+                })
+            })
+            .collect();
+        let orphelines: Vec<i64> = items
+            .iter()
+            .filter(|(_, name)| name.is_none())
+            .map(|(decision_id, _)| *decision_id)
+            .collect();
+        let efface = self.clear_case_names("source", &orphelines).await?;
+        Ok(efface.len() as u64 + self.put_case_names(&elected).await?)
     }
 
     /// Crée les lignes du référentiel `jurisdiction` manquantes — référentiel
@@ -464,118 +479,6 @@ impl DecisionRepository<'_> {
         .await
     }
 
-    #[tracing::instrument(name = "db.update_extracted_fields", skip(self, extracted), fields(db.system = "postgresql"))]
-    pub async fn update_extracted_fields(
-        &self,
-        decision_id: i64,
-        extracted: &ExtractedFields,
-        fields: Option<&[&str]>,
-        overwrite: bool,
-    ) -> Result<()> {
-        let selected: Vec<&str> = fields
-            .map(|f| f.to_vec())
-            .unwrap_or_else(|| REEXTRACTABLE_FIELDS.to_vec());
-        let column_fields: Vec<&str> = selected
-            .iter()
-            .copied()
-            .filter(|f| {
-                *f != LEGAL_REFS_FIELD
-                    && *f != DECISION_LINKS_FIELD
-                    && *f != CASE_CITATIONS_FIELD
-                    && *f != PARTIES_FIELD
-            })
-            .collect();
-
-        if !column_fields.is_empty() {
-            // FK jurisdiction_code : ligne référentielle garantie + code source résolu
-            // en code canonique avant l'UPDATE.
-            let jurisdiction_codes = if column_fields.contains(&"jurisdiction_code") {
-                let juris: Vec<JurisdictionRow> =
-                    extracted.jurisdiction.clone().into_iter().collect();
-                self.ensure_jurisdictions(&juris).await?
-            } else {
-                Default::default()
-            };
-            let mut assignments: Vec<String> = Vec::with_capacity(column_fields.len() + 1);
-            let mut rhs: Vec<String> = Vec::with_capacity(column_fields.len());
-            let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
-            let mut idx = 1;
-            for field in &column_fields {
-                rhs.push(if overwrite {
-                    format!("${idx}")
-                } else {
-                    format!("COALESCE({field}, ${idx})")
-                });
-                assignments.push(format!("{field} = {}", rhs[rhs.len() - 1]));
-                if *field == "jurisdiction_code" {
-                    params.push(Box::new(
-                        extracted
-                            .jurisdiction
-                            .as_ref()
-                            .and_then(|j| jurisdiction_codes.get(&j.source_code).cloned()),
-                    ));
-                } else {
-                    params.push(extracted_field_value(extracted, field));
-                }
-                idx += 1;
-            }
-            // Le tampon suit le contenu, pas l'écriture. Les RHS s'évaluent sur la
-            // ligne d'avant l'UPDATE, la comparaison est donc bien ancien vs nouveau.
-            assignments.push(format!(
-                "updated_at = CASE WHEN ({}) IS DISTINCT FROM ({}) THEN ${idx} ELSE updated_at END",
-                column_fields.join(", "),
-                rhs.join(", "),
-            ));
-            params.push(Box::new(now()));
-            idx += 1;
-            let id_ph = idx;
-            params.push(Box::new(decision_id));
-
-            let sql = format!(
-                "UPDATE decisions SET {} WHERE id = ${}",
-                assignments.join(", "),
-                id_ph,
-            );
-            let refs = as_param_refs(&params);
-            self.conn.execute(sql.as_str(), &refs).await?;
-        }
-
-        // Les couches satellites vivent hors de l'UPDATE colonnes : elles datent la
-        // page elles-mêmes quand elles changent.
-        let mut satellites: Vec<i64> = Vec::new();
-        if selected.contains(&LEGAL_REFS_FIELD)
-            && (overwrite || extracted.citation_occurrences.is_some())
-        {
-            satellites.extend(
-                self.replace_citations(decision_id, extracted.citation_occurrences.as_deref())
-                    .await?,
-            );
-        }
-        if selected.contains(&DECISION_LINKS_FIELD)
-            && (overwrite || extracted.decision_links.is_some())
-        {
-            satellites.extend(
-                self.replace_decision_links(decision_id, extracted.decision_links.as_deref())
-                    .await?,
-            );
-        }
-        if selected.contains(&CASE_CITATIONS_FIELD)
-            && (overwrite || extracted.case_citations.is_some())
-        {
-            satellites.extend(
-                self.replace_case_citations(decision_id, extracted.case_citations.as_deref())
-                    .await?,
-            );
-        }
-        if selected.contains(&PARTIES_FIELD) && (overwrite || extracted.parties.is_some()) {
-            satellites.extend(
-                self.replace_decision_parties(decision_id, extracted.parties.as_deref())
-                    .await?,
-            );
-        }
-        self.touch_content_changed(satellites).await
-    }
-
     /// Date du jour les pages dont une couche satellite vient de changer —
     /// références légales, liens de chronologie, citations de jurisprudence,
     /// acteurs. Le rendu a bougé même quand aucune colonne de `decisions` n'a été
@@ -600,7 +503,6 @@ impl DecisionRepository<'_> {
         &self,
         items: &[(i64, ExtractedFields)],
         fields: Option<&[&str]>,
-        overwrite: bool,
     ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -611,12 +513,7 @@ impl DecisionRepository<'_> {
         let column_fields: Vec<&str> = selected
             .iter()
             .copied()
-            .filter(|f| {
-                *f != LEGAL_REFS_FIELD
-                    && *f != DECISION_LINKS_FIELD
-                    && *f != CASE_CITATIONS_FIELD
-                    && *f != PARTIES_FIELD
-            })
+            .filter(|f| !is_routed_field(f))
             .collect();
 
         // Pas de skip-diff colonnes en lecture préalable : le skip vit DANS
@@ -674,17 +571,11 @@ impl DecisionRepository<'_> {
                 value_rows.push(format!("({})", cells.join(", ")));
             }
 
-            // RHS de chaque colonne (réutilisé par le SET et le skip-tuple) :
-            // overwrite = vérité de l'extracteur ; sinon fill-des-NULLs.
+            // RHS de chaque colonne (réutilisé par le SET et le skip-tuple) : la
+            // valeur ré-extraite fait autorité.
             let rhs: Vec<String> = column_fields
                 .iter()
-                .map(|field| {
-                    if overwrite {
-                        format!("src.{field}")
-                    } else {
-                        format!("COALESCE(d.{field}, src.{field})")
-                    }
-                })
+                .map(|field| format!("src.{field}"))
                 .collect();
             let d_tuple: Vec<String> = column_fields.iter().map(|f| format!("d.{f}")).collect();
             let mut assignments: Vec<String> = Vec::with_capacity(column_fields.len() + 2);
@@ -730,13 +621,20 @@ impl DecisionRepository<'_> {
             self.conn.execute(sql.as_str(), &refs).await?;
         }
 
+        if selected.contains(&CASE_NAME_FIELD) {
+            let names: Vec<(i64, Option<&str>)> = items
+                .iter()
+                .map(|(id, e)| (*id, e.case_name.as_deref()))
+                .collect();
+            self.set_source_case_names(&names).await?;
+        }
+
         // Les couches satellites vivent hors de l'UPDATE colonnes : elles datent la
         // page elles-mêmes quand elles changent.
         let mut satellites: Vec<i64> = Vec::new();
         if selected.contains(&LEGAL_REFS_FIELD) {
             let refs_items: Vec<super::citations::CitationWriteItem> = items
                 .iter()
-                .filter(|(_, e)| overwrite || e.citation_occurrences.is_some())
                 .map(|(id, e)| (*id, e.citation_occurrences.clone()))
                 .collect();
             satellites.extend(self.replace_citations_bulk(&refs_items).await?);
@@ -744,7 +642,6 @@ impl DecisionRepository<'_> {
         if selected.contains(&DECISION_LINKS_FIELD) {
             let link_items: Vec<super::links::DecisionLinkWriteItem> = items
                 .iter()
-                .filter(|(_, e)| overwrite || e.decision_links.is_some())
                 .map(|(id, e)| (*id, e.decision_links.clone()))
                 .collect();
             satellites.extend(self.replace_decision_links_bulk(&link_items).await?);
@@ -752,7 +649,6 @@ impl DecisionRepository<'_> {
         if selected.contains(&CASE_CITATIONS_FIELD) {
             let case_items: Vec<super::cases::CaseCitationWriteItem> = items
                 .iter()
-                .filter(|(_, e)| overwrite || e.case_citations.is_some())
                 .map(|(id, e)| (*id, e.case_citations.clone()))
                 .collect();
             satellites.extend(self.replace_case_citations_bulk(&case_items).await?);
@@ -760,7 +656,6 @@ impl DecisionRepository<'_> {
         if selected.contains(&PARTIES_FIELD) {
             let party_items: Vec<super::parties::DecisionPartyWriteItem> = items
                 .iter()
-                .filter(|(_, e)| overwrite || e.parties.is_some())
                 .map(|(id, e)| (*id, e.parties.clone()))
                 .collect();
             satellites.extend(self.replace_decision_parties_bulk(&party_items).await?);
@@ -802,12 +697,7 @@ impl DecisionRepository<'_> {
         let column_fields: Vec<&str> = fields
             .iter()
             .copied()
-            .filter(|f| {
-                *f != LEGAL_REFS_FIELD
-                    && *f != DECISION_LINKS_FIELD
-                    && *f != CASE_CITATIONS_FIELD
-                    && *f != PARTIES_FIELD
-            })
+            .filter(|f| !is_routed_field(f))
             .collect();
         if items.is_empty() || column_fields.is_empty() {
             return Ok(Vec::new());
@@ -926,6 +816,11 @@ impl DecisionRepository<'_> {
                 .remove(&j.source_code),
             None => None,
         };
+        let case_name = e.and_then(|e| e.case_name.clone());
+        let case_name_keys = case_name
+            .as_deref()
+            .map(|n| vec![lj_core::case_names::case_name_key(n)]);
+        let case_name_source = case_name.as_ref().map(|_| "source");
         let row = self
             .conn
             .query_one(
@@ -936,14 +831,16 @@ impl DecisionRepository<'_> {
                   publication_codes, extract_version,
                   full_text, embed_version, ecli, canonical_ref,
                   solution_uid, procedure_uid, office_uid, legal_domain_uid,
-                  publication_uid, jurisdiction_code,
+                  jurisdiction_code,
                   applicant_counsel_names, applicant_law_firms, applicant_companies,
                   defendant_counsel_names, defendant_law_firms, defendant_companies,
-                  intervenors, themes, chamber_position, chamber_uid, formation_uid,
-                  search_title
+                  intervenors, themes, chamber_key, formation_uid,
+                  search_title, case_name, case_name_keys, case_name_source,
+                  seat, seat_paths
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+                        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
+                        $29, $30, $31, $32, $33)
                 RETURNING id
                 ",
                 &[
@@ -963,7 +860,6 @@ impl DecisionRepository<'_> {
                     &e.and_then(|e| e.procedure_uid.clone()),
                     &e.and_then(|e| e.office_uid.clone()),
                     &e.and_then(|e| e.legal_domain_uid.clone()),
-                    &e.and_then(|e| e.publication_uid.clone()),
                     &jurisdiction_code,
                     &e.map(|e| e.applicant_counsel_names.clone())
                         .unwrap_or_default(),
@@ -975,10 +871,14 @@ impl DecisionRepository<'_> {
                     &e.map(|e| e.defendant_companies.clone()).unwrap_or_default(),
                     &e.map(|e| e.intervenors.clone()).unwrap_or_default(),
                     &e.map(|e| e.themes.clone()).unwrap_or_default(),
-                    &e.and_then(|e| e.chamber_position.clone()),
-                    &e.and_then(|e| e.chamber_uid.clone()),
+                    &e.and_then(|e| e.chamber_key.clone()),
                     &e.and_then(|e| e.formation_uid.clone()),
                     &e.and_then(|e| e.search_title.clone()),
+                    &case_name,
+                    &case_name_keys,
+                    &case_name_source,
+                    &e.and_then(|e| e.seat.clone()).map(Json),
+                    &e.map(|e| e.seat_paths.clone()).unwrap_or_default(),
                 ],
             )
             .await?;
@@ -1004,12 +904,9 @@ impl DecisionRepository<'_> {
         Ok(decision_id)
     }
 
-    /// Streame le texte des décisions par pagination keyset sur `id` : renvoie
-    /// jusqu'à `limit` lignes `(id, full_text)` d'`id` strictement > `after_id`,
-    /// ordonnées par `id`. L'appelant boucle en avançant `after_id` au dernier id
-    /// reçu jusqu'à un batch vide. `sample_mod` ≥ 1 sous-échantillonne
-    /// (`id % sample_mod = 0` ; `1` = tout le corpus). Alimente le mineur de
-    /// collocations (`lj-bench mine-collocations`) — grain décision.
+    /// Pagination keyset sur `id` : `limit` lignes `(id, full_text)` d'`id` >
+    /// `after_id`. L'appelant avance `after_id` jusqu'à un batch vide.
+    /// `sample_mod` ≥ 1 sous-échantillonne (`1` = tout le corpus).
     #[tracing::instrument(name = "db.fetch_chunk_bodies_after", skip(self), fields(db.system = "postgresql"))]
     pub async fn fetch_chunk_bodies_after(
         &self,
@@ -1037,7 +934,7 @@ impl DecisionRepository<'_> {
 /// (`tj_paris`, `tcom_lyon`) ; tout autre type reprend le code source tel quel
 /// (singletons `cc`/`ce`… et slugs `ca_`/`caa_`/`ta_` déjà en ville). Sans ville
 /// exploitable, repli franc sur le code source.
-fn canonical_jurisdiction_code(
+pub fn canonical_jurisdiction_code(
     jurisdiction_type: &str,
     city: Option<&str>,
     source_code: &str,

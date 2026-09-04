@@ -39,7 +39,7 @@ mod formation_label;
 mod jurisdiction_names;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Uids `procedure:*` / `office:*` / `legal_domain:*` détectés par la
 /// décomposition procédurale au scanner : chaque détection route directement vers
@@ -896,15 +896,24 @@ fn counsel(scan: Option<&crate::scan::DocScan>) -> crate::scan::CounselOut {
     scan.map(|s| s.counsel()).unwrap_or_default()
 }
 
-/// Métadonnée `avocat_requerant` (XML opendata) : fait foi côté requérant, le
-/// texte n'est que fallback. Cabinet quand elle ouvre sur une structure d'avocats
-/// ou mentionne « avocat »/« cabinet », personne sinon — vocabulaire fermé,
-/// comparaison pliée.
-fn avocat_requerant_meta(d: &Decision) -> Option<(String, bool)> {
-    let compact = common::normalize_spaces(d.avocat_requerant.as_deref()?);
-    if compact.is_empty() {
-        return None;
-    }
+/// Opendata `avocat_requerant`: applicant side in 97 of the 102 decidable gold
+/// cases, the body being only a fallback. The semicolon separates counsel and
+/// never belongs to a name: no gold cell out of 2 714 carries one.
+fn avocat_requerant_meta(d: &Decision) -> Vec<(String, bool)> {
+    let Some(brut) = d.avocat_requerant.as_deref() else {
+        return Vec::new();
+    };
+    brut.split(';')
+        .filter_map(|item| {
+            let compact = common::normalize_spaces(item);
+            (!compact.is_empty()).then(|| classe_conseil_meta(compact))
+        })
+        .collect()
+}
+
+/// Cabinet quand l'item ouvre ou finit sur une structure d'avocats, ou mentionne
+/// « avocat »/« cabinet » ; personne sinon.
+fn classe_conseil_meta(compact: String) -> (String, bool) {
     let f = crate::compiled::fold_stable(&compact);
     // Structure en tête (« SCP X ») OU en queue (« DHALLUIN SCP ») : la
     // métadonnée écrit les deux ordres.
@@ -933,7 +942,7 @@ fn avocat_requerant_meta(d: &Decision) -> Option<(String, bool)> {
     let last = toks.next_back().unwrap_or(first);
     let is_firm =
         structural(first) || structural(last) || f.contains("avocat") || f.contains("cabinet");
-    Some((compact, is_firm))
+    (compact, is_firm)
 }
 
 /// Ébarbe une valeur counsel de sa queue d'apposition cabinet (« Jean-Claude
@@ -983,22 +992,24 @@ fn trim_counsel_tail(v: String) -> String {
 /// Quand la tranche texte recouvre le MÊME nom entier (mêmes mots pliés) et
 /// que la métadonnée est tout-CAPS, la tranche du corps en casse mixte prend
 /// la place — les capitales ont détruit casse et accents.
-fn merge_meta_first(meta: Option<String>, text: Vec<String>) -> Vec<String> {
-    let Some(meta) = meta else { return text };
-    let mw: Vec<String> = crate::compiled::fold_stable(&meta)
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
-    let mut out = vec![meta];
-    for n in text {
-        let nw: Vec<String> = crate::compiled::fold_stable(&n)
+fn merge_meta_first(metas: Vec<String>, text: Vec<String>) -> Vec<String> {
+    if metas.is_empty() {
+        return text;
+    }
+    let mots = |v: &str| -> Vec<String> {
+        crate::compiled::fold_stable(v)
             .split_whitespace()
             .map(str::to_string)
-            .collect();
-        if !nw.iter().all(|w| mw.contains(w)) {
-            out.push(n);
-        } else if nw.len() == mw.len() && common::better_cased(&out[0], &n) {
-            out[0] = n;
+            .collect()
+    };
+    let mw: Vec<Vec<String>> = metas.iter().map(|m| mots(m)).collect();
+    let mut out = metas;
+    for n in text {
+        let nw = mots(&n);
+        match mw.iter().position(|m| nw.iter().all(|w| m.contains(w))) {
+            Some(j) if nw.len() == mw[j].len() && common::better_cased(&out[j], &n) => out[j] = n,
+            Some(_) => {}
+            None => out.push(n),
         }
     }
     out
@@ -1024,10 +1035,12 @@ pub fn applicant_counsel_names_scanned(
     d: &Decision,
     scan: Option<&crate::scan::DocScan>,
 ) -> Option<Vec<String>> {
-    let meta = avocat_requerant_meta(d)
+    let metas = avocat_requerant_meta(d)
+        .into_iter()
         .filter(|(_, firm)| !firm)
-        .map(|(v, _)| v);
-    let names = merge_meta_first(meta, counsel(scan).applicant_names)
+        .map(|(v, _)| v)
+        .collect();
+    let names = merge_meta_first(metas, counsel(scan).applicant_names)
         .into_iter()
         .map(trim_counsel_tail)
         .filter(|v| !common::is_anonymized_person(v))
@@ -1043,10 +1056,12 @@ pub fn applicant_law_firms_scanned(
     d: &Decision,
     scan: Option<&crate::scan::DocScan>,
 ) -> Option<Vec<String>> {
-    let meta = avocat_requerant_meta(d)
+    let metas = avocat_requerant_meta(d)
+        .into_iter()
         .filter(|(_, firm)| *firm)
-        .map(|(v, _)| v);
-    let firms = merge_meta_first(meta, counsel(scan).applicant_firms)
+        .map(|(v, _)| v)
+        .collect();
+    let firms = merge_meta_first(metas, counsel(scan).applicant_firms)
         .into_iter()
         .filter(|v| !common::is_anonymized_firm(v))
         .collect();
@@ -1104,6 +1119,38 @@ pub fn extract_defendant_companies(d: &Decision) -> Option<Vec<String>> {
 
 pub fn defendant_companies_scanned(scan: Option<&crate::scan::DocScan>) -> Option<Vec<String>> {
     common::unique_nonempty(&common::dedupe_prefix_variants(companies(scan).1))
+}
+
+/// Parties personnes physiques : la source les pseudonymise, la valeur est la
+/// tranche verbatim sans la civilité.
+fn individuals(scan: Option<&crate::scan::DocScan>) -> (Vec<String>, Vec<String>) {
+    use crate::registry::{Quality, Side};
+    match scan {
+        Some(s) => {
+            let r = s.party_registry();
+            (
+                r.view(Some(Side::Applicant), Quality::Individual),
+                r.view(Some(Side::Defendant), Quality::Individual),
+            )
+        }
+        None => Default::default(),
+    }
+}
+
+pub fn extract_applicant_individuals(d: &Decision) -> Option<Vec<String>> {
+    applicant_individuals_scanned(scan_doc(d).as_ref())
+}
+
+pub fn applicant_individuals_scanned(scan: Option<&crate::scan::DocScan>) -> Option<Vec<String>> {
+    common::unique_nonempty(&individuals(scan).0)
+}
+
+pub fn extract_defendant_individuals(d: &Decision) -> Option<Vec<String>> {
+    defendant_individuals_scanned(scan_doc(d).as_ref())
+}
+
+pub fn defendant_individuals_scanned(scan: Option<&crate::scan::DocScan>) -> Option<Vec<String>> {
+    common::unique_nonempty(&individuals(scan).1)
 }
 
 /// Codes de publication : métadonnée source jointe — un seul code = le code nu.

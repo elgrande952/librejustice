@@ -1,95 +1,105 @@
 {
-  "_provenance": "généré depuis l'oracle Python (apps/api) — fonctions pures de search.py / signals.py / rerank.py. NE PAS éditer à la main : régénérer via le script de gen (cf. docs/working-notes parité). Asservi par les tests Rust de lj-api.",
+  "_provenance": "Généré depuis un oracle Python retiré depuis — fonctions pures de search.py / signals.py / rerank.py. NE PAS éditer à la main. Asservi par les tests Rust de lj-api.",
   "cases": [
     {
       "query": "expulsion locative",
       "article": false,
-      "docket": false,
-      "date": false
+      "docket": false
     },
     {
       "query": "article L 531-1 du CESEDA",
       "article": true,
-      "docket": false,
-      "date": false
+      "docket": false
     },
     {
       "query": "R. 222-1 du code de justice administrative",
       "article": true,
-      "docket": false,
-      "date": false
+      "docket": false
     },
     {
       "query": "D.521-2",
       "article": true,
-      "docket": false,
-      "date": false
+      "docket": false
     },
     {
       "query": "L761-1",
       "article": true,
-      "docket": false,
-      "date": false
+      "docket": false
     },
     {
       "query": "pourvoi 07-11.687",
       "article": false,
-      "docket": true,
-      "date": false
+      "docket": true
     },
     {
       "query": "arrêt 19-23664",
       "article": false,
-      "docket": true,
-      "date": false
+      "docket": true
     },
     {
       "query": "RG 23/01001",
       "article": false,
-      "docket": true,
-      "date": false
+      "docket": true
     },
     {
       "query": "requête 2202166",
       "article": false,
-      "docket": true,
-      "date": false
+      "docket": true
     },
     {
       "query": "12345",
       "article": false,
-      "docket": false,
-      "date": false
+      "docket": true
     },
     {
       "query": "décision du 13 février 2024",
       "article": false,
-      "docket": false,
-      "date": true
+      "docket": false
     },
     {
       "query": "arrêt de février 2024",
       "article": false,
-      "docket": false,
-      "date": true
+      "docket": false
     },
     {
       "query": "2024-02-13",
       "article": false,
-      "docket": false,
-      "date": true
+      "docket": false
     },
     {
       "query": "Cour de cassation 22 novembre 2000",
       "article": false,
-      "docket": false,
-      "date": true
+      "docket": false
     },
     {
       "query": "simple requête sans rien",
       "article": false,
-      "docket": false,
-      "date": false
+      "docket": false
+    },
+    {
+      "query": "CAA de Paris, 21 décembre 2021, n° 21PA01295",
+      "article": false,
+      "docket": true
+    },
+    {
+      "query": "tribunal de commerce 2005J00072",
+      "article": false,
+      "docket": true
+    },
+    {
+      "query": "CJUE C-369/90 Micheletti",
+      "article": false,
+      "docket": true
+    },
+    {
+      "query": "délibération SAN-2022-019",
+      "article": false,
+      "docket": true
+    },
+    {
+      "query": "décret 2020-1310",
+      "article": false,
+      "docket": false
     }
   ]
 }

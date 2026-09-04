@@ -249,30 +249,19 @@ pub(crate) fn decisions_href(
 /// le SSR n'émet alors aucun nœud texte, et l'hydratation qui en cherche un
 /// panique en release (`failed_to_cast_text_node`).
 #[component]
-fn CitedDecisionRow(hit: CitingDecisionHit, cited: Option<String>) -> impl IntoView {
+pub(crate) fn CitedDecisionRow(hit: CitingDecisionHit, cited: Option<String>) -> impl IntoView {
     use crate::components::hover_preview::{HoverPreview, PreviewKind};
-    use lj_dtos::Significance;
     let kind = PreviewKind::Decision { id: hit.id.clone() };
     let href = format!("/decision/{}", hit.id);
-    let badge = match hit.significance {
-        Significance::Majeure => Some((
-            "Portée majeure",
-            "border-[var(--color-accent)] text-[var(--color-accent)]",
-        )),
-        Significance::Importante => Some((
-            "Portée importante",
-            "border-[var(--color-rule)] text-[var(--color-ink-muted)]",
-        )),
-        _ => None,
-    }
-    .map(|(label, tone)| {
-        view! {
-            <span class=format!(
-                "inline-flex w-fit items-center rounded-full border px-2 py-0.5 text-[11px] {tone}",
-            )>{label}</span>
-        }
-        .into_any()
-    });
+    let badge = crate::pages::decision_page::labels::publication_badge(&hit.publication_codes)
+        .map(|label| {
+            view! {
+                <span class="inline-flex w-fit items-center rounded-full border border-[var(--color-rule)] px-2 py-0.5 text-[11px] text-[var(--color-ink-muted)]">
+                    {label}
+                </span>
+            }
+            .into_any()
+        });
     let summary = hit.summary.as_deref().map(|s| {
         let snippet = crate::seo::decision::first_sentence(s);
         view! {

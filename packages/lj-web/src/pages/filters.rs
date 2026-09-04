@@ -16,13 +16,13 @@ const NON_FILTER_KEYS: [&str; 3] = ["mode", "sort", "aiMode"];
 /// `SearchRequest`).
 fn filter_label(key: &str) -> Option<&'static str> {
     Some(match key {
+        "seat" => "Juridiction",
         "jurisdictionType" => "Juridiction",
         "solution" => "Solution",
         "procedure" => "Voie",
         "office" => "Office",
-        "chamber" => "Chambre",
-        "legalDomain" => "Domaine",
-        "significance" => "Portée",
+        "chamber" => "Formation",
+        "legalDomain" => "Matière",
         "jurisdictionCode" => "Juridiction",
         "legalInstrument" => "Texte",
         "legalArticle" => "Article",
@@ -39,6 +39,11 @@ fn filter_label(key: &str) -> Option<&'static str> {
 fn value_label(key: &str, code: &str) -> Option<&'static str> {
     match key {
         "jurisdictionType" => jurisdiction_type_label(code),
+        // A seat path names its own court from the second segment on
+        // (`CA.PARIS`), which no compiled table labels. A lone root is a type.
+        "seat" => (!code.contains('.'))
+            .then(|| jurisdiction_type_label(code))
+            .flatten(),
         _ => None,
     }
 }

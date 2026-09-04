@@ -1,25 +1,22 @@
 //! Linker in-pass : résout chaque occurrence de citation vers le catalogue
-//! (`ref_text_uid`, `ref_num_key`) pendant la passe d'extraction. Opère sur un
-//! [`LinkSnapshot`] bâti de lignes catalogue plates hydratées par l'appelant.
+//! (`ref_text_uid`, `ref_num_key`) pendant la passe d'extraction, sur un
+//! [`LinkSnapshot`] hydraté par l'appelant.
 //!
-//! Jambes de résolution, dans l'ordre d'autorité :
+//! Jambes de résolution, **dans l'ordre d'autorité** :
 //!
-//! 1. **Alias embarqués** (`data/link_aliases.tsv`), validés contre le catalogue à
-//!    l'hydratation ; NOR porté par la forme brute.
-//! 2. **Gate de citabilité** (`key_signals`) : acte local, norme privée, fragment
-//!    → jamais lié. Sous le for d'un texte du référentiel étranger, une famille
-//!    citée nue vise le texte du même pays.
-//! 3. **Acte daté par numéro** — unique par (nature, numéro) seulement.
-//! 4. **Titre exact**, désambiguïsé « texte vivant » (max articles VIGUEUR, ex
-//!    æquo → abstention).
-//! 5. **Droit dérivé UE** par (directive|règlement, année/séquence).
-//! 6. **Accord bilatéral** par (gentilé, date).
-//! 7. **CCN** par squelette de tokens.
-//! 8. **Code étranger** par (ISO du gentilé, famille sans gentilé).
-//! 9. **Acte daté par date** (nature, date) — la forme courte sans numéro.
+//! 1. alias embarqués (`data/link_aliases.tsv`), validés à l'hydratation ;
+//! 2. gate de citabilité (`key_signals`) : acte local, norme privée, fragment →
+//!    jamais lié ;
+//! 3. acte daté par numéro — unique par (nature, numéro) seulement ;
+//! 4. titre exact, désambiguïsé « texte vivant » (ex æquo → abstention) ;
+//! 5. droit dérivé UE par (directive|règlement, année/séquence) ;
+//! 6. accord bilatéral par (gentilé, date) ;
+//! 7. CCN par squelette de tokens ;
+//! 8. code étranger par (ISO du gentilé, famille sans gentilé) ;
+//! 9. acte daté par date — la forme courte sans numéro.
 //!
-//! `ref_num_key` : posé par existence de l'article au catalogue (ou via la table
-//! préfixe-agnostique des codes territoriaux) ; jamais inventé.
+//! `ref_num_key` est posé par existence de l'article au catalogue, jamais
+//! inventé.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -210,9 +207,6 @@ pub struct LinkSnapshot {
     kalicont: HashSet<String>,
     /// uid → `num_key` des articles au catalogue (existence).
     articles: HashMap<String, HashSet<String>>,
-    /// uid → forme citée pointée → `num_key` officiel étoilé (« R. 771-5 » →
-    /// « R*771-5 », décrets en Conseil d'État).
-    star_articles: HashMap<String, HashMap<String, String>>,
     /// uid préfixe-agnostique → cœur numérique → `num_key` officiel.
     prefix_agnostic: HashMap<String, HashMap<String, String>>,
 }
@@ -227,22 +221,6 @@ impl LinkSnapshot {
         let mut article_sets: HashMap<String, HashSet<String>> = HashMap::new();
         for (uid, num_key) in articles {
             article_sets.entry(uid).or_default().insert(num_key);
-        }
-
-        let mut star_articles: HashMap<String, HashMap<String, String>> = HashMap::new();
-        for (uid, nums) in &article_sets {
-            for nk in nums {
-                if !nk.contains('*') {
-                    continue;
-                }
-                let cited = lj_core::article_key::article_key(&nk.replace('*', ""));
-                if !cited.is_empty() && !nums.contains(&cited) {
-                    star_articles
-                        .entry(uid.clone())
-                        .or_default()
-                        .insert(cited, nk.clone());
-                }
-            }
         }
 
         // Texte vivant par title_key : max VIGUEUR, ex æquo → skip. Clés pliées
@@ -565,7 +543,6 @@ impl LinkSnapshot {
             foreign_owner,
             kalicont,
             articles: article_sets,
-            star_articles,
             prefix_agnostic,
         }
     }
@@ -653,10 +630,6 @@ impl LinkSnapshot {
     pub fn has_article(&self, uid: &str, num_key: &str) -> bool {
         let ak = &lj_core::article_key::article_key(num_key);
         self.articles.get(uid).is_some_and(|s| s.contains(ak))
-            || self
-                .star_articles
-                .get(uid)
-                .is_some_and(|m| m.contains_key(ak))
             || !self.prefixed_variants(uid, ak).is_empty()
     }
 
@@ -754,9 +727,6 @@ impl LinkSnapshot {
         }
         if self.articles.get(uid).is_some_and(|s| s.contains(ak)) {
             return Some(ak.to_string());
-        }
-        if let Some(official) = self.star_articles.get(uid).and_then(|m| m.get(ak)) {
-            return Some(official.clone());
         }
         if let [unique] = &self.prefixed_variants(uid, ak)[..] {
             return Some(unique.clone());

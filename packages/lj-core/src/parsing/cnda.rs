@@ -531,25 +531,16 @@ pub fn cnda_solution_uid_from_source_fields(
 
 /// Parse une décision CNDA en [`CndaParsed`].
 ///
-/// `pdf_text` = texte issu de l'OCR Mistral déjà nettoyé au bord
-/// (`clean_ocr_markdown`) ; vide ⇒ décision fiche-only (`full_text` = abstract
-/// éditorial de la fiche). `fiche` = métadonnées de la fiche HTML désérialisées.
-/// `numero` = numéro de décision. PUR.
+/// `pdf_text` vide ⇒ décision fiche-only (`full_text` = abstract éditorial).
+/// L'`ecli` est fabriqué (`ECLI:FR:CNDA:{année}:{numero}`, année dérivée de la
+/// date de lecture) : la Cour n'en émet aucun.
 ///
-/// `ecli` = `ECLI:FR:CNDA:{année}:{numero}`, l'année étant dérivée de la date de
-/// lecture : la Cour n'émet aucun ECLI. `solution` = dispositif verbatim.
+/// Erreur franche si le numéro est vide, ou — avec PDF — si aucune des 8
+/// sections n'est détectée ou si la date de lecture est introuvable.
 ///
-/// Erreur franche [`CoreError::Xml`] si le numéro est vide, ou — sur une décision
-/// avec PDF — si aucune des 8 sections n'est détectée ou si la date de lecture
-/// est introuvable.
-///
-/// ## Contrat de stabilité du chunk
-///
-/// Le texte envoyé à l'embedder est dérivé de `texte_integral_clean`,
-/// `metadata_header` et `visa_trim`. Ce parser pose les deux derniers vides pour
-/// la CNDA : aucune métadonnée n'entre dans le chunk. Dates, ECLI, classement,
-/// importance, formation et URLs vivent donc uniquement dans `source_fields` et
-/// les colonnes de [`Decision`], modifiables sans re-embed.
+/// **Contrat de stabilité du chunk** : `metadata_header` et `visa_trim` sont
+/// posés vides, donc aucune métadonnée n'entre dans le chunk. Dates, ECLI,
+/// classement, formation et URLs restent modifiables sans re-embed.
 pub fn parse_cnda(pdf_text: &str, fiche: &Value, numero: &str) -> crate::error::Result<CndaParsed> {
     use crate::error::CoreError;
 

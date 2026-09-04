@@ -2,7 +2,10 @@
 //! rail de `/decisions`, « Dans les décisions » dans celui de `/textes`.
 //!
 //! Le fetch part en parallèle de la recherche principale, depuis un `Effect`
-//! vers un signal. Zéro résultat ou erreur ⇒ le bloc disparaît.
+//! vers un signal. Zéro résultat ou erreur ⇒ le bloc disparaît. Le signal porte
+//! la requête à laquelle il répond : tant que la requête courante n'est pas
+//! celle-là, le bloc est en attente — il ne montre jamais la question
+//! précédente.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -11,6 +14,7 @@ use lj_dtos::{
 };
 
 use crate::api::{ApiClient, PageParams, TextesFilters};
+use crate::components::ui::Skeleton;
 use crate::helpers::{encode_query, format_article_num, group_thousands};
 
 use super::compact_search::highlight::Highlighted;
@@ -22,11 +26,12 @@ const TEASER_ROWS: usize = 3;
 /// textes pour la même requête + lien vers `/textes?q=…`.
 #[component]
 pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
-    let data = RwSignal::new(None::<(String, ArticleSearchResponse)>);
+    let title = "Dans les textes";
+    let answer = RwSignal::new(None::<(String, Option<ArticleSearchResponse>)>);
     Effect::new(move |_| {
         let q = query.get();
         if q.is_empty() {
-            data.set(None);
+            answer.set(None);
             return;
         }
         leptos::task::spawn_local(async move {
@@ -44,12 +49,19 @@ pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
             if query.get_untracked() != q {
                 return;
             }
-            data.set(resp.ok().map(|r| (q, r)));
+            answer.set(Some((q, resp.ok())));
         });
     });
 
     move || {
-        let Some((q, resp)) = data.get() else {
+        let q = query.get();
+        if q.is_empty() {
+            return ().into_any();
+        }
+        let Some(answered) = answer.get().filter(|(to, _)| *to == q) else {
+            return teaser_skeleton(title);
+        };
+        let Some(resp) = answered.1 else {
             return ().into_any();
         };
         if resp.hits.is_empty() {
@@ -80,7 +92,7 @@ pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
             format!("Voir les {} textes", group_thousands(total))
         };
         teaser_block(
-            "Dans les textes",
+            title,
             rows.into_any(),
             format!("/textes?q={}", encode_query(&q)),
             more_label,
@@ -92,11 +104,12 @@ pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
 /// jurisprudence pour la même requête + lien vers `/decisions?q=…`.
 #[component]
 pub fn DecisionsTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
-    let data = RwSignal::new(None::<(String, SearchResponse)>);
+    let title = "Dans les décisions";
+    let answer = RwSignal::new(None::<(String, Option<SearchResponse>)>);
     Effect::new(move |_| {
         let q = query.get();
         if q.is_empty() {
-            data.set(None);
+            answer.set(None);
             return;
         }
         leptos::task::spawn_local(async move {
@@ -107,49 +120,76 @@ pub fn DecisionsTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
             if query.get_untracked() != q {
                 return;
             }
-            data.set(resp.ok().map(|r| (q, r)));
+            answer.set(Some((q, resp.ok())));
         });
     });
 
     move || {
-        let Some((q, resp)) = data.get() else {
+        let q = query.get();
+        if q.is_empty() {
+            return ().into_any();
+        }
+        let Some(answered) = answer.get().filter(|(to, _)| *to == q) else {
+            return teaser_skeleton(title);
+        };
+        let Some(resp) = answered.1 else {
             return ().into_any();
         };
         if resp.hits.is_empty() {
             return ().into_any();
         }
-        let total = resp.total;
         let rows = resp
             .hits
             .into_iter()
             .take(TEASER_ROWS)
             .map(|h| {
                 view! {
-                    <A
+                    <DecisionTeaserRow
                         href=format!("/decision/{}", h.id)
-                        attr:class="block truncate text-[13px] leading-snug text-[var(--color-ink-muted)] transition-colors hover:text-[var(--color-ink)]"
-                    >
-                        <Highlighted text=h.title_html />
-                    </A>
+                        title_html=h.title_html
+                        snippet=h.best_chunk.snippet
+                    />
                 }
             })
             .collect_view();
-        let more_label = if total == 1 {
-            "Voir la décision".to_string()
-        } else {
-            format!("Voir les {} décisions", group_thousands(total))
-        };
+        // Sans nombre : le décompte exact vaut une seconde d'agrégat, que le pont
+        // ne paie pas pour trois lignes de rail.
         teaser_block(
-            "Dans les décisions",
+            title,
             rows.into_any(),
             format!("/decisions?q={}", encode_query(&q)),
-            more_label,
+            "Voir les décisions".to_string(),
         )
     }
 }
 
-/// Requête décisions minimale du teaser : requête seule, top-3, tri
-/// pertinence, sans filtre ni mode IA.
+/// Ligne du teaser décisions : titre puis extrait du texte. L'extrait peut être
+/// vide, et un nœud conditionnel parmi les enfants d'un `collect_view()` n'émet
+/// son marqueur que dans une branche : la frontière de composant est ce qui le
+/// rend hydratable.
+#[component]
+fn DecisionTeaserRow(href: String, title_html: String, snippet: String) -> impl IntoView {
+    view! {
+        <A href=href attr:class="block no-underline">
+            <span class="block truncate text-[13px] leading-snug text-[var(--color-ink-muted)] transition-colors hover:text-[var(--color-ink)]">
+                <Highlighted text=title_html />
+            </span>
+            {Some(snippet)
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| {
+                    view! {
+                        <span class="mt-0.5 line-clamp-2 block text-[12px] leading-snug text-[var(--color-ink-subtle)]">
+                            <Highlighted text=s />
+                        </span>
+                    }
+                })}
+        </A>
+    }
+}
+
+/// Requête décisions du teaser : top-3, tri pertinence, sans filtre ni mode IA.
+/// Mode lexical forcé : le pont sert un extrait surligné, que produit la jambe
+/// BM25.
 fn teaser_search_request(q: &str) -> SearchRequest {
     SearchRequest {
         query: q.to_string(),
@@ -159,14 +199,13 @@ fn teaser_search_request(q: &str) -> SearchRequest {
         office: None,
         legal_domain: None,
         jurisdiction_code: None,
-        chamber: None,
+        seat: None,
         legal_instrument: None,
         legal_article: None,
-        significance: None,
         publication: None,
         date_from: None,
         date_to: None,
-        mode: SearchMode::Auto,
+        mode: SearchMode::Lexical,
         sort: SortOrder::Relevance,
         limit: TEASER_ROWS as u32,
         offset: 0,
@@ -194,6 +233,23 @@ fn teaser_block(
                 {more_label}
                 " →"
             </A>
+        </div>
+    }
+    .into_any()
+}
+
+/// Bloc en attente : le titre, qui ne dépend pas de la réponse, et des lignes
+/// muettes à la place des hits de la question précédente.
+fn teaser_skeleton(title: &'static str) -> AnyView {
+    view! {
+        <div class="flex flex-col gap-1.5 border-t border-[var(--color-rule)] pt-4">
+            <p class="pb-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                {title}
+            </p>
+            <Skeleton class="h-4 w-full" />
+            <Skeleton class="h-4 w-5/6" />
+            <Skeleton class="h-4 w-2/3" />
+            <Skeleton class="mt-1 h-4 w-32" />
         </div>
     }
     .into_any()

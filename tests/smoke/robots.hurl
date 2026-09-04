@@ -15,7 +15,8 @@ body contains "User-agent: GPTBot"
 # Les indexeurs de citation sont autorisés, hors API.
 body contains "User-agent: Claude-SearchBot"
 body contains "User-agent: PerplexityBot"
-body contains "Disallow: /api/"
+body contains "Disallow: /internal/"
+body not contains "Disallow: /api/"
 # Le signal d'intention opposable et le sitemap sont servis.
 body contains "Content-Signal: search=yes, ai-input=yes, ai-train=no"
 body matches "(?m)^Sitemap: https://.+/sitemap\\.xml$"

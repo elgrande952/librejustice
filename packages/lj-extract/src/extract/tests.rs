@@ -8,7 +8,7 @@ use crate::extract::{
 };
 use lj_core::decision::Decision;
 
-fn decision(jt: &str) -> Decision {
+pub(crate) fn decision(jt: &str) -> Decision {
     Decision {
         source_uid: "test".into(),
         member_name: "test".into(),
@@ -144,15 +144,17 @@ fn formation_axes_read_source_chamber_field() {
     let mut d = decision("TJ");
     d.chamber = Some("CTX PROTECTION SOCIALE".into());
     let axes = crate::extract::formation_axes_scanned(&d, None);
-    assert_eq!(axes.chamber_uid, Some("chamber:PROTECTION_SOCIALE"));
-    assert_eq!(axes.chamber_position.as_deref(), Some("Protection sociale"));
+    assert_eq!(
+        axes.chamber_label().as_deref(),
+        Some("Chambre de la protection sociale")
+    );
 
     let mut d2 = decision("CA");
     d2.chamber = Some("Pôle 1 - Chambre 11".into());
     let axes2 = crate::extract::formation_axes_scanned(&d2, None);
     assert_eq!(
-        axes2.chamber_position.as_deref(),
-        Some("Pôle 1 — 11e chambre")
+        axes2.chamber_label().as_deref(),
+        Some("Pôle 1, 11e chambre")
     );
 
     // Champ source vide → repli bandeau (comme la colonne composée).
@@ -160,7 +162,7 @@ fn formation_axes_read_source_chamber_field() {
     d3.texte_integral_clean =
         "COUR D'APPEL DE BASTIA \n\n CHAMBRE CIVILE \n\n ARRET DU \n TROIS JUILLET".into();
     let axes3 = crate::extract::formation_axes_scanned(&d3, crate::extract::scan_doc(&d3).as_ref());
-    assert_eq!(axes3.chamber_uid, Some("chamber:CIVILE"));
+    assert_eq!(axes3.chamber_label().as_deref(), Some("Chambre civile"));
 }
 
 #[test]
@@ -420,13 +422,20 @@ fn merge_meta_first_prefers_mixed_case_slice_for_same_name() {
     // Métadonnée CAPS + tranche corps du MÊME nom en casse mixte (accents
     // restaurés) : la tranche corps prend la place de tête.
     let out = crate::extract::merge_meta_first(
-        Some("POMEON".into()),
+        vec!["POMEON".into()],
         vec!["Poméon".into(), "Autre".into()],
     );
     assert_eq!(out, vec!["Poméon".to_string(), "Autre".to_string()]);
     // Recouvrement PARTIEL (la méta porte deux noms) : la méta reste telle
     // quelle, la tranche redondante est absorbée sans remplacement.
     let out =
-        crate::extract::merge_meta_first(Some("RIQUELME DUPONT".into()), vec!["Riquelme".into()]);
+        crate::extract::merge_meta_first(vec!["RIQUELME DUPONT".into()], vec!["Riquelme".into()]);
     assert_eq!(out, vec!["RIQUELME DUPONT".to_string()]);
+    // Liste source : chaque item garde sa place de tête, la tranche corps
+    // remplace celui qu'elle nomme mieux.
+    let out = crate::extract::merge_meta_first(
+        vec!["LE PRADO".into(), "ODENT".into()],
+        vec!["Odent".into()],
+    );
+    assert_eq!(out, vec!["LE PRADO".to_string(), "Odent".to_string()]);
 }

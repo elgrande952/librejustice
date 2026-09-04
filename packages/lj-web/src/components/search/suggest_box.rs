@@ -104,15 +104,21 @@ impl SuggestController {
         });
     }
 
-    /// Mots de la requête tapée que la sélection conserve (la suggestion ne
-    /// remplace que les `matched` derniers) — rendus estompés devant chaque
-    /// suggestion, et base de composition de [`pick`] / [`Self::navigate`].
-    fn kept_prefix(self) -> String {
+    /// Requête tapée coupée en deux : les mots que la sélection conserve et
+    /// ceux que la suggestion remplace (les `matched` derniers). Base de
+    /// composition de [`Self::composed`] et du rendu du panneau.
+    fn typed_split(self) -> (String, String) {
         let matched = self.matched.get() as usize;
         self.typed.with_value(|q| {
             let words: Vec<&str> = q.split_whitespace().collect();
-            words[..words.len().saturating_sub(matched)].join(" ")
+            let cut = words.len().saturating_sub(matched);
+            (words[..cut].join(" "), words[cut..].join(" "))
         })
+    }
+
+    /// Mots de la requête tapée que la sélection conserve devant la suggestion.
+    fn kept_prefix(self) -> String {
+        self.typed_split().0
     }
 
     /// Requête résultante si on retient la suggestion `i`.
@@ -257,21 +263,66 @@ pub fn SuggestPanel(ctrl: SuggestController) -> impl IntoView {
                                         )
                                     }
                                 >
-                                    // Début de requête conservé, estompé : la
-                                    // suggestion ne remplace que la fin saisie.
-                                    <span class="opacity-50">
-                                        {move || {
-                                            let kept = ctrl.kept_prefix();
-                                            if kept.is_empty() { kept } else { kept + " " }
-                                        }}
-                                    </span>
-                                    <span class="font-medium">{suggestion}</span>
+                                    {move || {
+                                        let (kept, replaced) = ctrl.typed_split();
+                                        let (typed, added) = split_added(
+                                            &kept,
+                                            &replaced,
+                                            &suggestion,
+                                        );
+                                        view! {
+                                            <span class="opacity-50">{typed}</span>
+                                            <span class="font-medium">{added}</span>
+                                        }
+                                    }}
                                 </button>
                             </li>
                         }
                     }
                 />
             </ul>
+    }
+}
+
+/// Ligne du panneau coupée en (déjà tapé, apport de la suggestion) : `kept` est
+/// le début de requête conservé, `replaced` la fin que la suggestion remplace et
+/// dont elle reprend le plus souvent les premiers caractères. Seul l'apport est
+/// mis en valeur ; ce que l'utilisateur a déjà écrit reste estompé, même quand
+/// la suggestion le réécrit avec ses accents. Aucun recouvrement (une
+/// dénomination de l'annuaire, qui remplace la requête entière) ⇒ tout est
+/// apport.
+fn split_added(kept: &str, replaced: &str, suggestion: &str) -> (String, String) {
+    let mut cut = 0;
+    let mut chars = suggestion.chars();
+    for typed in replaced.chars() {
+        match chars.next() {
+            Some(c) if fold(c) == fold(typed) => cut += c.len_utf8(),
+            _ => break,
+        }
+    }
+    // L'espace qui suit appartient au déjà-tapé : la frappe s'arrêtait dessus.
+    cut += suggestion[cut..].len() - suggestion[cut..].trim_start().len();
+    let mut typed = kept.to_string();
+    if !typed.is_empty() {
+        typed.push(' ');
+    }
+    typed.push_str(&suggestion[..cut]);
+    (typed, suggestion[cut..].to_string())
+}
+
+/// Repli d'un caractère pour cette comparaison seulement (casse et accents
+/// français) : `lj-core`, qui porte le repli de l'index, ne compile pas en wasm.
+fn fold(c: char) -> char {
+    match c.to_lowercase().next().unwrap_or(c) {
+        'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+        'ç' => 'c',
+        'è' | 'é' | 'ê' | 'ë' => 'e',
+        'ì' | 'í' | 'î' | 'ï' => 'i',
+        'ñ' => 'n',
+        'ò' | 'ó' | 'ô' | 'ö' | 'õ' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        other => other,
     }
 }
 
@@ -292,3 +343,44 @@ fn submit_enclosing_form(ev: &leptos::ev::MouseEvent) {
 
 #[cfg(feature = "ssr")]
 fn submit_enclosing_form(_ev: &leptos::ev::MouseEvent) {}
+
+#[cfg(test)]
+mod tests {
+    use super::split_added;
+
+    #[test]
+    fn seul_l_apport_de_la_suggestion_est_mis_en_valeur() {
+        let (typed, added) = split_added(
+            "responsabilité médicale",
+            "infection",
+            "infection nosocomiale",
+        );
+        assert_eq!(typed, "responsabilité médicale infection ");
+        assert_eq!(added, "nosocomiale");
+    }
+
+    #[test]
+    fn mot_en_cours_de_frappe_coupe_dans_le_mot() {
+        let (typed, added) = split_added(
+            "responsabilité médicale",
+            "infection n",
+            "infection nosocomiale",
+        );
+        assert_eq!(typed, "responsabilité médicale infection n");
+        assert_eq!(added, "osocomiale");
+    }
+
+    #[test]
+    fn frappe_sans_accent_rendue_avec_ceux_de_la_suggestion() {
+        let (typed, added) = split_added("", "conges pa", "congés payés");
+        assert_eq!(typed, "congés pa");
+        assert_eq!(added, "yés");
+    }
+
+    #[test]
+    fn suggestion_sans_recouvrement_entierement_en_apport() {
+        let (typed, added) = split_added("", "dupont", "SELARL Martin");
+        assert_eq!(typed, "");
+        assert_eq!(added, "SELARL Martin");
+    }
+}

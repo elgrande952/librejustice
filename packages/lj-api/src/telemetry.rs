@@ -46,10 +46,17 @@ pub fn init_telemetry(settings: &Settings) -> Result<TelemetryGuard> {
         json: false,
         service_name: settings.otel_service_name.clone(),
         deployment_environment: settings.deployment_environment.clone(),
+        host_name: settings.host_name.clone(),
+        container_name: settings.container_name.clone(),
+        // Une cible `INFO` absente de cette liste ne part pas en LogRecords : le
+        // plancher d'export est `WARN`, les signaux d'usage s'y inscrivent.
         otlp_log_filter: Targets::new()
             .with_default(LevelFilter::WARN)
             .with_target(crate::usage::LOG_TARGET, LevelFilter::INFO)
-            .with_target(crate::ratelimit::LOG_TARGET, LevelFilter::INFO),
+            .with_target(crate::ratelimit::LOG_TARGET, LevelFilter::INFO)
+            // La bascule du disjoncteur est WARN, le réarmement INFO : sous le
+            // plancher, Loki ne montre que les pannes et jamais les reprises.
+            .with_target(lj_llm::backend::LOG_TARGET, LevelFilter::INFO),
         otlp,
     })
 }

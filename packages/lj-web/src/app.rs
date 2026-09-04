@@ -8,11 +8,12 @@ use leptos_router::{ParamSegment, SsrMode, StaticSegment};
 use crate::components::AppShell;
 use crate::pages::{
     ActivityPage, AnnoncesCataloguePage, AnnoncesDepartementPage, AnnoncesPage,
-    AnnuaireDirectoryPage, AnnuairePage, AuthorizeMcpPage, CodeCataloguePage, Confidentialite,
-    ConfirmPage, DecisionPage, EntityPage, JuridictionHubPage, JuridictionYearPage,
-    JuridictionsPage, Landing, LawArticlePage, LawCodePage, LawComparePage, LawSectionPage,
-    LoginPage, MarchePage, McpGuide, MentionsLegales, NormFondPage, NormYearPage, NormesPage,
-    NotFound, ProfilePage, ResetPasswordPage, SearchPage, SourcesPage, TextesPage,
+    AnnuaireDirectoryPage, AnnuairePage, ApiGuide, AuthorizeMcpPage, CodeCataloguePage,
+    ConfirmPage, DecisionPage, EmailChangePage, EntityPage, FeedbackPage, JuridictionHubPage,
+    JuridictionYearPage, JuridictionsPage, Landing, LawArticlePage, LawCodePage, LawComparePage,
+    LawSectionPage, LegalNotice, LoginLinkPage, LoginPage, MarchePage, McpGuide, NormFondPage,
+    NormYearPage, NormesPage, NotFound, Privacy, ProfilePage, ResetPasswordPage, SearchPage,
+    SourcesPage, TextesPage,
 };
 use crate::seo::site_default;
 
@@ -32,39 +33,24 @@ const ANTI_FOUC: &str = r#"(() => {
   } catch {}
 })();"#;
 
-/// Sonde d'hydratation. Tout le contenu interactif du site dépend du bundle
-/// wasm : quand il ne charge pas, le bootstrap Leptos — un `import().then()`
-/// sans `catch` — meurt sans un mot et l'utilisateur reste sur un rendu SSR
-/// inerte, sans que rien ne remonte côté serveur. Ce script pose le seul témoin
-/// possible : si `__LJ_HYDRATED` (posé par `hydrate()`) n'apparaît pas, il
-/// affiche un recours et signale la panne.
+/// Bandeau bas partagé, et suivi du build servi.
 ///
-/// Déclenchement sur la première des deux conditions : un asset `/pkg` répondu
-/// en erreur, ou 30 s écoulées sans hydratation. Aucune identité transmise :
-/// chemin, assets en échec, temps écoulé.
+/// `__ljBar(message, refermable)` pose le seul recours possible quand la page ne
+/// peut pas se réparer seule : un message et un bouton qui recharge.
+///
+/// `__ljBuild(id)` reçoit l'identité du bundle portée par les réponses `/internal`
+/// (le client `hydrate` la lui passe). Elle est mémorisée à la
+/// première réponse et jamais réécrite ; si une suivante en porte une autre, un
+/// déploiement a eu lieu sous l'onglet et le bandeau le dit — **une fois**, la
+/// suite étant close définitivement. Aucun sondage : le suivi voyage sur le
+/// trafic existant.
 #[cfg(feature = "ssr")]
-const HYDRATION_WATCHDOG: &str = r#"(() => {
-  const failedAssets = () =>
-    performance
-      .getEntriesByType("resource")
-      .filter((r) => r.name.includes("/pkg/") && r.responseStatus >= 400)
-      .map((r) => r.name.split("/").pop() + ":" + r.responseStatus);
+const BANDEAU: &str = r#"(() => {
+  const bouton =
+    "padding:.35rem .9rem;border:1px solid currentColor;border-radius:4px;" +
+    "background:transparent;color:inherit;cursor:pointer;font:inherit";
 
-  const report = (assets) => {
-    try {
-      const body = JSON.stringify({
-        path: location.pathname,
-        assets,
-        elapsed_ms: Math.round(performance.now()),
-      });
-      navigator.sendBeacon(
-        "/api/client/hydration-failure",
-        new Blob([body], { type: "application/json" }),
-      );
-    } catch {}
-  };
-
-  const offerReload = () => {
+  window.__ljBar = (message, refermable) => {
     const bar = document.createElement("div");
     bar.setAttribute("role", "alert");
     bar.style.cssText =
@@ -72,92 +58,101 @@ const HYDRATION_WATCHDOG: &str = r#"(() => {
       "gap:1rem;align-items:center;justify-content:center;padding:.75rem 1rem;" +
       "background:#1B1612;color:#FBF9F4;font:14px/1.4 system-ui,sans-serif";
     const text = document.createElement("span");
-    text.textContent = "Cette page n'a pas pu charger entièrement.";
-    const button = document.createElement("button");
-    button.textContent = "Recharger";
-    button.style.cssText =
-      "padding:.35rem .9rem;border:1px solid currentColor;border-radius:4px;" +
-      "background:transparent;color:inherit;cursor:pointer;font:inherit";
-    button.onclick = () => location.reload();
-    bar.append(text, button);
+    text.textContent = message;
+    const reload = document.createElement("button");
+    reload.textContent = "Recharger";
+    reload.style.cssText = bouton;
+    reload.onclick = () => location.reload();
+    bar.append(text, reload);
+    if (refermable) {
+      const plus_tard = document.createElement("button");
+      plus_tard.textContent = "Plus tard";
+      plus_tard.style.cssText = bouton + ";border-color:transparent;opacity:.7";
+      plus_tard.onclick = () => bar.remove();
+      bar.append(plus_tard);
+    }
     document.body.appendChild(bar);
   };
 
+  let vu = null;
+  let annonce = false;
+  window.__ljBuild = (id) => {
+    if (annonce || !id) return;
+    if (vu === null) {
+      vu = id;
+    } else if (vu !== id) {
+      annonce = true;
+      window.__ljBar("Une nouvelle version est disponible.", true);
+    }
+  };
+})();"#;
+
+/// Balise d'incident client, et veille d'hydratation qui en est le premier
+/// usage.
+///
+/// `__ljIncident(motif, détail)` poste vers `/internal/client/incident` la seule
+/// classe de panne que le serveur ne peut pas voir : il a répondu, et
+/// l'utilisateur n'a pourtant pas sa page. Aucune identité transmise (chemin,
+/// assets en échec, temps écoulé) ; la page 404 l'appelle aussi.
+///
+/// La veille : tout le contenu interactif du site dépend du bundle wasm, et
+/// quand il ne charge pas, le bootstrap Leptos — un `import().then()` sans
+/// `catch` — meurt sans un mot, laissant un rendu SSR inerte. Si `__LJ_HYDRATED`
+/// (posé par `hydrate()`) n'apparaît pas, ce script affiche un recours et
+/// signale la panne, sur la première des deux conditions : un asset `/pkg`
+/// répondu en erreur, ou 30 s écoulées.
+///
+/// Une hydratation qui aboutit après un premier sondage sort en
+/// `hydration_lente`, au grain du sondage (5 s) : une page hydratée avant le
+/// premier ne signale rien.
+#[cfg(feature = "ssr")]
+const SONDE_CLIENT: &str = r#"(() => {
+  window.__ljIncident = (motif, detail) => {
+    try {
+      const body = JSON.stringify({
+        kind: motif,
+        path: location.pathname,
+        ...detail,
+      });
+      navigator.sendBeacon(
+        "/internal/client/incident",
+        new Blob([body], { type: "application/json" }),
+      );
+    } catch {}
+  };
+
+  const failedAssets = () =>
+    performance
+      .getEntriesByType("resource")
+      .filter((r) => r.name.includes("/pkg/") && r.responseStatus >= 400)
+      .map((r) => r.name.split("/").pop() + ":" + r.responseStatus);
+
+  let attendu = false;
+
   const check = (elapsed) => {
-    if (window.__LJ_HYDRATED) return;
+    if (window.__LJ_HYDRATED) {
+      if (attendu) {
+        window.__ljIncident("hydration_lente", {
+          elapsed_ms: Math.round(performance.now()),
+        });
+      }
+      return;
+    }
+    attendu = true;
     const assets = failedAssets();
     if (assets.length === 0 && elapsed < 30000) {
       setTimeout(() => check(elapsed + 5000), 5000);
       return;
     }
-    report(assets);
-    offerReload();
+    window.__ljIncident("hydration", {
+      assets,
+      elapsed_ms: Math.round(performance.now()),
+    });
+    window.__ljBar("Cette page n'a pas pu charger entièrement.", false);
   };
 
   setTimeout(() => check(5000), 5000);
 })();"#;
-
-/// Module d'auth Supabase vendore, importe par [`auth_bootstrap_script`]. Seul
-/// endroit du code qui nomme ce fichier ; `/vendor` etant servi `immutable`, la
-/// version vit dans le nom, et monter de version = deposer le bundle sous son
-/// nouveau nom et corriger cette constante.
-#[cfg(feature = "ssr")]
-const VENDOR_AUTH_MODULE: &str = "/vendor/supabase-auth-js-2.107.0.js";
-
-/// Amorcage de la session Supabase, des le `<head>`.
-///
-/// Construit l'`AuthClient` et lance `getSession()` sans attendre l'hydratation.
-/// Script CLASSIQUE, donc execute pendant le parsing, la ou un `<script
-/// type="module">` serait differe jusqu'a la fin du document : c'est toute la
-/// raison de sa forme. `api/client.rs` attend le jeton avant de construire
-/// CHAQUE requete `/api`, donc ce rafraichissement est sur le chemin critique de
-/// toutes les donnees de la page.
-///
-/// Le client est parke sur `window.__LJ_AUTH__` (promesse) et le shim l'adopte au
-/// lieu d'en construire un second : deux instances sur la meme `storageKey` se
-/// disputeraient le meme refresh token. Les options du client ne sont donc
-/// ecrites qu'ICI, et nulle part dans `js/auth.js`.
-///
-/// Les placeholders reproduisent le comportement du shim quand la config manque
-/// (auth inerte) ; `getSession()` ne part alors pas, faute de destination reelle.
-#[cfg(feature = "ssr")]
-fn auth_bootstrap_script() -> String {
-    format!(
-        r#"(() => {{
-  const c = window.__LJ_SUPABASE__ || {{}};
-  const url = c.url || "http://placeholder.local";
-  const anonKey = c.anonKey || "placeholder";
-  const ref = (url.match(/^https?:\/\/([^.]+)/) || [])[1] || "default";
-  window.__LJ_AUTH_STORAGE_KEY__ = `sb-${{ref}}-auth-token`;
-  window.__LJ_AUTH__ = import("{VENDOR_AUTH_MODULE}").then(({{ AuthClient }}) => {{
-    const client = new AuthClient({{
-      url: `${{url}}/auth/v1`,
-      headers: {{ Authorization: `Bearer ${{anonKey}}`, apikey: anonKey }},
-      storageKey: window.__LJ_AUTH_STORAGE_KEY__,
-      autoRefreshToken: true,
-      persistSession: true,
-      detectSessionInUrl: true,
-      flowType: "pkce",
-    }});
-    if (c.url && c.anonKey) client.getSession();
-    return client;
-  }});
-}})();"#
-    )
-}
-
-/// Config Supabase injectee dans la page pour le shim `js/auth.js` (qui ne peut
-/// pas lire `import.meta.env`). Lue via `Settings` ; vide si non configuree =>
-/// auth inerte cote shim. `serde_json` echappe les valeurs.
-#[cfg(feature = "ssr")]
-fn supabase_config_script() -> String {
-    let settings = crate::config::Settings::from_env();
-    let payload = serde_json::json!({
-        "url": settings.supabase_url,
-        "anonKey": settings.supabase_anon_key,
-    });
-    format!("window.__LJ_SUPABASE__={payload};")
-}
 
 /// Content-Security-Policy du document HTML.
 ///
@@ -169,43 +164,22 @@ fn supabase_config_script() -> String {
 /// au compte de la victime.
 ///
 /// Pas de `default-src` : seules sont posées les directives dont l'inventaire
-/// des ressources est vérifié (tout est same-origin — fonts, `/vendor`, `/pkg`).
+/// des ressources est vérifié, toutes same-origin.
 ///
-/// - `'wasm-unsafe-eval'` : sans lui le navigateur refuse de compiler le bundle
-///   `hydrate`.
-/// - `script-src 'self'` couvre `/cdn-cgi/challenge-platform/` (JS detections
-///   Cloudflare) ; leur script inline reçoit le nonce, que Cloudflare recopie en
-///   lisant cet en-tête.
+/// - `'wasm-unsafe-eval'` : sans lui le bundle `hydrate` ne compile pas ;
 /// - `style-src 'unsafe-inline'` : le rendu émet des attributs `style=`.
 ///
-/// Sur une page cachée, l'en-tête voyage avec le corps dans le cache CDN : le
-/// document reste cohérent, mais son `nonce` est public. Ce qui protège alors,
-/// et qu'aucun cache n'affaiblit : `script-src 'self'`, `object-src`,
-/// `base-uri`, `form-action` et `frame-ancestors`.
+/// Sur une page cachée le `nonce` voyage dans le cache CDN, donc public. Ce qui
+/// protège alors : `script-src 'self'`, `object-src`, `base-uri`, `form-action`
+/// et `frame-ancestors`.
 #[cfg(feature = "ssr")]
 fn content_security_policy(nonce: Option<&str>) -> String {
     let settings = crate::config::Settings::from_env();
-    let supabase = settings.supabase_url;
-    // Origine seule (`https://hôte`) : `connect-src` matche par origine.
-    let supabase_origin = supabase
-        .split_once("://")
-        .and_then(|(scheme, rest)| {
-            rest.split('/')
-                .next()
-                .map(|host| format!("{scheme}://{host}"))
-        })
-        .filter(|o| !o.ends_with("://"))
-        .unwrap_or_default();
-
     let script_nonce = match nonce {
         Some(n) => format!(" 'nonce-{n}'"),
         None => String::new(),
     };
     let mut connect_extra = String::new();
-    if !supabase_origin.is_empty() {
-        connect_extra.push(' ');
-        connect_extra.push_str(&supabase_origin);
-    }
     if settings.watch {
         connect_extra.push_str(" ws://localhost:* ws://127.0.0.1:*");
     }
@@ -278,10 +252,9 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                     type="font/woff2"
                     crossorigin="anonymous"
                 />
-                <script nonce=nonce.clone() inner_html=supabase_config_script()></script>
-                <script nonce=nonce.clone() inner_html=auth_bootstrap_script()></script>
                 <script nonce=nonce.clone() inner_html=ANTI_FOUC></script>
-                <script nonce=nonce.clone() inner_html=HYDRATION_WATCHDOG></script>
+                <script nonce=nonce.clone() inner_html=BANDEAU></script>
+                <script nonce=nonce.clone() inner_html=SONDE_CLIENT></script>
                 <AutoReload options=options.clone() />
                 <HydrationScripts options=options.clone() />
                 <HashedStylesheet options id="leptos" />
@@ -301,6 +274,7 @@ pub fn App() -> impl IntoView {
     provide_meta_context();
     crate::query::provide_query_client();
     crate::components::search::compact_search::search_data::provide_seen_search_keys();
+    crate::components::search::provide_card_view_pref();
     crate::components::client_only::provide_hydrated();
     crate::auth::provide_auth_state();
     provide_auth_runtime();
@@ -447,35 +421,42 @@ pub fn App() -> impl IntoView {
                         view=LawComparePage
                         ssr=SsrMode::PartiallyBlocked
                     />
-                    // ── Pages auth client-side : rendu SSR du shell, decision
-                    // de session/contenu cote client (AuthGuard / formulaires). ──
-                    <Route path=StaticSegment("connexion") view=LoginPage />
-                    <Route
-                        path=StaticSegment("reinitialiser-mot-de-passe")
-                        view=ResetPasswordPage
-                    />
-                    <Route path=StaticSegment("confirmer") view=ConfirmPage />
+                    // ── Pages auth et compte : formulaires rendus serveur, sans JS.
+                    // Le profil lit son compte au rendu (resource bloquante), derriere
+                    // la garde de session serveur. Les anciennes routes en francais
+                    // redirigent 308 (lj-server). ──
+                    <Route path=StaticSegment("login") view=LoginPage />
+                    <Route path=StaticSegment("reset-password") view=ResetPasswordPage />
+                    <Route path=StaticSegment("confirm") view=ConfirmPage />
+                    <Route path=StaticSegment("login-link") view=LoginLinkPage />
+                    <Route path=StaticSegment("email-change") view=EmailChangePage />
                     <Route path=StaticSegment("authorize-mcp") view=AuthorizeMcpPage />
-                    <Route path=StaticSegment("profil") view=ProfilePage />
+                    <Route
+                        path=StaticSegment("profile")
+                        view=ProfilePage
+                        ssr=SsrMode::PartiallyBlocked
+                    />
                     // ── Activite : meme composant, une route explicite par onglet sous
-                    // `/activite/`, defaut compris. `/activite` nu = 308 vers l'onglet
+                    // `/activity/`, defaut compris. `/activity` nu = 308 vers l'onglet
                     // recherches. ──
                     <Route
-                        path=(StaticSegment("activite"), StaticSegment("recherches"))
+                        path=(StaticSegment("activity"), StaticSegment("searches"))
                         view=ActivityPage
                     />
                     <Route
-                        path=(StaticSegment("activite"), StaticSegment("signets"))
+                        path=(StaticSegment("activity"), StaticSegment("bookmarks"))
                         view=ActivityPage
                     />
                     <Route
-                        path=(StaticSegment("activite"), StaticSegment("lectures"))
+                        path=(StaticSegment("activity"), StaticSegment("readings"))
                         view=ActivityPage
                     />
                     // ── Pages statiques publiques ──
+                    <Route path=StaticSegment("feedback") view=FeedbackPage />
+                    <Route path=StaticSegment("api-guide") view=ApiGuide />
                     <Route path=StaticSegment("mcp-guide") view=McpGuide />
-                    <Route path=StaticSegment("mentions-legales") view=MentionsLegales />
-                    <Route path=StaticSegment("confidentialite") view=Confidentialite />
+                    <Route path=StaticSegment("legal-notice") view=LegalNotice />
+                    <Route path=StaticSegment("privacy") view=Privacy />
                     // Pas de route catch-all : un `WildcardSegment` masquerait les assets
                     // statiques (`/pkg/*`, `/favicon.svg`) qui doivent atteindre le
                     // `file_and_error_handler`. Le no-match est couvert par
@@ -501,13 +482,12 @@ fn provide_auth_runtime() {
     use crate::components::profile::sync_auth_theme;
     use leptos_fetch::QueryClient;
 
-    let email = crate::auth::use_auth().email;
+    let auth = crate::auth::use_auth();
+    let email = auth.email;
     let client = expect_context::<QueryClient>();
     // Derniere identite RESOLUE : `None` = jamais lue encore, `Some(None)` =
     // anonyme, `Some(Some(mail))` = connecte. Porte la decision de vider le cache,
-    // qui se deduit de la donnee et non du site d'appel : supabase-auth-js emet
-    // `INITIAL_SESSION` a l'abonnement (session ou pas) puis `TOKEN_REFRESHED`
-    // toutes les ~50 min, evenements qui ne changent aucune identite.
+    // qui se deduit de la donnee et non du site d'appel.
     let known: StoredValue<Option<Option<String>>> = StoredValue::new(None);
 
     // Applique l'etat de session courant, et ne vide le cache que sur un vrai
@@ -529,37 +509,13 @@ fn provide_auth_runtime() {
         });
     };
 
-    apply();
-    // Abonnement permanent : le garde n'est ni `Send` ni `Sync` (il tient un
-    // `Closure` JS), inconfiable a un cleanup d'Owner (`Send + Sync`) ; sur wasm
-    // mono-thread, `forget` traduit « abonnement vivant le temps de la page ».
-    let subscription = crate::auth::on_auth_state_change(move |_event| apply());
-    std::mem::forget(subscription);
+    // Une lecture au montage, puis une par changement annonce (deconnexion).
+    Effect::new(move |_| {
+        auth.revision.track();
+        apply();
+    });
 }
 
 /// No-op SSR : pas de session locale ni d'evenement d'auth cote serveur.
 #[cfg(feature = "ssr")]
 fn provide_auth_runtime() {}
-
-#[cfg(all(test, feature = "ssr"))]
-mod tests {
-    use super::{auth_bootstrap_script, VENDOR_AUTH_MODULE};
-
-    #[test]
-    fn vendor_auth_module_exists_in_public() {
-        let path = format!("{}/public{VENDOR_AUTH_MODULE}", env!("CARGO_MANIFEST_DIR"));
-        assert!(
-            std::path::Path::new(&path).is_file(),
-            "{VENDOR_AUTH_MODULE} ne designe aucun fichier ({path}) — \
-             montee de version sans depot du bundle"
-        );
-    }
-
-    #[test]
-    fn bootstrap_imports_the_vendor_module() {
-        assert!(
-            auth_bootstrap_script().contains(&format!("import(\"{VENDOR_AUTH_MODULE}\")")),
-            "l'amorcage du <head> n'importe pas {VENDOR_AUTH_MODULE}"
-        );
-    }
-}

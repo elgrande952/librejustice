@@ -1,18 +1,14 @@
 //! Rejeu chronologique des snapshots CNB publiés depuis octobre 2022.
 //!
-//! data.gouv conserve un snapshot ~mensuel de l'annuaire des avocats. Leur
-//! schéma est plus maigre que celui de juillet 2026 (ni `avCnbfCode` ni
-//! `avBarEntree`) mais porte déjà barreau, nom, prénom, `cbSiretSiren` et
-//! `acDateSerment` : des années de présence observée et d'affiliations datées,
-//! que le reload courant ne peut pas reconstituer puisqu'il ne voit qu'un
-//! instant.
+//! Le schéma des snapshots mensuels est plus maigre que l'actuel, mais porte
+//! déjà barreau, nom, prénom, `cbSiretSiren` et `acDateSerment` : des années de
+//! présence observée que le reload courant ne peut pas reconstituer, ne voyant
+//! qu'un instant.
 //!
-//! Deux évidences en sortent, toutes deux sous la provenance `cnb-hist` : des
-//! spans d'activité (présence observée, come and go) et des arêtes
-//! d'affiliation datées (siren de la structure d'exercice). Le rejeu est une
-//! FONCTION des snapshots : chaque run recalcule ses évidences en entier et
-//! remplace les précédentes — pas d'état d'avancement à tenir, relançable sans
-//! borne. Dry-run par défaut, `--apply` pour écrire.
+//! Deux évidences en sortent, sous la provenance `cnb-hist` : des spans
+//! d'activité et des arêtes d'affiliation datées. Le rejeu est une FONCTION des
+//! snapshots — chaque run recalcule ses évidences en entier et remplace les
+//! précédentes, donc relançable sans borne. Dry-run par défaut.
 //!
 //! Le rejeu ne résout pas son propre delta : il crée des milliers d'identités
 //! d'un coup, là où la sonde at-write du reload est taillée pour les arrivées

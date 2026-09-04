@@ -1,18 +1,3 @@
-//! AJI-MAPA (`mapa.aji-france.com`).
-//!
-//! Profil d'acheteur des EPLE — collèges et lycées — opéré par l'association
-//! AJI (Nice). La liste publique `/mapa/marche/?page=N` sert 20 cartes par
-//! page, triées par publication décroissante, et ne porte que l'ouvert. Elle se
-//! lit **sans session** ; c'est la fiche `/mapa/marche/<id>/show` qui en exige
-//! une, armée par `GET /mapa/guest/anonymous` — sans elle, 302 vers
-//! `/mapa/guest/new?marche_return=<id>`, le formulaire de profil visiteur.
-//!
-//! Quota des fiches : **trois, puis 404 au corps vide jusqu'à une minute de
-//! silence**, après quoi trois de nouveau. Il porte sur l'IP appelante et non
-//! sur la session : ouvrir une session neuve à chaque fiche ne le réarme pas, et
-//! insister ne le prolonge pas. [`detail`] tient donc la cadence que l'hôte
-//! accorde, une fiche par [`POLITESSE`], et n'en gaspille aucune en 404.
-
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
@@ -26,8 +11,6 @@ use super::{apres_balise, dedup_source_uid, send_text, txt, DetailAnnonce, Moteu
 use crate::error::{Result, SourceError};
 
 const BASE: &str = "https://mapa.aji-france.com";
-/// Cadence des fiches : trois par minute, ce que l'hôte accorde sans 404. La
-/// liste, elle, n'est pas rationnée et garde le rythme commun.
 const POLITESSE: std::time::Duration = std::time::Duration::from_secs(20);
 /// Garde-fou de pagination : la boucle sort de toute façon dès qu'une page
 /// n'apporte plus d'uid neuf.
@@ -176,6 +159,7 @@ pub async fn enumerate() -> Result<MoteurRun> {
     Ok(MoteurRun {
         annonce,
         echecs: 0,
+        hotes: Vec::new(),
         rows: dedup_source_uid(rows),
     })
 }
@@ -188,10 +172,6 @@ pub async fn enumerate() -> Result<MoteurRun> {
 /// Cette carte n'existe que sur les fiches de MAPA — une demande de devis n'en a
 /// aucune. Une telle fiche est lue et muette : bloc vide, la ligne sort de la
 /// file d'enrichissement.
-///
-/// `Err` est réservé à la fiche non lue : sans session anonyme, `/show` redirige
-/// vers le formulaire de profil visiteur, page servie en 200 dont il ne faut
-/// surtout pas conclure que la consultation n'a pas de CPV.
 fn champs_fiche(html: &str) -> Result<DetailAnnonce> {
     static CPV: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?s)Type de produit principal CPV.*?<div class='col-sm-2'>\s*(\d{8}(?:-\d)?)")
@@ -209,9 +189,6 @@ fn champs_fiche(html: &str) -> Result<DetailAnnonce> {
     })
 }
 
-/// Page de détail d'un avis. La session anonyme est armée à chaque appel —
-/// elle ne vaut que trois fiches et ne se réarme pas —, et l'appel attend
-/// [`POLITESSE`] : le quota vise l'IP, donc rien d'autre ne le tient.
 pub async fn detail(url_avis: &str) -> Result<DetailAnnonce> {
     tokio::time::sleep(POLITESSE).await;
     let client = super::client();

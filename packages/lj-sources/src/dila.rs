@@ -95,6 +95,24 @@ pub fn tarballs_dir(data_dir: &Path, fond: DilaFond) -> std::path::PathBuf {
         .join("tarballs")
 }
 
+/// Tarballs d'un fond présents en cache, dans l'ordre de rejeu. Le tri lexical
+/// des noms DILA porte cet ordre : `Freemium_<fond>_global_` précède
+/// `<FOND>_YYYYMMDD`, donc le stock passe avant ses incréments.
+pub fn cached_dila_tarballs(data_dir: &Path, fond: DilaFond) -> Result<Vec<std::path::PathBuf>> {
+    let dir = tarballs_dir(data_dir, fond);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths: Vec<std::path::PathBuf> = fs::read_dir(&dir)?
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".tar.gz"))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 // ----------------------------------------------------------------------------
 // Manifeste DILA (watermark par fond)
 // ----------------------------------------------------------------------------
@@ -284,7 +302,7 @@ fn download_tarball(
 }
 
 /// Sync incrémental d'un fond DILA : télécharge les incréments postérieurs au
-/// watermark (ordre lexicographique = chronologique) et avance le watermark.
+/// watermark (ordre lexicographique = chronologique).
 ///
 /// **Auto-switch cold ↔ warm** (un seul point d'entrée pour le cron) :
 /// - **Cold start** (`stock_fetched == false`) : télécharge le **stock global**
@@ -293,18 +311,21 @@ fn download_tarball(
 ///   les incréments postérieurs.
 /// - **Warm** : applique les incréments `<FOND>_*` postérieurs au watermark.
 ///
-/// Renvoie les chemins locaux fraîchement téléchargés dans l'ordre d'application
-/// (stock d'abord au cold start, puis incréments chronologiques). Idempotent :
-/// le stock n'est repris qu'une fois (`stock_fetched`), un incrément ≤ watermark
-/// est ignoré. Le manifeste est persisté après CHAQUE téléchargement → une
-/// interruption reprend où elle s'est arrêtée.
+/// Renvoie le lot à ingérer dans l'ordre d'application (stock d'abord au cold
+/// start, puis incréments chronologiques). Idempotent : le stock n'est repris
+/// qu'une fois (`stock_fetched`), un incrément ≤ watermark est ignoré.
+///
+/// **Le manifeste ne bouge pas ici** : le filigrane appartient à l'ingestion, et
+/// s'avance archive par archive via [`DilaBatch::commit`]. Un téléchargement
+/// perdu se refait pour rien du tout — le fichier reste sur disque et
+/// `download_tarball` le saute.
 #[instrument(skip(data_dir))]
-pub fn sync_dila(data_dir: &Path, fond: DilaFond) -> Result<Vec<std::path::PathBuf>> {
+pub fn sync_dila(data_dir: &Path, fond: DilaFond) -> Result<DilaBatch> {
     let tarballs_path = tarballs_dir(data_dir, fond);
     fs::create_dir_all(&tarballs_path)?;
     let source_dir = data_dir.join(DILA_DIR).join(fond.stock_infix());
     let manifest_path = source_dir.join("manifest.json");
-    let mut manifest = DilaManifest::load(&manifest_path)?;
+    let manifest = DilaManifest::load(&manifest_path)?;
 
     let client = http_client()?;
     let tarballs = list_tarballs(&client, fond)?;
@@ -320,11 +341,13 @@ pub fn sync_dila(data_dir: &Path, fond: DilaFond) -> Result<Vec<std::path::PathB
     stocks.sort();
     increments.sort();
 
-    let mut downloaded = Vec::new();
+    let mut archives = Vec::new();
+    // Plancher du lot, figé pour tout le parcours : le filigrane en base de
+    // départ, relevé à la date du stock quand le cold start en télécharge un.
+    let mut floor = manifest.watermark.clone();
 
-    // Cold start : bootstrap du stock global le plus récent AVANT les incréments,
-    // watermark calé sur sa date. Erreur franche si aucun stock publié — un fond ne
-    // peut pas démarrer par diff.
+    // Cold start : bootstrap du stock global le plus récent AVANT les incréments.
+    // Erreur franche si aucun stock publié — un fond ne peut pas démarrer par diff.
     if !manifest.stock_fetched {
         let stock = stocks.last().ok_or_else(|| {
             SourceError::Invalid(format!(
@@ -335,28 +358,70 @@ pub fn sync_dila(data_dir: &Path, fond: DilaFond) -> Result<Vec<std::path::PathB
         })?;
         let dst = tarballs_path.join(stock);
         download_tarball(&client, fond, stock, &dst)?;
-        manifest.stock_fetched = true;
-        manifest.watermark = Some(stock_watermark(fond, stock));
-        manifest.fetched_at = Some(DilaManifest::now_iso_seconds());
-        manifest.save(&manifest_path)?;
-        downloaded.push(dst);
+        let watermark = stock_watermark(fond, stock);
+        floor = Some(watermark.clone());
+        archives.push(DilaArchive {
+            path: dst,
+            watermark,
+            is_stock: true,
+        });
     }
 
     for name in increments {
-        if let Some(wm) = &manifest.watermark {
+        if let Some(wm) = &floor {
             if &name <= wm {
                 continue;
             }
         }
         let dst = tarballs_path.join(&name);
         download_tarball(&client, fond, &name, &dst)?;
-        manifest.watermark = Some(name.clone());
-        manifest.fetched_at = Some(DilaManifest::now_iso_seconds());
-        manifest.save(&manifest_path)?;
-        downloaded.push(dst);
+        archives.push(DilaArchive {
+            path: dst,
+            watermark: name,
+            is_stock: false,
+        });
     }
 
-    Ok(downloaded)
+    Ok(DilaBatch {
+        manifest_path,
+        manifest,
+        archives,
+    })
+}
+
+/// Une archive DILA téléchargée, en attente d'ingestion.
+#[derive(Clone, Debug)]
+pub struct DilaArchive {
+    pub path: std::path::PathBuf,
+    /// Filigrane à poser une fois cette archive ingérée : le nom de l'incrément,
+    /// ou la borne synthétique calée sur la date d'un stock global.
+    pub watermark: String,
+    /// Stock global de cold start plutôt qu'incrément.
+    pub is_stock: bool,
+}
+
+/// Lot téléchargé et le manifeste qui suit son **ingestion**. Le filigrane
+/// n'avance qu'au [`DilaBatch::commit`], appelé après chaque archive ingérée :
+/// tuée ou en erreur au milieu du lot, la passe laisse le filigrane sur la
+/// dernière archive réellement appliquée, et la suivante reprend là.
+pub struct DilaBatch {
+    manifest_path: std::path::PathBuf,
+    manifest: DilaManifest,
+    /// Archives à ingérer, dans l'ordre.
+    pub archives: Vec<DilaArchive>,
+}
+
+impl DilaBatch {
+    /// Pose le filigrane d'une archive ingérée. À appeler dans l'ordre du lot :
+    /// le filigrane est un ordre lexicographique, il ne recule pas.
+    pub fn commit(&mut self, archive: &DilaArchive) -> Result<()> {
+        if archive.is_stock {
+            self.manifest.stock_fetched = true;
+        }
+        self.manifest.watermark = Some(archive.watermark.clone());
+        self.manifest.fetched_at = Some(DilaManifest::now_iso_seconds());
+        self.manifest.save(&self.manifest_path)
+    }
 }
 
 /// Watermark synthétique calé sur la date d'un stock global, pour ne reprendre

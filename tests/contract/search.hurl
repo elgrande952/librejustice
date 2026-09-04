@@ -1,5 +1,5 @@
 # ============================================================================
-# CONTRACT TESTS — GET /api/search
+# CONTRACT TESTS: GET /internal/search
 # ----------------------------------------------------------------------------
 # Asserts HTTP status + JSON STRUCTURAL invariants only (field presence, types,
 # enum value sets, ordering contracts). NOT exact live-data values.
@@ -11,7 +11,7 @@
 # ============================================================================
 
 # ── Health (sanity / smoke) ─────────────────────────────────────────────────
-GET {{base}}/api/health
+GET {{base}}/internal/health
 HTTP 200
 [Asserts]
 jsonpath "$.status" == "ok"
@@ -19,36 +19,45 @@ jsonpath "$.version" isString
 
 
 # ── 1. Baseline hybrid search (mode=auto, natural language → hybrid) ─────────
-GET {{base}}/api/search?q=expulsion%20locative
+GET {{base}}/internal/search?q=expulsion%20locative
 HTTP 200
 [Asserts]
 header "Content-Type" contains "application/json"
 jsonpath "$.query" == "expulsion locative"
-jsonpath "$.total" isInteger
-jsonpath "$.total" >= 0
 jsonpath "$.hits" isCollection
 jsonpath "$.queryMode" isString
 # queryMode enum set
-jsonpath "$.queryMode" matches /^(lexical|hybrid)$/
+jsonpath "$.queryMode" matches /^(lexical|hybrid|browse)$/
 # auto + natural language ⇒ resolved hybrid
 jsonpath "$.queryMode" == "hybrid"
 jsonpath "$.allHitIds" isCollection
-jsonpath "$.facets" exists
+# no assertion on total/facets: the count is a second call, and this response
+# hands over one already resolved on its bundle, for free. Their presence
+# depends on what ran before; the count route below is where the number holds.
+# the ranked list itself stays capped at MAX_RESULTS
+jsonpath "$.allHitIds" count <= 100
+
+
+# ── 1b. The count route: exact total + the facet axes, same query params ─────
+GET {{base}}/internal/search/decompte?q=expulsion%20locative
+HTTP 200
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.total" isInteger
+# total counts every matched decision, not the 100 the ranked list caps at
+jsonpath "$.total" > 100
 # facets struct: every dimension present as an array
-jsonpath "$.facets.jurisdiction" isCollection
+jsonpath "$.facets.seat" isCollection
 jsonpath "$.facets.legalDomain" isCollection
 jsonpath "$.facets.solution" isCollection
 jsonpath "$.facets.publication" isCollection
 jsonpath "$.facets.dateLectureYear" isCollection
 jsonpath "$.facets.legalInstrument" isCollection
-# total never exceeds the absolute cap of 100 (MAX_RESULTS)
-jsonpath "$.total" <= 100
-# allHitIds length tracks total (full ranked list, not just the page)
-jsonpath "$.allHitIds" count <= 100
+jsonpath "$.facets.procedure" isCollection
 
 
 # ── 2. Hit shape contract (only assert when at least one hit exists) ─────────
-GET {{base}}/api/search?q=responsabilite&limit=5
+GET {{base}}/internal/search?q=responsabilite&limit=5
 HTTP 200
 [Asserts]
 jsonpath "$.hits" count <= 5
@@ -64,7 +73,7 @@ jsonpath "$.hits[0].publicationCodes" isCollection
 
 
 # ── 3. mode=lexical (forces boolean_search path) ─────────────────────────────
-GET {{base}}/api/search?q=licenciement&mode=lexical
+GET {{base}}/internal/search?q=licenciement&mode=lexical
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" == "lexical"
@@ -72,14 +81,14 @@ jsonpath "$.hits" isCollection
 
 
 # ── 4. mode=semantic (forces hybrid; there is NO pure-ANN path) ──────────────
-GET {{base}}/api/search?q=trouble%20du%20voisinage&mode=semantic
+GET {{base}}/internal/search?q=trouble%20du%20voisinage&mode=semantic
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" == "hybrid"
 
 
 # ── 5. Boolean operator ET (auto-detected → lexical) ─────────────────────────
-GET {{base}}/api/search?q=cong%C3%A9s%20ET%20pay%C3%A9s
+GET {{base}}/internal/search?q=cong%C3%A9s%20ET%20pay%C3%A9s
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" == "lexical"
@@ -87,42 +96,42 @@ jsonpath "$.hits" isCollection
 
 
 # ── 6. Boolean operator OU ───────────────────────────────────────────────────
-GET {{base}}/api/search?q=bail%20OU%20loyer
+GET {{base}}/internal/search?q=bail%20OU%20loyer
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" == "lexical"
 
 
 # ── 7. Boolean operator SAUF (negation) ──────────────────────────────────────
-GET {{base}}/api/search?q=cong%C3%A9s%20SAUF%20maladie
+GET {{base}}/internal/search?q=cong%C3%A9s%20SAUF%20maladie
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" == "lexical"
 
 
 # ── 8. Quoted phrase (triggers BOOL_RE via the quote char → lexical) ─────────
-GET {{base}}/api/search?q=%22travail%20dominical%22
+GET {{base}}/internal/search?q=%22travail%20dominical%22
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" == "lexical"
 
 
 # ── 9. PROCHEn proximity operator → slop, lexical ────────────────────────────
-GET {{base}}/api/search?q=%22travail%20dominical%22PROCHE3
+GET {{base}}/internal/search?q=%22travail%20dominical%22PROCHE3
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" == "lexical"
 
 
 # ── 10. Wildcard `*` → lexical ───────────────────────────────────────────────
-GET {{base}}/api/search?q=expuls*
+GET {{base}}/internal/search?q=expuls*
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" == "lexical"
 
 
 # ── 11. sort=date_desc ───────────────────────────────────────────────────────
-GET {{base}}/api/search?q=urbanisme&sort=date_desc
+GET {{base}}/internal/search?q=urbanisme&sort=date_desc
 HTTP 200
 [Asserts]
 jsonpath "$.queryMode" exists
@@ -130,74 +139,77 @@ jsonpath "$.hits" isCollection
 
 
 # ── 12. sort=date_asc ────────────────────────────────────────────────────────
-GET {{base}}/api/search?q=urbanisme&sort=date_asc
+GET {{base}}/internal/search?q=urbanisme&sort=date_asc
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
-# ── 13. Pagination: offset beyond results returns empty page (total kept) ────
-GET {{base}}/api/search?q=urbanisme&offset=99&limit=1
+# ── 13. Pagination: offset beyond results returns an empty page ──────────────
+GET {{base}}/internal/search?q=urbanisme&offset=99&limit=1
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 jsonpath "$.hits" count <= 1
-jsonpath "$.total" isInteger
 jsonpath "$.allHitIds" isCollection
 
 
 # ── 14. Single filter: jurisdictionType (repeated query param) ────────────────
-GET {{base}}/api/search?q=contrat&jurisdictionType=CE&jurisdictionType=CAA
+GET {{base}}/internal/search?q=contrat&jurisdictionType=CE&jurisdictionType=CAA
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
-jsonpath "$.facets.jurisdiction" isCollection
+
+GET {{base}}/internal/search/decompte?q=contrat&jurisdictionType=CE&jurisdictionType=CAA
+HTTP 200
+[Asserts]
+jsonpath "$.facets.seat" isCollection
 
 
 # ── 15. Single filter: solution (référentiel solution:*) ────────────────────
-GET {{base}}/api/search?q=rejet&solution=REJET
+GET {{base}}/internal/search?q=rejet&solution=REJET
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
 # ── 16. Single filter: procedure (référentiel procedure:*) ──────────────────
-GET {{base}}/api/search?q=suspension&procedure=REFERE_SUSPENSION
+GET {{base}}/internal/search?q=suspension&procedure=REFERE_SUSPENSION
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
 # ── 17. Single filter: office (référentiel office:*) ─────────────────────────
-GET {{base}}/api/search?q=saisie&office=JEX
+GET {{base}}/internal/search?q=saisie&office=JEX
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
 # ── 18. Single filter: legalDomain ──────────────────────────────────────────
-GET {{base}}/api/search?q=bail&legalDomain=CIVIL
+GET {{base}}/internal/search?q=bail&legalDomain=CIVIL
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
 # ── 19. Single filter: jurisdictionCode (codes référentiel jurisdiction) ─────
-GET {{base}}/api/search?q=permis&jurisdictionCode=ce
+GET {{base}}/internal/search?q=permis&jurisdictionCode=ce
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
 # ── 20. Single filter: legalInstrument (token = ref_text_uid) ───────────────
-GET {{base}}/api/search?q=responsabilite&legalInstrument=LEGITEXT000006070721
+GET {{base}}/internal/search?q=responsabilite&legalInstrument=LEGITEXT000006070721
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
 # ── 21. Single filter: legalArticle (clé composite ref_text_uid|ref_num_key) ─
-GET {{base}}/api/search?q=responsabilite&legalArticle=LEGITEXT000006070721%7C1240
+GET {{base}}/internal/search?q=responsabilite&legalArticle=LEGITEXT000006070721%7C1240
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
@@ -207,14 +219,14 @@ jsonpath "$.hits" isCollection
 # Valeur canonique de facette (`facet_value.uid` sans le préfixe `publication:`),
 # pas le code court de source (« B ») : un token inconnu est rejeté en 422
 # correctif, jamais ignoré en silence.
-GET {{base}}/api/search?q=arret&publication=PUBLIE_BULLETIN
+GET {{base}}/internal/search?q=arret&publication=PUBLIE_BULLETIN
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
 # ── 22b. Token de filtre inconnu → 422 correctif (jamais 200 silencieux) ─────
-GET {{base}}/api/search?q=arret&publication=B
+GET {{base}}/internal/search?q=arret&publication=B
 HTTP 422
 [Asserts]
 jsonpath "$.detail[0].loc[1]" == "publication"
@@ -222,22 +234,26 @@ jsonpath "$.detail[0].type" == "enum"
 
 
 # ── 23. Date range filters ───────────────────────────────────────────────────
-GET {{base}}/api/search?q=fiscalite&dateFrom=2020-01-01&dateTo=2023-12-31
+GET {{base}}/internal/search?q=fiscalite&dateFrom=2020-01-01&dateTo=2023-12-31
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 
 
 # ── 24. Combined filters (many dimensions at once + date range) ──────────────
-GET {{base}}/api/search?q=expulsion&jurisdictionType=CA&solution=CONFIRMATION&legalDomain=CIVIL_DROIT_LOCATIF&dateFrom=2018-01-01&dateTo=2024-12-31&publication=PUBLIE_BULLETIN
+GET {{base}}/internal/search?q=expulsion&jurisdictionType=CA&solution=CONFIRMATION&legalDomain=CIVIL_DROIT_LOCATIF&dateFrom=2018-01-01&dateTo=2024-12-31&publication=PUBLIE_BULLETIN
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
+
+GET {{base}}/internal/search/decompte?q=expulsion&jurisdictionType=CA&solution=CONFIRMATION&legalDomain=CIVIL_DROIT_LOCATIF&dateFrom=2018-01-01&dateTo=2024-12-31&publication=PUBLIE_BULLETIN
+HTTP 200
+[Asserts]
 jsonpath "$.facets" exists
 
 
 # ── 25. aiMode=true (rerank; summary embedded if present) ────────────────────
-GET {{base}}/api/search?q=divorce&aiMode=true
+GET {{base}}/internal/search?q=divorce&aiMode=true
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
@@ -245,7 +261,7 @@ jsonpath "$.queryMode" exists
 
 
 # ── 26. legalInstrumentFacet ordering + nested articles contract ─────────────
-GET {{base}}/api/search?q=responsabilite%20civile&limit=10
+GET {{base}}/internal/search/decompte?q=responsabilite%20civile&limit=10
 HTTP 200
 [Asserts]
 jsonpath "$.facets.legalInstrument" isCollection
@@ -256,17 +272,17 @@ jsonpath "$.facets.legalInstrument[0].count" isInteger
 jsonpath "$.facets.legalInstrument[0].articles" isCollection
 
 
-# ── 27. jurisdiction facet = arbre 2 niveaux (racines uid, enfants parent) ────
-GET {{base}}/api/search?q=permis%20de%20construire&limit=10
+# ── 27. seat facet = a tree of free depth (roots have no parent) ─────────────
+GET {{base}}/internal/search/decompte?q=permis%20de%20construire&limit=10
 HTTP 200
 [Asserts]
-jsonpath "$.facets.jurisdiction" isCollection
-jsonpath "$.facets.jurisdiction[0].value" isString
-jsonpath "$.facets.jurisdiction[0].label" isString
-jsonpath "$.facets.jurisdiction[0].count" isInteger
-# racines = tokens jurisdiction_type (TA, CC, …), sans préfixe d'uid
-jsonpath "$.facets.jurisdiction[0].value" matches /^[A-Z]{2,6}$/
-jsonpath "$.facets.jurisdiction[0].parent" not exists
+jsonpath "$.facets.seat" isCollection
+jsonpath "$.facets.seat[0].value" isString
+jsonpath "$.facets.seat[0].label" isString
+jsonpath "$.facets.seat[0].count" isInteger
+# roots = a court type alone (TA, CC, …), the first segment of a seat path
+jsonpath "$.facets.seat[0].value" matches /^[A-Z]{2,6}$/
+jsonpath "$.facets.seat[0].parent" not exists
 
 
 # ============================================================================
@@ -275,24 +291,45 @@ jsonpath "$.facets.jurisdiction[0].parent" not exists
 # assert the 4xx class, not the exact code.
 # ============================================================================
 
-# ── 28. Empty q (min_length=1 violated) ──────────────────────────────────────
-GET {{base}}/api/search?q=
-HTTP *
+# ── 28. Empty q is browse mode, not an error ─────────────────────────────────
+# Total and facets cover the WHOLE filtered corpus, so total goes far above the
+# 100-result cap of a ranked search.
+GET {{base}}/internal/search?q=&limit=5
+HTTP 200
 [Asserts]
-status >= 400
-status < 500
+jsonpath "$.queryMode" == "browse"
+jsonpath "$.query" == ""
+jsonpath "$.total" > 1000000
+jsonpath "$.hits" count == 5
+jsonpath "$.facets.seat" isCollection
+jsonpath "$.facets.dateLectureYear" isCollection
+# The cited-texts facet is served here too, from the nightly snapshot: the top 30
+# of the whole corpus, each line carrying the catalogue title and slug.
+jsonpath "$.facets.legalInstrument" count == 30
+jsonpath "$.facets.legalInstrument[0].label" exists
+jsonpath "$.facets.legalInstrument[0].slug" exists
+jsonpath "$.facets.legalInstrument[0].articles" isCollection
 
 
-# ── 29. Missing q entirely ───────────────────────────────────────────────────
-GET {{base}}/api/search
-HTTP *
+# ── 29. Missing q entirely: same browse mode ─────────────────────────────────
+GET {{base}}/internal/search
+HTTP 200
 [Asserts]
-status >= 400
-status < 500
+jsonpath "$.queryMode" == "browse"
+jsonpath "$.total" > 1000000
+
+
+# ── 29b. Browse under a filter: exact total of the filtered corpus ───────────
+GET {{base}}/internal/search?jurisdictionType=CA&limit=1
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "browse"
+jsonpath "$.total" > 100
+jsonpath "$.facets.seat" isCollection
 
 
 # ── 30. limit above max (le=50) ──────────────────────────────────────────────
-GET {{base}}/api/search?q=test&limit=51
+GET {{base}}/internal/search?q=test&limit=51
 HTTP *
 [Asserts]
 status >= 400
@@ -300,7 +337,7 @@ status < 500
 
 
 # ── 31. limit below min (ge=1) ───────────────────────────────────────────────
-GET {{base}}/api/search?q=test&limit=0
+GET {{base}}/internal/search?q=test&limit=0
 HTTP *
 [Asserts]
 status >= 400
@@ -308,7 +345,7 @@ status < 500
 
 
 # ── 32. offset above max (le=99) ─────────────────────────────────────────────
-GET {{base}}/api/search?q=test&offset=100
+GET {{base}}/internal/search?q=test&offset=100
 HTTP *
 [Asserts]
 status >= 400
@@ -316,7 +353,7 @@ status < 500
 
 
 # ── 33. Invalid mode enum ────────────────────────────────────────────────────
-GET {{base}}/api/search?q=test&mode=fulltext
+GET {{base}}/internal/search?q=test&mode=fulltext
 HTTP *
 [Asserts]
 status >= 400
@@ -324,7 +361,7 @@ status < 500
 
 
 # ── 34. Invalid sort enum ────────────────────────────────────────────────────
-GET {{base}}/api/search?q=test&sort=price
+GET {{base}}/internal/search?q=test&sort=price
 HTTP *
 [Asserts]
 status >= 400
@@ -333,7 +370,7 @@ status < 500
 
 # ── 35. Unknown token on a typed facet axis (never silently unfiltered) ──────
 # JAF is a valid office token, not a procedure one: axis mixups get corrected.
-GET {{base}}/api/search?q=test&procedure=JAF
+GET {{base}}/internal/search?q=test&procedure=JAF
 HTTP *
 [Asserts]
 status >= 400
@@ -341,7 +378,7 @@ status < 500
 
 
 # ── 36. Unknown token on a referential facet axis (never silently zero) ──────
-GET {{base}}/api/search?q=test&chamber=JAF
+GET {{base}}/internal/search?q=test&publication=JAF
 HTTP *
 [Asserts]
 status >= 400
@@ -349,11 +386,78 @@ status < 500
 
 
 # ── 37. Unknown jurisdictionCode (corrective error, not silently zero) ───────
-GET {{base}}/api/search?q=test&jurisdictionCode=tribunal_paris
+GET {{base}}/internal/search?q=test&jurisdictionCode=tribunal_paris
 HTTP *
 [Asserts]
 status >= 400
 status < 500
+
+
+# ── 38. A room hangs from its court type, one segment down ───────────────────
+# The Cour de cassation has one court, so its code names the type: the path
+# stops at two segments and the parent of a room is the root.
+GET {{base}}/internal/search/decompte?q=bail%20commercial&jurisdictionCode=cc&perPage=20
+HTTP 200
+[Asserts]
+jsonpath "$.facets.seat[?(@.value == 'CC.C3_CIVILE')]" count == 1
+jsonpath "$.facets.seat[?(@.value == 'CC.C3_CIVILE')].parent" includes "CC"
+jsonpath "$.facets.seat[?(@.value == 'CC.C3_CIVILE')].label" includes "3e chambre civile"
+
+
+# ── 39. The seat filters on the path, and the tree stays in the filter ───────
+GET {{base}}/internal/search?q=bail&seat=CC.C3_CIVILE
+HTTP 200
+[Asserts]
+jsonpath "$.hits[0].seatPath.key" == "CC.C3_CIVILE"
+
+GET {{base}}/internal/search/decompte?q=bail&seat=CC.C3_CIVILE
+HTTP 200
+[Asserts]
+jsonpath "$.facets.seat[?(@.value == 'CC.C3_CIVILE')]" count == 1
+jsonpath "$.facets.seat[?(@.value == 'CC.C2_CIVILE')]" count == 0
+
+
+# ── 40. A room with no number is named by its specialisation ─────────────────
+GET {{base}}/internal/search?q=licenciement&seat=CC.SOCIALE
+HTTP 200
+[Asserts]
+jsonpath "$.hits[0].seatPath.key" == "CC.SOCIALE"
+
+GET {{base}}/internal/search/decompte?q=licenciement&seat=CC.SOCIALE
+HTTP 200
+[Asserts]
+jsonpath "$.facets.seat[?(@.value == 'CC.SOCIALE')]" count == 1
+jsonpath "$.facets.seat[?(@.value == 'CC.SOCIALE')].parent" includes "CC"
+jsonpath "$.facets.seat[?(@.value == 'CC.SOCIALE')].label" includes "Chambre sociale"
+
+
+# ── 40b. A path the corpus does not carry is refused, and names the filter ───
+GET {{base}}/internal/search?q=bail&seat=CC.CHAMBRE_DES_REVES
+HTTP *
+[Asserts]
+status >= 400
+status < 500
+
+
+# ── 41. A bare number no body writes: the designated decision is the list ────
+GET {{base}}/internal/search?q=362324
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.hits" count == 1
+jsonpath "$.hits[0].titleHtml" contains "362324"
+jsonpath "$.pinned" not exists
+
+
+# ── 42. A case name beside its court is a declared reference ─────────────────
+GET {{base}}/internal/search?q=B%C3%A9ziers%20conseil%20d%27%C3%89tat
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.hits" count >= 3
+jsonpath "$.hits[0].titleHtml" contains "Béziers"
+jsonpath "$.pinned" not exists
+
 
 
 # ============================================================================

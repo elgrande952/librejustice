@@ -39,6 +39,7 @@ fn fixture_detail() -> DecisionDetail {
         id: "ce-2024-470537".to_string(),
         jurisdiction_type: JurisdictionType::Ce,
         title: "Conseil d'État, 12 mars 2024, n° 470537".to_string(),
+        case_name: None,
         paragraphs: vec![],
         paragraph_spans: Vec::new(),
         sections: None,
@@ -54,21 +55,23 @@ fn fixture_detail() -> DecisionDetail {
         procedure: None,
         office: None,
         legal_domain: None,
-        publication: None,
         publication_codes: vec![],
         date_audience: None,
         docket_numbers: None,
         seat: None,
-        chamber: None,
-        formation: None,
+        seat_path: None,
         legal_references: None,
         source_xml: None,
         themes: Vec::new(),
         nac: None,
         ecli: None,
+        official_url: None,
         source: None,
         chronology: Vec::new(),
         commentaires: vec![],
+        renvoyants: vec![],
+        citantes: vec![],
+        citantes_total: None,
     }
 }
 
@@ -120,7 +123,8 @@ fn decision_route_head_matches_react_meta_contract() {
 
     assert_eq!(
         description,
-        "Le Conseil d'État annule la décision attaquée pour erreur de droit."
+        "Le Conseil d'État annule la décision attaquée pour erreur de droit. \
+         La haute juridiction renvoie l'affaire."
     );
 
     assert_eq!(url, "https://librejustice.fr/decision/ce-2024-470537");
@@ -195,6 +199,38 @@ fn decision_jsonld_matches_react_graph() {
     });
 
     assert_eq!(got, expected);
+}
+
+/// La description remplit le budget SERP : elle déborde de la phrase 1 et coupe
+/// en milieu de phrase sur une frontière de mot, ellipse comprise.
+#[test]
+fn decision_description_spans_beyond_the_first_sentence() {
+    let mut detail = fixture_detail();
+    detail.summary = Some(
+        "M. et Mme N recherchent la responsabilité de leur voisin M. R pour troubles \
+         anormaux de voisinage. La cour d'appel d'Amiens retient l'anormalité du trouble \
+         causé par l'utilisation fréquente du barbecue et condamne M. R à le déplacer, \
+         ainsi qu'à verser 1500 euros de dommages-intérêts."
+            .to_string(),
+    );
+    let description = meta_description(&detail, &detail.title);
+
+    assert_eq!(
+        description,
+        "M. et Mme N recherchent la responsabilité de leur voisin M. R pour troubles \
+         anormaux de voisinage. La cour d'appel d'Amiens retient l'anormalité du trouble…"
+    );
+    assert!(description.chars().count() <= 160);
+}
+
+/// Un paragraphe suivant ne rejoint jamais la description : le résumé s'arrête
+/// au premier `\n\n`.
+#[test]
+fn decision_description_stops_at_the_first_paragraph() {
+    let mut detail = fixture_detail();
+    detail.summary = Some("Première phrase courte.\n\nSecond paragraphe.".to_string());
+    let description = meta_description(&detail, &detail.title);
+    assert_eq!(description, "Première phrase courte.");
 }
 
 #[test]

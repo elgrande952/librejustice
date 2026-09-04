@@ -8,7 +8,7 @@
 //! évolution = nouvelle migration qui ré-indexe. Les libellés et l'ordre
 //! d'affichage des fonds vivent dans `lj_core::referential_labels`.
 
-use super::types::NormTextRow;
+use super::types::{NormHubPages, NormTextRow};
 use super::DecisionRepository;
 use crate::error::Result;
 
@@ -34,10 +34,8 @@ const NORM_BROWSE_DATE_EXPR: &str = "CASE \
     WHEN date_publi >= DATE '1500-01-01' AND date_publi < DATE '2100-01-01' THEN date_publi \
   END";
 
-/// Filtre commun : textes publiés (page `/texte/{slug}`) hors actes
-/// individuels (nominations JORF, pas des normes). Miroir du prédicat partiel
-/// de l'index.
-pub(super) const NORM_SCOPE: &str = "slug IS NOT NULL AND role <> 'individuel'";
+/// Miroir du prédicat partiel de l'index.
+pub(super) const NORM_SCOPE: &str = "slug IS NOT NULL";
 
 impl DecisionRepository<'_> {
     /// Volumes par fond (`/normes`). Servi derrière le cache 12 h de `lj-api` ;
@@ -107,8 +105,7 @@ impl DecisionRepository<'_> {
     }
 
     /// Fond et année de parcours d'un texte, pour le maillage retour de la
-    /// page `/texte/{slug}`. `None` si le texte est hors catalogue (pas de slug ou
-    /// acte individuel).
+    /// page `/texte/{slug}`.
     #[tracing::instrument(name = "db.norm_fond_of_text", skip(self), fields(db.system = "postgresql"))]
     pub async fn norm_fond_of_text(&self, text_uid: &str) -> Result<Option<(String, Option<i32>)>> {
         let sql = format!(
@@ -119,20 +116,22 @@ impl DecisionRepository<'_> {
         Ok(rows.first().map(|r| (r.get(0), r.get(1))))
     }
 
-    /// Couples `(fond, années)` pour la section `normes` des sitemaps : un hub
-    /// par fond + une URL par année (token `sans-date` pour le bucket sans date de
-    /// parcours), années récentes en tête. Le fond `codes` est exclu — son
-    /// catalogue `/normes/codes` (pas de hubs année) est porté par la section
-    /// `pages`.
+    /// Couples `(fond, [(token année, nombre de pages)])` pour la section
+    /// `normes` des sitemaps, années récentes en tête. Le fond `codes` sort
+    /// ici : son catalogue `/normes/codes`, sans hub année, est porté par la
+    /// section `pages`.
     #[tracing::instrument(name = "db.iter_norm_hubs_for_sitemap", skip(self), fields(db.system = "postgresql"))]
-    pub async fn iter_norm_hubs_for_sitemap(&self) -> Result<Vec<(String, Vec<String>)>> {
+    pub async fn iter_norm_hubs_for_sitemap(&self, page_size: i64) -> Result<NormHubPages> {
+        // `$1::bigint` avant le float8 : sous `$1::float8` seul, Postgres infère
+        // le paramètre en float8 et refuse d'y sérialiser l'i64.
         let sql = format!(
-            "SELECT {NORM_FOND_EXPR}, extract(year FROM {NORM_BROWSE_DATE_EXPR})::int \
+            "SELECT {NORM_FOND_EXPR}, extract(year FROM {NORM_BROWSE_DATE_EXPR})::int, \
+                    ceil(count(*)::float8 / $1::bigint::float8)::bigint \
              FROM legal_text WHERE {NORM_SCOPE} \
              GROUP BY 1, 2 ORDER BY 1, 2 DESC NULLS LAST"
         );
-        let rows = self.conn.query(&sql, &[]).await?;
-        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        let rows = self.conn.query(&sql, &[&page_size]).await?;
+        let mut out: NormHubPages = Vec::new();
         for r in rows {
             let fond: String = r.get(0);
             if fond == "codes" {
@@ -142,9 +141,10 @@ impl DecisionRepository<'_> {
                 Some(y) => y.to_string(),
                 None => "sans-date".to_string(),
             };
+            let bucket = (token, r.get(2));
             match out.last_mut() {
-                Some((f, tokens)) if *f == fond => tokens.push(token),
-                _ => out.push((fond, vec![token])),
+                Some((f, tokens)) if *f == fond => tokens.push(bucket),
+                _ => out.push((fond, vec![bucket])),
             }
         }
         Ok(out)

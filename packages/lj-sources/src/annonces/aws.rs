@@ -1,16 +1,3 @@
-//! AWS / Avenue Web (`marches-publics.info`) — recherche centrale tous
-//! tenants.
-//!
-//! `POST /Annonces/lister` (IDE=EC, IDN=T/S/F, IDR=département, IDP=X),
-//! énuméré par cellule (département × nature). **Le contexte de recherche est
-//! global au serveur** : un GET pager sur une session déjà servie revient
-//! vide — on rejoue le POST complet à chaque page, le numéro en query string
-//! `?pager_<nature minuscule>=N`, avec une session neuve. Avis `MPI-pub-…`
-//! (dématérialisation AWS) et `DL-pub-…` (relais, dématérialisation ailleurs
-//! — la clé du dédoublonnage inter-canaux). Le RC est servi sans captcha
-//! (`fuseaction=dce.dRC&IDM=`) ; le DCE complet est derrière un captcha — on
-//! n'émet que les liens présents dans la ligne.
-
 use std::sync::LazyLock;
 
 use futures::StreamExt;
@@ -30,9 +17,23 @@ const NATURES: [(&str, NatureMarche); 3] = [
     ("S", NatureMarche::Services),
     ("F", NatureMarche::Fournitures),
 ];
-const PER_PAGE: usize = 10;
 const MAX_PAGES: u64 = 60;
 const CELLULES_PARALLELES: usize = 12;
+/// Procédures du formulaire (`<select name="IDP">`), seul axe qui morde en plus
+/// de la nature et du département. Elles laissent ~2 % de la cellule dehors, des
+/// avis sans procédure déclarée qu'aucune valeur ne rattrape.
+const PROCEDURES: [&str; 9] = ["PA", "AOO", "AOE", "MN", "CO", "CR", "DC", "AU", "DSP"];
+
+/// Ce que `lister` rend : la page servie, ou le refus au-delà du plafond.
+enum Cellule {
+    Liste {
+        annonce: u64,
+        rows: Vec<AnnonceBrute>,
+    },
+    Plafond {
+        annonce: u64,
+    },
+}
 
 async fn session() -> Result<reqwest::Client> {
     let client = super::client();
@@ -69,11 +70,7 @@ async fn departements() -> Result<Vec<String>> {
 }
 
 /// Une page d'une cellule : session neuve (contexte serveur global).
-async fn page_query(
-    dept: &str,
-    nature: &str,
-    page: u64,
-) -> Result<(Option<u64>, Vec<AnnonceBrute>)> {
+async fn page_query(dept: &str, nature: &str, idp: &str, page: u64) -> Result<Cellule> {
     let client = session().await?;
     let mut url = format!("{BASE}/Annonces/lister");
     if page > 1 {
@@ -84,22 +81,35 @@ async fn page_query(
             ("IDE", "EC"),
             ("IDN", nature),
             ("IDR", dept),
-            ("IDP", "X"),
+            ("IDP", idp),
             ("dateParution", ""),
             ("Rechercher", "Rechercher"),
         ]),
-        &format!("aws lister {dept}/{nature} p{page}"),
+        &format!("aws lister {dept}/{nature}/{idp} p{page}"),
     )
     .await?;
-    Ok((total(&corps), parse_rows(&corps, dept, nature)))
+    Ok(lecture(&corps, dept, nature))
 }
 
-fn total(page: &str) -> Option<u64> {
+/// Le refus se reconnaît à son propre décompte, servi à la place de la liste.
+fn lecture(page: &str, dept: &str, nature: &str) -> Cellule {
+    static PLAFOND: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)Votre recherche trouve\s*(\d[\d\s]*)\s*résultats?").unwrap()
+    });
     static TOTAL: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?i)(\d[\d\s]*)\s*(?:Avis|résultats?)").unwrap());
-    TOTAL
-        .captures(&txt(page))
-        .and_then(|c| c[1].replace(char::is_whitespace, "").parse().ok())
+        LazyLock::new(|| Regex::new(r"(?i)(\d[\d\s]*)\s*Avis\s+correspond").unwrap());
+    let plat = txt(page);
+    let nombre = |re: &Regex| -> Option<u64> {
+        re.captures(&plat)
+            .and_then(|c| c[1].replace(char::is_whitespace, "").parse().ok())
+    };
+    match nombre(&PLAFOND) {
+        Some(annonce) => Cellule::Plafond { annonce },
+        None => Cellule::Liste {
+            annonce: nombre(&TOTAL).unwrap_or(0),
+            rows: parse_rows(page, dept, nature),
+        },
+    }
 }
 
 fn parse_rows(page: &str, dept: &str, nature: &str) -> Vec<AnnonceBrute> {
@@ -192,16 +202,20 @@ fn parse_rows(page: &str, dept: &str, nature: &str) -> Vec<AnnonceBrute> {
     out
 }
 
-/// Toutes les pages d'une cellule (département × nature).
-async fn enumerate_cell(dept: String, nature: &'static str) -> super::HoteRun {
-    let (annonce, mut rows) = page_query(&dept, nature, 1).await?;
-    let annonce = annonce.unwrap_or(0);
+/// Toutes les pages d'une cellule servie (département × nature × procédure).
+async fn pages(dept: &str, nature: &str, idp: &str) -> Result<Cellule> {
+    let (annonce, mut rows) = match page_query(dept, nature, idp, 1).await? {
+        Cellule::Plafond { annonce } => return Ok(Cellule::Plafond { annonce }),
+        Cellule::Liste { annonce, rows } => (annonce, rows),
+    };
     let mut vus: std::collections::HashSet<String> =
         rows.iter().map(|r| r.source_uid.clone()).collect();
     let mut page = 1;
     while (vus.len() as u64) < annonce && page < MAX_PAGES && !rows.is_empty() {
         page += 1;
-        let (_, suite) = page_query(&dept, nature, page).await?;
+        let Cellule::Liste { rows: suite, .. } = page_query(dept, nature, idp, page).await? else {
+            break;
+        };
         let avant = vus.len();
         for r in suite {
             if vus.insert(r.source_uid.clone()) {
@@ -212,8 +226,35 @@ async fn enumerate_cell(dept: String, nature: &'static str) -> super::HoteRun {
             break;
         }
     }
-    let _ = PER_PAGE;
-    Ok((annonce, rows))
+    Ok(Cellule::Liste { annonce, rows })
+}
+
+/// Une cellule, redécoupée par procédure quand le moteur refuse de la lister.
+/// Le déclaré retenu reste celui du refus, pour que le résidu se voie au ratio.
+async fn enumerate_cell(dept: String, nature: &'static str) -> super::HoteRun {
+    let plafond = match pages(&dept, nature, "X").await? {
+        Cellule::Liste { annonce, rows } => return Ok((annonce, rows)),
+        Cellule::Plafond { annonce } => annonce,
+    };
+    let mut rows: Vec<AnnonceBrute> = Vec::new();
+    let mut vus = std::collections::HashSet::new();
+    for idp in PROCEDURES {
+        match pages(&dept, nature, idp).await? {
+            Cellule::Liste { rows: lot, .. } => {
+                for r in lot {
+                    if vus.insert(r.source_uid.clone()) {
+                        rows.push(r);
+                    }
+                }
+            }
+            Cellule::Plafond { annonce } => {
+                return Err(SourceError::Invalid(format!(
+                    "aws: {dept}/{nature}/{idp} pèse {annonce} avis, plus rien ne le redécoupe"
+                )))
+            }
+        }
+    }
+    Ok((plafond, rows))
 }
 
 /// Ré-énumère le stock actif France entière, cellule par cellule.
@@ -231,6 +272,7 @@ pub async fn enumerate() -> Result<MoteurRun> {
     let mut run = MoteurRun {
         annonce: Some(0),
         echecs: 0,
+        hotes: Vec::new(),
         rows: Vec::new(),
     };
     for res in resultats {
@@ -306,6 +348,26 @@ Publié le 07/08/2026 Date limite : le 09/09/2026 à 10h00"#;
         assert_eq!(rows[0].objet, "Montage et démontage des illuminations");
         assert_eq!(rows[0].reference.as_deref(), Some("26AC01"));
         assert_eq!(rows[0].source_uid, "aws:1848353");
+    }
+
+    /// Le refus compte lui aussi ses avis : le lire comme un total ferait passer
+    /// la cellule pour servie et vide.
+    #[test]
+    fn le_refus_de_lister_ne_se_lit_pas_comme_un_total() {
+        let refus = r#"<h2>Votre recherche trouve 115 résultats.
+            Veuillez préciser votre recherche à l&#039;aide des critères suivants :</h2>"#;
+        assert!(matches!(
+            lecture(refus, "75", "S"),
+            Cellule::Plafond { annonce: 115 }
+        ));
+        let servie = r#"<h2 id="nbResultAvis"><strong>
+                6
+            </strong>
+            Avis correspondent à votre recherche</h2>"#;
+        assert!(matches!(
+            lecture(servie, "68", "T"),
+            Cellule::Liste { annonce: 6, .. }
+        ));
     }
 
     /// Extrait de `MPI-pub-20261911503.htm` : les deux lignes de la carte.

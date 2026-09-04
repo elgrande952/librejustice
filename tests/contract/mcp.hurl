@@ -202,7 +202,7 @@ jsonpath "$.result.isError" == false
 # Per-hit shape (only assert when at least one hit; data-dependent):
 # hits[].title/url/chars/jurisdictionType always present (camelCase), plus
 # exactly one of aiSummary (semantic) / snippet (lexical) per hit,
-# optional metadata = filter tokens: jurisdictionCode, chamber, solution,
+# optional metadata = filter tokens: jurisdictionCode, seat, solution,
 # procedure, office, legalDomain, publication, dateLecture, docketNumbers
 # (omitted when null — skip_serializing_if).
 
@@ -273,8 +273,8 @@ jsonpath "$.result.content[0].text" contains "\"category\":\"validation\""
 jsonpath "$.result.content[0].text" contains "\"hint\""
 
 # -----------------------------------------------------------------------------
-# resources/list — liste vide assumée (primitive application-controlled sans
-# consommateur réel côté clients).
+# resources/list: the capability is not announced, so the method does not exist.
+# Serving an empty list made the directories advertise `capability:resources`.
 # -----------------------------------------------------------------------------
 POST {{base}}/mcp/
 Accept: application/json, text/event-stream
@@ -289,11 +289,35 @@ HTTP 200
 [Asserts]
 jsonpath "$.jsonrpc" == "2.0"
 jsonpath "$.id" == 8
-jsonpath "$.result.resources" count == 0
-jsonpath "$.error" not exists
+jsonpath "$.error.code" == -32601
+jsonpath "$.result" not exists
 
 # -----------------------------------------------------------------------------
-# prompts/list + prompts/get — workflows invocables par l'utilisateur
+# tools/call search_decisions : le filtre `matiere`, retiré du schéma, est
+# toujours accepté, réécrit en `legal_domain` et annoncé dans `filterRewritten`.
+# -----------------------------------------------------------------------------
+POST {{base}}/mcp/
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 9,
+  "method": "tools/call",
+  "params": {
+    "name": "search_decisions",
+    "arguments": {"query": "obligation de quitter le territoire", "matiere": ["ETRANGERS"], "limit": 3, "ai_rerank": false}
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" == false
+jsonpath "$.result.structuredContent.filterRewritten" contains "legal_domain"
+jsonpath "$.result.structuredContent.filterRewritten" contains "PUBLIC_DROIT_ETRANGERS_NATIONALITE"
+jsonpath "$.result.structuredContent.hits" isCollection
+
+# -----------------------------------------------------------------------------
+# tools/call search_decisions : une valeur `matiere` qui ne nommait pas un sujet
+# rend une erreur corrective, pas un filtre muet.
 # -----------------------------------------------------------------------------
 POST {{base}}/mcp/
 Accept: application/json, text/event-stream
@@ -301,35 +325,16 @@ Content-Type: application/json
 {
   "jsonrpc": "2.0",
   "id": 10,
-  "method": "prompts/list",
-  "params": {}
+  "method": "tools/call",
+  "params": {
+    "name": "search_decisions",
+    "arguments": {"query": "test", "matiere": ["URGENCES"], "limit": 3}
+  }
 }
 HTTP 200
 [Asserts]
-jsonpath "$.result.prompts" count == 3
-jsonpath "$.result.prompts[0].name" == "recherche_jurisprudence"
-jsonpath "$.result.prompts[1].name" == "article_a_date"
-jsonpath "$.result.prompts[2].name" == "textes_applicables"
-jsonpath "$.result.prompts[0].arguments[0].name" == "question"
-jsonpath "$.result.prompts[0].arguments[0].required" == true
-jsonpath "$.error" not exists
-
-POST {{base}}/mcp/
-Accept: application/json, text/event-stream
-Content-Type: application/json
-{
-  "jsonrpc": "2.0",
-  "id": 11,
-  "method": "prompts/get",
-  "params": {"name": "article_a_date", "arguments": {"article": "article 1240 du code civil", "date": "2018-01-01"}}
-}
-HTTP 200
-[Asserts]
-jsonpath "$.result.messages[0].role" == "user"
-jsonpath "$.result.messages[0].content.type" == "text"
-jsonpath "$.result.messages[0].content.text" contains "article 1240 du code civil"
-jsonpath "$.result.messages[0].content.text" contains "2018-01-01"
-jsonpath "$.error" not exists
+jsonpath "$.result.isError" == true
+jsonpath "$.result.content[0].text" contains "legal_domain"
 
 # -----------------------------------------------------------------------------
 # unknown top-level method → method not found

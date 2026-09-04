@@ -1,46 +1,91 @@
-# Chemin AUTHENTIFIÉ de bout en bout — web (JWT Supabase) puis MCP (OAuth).
+# The AUTHENTICATED path end to end: web session by cookie, then MCP, by OAuth
+# and by a static key.
 #
-# Ce fichier est le SEUL contrôle automatique qui présente un jeton VALIDE. Le
-# reste de la suite est volontairement sans secret et ne peut donc tester que le
-# refus : `me.hurl` § bogus bearer attend un 401, et il reste vert même quand le
-# serveur refuse TOUS les jetons valides. C'est ce trou qui a laissé la panne de
-# vérification JWT du 07/08 vivre 2 j 23 h sans un symptôme visible.
+# This file is the ONLY automatic check that presents a VALID identity. The rest
+# of the suite carries no secret and therefore only tests refusal: `me.hurl`
+# stays green even when the server refuses EVERY valid identity.
 #
-# Ne se lance pas seul : `mise run contract-authed` provisionne le compte
-# jetable, injecte `base` + `token`, et supprime le compte même en cas d'échec.
+# The target must be https, the cookie being `Secure` and so never sent in the
+# clear. It does not run alone: `mise run contract-authed` injects `base`,
+# `email`, `password` and `api_key`. The account is the one an agent takes to be
+# logged into the app: it exists already, it survives the run, and no real
+# account is borrowed.
 #
-# PKCE : le couple vérifieur/défi est celui de l'annexe B de la RFC 7636, donc
-# une constante — un client n'a pas à calculer un SHA-256 pour prouver que le
-# serveur vérifie le sien. Même paire que le test unitaire
-# `pkce_s256_challenge_matches_rfc7636_example` de `oauth.rs`.
+# PKCE: the verifier and challenge pair is the one of RFC 7636 appendix B, so a
+# constant. A client does not have to compute a SHA-256 to prove the server
+# checks its own. Same pair as the unit test
+# `pkce_s256_challenge_matches_rfc7636_example` of `oauth.rs`.
 
-# ── 1. Le profil se résout : c'est la vérification JWT elle-même ──────────────
-GET {{base}}/api/me
-Authorization: Bearer {{token}}
+# ── 1. La connexion pose le cookie et repart vers `next` ─────────────────────
+# Formulaire natif : POST → 303, la destination interne du champ caché `next`
+# dans le Location.
+POST {{base}}/internal/auth/login
+[FormParams]
+email: {{email}}
+password: {{password}}
+next: /decisions
+HTTP 303
+[Captures]
+session: cookie "__Host-lj_session"
+[Asserts]
+header "Location" == "/decisions"
+cookie "__Host-lj_session" exists
+cookie "__Host-lj_session[HttpOnly]" exists
+cookie "__Host-lj_session[Secure]" exists
+cookie "__Host-lj_session[SameSite]" == "Lax"
+# ── 2. Le cookie seul résout le profil ───────────────────────────────────────
+# L'identité résolue est CELLE du cookie, pas n'importe laquelle : c'est ce qui
+# distingue « la vérification marche » de « le serveur rend un profil ».
+GET {{base}}/internal/me
 HTTP 200
 [Asserts]
 header "Content-Type" contains "application/json"
 jsonpath "$.sub" isString
-# L'identité résolue est CELLE du jeton, pas n'importe laquelle : c'est ce qui
-# distingue « la vérification marche » de « le serveur rend un profil ».
-# `displayName` n'est pas asserté — il est nul sur un compte neuf.
 jsonpath "$.email" == "{{email}}"
 jsonpath "$.createdAt" isString
 jsonpath "$.lastSeenAt" isString
 jsonpath "$.trackActivity" isBoolean
 
-# ── 2. Une recherche identifiée aboutit ──────────────────────────────────────
+# ── 3. La page de connexion refuse un porteur de session ─────────────────────
+# La garde serveur répond 303 vers `next` avant tout rendu : un connecté n'a
+# rien à faire sur /login.
+GET {{base}}/login?next=%2Fdecisions
+HTTP 303
+[Asserts]
+header "Location" == "/decisions"
+
+# ── 4. Le consentement MCP se rend avec la session, en privé ─────────────────
+# La garde laisse passer le porteur du cookie, l'écran hérite du défaut privé.
+GET {{base}}/authorize-mcp
+HTTP 200
+[Asserts]
+header "Cache-Control" == "private, no-store"
+body contains "Autoriser"
+# `form-action` a quitté cette page : Chrome l'oppose à toute la chaîne de
+# redirection du POST, dont nous ne connaissons que le premier saut. La
+# régression consiste à la remettre.
+header "Content-Security-Policy" not contains "form-action"
+
+# ── 5. Le profil se rend avec la session : compte lu au rendu, en privé ──────
+# La zone danger dans le HTML prouve que le rendu serveur est complet, pas un
+# squelette.
+GET {{base}}/profile
+HTTP 200
+[Asserts]
+header "Cache-Control" == "private, no-store"
+body contains "Supprimer mon compte"
+body contains "{{email}}"
+# ── 6. Une recherche identifiée aboutit ──────────────────────────────────────
 # Le 401 n'est pas le seul symptôme possible : une identité perdue dégrade en
 # anonyme sans erreur. On assert donc le succès, et `identity` se lit
 # dans les spans.
-GET {{base}}/api/search?q=trouble+anormal+de+voisinage&limit=3
-Authorization: Bearer {{token}}
+GET {{base}}/internal/search?q=trouble+anormal+de+voisinage&limit=3
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
-jsonpath "$.total" isInteger
+jsonpath "$.allHitIds" isCollection
 
-# ── 3. Enregistrement dynamique du client (RFC 7591) ─────────────────────────
+# ── 7. Enregistrement dynamique du client (RFC 7591) ─────────────────────────
 POST {{base}}/oauth/register
 Content-Type: application/json
 {
@@ -51,24 +96,37 @@ HTTP 201
 [Captures]
 client_id: jsonpath "$.client_id"
 
-# ── 4. Approbation : c'est l'étape que la panne du 07/08 cassait ─────────────
-# Elle exige un JWT Supabase valide. Un 401 ici = plus personne ne peut installer
-# un connecteur, et c'est exactement ce qui s'est produit pendant 2 j 23 h.
+# ── 8. Approbation : l'étape sans laquelle aucun connecteur ne s'installe ────
+# Elle exige une session, et répond en 303 : le code sort dans la query du
+# Location.
 POST {{base}}/oauth/approve
-Authorization: Bearer {{token}}
-Content-Type: application/json
-{
-  "client_id": "{{client_id}}",
-  "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
-  "code_challenge": "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-}
-HTTP 200
+Content-Type: application/x-www-form-urlencoded
+[FormParams]
+action: approve
+client_id: {{client_id}}
+redirect_uri: https://claude.ai/api/mcp/auth_callback
+code_challenge: E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+HTTP 303
 [Captures]
-code: jsonpath "$.code"
+code: header "Location" regex "[?&]code=([A-Za-z0-9_-]{43})"
 [Asserts]
-jsonpath "$.redirect_uri" == "https://claude.ai/api/mcp/auth_callback"
+header "Location" startsWith "https://claude.ai/api/mcp/auth_callback"
 
-# ── 5. Échange du code contre une paire, PKCE vérifié ────────────────────────
+# ── 8 bis. Le même défi rend le même code ────────────────────────────────────
+# Un navigateur mobile rejoue la soumission quand le retour n'aboutit pas : 33
+# fois en 32 s le 28/08/2026, donc 33 codes dont un seul pouvait servir.
+POST {{base}}/oauth/approve
+Content-Type: application/x-www-form-urlencoded
+[FormParams]
+action: approve
+client_id: {{client_id}}
+redirect_uri: https://claude.ai/api/mcp/auth_callback
+code_challenge: E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+HTTP 303
+[Asserts]
+header "Location" contains "code={{code}}"
+
+# ── 9. Échange du code contre une paire, PKCE vérifié ────────────────────────
 POST {{base}}/oauth/token
 [FormParams]
 grant_type: authorization_code
@@ -81,13 +139,12 @@ HTTP 200
 access: jsonpath "$.access_token"
 refresh: jsonpath "$.refresh_token"
 [Asserts]
-# Minuscule : c'est ce que le serveur rend, et la RFC 6749 §7.1 rend le champ
-# insensible à la casse.
-jsonpath "$.token_type" == "bearer"
+jsonpath "$.token_type" == "Bearer"
+jsonpath "$.scope" == "mcp"
 jsonpath "$.expires_in" isInteger
 jsonpath "$.refresh_token" isString
 
-# ── 6. Le jeton MCP ouvre un appel d'outil réel ──────────────────────────────
+# ── 10. Le jeton MCP ouvre un appel d'outil réel ─────────────────────────────
 POST {{base}}/mcp
 Authorization: Bearer {{access}}
 Accept: application/json, text/event-stream
@@ -106,7 +163,252 @@ HTTP 200
 jsonpath "$.jsonrpc" == "2.0"
 jsonpath "$.result.isError" not == true
 
-# ── 7. Le grant refresh tourne, et rote les deux jetons ──────────────────────
+# A case name inside a question: the list answers the question, the decision sits apart in `pinned`.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "method": "tools/call",
+  "params": {
+    "name": "search_decisions",
+    "arguments": { "query": "Danthony vice de procédure", "limit": 1, "ai_rerank": false }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.pinned[0].title" contains "Danthony"
+jsonpath "$.result.structuredContent.pinned[0].url" contains "/decision/"
+
+# A stated mode is served as stated: `pinned` exists in `auto` only.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "method": "tools/call",
+  "params": {
+    "name": "search_decisions",
+    "arguments": { "query": "Danthony vice de procédure", "mode": "lexical", "limit": 1, "ai_rerank": false }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.pinned" not exists
+
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 23,
+  "method": "tools/call",
+  "params": {
+    "name": "search_decisions",
+    "arguments": { "query": "Danthony vice de procédure", "mode": "semantic", "limit": 1, "ai_rerank": false }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.pinned" not exists
+
+# A room is one level of the seat tree: MCP serves the `seat` facet, whose keys
+# are dotted paths, handed back verbatim to the `seat` filter. A room with no
+# number is named by its specialisation.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 20,
+  "method": "tools/call",
+  "params": {
+    "name": "search_decisions",
+    "arguments": { "query": "bail commercial", "jurisdiction_code": ["cc"], "limit": 1 }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+# Le total sort de la cellule différée : MCP la résout, et les facettes ne
+# s'ouvrent que parce qu'il dépasse la fenêtre servie.
+jsonpath "$.result.structuredContent.total" isInteger
+jsonpath "$.result.structuredContent.total" > 1
+jsonpath "$.result.structuredContent.facets.seat['CC.C3_CIVILE']" isInteger
+jsonpath "$.result.structuredContent.facets.seat['CC.COMMERCIALE']" isInteger
+# `cc` has no court segment: its code names the type, so a room's path holds in
+# two segments and the root carries the court's count.
+jsonpath "$.result.structuredContent.facets.seat.CC" isInteger
+
+# ── 10 bis. La liste servie est enregistrable telle quelle par un client ─────
+# Un combinateur à la racine d'un `inputSchema` fait omettre l'outil par le
+# client, sans erreur ni trace côté serveur : du 15 au 19/08/2026, `tools/list`
+# déclarait cinq outils et les clients Claude n'en voyaient que quatre.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }
+HTTP 200
+[Asserts]
+jsonpath "$.result.tools" count == 5
+jsonpath "$.result.tools[*].name" contains "get_legal_text"
+jsonpath "$.result.tools[0].inputSchema.anyOf" not exists
+jsonpath "$.result.tools[1].inputSchema.anyOf" not exists
+jsonpath "$.result.tools[2].inputSchema.anyOf" not exists
+jsonpath "$.result.tools[3].inputSchema.anyOf" not exists
+jsonpath "$.result.tools[4].inputSchema.anyOf" not exists
+
+# ── 10 ter. Les rattrapages de désignation, que seul un vrai jeton atteint ───
+# Un client MCP est un modèle : il compose la forme d'appel qui lui paraît
+# naturelle, et le serveur accepte ce qui ne peut désigner qu'une cible unique.
+# Sans verrou, ces rattrapages repartent en arrière sans bruit.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "method": "tools/call",
+  "params": {
+    "name": "get_legal_text",
+    "arguments": { "code_name": "Code de procédure pénale", "article_number": "706-88" }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.code" == "code-de-procedure-penale"
+jsonpath "$.result.structuredContent.num" == "706-88"
+
+# Un identifiant Légifrance se reconnaît à sa forme, où qu'il soit posé.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 12,
+  "method": "tools/call",
+  "params": { "name": "get_legal_text", "arguments": { "textId": "LEGIARTI000006419282" } }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.code" == "code-civil"
+
+# Racine d'un texte sans articles : le corps, et pas de `num` — c'est l'absence
+# de `num` qui dit à l'appelant qu'il tient un texte et non un article.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 13,
+  "method": "tools/call",
+  "params": {
+    "name": "get_legal_text",
+    "arguments": { "url": "/texte/circulaire-imig0800044c-du-20-novembre-2008-relative-a-l-accord-franco-gabonais" }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.text" isString
+jsonpath "$.result.structuredContent.num" not exists
+
+# Racine d'un texte qui a des articles : elle rend sa table des matières, bornée,
+# et `omitted` dit ce qui manque. Un code entier ne tient pas dans une réponse ;
+# sa table, oui.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 14,
+  "method": "tools/call",
+  "params": { "name": "get_legal_text", "arguments": { "url": "/texte/code-du-travail" } }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.articleCount" > 1000
+jsonpath "$.result.structuredContent.articles" isCollection
+jsonpath "$.result.structuredContent.omitted" isInteger
+jsonpath "$.result.structuredContent.text" not exists
+
+# Nom de texte écrit juste mais autrement ponctué, et code de juridiction au
+# tiret : deux rattrapages qui ne réécrivent que ce qui devient connu.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 15,
+  "method": "tools/call",
+  "params": {
+    "name": "search_decisions",
+    "arguments": {
+      "query": "trouble de voisinage",
+      "legal_instrument": ["code-de-la-construction-et-de-lhabitation"],
+      "jurisdiction_code": ["ca_aix-en-provence"],
+      "limit": 1
+    }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+
+# Le CGI renommé se filtre sous son nom, et un code inventé erre toujours.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 16,
+  "method": "tools/call",
+  "params": {
+    "name": "search_legal_texts",
+    "arguments": { "code": "code-general-des-impots", "query": "exigibilité de la taxe", "limit": 1 }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 17,
+  "method": "tools/call",
+  "params": {
+    "name": "search_legal_texts",
+    "arguments": { "code": "code-inexistant-xyz", "query": "peine", "limit": 1 }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" == true
+
+# ── 11. Le grant refresh tourne, et rote les deux jetons ─────────────────────
 # Ce chemin n'avait jamais tourné en réel avant la sonde manuelle du 10/08 :
 # 85 des 90 access tokens vivants dépendent de lui pour survivre à 30 jours.
 POST {{base}}/oauth/token
@@ -122,7 +424,7 @@ refresh2: jsonpath "$.refresh_token"
 jsonpath "$.access_token" != "{{access}}"
 jsonpath "$.refresh_token" != "{{refresh}}"
 
-# ── 8. Le jeton issu du refresh appelle un outil ─────────────────────────────
+# ── 12. Le jeton issu du refresh appelle un outil ────────────────────────────
 POST {{base}}/mcp
 Authorization: Bearer {{access2}}
 Accept: application/json, text/event-stream
@@ -140,7 +442,7 @@ HTTP 200
 [Asserts]
 jsonpath "$.result.isError" not == true
 
-# ── 9. L'ancien refresh est mort : la rotation tient ─────────────────────────
+# ── 13. L'ancien refresh est mort : la rotation tient ────────────────────────
 POST {{base}}/oauth/token
 [FormParams]
 grant_type: refresh_token
@@ -150,7 +452,7 @@ client_id: {{client_id}}
 # est « l'ancien refresh ne marche plus », et le 400 l'exprime entièrement.
 HTTP 400
 
-# ── 10. Un jeton MCP inventé est refusé ──────────────────────────────────────
+# ── 14. Un jeton MCP inventé est refusé ──────────────────────────────────────
 # Vérifie le motif d'alerte `mcp_token_rejete` : c'est la seule trace qu'un
 # connecteur cassé laisse désormais côté serveur.
 POST {{base}}/mcp
@@ -162,3 +464,37 @@ HTTP 401
 [Asserts]
 jsonpath "$.error" == "invalid_token"
 header "WWW-Authenticate" contains "resource_metadata="
+
+# ── 14 bis. The public door answers at the grain of the MCP tools ────────────
+# A hit carries the url that chains to `get_decision`; the browser DTO does not.
+GET {{base}}/api/search?q=usufruit&limit=1&aiMode=1
+Authorization: Bearer {{api_key}}
+HTTP 200
+[Asserts]
+jsonpath "$.hits[0].url" contains "/decision/"
+jsonpath "$.hits[0].title" exists
+jsonpath "$.total" exists
+
+# ── 14 ter. A code is named as a model composes it, an article likewise ──────
+GET {{base}}/api/texte/code%20civil/Article%201240
+Authorization: Bearer {{api_key}}
+HTTP 200
+[Asserts]
+jsonpath "$.url" contains "/texte/code-civil/1240"
+jsonpath "$.code" == "code-civil"
+
+# ── 15. La déconnexion efface le cookie côté client ──────────────────────────
+POST {{base}}/internal/auth/logout
+HTTP 204
+[Asserts]
+cookie "__Host-lj_session[Max-Age]" == 0
+
+# ── 16. La valeur déconnectée est refusée, pas ignorée ───────────────────────
+# Represente à la main : l'étape 3 l'a retirée du client, et ce qui est vérifié
+# ici est le refus côté serveur — un 401 anonyme passerait pour une réussite.
+GET {{base}}/internal/me
+Cookie: __Host-lj_session={{session}}
+HTTP 401
+[Asserts]
+jsonpath "$.detail" == "session_rejected"
+cookie "__Host-lj_session[Max-Age]" == 0

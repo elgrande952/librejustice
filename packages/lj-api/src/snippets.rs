@@ -1,18 +1,13 @@
 //! Surlignage de snippets, **sans index inversé**.
 //!
-//! On réplique 1-pour-1 le tokenizer ParadeDB (regex `[\p{L}\p{N}-]+` +
-//! ascii_folding + lowercase + stopwords FR optionnels) via le `TextAnalyzer` de
-//! tantivy (version EPINGLEE `=0.26.0`), puis on porte la sélection « best
-//! fragment » de tantivy (`search_fragments` + `select_best_fragment_combination`
-//! de `snippet/mod.rs`) sur des tokens **précalculés**. Aucun
-//! `Index`/`writer`/`commit`/segment : un index in-RAM squelette (bâti UNE fois
-//! pour le process, cf. [`ENGINE`]) sert seulement à construire le `QueryParser` ;
-//! le `doc_freq`, pour le score `1/(1+df)` par terme, est compté à la main sur les
-//! mêmes tokens.
+//! Le tokenizer ParadeDB est répliqué 1-pour-1 via le `TextAnalyzer` de tantivy
+//! (version **épinglée** `=0.26.0`), puis la sélection « best fragment » de
+//! tantivy est portée sur des tokens **précalculés**. Aucun index : le squelette
+//! in-RAM d'[`ENGINE`] ne sert qu'à construire le `QueryParser`, et le `doc_freq`
+//! du score `1/(1+df)` est compté à la main sur les mêmes tokens.
 //!
-//! Le HTML `<mark>` est reconstruit à la main (ranges en octets UTF-8) pour ne
-//! PAS échapper les entités HTML : le consommateur rend chaque fragment comme
-//! text node.
+//! Le `<mark>` est reconstruit à la main en octets UTF-8 pour ne PAS échapper
+//! les entités : le consommateur rend chaque fragment comme text node.
 //!
 //! Les configs ``SNIPPET_TOKENIZER`` sont la source de vérité ; elles doivent
 //! rester synchronisées avec le ``CREATE INDEX ... USING bm25`` de
@@ -34,14 +29,17 @@ use tantivy::{Index, Score, Term};
 /// Budget de caractères par défaut d'un snippet.
 pub const DEFAULT_MAX_CHARS: usize = 500;
 
-/// Pattern du tokenizer ParadeDB répliqué (= `TokenizerConfig.pattern`).
-const TOKENIZER_PATTERN: &str = r"[\p{L}\p{N}-]+";
+/// Pattern du tokenizer ParadeDB répliqué : la source unique est
+/// `lj_core::body_tok`, dont les migrations `CREATE INDEX ... USING bm25`
+/// portent la copie.
+const TOKENIZER_PATTERN: &str = lj_core::body_tok::TOKEN_PATTERN;
 
 /// Nom du tokenizer custom enregistré dans l'index.
 const TOKENIZER_NAME: &str = "t";
 
-/// Tokenizer ParadeDB répliqué : pattern Unicode `[\p{L}\p{N}-]+`,
-/// ascii-folding + lowercase, stopwords FR optionnels.
+/// Tokenizer ParadeDB répliqué : pattern Unicode
+/// `lj_core::body_tok::TOKEN_PATTERN`, ascii-folding + lowercase, stopwords FR
+/// optionnels.
 ///
 /// À synchroniser avec les ``text_fields`` JSON dans les migrations
 /// ``CREATE INDEX ... USING bm25``. Aucun stemming côté ParadeDB → on n'en

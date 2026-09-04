@@ -1,23 +1,17 @@
-//! Moteur d'extraction des citations. L'automate porte les FORMES structurelles
-//! de citation (ancres de nature « code/loi/convention… », « article(s) »,
-//! connecteurs d'anaphore) et les alias embarqués ; chaque ancre positionne un
-//! LEXER sur un petit span qui borne la mention, le span est SNAPPÉ sur le
-//! catalogue (titres exacts pliés, index du linker) et le lien est délégué à
-//! [`link_citation`].
+//! Moteur d'extraction des citations. L'automate porte les FORMES de citation et
+//! les alias embarqués ; chaque ancre positionne un lexer sur un petit span qui
+//! borne la mention, le span est snappé sur le catalogue, et le lien est délégué
+//! à [`link_citation`].
 //!
 //! Deux phases strictement séparées :
 //!
-//! 1. **scan** — automate Aho-Corasick leftmost-longest (petit, statique) sur
-//!    texte plié longueur-stable + lexers positionnés par classe d'ancre +
-//!    lexer d'énumérations d'articles → [`Tok`]s triés par position.
+//! 1. **scan** — Aho-Corasick leftmost-longest sur texte plié longueur-stable,
+//!    lexers positionnés par classe d'ancre → [`Tok`]s triés par position ;
 //! 2. **compose** — rejoue le flux sans relire le texte : rattachement
-//!    article→instrument (énumérations traversantes), anaphores (« du même
-//!    code », « dudit règlement »), antécédent validé par existence de
-//!    l'article au catalogue, résolution des articles nus par UNICITÉ
-//!    (index inversé `num_key` → textes ∩ instruments du document).
+//!    article→instrument, anaphores (« du même code »), antécédent validé par
+//!    existence au catalogue, articles nus résolus par UNICITÉ.
 //!
-//! PUR : opère sur un [`LinkSnapshot`] et des [`CatalogText`] hydratés par
-//! l'appelant.
+//! PUR : opère sur un [`LinkSnapshot`] et des [`CatalogText`] hydratés.
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, OnceLock};
@@ -169,6 +163,8 @@ const ANCHORS: &[(&str, Anchor)] = &[
     ("ce", Anchor::Case),
     ("conseil constitutionnel", Anchor::Case),
     ("cons. const.", Anchor::Case),
+    ("tribunal des conflits", Anchor::Case),
+    ("tc", Anchor::Case),
     ("cour europeenne des droits de l'homme", Anchor::Case),
     ("cjue", Anchor::Case),
     ("cjce", Anchor::Case),
@@ -1151,6 +1147,12 @@ fn lex_case(
         }
         "conseil constitutionnel" => case_constit(folded, byte2char, bs, be, out, false),
         "cons. const." => case_constit(folded, byte2char, bs, be, out, false),
+        "tribunal des conflits" => case_tc(folded, byte2char, bs, be, out),
+        "tc" => {
+            if upper(2) {
+                case_tc(folded, byte2char, bs, be, out);
+            }
+        }
         "cour europeenne des droits de l'homme" => {
             case_cedh(folded, byte2char, be, out, false);
         }
@@ -1391,6 +1393,134 @@ fn case_constit(
         push_case(out, byte2char, s, e, format!("constit|{}", g.as_str()));
         pos += g.end();
     }
+}
+
+/// Clé Tribunal des conflits : espaces et points ôtés du texte plié. « C 4174 »
+/// tombe sur `c4174`, « 14-03.959 » sur `14-03959`, graphie année-numéro.
+fn tc_key(num: &str) -> String {
+    format!("tc|{}", lj_core::docket_key::tc_ordinal(num))
+}
+
+/// Citation du Tribunal des conflits, « TC, 8 février 1873, [U], n° 00012 » ou
+/// « TC, 7 juillet 2014, pourvoi n° 14-03.959 » : le tribunal écrit « pourvoi »
+/// là où il tranche un conflit, et la clé reste `tc`.
+///
+/// La date est le seul discriminant, jamais la place du numéro : sans elle,
+/// « TC de Caen » est un tribunal de commerce et « TC n° 2 » un terme de
+/// comparaison d'expropriation.
+fn case_tc(folded: &str, byte2char: &[usize], bs: usize, be: usize, out: &mut Vec<CompiledCase>) {
+    let win = case_window(folded, be, 200);
+    let date = RE_CASE_TC_DATE.find(win);
+    if let Some(d) = date {
+        if tc_ahead(folded, byte2char, be, win, d.end(), out) {
+            return;
+        }
+    } else if let Some(c) = RE_CASE_TC_NUM_DATED.captures(win) {
+        let g = c.get(1).expect("groupe n° TC");
+        if !tc_cut(folded, be, win, g.end()) {
+            push_case(
+                out,
+                byte2char,
+                be + g.start(),
+                be + g.end(),
+                tc_key(g.as_str()),
+            );
+            return;
+        }
+    }
+    tc_back(folded, byte2char, bs, date.is_some(), out);
+}
+
+/// Le millésime d'un décret visé derrière la citation (« n° 2015-233 »), ou un
+/// numéro que la fenêtre a coupé : le numéro du fonds ne porte ni tiret de
+/// millésime ni barre de rôle.
+fn tc_cut(folded: &str, be: usize, win: &str, e: usize) -> bool {
+    cut_by_window(folded, be, win, e) || folded[be + e..].starts_with(['-', '/'])
+}
+
+/// Les numéros derrière la date : le premier, puis ceux que l'énumération
+/// enchaîne, « n° 3789, 3790, 3791 » comme « n° 03086, du 12 décembre 2005,
+/// Commune de Cestas, n° 3485 ».
+fn tc_ahead(
+    folded: &str,
+    byte2char: &[usize],
+    be: usize,
+    win: &str,
+    from: usize,
+    out: &mut Vec<CompiledCase>,
+) -> bool {
+    let Some(c) = RE_CASE_TC_NUM.captures(&win[from..]) else {
+        return false;
+    };
+    let g = c.get(1).expect("groupe n° TC");
+    let mut pos = from + g.end();
+    if tc_cut(folded, be, win, pos) {
+        return false;
+    }
+    push_case(
+        out,
+        byte2char,
+        be + from + g.start(),
+        be + pos,
+        tc_key(g.as_str()),
+    );
+    while let Some(c) = tc_next(&win[pos..]) {
+        let g = c.get(1).expect("groupe n° TC");
+        let (s, e) = (pos + g.start(), pos + g.end());
+        if tc_cut(folded, be, win, e) {
+            break;
+        }
+        push_case(out, byte2char, be + s, be + e, tc_key(g.as_str()));
+        pos = e;
+    }
+    true
+}
+
+/// Maillon suivant de l'énumération. Le maillon nu, sans « n° », n'est retenu
+/// que devant une ponctuation de liste : « n° 4283, 1500 euros » n'énumère pas.
+fn tc_next(rest: &str) -> Option<regex::Captures<'_>> {
+    if let Some(c) = RE_CASE_TC_NEXT_DATED.captures(rest) {
+        return Some(c);
+    }
+    let c = RE_CASE_TC_NEXT_BARE.captures(rest)?;
+    let after = rest[c.get(1).expect("groupe n° TC").end()..].trim_start();
+    let liste = after.is_empty()
+        || after.starts_with([',', ';', ')', '.'])
+        || after
+            .strip_prefix("et")
+            .is_some_and(|r| !r.starts_with(char::is_alphanumeric));
+    liste.then_some(c)
+}
+
+/// Le numéro devant l'ancre : « Vu la décision n° 3124 du Tribunal des Conflits
+/// du 23 novembre 1998 ». La fenêtre s'arrête à la ponctuation de phrase, et la
+/// date reste exigée, portée par l'arrière ou par l'avant.
+fn tc_back(
+    folded: &str,
+    byte2char: &[usize],
+    bs: usize,
+    date_ahead: bool,
+    out: &mut Vec<CompiledCase>,
+) {
+    let mut ws = bs.saturating_sub(90);
+    while !folded.is_char_boundary(ws) {
+        ws += 1;
+    }
+    if let Some(i) = folded[ws..bs].rfind(['.', ';', ':']) {
+        ws += i + 1;
+    }
+    let Some(c) = RE_CASE_TC_BACK.captures(&folded[ws..bs]) else {
+        return;
+    };
+    if c.get(2).is_none() && !date_ahead {
+        return;
+    }
+    let g = c.get(1).expect("groupe n° TC");
+    let (s, e) = (ws + g.start(), ws + g.end());
+    if folded[e..].starts_with(['-', '/']) {
+        return;
+    }
+    push_case(out, byte2char, s, e, tc_key(g.as_str()));
 }
 
 /// Une requête CEDH suivie d'une barre oblique est un acte UE gaufré
@@ -3683,7 +3813,7 @@ static RE_LEX_EU: LazyLock<Regex> = LazyLock::new(|| {
         \s*\d{1,4}\s*/\s*\d{1,4}
         (?:\s*/\s*(?:ce|cee|ue|euratom))?
         # Identité institutionnelle écrite en toutes lettres (l'oracle capture
-        # l'identité complète, ADR 0143 §2) : « … du Parlement européen et du
+        # l'identité complète) : « … du Parlement européen et du
         # Conseil du 12 décembre 2012 ».
         (?:
           \s+(?:du\s+parlement\s+europeen\s+et\s+du\s+conseil|du\s+conseil|de\s+la\s+commission)
@@ -3825,6 +3955,77 @@ static RE_CASE_CONSTIT_BACK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?x)decisions?\s+(?:qpc\s+)?n\s*[°oº]\s*s?\s*(\d{2,4}-\d{1,4})
           (?:\s*(?:dc|qpc))?\s*(?:,|du)?\s*$",
+    )
+    .unwrap()
+});
+/// Date derrière l'ancre TC, discriminant de la juridiction. Le nom de l'acte
+/// s'intercale (« Tribunal des conflits, ordonnance du 9 octobre 2017 ») : le
+/// vocabulaire en est fermé, et ce qui le précède ne porte ni chiffre ni fin de
+/// phrase, sinon « TC de Caen en date du 11 mai 2023 » redeviendrait une
+/// citation.
+static RE_CASE_TC_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)^\s*[,(]?\s*
+          (?:[^.;:0-9]{0,25}?\b(?:ordonnance|decision|arret|jugement|avis)\s+)?
+          (?:du\s+|le\s+|en\s+date\s+du\s+)?\d{1,2}(?:er)?\s+[a-z]+\.?\s+\d{4}\b",
+    )
+    .unwrap()
+});
+/// « la décision n° 3643 en date du 17 décembre 2007 » : le numéro AVANT la
+/// date, l'inverse de [`RE_CASE_TC_DATE`]. Nom de l'acte, degré et date sont
+/// exigés ensemble, et la classe sans ponctuation forte reste dans la phrase.
+static RE_CASE_TC_NUM_DATED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)^[^.;:0-9]{0,60}?\b(?:ordonnance|decision|arret|jugement|avis)s?\s+
+          n\s*[°oº]?\s*s?\s*:?\s*
+          (c\s?\d{3,4}|\d{2}-\d{2}\.\d{3}|\d{2}-\d{4,5}|\d{3,5})\b
+          \s*,?\s*(?:du\s+|le\s+|en\s+date\s+du\s+)\d{1,2}(?:er)?\s+[a-z]+\.?\s+\d{4}\b",
+    )
+    .unwrap()
+});
+/// Numéro TC derrière la date, nom d'usage toléré. Le degré est optionnel
+/// (« n C3952 ») : c'est la forme du numéro qui discrimine, et trois graphies
+/// se succèdent au fonds selon l'époque, `C4174` (2005 et après), `3220`
+/// (2000-2004), `00012` (avant 2000) ; les citations ajoutent la forme
+/// année-numéro (« 14-03.959 », « 99-03174 »).
+static RE_CASE_TC_NUM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)^[^.;:]{0,80}?\bn\s*[°oº]?\s*s?\s*:?\s*
+          (c\s?\d{3,4}|\d{2}-\d{2}\.\d{3}|\d{2}-\d{4,5}|\d{3,5})\b",
+    )
+    .unwrap()
+});
+/// Maillon daté de l'énumération TC : « n° 03086, du 12 décembre 2005, Commune
+/// de Cestas, n° 3485 ». Le point de l'initiale (« M. C. et autres ») traverse,
+/// là où le point de fin de phrase arrête : une lettre seule entre frontière de
+/// mot et point n'est pas une fin de phrase.
+static RE_CASE_TC_NEXT_DATED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)^\s*(?:,|;|\bet\b)\s*
+          (?:du\s+|le\s+|en\s+date\s+du\s+)?\d{1,2}(?:er)?\s+[a-z]+\.?\s+\d{4}\b
+          (?:[^.;:]|\b[a-z]\.){0,60}?\bn\s*[°oº]?\s*s?\s*:?\s*
+          (c\s?\d{3,4}|\d{2}-\d{2}\.\d{3}|\d{2}-\d{4,5}|\d{3,5})\b",
+    )
+    .unwrap()
+});
+/// Maillon nu de l'énumération TC : « n° 3789, 3790, 3791 ».
+static RE_CASE_TC_NEXT_BARE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)^\s*(?:,|\bet\b)\s*
+          (c\s?\d{3,4}|\d{2}-\d{2}\.\d{3}|\d{2}-\d{4,5}|\d{3,5})\b",
+    )
+    .unwrap()
+});
+/// Sonde ARRIÈRE TC : « la décision n° 3124 du Tribunal des Conflits ». La
+/// queue qui rejoint l'ancre ne porte aucun chiffre, ce qui écarte le décret
+/// visé (« n° 2015-233 du 27 février 2015 »), et le groupe 2 dit si la date se
+/// tient de ce côté.
+static RE_CASE_TC_BACK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?x)\bn\s*[°oº]?\s*s?\s*:?\s*
+          (c\s?\d{3,4}|\d{2}-\d{2}\.\d{3}|\d{2}-\d{4,5}|\d{3,5})\b
+          (\s*,?\s*(?:du\s+|le\s+|en\s+date\s+du\s+)?\d{1,2}(?:er)?\s+[a-z]+\.?\s+\d{4})?
+          [^.;:0-9]{0,30}$",
     )
     .unwrap()
 });
@@ -4252,8 +4453,8 @@ mod tests {
         }
         let articles = vec![
             ("LEGI_CJA".to_string(), "l761-1".to_string()),
-            ("LEGI_CJA".to_string(), "r*771-5".to_string()),
-            ("LEGI_CJA".to_string(), "r*771-7".to_string()),
+            ("LEGI_CJA".to_string(), "r771-5".to_string()),
+            ("LEGI_CJA".to_string(), "r771-7".to_string()),
             ("LEGI_CC".to_string(), "1240".to_string()),
             ("LEGI_CESEDA".to_string(), "l742-3".to_string()),
             ("LEGI_CESEDA".to_string(), "l313-14".to_string()),
@@ -4678,7 +4879,7 @@ mod tests {
         );
         let c = by_article(&out, "R. 771-5");
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("LEGI_CJA"));
-        assert_eq!(c.target.ref_num_key.as_deref(), Some("r*771-5"));
+        assert_eq!(c.target.ref_num_key.as_deref(), Some("r771-5"));
         let c = by_article(&out, "R. 771-7");
         assert_eq!(c.target.ref_text_uid.as_deref(), Some("LEGI_CJA"));
     }
@@ -5454,6 +5655,205 @@ mod tests {
             vec![("2019-781".to_string(), "constit|2019-781".to_string())]
         );
         assert!(case_surfaces("la décision n° 2020-1310 du 29 octobre 2020").is_empty());
+    }
+
+    /// Surfaces relevées dans le fonds judiciaire : c'est le juge judiciaire
+    /// qui cite le Tribunal des conflits, au moment de se déclarer incompétent.
+    #[test]
+    fn case_tc_reads_the_short_docket_behind_the_date() {
+        for (text, num) in [
+            ("(TC, 8 février 1873, [U], n° 00012)", "00012"),
+            (
+                "Vu la décision du Tribunal des conflits, 8 février 1873, Blanco, n° 00012",
+                "00012",
+            ),
+            (
+                "la décision du Tribunal des conflits du 8 février 1873 (n° 00012 dit « [K] »)",
+                "00012",
+            ),
+            ("TC, 23 octobre 2000, n° 3220)", "3220"),
+            ("TC 9 décembre 2019, N° C4174, à propos des soins", "C4174"),
+            (
+                "TC 28 mars 2011 Commune de la Clusaz c/ Société mutuelle \
+                 d'assurance du bâtiment n° 3773)",
+                "3773",
+            ),
+            (
+                "(TC, 7 juillet 2014, Mme Voguet c/ Centre de prestations \
+                 sociales interministérielles, n C3952)",
+                "C3952",
+            ),
+        ] {
+            let key = format!("tc|{}", lj_core::docket_key::tc_ordinal(num));
+            assert_eq!(
+                case_surfaces(text),
+                vec![(num.to_string(), key)],
+                "surface {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_tc_pourvoi_is_not_a_cassation_reference() {
+        assert_eq!(
+            case_surfaces("TC, 7 juillet 2014, pourvoi n° 14-03.959"),
+            vec![("14-03.959".to_string(), "tc|1403959".to_string())]
+        );
+    }
+
+    /// Le visa d'un tribunal judiciaire, verbatim : trois décisions d'affilée,
+    /// nom d'usage intercalé, et le `C` détaché du numéro moderne.
+    #[test]
+    fn case_tc_visa_enumerates_one_span_per_decision() {
+        assert_eq!(
+            case_surfaces(
+                "Vu la décision du Tribunal des conflits, 8 février 1873, Blanco, \
+                 n° 00012 Vu la décision du Tribunal des conflits, 22 janvier 1921, \
+                 Société commerciale de l'Ouest africain, n° 00706 Vu la décision du \
+                 Tribunal des conflits, 23 avril 2007, n° C 3451"
+            ),
+            vec![
+                ("00012".to_string(), "tc|12".to_string()),
+                ("00706".to_string(), "tc|706".to_string()),
+                ("C 3451".to_string(), "tc|3451".to_string()),
+            ]
+        );
+    }
+
+    /// Surfaces du fonds où le numéro précède l'ancre : c'est la forme du visa,
+    /// et c'est elle qui domine les citations TC ratées.
+    #[test]
+    fn case_tc_reads_the_docket_ahead_of_the_anchor() {
+        for (text, num) in [
+            (
+                "Vu la décision n° 3124 du Tribunal des Conflits du 23 novembre 1998 ;",
+                "3124",
+            ),
+            (
+                "Vu les autres pièces du dossier ; Vu la décision n° 3869 du 15 \
+                 octobre 2012 du Tribunal des conflits ;",
+                "3869",
+            ),
+            (
+                "tendant à ce que la décision n° 3940 du 19 mai 2014, par laquelle \
+                 le Tribunal des conflits a déclaré",
+                "3940",
+            ),
+            (
+                "Par une décision n° 4238 du 14 mars 2022, le Tribunal des conflits \
+                 a déclaré la juridiction administrative compétente",
+                "4238",
+            ),
+        ] {
+            let key = format!("tc|{}", lj_core::docket_key::tc_ordinal(num));
+            assert_eq!(
+                case_surfaces(text),
+                vec![(num.to_string(), key)],
+                "surface {text:?}"
+            );
+        }
+    }
+
+    /// L'énumération du visa administratif, verbatim : trois dates, un nom
+    /// d'usage par décision, puis une liste nue de numéros.
+    #[test]
+    fn case_tc_enumerates_behind_one_anchor() {
+        assert_eq!(
+            case_surfaces(
+                "- les décisions du Tribunal des conflits du 20 octobre 1997, \
+                 Préfet du Finistère, n° 03086, du 12 décembre 2005, Commune de \
+                 Cestas, n° 3485 et du 22 novembre 2011, M. C. et autres c/ Lycée \
+                 David d'Angers, n° 3789, 3790, 3791 ;"
+            ),
+            vec![
+                ("03086".to_string(), "tc|3086".to_string()),
+                ("3485".to_string(), "tc|3485".to_string()),
+                ("3789".to_string(), "tc|3789".to_string()),
+                ("3790".to_string(), "tc|3790".to_string()),
+                ("3791".to_string(), "tc|3791".to_string()),
+            ]
+        );
+        assert_eq!(
+            case_surfaces(
+                "arrêts rendus par le Tribunal des conflits le 8 avril 2019 sous \
+                 le n° 4154 et le 14 juin 2021 sous le n° 4209 ;"
+            ),
+            vec![
+                ("4154".to_string(), "tc|4154".to_string()),
+                ("4209".to_string(), "tc|4209".to_string()),
+            ]
+        );
+        // Le maillon nu s'arrête devant un mot : la somme n'énumère pas.
+        assert_eq!(
+            case_surfaces("Tribunal des conflits, 3 juillet 2023, n° 4283, 1500 euros"),
+            vec![("4283".to_string(), "tc|4283".to_string())]
+        );
+    }
+
+    /// Le nom de l'acte s'intercale entre l'ancre et la date.
+    #[test]
+    fn case_tc_reads_the_date_behind_the_kind_of_act() {
+        for (text, num) in [
+            (
+                "il résulte de la jurisprudence (Tribunal des conflits, ordonnance \
+                 du 9 octobre 2017, n°4106) que les juridictions",
+                "4106",
+            ),
+            (
+                "le Tribunal des conflits a jugé, par une ordonnance du 17 juillet \
+                 2024 au n°4320, que c'est à tort",
+                "4320",
+            ),
+        ] {
+            let key = format!("tc|{}", lj_core::docket_key::tc_ordinal(num));
+            assert_eq!(
+                case_surfaces(text),
+                vec![(num.to_string(), key)],
+                "surface {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_tc_reads_the_docket_before_its_date_ahead_of_the_anchor() {
+        assert_eq!(
+            case_surfaces(
+                "requête enregistrée au secrétariat du Tribunal des conflits, tendant \
+                 à ce que la décision n° 3643 en date du 17 décembre 2007, notifiée le \
+                 29 janvier 2008, soit rapportée"
+            ),
+            vec![("3643".to_string(), "tc|3643".to_string())]
+        );
+        assert!(
+            case_surfaces(
+                "le Tribunal des conflits ait tranché cette question. Par une décision \
+                 n° 4374 du 8 juin 2026, ce tribunal a jugé"
+            )
+            .is_empty(),
+            "l'ancre et le numéro sont dans deux phrases"
+        );
+    }
+
+    #[test]
+    fn case_tc_sigle_needs_the_date_and_a_docket_shaped_number() {
+        // Tribunal de commerce, et terme de comparaison d'expropriation.
+        assert!(case_surfaces(
+            "DECISION du Président du TC de Caen en date du 11 Mai 2023 RG n° 2023001895"
+        )
+        .is_empty());
+        assert!(case_surfaces("le TC n° 2 proposé par l'expropriant est écarté").is_empty());
+        // Citation sans numéro : pas de clé, donc pas de span.
+        assert!(case_surfaces("TC 8 février 1873, arrêt dit [B]").is_empty());
+        assert!(case_surfaces("TC 29 février 1908").is_empty());
+        // Le sigle en minuscules n'est pas la juridiction.
+        assert!(case_surfaces("tc, 8 février 1873, n° 00012").is_empty());
+        // Le décret visé derrière la citation porte un millésime, pas un numéro
+        // du fonds.
+        assert!(case_surfaces(
+            "Vu l'arrêt du tribunal des conflits du 17 octobre 2011 dit SCEA du \
+             CHENEAU, Vu le Décret n° 2015-233 du 27 février 2015"
+        )
+        .is_empty());
     }
 
     #[test]

@@ -22,6 +22,10 @@ pub struct FacetValueEntry {
     pub label: String,
     pub abbr: Option<String>,
     pub parent_uid: Option<String>,
+    pub hint: Option<String>,
+    /// Rang de lecture voulu au sein de la facette. Ne sert qu'aux facettes qui
+    /// forment une échelle, où le compteur classerait le moins important devant.
+    pub sort: i32,
 }
 
 /// Une unité juridictionnelle (`jurisdiction`), indexée par code.
@@ -40,12 +44,44 @@ pub struct JurisdictionEntry {
 pub struct Referential {
     values: HashMap<String, FacetValueEntry>,
     jurisdictions: HashMap<String, JurisdictionEntry>,
+    /// Nodes of the seat axis the nightly snapshot counted, sorted HERE: the
+    /// database orders under `en_US.utf8`, which ignores the dot and puts `CAA`
+    /// before `CA.AGEN`, so a binary search over its order misses.
+    seats: Vec<String>,
+    /// Court label under every slug that designates its unit: code, source
+    /// location, folded label. The three key spaces do not overlap, so the map
+    /// stays flat. Only reader: [`crate::chronology`].
+    courts: HashMap<String, String>,
+    /// Court label under its seat path, derived by the same rule the extraction
+    /// uses, so a node of the tree and an indexed path can never disagree.
+    court_paths: HashMap<String, String>,
+    /// Every case name the fonds carries. A content query offers a median of 52
+    /// candidate keys and 96.4 % of them name nothing: asked in Postgres, that
+    /// answer costs 133 ms of the search (measured 31/08/2026).
+    case_names: std::collections::HashSet<String>,
 }
 
 impl Referential {
     /// Construit la vue depuis les lignes DB (ou des fixtures de test).
-    pub fn new(values: Vec<FacetValueRow>, jurisdictions: Vec<JurisdictionRow>) -> Self {
+    pub fn new(
+        values: Vec<FacetValueRow>,
+        jurisdictions: Vec<JurisdictionRow>,
+        mut seats: Vec<String>,
+    ) -> Self {
+        seats.sort_unstable();
         Self {
+            case_names: Default::default(),
+            courts: jurisdictions.iter().flat_map(court_keys).collect(),
+            court_paths: jurisdictions
+                .iter()
+                .map(|j| {
+                    (
+                        lj_core::chamber::jurisdiction_trunk(&j.jurisdiction_type, Some(&j.code))
+                            .join("."),
+                        j.label.clone(),
+                    )
+                })
+                .collect(),
             values: values
                 .into_iter()
                 .map(|r| {
@@ -56,6 +92,8 @@ impl Referential {
                             label: r.label,
                             abbr: r.abbr,
                             parent_uid: r.parent_uid,
+                            hint: r.hint,
+                            sort: r.sort,
                         },
                     )
                 })
@@ -73,7 +111,24 @@ impl Referential {
                     )
                 })
                 .collect(),
+            seats,
         }
+    }
+
+    /// Libellé d'une cour sous son chemin de siège.
+    pub fn court_label_of_path(&self, path: &str) -> Option<&str> {
+        self.court_paths.get(path).map(String::as_str)
+    }
+
+    /// Le fonds porte-t-il ce nœud de siège ?
+    pub fn has_seat(&self, path: &str) -> bool {
+        self.seats
+            .binary_search_by(|n| n.as_str().cmp(path))
+            .is_ok()
+    }
+
+    pub fn seat_nodes(&self) -> &[String] {
+        &self.seats
     }
 
     /// Entrée `facet_value` d'un uid complet (`solution:REJET`).
@@ -88,6 +143,17 @@ impl Referential {
             .get(uid)
             .map(|e| e.label.as_str())
             .unwrap_or_else(|| uid_suffix(uid))
+    }
+
+    /// Ce que la valeur recouvre quand elle en regroupe plusieurs, `None` sinon.
+    pub fn hint(&self, uid: &str) -> Option<String> {
+        self.values.get(uid).and_then(|e| e.hint.clone())
+    }
+
+    /// Rang de lecture d'un uid, `i32::MAX` si l'entrée manque : un uid hors
+    /// référentiel se lit après ceux qui y sont.
+    pub fn rank(&self, uid: &str) -> i32 {
+        self.values.get(uid).map_or(i32::MAX, |e| e.sort)
     }
 
     /// Tag référentiel d'un uid complet : `key` = suffixe d'uid, `label` résolu.
@@ -106,9 +172,30 @@ impl Referential {
             .map(|e| e.label.as_str())
     }
 
+    pub fn with_case_names(mut self, keys: Vec<String>) -> Self {
+        self.case_names = keys.into_iter().collect();
+        self
+    }
+
+    /// Whether these candidate keys can name a case. An unloaded sieve answers
+    /// yes and leaves the question to Postgres: emptied, it would report every
+    /// query as naming nothing, which silently kills the name leg.
+    pub fn names_a_case(&self, keys: &[String]) -> bool {
+        !keys.is_empty()
+            && (self.case_names.is_empty() || keys.iter().any(|k| self.case_names.contains(k)))
+    }
+
     /// Entrée `jurisdiction` d'un code (`tj_le_havre`).
     pub fn jurisdiction(&self, code: &str) -> Option<&JurisdictionEntry> {
         self.jurisdictions.get(code)
+    }
+
+    /// Court label under any writing of its unit: code (`tj_le_havre`), source
+    /// location (`tj76351`, `7501`) or name (`tribunal judiciaire du havre`).
+    pub fn court_by_key(&self, key: &str) -> Option<&str> {
+        self.courts
+            .get(&lj_core::text::slug(key))
+            .map(String::as_str)
     }
 
     /// Itère les unités juridictionnelles `(code, entrée)`.
@@ -117,7 +204,7 @@ impl Referential {
     }
 
     /// Tokens (suffixes d'uid) d'une facette, triés — le vocabulaire valide
-    /// d'un axe à catégorie contrôlée (`chamber`, `publication`).
+    /// d'un axe à catégorie contrôlée (`publication`).
     pub fn facet_tokens(&self, facet: &str) -> Vec<&str> {
         let mut tokens: Vec<&str> = self
             .values
@@ -201,6 +288,27 @@ pub fn unknown_jurisdiction_code_msg(code: &str, refs: &Referential) -> String {
     format!("unknown jurisdiction_code '{code}'{hint}")
 }
 
+/// Correctif d'un chemin de siège inconnu : le fonds n'en porte aucun nœud, ou
+/// la graphie est fautive. On nomme les nœuds voisins sous le même parent.
+pub fn unknown_seat_msg(path: &str, nodes: &[String]) -> String {
+    let parent = path.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
+    let voisins: Vec<&str> = nodes
+        .iter()
+        .filter(|n| n.rsplit_once('.').map(|(p, _)| p).unwrap_or("") == parent)
+        .map(String::as_str)
+        .take(8)
+        .collect();
+    if voisins.is_empty() {
+        return format!(
+            "Chemin de siège inconnu : « {path} ». Les chemins servis sont dans facets.seat."
+        );
+    }
+    format!(
+        "Chemin de siège inconnu : « {path} ». Sous « {parent} », le fonds porte : {}.",
+        voisins.join(", ")
+    )
+}
+
 /// `needle` présent dans `hay` en segment entier (bornes `-` ou extrémités) —
 /// une sous-chaîne libre fait matcher « ta_basse_terre » sur Nanterre.
 fn segment_of(hay: &str, needle: &str) -> bool {
@@ -227,6 +335,21 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// Every slug under which a chronology key may name this unit. The Judilibre
+/// location of a `TCOM` is bare (`7501`) where its source code is prefixed
+/// (`tcom7501`), so both are indexed.
+fn court_keys(row: &JurisdictionRow) -> Vec<(String, String)> {
+    let mut keys = vec![
+        lj_core::text::slug(&row.code),
+        lj_core::text::slug(&row.source_code),
+        lj_core::text::slug(&row.label),
+    ];
+    if let Some(bare) = row.source_code.strip_prefix("tcom") {
+        keys.push(lj_core::text::slug(bare));
+    }
+    keys.into_iter().map(|k| (k, row.label.clone())).collect()
+}
+
 /// Suffixe d'un uid namespacé (`solution:REJET` → `REJET`).
 pub fn uid_suffix(uid: &str) -> &str {
     uid.split_once(':').map(|(_, s)| s).unwrap_or(uid)
@@ -246,12 +369,26 @@ async fn load(state: &AppState) -> Result<Arc<Referential>> {
     let repo = DecisionRepository::new(&conn);
     let values = repo.load_facet_values().await.map_err(ApiError::Store)?;
     let jurisdictions = repo.load_jurisdictions().await.map_err(ApiError::Store)?;
-    Ok(Arc::new(Referential::new(values, jurisdictions)))
+    let seats = repo.load_seat_paths().await.map_err(ApiError::Store)?;
+    let case_names = repo.case_name_key_set().await.map_err(ApiError::Store)?;
+    Ok(Arc::new(
+        Referential::new(values, jurisdictions, seats).with_case_names(case_names),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn le_crible_des_noms_laisse_passer_le_doute_jamais_le_silence() {
+        let cle = |s: &str| vec![s.to_string()];
+        let charge = Referential::default().with_case_names(cle("danthony"));
+        assert!(charge.names_a_case(&cle("danthony")));
+        assert!(!charge.names_a_case(&cle("congés payés")));
+        assert!(!charge.names_a_case(&[]));
+        assert!(Referential::default().names_a_case(&cle("congés payés")));
+    }
 
     fn jr(code: &str, jurisdiction_type: &str, label: &str) -> JurisdictionRow {
         JurisdictionRow {
@@ -271,6 +408,7 @@ mod tests {
             abbr: None,
             parent_uid: parent.map(str::to_string),
             sort: 0,
+            hint: None,
         }
     }
 
@@ -288,6 +426,7 @@ mod tests {
                 city: Some("Le Havre".to_string()),
                 label: "Tribunal judiciaire du Havre".to_string(),
             }],
+            Vec::new(),
         );
         let tag = refs.tag("solution:REJET");
         assert_eq!((tag.key.as_str(), tag.label.as_str()), ("REJET", "Rejet"));
@@ -303,6 +442,25 @@ mod tests {
         );
     }
 
+    /// Un chemin hors du fonds rendait 200 et zéro résultat : le correctif
+    /// nomme les nœuds voisins sous le même parent.
+    #[test]
+    fn unknown_seat_nomme_les_voisins_du_parent() {
+        let noeuds = vec![
+            "CA".to_string(),
+            "CA.PARIS".to_string(),
+            "CA.PARIS.C3".to_string(),
+            "CA.PARIS.P6".to_string(),
+        ];
+
+        let inconnu = unknown_seat_msg("CA.PARIS.C9", &noeuds);
+        assert!(inconnu.contains("CA.PARIS.C3"), "{inconnu}");
+        assert!(inconnu.contains("CA.PARIS.P6"), "{inconnu}");
+
+        let orphelin = unknown_seat_msg("CA.PARSI.C3", &noeuds);
+        assert!(orphelin.contains("facets.seat"), "{orphelin}");
+    }
+
     #[test]
     fn unknown_code_suggests_accented_label_from_ascii_needle() {
         let refs = Referential::new(
@@ -314,6 +472,7 @@ mod tests {
                 city: None,
                 label: "Conseil d'État".to_string(),
             }],
+            Vec::new(),
         );
         assert_eq!(
             unknown_jurisdiction_code_msg("conseil_etat", &refs),
@@ -336,6 +495,7 @@ mod tests {
                     "Tribunal administratif de la Guadeloupe",
                 ),
             ],
+            Vec::new(),
         );
         assert_eq!(
             unknown_jurisdiction_code_msg("ta_cayenne", &refs),
@@ -353,15 +513,16 @@ mod tests {
     fn facet_tokens_and_unknown_token_lookup() {
         let refs = Referential::new(
             vec![
-                fv("chamber:SOCIALE", "Chambre sociale", None),
-                fv("chamber:CIVILE", "Chambre civile", None),
+                fv("matiere:SOCIALE", "Chambre sociale", None),
+                fv("matiere:CIVILE", "Chambre civile", None),
                 fv("publication:B", "Bulletin", None),
             ],
             vec![],
+            Vec::new(),
         );
-        assert_eq!(refs.facet_tokens("chamber"), vec!["CIVILE", "SOCIALE"]);
+        assert_eq!(refs.facet_tokens("matiere"), vec!["CIVILE", "SOCIALE"]);
         let values = vec!["SOCIALE".to_string(), "JAF".to_string()];
-        assert_eq!(refs.find_unknown_token("chamber", &values), Some("JAF"));
+        assert_eq!(refs.find_unknown_token("matiere", &values), Some("JAF"));
         assert_eq!(
             refs.find_unknown_token("publication", &["B".to_string()]),
             None

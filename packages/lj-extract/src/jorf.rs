@@ -188,15 +188,25 @@ fn collect_liens(root: &lj_core::parsing::XmlNode) -> Vec<JorfLien> {
         .unwrap_or_default()
 }
 
-/// L'ordre de lecture d'un `texte/struct/JORFTEXT*.xml` (racine `<TEXTELR>`) :
-/// le cid chronique et ses `STRUCT/LIEN_ART@id` dans l'ordre du fichier — qui
-/// est l'ordre du document au JO (les ids `JORFARTI`, eux, ne suivent PAS cet
-/// ordre). Tous les liens sont rendus, numérotés ou non : ce parseur sert
-/// l'assemblage du corps, pas le référentiel citable.
+/// Une entrée `STRUCT/LIEN_ART` : l'article et, s'il est numéroté, sa clé
+/// d'identité.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JorfStructArt {
+    pub id: String,
+    pub num_key: Option<String>,
+}
+
+/// Le **dispositif propre** d'un `texte/struct/JORFTEXT*.xml` (racine
+/// `<TEXTELR>`) : le cid chronique et ses `STRUCT/LIEN_ART` dans l'ordre du
+/// fichier, qui est l'ordre du document au JO (les ids `JORFARTI`, eux, ne
+/// suivent PAS cet ordre). La `STRUCT` ne descend pas dans les sections : les
+/// articles d'une annexe sont déclarés par sa `section_ta/JORFSCTA*.xml`, et
+/// c'est ce qui départage les deux séries d'un texte dont l'annexe renumérote
+/// à partir de 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JorfStructOrder {
     pub jorftext: String,
-    pub article_ids: Vec<String>,
+    pub articles: Vec<JorfStructArt>,
 }
 
 /// Parse un `texte/struct/JORFTEXT*.xml` en [`JorfStructOrder`]. Erreur franche
@@ -207,19 +217,24 @@ pub fn parse_jorf_struct(raw: &[u8]) -> Result<JorfStructOrder, CoreError> {
         build_tree(raw).ok_or_else(|| CoreError::Xml("TEXTELR JORF: XML illisible".into()))?;
     let jorftext = node_text(find_anywhere(&root, "META_TEXTE_CHRONICLE/CID"))
         .ok_or_else(|| CoreError::Xml("TEXTELR JORF: META_TEXTE_CHRONICLE/CID manquant".into()))?;
-    let article_ids = find_anywhere(&root, "STRUCT")
+    let articles = find_anywhere(&root, "STRUCT")
         .map(|s| {
             s.children
                 .iter()
                 .filter(|c| c.tag == "LIEN_ART")
-                .filter_map(|c| c.attr("id").filter(|v| !v.is_empty()).map(str::to_string))
+                .filter_map(|c| {
+                    Some(JorfStructArt {
+                        id: c.attr("id").filter(|v| !v.is_empty())?.to_string(),
+                        num_key: c
+                            .attr("num")
+                            .filter(|v| !v.is_empty())
+                            .map(lj_core::article_key::identity_key),
+                    })
+                })
                 .collect()
         })
         .unwrap_or_default();
-    Ok(JorfStructOrder {
-        jorftext,
-        article_ids,
-    })
+    Ok(JorfStructOrder { jorftext, articles })
 }
 
 #[cfg(test)]
@@ -390,12 +405,42 @@ mod tests {
         let s = parse_jorf_struct(xml.as_bytes()).expect("struct");
         assert_eq!(s.jorftext, "JORFTEXT000000209787");
         assert_eq!(
-            s.article_ids,
+            s.articles.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
             vec![
                 "JORFARTI000001045162",
                 "JORFARTI000002207442",
                 "JORFARTI000001817636"
             ]
+        );
+        assert_eq!(
+            s.articles
+                .iter()
+                .map(|a| a.num_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, None, Some("annexe")]
+        );
+    }
+
+    #[test]
+    fn parse_struct_ne_liste_que_le_dispositif_pas_les_articles_de_l_annexe() {
+        // STRUCT réelle de l'arrêté du 31 juillet 2026 (JORFTEXT000054750162) :
+        // six articles au dispositif, et une annexe qui renumérote de 1 à 3
+        // derrière son LIEN_SECTION_TA. Seuls les six sont ici.
+        let xml = r#"<TEXTELR>
+<META><META_SPEC><META_TEXTE_CHRONICLE><CID>JORFTEXT000054750162</CID></META_TEXTE_CHRONICLE></META_SPEC></META>
+<STRUCT>
+<LIEN_ART debut="2999-01-01" etat="" fin="2999-01-01" id="JORFARTI000054750167" num="1" origine="JORF"/>
+<LIEN_ART debut="2999-01-01" etat="" fin="2999-01-01" id="JORFARTI000054750172" num="6" origine="JORF"/>
+<LIEN_SECTION_TA cid="JORFSCTA000054750173" debut="2999-01-01" etat="" fin="2999-01-01" id="JORFSCTA000054750173" niv="1" url="/JORF/SCTA/00/00/54/75/01/JORFSCTA000054750173.xml">Annexe</LIEN_SECTION_TA>
+</STRUCT>
+</TEXTELR>"#;
+        let s = parse_jorf_struct(xml.as_bytes()).expect("struct");
+        assert_eq!(
+            s.articles
+                .iter()
+                .map(|a| a.num_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("1"), Some("6")]
         );
     }
 
@@ -407,7 +452,7 @@ mod tests {
 <STRUCT/>
 </TEXTELR>"#;
         let s = parse_jorf_struct(xml.as_bytes()).expect("struct");
-        assert!(s.article_ids.is_empty());
+        assert!(s.articles.is_empty());
     }
 
     #[test]

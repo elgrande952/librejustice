@@ -5,13 +5,15 @@
 //!
 //! PUR comme `lj-core` (aucune I/O, aucun client réseau) ; il dépend de `lj-core`
 //! (primitives texte partagées, modèle `Decision`, `error`, `schema`) et de
-//! `lj-dtos`. Tiré uniquement par `lj-ingest` et `lj-bench`.
+//! `lj-dtos`. Tiré par l'ingest et les bancs offline, jamais par le serveur.
 
 pub mod articles;
+pub mod case_link;
 pub mod chrono;
 pub mod compiled;
 pub mod data;
 pub mod domain;
+pub mod eponyme;
 pub mod extract;
 pub mod facets;
 pub mod formation;
@@ -24,5 +26,7 @@ pub mod kali;
 pub mod legi;
 pub mod link;
 pub mod parties;
+pub mod quantum;
 pub mod registry;
 pub mod scan;
+pub mod seat_link;

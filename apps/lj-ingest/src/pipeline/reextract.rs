@@ -15,6 +15,11 @@ use crate::config::Settings;
 /// Taille d'un lot écrit en une transaction (fetch `id = ANY`, DELETE+INSERT bulk).
 const BATCH: usize = 256;
 
+/// Page du keyset d'énumération, distincte de [`BATCH`] : sur `decisions` le coût
+/// d'une page tient à la borne, pas à sa taille (2,5 s en tête de 566 k lignes,
+/// que la limite soit 256 ou 20 000, mesuré le 25/08).
+const SCAN_PAGE: usize = 20_000;
+
 /// Ré-extrait les champs structurés depuis les payloads stockés.
 ///
 /// Pipeline concurrent : un seul scan construit la worklist des ids périmés,
@@ -23,11 +28,11 @@ const BATCH: usize = 256;
 /// Aucun ré-chunking ni ré-embedding.
 pub async fn reextract_fields(
     fields: Option<&[String]>,
-    overwrite: bool,
     dry_run: bool,
     full: bool,
     jurisdiction_types: Option<&[String]>,
     citing_ref_uid: Option<&str>,
+    text_query: Option<&str>,
     workers: Option<usize>,
 ) -> Result<()> {
     let settings = Settings::from_env()?;
@@ -47,7 +52,7 @@ pub async fn reextract_fields(
     // Worklist : un seul scan (`stale_decision_ids_for_reextract`). Modes scopés
     // (`--juridiction-type` / `--citing-ref-uid`) : on draine leur keyset pour bâtir
     // la même worklist, puis on parallélise pareil.
-    let ids = build_worklist(&pool, full, jurisdiction_types, citing_ref_uid).await?;
+    let ids = build_worklist(&pool, full, jurisdiction_types, citing_ref_uid, text_query).await?;
     let total = ids.len();
     tracing::info!(total, workers, "reextract : worklist construite");
     if ids.is_empty() {
@@ -97,7 +102,6 @@ pub async fn reextract_fields(
                 pool.clone(),
                 slice.to_vec(),
                 selected.clone(),
-                overwrite,
                 dry_run.then(|| diffs.clone()),
                 &processed,
                 &errors,
@@ -135,13 +139,13 @@ pub async fn reextract_fields(
     Ok(())
 }
 
-/// Agrégat du mode sonde (`--dry-run`) : ce qu'un `--overwrite` réécrirait.
+/// Agrégat du mode sonde (`--dry-run`) : ce que la passe réécrirait.
 #[derive(Default)]
 struct DiffReport {
     /// Champ colonne → (lignes divergentes, jusqu'à quatre exemples).
     columns: std::collections::BTreeMap<String, (i64, Vec<String>)>,
-    /// Couche satellite → items dont l'extracteur ne produit RIEN. Sans
-    /// `--overwrite` la couche existante survit ; avec, elle est purgée.
+    /// Couche satellite → items dont l'extracteur ne produit RIEN, donc que la
+    /// passe purgerait.
     satellites: std::collections::BTreeMap<&'static str, usize>,
 }
 
@@ -188,7 +192,7 @@ impl DiffReport {
                 divergent = count,
                 sur = total,
                 exemples = ?samples,
-                "dry-run : colonne que --overwrite réécrirait"
+                "dry-run : colonne que la passe réécrirait"
             );
         }
         let intactes: Vec<&str> = self
@@ -203,7 +207,7 @@ impl DiffReport {
                 layer,
                 extracteur_muet = muet,
                 sur = total,
-                "dry-run : couche satellite que --overwrite purgerait (sans lui, elle survit)"
+                "dry-run : couche satellite que la passe purgerait"
             );
         }
     }
@@ -217,6 +221,7 @@ async fn build_worklist(
     full: bool,
     jurisdiction_types: Option<&[String]>,
     citing_ref_uid: Option<&str>,
+    text_query: Option<&str>,
 ) -> Result<Vec<i64>> {
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
     conn.batch_execute("SET statement_timeout = 0").await?;
@@ -235,7 +240,12 @@ async fn build_worklist(
             let mut last_id = 0i64;
             loop {
                 let ids = repo
-                    .decision_ids_for_reextract_by_juridiction(last_id, BATCH as i64, jts)
+                    .decision_ids_for_reextract_by_juridiction(
+                        last_id,
+                        SCAN_PAGE as i64,
+                        jts,
+                        text_query,
+                    )
                     .await?;
                 let Some(&max) = ids.last() else { break };
                 last_id = max;
@@ -254,7 +264,6 @@ async fn worker_loop(
     pool: Pool,
     slice: Vec<i64>,
     selected: Vec<String>,
-    overwrite: bool,
     diffs: Option<Arc<Mutex<DiffReport>>>,
     processed: &AtomicUsize,
     errors: &AtomicUsize,
@@ -278,7 +287,7 @@ async fn worker_loop(
     let ctx = super::extract_ctx(&conn).await?;
 
     for batch in slice.chunks(BATCH) {
-        let rows: Vec<(i64, String, serde_json::Value, String)> =
+        let rows: Vec<(i64, String, serde_json::Value, String, Option<String>)> =
             repo.fetch_reextract_inputs_batch(batch).await?;
         if rows.is_empty() {
             continue;
@@ -289,9 +298,16 @@ async fn worker_loop(
         let extracted = tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             rows.into_par_iter()
-                .map(|(id, full_text, source_fields, source_uid)| {
-                    reextract_one(id, &full_text, &source_fields, &source_uid, ctx)
-                        .map(|fields| (id, fields))
+                .map(|(id, full_text, source_fields, source_uid, case_name)| {
+                    reextract_one(
+                        id,
+                        &full_text,
+                        &source_fields,
+                        &source_uid,
+                        case_name.as_deref(),
+                        ctx,
+                    )
+                    .map(|fields| (id, fields))
                 })
                 .collect::<Vec<Result<(i64, ExtractedFields)>>>()
         })
@@ -327,7 +343,7 @@ async fn worker_loop(
 
         conn.batch_execute("BEGIN").await?;
         let write = async {
-            repo.update_extracted_fields_bulk(&items, Some(&selected_refs), overwrite)
+            repo.update_extracted_fields_bulk(&items, Some(&selected_refs))
                 .await
                 // `anyhow::Error::new` préserve la chaîne `StoreError → DbError`
                 // (SQLSTATE + message).
@@ -366,24 +382,30 @@ fn reextract_one(
     full_text: &str,
     source_fields: &serde_json::Value,
     source_uid: &str,
+    case_name: Option<&str>,
     ctx: &super::ExtractCtx,
 ) -> Result<ExtractedFields> {
     let decision = Decision::from_source_fields(full_text, source_fields, source_uid);
-    let full = lj_ingest::extract::extracted_fields(
-        &decision,
-        &ctx.link,
-        &ctx.vocab,
-        &ctx.chrono,
-        &ctx.jur_labels,
-    )
-    .map_err(|e| anyhow!("extract id={decision_id}: {e}"))?;
+    let full = lj_ingest::extract::extracted_fields(&decision, &ctx.snapshots())
+        .map_err(|e| anyhow!("extract id={decision_id}: {e}"))?;
     // Même superposition qu'à l'ingest (`prepare::extract_write`).
-    Ok(
+    let mut fields =
         match lj_ingest::extract::prebuilt_from_source_fields(source_uid, source_fields) {
             Some(pre) => lj_ingest::extract::merge_prebuilt(pre, full),
             None => full,
-        },
-    )
+        };
+    // The stored name does not go back into `case_name`: `set_source_case_names`
+    // would rewrite it at rank `source`, above whoever elected it. It only feeds
+    // the title, which nothing else protects from a nameless recomposition.
+    if fields.case_name.is_none() && case_name.is_some() {
+        fields.search_title = lj_ingest::extract::compose_search_title(
+            &fields,
+            decision.jurisdiction_type.as_deref(),
+            &ctx.jur_labels,
+            case_name,
+        );
+    }
+    Ok(fields)
 }
 
 /// Normalise la liste de champs ré-extractibles.

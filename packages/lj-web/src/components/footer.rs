@@ -1,20 +1,39 @@
 use leptos::prelude::*;
+use leptos_router::hooks::use_location;
 
+const KO_FI: &str = "https://ko-fi.com/librejustice";
+
+/// Bascule sur la charnière `lg` du site (`top_bar`, `layout`), sans palier.
+/// Le repli s'équilibre sur la largeur : les espaces entre liens portent la
+/// coupe et la gouttière, et un lien insécable ne se coupe pas en son milieu.
 #[component]
 pub fn Footer() -> impl IntoView {
+    // Le signalement emporte la page d'où il part : depuis une décision, le
+    // formulaire s'ouvre avec sa cible déjà remplie.
+    let location = use_location();
+    let signaler = move || {
+        format!(
+            "/feedback?from={}",
+            chemin_en_query(&location.pathname.get())
+        )
+    };
+
     view! {
         <footer class="border-t border-[var(--color-rule)] bg-[var(--color-vellum)]">
-            <div class="mx-auto flex max-w-7xl flex-col gap-3 px-4 py-6 text-sm text-[var(--color-ink-muted)] sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-8 lg:px-8">
-                <nav class="flex flex-wrap gap-x-5 gap-y-2">
+            <div class="mx-auto flex max-w-7xl flex-col gap-4 px-4 py-6 text-sm text-[var(--color-ink-muted)] sm:px-6 lg:flex-row lg:items-center lg:justify-between lg:px-8 lg:py-8">
+                <nav class="text-balance leading-7 [word-spacing:1rem] [&>a]:whitespace-nowrap [&>a]:[word-spacing:normal]">
                     <a class="hover:text-[var(--color-ink)]" href="/sources">
                         "Données"
                     </a>
-                    <a class="hover:text-[var(--color-ink)]" href="/mentions-legales">
+                    " "
+                    <a class="hover:text-[var(--color-ink)]" href="/legal-notice">
                         "Mentions légales"
                     </a>
-                    <a class="hover:text-[var(--color-ink)]" href="/confidentialite">
+                    " "
+                    <a class="hover:text-[var(--color-ink)]" href="/privacy">
                         "Confidentialité"
                     </a>
+                    " "
                     <a
                         class="hover:text-[var(--color-ink)]"
                         href="https://github.com/librejustice/librejustice"
@@ -23,8 +42,21 @@ pub fn Footer() -> impl IntoView {
                     >
                         "Code source"
                     </a>
+                    " "
+                    <a
+                        class="hover:text-[var(--color-ink)]"
+                        href=KO_FI
+                        target="_blank"
+                        rel="noopener noreferrer"
+                    >
+                        "Soutenir"
+                    </a>
+                    " "
+                    <a class="hover:text-[var(--color-ink)]" href=signaler>
+                        "Signaler un problème"
+                    </a>
                 </nav>
-                <p class="hidden text-base sm:block">
+                <p class="hidden text-base lg:block">
                     <span
                         class="font-sans tracking-[0.02em] text-[var(--color-ink-muted)]"
                         style="font-variation-settings: 'wght' 300"
@@ -41,4 +73,17 @@ pub fn Footer() -> impl IntoView {
             </div>
         </footer>
     }
+}
+
+/// Échappe un chemin pour qu'il traverse une query sans la couper.
+fn chemin_en_query(chemin: &str) -> String {
+    chemin
+        .bytes()
+        .map(|octet| match octet {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (octet as char).to_string()
+            }
+            _ => format!("%{octet:02X}"),
+        })
+        .collect()
 }

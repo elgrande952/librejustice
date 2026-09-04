@@ -8,7 +8,7 @@ use lj_dtos::SimilarDecisionHit;
 use crate::components::decision_bar::{use_decision_bar, use_result_nav, ResultNavSeed};
 use crate::components::ui::{Badge, BadgeTone, Skeleton};
 use crate::helpers::{format_decision_jurisdiction, format_iso_date};
-use crate::pages::decision_page::labels::significance_badge;
+use crate::pages::decision_page::labels::publication_badge;
 use crate::seo::decision::first_sentence;
 
 /// Doublure d'une liste de voisins : la carte réelle de [`SimilarCard`] avec un
@@ -171,7 +171,7 @@ fn SimilarMeta(hit: SimilarDecisionHit) -> impl IntoView {
     // procédure ordinaire, pas de badge.
     let solution = hit.solution.clone();
     let procedure = hit.procedure.clone();
-    let pub_badge = significance_badge(&hit.publication_codes);
+    let pub_badge = publication_badge(&hit.publication_codes);
 
     if solution.is_none() && procedure.is_none() && pub_badge.is_none() {
         return ().into_any();

@@ -5,7 +5,7 @@
 -- par une API publique (BODACC, JOAFE) restent en proxy live ; les
 -- marchés publics entrent en table parce que la requête produit — liste
 -- unifiée BOAMP + profils d'acheteurs, dédupliquée inter-plateformes,
--- facettée — n'est servie par aucune API. Mesures (working note 2026-08-04) :
+-- facettée — n'est servie par aucune API. Mesures :
 -- stock actif 14 863 consultations France entière, flux ~200-300 k/an,
 -- ~1 Go/an tout compris — deux ordres de grandeur sous le scatter 0197
 -- (registre_annonce, 59 Go, droppée en 0139). Garde-fous : une colonne

@@ -25,6 +25,16 @@ const ESPECE_OVERFETCH_FACTOR: i64 = 3;
 /// Probes vchordrq de la jambe KNN pré-filtrée portée notable.
 const PRINCIPE_KNN_PROBES: u32 = 100;
 
+/// Plafond du bloc « citée par les analyses ». Mesuré : 1,5 citation entrante en
+/// moyenne sur 6 417 décisions citées, 66 pour la plus citée, une seule au-delà
+/// de 50. Le bloc tronque en silence, donc il tient au-dessus du maximum observé.
+const RENVOYANTS_LIMIT: i64 = 100;
+
+/// Page de tête du bloc « citée par ». Mesuré le 23/08 sur 258 372 décisions
+/// citées : une citante médiane, 31 au 99e centile, 8 074 pour la plus citée. Le
+/// total accompagne la liste, faute de facette où poursuivre la postérité.
+const CITANTES_LIMIT: i64 = 5;
+
 /// Codes de publication « portée notable » = MAJEURE ∪ IMPORTANTE.
 const NOTABLE_CODES: [&str; 8] = ["r", "A", "b", "l", "c", "B", "C+", "R"];
 
@@ -62,23 +72,26 @@ pub fn decision_paragraphs(decision: &Decision) -> Vec<String> {
 
 /// Plage globale `[start, end)` (codepoints sur `texte_integral_clean` =
 /// `decisions.full_text`) de chaque paragraphe rendu, alignée index-à-index sur
-/// [`decision_paragraphs`].
+/// `paragraphs`. Paragraphe introuvable ⇒ plage dégénérée `(cursor, cursor)`, à
+/// laquelle aucun span ne se rattache.
 ///
-/// Chaque paragraphe (ligne trimmée) est localisé via [`find_char`] depuis le
-/// curseur, sa plage couvre `[pos, pos + nb_codepoints)`. Introuvable ⇒ plage
-/// dégénérée `(cursor, cursor)`, à laquelle aucun span ne se rattache.
-fn paragraph_global_ranges(decision: &Decision) -> Vec<(usize, usize)> {
-    let text = &decision.texte_integral_clean;
-    let mut cursor = 0usize;
-    let mut ranges = Vec::new();
-    for paragraph in decision_paragraphs(decision) {
-        let plen = paragraph.chars().count();
-        match find_char(text, &paragraph, cursor) {
-            Some(idx) => {
-                cursor = idx + plen;
-                ranges.push((idx, idx + plen));
+/// Le curseur porte l'offset codepoint ET l'offset octet : seul l'écart depuis
+/// le curseur est recompté. Repartir de l'octet 0 à chaque paragraphe coûtait
+/// 6,7 s sur 227 k caractères et 3 000 lignes.
+fn paragraph_global_ranges(text: &str, paragraphs: &[String]) -> Vec<(usize, usize)> {
+    let mut char_cursor = 0usize;
+    let mut byte_cursor = 0usize;
+    let mut ranges = Vec::with_capacity(paragraphs.len());
+    for paragraph in paragraphs {
+        match text[byte_cursor..].find(paragraph.as_str()) {
+            Some(gap) => {
+                let start = char_cursor + text[byte_cursor..byte_cursor + gap].chars().count();
+                let end = start + paragraph.chars().count();
+                byte_cursor += gap + paragraph.len();
+                char_cursor = end;
+                ranges.push((start, end));
             }
-            None => ranges.push((cursor, cursor)),
+            None => ranges.push((char_cursor, char_cursor)),
         }
     }
     ranges
@@ -105,6 +118,8 @@ fn decision_source_meta(decision: &Decision) -> DecisionSourceXml {
 /// n'existe.
 pub fn sections_from_decision(
     decision: &Decision,
+    paragraphs: &[String],
+    ranges: &[(usize, usize)],
     citations: &[GlobalCitation],
 ) -> Option<Vec<DecisionSection>> {
     // (start_char, end_char, kind, label), trié par start_char.
@@ -140,14 +155,13 @@ pub fn sections_from_decision(
     let mut out_ranges: Vec<Vec<(usize, usize)>> = Vec::new();
     let mut seen_kinds: HashMap<String, usize> = HashMap::new();
 
-    let ranges = paragraph_global_ranges(decision);
-    for (paragraph, range) in decision_paragraphs(decision).into_iter().zip(ranges) {
+    for (paragraph, &range) in paragraphs.iter().zip(ranges) {
         let pos = range.0;
         let (kind, label) = section_for(pos);
 
         if let Some(last) = out.last_mut() {
             if last.kind == kind {
-                last.paragraphs.push(paragraph);
+                last.paragraphs.push(paragraph.clone());
                 out_ranges
                     .last_mut()
                     .expect("out_ranges aligné sur out")
@@ -167,7 +181,7 @@ pub fn sections_from_decision(
             kind: kind.to_string(),
             anchor,
             label,
-            paragraphs: vec![paragraph],
+            paragraphs: vec![paragraph.clone()],
             paragraph_spans: Vec::new(),
         });
         out_ranges.push(vec![range]);
@@ -305,32 +319,18 @@ fn spans_for_range(citations: &[GlobalCitation], pstart: usize, pend: usize) -> 
 /// Spans cliquables alignés sur [`decision_paragraphs`] (corps plat, sans
 /// sections autoritatives).
 fn flat_paragraph_spans(
-    decision: &Decision,
+    ranges: &[(usize, usize)],
     citations: &[GlobalCitation],
 ) -> Vec<Vec<CitationSpan>> {
-    let spans: Vec<Vec<CitationSpan>> = paragraph_global_ranges(decision)
-        .into_iter()
-        .map(|(pstart, pend)| spans_for_range(citations, pstart, pend))
+    let spans: Vec<Vec<CitationSpan>> = ranges
+        .iter()
+        .map(|&(pstart, pend)| spans_for_range(citations, pstart, pend))
         .collect();
     if spans.iter().any(|s| !s.is_empty()) {
         spans
     } else {
         Vec::new()
     }
-}
-
-/// Indice (en codepoints) de la première occurrence de `needle` dans `haystack`
-/// à partir de `from_char`.
-fn find_char(haystack: &str, needle: &str, from_char: usize) -> Option<usize> {
-    let byte_start = haystack
-        .char_indices()
-        .nth(from_char)
-        .map(|(b, _)| b)
-        .unwrap_or(haystack.len());
-    let slice = &haystack[byte_start..];
-    let byte_off = slice.find(needle)?;
-    let char_off = slice[..byte_off].chars().count();
-    Some(from_char + char_off)
 }
 
 /// Une référence brute lue de la DB : `(instrument, slug résolu, [(num affiché,
@@ -465,19 +465,20 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
               d.date_audience::text,
               d.jurisdiction_code,
               d.docket_numbers,
-              d.chamber_position,
+              d.seat,
               d.summary,
               d.ecli,
               ds.source,
-              d.chamber_uid,
               d.formation_uid,
               ariane.source_fields,
-              d.publication_uid,
               notes.files,
-              web.notes
+              web.notes,
+              ds.source_uid,
+              d.case_name,
+              d.seat_paths
             FROM decisions d
             LEFT JOIN LATERAL (
-                SELECT source_fields, source
+                SELECT source_fields, source, source_uid
                 FROM decision_sources
                 WHERE decision_id = d.id AND deleted_at IS NULL
                 ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC
@@ -528,16 +529,19 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
     let date_audience: Option<String> = row.get(11);
     let jurisdiction_code: Option<String> = row.get(12);
     let docket_numbers_raw: Option<Vec<String>> = row.get(13);
-    let chamber_position: Option<String> = row.get(14);
+    let seat_stored: Option<lj_core::chamber::Seat> = row
+        .get::<_, Option<tokio_postgres::types::Json<lj_core::chamber::Seat>>>(14)
+        .map(|j| j.0);
+    let seat_paths: Vec<String> = row.get::<_, Option<Vec<String>>>(24).unwrap_or_default();
     let summary: Option<String> = row.get(15);
     let ecli: Option<String> = row.get(16);
     let source: Option<String> = row.get(17);
-    let chamber_uid: Option<String> = row.get(18);
-    let formation_uid: Option<String> = row.get(19);
-    let ariane_bundle: Option<serde_json::Value> = row.get(20);
-    let publication_uid: Option<String> = row.get(21);
-    let judilibre_files: Option<serde_json::Value> = row.get(22);
-    let web_notes: Option<serde_json::Value> = row.get(23);
+    let formation_uid: Option<String> = row.get(18);
+    let ariane_bundle: Option<serde_json::Value> = row.get(19);
+    let judilibre_files: Option<serde_json::Value> = row.get(20);
+    let web_notes: Option<serde_json::Value> = row.get(21);
+    let source_uid: Option<String> = row.get(22);
+    let case_name: Option<String> = row.get(23);
 
     let jur_type = parse_jur_type(&jur_type_raw)?;
     let jurisdiction_name = jurisdiction_code
@@ -604,6 +608,15 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         )
         .await?;
 
+    // Le lien de citation porte la date de lecture : il sert la version que la
+    // décision appliquait. Sans elle, 5,1 % des liens rendent un texte que la cour
+    // n'a pas appliqué, l'article ayant reçu une version depuis, et sans le dire.
+    let cite_date = date_lecture.clone();
+    let article_href = |slug: &str, num_key: &str| match cite_date.as_deref() {
+        Some(d) => format!("/texte/{slug}/{num_key}/{d}"),
+        None => format!("/texte/{slug}/{num_key}"),
+    };
+
     let mut raw: Vec<RawCite> = span_rows
         .iter()
         .filter_map(|r| {
@@ -618,7 +631,7 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
             let slug = slug?;
             let num_key = num_key.filter(|k| !k.is_empty());
             let href = match num_key.as_deref() {
-                Some(k) => format!("/texte/{slug}/{k}"),
+                Some(k) => article_href(&slug, k),
                 None if readable => format!("/texte/{slug}"),
                 None => return None,
             };
@@ -695,10 +708,9 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
                 family
                     .iter()
                     .map(|nk| CitationTarget {
-                        href: Some(format!(
-                            "/texte/{}/{}",
-                            a.slug,
-                            lj_core::article_key::article_key(nk)
+                        href: Some(article_href(
+                            &a.slug,
+                            &lj_core::article_key::article_key(nk),
                         )),
                         label: format!("{nk} — {}", a.label),
                     })
@@ -760,7 +772,7 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         members.push(b.num_key.clone().expect("gardé par is_article_range"));
         let mut targets = vec![bound(&a)];
         targets.extend(inter.into_iter().map(|nk| CitationTarget {
-            href: Some(format!("/texte/{}/{nk}", a.slug)),
+            href: Some(article_href(&a.slug, &nk)),
             label: format!("{} — {}", lj_core::article_key::display(&nk), a.label),
         }));
         targets.push(bound(&b));
@@ -858,69 +870,35 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         )
         .await?;
 
-    let chrono_edges = if chrono_rows.len() >= 2 {
-        let ids: Vec<i64> = chrono_rows.iter().map(|r| r.get::<_, i64>(5)).collect();
-        conn.query(
+    let chain_ids: Vec<i64> = chrono_rows.iter().map(|r| r.get::<_, i64>(5)).collect();
+    let chrono_edges = conn
+        .query(
             "
-            SELECT s.public_id, t.public_id, dl.link_type
+            SELECT s.public_id, t.public_id, dl.target_ref, dl.link_type
             FROM decision_links dl
             JOIN decisions s ON s.id = dl.decision_id
-            JOIN decisions t ON t.id = dl.target_decision_id
-            WHERE dl.decision_id = ANY($1) AND dl.target_decision_id = ANY($1)
+            LEFT JOIN decisions t ON t.id = dl.target_decision_id
+            WHERE dl.decision_id = ANY($1)
+              AND (dl.target_decision_id = ANY($1) OR dl.target_decision_id IS NULL)
             ",
-            &[&ids],
+            &[&chain_ids],
         )
-        .await?
-    } else {
-        Vec::new()
+        .await?;
+
+    let (renvoyants, (citantes_total, citantes)) = {
+        let repo = lj_store::repository::DecisionRepository::new(&conn);
+        (
+            repo.renvoyants(decision_id, RENVOYANTS_LIMIT).await?,
+            repo.decisions_citing(decision_id, &chain_ids, CITANTES_LIMIT)
+                .await?,
+        )
     };
 
     // La connexion est rendue au pool avant le parse offloadé, qui ne touche plus
     // la DB.
     drop(conn);
 
-    let chronology: Vec<lj_dtos::ChronologyEntry> = if chrono_rows.len() >= 2 {
-        let edges: std::collections::HashMap<(String, String), String> = chrono_edges
-            .iter()
-            .map(|r| ((r.get(0), r.get(1)), r.get(2)))
-            .collect();
-        let mut entries: Vec<lj_dtos::ChronologyEntry> = chrono_rows
-            .iter()
-            .map(|r| {
-                let entry_id: String = r.get(0);
-                let code: Option<String> = r.get(1);
-                let jt: String = r.get(2);
-                let date: Option<String> = r.get(3);
-                let current: bool = r.get(4);
-                let solution_uid: Option<String> = r.get(6);
-                let label = code
-                    .as_deref()
-                    .and_then(|c| refs.jurisdiction(c))
-                    .map(|j| j.label.clone())
-                    .unwrap_or_else(|| {
-                        refs.jurisdiction_type_label(&jt).unwrap_or(&jt).to_string()
-                    });
-                lj_dtos::ChronologyEntry {
-                    id: entry_id,
-                    label,
-                    date,
-                    current,
-                    solution: solution_uid.as_deref().map(|u| refs.tag(u).key),
-                    docket_numbers: r.get(7),
-                    link: None,
-                }
-            })
-            .collect();
-        // Le lien porte du plus récent vers la décision qu'il attaque.
-        for i in 0..entries.len() - 1 {
-            entries[i].link = edges
-                .get(&(entries[i].id.clone(), entries[i + 1].id.clone()))
-                .cloned();
-        }
-        entries
-    } else {
-        Vec::new()
-    };
+    let chronology = chronology(&refs, &chrono_rows, &chrono_edges);
 
     // `source_fields` est un JSONB hétérogène par source : forme inattendue ⇒
     // champ vide, jamais d'erreur.
@@ -928,6 +906,40 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         Some(sf) => (project_themes(sf), project_nac(sf)),
         None => (Vec::new(), None),
     };
+
+    let official_url =
+        source
+            .as_deref()
+            .zip(source_uid.as_deref())
+            .and_then(|(source, source_uid)| {
+                let field = |path: [&str; 2]| {
+                    source_fields
+                        .as_ref()
+                        .and_then(|f| f.get(path[0]))
+                        .and_then(|f| f.get(path[1]))
+                        .and_then(serde_json::Value::as_str)
+                };
+                let top = |key: &str| {
+                    source_fields
+                        .as_ref()
+                        .and_then(|f| f.get(key))
+                        .and_then(serde_json::Value::as_str)
+                };
+                lj_core::official_url::official_url(&lj_core::official_url::SourceRef {
+                    source,
+                    source_uid,
+                    court_code: field(["Dossier", "Code_Juridiction"]),
+                    published_url: field(["META_JURI_CONSTIT", "URL_CC"])
+                        .or_else(|| top("fiche_url")),
+                    ariane_ref: top("decision_date").zip(
+                        source_fields
+                            .as_ref()
+                            .and_then(|f| f.get("numbers"))
+                            .and_then(|n| n.get(0))
+                            .and_then(serde_json::Value::as_str),
+                    ),
+                })
+            });
 
     // Reconstruction `(full_text, source_fields)` → `Decision` puis dérivation
     // paragraphes/sections : CPU-bloquant, donc offloadé sur `spawn_blocking`.
@@ -937,11 +949,13 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
             tokio::task::spawn_blocking(move || -> ParsedPayload {
                 let decision = Decision::from_source_fields(&full_text, &source_fields, &pid);
                 let mut paragraphs = decision_paragraphs(&decision);
-                let mut sections = sections_from_decision(&decision, &citations);
+                let ranges = paragraph_global_ranges(&decision.texte_integral_clean, &paragraphs);
+                let mut sections =
+                    sections_from_decision(&decision, &paragraphs, &ranges, &citations);
                 // Spans alignés sur le corps plat (repli front sans sections). Les offsets
                 // sont en codepoints sur le texte original, et truecase préserve la
                 // longueur en codepoints.
-                let flat_spans = flat_paragraph_spans(&decision, &citations);
+                let flat_spans = flat_paragraph_spans(&ranges, &citations);
                 // Décisions intégralement en MAJUSCULES : recasse déterministe pour
                 // l'affichage seulement, appliquée APRÈS l'assignation des sections, qui
                 // matche les paragraphes par offsets sur le texte source.
@@ -981,9 +995,10 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
             .unwrap_or(&jur_type_raw),
         jurisdiction_name.as_deref(),
     );
+    let chamber_label = seat_stored.as_ref().and_then(lj_core::chamber::Seat::label);
     let seat = crate::titles::decision_seat(
         &jur_display,
-        chamber_position.as_deref(),
+        chamber_label.as_deref(),
         formation_uid.as_deref(),
         office_uid.as_deref(),
     );
@@ -991,16 +1006,20 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         &jur_display,
         seat.as_deref(),
         date_lecture.as_deref(),
+        case_name.as_deref(),
         docket_numbers
             .as_deref()
             .and_then(|d| d.first())
             .map(String::as_str),
     );
 
+    let seat_path = crate::titles::seat_path_tag(&seat_paths);
+
     Ok(DecisionDetail {
         id,
         jurisdiction_type: jur_type,
         title,
+        case_name,
         paragraphs,
         paragraph_spans,
         sections,
@@ -1012,19 +1031,18 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
         procedure: opt_tag(&procedure_uid, &refs),
         office: opt_tag(&office_uid, &refs),
         legal_domain: opt_tag(&legal_domain_uid, &refs),
-        publication: opt_tag(&publication_uid, &refs),
         publication_codes,
         date_audience,
         docket_numbers,
         seat,
-        chamber: opt_tag(&chamber_uid, &refs),
-        formation: opt_tag(&formation_uid, &refs),
+        seat_path,
         legal_references,
         source_xml,
         themes,
         nac,
         ecli,
         source,
+        official_url,
         chronology,
         commentaires: {
             let mut c = ariane_bundle
@@ -1039,7 +1057,115 @@ pub async fn get_decision(state: &AppState, public_id: &str) -> Result<DecisionD
             }
             c
         },
+        renvoyants: renvoyants
+            .into_iter()
+            .map(|r| lj_dtos::Renvoyant {
+                id: r.public_id,
+                label: jurisdiction_label(
+                    &refs,
+                    r.jurisdiction_code.as_deref(),
+                    &r.jurisdiction_type,
+                ),
+                date: r.date_lecture,
+                docket_numbers: r.docket_numbers.filter(|d| !d.is_empty()),
+            })
+            .collect(),
+        citantes: citantes
+            .into_iter()
+            .map(|r| crate::legi::citing_dto(r, &refs))
+            .collect(),
+        citantes_total: (citantes_total > CITANTES_LIMIT).then_some(citantes_total),
     })
+}
+
+/// Case chronology, most recent first: the decisions of the chain (`rows`) and,
+/// for every link left pending, the step its key names without leading
+/// anywhere. A lone step is no chronology.
+fn chronology(
+    refs: &Referential,
+    rows: &[tokio_postgres::Row],
+    edges: &[tokio_postgres::Row],
+) -> Vec<lj_dtos::ChronologyEntry> {
+    // Ordering and edge key: `public_id` of a step held by the corpus,
+    // `target_ref` of a pending one.
+    let mut steps: Vec<(String, lj_dtos::ChronologyEntry)> = rows
+        .iter()
+        .map(|r| {
+            let public_id: String = r.get(0);
+            let code: Option<String> = r.get(1);
+            let jt: String = r.get(2);
+            let solution_uid: Option<String> = r.get(6);
+            (
+                public_id.clone(),
+                lj_dtos::ChronologyEntry {
+                    id: Some(public_id),
+                    label: jurisdiction_label(refs, code.as_deref(), &jt),
+                    date: r.get(3),
+                    current: r.get(4),
+                    solution: solution_uid.as_deref().map(|u| refs.tag(u).key),
+                    docket_numbers: r.get(7),
+                    link: None,
+                },
+            )
+        })
+        .collect();
+
+    let mut seen: HashSet<(String, Option<String>)> = steps
+        .iter()
+        .map(|(_, e)| (e.label.clone(), e.date.clone()))
+        .collect();
+    let mut links: HashMap<(String, String), String> = HashMap::new();
+    for row in edges {
+        let source: String = row.get(0);
+        let target: Option<String> = row.get(1);
+        let target_ref: String = row.get(2);
+        let link_type: String = row.get(3);
+        let Some(target) = target else {
+            let Some(step) = crate::chronology::pending_step(&target_ref, refs) else {
+                continue;
+            };
+            if seen.insert((step.label.clone(), Some(step.date.clone()))) {
+                steps.push((
+                    target_ref.clone(),
+                    lj_dtos::ChronologyEntry {
+                        id: None,
+                        label: step.label,
+                        date: Some(step.date),
+                        current: false,
+                        solution: None,
+                        docket_numbers: step.docket.map(|d| vec![d]),
+                        link: None,
+                    },
+                ));
+            }
+            links.insert((source, target_ref), link_type);
+            continue;
+        };
+        links.insert((source, target), link_type);
+    }
+
+    if steps.len() < 2 {
+        return Vec::new();
+    }
+    steps.sort_by(|a, b| b.1.date.cmp(&a.1.date).then_with(|| a.0.cmp(&b.0)));
+    // A link reads from the more recent step to the decision it attacks.
+    for i in 0..steps.len() - 1 {
+        steps[i].1.link = links
+            .get(&(steps[i].0.clone(), steps[i + 1].0.clone()))
+            .cloned();
+    }
+    steps.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Nom de la cour, repli sur le libellé du type de juridiction.
+fn jurisdiction_label(refs: &Referential, code: Option<&str>, jur_type: &str) -> String {
+    code.and_then(|c| refs.jurisdiction(c))
+        .map(|j| j.label.clone())
+        .unwrap_or_else(|| {
+            refs.jurisdiction_type_label(jur_type)
+                .unwrap_or(jur_type)
+                .to_string()
+        })
 }
 
 /// Commentaires doctrine web (`source_fields.commentaires[]` des fournisseurs
@@ -1191,7 +1317,7 @@ pub async fn decision_preview(state: &AppState, public_id: &str) -> Result<Decis
               d.procedure_uid,
               d.publication_codes,
               d.summary,
-              d.chamber_position,
+              d.seat,
               d.formation_uid,
               d.office_uid
             FROM decisions d
@@ -1211,7 +1337,9 @@ pub async fn decision_preview(state: &AppState, public_id: &str) -> Result<Decis
     let procedure_uid: Option<String> = row.get(6);
     let publication_codes: Vec<String> = row.get(7);
     let summary: Option<String> = row.get(8);
-    let chamber_position: Option<String> = row.get(9);
+    let seat_stored: Option<lj_core::chamber::Seat> = row
+        .get::<_, Option<tokio_postgres::types::Json<lj_core::chamber::Seat>>>(9)
+        .map(|j| j.0);
     let formation_uid: Option<String> = row.get(10);
     let office_uid: Option<String> = row.get(11);
 
@@ -1225,9 +1353,10 @@ pub async fn decision_preview(state: &AppState, public_id: &str) -> Result<Decis
             .unwrap_or(&jur_type_raw),
         jurisdiction_name.as_deref(),
     );
+    let chamber_label = seat_stored.as_ref().and_then(lj_core::chamber::Seat::label);
     let seat = crate::titles::decision_seat(
         &jur_display,
-        chamber_position.as_deref(),
+        chamber_label.as_deref(),
         formation_uid.as_deref(),
         office_uid.as_deref(),
     );
@@ -1235,6 +1364,7 @@ pub async fn decision_preview(state: &AppState, public_id: &str) -> Result<Decis
         &jur_display,
         seat.as_deref(),
         date_lecture.as_deref(),
+        None,
         docket_numbers
             .as_deref()
             .and_then(|d| d.first())
@@ -1565,6 +1695,10 @@ async fn graph_legs(state: &AppState, source_id: i64, limit: usize) -> Result<Gr
     // Articles rares partagés : termes article de la source (`text_uid|num_key`),
     // gardés sous le cap de rareté, inversés par le GIN `legal_citation_terms_idx`
     // vers les décisions notables, score Σ ln(N/df) avec N = estimation planner.
+    // Codes inlinés, jamais liés : `idx_decisions_notable` est partiel, et d'un
+    // paramètre le planificateur ne prouve pas l'implication sur un plan
+    // générique. Mesuré : 607 ms littéral contre 1 541 ms lié.
+    let notable_sql = NOTABLE_CODES.map(|code| format!("'{code}'")).join(", ");
     let idf_query = format!(
         "
         WITH terms AS (
@@ -1584,7 +1718,7 @@ async fn graph_legs(state: &AppState, source_id: i64, limit: usize) -> Result<Gr
         FROM rare r
         JOIN legal_citation lc2 ON public.lj_cit_terms(lc2.spans) @> ARRAY[r.t]
         JOIN decisions d2 ON d2.id = lc2.decision_id
-        WHERE d2.publication_codes && $2
+        WHERE d2.publication_codes && ARRAY[{notable_sql}]::text[]
           AND lc2.decision_id <> $1
         GROUP BY lc2.decision_id
         ORDER BY sum(ln(
@@ -1593,12 +1727,10 @@ async fn graph_legs(state: &AppState, source_id: i64, limit: usize) -> Result<Gr
                      / r.decision_count::float8
                  )) DESC,
                  lc2.decision_id
-        LIMIT $3
+        LIMIT $2
         ",
     );
-    let idf_rows = conn
-        .query(&idf_query, &[&source_id, &notable, &limit])
-        .await?;
+    let idf_rows = conn.query(&idf_query, &[&source_id, &limit]).await?;
 
     let chrono_rows = conn
         .query(
@@ -1841,14 +1973,17 @@ mod tests {
     }
 
     #[test]
-    fn find_char_indexes_in_codepoints() {
-        let text = "café au lait, motivations: rejet";
-        let pos = find_char(text, "motivations", 0).unwrap();
-        assert_eq!(
-            text.chars().skip(pos).take(11).collect::<String>(),
-            "motivations"
-        );
-        assert!(find_char(text, "café", 5).is_none());
+    fn paragraph_ranges_are_codepoints_and_never_rewind() {
+        let clean = "Considérant café au lait\nRejet\nÀ nouveau é\nRejet";
+        let decision = mk_decision(clean, Vec::new());
+        let paragraphs = decision_paragraphs(&decision);
+        let ranges = paragraph_global_ranges(&decision.texte_integral_clean, &paragraphs);
+        assert_eq!(ranges.len(), 4);
+        for (paragraph, &(start, end)) in paragraphs.iter().zip(&ranges) {
+            let cut: String = clean.chars().skip(start).take(end - start).collect();
+            assert_eq!(&cut, paragraph);
+        }
+        assert_ne!(ranges[1], ranges[3], "le second Rejet a sa propre plage");
     }
 
     #[test]
@@ -1968,7 +2103,10 @@ mod tests {
         let g_end = n_p0;
 
         let decision = mk_decision(clean, Vec::new());
-        let ranges = paragraph_global_ranges(&decision);
+        let ranges = paragraph_global_ranges(
+            &decision.texte_integral_clean,
+            &decision_paragraphs(&decision),
+        );
         assert_eq!(ranges.len(), 2);
         let (p0s, p0e) = ranges[0];
         assert_eq!((p0s, p0e), (0, n_p0));

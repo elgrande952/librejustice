@@ -55,6 +55,17 @@ impl EmbeddingCache {
     pub async fn set(&self, key: &str, vector: Arc<Array1<f32>>) {
         self.inner.insert(key.to_string(), vector).await;
     }
+
+    /// Occupation `(entrées, poids, plafond)` pour la métrique. Les deux premiers
+    /// ne sont exacts qu'après `run_pending_tasks`.
+    pub async fn usage(&self) -> (u64, u64, Option<u64>) {
+        self.inner.run_pending_tasks().await;
+        (
+            self.inner.entry_count(),
+            self.inner.weighted_size(),
+            self.inner.policy().max_capacity(),
+        )
+    }
 }
 
 impl Default for EmbeddingCache {

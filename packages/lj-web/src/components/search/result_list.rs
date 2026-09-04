@@ -4,15 +4,15 @@ use leptos::prelude::*;
 use lj_dtos::SearchHit;
 
 use super::result_card::ResultCard;
+use super::view_prefs::CardView;
 
 #[component]
 pub fn ResultList(
     hits: Vec<SearchHit>,
     all_hit_ids: Vec<String>,
     page: u32,
-    total: i64,
     page_size: u32,
-    auto_load_summary: bool,
+    #[prop(into)] default_view: Signal<CardView>,
     animate: bool,
 ) -> impl IntoView {
     let all_hit_ids = std::sync::Arc::new(all_hit_ids);
@@ -29,10 +29,9 @@ pub fn ResultList(
                         hit=hit
                         index=index
                         page=page
-                        total=total
                         page_size=page_size
                         hit_ids=all_hit_ids.clone()
-                        auto_load_summary=auto_load_summary
+                        default_view=default_view
                         animate=animate
                     />
                 </li>

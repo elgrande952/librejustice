@@ -27,6 +27,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::{use_navigate, use_query_map};
 
 use self::ai_mode::use_ai_mode;
+use super::query_length::{truncate_to_cap, QueryLengthNotice};
 use super::search_submit::{SearchSubmit, SubmitSize};
 use super::suggest_box::{SuggestController, SuggestPanel};
 
@@ -50,12 +51,13 @@ pub fn CompactSearch() -> impl IntoView {
     let query = use_context::<DraftQuery>()
         .map(|d| d.0)
         .unwrap_or_else(|| RwSignal::new(initial));
-    let (ai_mode, set_ai_mode) = use_ai_mode();
-    // Corpus actif par la route (`/textes` vs `/decisions`) : le mode IA
-    // (reclassement LLM) n'existe que pour les décisions — toggle masqué et
-    // jamais soumis côté textes ; le placeholder suit.
+    // Le reclassement se règle sur la page de résultats ; la barre ne fait que
+    // reconduire le choix courant dans l'URL qu'elle soumet.
+    let (ai_mode, _) = use_ai_mode();
+    // Corpus actif par la route : le reclassement n'existe que pour les
+    // décisions, donc n'est jamais soumis côté textes ; le placeholder suit.
     let corpus = Signal::derive(query_state::corpus);
-    let show_ai = Signal::derive(move || corpus.get() == query_state::Corpus::Decisions);
+    let submits_ai = Signal::derive(move || corpus.get() == query_state::Corpus::Decisions);
     // Autocomplétion : le mode suit le corpus de la route, vide pour celui qui n'a
     // pas d'index de suggestions.
     let suggest_mode = Signal::derive(move || corpus.get().suggest_mode());
@@ -74,17 +76,14 @@ pub fn CompactSearch() -> impl IntoView {
 
     let submit_nav = navigate.clone();
     let submit = move || {
-        let trimmed = query.get_untracked().trim().to_string();
-        // Vider la barre est une soumission valable là où l'état sans requête
-        // est un résultat (le pot d'annonces) : c'est le seul geste qui retire
+        // Vider la barre est une soumission valable sur les trois moteurs : sans
+        // question, ils listent le fonds filtré. C'est le seul geste qui retire
         // `q` quand la croix a déjà disparu avec le dernier caractère.
-        if trimmed.is_empty() && !corpus.get_untracked().accepts_empty_query() {
-            return;
-        }
+        let trimmed = truncate_to_cap(query.get_untracked().trim());
         let qs = query_state::with_query(
             &query_map.get_untracked(),
             &trimmed,
-            show_ai.get_untracked().then(|| ai_mode.get_untracked()),
+            submits_ai.get_untracked().then(|| ai_mode.get_untracked()),
         );
         submit_nav(&query_state::search_href(&qs), Default::default());
     };
@@ -109,7 +108,8 @@ pub fn CompactSearch() -> impl IntoView {
     };
 
     view! {
-        <form on:submit=on_submit class="flex w-full items-center gap-2">
+        <form on:submit=on_submit class="flex w-full flex-col gap-1.5">
+            <div class="flex w-full items-center gap-2">
             <div class="group relative flex h-11 w-full min-w-0 flex-1 items-center gap-2 rounded-md border border-[var(--color-rule)] bg-[var(--color-parchment)] px-3 transition-colors has-[:focus-visible]:border-[var(--color-ink)]">
                 <span class="text-[var(--color-ink-subtle)]" aria-hidden="true">
                     <SearchIcon />
@@ -141,12 +141,9 @@ pub fn CompactSearch() -> impl IntoView {
                     </span>
                 </Show>
             </div>
-            <SearchSubmit
-                ai_mode=ai_mode
-                on_toggle=set_ai_mode
-                size=SubmitSize::Md
-                show_ai=show_ai
-            />
+            <SearchSubmit size=SubmitSize::Md />
+            </div>
+            <QueryLengthNotice query=query.into() />
         </form>
     }
 }

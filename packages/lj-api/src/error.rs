@@ -20,8 +20,19 @@ pub enum ApiError {
     Unprocessable(Value),
     #[error("not found")]
     NotFound,
+    /// Article présent au référentiel, aucune version ne couvrant la date → 404
+    /// portant le motif. Distinct de [`Self::NotFound`], qui dit « rien sous ce
+    /// numéro » : sans ce troisième état, un article abrogé se lit comme un
+    /// article inexistant.
+    #[error("{0}")]
+    NoVersionAtDate(String),
     #[error("unauthorized")]
     Unauthorized,
+    /// Cookie de session présenté et **refusé** (inconnu, expiré, révoqué) → 401 +
+    /// effacement du cookie. Distinct d'`Unauthorized`, qui dit « aucune preuve
+    /// fournie » : sans ce troisième état, un refus de session est muet.
+    #[error("session refusée")]
+    SessionRejected,
     /// Service indisponible (ex. client résumé non instancié) → 503.
     #[error("unavailable: {0}")]
     Unavailable(String),
@@ -130,8 +141,8 @@ impl ApiError {
         match self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError::NotFound => StatusCode::NOT_FOUND,
-            ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::NotFound | ApiError::NoVersionAtDate(_) => StatusCode::NOT_FOUND,
+            ApiError::Unauthorized | ApiError::SessionRejected => StatusCode::UNAUTHORIZED,
             ApiError::Unavailable(_) | ApiError::DbBusy(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
@@ -162,7 +173,9 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(msg) => json!(msg),
             ApiError::Unprocessable(obj) => json!([obj.clone()]),
             ApiError::NotFound => json!("not_found"),
+            ApiError::NoVersionAtDate(msg) => json!(msg),
             ApiError::Unauthorized => json!("auth_required"),
+            ApiError::SessionRejected => json!("session_rejected"),
             ApiError::Unavailable(msg) => json!(msg),
             ApiError::BadGateway(msg) => json!(msg),
             ApiError::DbBusy(_) => json!("database_busy"),
@@ -205,6 +218,16 @@ impl IntoResponse for ApiError {
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static(RATE_LIMIT_RETRY_AFTER_SECS),
             );
+        }
+        // Pas de `warn!` ici : le refus est journalisé par l'extracteur, une seule
+        // fois par requête et sur toutes les routes, pas seulement celles qui
+        // exigent une identité.
+        if matches!(self, ApiError::SessionRejected) {
+            for effacement in crate::session::clear_cookies() {
+                if let Ok(v) = axum::http::HeaderValue::from_str(&effacement) {
+                    resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+                }
+            }
         }
         if let Some(kind) = pg_kind {
             resp.extensions_mut().insert(kind);

@@ -4,10 +4,19 @@ experimental = true
 [env]
 _.file = [".env", ".env.admin", ".env.local"]
 
+# L'environnement de déploiement est décidé par le lanceur : `deploy-from-tree`
+# exporte prod, le conteneur cron impose prod, `beta.sh` impose beta. Ici, le
+# repli de tout lancement à la main. Pas dans `.env`, qui est injecté tel quel
+# dans les conteneurs : ce serait y poser dev pour le faire écraser ensuite.
+LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT = "dev"
+LIBREJUSTICE_DEPLOYMENT_ENVIRONMENT = "dev"
+
 # La toolchain Rust est pinnée par `rust-toolchain.toml`, via rustup. Ce qui
 # suit est de l'outillage ops/dev : node pour `npx`, uv pour podman-compose
 # (le `podman compose` intégré ne gère pas `--profile`), prek pour l'hygiène de
-# fichiers, usage pour les flags de task.
+# fichiers, usage pour les flags de task, age pour chiffrer les sauvegardes et
+# les relire (le backend aqua fournit `age` ET `age-keygen`, contrairement à ubi ;
+# pin majeur parce que le format de fichier est stable en v1).
 #
 # `hurl` vient du paquet de la distribution, pas d'ici : le tarball amont est
 # lié à `libxml2.so.2`, soname qu'Ubuntu ne fournit plus.
@@ -16,6 +25,7 @@ node = "24"
 uv = "latest"
 prek = "latest"
 usage = "latest"
+age = "1"
 
 [tasks.lint]
 description = "Linters Rust (rustfmt --check + clippy -D warnings)"
@@ -29,9 +39,12 @@ description = "Tous les tests du workspace SANS le lint (cargo test, sans DB) : 
 run = "cargo test --workspace"
 
 [tasks.test]
-description = "Lint Rust + tous les tests du workspace"
+description = "Lint Rust + tous les tests du workspace + le serveur MCP local"
 depends = ["lint"]
-run = "cargo test --workspace"
+run = """
+cargo test --workspace
+uv run pytest mcp -q
+"""
 
 [tasks.ensure-pg]
 description = "Prépare l'état Postgres de state_dir : propriétaire de pgdata (uid 999 rootless) et conf montée en /etc/postgresql."
@@ -42,15 +55,7 @@ mkdir -p "$LIBREJUSTICE_STATE_DIR/pgdata"
 # tout premier démarrage. Idempotent (no-op une fois la base initialisée).
 podman unshare chown 999:999 "$LIBREJUSTICE_STATE_DIR/pgdata"
 
-# La conf montée vit dans state_dir comme pgdata : le compose ne porte qu'un
-# chemin, et le choix du dossier source se fait ici. Une machine qui a son
-# propre profil matériel le pose dans `sysadmin/pg-conf` ; sinon c'est la conf
-# générique. Le dimensionnement n'est pas interchangeable, d'où la trace en
-# sortie.
-pgconf=infra/pg-conf
-if [ -d sysadmin/pg-conf ]; then
-  pgconf=sysadmin/pg-conf
-fi
+pgconf="${LIBREJUSTICE_PG_CONF_DIR:-infra/pg-conf}"
 mkdir -p "$LIBREJUSTICE_STATE_DIR/pg-conf"
 cp -f "$pgconf/postgresql.conf" "$pgconf/pg_hba.conf" "$LIBREJUSTICE_STATE_DIR/pg-conf/"
 echo "conf postgres : $pgconf -> $LIBREJUSTICE_STATE_DIR/pg-conf (relire exige un restart du conteneur)"
@@ -68,7 +73,7 @@ podman compose -f infra/docker-compose.yml up -d --no-recreate postgres
 # `LIBREJUSTICE_DB_URL` : aucun Postgres local requis.
 [tasks.dev]
 description = "lj-server fusionné (API + MCP + SSR Leptos, :3000) via cargo-leptos watch ; DB = LIBREJUSTICE_DB_URL (.env → prod)"
-env = { LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT = "dev" }
+env = { LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT = "dev", LIBREJUSTICE_API_PUBLIC_BASE_URL = "http://localhost:3000" }
 depends = ["build-skill-zips"]
 run = "cargo leptos watch --project librejustice-dev"
 
@@ -143,32 +148,14 @@ cargo leptos build --release --project librejustice \
   --bin-cargo-args="-p" --bin-cargo-args="lj-ingest" \
   --bin-cargo-args="--bin" --bin-cargo-args="lj-ingest" \
   --bin-cargo-args="--locked"
-# Versionnement des snippets wasm-bindgen. cargo-leptos les exclut de son
-# hachage : leur chemin est la clé d'import que le binaire wasm déclare, donc on
-# ne peut pas les renommer sans patcher le wasm. Ce chemin dérive de l'identité
-# du crate et pas du contenu — il ne bouge jamais, alors que le contenu change,
-# et `/pkg` est servi `immutable` un an.
-# Le glue distingue deux occurrences par module : le spécificateur d'`import`
-# (l'URL que le navigateur va chercher) et la clé de l'objet d'imports (que le
-# wasm doit matcher octet pour octet). On ne versionne QUE la première.
-pkg=target/site/pkg
-glue=$(ls "$pkg"/lj-web.*.js)
-snip_hash=$(find "$pkg/snippets" -type f -print0 | LC_ALL=C sort -z | xargs -0 cat | md5sum | cut -c1-12)
-rewritten=$(perl -0777 -pi -e \
-  'our $n = 0; $n += s{from"(\\./snippets/[^"?]+\\.js)"}{from"$1?v='"$snip_hash"'"}g; END { print STDERR "$n\\n" }' \
-  "$glue" 2>&1 >/dev/null)
-if [ "${rewritten:-0}" -eq 0 ]; then
-  echo "build-app: aucun import de snippet versionné — le glue a changé de forme, snippets servis immutable sous une URL figée" >&2
+# Un snippet wasm-bindgen n'est pas renommable — son chemin est la clé d'import
+# que le binaire wasm déclare, et cargo-leptos l'exclut de son hachage —, alors
+# que `/pkg` est servi `immutable` un an. On refuse plutôt que de figer l'URL
+# d'un contenu qui change.
+if [ -d target/site/pkg/snippets ]; then
+  echo "build-app: le bundle porte des snippets wasm-bindgen — ils seraient servis immutable sous une URL figée, à versionner avant de livrer" >&2
   exit 1
 fi
-# Le glue vient d'être modifié : son nom content-hashé ne correspond plus. On
-# recalcule l'empreinte comme cargo-leptos (MD5 → base64url non paddé,
-# `compile/hash.rs`) et on réaligne `hash.txt`, que le SSR lit pour référencer
-# le bundle.
-new_hash=$(md5sum "$glue" | cut -d' ' -f1 | xxd -r -p | base64 | tr '+/' '-_' | tr -d '=')
-mv "$glue" "$pkg/lj-web.${new_hash}.js"
-sed -i "s|^js: .*|js: ${new_hash}|" target/release/hash.txt
-echo "build-app: $rewritten imports de snippets versionnés (v=$snip_hash), glue rehashé en $new_hash"
 mise run precompress
 # Le HTML SSR référence les noms de `hash.txt` : s'ils ne sont pas dans le
 # bundle, `/pkg` répond 404 et l'hydratation meurt en silence sur tout le site.
@@ -180,6 +167,9 @@ while read -r kind hash; do
     exit 1
   fi
 done < target/release/hash.txt
+# Signe l'arbre bâti : la beta et le deploy lisent cette trace pour savoir si
+# l'artefact du worktree est celui de leur arbre.
+git rev-parse "HEAD^{tree}" > target/release/arbre-construit
 """
 
 # Purge le cache CDN de la zone. Appelée en fin de deploy, et lançable seule en
@@ -243,8 +233,10 @@ run = "hurl --variable api_url=$LIBREJUSTICE_STAGING_API_BASE_URL tests/smoke/*.
 
 # Contrats HTTP : une seule commande, aucun secret, des fichiers autosuffisants
 # (les ids réels sont capturés d'une recherche live). Ils exigent un serveur et
-# un corpus ingéré, donc rien ne peut les jouer automatiquement : à lancer après
-# chaque deploy, sans quoi la suite dérive en silence.
+# un corpus ingéré, donc ils ne se jouent que contre une cible déployée. Le
+# sous-ensemble déterministe part tout seul en fin de deploy (`contract-deploy`)
+# ; la suite complète, qui touche le classement et met une minute, reste à
+# lancer à la main après chaque deploy.
 #
 # `mcp.hurl` est à part : il encode le contrat MCP non authentifié, donc il ne
 # se joue que contre un serveur local — la prod exige OAuth et répond 401.
@@ -252,72 +244,80 @@ run = "hurl --variable api_url=$LIBREJUSTICE_STAGING_API_BASE_URL tests/smoke/*.
 description = "Contrats HTTP publics contre une cible (défaut prod), sans secret"
 run = """
 hurl --variable base=${LIBREJUSTICE_CONTRACT_BASE_URL:-https://librejustice.fr} \
+  -H "x-lj-origin: ${LIBREJUSTICE_API_INTERNAL_ORIGIN_TOKEN:-}" \
   tests/contract/health.hurl \
   tests/contract/decisions.hurl \
   tests/contract/search.hurl \
   tests/contract/search-textes.hurl \
   tests/contract/texte-compare.hurl \
   tests/contract/texte-contexte.hurl \
+  tests/contract/resolution.hurl \
   tests/contract/entities.hurl \
   tests/contract/annonces.hurl \
   tests/contract/oauth.hurl \
   tests/contract/me.hurl \
+  tests/contract/auth.hurl \
+  tests/contract/api-publique.hurl \
   tests/contract/security-headers.hurl \
+  tests/contract/front-build.hurl \
   --test
+"""
+
+# Joué automatiquement en fin de `deploy-prod`, d'où le tri : seuls entrent ici
+# les contrats dont le verdict ne dépend ni d'un classement, ni d'un corpus du
+# jour, ni d'un amont tiers — sans quoi un rouge intermittent apprend à ignorer
+# le rouge. Une dizaine de secondes en tout, jeton MCP compris.
+[tasks.contract-deploy]
+description = "Sous-ensemble déterministe, joué à chaque deploy (santé, bundle, résolution, chemin authentifié)"
+run = """
+set -eu
+hurl --variable base=${LIBREJUSTICE_CONTRACT_BASE_URL:-https://librejustice.fr} \
+  -H "x-lj-origin: ${LIBREJUSTICE_API_INTERNAL_ORIGIN_TOKEN:-}" \
+  tests/contract/health.hurl \
+  tests/contract/front-build.hurl \
+  tests/contract/resolution.hurl \
+  --test
+mise run contract-authed
 """
 
 [tasks.contract-mcp]
 description = "Contrat MCP non authentifié — serveur local uniquement (prod = OAuth, 401)"
-run = "hurl --variable base=${LIBREJUSTICE_CONTRACT_BASE_URL:-http://localhost:3000} tests/contract/mcp.hurl --test"
+run = "hurl --variable base=${LIBREJUSTICE_CONTRACT_BASE_URL:-http://localhost:3000} -H \"x-lj-origin: ${LIBREJUSTICE_API_INTERNAL_ORIGIN_TOKEN:-}\" tests/contract/mcp.hurl --test"
 
-# Le seul contrôle automatique qui présente un jeton valide. `contract` est sans
-# secret par construction, donc elle ne teste que le refus : son « bogus
-# bearer » attend un 401 et reste vert même si le serveur refuse tous les jetons
-# valides. À jouer après chaque deploy, avec `contract`.
+# Le seul contrôle automatique qui présente une identité valide. `contract` est
+# sans secret par construction, donc elle ne teste que le refus : son « bogus
+# bearer » attend un 401 et reste vert même si le serveur refuse toutes les
+# identités valides. À jouer après chaque deploy, avec `contract`.
 #
-# Provisionne un compte Supabase jetable, en fait un JWT par grant `password`,
-# déroule web + OAuth MCP + refresh, puis supprime le compte — le `trap` s'en
-# charge même si hurl échoue, sinon chaque échec laisserait un compte derrière.
-# Le JWT passe par un fichier de variables en 0600 et non par la ligne de
-# commande, qui est lisible dans `ps`.
+# Ne provisionne rien : le compte utilisé est celui qu'un agent prend pour être
+# connecté à l'app, il existe déjà et survit au run — aucun vrai compte emprunté.
+#
+# Cible en https obligatoire, le cookie étant `Secure` : la prod, pas la beta,
+# servie en clair.
+#
+# Les identifiants passent par un fichier de variables en 0600 et non par la
+# ligne de commande, qui est lisible dans `ps`.
 [tasks.contract-authed]
-description = "Chemin authentifié de bout en bout (web + MCP + refresh), compte jetable"
+description = "Chemin authentifié de bout en bout (session cookie + MCP + refresh)"
 run = """
 set -eu
 base="${LIBREJUSTICE_CONTRACT_BASE_URL:-https://librejustice.fr}"
-sb="${LIBREJUSTICE_VITE_SUPABASE_URL%/}"
-key="$LIBREJUSTICE_API_SUPABASE_SECRET_KEY"
-adm="$sb/auth/v1/admin/users"
+: "${LIBREJUSTICE_TEST_ACCOUNT_EMAIL:?absent : compte de test de l'app, à mettre dans .env.admin}"
+: "${LIBREJUSTICE_TEST_ACCOUNT_PASSWORD:?absent : mot de passe du compte de test, à mettre dans .env.admin}"
+: "${LIBREJUSTICE_TEST_ACCOUNT_API_KEY:?absent : clé ljk_ du compte de test, à mettre dans .env.admin}"
 
-# Sans majuscules : Supabase normalise l'adresse en minuscules, et la sonde
-# compare le profil rendu à l'adresse demandée.
-email="contract-probe-$(date -u +%Y%m%d-%H%M%S)@librejustice.fr"
-pass="Aa1!$(head -c 24 /dev/urandom | base64 | tr -d '/+=')"
+case "$base" in
+https://*) ;;
+*) echo "contract-authed: $base n'est pas en https, un cookie Secure n'y repartirait pas" >&2
+   exit 1 ;;
+esac
+
 tmp="$(mktemp -d)"
-sub=""
-
-cleanup() {
-  if [ -n "$sub" ]; then
-    curl -sS -o /dev/null -X DELETE -H "apikey: $key" -H "Authorization: Bearer $key" "$adm/$sub" \\
-      && echo "contract-authed: compte jetable supprimé" \\
-      || echo "contract-authed: ⚠️ suppression du compte $sub ÉCHOUÉE, à retirer à la main" >&2
-  fi
-  rm -rf "$tmp"
-}
-trap cleanup EXIT
-
-# `email_confirm` à true : on teste le chemin authentifié, pas la délivrabilité
-# du mail de confirmation — et ça évite d'envoyer un mail à chaque run.
-sub=$(curl -sS -X POST -H "apikey: $key" -H "Authorization: Bearer $key" \\
-  -H 'Content-Type: application/json' \\
-  -d "{\\"email\\":\\"$email\\",\\"password\\":\\"$pass\\",\\"email_confirm\\":true}" \\
-  "$adm" | jq -er '.id')
-
-jwt=$(curl -sS -X POST -H "apikey: $key" -H 'Content-Type: application/json' \\
-  -d "{\\"email\\":\\"$email\\",\\"password\\":\\"$pass\\"}" \\
-  "$sb/auth/v1/token?grant_type=password" | jq -er '.access_token')
+trap 'rm -rf "$tmp"' EXIT
 
 umask 077
-printf 'base=%s\\ntoken=%s\\nemail=%s\\n' "$base" "$jwt" "$email" > "$tmp/vars"
-hurl --variables-file "$tmp/vars" tests/contract/authed.hurl --test
+printf 'base=%s\\nemail=%s\\npassword=%s\\napi_key=%s\\n' \\
+  "$base" "$LIBREJUSTICE_TEST_ACCOUNT_EMAIL" "$LIBREJUSTICE_TEST_ACCOUNT_PASSWORD" \\
+  "$LIBREJUSTICE_TEST_ACCOUNT_API_KEY" > "$tmp/vars"
+hurl --variables-file "$tmp/vars" -H "x-lj-origin: ${LIBREJUSTICE_API_INTERNAL_ORIGIN_TOKEN:-}" tests/contract/authed.hurl --test
 """

@@ -1,11 +1,11 @@
 # ============================================================================
 # CONTRACT TESTS — route group: entities (fiche entité + annuaire)
-#   GET /api/entity/{ns}/{id}
-#   GET /api/entity/{ns}/{id}/decisions
-#   GET /api/decision/{id}/parties
-#   GET /api/entities/search
-#   GET /api/entities/directory
-#   GET /api/entities/stats
+#   GET /internal/entity/{ns}/{id}
+#   GET /internal/entity/{ns}/{id}/decisions
+#   GET /internal/decision/{id}/parties
+#   GET /internal/entities/search
+#   GET /internal/entities/directory
+#   GET /internal/entities/stats
 # All public (auth=none). {{base}} = host root. Real prod anchors (registres
 # chargés) : entité `siren:444608442` = ENEDIS (2237 décisions
 # citantes) ; décision `qlSPCVKPKFgt` a des parties résolues ; barreau `paris`
@@ -16,16 +16,16 @@
 # ---------------------------------------------------------------------------
 # health sanity (anchors {{base}})
 # ---------------------------------------------------------------------------
-GET {{base}}/api/health
+GET {{base}}/admin/health
 HTTP 200
 [Asserts]
 jsonpath "$.status" == "ok"
 
 
 # ===========================================================================
-# GET /api/entity/{ns}/{id} — fiche, entité réelle connue
+# GET /internal/entity/{ns}/{id}: fiche, entité réelle connue
 # ===========================================================================
-GET {{base}}/api/entity/siren/444608442
+GET {{base}}/internal/entity/siren/444608442
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -57,14 +57,14 @@ jsonpath "$.stats.topCounsel[0].count" isInteger
 # ---------------------------------------------------------------------------
 # fiche: uid inconnu → 404
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entity/siren/000000000
+GET {{base}}/internal/entity/siren/000000000
 HTTP 404
 
 
 # ===========================================================================
-# GET /api/entity/{ns}/{id}/decisions — page 1, taille bornée
+# GET /internal/entity/{ns}/{id}/decisions: page 1, taille bornée
 # ===========================================================================
-GET {{base}}/api/entity/siren/444608442/decisions?page=1&page_size=5
+GET {{base}}/internal/entity/siren/444608442/decisions?page=1&page_size=5
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -86,14 +86,14 @@ jsonpath "$.items[0].quality" matches /^(party|law_firm|counsel_name)$/
 # ---------------------------------------------------------------------------
 # décisions: page_size hors borne (> 100) → 422
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entity/siren/444608442/decisions?page_size=101
+GET {{base}}/internal/entity/siren/444608442/decisions?page_size=101
 HTTP 422
 
 
 # ===========================================================================
-# GET /api/decision/{id}/parties — décision réelle avec parties résolues
+# GET /internal/decision/{id}/parties: décision réelle avec parties résolues
 # ===========================================================================
-GET {{base}}/api/decision/qlSPCVKPKFgt/parties
+GET {{base}}/internal/decision/qlSPCVKPKFgt/parties
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -107,14 +107,14 @@ jsonpath "$.parties[0].value" isString
 # ---------------------------------------------------------------------------
 # parties: décision inconnue → 404
 # ---------------------------------------------------------------------------
-GET {{base}}/api/decision/does-not-exist-xyz-0000/parties
+GET {{base}}/internal/decision/does-not-exist-xyz-0000/parties
 HTTP 404
 
 
 # ===========================================================================
-# GET /api/entities/search — préfixe de dénomination, catégorie entreprises
+# GET /internal/entities/search: préfixe de dénomination, catégorie entreprises
 # ===========================================================================
-GET {{base}}/api/entities/search?q=credit&kind=entreprises&limit=5
+GET {{base}}/internal/entities/search?q=credit&kind=entreprises&limit=5
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -133,7 +133,7 @@ jsonpath "$.items[0].decisionCount" > 0
 # ---------------------------------------------------------------------------
 # search: sans kind (toutes catégories), défaut limit
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/search?q=societe
+GET {{base}}/internal/entities/search?q=societe
 HTTP 200
 [Asserts]
 jsonpath "$.items" isCollection
@@ -143,28 +143,28 @@ jsonpath "$.items" count <= 10
 # ---------------------------------------------------------------------------
 # search: q trop courte (< 2) → 422
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/search?q=a
+GET {{base}}/internal/entities/search?q=a
 HTTP 422
 
 
 # ---------------------------------------------------------------------------
 # search: kind inconnu → 422
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/search?q=credit&kind=martiens
+GET {{base}}/internal/entities/search?q=credit&kind=martiens
 HTTP 422
 
 
 # ---------------------------------------------------------------------------
 # search: limit hors borne (> 50) → 422
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/search?q=credit&limit=51
+GET {{base}}/internal/entities/search?q=credit&limit=51
 HTTP 422
 
 
 # ===========================================================================
-# GET /api/entities/directory — listing paginé d'une catégorie
+# GET /internal/entities/directory: listing paginé d'une catégorie
 # ===========================================================================
-GET {{base}}/api/entities/directory?kind=entreprises&page=1&page_size=10
+GET {{base}}/internal/entities/directory?kind=entreprises&page=1&page_size=10
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -185,7 +185,7 @@ jsonpath "$.items[0].decisionCount" isInteger
 # ---------------------------------------------------------------------------
 # directory: avocats filtrés par barreau (barreau exposé sur l'item)
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/directory?kind=avocats&barreau=paris&page_size=5
+GET {{base}}/internal/entities/directory?kind=avocats&barreau=paris&page_size=5
 HTTP 200
 [Asserts]
 jsonpath "$.total" > 0
@@ -197,36 +197,35 @@ jsonpath "$.items[0].barreau" == "paris"
 # ---------------------------------------------------------------------------
 # directory: kind manquant → 422
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/directory?page=1
+GET {{base}}/internal/entities/directory?page=1
 HTTP 422
 
 
 # ---------------------------------------------------------------------------
 # directory: kind inconnu → 422
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/directory?kind=martiens
+GET {{base}}/internal/entities/directory?kind=martiens
 HTTP 422
 
 
 # ---------------------------------------------------------------------------
 # directory: page_size hors borne (> 100) → 422
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/directory?kind=entreprises&page_size=101
+GET {{base}}/internal/entities/directory?kind=entreprises&page_size=101
 HTTP 422
 
 
 # ---------------------------------------------------------------------------
-# directory: profondeur au-delà du plafond (page × page_size > 10 000, ADR
-# 0239) → 422
+# directory: profondeur au-delà du plafond (page × page_size > 10 000) → 422
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/directory?kind=entreprises&page=501&page_size=20
+GET {{base}}/internal/entities/directory?kind=entreprises&page=501&page_size=20
 HTTP 422
 
 
 # ---------------------------------------------------------------------------
 # directory: catégorie cabinets
 # ---------------------------------------------------------------------------
-GET {{base}}/api/entities/directory?kind=cabinets&page_size=5
+GET {{base}}/internal/entities/directory?kind=cabinets&page_size=5
 HTTP 200
 [Asserts]
 jsonpath "$.total" isInteger
@@ -234,9 +233,9 @@ jsonpath "$.items" isCollection
 
 
 # ===========================================================================
-# GET /api/entities/stats — compteurs par catégorie (registre + contentieux)
+# GET /internal/entities/stats: compteurs par catégorie (registre + contentieux)
 # ===========================================================================
-GET {{base}}/api/entities/stats
+GET {{base}}/internal/entities/stats
 HTTP 200
 [Asserts]
 header "Cache-Control" exists

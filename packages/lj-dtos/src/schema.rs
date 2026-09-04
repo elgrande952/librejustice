@@ -129,8 +129,8 @@ impl Procedure {
     ];
 }
 
-/// Juge/office spécialisé — miroir du seed `office:*` (migration 0100).
-/// `null` = formation ordinaire ; vocabulaire fermé, pas de `AUTRE`.
+/// Juge/office spécialisé, miroir du référentiel `office:*` que les migrations
+/// laissent. `null` = formation ordinaire ; vocabulaire fermé, pas de `AUTRE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Office {
@@ -141,11 +141,13 @@ pub enum Office {
     JugeEnfants,
     PremierPresident,
     MagistratDesigne,
+    PresidentSectionContentieux,
+    JugeExpropriation,
 }
 
 impl Office {
-    /// Toutes les variantes, dans l'ordre `sort` du seed 0100.
-    pub const ALL: [Office; 7] = [
+    /// Toutes les variantes, dans l'ordre `sort` du référentiel.
+    pub const ALL: [Office; 9] = [
         Office::Jld,
         Office::Jaf,
         Office::Jcp,
@@ -153,29 +155,8 @@ impl Office {
         Office::JugeEnfants,
         Office::PremierPresident,
         Office::MagistratDesigne,
-    ];
-}
-
-/// Portée jurisprudentielle — miroir du seed `portee:*` (migration 0114),
-/// namespace renommé `significance:*` par la 0145 : groupes de
-/// `publication_codes` au rang le plus fort (`significance_codes` de lj-core).
-/// Mapping total : `INDETERMINEE` sans code classant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Significance {
-    Majeure,
-    Importante,
-    Limitee,
-    Indeterminee,
-}
-
-impl Significance {
-    /// Toutes les variantes, dans l'ordre `sort` du seed 0114.
-    pub const ALL: [Significance; 4] = [
-        Significance::Majeure,
-        Significance::Importante,
-        Significance::Limitee,
-        Significance::Indeterminee,
+        Office::PresidentSectionContentieux,
+        Office::JugeExpropriation,
     ];
 }
 
@@ -370,6 +351,19 @@ impl JurisdictionType {
         JurisdictionType::Cnda,
         JurisdictionType::Cnil,
     ];
+
+    /// Libellé de la date de la décision. « Lecture » est le mot de l'ordre
+    /// administratif, jamais celui d'un arrêt de cassation.
+    pub fn date_label(self) -> &'static str {
+        match self {
+            JurisdictionType::Ta
+            | JurisdictionType::Caa
+            | JurisdictionType::Ce
+            | JurisdictionType::Tc
+            | JurisdictionType::Cnda => "Date de lecture",
+            _ => "Date de la décision",
+        }
+    }
 }
 
 /// Abréviations de citation : tête de nom de juridiction (minuscules) →
@@ -496,28 +490,50 @@ mod tests {
         assert_eq!(ser(&Domain::CivilDroitLocatif), "CIVIL_DROIT_LOCATIF");
     }
 
-    /// Uids d'une facette dans un seed de migration (lignes `('facet:…`) — les
-    /// seeds gardent les préfixes historiques.
-    fn seed_uid_suffixes_in(migration: &str, facet: &str) -> std::collections::BTreeSet<String> {
-        let sql = std::fs::read_to_string(format!(
-            "{}/../lj-store/migrations/{migration}",
-            env!("CARGO_MANIFEST_DIR"),
-        ))
-        .unwrap();
-        let prefix = format!("('{facet}:");
-        let uids: std::collections::BTreeSet<String> = sql
-            .lines()
-            .filter_map(|l| {
-                let rest = l.trim_start().strip_prefix(&prefix)?;
-                Some(rest[..rest.find('\'')?].to_string())
-            })
+    /// État net d'une facette, migrations rejouées dans l'ordre : une ligne
+    /// `('facet:X'` sème, un `DELETE FROM facet_value` retire les uids qu'il
+    /// cite. Lire un seul fichier rendait aveugle à tout ce qui vient après lui.
+    fn seed_uid_suffixes(facet: &str) -> std::collections::BTreeSet<String> {
+        let dir = format!("{}/../lj-store/migrations", env!("CARGO_MANIFEST_DIR"));
+        let mut fichiers: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "sql"))
             .collect();
-        assert!(!uids.is_empty(), "aucun uid `{facet}:*` dans {migration}");
+        fichiers.sort();
+        let prefix = format!("('{facet}:");
+        let mut uids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for fichier in fichiers {
+            let sql = std::fs::read_to_string(&fichier).unwrap();
+            for ligne in sql.lines().map(str::trim_start) {
+                if let Some(rest) = ligne.strip_prefix(&prefix) {
+                    if let Some(fin) = rest.find('\'') {
+                        uids.insert(rest[..fin].to_string());
+                    }
+                }
+            }
+            for statement in sql.split(';') {
+                if !statement.contains("DELETE FROM facet_value") {
+                    continue;
+                }
+                for uid in cite_uids(statement, facet) {
+                    uids.remove(&uid);
+                }
+            }
+        }
+        assert!(!uids.is_empty(), "aucun uid `{facet}:*` semé");
         uids
     }
 
-    fn seed_uid_suffixes(facet: &str) -> std::collections::BTreeSet<String> {
-        seed_uid_suffixes_in("0100_facet_referentiels.sql", facet)
+    /// Suffixes des littéraux `'facet:X'` d'un fragment SQL.
+    fn cite_uids(sql: &str, facet: &str) -> Vec<String> {
+        let motif = format!("'{facet}:");
+        sql.match_indices(&motif)
+            .filter_map(|(i, _)| {
+                let rest = &sql[i + motif.len()..];
+                Some(rest[..rest.find('\'')?].to_string())
+            })
+            .collect()
     }
 
     fn all_codes<T: Serialize>(all: &[T]) -> std::collections::BTreeSet<String> {
@@ -533,15 +549,10 @@ mod tests {
         assert_eq!(all_codes(&Procedure::ALL), seed_uid_suffixes("voie"));
         assert_eq!(all_codes(&Office::ALL), seed_uid_suffixes("office"));
         assert_eq!(all_codes(&Domain::ALL), seed_uid_suffixes("domaine"));
-        assert_eq!(
-            all_codes(&Significance::ALL),
-            seed_uid_suffixes_in("0114_portee_facette.sql", "portee")
-        );
         assert_eq!(Solution::ALL.len(), 17);
         assert_eq!(Procedure::ALL.len(), 13);
-        assert_eq!(Office::ALL.len(), 7);
+        assert_eq!(Office::ALL.len(), 9);
         assert_eq!(Domain::ALL.len(), 45);
-        assert_eq!(Significance::ALL.len(), 4);
     }
 
     #[test]

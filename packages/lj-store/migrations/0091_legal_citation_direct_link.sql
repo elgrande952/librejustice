@@ -14,9 +14,9 @@
 -- d'anaphore. C'est exactement la prémisse écartée à raison quand
 -- la résolution était un batch GLOBAL recalculable — prémisse désormais inversée.
 --
---   char_start / char_end : codepoints sur `decisions.full_text` immuable (ADR
---            0125 §2). NULL = span pas encore émis (ancien fonds backfillé sans
---            positions) → souligné non-cliquable, drainé au reextract.
+--   char_start / char_end : codepoints into the immutable `decisions.full_text`.
+--            NULL = span not emitted yet (old corpus backfilled without
+--            positions) → underlined, not clickable, drained at reextract.
 --   surface_text          : capture verbatim figée (le texte cité tel quel).
 --   text_key / article_key: clé canonique (compat résolveur + override 0089).
 --   ref_text_uid          : cible résolue (legal_text.text_uid). NULL si non lié.

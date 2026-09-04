@@ -41,14 +41,6 @@ impl Corpus {
         }
     }
 
-    /// Le corpus répond-il à une requête vide ? Le pot d'annonces montre ce qui
-    /// est ouvert sans qu'on lui demande rien — `q` n'y est qu'un filtre de
-    /// plus, qu'on doit pouvoir retirer en vidant la barre. Les deux corpus de
-    /// recherche n'ont rien à dire sans mots.
-    pub fn accepts_empty_query(self) -> bool {
-        matches!(self, Corpus::Annonces)
-    }
-
     pub fn placeholder(self) -> &'static str {
         match self {
             Corpus::Decisions => "Rechercher dans la jurisprudence…",
@@ -222,8 +214,6 @@ mod tests {
         let qs = with_query(&m, "", None);
         assert!(!qs.contains("q="));
         assert!(qs.contains("fond=marche"));
-        assert!(Corpus::Annonces.accepts_empty_query());
-        assert!(!Corpus::Decisions.accepts_empty_query());
     }
 
     #[test]

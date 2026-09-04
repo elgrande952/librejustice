@@ -227,6 +227,14 @@ impl DecisionRepository<'_> {
             ] {
                 *slot = self.conn.execute(sql, &[&from_uid, &to_uid]).await?;
             }
+            // Before the delete: the redirect FK is `ON DELETE CASCADE`, so an
+            // already published URL would vanish with the uid it points at.
+            self.conn
+                .execute(
+                    "UPDATE legal_text_slug_redirect SET text_uid = $2 WHERE text_uid = $1",
+                    &[&from_uid, &to_uid],
+                )
+                .await?;
             self.conn
                 .execute("DELETE FROM legal_text WHERE text_uid = $1", &[&from_uid])
                 .await?;
@@ -259,6 +267,9 @@ impl DecisionRepository<'_> {
     /// porte les jumeaux. Seules les **entrantes** déménagent : liens dont il est
     /// la cible, citations texte→texte qui le référencent. Les citations des
     /// décisions suivent au drain de relink. Idempotent : source absente → `None`.
+    /// Two things survive the fiche that dies: its slug, kept as a redirect, and
+    /// the identity columns the target has none of, a DILA fiche carrying the
+    /// date and the NOR that EUR-Lex does not publish.
     #[tracing::instrument(name = "db.collapse_legal_text", skip(self), fields(db.system = "postgresql"))]
     pub async fn collapse_legal_text(
         &self,
@@ -287,6 +298,24 @@ impl DecisionRepository<'_> {
                 .ok_or_else(|| {
                     StoreError::Invalid(format!("fiche cible de fusion absente: {into_uid}"))
                 })?;
+            self.conn
+                .execute(
+                    "UPDATE legal_text t SET date_texte = coalesce(t.date_texte, f.date_texte), \
+                            date_publi = coalesce(t.date_publi, f.date_publi), \
+                            nor = coalesce(t.nor, f.nor), eli = coalesce(t.eli, f.eli), \
+                            instrument_key = coalesce(t.instrument_key, f.instrument_key) \
+                       FROM legal_text f WHERE t.text_uid = $2 AND f.text_uid = $1",
+                    &[&from_uid, &into_uid],
+                )
+                .await?;
+            for sql in [
+                "UPDATE legal_text_slug_redirect SET text_uid = $2 WHERE text_uid = $1",
+                "INSERT INTO legal_text_slug_redirect (ancien_slug, text_uid) \
+                 SELECT slug, $2 FROM legal_text WHERE text_uid = $1 AND slug IS NOT NULL \
+                 ON CONFLICT (ancien_slug) DO UPDATE SET text_uid = EXCLUDED.text_uid",
+            ] {
+                self.conn.execute(sql, &[&from_uid, &into_uid]).await?;
+            }
             let mut counts = TextRenameCounts::default();
             for (slot, sql) in [
                 (

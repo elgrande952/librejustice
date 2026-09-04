@@ -317,19 +317,15 @@ const EXTRACT_QUEUE: usize = 4;
 /// produce ─→ [candidats] ─→ prepare ─→ [préparés] ─→ embed ─→ [embarqués] ─→ extract ─→ [bulk] ─→ write
 /// ```
 ///
-/// `produce` reçoit l'émetteur et rend les compteurs que lui seul connaît
-/// (erreurs de parse, membres vides) : seul point d'adaptation par source, tout
-/// le reste est commun.
+/// `produce` est le seul point d'adaptation par source.
 ///
-/// **Les écritures restent strictement séquentielles et dans l'ordre.** Un seul
-/// étage écrit, sur une seule connexion : la résolution d'identité de l'upsert
-/// (`source_uid` → ECLI → `canonical_ref`) est un lire-puis-écrire non atomique
-/// que des transactions concurrentes casseraient.
+/// **Les écritures restent séquentielles et dans l'ordre.** Un seul étage écrit,
+/// sur une seule connexion : la résolution d'identité de l'upsert (`source_uid`
+/// → ECLI → `canonical_ref`) est un lire-puis-écrire non atomique.
 ///
-/// Le décalage introduit est borné par les canaux : `prepare` lit l'état d'avant
-/// le commit des lots encore en vol, donc un `source_uid` présent deux fois dans
-/// cette fenêtre n'est plus filtré au triage. L'upsert le rattrape dans sa propre
-/// transaction et rend `Skipped`/`Updated`.
+/// `prepare` lit donc l'état d'avant le commit des lots en vol : un `source_uid`
+/// présent deux fois dans cette fenêtre échappe au triage, et c'est l'upsert qui
+/// le rattrape en rendant `Skipped`/`Updated`.
 pub(super) async fn run_stream<E, P, Fut>(
     read_conn: &Connection,
     write_conn: &Connection,

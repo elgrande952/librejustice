@@ -85,21 +85,58 @@ pub fn whole_query_expansions(query: &str) -> Vec<String> {
 }
 
 /// Slug catalogue d'un alias tapé **seul** — l'acronyme d'usage (« cgi »,
-/// « ceseda », « cpc ») là où l'alphabet public attend le slug. `None` si l'alias
-/// est inconnu ou n'est ancré que par uid. Pur, sans I/O.
+/// « ceseda », « cpc ») ou le nom usuel d'une loi (« loi du 6 juillet 1989 ») là
+/// où l'alphabet public attend le slug. `None` si l'alias est inconnu ou n'est
+/// ancré que par uid. Pur, sans I/O.
+///
+/// Le rapprochement se fait à la clé (séparateurs retirés) : un appelant MCP
+/// passe le nom déjà slugifié (`loi-du-6-juillet-1989`), le dataset l'écrit en
+/// clair, c'est la même entrée.
 ///
 /// Complète [`strip_query_named_text`], qui cherche un alias *dans* une requête
 /// en langue naturelle : ici l'entrée EST le nom du texte, telle qu'un appelant
 /// d'API la passe dans un paramètre `code`.
 pub fn canonical_slug(name: &str) -> Option<&'static str> {
-    let folded = fold(name);
-    if folded.is_empty() {
+    let key = crate::instrument_match::match_key(name);
+    if key.is_empty() {
         return None;
     }
     ALIASES
         .iter()
-        .find(|(alias, _)| *alias == folded)
+        .find(|(alias, _)| crate::instrument_match::match_key(alias) == key)
         .and_then(|(_, e)| e.canonical_slug.as_deref())
+}
+
+/// Tous les slugs catalogue que le dataset d'alias désigne. Le fichier est écrit
+/// à la main et nomme des slugs qu'une passe `assign-slugs` peut renommer sous
+/// lui — l'invariant de fin de chaîne les confronte au catalogue.
+pub fn canonical_slugs() -> impl Iterator<Item = &'static str> {
+    ALIASES
+        .iter()
+        .filter_map(|(_, e)| e.canonical_slug.as_deref())
+}
+
+/// Les uid catalogue effectivement lus, c'est-à-dire ceux des entrées sans slug
+/// — ailleurs le slug gagne et l'uid n'est jamais consulté. Même exposition que
+/// [`canonical_slugs`] : une ancre écrite à la main que rien ne confronte au
+/// catalogue vieillit sans le dire.
+pub fn canonical_uids() -> impl Iterator<Item = &'static str> {
+    ALIASES.iter().filter_map(|(_, e)| {
+        e.canonical_slug
+            .is_none()
+            .then_some(e.canonical_text_uid.as_deref())
+            .flatten()
+    })
+}
+
+/// Entries with no anchor at all, `(alias, expansion)`: they claim the text is
+/// outside the catalogue, and twelve of them claimed it wrongly while their text
+/// was entering the corpus.
+pub fn unanchored() -> impl Iterator<Item = (&'static str, &'static str)> {
+    ALIASES
+        .iter()
+        .filter(|(_, e)| e.canonical_slug.is_none() && e.canonical_text_uid.is_none())
+        .map(|(_, e)| (e.alias.as_str(), e.expansion.as_str()))
 }
 
 /// Connecteurs sans contenu autour ou dans un nom de code : ignorés à
@@ -159,17 +196,11 @@ const FR_MONTHS: &[&str] = &[
 /// ranking : les tokens qui nomment le texte ne discriminent rien *à
 /// l'intérieur* du texte visé. Trois détecteurs, du plus explicite au moins :
 ///
-/// 1. **Titre de code du catalogue** (« clause pénale code civil ») : à
-///    partir de chaque token « code », les tokens porteurs du titre sont
-///    consommés dans l'ordre, connecteurs ignorés des deux côtés (« code
-///    consommation » matche « Code de la consommation ») ; titre le plus
-///    long gagnant.
-/// 2. **Instrument par nature + numéro/date** (« préavis loi 89-462 »,
-///    « article 15 de la loi du 6 juillet 1989 », décrets, ordonnances) →
-///    motifs de slug, la date optionnelle après le numéro avalée avec.
-/// 3. **Alias du dataset** ancré au catalogue (« 145 cpc »,
-///    « indemnisation loi badinter ») : tokens de l'alias contigus dans la
-///    requête.
+/// 1. **Titre de code du catalogue** (« clause pénale code civil ») :
+///    connecteurs ignorés des deux côtés, titre le plus long gagnant ;
+/// 2. **instrument par nature + numéro/date** (« préavis loi 89-462 ») → motifs
+///    de slug, la date après le numéro avalée avec ;
+/// 3. **alias du dataset** (« 145 cpc »), tokens contigus dans la requête.
 ///
 /// `None` si la requête nomme un pays (la jambe pays possède le scoping), si
 /// rien ne s'aligne, ou si rien de porteur ne subsiste hors du nom (requête
@@ -354,21 +385,19 @@ fn match_alias(folded: &[String]) -> Option<(NamedTextTarget, (usize, usize))> {
 /// on élimine les tokens que le titre ne porte jamais et on recolle les numéros
 /// d'article à la forme indexée.
 ///
-/// - « article(s) » / « art » sautent : le mot est exclu de `search_title`, et le
-///   laisser ferait échouer TOUTE conjonction « article L442-1 du code de
-///   commerce ».
-/// - « L. 442-1 » / « R 600-2 » se recollent en « L442-1 » / « R600-2 » : le
-///   tokenizer `[\p{L}\p{N}-]+` indexe le `num` en un seul token collé, la
-///   forme pointée usuelle en produit deux qui ne matchent jamais.
-/// - Les stopwords FR (« du », « de la »…) restent : le tokenizer de l'index
-///   les élimine des deux côtés.
+/// - « article(s) » saute : le mot est exclu de `search_title`, le garder ferait
+///   échouer TOUTE conjonction « article L442-1 du code de commerce » ;
+/// - « L. 442-1 » se recolle en « L442-1 » : l'index tient le `num` en un seul
+///   token, la forme pointée en produit deux qui ne matchent jamais ;
+/// - les stopwords FR restent, le tokenizer les élimine des deux côtés.
 ///
-/// Renvoie `None` si rien ne subsiste (requête réduite à « article »…) —
-/// l'appelant n'émet alors pas de clause conjonctive. Pur, sans I/O.
+/// Le découpage est celui de l'index, [`crate::body_tok::tokens_raw`], et pas un
+/// découpage maison : 45 274 articles portent un `num` à séparateur.
+///
+/// `None` si rien ne subsiste — l'appelant n'émet alors pas de conjonction.
 pub fn conj_title_query(query: &str) -> Option<String> {
-    let tokens: Vec<&str> = query
-        .split(|c: char| !(c.is_alphanumeric() || c == '-'))
-        .filter(|t| !t.is_empty())
+    let tokens: Vec<&str> = crate::body_tok::tokens_raw(query)
+        .into_iter()
         .filter(|t| {
             let t = fold(t);
             t != "article" && t != "articles" && t != "art"
@@ -443,6 +472,14 @@ mod tests {
     }
 
     #[test]
+    fn conj_query_keeps_a_num_with_separator_whole() {
+        assert_eq!(
+            conj_title_query("article 2.1 convention de New York").as_deref(),
+            Some("2.1 convention de New York")
+        );
+    }
+
+    #[test]
     fn conj_query_empty_when_nothing_left() {
         assert_eq!(conj_title_query("article"), None);
         assert_eq!(conj_title_query(""), None);
@@ -497,13 +534,19 @@ mod tests {
     #[test]
     fn acronym_resolves_to_catalog_slug() {
         use super::canonical_slug;
-        assert_eq!(canonical_slug("cgi"), Some("code-general-des-impots-cgi"));
+        assert_eq!(canonical_slug("cgi"), Some("code-general-des-impots"));
         assert_eq!(
             canonical_slug("ceseda"),
             Some("code-de-l-entree-et-du-sejour-des-etrangers-et-du-droit-d-asile")
         );
         assert_eq!(canonical_slug("CPC"), Some("code-de-procedure-civile"));
-        assert_eq!(canonical_slug("code-civil"), None);
+        // Nom d'usage déjà slugifié par l'appelant : c'est la même entrée que
+        // le nom écrit en clair, sans quoi un client MCP ne l'atteint jamais.
+        assert_eq!(
+            canonical_slug("loi-du-6-juillet-1989"),
+            canonical_slug("loi du 6 juillet 1989")
+        );
+        assert_eq!(canonical_slug("code-civil"), Some("code-civil"));
         assert_eq!(canonical_slug("pas-un-alias"), None);
         assert_eq!(canonical_slug(""), None);
     }
@@ -604,7 +647,10 @@ mod tests {
         else {
             panic!("alias loi badinter attendu");
         };
-        assert_eq!(slug, "loi-n-85-677-du-5-juillet-1985");
+        assert_eq!(
+            slug,
+            "loi-n-85-677-du-5-juillet-1985-tendant-a-l-amelioration-de-la-situation-des"
+        );
         assert_eq!(rest, "indemnisation accident");
         assert_eq!(strip_query_named_text("cpc", &[]), None);
     }

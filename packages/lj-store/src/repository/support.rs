@@ -12,16 +12,17 @@ pub const REEXTRACTABLE_FIELDS: &[&str] = &[
     "date_lecture",
     "date_audience",
     "docket_numbers",
-    "chamber_position",
-    "chamber_uid",
+    "chamber_key",
+    "seat",
+    "seat_paths",
     "formation_uid",
+    "case_name",
     "search_title",
     "publication_codes",
     "solution_uid",
     "procedure_uid",
     "office_uid",
     "legal_domain_uid",
-    "publication_uid",
     "jurisdiction_code",
     "applicant_counsel_names",
     "applicant_law_firms",
@@ -53,6 +54,23 @@ pub(super) const CASE_CITATIONS_FIELD: &str = "case_citations";
 /// `decision_party`).
 pub(super) const PARTIES_FIELD: &str = "parties";
 
+/// Champ ré-extractible routé vers `set_source_case_names` : trois colonnes
+/// (`case_name`, `case_name_keys`, `case_name_source`) et un rang d'écrivain à
+/// respecter, que l'UPDATE générique ne sait pas porter.
+pub(super) const CASE_NAME_FIELD: &str = "case_name";
+
+/// Champ écrit par une passe dédiée, hors de l'UPDATE colonnes générique.
+pub(super) fn is_routed_field(field: &str) -> bool {
+    matches!(
+        field,
+        LEGAL_REFS_FIELD
+            | DECISION_LINKS_FIELD
+            | CASE_CITATIONS_FIELD
+            | PARTIES_FIELD
+            | CASE_NAME_FIELD
+    )
+}
+
 /// Types PG des colonnes ré-extractibles. Sert à caster la première ligne de
 /// `VALUES` dans `update_extracted_fields_bulk` (inférence de type robuste même
 /// quand le batch n'a que des NULL pour une colonne).
@@ -60,10 +78,11 @@ pub(super) fn extracted_column_type(field: &str) -> &'static str {
     match field {
         "date_lecture" => "date",
         "date_audience" => "date",
-        "docket_numbers" | "publication_codes" => "text[]",
-        "chamber_position" | "search_title" => "text",
+        "docket_numbers" | "publication_codes" | "seat_paths" => "text[]",
+        "chamber_key" | "search_title" => "text",
+        "seat" => "jsonb",
         "solution_uid" | "procedure_uid" | "office_uid" | "legal_domain_uid"
-        | "publication_uid" | "jurisdiction_code" | "chamber_uid" | "formation_uid" => "text",
+        | "jurisdiction_code" | "formation_uid" => "text",
         "applicant_counsel_names"
         | "applicant_law_firms"
         | "applicant_companies"
@@ -86,8 +105,9 @@ pub(super) fn extracted_field_value(
         "date_lecture" => Box::new(extracted.date_lecture),
         "date_audience" => Box::new(extracted.date_audience),
         "docket_numbers" => Box::new(extracted.docket_numbers.clone()),
-        "chamber_position" => Box::new(extracted.chamber_position.clone()),
-        "chamber_uid" => Box::new(extracted.chamber_uid.clone()),
+        "chamber_key" => Box::new(extracted.chamber_key.clone()),
+        "seat" => Box::new(extracted.seat.clone().map(tokio_postgres::types::Json)),
+        "seat_paths" => Box::new(extracted.seat_paths.clone()),
         "formation_uid" => Box::new(extracted.formation_uid.clone()),
         "search_title" => Box::new(extracted.search_title.clone()),
         "publication_codes" => Box::new(extracted.publication_codes.clone()),
@@ -95,7 +115,6 @@ pub(super) fn extracted_field_value(
         "procedure_uid" => Box::new(extracted.procedure_uid.clone()),
         "office_uid" => Box::new(extracted.office_uid.clone()),
         "legal_domain_uid" => Box::new(extracted.legal_domain_uid.clone()),
-        "publication_uid" => Box::new(extracted.publication_uid.clone()),
         // Le code canonique exige la résolution `source_code` → `code` via
         // `ensure_jurisdictions` : les appelants spécialisent ce champ avant d'arriver
         // ici.
@@ -110,6 +129,23 @@ pub(super) fn extracted_field_value(
         "themes" => Box::new(extracted.themes.clone()),
         other => panic!("colonne ré-extractible inconnue: {other}"),
     }
+}
+
+/// `CASE` de rang d'autorité sur une colonne de codes de publication, du plus
+/// fort au plus faible, pour trier une liste quand la pertinence ne tranche pas.
+/// Les paliers sont des constantes du code, inlinées, pas des données.
+pub fn authority_rank_sql(column: &str) -> String {
+    let tiers = lj_core::publication::authority_tiers();
+    let mut sql = String::from("CASE");
+    for (rank, codes) in tiers.iter().enumerate() {
+        let list: Vec<String> = codes.iter().map(|c| format!("'{c}'")).collect(); // sql-splice-ok: paliers constants de lj-core
+        sql.push_str(&format!(
+            " WHEN {column} && ARRAY[{}] THEN {rank}",
+            list.join(",")
+        ));
+    }
+    sql.push_str(&format!(" ELSE {} END", tiers.len()));
+    sql
 }
 
 /// Dérive le nom de source d'un `source_uid` à partir de son préfixe. Les fonds
@@ -130,6 +166,8 @@ pub fn source_from_source_uid(source_uid: &str) -> &'static str {
         "cjue"
     } else if source_uid.starts_with("cnda/") {
         "cnda"
+    } else if source_uid.starts_with("ariane-dce/") {
+        "ariane-dce"
     } else if source_uid.starts_with("ariane-web/") {
         "ariane-web"
     } else if source_uid.starts_with("adde/") {
@@ -193,11 +231,7 @@ mod tests {
     #[test]
     fn extracted_column_type_covers_all_column_fields() {
         for f in REEXTRACTABLE_FIELDS {
-            if *f == LEGAL_REFS_FIELD
-                || *f == DECISION_LINKS_FIELD
-                || *f == CASE_CITATIONS_FIELD
-                || *f == PARTIES_FIELD
-            {
+            if is_routed_field(f) {
                 continue;
             }
             let _ = extracted_column_type(f);

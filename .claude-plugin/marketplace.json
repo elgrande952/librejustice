@@ -1,6 +1,6 @@
 {
   "name": "librejustice",
-  "description": "Recherche juridique française : le connecteur MCP LibreJustice (jurisprudence des deux ordres, codes et textes applicables à date) et ses skills.",
+  "description": "The LibreJustice MCP connector and its skills: free French legal research, case law from France's administrative and judicial courts, and legislation as it stood on any date.",
   "owner": {
     "name": "LibreJustice"
   },
@@ -8,8 +8,8 @@
     {
       "name": "librejustice",
       "source": "./plugins/librejustice",
-      "description": "Assistant de recherche juridique (librejustice.fr) : serveur MCP distant avec OAuth automatique + skills — jurisprudence et normes (codes, traités, UE, droit étranger).",
-      "version": "1.16.1",
+      "description": "Free and open source, LibreJustice gives your agent ~3.7 million French and European decisions and ~3.6 million legal articles as they stood on any date: five MCP tools over OAuth, no API key, and two research skills.",
+      "version": "1.17.0",
       "author": {
         "name": "LibreJustice"
       },

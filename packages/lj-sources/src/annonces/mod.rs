@@ -5,11 +5,6 @@
 //! absents du BOAMP). Chaque connecteur ré-énumère le stock actif complet — pas
 //! de delta incrémental — et rend des [`AnnonceBrute`] que
 //! `lj_core::annonces::canonicaliser` fond en lignes canoniques.
-//!
-//! Cadre d'accès : uniquement les listes publiques que l'arrêté du 14 avril
-//! 2017 (profils d'acheteurs) oblige à servir « gratuitement, complètement,
-//! directement et sans restriction ». Aucun contournement de captcha, aucun
-//! compte, débit borné par moteur.
 
 use std::time::Duration;
 
@@ -27,12 +22,22 @@ pub mod dematis;
 pub mod discover;
 pub mod klekoon;
 pub mod modula;
+pub mod presse;
 pub mod safetender;
 pub mod synapse;
+pub mod ted;
 pub mod xmarches;
 
 /// Énumération d'un hôte d'un moteur multi-tenant : total déclaré + lignes.
 pub(crate) type HoteRun = Result<(u64, Vec<AnnonceBrute>)>;
+
+/// Verdict d'un hôte recensé tenté. Le recensement en tient l'historique, qui
+/// seul sépare l'entrée morte de la panne du jour.
+#[derive(Debug)]
+pub struct HoteVerdict {
+    pub host: String,
+    pub joignable: bool,
+}
 
 /// Résultat d'une ré-énumération complète d'un canal.
 #[derive(Debug)]
@@ -41,9 +46,13 @@ pub struct MoteurRun {
     /// check collecté/annoncé — `None` quand le moteur n'en publie pas de
     /// fiable (Dematis compte les avis clos, Synapse n'en publie aucun…).
     pub annonce: Option<u64>,
-    /// Sous-unités (hôte, cellule, tranche de pages) perdues après retries :
-    /// run partiel, on upserte ce qui est vu.
+    /// Sous-unités perdues après retries qui ne sont pas des hôtes recensés
+    /// (cellule, tranche de pages, branding) : run partiel, on upserte ce qui
+    /// est vu. Les hôtes se comptent dans [`Self::hotes`].
     pub echecs: u32,
+    /// Un verdict par hôte recensé tenté, pour Atexo et Safetender. Vide pour
+    /// les moteurs à point d'entrée unique.
+    pub hotes: Vec<HoteVerdict>,
     pub rows: Vec<AnnonceBrute>,
 }
 
@@ -67,8 +76,9 @@ pub struct DetailAnnonce {
 
 /// Lit la page de détail d'un avis sur le moteur qui la sert. Moteur inconnu =
 /// erreur franche : la file d'enrichissement retient la ligne, elle ne l'oublie
-/// pas silencieusement.
-pub async fn detail(moteur: &str, url_avis: &str) -> Result<DetailAnnonce> {
+/// pas silencieusement. `egress` n'est consommé que par klekoon, dont le TLS
+/// impose un pont — les autres moteurs l'ignorent.
+pub async fn detail(moteur: &str, url_avis: &str, egress: &str) -> Result<DetailAnnonce> {
     match moteur {
         "atexo" => atexo::detail(url_avis).await,
         "safetender" => safetender::detail(url_avis).await,
@@ -79,11 +89,15 @@ pub async fn detail(moteur: &str, url_avis: &str) -> Result<DetailAnnonce> {
         "synapse" => synapse::detail(url_avis).await,
         "xmarches" => xmarches::detail(url_avis).await,
         "aji" => aji::detail(url_avis).await,
-        "klekoon" => klekoon::detail(url_avis).await,
+        "klekoon" => klekoon::detail(egress, url_avis).await,
         // Le produit Modula ne publie de CPV nulle part (listing, fiche DCE,
         // bloc CPF) et la procédure est déjà en liste : fiche muette par
         // construction, sans requête.
         "modula" => Ok(DetailAnnonce::default()),
+        // Canaux de publication, pas plateformes : TED sert CPV et procédure
+        // dans sa recherche, le dump de presse ne mène qu'à la page d'avis
+        // qu'on a déjà lue. Rien de plus à aller chercher.
+        "ted" | "presse" => Ok(DetailAnnonce::default()),
         autre => Err(SourceError::Invalid(format!(
             "détail : moteur inconnu « {autre} »"
         ))),
@@ -91,7 +105,7 @@ pub async fn detail(moteur: &str, url_avis: &str) -> Result<DetailAnnonce> {
 }
 
 /// UA navigateur : plusieurs moteurs servent une page dégradée (ou un 403) aux
-/// UA inconnus. Les listes lues restent les listes publiques de l'arrêté.
+/// UA inconnus.
 pub(crate) const UA_NAVIGATEUR: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149 Safari/537.36";
 
@@ -116,6 +130,10 @@ pub(crate) fn client_sonde() -> reqwest::Client {
         .user_agent(UA_NAVIGATEUR)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(8))
+        // Un profil sous nom de vanité (`mp74.fr`, `marches-publics.parishabitat.fr`)
+        // sert le certificat de son moteur : 25 hôtes du recensement ne se
+        // classaient pas pour cette seule raison.
+        .danger_accept_invalid_certs(true)
         .build()
         .expect("reqwest client build")
 }
@@ -199,7 +217,7 @@ pub(crate) fn apres_balise(bloc: &str) -> &str {
 
 /// Dédoublonne par `source_uid` (une consultation revient sur plusieurs
 /// cellules ou pages d'un même moteur), ordre stable.
-pub(crate) fn dedup_source_uid(rows: Vec<AnnonceBrute>) -> Vec<AnnonceBrute> {
+pub fn dedup_source_uid(rows: Vec<AnnonceBrute>) -> Vec<AnnonceBrute> {
     let mut vus = std::collections::HashSet::new();
     rows.into_iter()
         .filter(|r| vus.insert(r.source_uid.clone()))

@@ -1,35 +1,36 @@
-//! ArianeWeb : analyses AJCE + existence des conclusions CRP →
-//! bundles `commentaires[]` en `decision_sources` (`source = 'ariane-web'`,
-//! une ligne par décision CE, pivot `source_uid =
-//! ariane-web/<dossier>@<date>`).
+//! ArianeWeb : les trois fonds en un job, piloté par le recensement. Une requête
+//! par fond rend la facette `anneeDateDeLecture` comptée serveur, donc le fond
+//! entier année par année. Seul ce que le recensement dément est visité : les
+//! années où `AW_DCE` compte plus que le fonds (décisions absentes, créées sous
+//! `ariane-dce`), celles dont le compte `AW_AJCE`+`AW_CRP` a bougé depuis le
+//! dernier passage propre (commentaires). Les décisions passent avant les
+//! commentaires : une décision créée dans le run reçoit ses analyses dans le même
+//! run, au lieu de faire un orphelin de plus.
 //!
-//! Déroulé par **année** (l'année xsearch est celle de la date de lecture de
-//! la décision parente — analyses et conclusions d'une même décision tombent
-//! dans la même tranche) : énumération CRP puis AJCE, téléchargement HTML AJCE
-//! (cache disque shardé), parse pur, groupage et rattachement en mémoire par
-//! (n° dossier, date de lecture) — jamais l'ECLI brut.
+//! Analyses AJCE + existence des conclusions CRP → bundles `commentaires[]` en
+//! `decision_sources` (`source = 'ariane-web'`, une ligne par décision CE, pivot
+//! `source_uid = ariane-web/<dossier>@<date>`).
 //!
-//! Le réseau (pages xsearch, HTML des fiches) est crawlé par un pool borné de
-//! [`CRAWL_WORKERS`] threads, [`ariane::THROTTLE`] par worker ; la fusion des
-//! bundles reste séquentielle dans l'ordre d'énumération (checksums stables).
+//! Déroulé par **année** — celle de la date de lecture de la parente, pour que
+//! analyses et conclusions d'une même décision tombent dans la même tranche.
+//! Rattachement par (n° dossier, date de lecture), jamais l'ECLI brut. La fusion
+//! des bundles reste séquentielle : checksums stables.
 //!
-//! Idempotence : `content_checksum` = xxh3-64 hex du bundle sérialisé,
-//! skip si identique. Une année est marquée au manifeste quand elle est
-//! entièrement traitée **sans erreur transitoire** (téléchargement échoué).
-//! Les états durables côté source ne bloquent pas le marquage : orphelins
-//! (parente hors stock — avant ~1990 le CE en base est clairsemé), fiches
-//! vides et hits sans numéro (`vides`).
+//! Idempotence : `content_checksum` = xxh3-64 du bundle sérialisé. Une année
+//! n'est marquée au manifeste que si elle passe **sans erreur transitoire** ;
+//! orphelins, fiches vides et hits sans numéro ne bloquent pas le marquage.
 //!
-//! Un orphelin dont le hit porte un n° `AW_DCE` n'est pas abandonné : le
-//! document intégral ArianeWeb devient la décision elle-même, rang 0.
+//! Un orphelin dont le hit porte un n° `AW_DCE` devient la décision elle-même,
+//! sous la source `ariane-dce` : c'est une charge de décision, le bundle de
+//! commentaires n'en est pas une, et le barème d'autorité les sépare.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
-use chrono::Datelike;
+use serde::{Deserialize, Serialize};
 
 use lj_core::decision::Decision;
 use lj_core::parsing::{
@@ -44,13 +45,72 @@ use super::batch::drain_batch;
 use super::embed::build_embedder_opt;
 use super::{content_checksum, generate_public_id, Candidate, IngestCounts, IngestMode};
 
-/// Première année sondée par défaut : le fond AJCE descend à 1976 — une marge
-/// basse, chaque année vide coûte une requête.
-const FIRST_YEAR: u16 = 1960;
-
 /// Threads de crawl concurrents. Avec [`ariane::THROTTLE`] respecté par
 /// worker, le débit reste plafonné vers un site public.
 const CRAWL_WORKERS: usize = 4;
+
+/// Les trois fonds recensés année par année, une requête chacun.
+struct Census {
+    ajce: BTreeMap<u16, u32>,
+    crp: BTreeMap<u16, u32>,
+    dce: BTreeMap<u16, u32>,
+}
+
+/// Comptes qu'ArianeWeb déclarait pour une année au dernier passage propre, un
+/// champ par fond : le recensement du run suivant les dément ou les confirme, et
+/// rien d'autre ne décide de rejouer l'année. `dce` reste absent tant qu'aucune
+/// énumération de décisions n'a conclu.
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+struct YearMark {
+    ajce: u32,
+    crp: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dce: Option<u32>,
+}
+
+type Manifest = HashMap<u16, YearMark>;
+
+impl Census {
+    fn read(client: &reqwest::blocking::Client) -> Result<Self> {
+        let of = |fond| {
+            ariane::census_by_year(client, fond)
+                .map_err(|e| anyhow!("recensement {}: {e}", ArianeFond::as_str(fond)))
+        };
+        Ok(Self {
+            ajce: of(ArianeFond::Ajce)?,
+            crp: of(ArianeFond::Crp)?,
+            dce: of(ArianeFond::Dce)?,
+        })
+    }
+
+    fn count(fond: &BTreeMap<u16, u32>, year: u16) -> u32 {
+        fond.get(&year).copied().unwrap_or(0)
+    }
+
+    /// Années portant des commentaires dont le compte a bougé depuis le dernier
+    /// passage propre. La borne basse vient du fond, jamais d'une constante :
+    /// `AW_AJCE` descend à 1875.
+    fn commented_years_moved(&self, manifest: &Manifest) -> Vec<u16> {
+        let mut years: Vec<u16> = self.ajce.keys().chain(self.crp.keys()).copied().collect();
+        years.sort_unstable();
+        years.dedup();
+        years.retain(|&y| {
+            manifest.get(&y).map(|m| (m.ajce, m.crp))
+                != Some((Self::count(&self.ajce, y), Self::count(&self.crp, y)))
+        });
+        years
+    }
+
+    fn mark_comments(&self, manifest: &mut Manifest, year: u16) {
+        let m = manifest.entry(year).or_default();
+        m.ajce = Self::count(&self.ajce, year);
+        m.crp = Self::count(&self.crp, year);
+    }
+
+    fn mark_decisions(&self, manifest: &mut Manifest, year: u16) {
+        manifest.entry(year).or_default().dce = Some(Self::count(&self.dce, year));
+    }
+}
 
 /// Bundle en construction pour une décision (clé : dossier principal + date).
 #[derive(Default)]
@@ -84,10 +144,12 @@ struct Stats {
     erreurs: usize,
 }
 
-/// Sync ArianeWeb. `years` vide = toutes les années depuis [`FIRST_YEAR`] ;
-/// `limit` = plafond de documents AJCE téléchargés (sonde) — quand il est
-/// atteint le run s'arrête proprement sans marquer l'année au manifeste.
-pub async fn sync_ariane(years: Vec<u16>, limit: Option<usize>) -> Result<()> {
+/// Sync ArianeWeb : recensement des trois fonds, décisions absentes, puis
+/// commentaires des années qui ont bougé. `years` force les années des deux
+/// passes ; `census_only` s'arrête au recensement ; `limit` plafonne les
+/// documents AJCE téléchargés (sonde), et le run s'arrête alors proprement sans
+/// marquer l'année au manifeste.
+pub async fn sync_ariane(years: Vec<u16>, census_only: bool, limit: Option<usize>) -> Result<()> {
     let settings = Settings::from_env()?;
     let dir = settings.cache_dir().join("ariane");
     fs::create_dir_all(&dir)?;
@@ -98,8 +160,71 @@ pub async fn sync_ariane(years: Vec<u16>, limit: Option<usize>) -> Result<()> {
     lj_store::migrator::apply_migrations(&conn)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
-    let repo = DecisionRepository::new(&conn);
 
+    let census = tokio::task::spawn_blocking(|| {
+        let client = ariane::http_client().map_err(|e| anyhow!("client ariane: {e}"))?;
+        Census::read(&client)
+    })
+    .await
+    .map_err(|e| anyhow!("tâche recensement: {e}"))??;
+
+    let mut manifest = read_manifest(&dir)?;
+    let deficits =
+        deficits_de_decisions(&DecisionRepository::new(&conn), &census, &manifest).await?;
+    let bougees = census.commented_years_moved(&manifest);
+    tracing::info!(
+        ajce = census.ajce.values().map(|&n| u64::from(n)).sum::<u64>(),
+        crp = census.crp.values().map(|&n| u64::from(n)).sum::<u64>(),
+        dce = census.dce.values().map(|&n| u64::from(n)).sum::<u64>(),
+        annees_en_deficit = deficits.len(),
+        annees_commentaires_a_rejouer = bougees.len(),
+        "recensement ArianeWeb"
+    );
+    if census_only {
+        return Ok(());
+    }
+
+    let cibles = |designees: Vec<u16>| {
+        if years.is_empty() {
+            designees
+        } else {
+            years.clone()
+        }
+    };
+    fill_decisions(
+        &settings,
+        &dir,
+        &conn,
+        cibles(deficits),
+        &census,
+        &mut manifest,
+    )
+    .await?;
+    sync_comments(
+        &settings,
+        &dir,
+        &conn,
+        cibles(bougees),
+        limit,
+        &census,
+        manifest,
+    )
+    .await
+}
+
+/// Récolte les commentaires des années désignées et rattache leurs bundles. Une
+/// année qui passe sans erreur transitoire est marquée au manifeste sur les
+/// comptes du recensement, et sautée tant qu'ils ne bougent pas.
+async fn sync_comments(
+    settings: &Settings,
+    dir: &Path,
+    conn: &lj_store::db::Connection,
+    years: Vec<u16>,
+    limit: Option<usize>,
+    census: &Census,
+    mut manifest: Manifest,
+) -> Result<()> {
+    let repo = DecisionRepository::new(conn);
     let index: HashMap<(String, String), i64> = repo
         .ce_docket_date_index()
         .await?
@@ -110,17 +235,10 @@ pub async fn sync_ariane(years: Vec<u16>, limit: Option<usize>) -> Result<()> {
     tracing::info!(
         ce_keys = index.len(),
         bundles_en_base = existing.len(),
-        "sync_ariane démarré"
+        annees = years.len(),
+        "sync_ariane commentaires"
     );
 
-    let current_year = chrono::Utc::now().year() as u16;
-    let years = if years.is_empty() {
-        (FIRST_YEAR..=current_year).collect()
-    } else {
-        years
-    };
-
-    let mut manifest = read_manifest(&dir)?;
     let mut totals = Stats::default();
     let mut budget = limit;
     // Orphelins dont le hit porte un n° AW_DCE : récupérés en fin de run
@@ -128,16 +246,11 @@ pub async fn sync_ariane(years: Vec<u16>, limit: Option<usize>) -> Result<()> {
     let mut recoverable: Vec<((String, String), Bundle)> = Vec::new();
 
     for year in years {
-        // Une année marquée est entièrement traitée ; les deux dernières
-        // années restent vivantes (le fond s'y remplit encore).
-        if manifest.contains_key(&year.to_string()) && year + 1 < current_year {
-            continue;
-        }
         if budget == Some(0) {
             break;
         }
         let (bundles, stats, exhausted) = {
-            let dir = dir.clone();
+            let dir = dir.to_path_buf();
             let year_budget = budget;
             // Le client `reqwest::blocking` vit entièrement côté bloquant :
             // sa création comme son drop paniquent en contexte async.
@@ -203,8 +316,8 @@ pub async fn sync_ariane(years: Vec<u16>, limit: Option<usize>) -> Result<()> {
         // transitoire. Les états durables (`orphans`, `vides`) ne bloquent
         // pas : identiques au re-run.
         if !exhausted && stats.erreurs == 0 {
-            manifest.insert(year.to_string(), stats.analyses + stats.conclusions);
-            write_manifest(&dir, &manifest)?;
+            census.mark_comments(&mut manifest, year);
+            write_manifest(dir, &manifest)?;
         }
         tracing::info!(
             year,
@@ -221,7 +334,7 @@ pub async fn sync_ariane(years: Vec<u16>, limit: Option<usize>) -> Result<()> {
         (0, 0)
     } else {
         let (created, attached, still_orphans) =
-            recover_dce_orphans(&settings, &dir, &conn, index, recoverable).await?;
+            recover_dce_orphans(settings, dir, conn, index, recoverable).await?;
         totals.orphans += still_orphans;
         (created, attached)
     };
@@ -508,6 +621,253 @@ fn enumerate(
     Ok(out)
 }
 
+/// Années où `AW_DCE` compte plus de décisions que le fonds, du déficit le plus
+/// large au plus étroit. Le compte est un **majorant** du manque : ArianeWeb
+/// porte un document par dossier, le fonds une décision par affaire, et cinq
+/// affaires jointes creusent un écart que rien ne manque. L'énumération tranche.
+async fn deficits_de_decisions(
+    repo: &DecisionRepository<'_>,
+    census: &Census,
+    manifest: &Manifest,
+) -> Result<Vec<u16>> {
+    let ours: HashMap<u16, i64> = repo
+        .ce_counts_by_year()
+        .await?
+        .into_iter()
+        .map(|(y, n)| (y as u16, n))
+        .collect();
+    let mut deficits: Vec<(u16, u32, i64)> = census
+        .dce
+        .iter()
+        .map(|(&y, &aw)| (y, aw, ours.get(&y).copied().unwrap_or(0)))
+        .filter(|(_, aw, notre)| i64::from(*aw) > *notre)
+        .collect();
+    deficits.sort_by_key(|(_, aw, notre)| *notre - i64::from(*aw));
+    for (year, aw, notre) in &deficits {
+        let tranche = manifest.get(year).and_then(|m| m.dce) == Some(*aw);
+        tracing::info!(
+            year,
+            ariane = aw,
+            fonds = notre,
+            manque = i64::from(*aw) - notre,
+            tranche,
+            "déficit"
+        );
+    }
+    Ok(deficits
+        .into_iter()
+        .filter(|(y, aw, _)| manifest.get(y).and_then(|m| m.dce) != Some(*aw))
+        .map(|(y, _, _)| y)
+        .collect())
+}
+
+/// Énumère les années désignées, garde les hits que le fonds n'a pas, et crée
+/// leurs décisions depuis le document intégral.
+async fn fill_decisions(
+    settings: &Settings,
+    dir: &Path,
+    conn: &lj_store::db::Connection,
+    years: Vec<u16>,
+    census: &Census,
+    manifest: &mut Manifest,
+) -> Result<()> {
+    if years.is_empty() {
+        return Ok(());
+    }
+    let index: HashMap<(String, String), i64> = DecisionRepository::new(conn)
+        .ce_docket_date_index()
+        .await?
+        .into_iter()
+        .map(|(dossier, date, id)| ((norm_dossier(&dossier), date), id))
+        .collect();
+
+    let (embedder, require_embeddings) = build_embedder_opt(settings).await?;
+    let mut counts = IngestCounts::default();
+    for year in years {
+        let absents = {
+            let index = index.clone();
+            tokio::task::spawn_blocking(move || -> Result<Vec<ArianeHit>> {
+                let client = ariane::http_client().map_err(|e| anyhow!("client ariane: {e}"))?;
+                let hits = enumerate(&client, ArianeFond::Dce, year)?;
+                Ok(hits
+                    .into_iter()
+                    .filter(|h| !hit_en_base(h, &index))
+                    .collect())
+            })
+            .await
+            .map_err(|e| anyhow!("tâche énumération DCE {year}: {e}"))??
+        };
+        tracing::info!(year, absents = absents.len(), "énumération DCE");
+        if absents.is_empty() {
+            census.mark_decisions(manifest, year);
+            write_manifest(dir, manifest)?;
+            continue;
+        }
+        let attendus = absents.len();
+        let candidates = {
+            let dir = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || -> Result<Vec<Candidate>> {
+                let client = ariane::http_client().map_err(|e| anyhow!("client ariane: {e}"))?;
+                Ok(parallel_map(absents, CRAWL_WORKERS, |hit| {
+                    dce_from_hit(&client, &dir, &hit)
+                })
+                .into_iter()
+                .flatten()
+                .collect())
+            })
+            .await
+            .map_err(|e| anyhow!("tâche téléchargement DCE {year}: {e}"))??
+        };
+        tracing::info!(year, candidats = candidates.len(), "documents DCE lus");
+        let tous_lus = candidates.len() == attendus;
+        drain_batch(
+            conn,
+            embedder.as_ref(),
+            candidates,
+            require_embeddings,
+            IngestMode::MissingHash,
+            &mut counts,
+        )
+        .await?;
+        if tous_lus {
+            census.mark_decisions(manifest, year);
+            write_manifest(dir, manifest)?;
+        }
+    }
+    tracing::info!(created = counts.created, "décisions ArianeWeb créées");
+    Ok(())
+}
+
+/// Un hit DCE est en base si l'une de ses clés (dossier normalisé, date de
+/// lecture) y est. Un hit sans date ni dossier n'est pas rattachable : le
+/// traiter comme absent créerait un doublon à chaque run.
+fn hit_en_base(hit: &ArianeHit, index: &HashMap<(String, String), i64>) -> bool {
+    let Some(date) = hit.date_iso() else {
+        return true;
+    };
+    let dossiers = hit.dossiers();
+    if dossiers.is_empty() {
+        return true;
+    }
+    dossiers
+        .iter()
+        .any(|d| index.contains_key(&(norm_dossier(d), date.to_string())))
+}
+
+/// Télécharge et lit le document DCE d'un hit absent du fonds.
+fn dce_from_hit(
+    client: &reqwest::blocking::Client,
+    dir: &Path,
+    hit: &ArianeHit,
+) -> Option<Candidate> {
+    let num = hit.num().ok()?;
+    let date = hit.date_iso()?.to_string();
+    let html = match ariane::dce_html_cached(client, dir, num) {
+        Ok((html, fetched)) => {
+            if fetched {
+                std::thread::sleep(ariane::THROTTLE);
+            }
+            html
+        }
+        Err(e) => {
+            tracing::warn!(num, error = %e, "téléchargement DCE échoué, skip");
+            return None;
+        }
+    };
+    let parsed = parse_dce_html(&html);
+    if parsed.body.len() < 200 {
+        tracing::warn!(num, "document DCE quasi vide, skip");
+        return None;
+    }
+    let dossiers = if parsed.dossiers.is_empty() {
+        hit.dossiers()
+    } else {
+        parsed.dossiers.clone()
+    };
+    Some(dce_candidate(
+        num,
+        &html,
+        parsed.body,
+        dossiers,
+        parsed.ecli.or_else(|| hit.ecli_parent.clone()),
+        &date,
+        parsed.niveau.or_else(|| hit.niveau.clone()),
+    ))
+}
+
+/// Candidat de décision CE bâti sur un document `AW_DCE` : c'est la forme sous
+/// laquelle une décision entre par ArianeWeb, que le bundle l'ait révélée ou que
+/// le recensement l'ait trouvée manquante.
+fn dce_candidate(
+    num: u32,
+    html: &str,
+    body: String,
+    dossiers: Vec<String>,
+    ecli: Option<String>,
+    date: &str,
+    niveau: Option<String>,
+) -> Candidate {
+    let extracted = ExtractedFields {
+        date_lecture: chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok(),
+        docket_numbers: dossiers.clone(),
+        ..Default::default()
+    };
+    let extracted = lj_ingest::extract::with_facet_uids(extracted, Some("CE"));
+    let decision = Decision {
+        source_uid: format!("ariane-dce/{num}"),
+        member_name: num.to_string(),
+        ecli: ecli.clone(),
+        jurisdiction_source_code: None,
+        chamber: None,
+        nac: None,
+        jurisdiction_name: Some("Conseil d'État".to_string()),
+        jurisdiction_type: Some("CE".to_string()),
+        jurisdiction_location: None,
+        numero_dossier: dossiers.first().cloned(),
+        numero_dossiers: Some(dossiers.clone()),
+        numero_role: None,
+        date_lecture: Some(date.to_string()),
+        date_audience: None,
+        date_mise_jour: None,
+        formation: None,
+        type_decision: None,
+        type_recours: None,
+        solution: None,
+        publication_codes: Vec::new(),
+        avocat_requerant: None,
+        themes: Vec::new(),
+        attacked: None,
+        texte_integral_raw: body.clone(),
+        texte_integral_clean: body,
+        sections: Vec::new(),
+        metadata_header: String::new(),
+        visa_trim: String::new(),
+        parse_warnings: Vec::new(),
+    };
+    Candidate {
+        decision_id: None,
+        public_id: generate_public_id(),
+        decision,
+        content_checksum: content_checksum(html.as_bytes()),
+        raw_payload: Vec::new(),
+        payload_format: "html".to_string(),
+        write_mode: super::WriteMode::Full,
+        dila_fond: None,
+        // Forme payload-Judilibre minimale : le chemin linéaire
+        // (`Decision::from_source_fields_json`) reconstruit la décision
+        // canonique depuis ces clés.
+        prebuilt_source_fields: Some(serde_json::json!({
+            "jurisdiction": "ce",
+            "decision_date": date,
+            "numbers": dossiers,
+            "ecli": ecli,
+            "ariane_dce": num,
+            "niveau": niveau,
+        })),
+        prebuilt_extracted: Some(extracted),
+    }
+}
+
 /// Récupération DCE : les bundles orphelins dont le hit xsearch porte un n°
 /// `AW_DCE` deviennent des décisions (source `ariane-web`, rang 0 — le texte
 /// cède à toute source officielle future), puis leurs bundles sont rattachés
@@ -602,67 +962,15 @@ async fn recover_dce_orphans(
                     attaches.push((key, bundle, lookup_keys));
                     continue;
                 }
-                let dossiers2 = dossiers.clone();
-                let ecli2 = parsed.ecli.clone().or_else(|| bundle.ecli.clone());
-                let extracted = ExtractedFields {
-                    date_lecture: chrono::NaiveDate::parse_from_str(&true_date, "%Y-%m-%d").ok(),
-                    docket_numbers: dossiers.clone(),
-                    ..Default::default()
-                };
-                let extracted = lj_ingest::extract::with_facet_uids(extracted, Some("CE"));
-                let decision = Decision {
-                    source_uid: format!("ariane-web/dce/{num}"),
-                    member_name: num.to_string(),
-                    ecli: parsed.ecli.clone().or_else(|| bundle.ecli.clone()),
-                    jurisdiction_source_code: None,
-                    chamber: None,
-                    nac: None,
-                    jurisdiction_name: Some("Conseil d'État".to_string()),
-                    jurisdiction_type: Some("CE".to_string()),
-                    jurisdiction_location: None,
-                    numero_dossier: dossiers.first().cloned(),
-                    numero_dossiers: Some(dossiers),
-                    numero_role: None,
-                    date_lecture: Some(true_date.clone()),
-                    date_audience: None,
-                    date_mise_jour: None,
-                    formation: None,
-                    type_decision: None,
-                    type_recours: None,
-                    solution: None,
-                    publication_codes: Vec::new(),
-                    avocat_requerant: None,
-                    themes: Vec::new(),
-                    attacked: None,
-                    texte_integral_raw: parsed.body.clone(),
-                    texte_integral_clean: parsed.body.clone(),
-                    sections: Vec::new(),
-                    metadata_header: String::new(),
-                    visa_trim: String::new(),
-                    parse_warnings: Vec::new(),
-                };
-                candidates.push(Candidate {
-                    decision_id: None,
-                    public_id: generate_public_id(),
-                    decision,
-                    content_checksum: content_checksum(html.as_bytes()),
-                    raw_payload: Vec::new(),
-                    payload_format: "html".to_string(),
-                    write_mode: super::WriteMode::Full,
-                    dila_fond: None,
-                    // Forme payload-Judilibre minimale : le chemin linéaire
-                    // (`Decision::from_source_fields_json`) reconstruit la
-                    // décision canonique depuis ces clés.
-                    prebuilt_source_fields: Some(serde_json::json!({
-                        "jurisdiction": "ce",
-                        "decision_date": true_date,
-                        "numbers": dossiers2,
-                        "ecli": ecli2,
-                        "ariane_dce": num,
-                        "niveau": parsed.niveau,
-                    })),
-                    prebuilt_extracted: Some(extracted),
-                });
+                candidates.push(dce_candidate(
+                    num,
+                    &html,
+                    parsed.body.clone(),
+                    dossiers,
+                    parsed.ecli.clone().or_else(|| bundle.ecli.clone()),
+                    &true_date,
+                    parsed.niveau.clone(),
+                ));
                 attaches.push((key, bundle, lookup_keys));
             }
             Ok((candidates, attaches, liens_rates))
@@ -733,26 +1041,83 @@ async fn recover_dce_orphans(
     Ok((counts.created, attached, still_orphans))
 }
 
-/// Manifeste des années complètes (`année → docs vus`), sous le cache ariane.
-fn read_manifest(dir: &Path) -> Result<HashMap<String, usize>> {
+/// Manifeste des années passées proprement (`année → comptes du recensement`),
+/// sous le cache ariane. Une entrée illisible est tenue pour absente, donc son
+/// année repasse une fois : c'est la porte de sortie du format antérieur, qui
+/// stockait les documents traités, incomparables au recensement.
+fn read_manifest(dir: &Path) -> Result<HashMap<u16, YearMark>> {
     let path = dir.join("manifest.json");
     if !path.exists() {
         return Ok(HashMap::new());
     }
-    Ok(serde_json::from_str(&fs::read_to_string(&path)?)?)
+    let raw: HashMap<String, serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&path)?)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(y, v)| Some((y.parse().ok()?, serde_json::from_value::<YearMark>(v).ok()?)))
+        .collect())
 }
 
-fn write_manifest(dir: &Path, manifest: &HashMap<String, usize>) -> Result<()> {
+fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
+    let keyed: BTreeMap<String, &YearMark> =
+        manifest.iter().map(|(y, m)| (y.to_string(), m)).collect();
     fs::write(
         dir.join("manifest.json"),
-        serde_json::to_string_pretty(manifest)?,
+        serde_json::to_string_pretty(&keyed)?,
     )?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ecli_num_date, norm_dossier};
+    use super::{ecli_num_date, hit_en_base, norm_dossier, Census, Manifest};
+    use lj_sources::ariane::ArianeHit;
+    use std::collections::{BTreeMap, HashMap};
+
+    fn census(ajce: &[(u16, u32)], crp: &[(u16, u32)], dce: &[(u16, u32)]) -> Census {
+        let map = |v: &[(u16, u32)]| -> BTreeMap<u16, u32> { v.iter().copied().collect() };
+        Census {
+            ajce: map(ajce),
+            crp: map(crp),
+            dce: map(dce),
+        }
+    }
+
+    /// Le compte du recensement est le seul juge : une année confirmée est
+    /// sautée, une année démentie repart, une année inconnue passe une fois.
+    #[test]
+    fn seul_un_compte_qui_bouge_rejoue_une_annee() {
+        let c = census(&[(1918, 158), (2026, 800)], &[(2026, 40)], &[]);
+        let mut m = Manifest::new();
+        c.mark_comments(&mut m, 1918);
+        c.mark_comments(&mut m, 2026);
+        assert!(c.commented_years_moved(&m).is_empty());
+
+        let bouge = census(&[(1918, 158), (2026, 812)], &[(2026, 40)], &[]);
+        assert_eq!(bouge.commented_years_moved(&m), vec![2026]);
+
+        let neuve = census(&[(1918, 158), (1919, 3), (2026, 800)], &[(2026, 40)], &[]);
+        assert_eq!(neuve.commented_years_moved(&m), vec![1919]);
+    }
+
+    /// Les deux passes marquent la même année sans s'effacer : le déficit de six
+    /// de 1982 (affaires jointes comptées par dossier chez ArianeWeb) est tranché
+    /// par une énumération, et ne réénumère pas tant que le fond ne bouge pas.
+    #[test]
+    fn une_enumeration_qui_ne_trouve_rien_clot_lannee() {
+        let c = census(&[(1982, 1600)], &[], &[(1982, 2507)]);
+        let mut m = Manifest::new();
+        c.mark_decisions(&mut m, 1982);
+        assert_eq!(m[&1982].dce, Some(2507));
+        assert_eq!(m[&1982].ajce, 0);
+
+        c.mark_comments(&mut m, 1982);
+        assert_eq!(m[&1982].dce, Some(2507));
+        assert_eq!(m[&1982].ajce, 1600);
+
+        let ajoutee = census(&[(1982, 1600)], &[], &[(1982, 2508)]);
+        assert_ne!(m[&1982].dce, Some(super::Census::count(&ajoutee.dce, 1982)));
+    }
 
     // Clés de rattachement : cas réels de liens ratés
     // (99137 ArianeWeb vs 099137 JADE ; date de fiche 09/06 vs ECLI 23/06).
@@ -775,5 +1140,36 @@ mod tests {
             Some(("04834".to_string(), "1978-06-23".to_string()))
         );
         assert_eq!(ecli_num_date("ECLI:FR:CE:2020:sansdate"), None);
+    }
+
+    fn hit(dossier: Option<&str>, date: Option<&str>) -> ArianeHit {
+        ArianeHit {
+            id: "/Ariane_Web/AW_DCE/|57666".to_string(),
+            dossier: dossier.map(str::to_string),
+            date_lecture: date.map(str::to_string),
+            parent: None,
+            siblings: None,
+            crp: None,
+            codes_pcja: None,
+            niveau: None,
+            ecli_parent: None,
+        }
+    }
+
+    /// Un hit sans clé de rattachement passe pour présent : le créer poserait un
+    /// doublon de plus à chaque recensement, faute de pouvoir le retrouver.
+    #[test]
+    fn un_hit_sans_cle_ne_se_cree_pas() {
+        let index = HashMap::from([(("18297".to_string(), "1982-07-26".to_string()), 1i64)]);
+        assert!(hit_en_base(
+            &hit(Some("018297"), Some("1982-07-26 02:00:00")),
+            &index
+        ));
+        assert!(!hit_en_base(
+            &hit(Some("99999"), Some("1982-07-26 02:00:00")),
+            &index
+        ));
+        assert!(hit_en_base(&hit(Some("99999"), None), &index));
+        assert!(hit_en_base(&hit(None, Some("1982-07-26 02:00:00")), &index));
     }
 }

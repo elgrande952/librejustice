@@ -1,5 +1,5 @@
 {
-  "_provenance": "généré depuis l'oracle Python (apps/api) — fonctions pures de search.py / signals.py / rerank.py. NE PAS éditer à la main : régénérer via le script de gen (cf. docs/working-notes parité). Asservi par les tests Rust de lj-api.",
+  "_provenance": "Généré depuis un oracle Python retiré depuis — fonctions pures de search.py / signals.py / rerank.py. NE PAS éditer à la main. Asservi par les tests Rust de lj-api.",
   "cases": [
     {
       "content": "1: 90\n2: 70\n3: 50",

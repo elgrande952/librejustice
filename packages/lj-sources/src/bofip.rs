@@ -6,14 +6,11 @@
 //! `serie`/`division`, `titre` (fil d'Ariane complet), `debut_de_validite`,
 //! `contenu_html`. Export JSONL streamé sur disque puis parsé ligne à ligne.
 //!
-//! Le corps HTML porte les **paragraphes numérotés** (`<p class=
-//! "numero-de-paragraphe-western">130</p>` puis le contenu jusqu'au § suivant)
-//! — l'unité que citent les décisions (« paragraphe n° 130 du BOI-… ») — et
-//! des **intertitres** `<h1>`–`<h6>` (« I. », « A. », « 1. ») qui portent le
-//! plan du document. Le parse découpe donc : préambule (avant le premier §) +
-//! liste de §, chaque § portant son chemin d'intertitres englobants
-//! (`section_path`) ; les intertitres sont retirés des textes. Les records
-//! `type=Actualité` (annonces de mise à jour, non citables) sont ignorés.
+//! Le corps HTML porte les **paragraphes numérotés**, l'unité que citent les
+//! décisions (« paragraphe n° 130 du BOI-… »), et des intertitres `<h1>`–`<h6>`
+//! qui portent le plan. Le parse rend donc un préambule puis la liste des §,
+//! chacun avec son `section_path` ; les intertitres sont retirés des textes. Les
+//! records `type=Actualité` ne sont pas citables et sont ignorés.
 //!
 //! Chausse-trappe source : les attributs HTML arrivent avec des guillemets
 //! doublés (`class=""paragraphe-western""`, artefact d'échappement CSV côté

@@ -205,26 +205,18 @@ pub(super) async fn europe_pool() -> Result<deadpool_postgres::Pool> {
 /// Ingère les arrêts CEDH (HUDOC) d'une plage d'années en base (corpus bilingue
 /// FR-prioritaire).
 ///
-/// Pour chaque année (de la plus ancienne à la plus récente), en quatre temps :
-/// 1. **Liste seule** (métadonnées, sans corps) : pagine la liste bilingue
-///    (`results_page`, `sort` posé, fenêtre 10 000) et ne retient que les **arrêts**
-///    FR (`HFJUD`) **et** EN (`HEJUD`) ; notes `CLINF`/press `PR` non ingérées.
-/// 2. **Regroupement par affaire** : [`group_cases`] regroupe par ECLI/`appno`, FR
-///    d'abord — les deux versions restent pour cascader au fetch.
-/// 3. **Filtrage des présents** (`skip`) : `AllPresent` (bootstrap) retire toute
-///    affaire déjà en base ; `FrPresentOnly` (sync) ne retire que celles déjà
-///    servies en **français** (`lang='fra'`) et re-visite les EN-only chaque nuit
-///    pour capter l'upgrade FR différé (le stub `HFJUD` passe de 204 à 200 quand
-///    la traduction paraît → l'autorité bascule le `full_text` en français) — par
-///    une **re-sonde concurrente du seul document FR** : les gagnantes rejoignent
-///    la cascade, les autres sont closes sans re-fetch EN ni parse ni drain. Une
-///    affaire est « présente » si l'un de ses itemids l'est.
-/// 4. **Corps + ingestion** : fetch converti+strippé (`body_text`). **Corps vide ⇒
-///    SKIP** (lag de conversion DOCX→HTML, re-fetch au prochain run). Sinon
-///    `parse_cedh` → `drain_batch` (`payload_format = "html"`,
-///    `source_uid = cedh/{itemid}`). La langue retenue est tracée dans
-///    `source_fields` (`languageisocode`). Idempotent par `content_checksum`,
-///    throttle de courtoisie, manifeste par année.
+/// Par année, de la plus ancienne à la plus récente :
+/// 1. **Liste seule**, sans corps : ne retient que les arrêts FR (`HFJUD`) et EN
+///    (`HEJUD`) ; notes et communiqués non ingérés.
+/// 2. **Regroupement par affaire** ([`group_cases`]), FR d'abord — les deux
+///    versions restent pour cascader au fetch.
+/// 3. **Filtrage des présents** : `AllPresent` retire toute affaire déjà en
+///    base ; `FrPresentOnly` ne retire que celles servies en français et
+///    re-sonde les EN-only, dont le stub `HFJUD` passe de 204 à 200 le jour où
+///    la traduction paraît. Les autres sont closes sans re-fetch ni parse.
+/// 4. **Corps + ingestion**. **Corps vide ⇒ SKIP** : c'est le lag de conversion
+///    DOCX→HTML, repris au run suivant. Idempotent par `content_checksum`,
+///    manifeste par année.
 async fn run_cedh(start_year: i32, end_year: i32, skip: EuropeSkip) -> Result<()> {
     use lj_sources::cedh::{parse_results, CedhClient, CedhManifest, PAGE_SIZE};
 
@@ -446,12 +438,9 @@ async fn run_cedh(start_year: i32, end_year: i32, skip: EuropeSkip) -> Result<()
 /// non ingérées comme décisions concurrentes. Idempotent par `content_checksum`,
 /// throttle de courtoisie, manifeste par année.
 ///
-/// `source_fields` CJUE = les **prédicats CDM riches** par CELEX
-/// (`fetch_work_predicates` : subject-matter, juge/AG/formation, `work_cites_work`,
-/// `interpretes_resource_legal`, procédure, pays de renvoi…), plus la bannière
-/// « objet » extraite du corps et l'ECLI + date de la liste. Si le fetch des
-/// prédicats échoue (réseau / SPARQL), on logue et on retombe sur le minimum
-/// `{case-law_ecli, work_date_document}`.
+/// `source_fields` porte les **prédicats CDM** par CELEX
+/// (`fetch_work_predicates`), la bannière « objet » du corps et l'ECLI de la
+/// liste. Fetch en échec ⇒ repli sur `{case-law_ecli, work_date_document}`.
 async fn run_cjue(start_year: i32, end_year: i32, skip: EuropeSkip) -> Result<()> {
     use lj_sources::cjue::{
         extract_objet, parse_sparql, CjueClient, CjueManifest, PAGE_SIZE, THROTTLE,

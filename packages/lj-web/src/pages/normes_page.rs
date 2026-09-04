@@ -45,6 +45,7 @@ fn year_token(year: Option<i32>) -> String {
 
 #[component]
 pub fn NormesPage() -> impl IntoView {
+    crate::pages::cache_public_5_min();
     // La page pose sa propre description (parfois depuis un `<Suspense>`) :
     // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
     own_page_description();
@@ -148,6 +149,7 @@ fn NormesLoaded(response: NormCatalogueResponse) -> impl IntoView {
 
 #[component]
 pub fn NormFondPage() -> impl IntoView {
+    crate::pages::cache_public_5_min();
     // La page pose sa propre description (parfois depuis un `<Suspense>`) :
     // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
     own_page_description();
@@ -269,6 +271,7 @@ fn NormFondLoaded(hub: NormFondResponse) -> impl IntoView {
 
 #[component]
 pub fn NormYearPage() -> impl IntoView {
+    crate::pages::cache_public_5_min();
     // La page pose sa propre description (parfois depuis un `<Suspense>`) :
     // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
     own_page_description();

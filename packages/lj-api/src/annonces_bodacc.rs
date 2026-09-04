@@ -215,6 +215,7 @@ async fn facette(
                     value: f.value,
                     count: f.count,
                     parent: None,
+                    hint: None,
                 })
                 .collect()
         })

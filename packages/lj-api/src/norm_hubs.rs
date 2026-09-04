@@ -8,13 +8,10 @@ use crate::state::AppState;
 use lj_core::referential_labels::{norm_fond_label, NORM_FONDS};
 use lj_dtos::{
     NormCatalogueResponse, NormFondEntry, NormFondResponse, NormHubText, NormYearCount,
-    NormYearResponse,
+    NormYearResponse, HUB_PAGE_SIZE,
 };
 use lj_store::repository::DecisionRepository;
 use std::sync::Arc;
-
-/// Textes par page hub fond×année.
-pub const HUB_PAGE_SIZE: u32 = 100;
 
 /// Token d'URL du bucket des textes sans date de parcours.
 pub const UNDATED_TOKEN: &str = "sans-date";

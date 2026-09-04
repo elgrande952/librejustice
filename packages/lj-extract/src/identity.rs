@@ -187,6 +187,7 @@ fn is_canonical_pourvoi(docket: &str) -> bool {
 ///   (`18-23.954` → `cc|1823954`) — les autres formes sont irrésolubles par
 ///   le sweep aussi ;
 /// - `CE`/`CEDH`/`CONSTIT` : `<préfixe>|<docket>` tel quel ;
+/// - `TC` : `tc|<docket minuscule>` (le `C` des numéros modernes est plié) ;
 /// - `CJUE` : `cjue|<docket minuscule>` + variante sans préfixe `c-` (la clé
 ///   nue « aff. 6/64 » résout en C-) ;
 /// - tout type à `jurisdiction_code` : `rg|<code>|<docket>` ET
@@ -206,6 +207,7 @@ pub fn pending_target_keys(
             "CE" => keys.push(format!("ce|{docket}")),
             "CEDH" => keys.push(format!("cedh|{docket}")),
             "CONSTIT" => keys.push(format!("constit|{docket}")),
+            "TC" => keys.push(format!("tc|{}", lj_core::docket_key::tc_ordinal(docket))),
             "CJUE" => {
                 let lower = docket.to_lowercase();
                 if let Some(bare) = lower.strip_prefix("c-") {
@@ -308,6 +310,14 @@ mod tests {
         assert_eq!(
             pending_target_keys("CE", None, &["498887".into()]),
             vec!["ce|498887"]
+        );
+        assert_eq!(
+            pending_target_keys("TC", None, &["00012".into()]),
+            vec!["tc|12"]
+        );
+        assert_eq!(
+            pending_target_keys("TC", None, &["C4174".into()]),
+            vec!["tc|4174"]
         );
     }
 

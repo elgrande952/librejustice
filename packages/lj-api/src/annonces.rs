@@ -39,7 +39,14 @@ const PAR_ROLE: i64 = 5;
 pub const FEED_MAX_ITEMS: u32 = 100;
 
 /// Une page du moteur, facettes comprises, servie depuis le cache in-process.
-#[instrument(skip(state, req), fields(fonds = %req.fond.join(","), total = tracing::field::Empty))]
+///
+/// Le span est nommé explicitement : sans ça il prend le nom de la fonction et
+/// percute `search`, le span du signal d'usage ([`crate::usage`]).
+#[instrument(
+    name = "annonces_search",
+    skip(state, req),
+    fields(fonds = %req.fond.join(","), total = tracing::field::Empty)
+)]
 pub async fn search(state: &AppState, req: &AnnonceSearchRequest) -> Result<AnnonceSearchResponse> {
     let key = cache_key(req);
     if let Some(hit) = state.annonces_cache.get(&key).await {
@@ -177,6 +184,7 @@ async fn axes(
                 label: annonce_fond_label(fond).unwrap_or(fond).to_string(),
                 count: *count,
                 parent: None,
+                hint: None,
             })
             .collect(),
     }];
@@ -223,6 +231,7 @@ async fn axes_stockes(
                     value: code,
                     count,
                     parent: None,
+                    hint: None,
                 })
                 .collect(),
         ),
@@ -264,6 +273,7 @@ async fn axes_stockes(
                 label: format!("Ferme sous {jours} jours"),
                 count,
                 parent: None,
+                hint: None,
             })
             .collect(),
     });
@@ -289,6 +299,7 @@ fn completer_selection(
             value: value.clone(),
             count: 0,
             parent: None,
+            hint: None,
         });
     }
 }
@@ -309,6 +320,7 @@ fn choices_referentiel(rows: Vec<(String, Option<String>, i64)>) -> Vec<FacetCho
             value: suffixe(&uid).to_string(),
             count,
             parent: None,
+            hint: None,
         })
         .collect()
 }
@@ -901,6 +913,7 @@ mod tests {
                 label: "Travaux de construction".to_string(),
                 count: 18,
                 parent: None,
+                hint: None,
             }],
         };
         completer_selection(&mut axe, &["45".to_string(), "71".to_string()], |v| {

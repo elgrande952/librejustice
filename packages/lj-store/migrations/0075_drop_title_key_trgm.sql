@@ -6,7 +6,7 @@
 -- pour le snap fréquentiel qu'elle remplace). Le résolveur FUZZY
 -- (candidats trigram + best_catalogue_match) n'ajoutait que +0,03 pp — sa seule
 -- prise réelle, les coquilles OCR, pèse quelques centaines d'arêtes. Abandonné
--- (pas de code mort, AGENTS.md #11/#12) : on retire l'index qui ne le servait
+-- (pas de code mort) : on retire l'index qui ne le servait
 -- que lui (0074), et l'extension pg_trgm, plus référencée nulle part.
 --
 -- Réversion additive de 0074 : aucun chemin vif ne lit cet index.

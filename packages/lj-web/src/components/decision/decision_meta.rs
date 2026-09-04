@@ -6,7 +6,7 @@ use leptos_router::components::A;
 
 use crate::components::hover_preview::{HoverPreview, PreviewKind};
 use crate::helpers::{format_iso_date, format_juridiction};
-use crate::pages::decision_page::labels::{publication_label, significance_label};
+use crate::pages::decision_page::labels::publication_label;
 
 /// Champ de synthèse (label + valeur, `mono` = police monospace).
 #[derive(Clone)]
@@ -27,6 +27,14 @@ fn build_fields(detail: &DecisionDetail) -> Vec<MetaField> {
             .unwrap_or_else(|| format_juridiction(detail.jurisdiction_type).to_string()),
         mono: false,
     });
+    // Nom d'usage : c'est par lui que la décision se cite.
+    if let Some(nom) = detail.case_name.clone() {
+        fields.push(MetaField {
+            label: "Nom d'usage",
+            value: nom,
+            mono: false,
+        });
+    }
     // 2. Numéros de dossier (si non vide).
     if let Some(dockets) = detail.docket_numbers.as_ref().filter(|d| !d.is_empty()) {
         fields.push(MetaField {
@@ -35,10 +43,10 @@ fn build_fields(detail: &DecisionDetail) -> Vec<MetaField> {
             mono: true,
         });
     }
-    // 3. Date de lecture.
+    // 3. Date de la décision.
     if let Some(date) = detail.date_lecture.as_deref() {
         fields.push(MetaField {
-            label: "Date de lecture",
+            label: detail.jurisdiction_type.date_label(),
             value: format_iso_date(Some(date)),
             mono: false,
         });
@@ -81,13 +89,6 @@ fn build_fields(detail: &DecisionDetail) -> Vec<MetaField> {
         fields.push(MetaField {
             label: "Publication",
             value: pub_label,
-            mono: false,
-        });
-    }
-    if let Some(significance) = significance_label(&detail.publication_codes) {
-        fields.push(MetaField {
-            label: "Portée",
-            value: significance.to_string(),
             mono: false,
         });
     }
@@ -211,9 +212,9 @@ fn LegalRefRow(
         slug,
         articles,
     } = reference;
-    // Chaque article devient un lien `/texte/{slug}/{numKey}` quand la citation est
-    // **résolue** au catalogue : `slug` du `legal_text` + `numKey` canonique posés
-    // au DTO ; sinon texte brut. Articles séparés par « , ».
+    // Chaque article devient un lien `/texte/{slug}/{numKey}/{at_date}` quand la
+    // citation est **résolue** au catalogue : `slug` du `legal_text` + `numKey`
+    // canonique posés au DTO ; sinon texte brut. Articles séparés par « , ».
     let articles_view = (!articles.is_empty()).then(|| {
         let last = articles.len() - 1;
         let items = articles
@@ -223,8 +224,12 @@ fn LegalRefRow(
                 let sep = (i < last).then_some(", ");
                 let target = slug.as_ref().filter(|_| !article.num_key.is_empty()).map(
                     |s| {
+                        let href = match at_date.as_deref() {
+                            Some(d) => format!("/texte/{s}/{}/{d}", article.num_key),
+                            None => format!("/texte/{s}/{}", article.num_key),
+                        };
                         (
-                            format!("/texte/{s}/{}", article.num_key),
+                            href,
                             PreviewKind::Article {
                                 code: s.to_string(),
                                 num: article.num_key.clone(),

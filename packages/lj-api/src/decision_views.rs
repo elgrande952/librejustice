@@ -1,9 +1,8 @@
 //! Endpoints `/me/decision-views` + hook d'enregistrement des consultations.
 //!
-//! Modèle dédupliqué : une ligne par `(user, décision)`. Chaque ouverture bump
-//! `last_viewed_at` + `view_count` et met à jour `last_source` (`web` | `mcp`)
-//! avec **web prioritaire** : dès qu'une décision a été ouverte une fois à la
-//! main, `last_source` reste `web` même si le MCP la rouvre.
+//! One row per `(user, decision)`. `last_source` is web-first: once a decision
+//! has been opened by hand, it stays `web` however often `api` or `mcp` reopen
+//! it.
 
 use deadpool_postgres::Pool;
 use lj_dtos::{ActivitySource, DecisionViewItem, JurisdictionType};
@@ -21,10 +20,11 @@ fn parse_jurisdiction_type(raw: &str) -> Result<JurisdictionType, ApiError> {
         .map_err(|e| ApiError::Internal(format!("jurisdiction_type invalide {raw:?}: {e}")))
 }
 
-/// Désérialise un TEXT `web`/`mcp` lu en base vers l'enum.
+/// Désérialise un TEXT `web`/`api`/`mcp` lu en base vers l'enum.
 fn parse_source(raw: &str) -> Result<ActivitySource, ApiError> {
     match raw {
         "web" => Ok(ActivitySource::Web),
+        "api" => Ok(ActivitySource::Api),
         "mcp" => Ok(ActivitySource::Mcp),
         other => Err(ApiError::Internal(format!("source invalide {other:?}"))),
     }
@@ -117,7 +117,7 @@ pub async fn fetch_views(
                v.last_source, \
                v.last_viewed_at, \
                COUNT(*) OVER() AS total, \
-               d.chamber_position, \
+               d.seat, \
                d.formation_uid, \
                d.office_uid \
              FROM user_decision_views v \
@@ -148,9 +148,13 @@ pub async fn fetch_views(
                 .unwrap_or(jur_type_raw),
             jurisdiction_name.as_deref(),
         );
+        let seat_stored: Option<lj_core::chamber::Seat> = row
+            .get::<_, Option<tokio_postgres::types::Json<lj_core::chamber::Seat>>>(11)
+            .map(|j| j.0);
+        let chamber_label = seat_stored.as_ref().and_then(lj_core::chamber::Seat::label);
         let seat = crate::titles::decision_seat(
             &jur_display,
-            row.get::<_, Option<String>>(11).as_deref(),
+            chamber_label.as_deref(),
             row.get::<_, Option<String>>(12).as_deref(),
             row.get::<_, Option<String>>(13).as_deref(),
         );
@@ -158,6 +162,7 @@ pub async fn fetch_views(
             &jur_display,
             seat.as_deref(),
             date_lecture.as_deref(),
+            None,
             docket_numbers
                 .as_deref()
                 .and_then(|d| d.first())

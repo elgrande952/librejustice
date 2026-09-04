@@ -210,6 +210,8 @@ pub async fn decision_parties(
             nature: r.nature,
             barreau: r.barreau,
             entity_uid: r.entity_uid,
+            ord: r.ord,
+            party_ord: r.party_ord,
         })
         .collect();
 

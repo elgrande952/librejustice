@@ -1,9 +1,8 @@
 //! Vue « Lois et règlements » de la page `/textes` : barre de filtres
 //! horizontale `Juridiction ▾ · Nature ▾ · Source ▾` + chips actives + liste
 //! paginée de hits avec total exact. État (requête, filtres, page) dans les
-//! query params — la clé URL du filtre provenance est `origine` (`source` est
-//! un nom hérité) ; le param API `/api/search-textes` reste `source`. Données
-//! via `ApiClient::search_textes`.
+//! query params, du même nom que ceux de `/internal/search-textes`. Données via
+//! `ApiClient::search_textes`.
 
 use leptos::prelude::*;
 use leptos_router::components::A;
@@ -14,32 +13,23 @@ use lj_dtos::{ArticleSearchFacets, ArticleSearchHit, ArticleSearchResponse, Face
 use crate::api::{ApiClient, PageParams, TextesFilters};
 use crate::components::layout::{CONTENT_COL, GRID_3COL, SIDE_RAIL};
 use crate::helpers::{
-    format_article_num, format_results_count_exact, group_thousands, total_pages,
+    format_article_num, format_results_count, group_thousands, total_pages, SEARCH_PAGE_SIZE,
 };
 use crate::pages::decision_page::data::sendable;
 
 use super::compact_search::highlight::Highlighted;
 use super::compact_search::query_state;
-use super::corpus_intro::{
-    corpus_stats, DecisionsCorpusTeaser, NormesRail, TextesCorpusLine, TextesCorpusSummary,
-    TextesExamples,
-};
+use super::corpus_intro::{corpus_stats, DecisionsCorpusTeaser};
 use super::cross_teaser::DecisionsTeaser;
-use super::facet_widgets::Nav;
+use super::facet_widgets::{stale_counts, Nav, StaleCounts};
 use super::filter_dropdown::{FilterDropdown, OpenDropdown};
+use super::results_rail::{skeleton_block, skeleton_rows, RAIL_COLUMN};
 use super::syntax_hint::{HelpCorpus, SyntaxHint};
 use super::CompactSearch;
 
-/// Articles ramenés par page.
-const TEXTES_LIMIT: u32 = 20;
-
-/// Plafond de pages affichées (cohérent avec `helpers::total_pages` ; le
-/// service borne déjà le total à 400).
-const MAX_PAGES_DISPLAY: i64 = 40;
-
 /// Clés de filtre portées par l'URL (corpus articles). `code` borne le moteur à
 /// un texte (posé par le formulaire « Rechercher dans ce code » de `/texte/{code}`).
-const FILTER_KEYS: [&str; 5] = ["jurisdiction", "nature", "origine", "scope", "code"];
+const FILTER_KEYS: [&str; 5] = ["jurisdiction", "nature", "source", "scope", "code"];
 
 /// État de recherche lu depuis l'URL.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -48,7 +38,7 @@ struct TextesQuery {
     code: Option<String>,
     jurisdiction: Option<String>,
     nature: Option<String>,
-    origine: Option<String>,
+    source: Option<String>,
     scope: Option<String>,
     page: u32,
 }
@@ -68,7 +58,7 @@ impl TextesQuery {
             code: single("code"),
             jurisdiction: single("jurisdiction"),
             nature: single("nature"),
-            origine: single("origine"),
+            source: single("source"),
             scope: single("scope"),
             page: map
                 .get("page")
@@ -77,35 +67,47 @@ impl TextesQuery {
                 .unwrap_or(1),
         }
     }
+
+    /// Ce dont dépendent le total et les facettes : la question et ses filtres,
+    /// la page parcourant le même ensemble.
+    fn count_key(&self) -> Self {
+        Self {
+            page: 1,
+            ..self.clone()
+        }
+    }
 }
 
-/// Récupère articles + facettes pour l'état courant. Requête vide ⇒ pas d'appel.
-/// Erreur repliée en message (jamais de reject).
-async fn fetch_textes(state: TextesQuery) -> Result<Option<ArticleSearchResponse>, String> {
-    if state.q.is_empty() {
-        return Ok(None);
-    }
+/// Récupère articles + facettes pour l'état courant. Requête vide ⇒ parcours du
+/// corpus, servi par le même appel. Erreur repliée en message montrable (jamais
+/// de reject).
+async fn fetch_textes(
+    state: TextesQuery,
+) -> Result<ArticleSearchResponse, crate::api::client::SearchFailure> {
     let filters = TextesFilters {
         code: state.code.as_deref(),
         jurisdiction: state.jurisdiction.as_deref(),
         nature: state.nature.as_deref(),
-        source: state.origine.as_deref(),
+        source: state.source.as_deref(),
         scope: state.scope.as_deref(),
     };
-    let offset = (state.page - 1) * TEXTES_LIMIT;
+    let offset = (state.page - 1) * SEARCH_PAGE_SIZE;
     ApiClient::from_context()
         .search_textes(
             &state.q,
             filters,
             PageParams {
-                limit: TEXTES_LIMIT,
+                limit: SEARCH_PAGE_SIZE,
                 offset,
             },
             lj_dtos::SearchContext::User,
         )
         .await
-        .map(Some)
-        .map_err(|e| e.message)
+        .map_err(|e| {
+            #[cfg(feature = "hydrate")]
+            crate::incident::signaler_recherche_refusee(e.status);
+            crate::api::client::SearchFailure::from_error(&e, &state.q)
+        })
 }
 
 /// Corps « Lois et règlements » : grille `240px | minmax(0,1fr) | 280px` dès
@@ -115,8 +117,8 @@ async fn fetch_textes(state: TextesQuery) -> Result<Option<ArticleSearchResponse
 ///
 /// Les facettes et la volumétrie alimentent rail et barre par `Effect`, mis à
 /// jour sur réponse seulement : pendant un refetch ils gardent les précédentes
-/// et restent interactifs. Sans requête, ni filtres ni résultats — juste
-/// l'invite.
+/// et restent interactifs. Sans requête la page est la même, servie par le mode
+/// parcours : mêmes filtres, mêmes facettes, même liste.
 #[component]
 pub fn TextesView() -> impl IntoView {
     let query_map = use_query_map();
@@ -125,97 +127,89 @@ pub fn TextesView() -> impl IntoView {
     let results = Resource::new(move || state.get(), |s| sendable(fetch_textes(s)));
     let facets = RwSignal::new(None::<ArticleSearchFacets>);
     let volume = RwSignal::new(None::<i64>);
+    // État auquel les facettes en main répondent : question changée, le rail
+    // passe en attente plutôt que de résumer les résultats précédents ; filtre
+    // changé, il reste interactif mais ses nombres comptent l'ensemble d'avant.
+    let counted = RwSignal::new(None::<TextesQuery>);
     Effect::new(move |_| {
-        if let Some(Ok(Some(resp))) = results.get() {
+        if let Some(Ok(resp)) = results.get() {
             facets.set(Some(resp.facets));
             volume.set(Some(resp.total));
+            counted.set(Some(state.get_untracked().count_key()));
         }
     });
+    let rail_loading = Signal::derive(move || {
+        counted.with(|c| c.as_ref().map(|k| k.q.clone())) != Some(query.get())
+    });
+    let stale = Memo::new(move |_| counted.get() != Some(state.get().count_key()));
+    provide_context(StaleCounts(stale.into()));
+    let shown_volume = Signal::derive(move || volume.get().filter(|_| !stale.get()));
     let has_query = Signal::derive(move || !query.get().is_empty());
     let stats = corpus_stats();
 
     view! {
         <div class=GRID_3COL>
             <aside aria-label="Synthèse des résultats" class=SIDE_RAIL>
-                <Show when=move || has_query.get() fallback=move || view! { <NormesRail /> }>
-                    <TextesRail facets=facets state=state />
-                </Show>
+                <TextesRail facets=facets state=state loading=rail_loading />
             </aside>
             <div class=CONTENT_COL>
                 <div class="flex flex-col gap-2">
                     <CompactSearch />
-                    // Ligne compacte mobile, rendue dans les DEUX états au même endroit (sur
-                    // desktop volumétrie et aide vivent dans la colonne droite) : volume des
-                    // résultats ou volume du corpus, et l'aide calée à droite.
+                    // Volumétrie mobile sous la barre, l'aide calée à droite (sur
+                    // desktop les deux vivent dans la colonne droite).
                     <div class="flex items-baseline gap-3 lg:hidden">
-                        <Show
-                            when=move || has_query.get()
-                            fallback=move || view! { <TextesCorpusLine stats=stats /> }
-                        >
-                            {move || {
-                                volume
-                                    .get()
-                                    .map(|total| {
-                                        view! {
-                                            <p class="text-sm text-[var(--color-ink-subtle)]">
-                                                <span class="font-medium text-[var(--color-ink)]">
-                                                    {format_results_count_exact(total)}
-                                                </span>
-                                            </p>
-                                        }
-                                    })
-                            }}
-                        </Show>
+                        {move || {
+                            shown_volume
+                                .get()
+                                .map(|total| {
+                                    view! {
+                                        <p class="text-sm text-[var(--color-ink-subtle)]">
+                                            <span class="font-medium text-[var(--color-ink)]">
+                                                {format_results_count(total)}
+                                            </span>
+                                        </p>
+                                    }
+                                })
+                        }}
                         <SyntaxHint corpus=HelpCorpus::Textes class="ml-auto shrink-0" />
                     </div>
                 </div>
-                <Show
-                    when=move || !query.get().is_empty()
-                    fallback=move || view! { <TextSearchPrompt /> }
-                >
-                    <div class="flex min-w-0 flex-col gap-4">
-                        <TextesFilterBar facets=facets state=state />
-                        <TextesActiveChips facets=facets state=state />
-                        <Suspense fallback=move || {
-                            view! {
-                                <p class="text-sm text-[var(--color-ink-subtle)]">"Recherche…"</p>
-                            }
-                        }>
-                            {move || Suspend::new(async move {
-                                let st = state.get_untracked();
-                                match results.await {
-                                    Ok(Some(resp)) => {
-                                        view! { <TextResultsLayout resp=resp state=st /> }
-                                            .into_any()
-                                    }
-                                    // Requête vide arrivée jusqu'au resource : ce bras couvre la frame où l'URL
-                                    // vient de se vider.
-                                    Ok(None) => view! { <TextSearchPrompt /> }.into_any(),
-                                    Err(msg) => {
-                                        view! {
-                                            <p class="text-sm text-[var(--color-ink-subtle)]">
-                                                {format!("Recherche indisponible ({msg}).")}
-                                            </p>
-                                        }
-                                            .into_any()
-                                    }
+                <div class="flex min-w-0 flex-col gap-4">
+                    <TextesFilterBar facets=facets state=state />
+                    <TextesActiveChips facets=facets state=state />
+                    <Suspense fallback=move || {
+                        view! {
+                            <p class="text-sm text-[var(--color-ink-subtle)]">"Recherche…"</p>
+                        }
+                    }>
+                        {move || Suspend::new(async move {
+                            let st = state.get_untracked();
+                            match results.await {
+                                Ok(resp) => {
+                                    view! { <TextResultsLayout resp=resp state=st /> }.into_any()
                                 }
-                            })}
-                        </Suspense>
-                    </div>
-                </Show>
+                                Err(failure) => {
+                                    view! {
+                                        <div role="alert" class="text-sm">
+                                            <p class="text-[var(--color-accent)]">{failure.title}</p>
+                                            <p class="mt-1 text-[var(--color-ink-subtle)]">
+                                                {failure.hint}
+                                            </p>
+                                        </div>
+                                    }
+                                        .into_any()
+                                }
+                            }
+                        })}
+                    </Suspense>
+                </div>
             </div>
-            // Colonne droite : volumétrie, aide à la recherche, puis pont croisé vers le
-            // moteur décisions. Requête vide, les trois emplacements sont remplis par leur
-            // pendant corpus, dans le même gabarit. Sous lg la colonne disparaît.
+            // Colonne droite : volumétrie, aide à la recherche, puis pont croisé vers
+            // le moteur décisions. Sans question à poser, le pont montre le fonds
+            // jurisprudentiel. Sous lg la colonne disparaît.
             <aside aria-label="Voir aussi" class=SIDE_RAIL>
                 <div class="flex flex-col gap-4">
-                    <Show
-                        when=move || has_query.get()
-                        fallback=move || view! { <TextesCorpusSummary stats=stats /> }
-                    >
-                        <TextesSummary query=query volume=volume />
-                    </Show>
+                    <TextesSummary query=query volume=shown_volume />
                     <div class="flex self-start">
                         <SyntaxHint corpus=HelpCorpus::Textes />
                     </div>
@@ -232,31 +226,54 @@ pub fn TextesView() -> impl IntoView {
 }
 
 /// Volumétrie desktop, en tête de la colonne droite : « N résultats / pour
-/// « q » », ou l'état d'attente tant que la réponse n'est pas arrivée.
+/// « q » », ou l'état d'attente tant que la réponse n'est pas arrivée. En
+/// parcours il n'y a pas de question, donc pas de ligne « pour ».
 #[component]
 fn TextesSummary(
     #[prop(into)] query: Signal<String>,
     #[prop(into)] volume: Signal<Option<i64>>,
 ) -> impl IntoView {
     move || {
+        let q = query.get();
         let Some(total) = volume.get() else {
+            if q.is_empty() {
+                return view! {
+                    <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">
+                        "Chargement du fonds…"
+                    </h2>
+                }
+                .into_any();
+            }
             return view! {
                 <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">
                     "Recherche en cours pour "
-                    <em class="not-italic">"«\u{00A0}"{move || query.get()}"\u{00A0}»"</em>
+                    <em class="not-italic">"«\u{00A0}"{q}"\u{00A0}»"</em>
                     "…"
                 </h2>
             }
             .into_any();
         };
+        if q.is_empty() {
+            return view! {
+                <div class="flex flex-col gap-1">
+                    <h2 class="font-sans text-xl text-[var(--color-ink)]">
+                        {format_results_count(total)}
+                    </h2>
+                    <p class="text-xs text-[var(--color-ink-subtle)]">
+                        "Articles en vigueur, par entrée en vigueur"
+                    </p>
+                </div>
+            }
+            .into_any();
+        }
         view! {
             <div class="flex flex-col gap-1">
                 <h2 class="font-sans text-xl text-[var(--color-ink)]">
-                    {format_results_count_exact(total)}
+                    {format_results_count(total)}
                 </h2>
                 <p class="text-sm leading-snug text-[var(--color-ink-subtle)]">
                     "pour "
-                    <em class="text-[var(--color-ink)]">"«\u{00A0}"{move || query.get()}"\u{00A0}»"</em>
+                    <em class="text-[var(--color-ink)]">"«\u{00A0}"{q}"\u{00A0}»"</em>
                 </p>
                 <p class="text-xs text-[var(--color-ink-subtle)]">"Articles et textes en vigueur"</p>
             </div>
@@ -270,7 +287,7 @@ fn TextesSummary(
 #[component]
 fn TextResultsLayout(resp: ArticleSearchResponse, state: TextesQuery) -> impl IntoView {
     let total = resp.total;
-    let pages = total_pages(total, TEXTES_LIMIT as i64, MAX_PAGES_DISPLAY) as u32;
+    let pages = total_pages(total) as u32;
     let page = state.page;
     let query = state.q.clone();
     let hits = resp.hits;
@@ -289,11 +306,13 @@ const RAIL_ROWS: usize = 5;
 /// Rail gauche de `/textes` : blocs de facettes cliquables (Portée, Nature,
 /// Juridictions, Sources). Chaque clic passe par la même mutation d'URL
 /// mono-sélection que les dropdowns de la barre (valeur active ⇒ re-clic la
-/// retire, retour page 1).
+/// retire, retour page 1). `loading` = les facettes en main répondent à une
+/// autre question : lignes muettes plutôt que faux résumé.
 #[component]
 fn TextesRail(
     #[prop(into)] facets: Signal<Option<ArticleSearchFacets>>,
     #[prop(into)] state: Signal<TextesQuery>,
+    #[prop(into)] loading: Signal<bool>,
 ) -> impl IntoView {
     let scopes = move || {
         rail_facet_block(
@@ -322,21 +341,33 @@ fn TextesRail(
     let sources = move || {
         rail_facet_block(
             "Sources",
-            "origine",
+            "source",
             facets.get().map(|f| f.source).unwrap_or_default(),
-            state.get().origine,
+            state.get().source,
         )
     };
 
-    // Le premier bloc rendu perd son filet haut (pas de séparateur au-dessus
-    // du premier bloc d'une colonne) ; les suivants gardent le leur.
-    view! {
-        <div class="flex flex-col gap-4 [&>div:first-child]:border-t-0 [&>div:first-child]:pt-0">
-            {scopes}
-            {natures}
-            {jurisdictions}
-            {sources}
-        </div>
+    move || {
+        if loading.get() {
+            return view! {
+                <div class=RAIL_COLUMN>
+                    {skeleton_block("Portée", skeleton_rows(RAIL_ROWS))}
+                    {skeleton_block("Nature", skeleton_rows(RAIL_ROWS))}
+                    {skeleton_block("Juridictions", skeleton_rows(RAIL_ROWS))}
+                    {skeleton_block("Sources", skeleton_rows(RAIL_ROWS))}
+                </div>
+            }
+            .into_any();
+        }
+        view! {
+            <div class=RAIL_COLUMN>
+                {scopes}
+                {natures}
+                {jurisdictions}
+                {sources}
+            </div>
+        }
+        .into_any()
     }
 }
 
@@ -353,11 +384,13 @@ fn rail_facet_block(
     }
     let query_map = use_query_map();
     let nav = Nav::new();
+    let stale = stale_counts();
     let rows = choices
         .into_iter()
         .take(RAIL_ROWS)
         .map(|c| {
             let is_active = active.as_deref() == Some(c.value.as_str());
+            let count = c.count;
             let label_class = if is_active {
                 "truncate text-[13px] leading-snug font-medium text-[var(--color-bordeaux)]"
             } else {
@@ -384,9 +417,11 @@ fn rail_facet_block(
                     }
                 >
                     <span class=label_class>{c.label.clone()}</span>
-                    <span class="shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]">
-                        {group_thousands(c.count)}
-                    </span>
+                    <Show when=move || !stale.get()>
+                        <span class="shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]">
+                            {group_thousands(count)}
+                        </span>
+                    </Show>
                 </button>
             }
         })
@@ -462,16 +497,16 @@ fn TextesFilterBar(
                 />
             </FilterDropdown>
             <FilterDropdown
-                id="origine"
+                id="source"
                 label="Source"
-                active_count=Signal::derive(move || usize::from(state.get().origine.is_some()))
+                active_count=Signal::derive(move || usize::from(state.get().source.is_some()))
             >
                 <MonoFacetList
-                    url_key="origine"
+                    url_key="source"
                     choices=Signal::derive(move || {
                         facets.get().map(|f| f.source).unwrap_or_default()
                     })
-                    active=Signal::derive(move || state.get().origine)
+                    active=Signal::derive(move || state.get().source)
                 />
             </FilterDropdown>
         </div>
@@ -489,6 +524,7 @@ fn MonoFacetList(
 ) -> impl IntoView {
     let query_map = use_query_map();
     let nav = Nav::new();
+    let stale = stale_counts();
     let select = move |value: String, is_active: bool| {
         let next = if is_active {
             query_state::with_param(&query_map.get_untracked(), url_key, None, true)
@@ -509,6 +545,7 @@ fn MonoFacetList(
                 value: a,
                 count: 0,
                 parent: None,
+                hint: None,
             })
             .into_iter()
             .collect();
@@ -557,7 +594,7 @@ fn MonoFacetList(
                             class=row_class
                         >
                             <span class="flex-1 truncate leading-tight">{row_label}</span>
-                            <Show when=move || { row_count.get() > 0 }>
+                            <Show when=move || { row_count.get() > 0 && !stale.get() }>
                                 <span class="tabular-nums text-xs text-[var(--color-ink-subtle)]">
                                     {move || row_count.get()}
                                 </span>
@@ -604,9 +641,9 @@ fn TextesActiveChips(
             let label = resolve(facets.as_ref().map(|f| f.nature.as_slice()), &v);
             out.push(("nature", v, label));
         }
-        if let Some(v) = state.origine {
+        if let Some(v) = state.source {
             let label = resolve(facets.as_ref().map(|f| f.source.as_slice()), &v);
-            out.push(("origine", v, label));
+            out.push(("source", v, label));
         }
         if let Some(v) = state.scope {
             let label = resolve(facets.as_ref().map(|f| f.scope.as_slice()), &v);
@@ -706,7 +743,7 @@ fn TextHit(hit: ArticleSearchHit, index: usize, page: u32) -> impl IntoView {
     } else {
         format!("/texte/{}/{}", hit.code, hit.num_key)
     };
-    let position = (page as usize - 1) * TEXTES_LIMIT as usize + index + 1;
+    let position = (page as usize - 1) * SEARCH_PAGE_SIZE as usize + index + 1;
     let numeral = format!("{position:02}");
     // Fil d'ariane LEGI compacté aux deux derniers échelons : ils situent
     // l'article, le chemin complet (Partie > Livre > Titre > …) noie le hit.
@@ -934,21 +971,24 @@ fn humanize_slug(slug: &str) -> String {
     s
 }
 
-/// Invite initiale (requête vide).
-#[component]
-fn TextSearchPrompt() -> impl IntoView {
-    view! {
-        <div class="flex flex-col items-start gap-3">
-            <h2 class="font-sans text-2xl text-[var(--color-ink)]">
-                "Cherchez dans le texte des normes."
-            </h2>
-            <p class="max-w-prose text-[var(--color-ink-muted)]">
-                "Codes, lois et règlements, conventions collectives, doctrine "
-                "administrative (BOFiP, circulaires). Saisissez une notion ou un "
-                "numéro d'article ; les articles en vigueur les plus pertinents "
-                "s'affichent, avec un lien vers leur page versionnée."
-            </p>
-            <TextesExamples />
-        </div>
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// La page parcourt le même ensemble : ses nombres ne se taisent pas.
+    #[test]
+    fn count_key_ignore_la_page() {
+        let base = TextesQuery::default();
+        let page4 = TextesQuery {
+            page: 4,
+            ..base.clone()
+        };
+        assert_eq!(base.count_key(), page4.count_key());
+
+        let filtre = TextesQuery {
+            nature: Some("CODE".to_string()),
+            ..base.clone()
+        };
+        assert_ne!(base.count_key(), filtre.count_key());
     }
 }

@@ -32,6 +32,8 @@ type PartyFingerprint = (
     Option<String>,
     Option<String>,
     Option<i32>,
+    Option<i32>,
+    Option<i32>,
     Option<Vec<i32>>,
     Option<Vec<i32>>,
 );
@@ -46,13 +48,16 @@ fn fingerprint(r: &DecisionPartyRow) -> PartyFingerprint {
         r.barreau.clone(),
         r.role.clone(),
         r.firm_ord,
+        r.party_ord,
+        r.sub_ord,
         Some(r.char_starts.clone()),
         Some(r.char_ends.clone()),
     )
 }
 
 const COPY_SQL: &str = "COPY decision_party (decision_id, ord, quality, side, value, \
-     resolve_key, char_starts, char_ends, nature, barreau, role, firm_ord, extract_version) \
+     resolve_key, char_starts, char_ends, nature, barreau, role, firm_ord, party_ord, \
+     sub_ord, extract_version) \
      FROM STDIN (FORMAT binary)";
 const COPY_TYPES: &[Type] = &[
     Type::INT8,
@@ -66,6 +71,8 @@ const COPY_TYPES: &[Type] = &[
     Type::TEXT,
     Type::TEXT,
     Type::TEXT,
+    Type::INT4,
+    Type::INT4,
     Type::INT4,
     Type::INT2,
 ];
@@ -113,7 +120,7 @@ impl DecisionRepository<'_> {
             .conn
             .query(
                 "SELECT decision_id, quality, side, value, resolve_key, nature, barreau, \
-                        role, firm_ord, char_starts, char_ends \
+                        role, firm_ord, party_ord, sub_ord, char_starts, char_ends \
                  FROM decision_party \
                  WHERE decision_id = ANY($1) AND extract_version <= $2",
                 &[&ids, &lj_core::EXTRACT_VERSION],
@@ -132,6 +139,8 @@ impl DecisionRepository<'_> {
                 row.get(8),
                 row.get(9),
                 row.get(10),
+                row.get(11),
+                row.get(12),
             ));
         }
         let empty = HashSet::new();
@@ -204,6 +213,8 @@ impl DecisionRepository<'_> {
                         &r.barreau,
                         &r.role,
                         &r.firm_ord,
+                        &r.party_ord,
+                        &r.sub_ord,
                         &lj_core::EXTRACT_VERSION,
                     ])
                     .await?;

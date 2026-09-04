@@ -10,71 +10,32 @@
 
 use std::collections::HashMap;
 
-/// Contexte de classement : ordre + coloration de la formation (chambre
-/// sociale / prud'hommes, chambre commerciale / tribunal de commerce,
-/// chambre criminelle) — les mêmes articles du code civil colorent
-/// différemment selon la chambre.
+/// Ranking context: the order alone decides what a cited code means.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DomainContext {
+    /// `!is_judiciaire`, never `is_admin`: CONSTIT, TC, CEDH, CJUE, CNDA and
+    /// CNIL vote here as administrative.
     pub admin: bool,
-    pub social: bool,
-    pub commercial: bool,
-    pub criminal: bool,
-    /// Chambre civile CC (`civ1`/`civ2`/`civ3`/`ordo`/`mi`) : plancher CIVIL
-    /// quand rien ne vote.
-    pub civil_chamber: bool,
     /// Raffinement TEXTE pour l'ordre admin ([`crate::extract::ProcedureUids::
     /// domain_hint`]) : ne s'applique que si aucun code substantiel ne vote.
     pub hint: Option<&'static str>,
-}
-
-/// Contexte dérivé de la décision : ordre + coloration de chambre, lue sur
-/// le code Judilibre ([`Decision::chamber`] — `soc`, `comm`, `cr` à la CC),
-/// les champs greffe bruts et les axes de formation structurés. Un tribunal
-/// de commerce colore commercial par nature.
-///
-/// [`Decision::chamber`]: lj_core::decision::Decision::chamber
-pub fn context_for(
-    d: &lj_core::decision::Decision,
-    axes: &crate::formation::FormationAxes,
-    hint: Option<&'static str>,
-) -> DomainContext {
-    let blob = crate::compiled::fold_stable(&format!(
-        "{} {} {} {}",
-        d.formation.as_deref().unwrap_or(""),
-        d.chamber.as_deref().unwrap_or(""),
-        axes.chamber_uid.unwrap_or(""),
-        axes.chamber_position.as_deref().unwrap_or("")
-    ));
-    let code = d.chamber.as_deref().map(str::trim).unwrap_or("");
-    let judiciaire = crate::extract::is_judiciaire(d);
-    DomainContext {
-        admin: !judiciaire,
-        social: code == "soc" || blob.contains("social") || blob.contains("prud"),
-        commercial: code == "comm"
-            || d.jurisdiction_type.as_deref() == Some("TCOM")
-            || blob.contains("commer"),
-        // Coloration JUDICIAIRE seulement : CRIMINEL n'existe pas dans l'ordre
-        // admin.
-        criminal: judiciaire
-            && (code == "cr" || blob.contains("criminel") || blob.contains("correctionnel")),
-        civil_chamber: matches!(code, "civ1" | "civ2" | "civ3" | "ordo" | "mi"),
-        hint,
-    }
 }
 
 /// Codes procéduraux/génériques : présence = contentieux devant l'ordre,
 /// pas un domaine — mais leur seule présence autorise le fallback PUBLIC.
 const GENERIC_ADMIN: &[&str] = &["LEGITEXT000006070933", "LEGITEXT000031366350"];
 
-/// Raffine par les votes de TERMES du scan ([`crate::scan::DocScan::
-/// domain_term_votes`]) un domaine ABSENT ou parent nu (PUBLIC / CIVIL /
-/// SOCIAL / COMMERCIAL) : gagnant à ≥ 2 occurrences ET ≥ 2× le second, même
-/// parent que l'existant. Cas particulier : CIVIL_DROIT_RESPONSABILITE_
-/// CONTRATS — la plage « obligations » par défaut du code civil — se
-/// sur-classe à seuil RENFORCÉ (≥ 5 occurrences, ≥ 3× le second, parent
-/// CIVIL ou COMMERCIAL) : un prêt qui cite 1103/1343 reste du bancaire.
-/// Les autres sous-domaines posés par les codes cités sont intouchables.
+/// Refines by the TERM votes of the scan ([`crate::scan::DocScan::
+/// domain_term_votes`]). The text vocabulary is the only reading left of what
+/// the chamber used to colour, so its mandate covers three regimes:
+///
+/// - domain ABSENT or bare parent (PUBLIC / CIVIL / SOCIAL / COMMERCIAL):
+///   winner at >= 2 occurrences AND >= 2x the runner-up, under that parent;
+/// - the default « obligations » range of the civil code: reinforced
+///   threshold (>= 5, >= 3x), and it may leave for CIVIL, COMMERCIAL or
+///   SOCIAL, an employment contract being written before it is cited;
+/// - any other sub-domain posed by the cited codes: same reinforced
+///   threshold, and only for a sibling of the SAME parent.
 pub fn refine_with_terms(current: Option<String>, votes: &[(&'static str, u32)]) -> Option<String> {
     const PARENTS: &[&str] = &["PUBLIC", "CIVIL", "SOCIAL", "COMMERCIAL"];
     const SOFT_DEFAULT: &str = "CIVIL_DROIT_RESPONSABILITE_CONTRATS";
@@ -82,25 +43,23 @@ pub fn refine_with_terms(current: Option<String>, votes: &[(&'static str, u32)])
         .as_deref()
         .map(|u| u.strip_prefix("legal_domain:").unwrap_or(u));
     let soft = key == Some(SOFT_DEFAULT);
-    if key.is_some_and(|k| !soft && !PARENTS.contains(&k)) {
-        return current;
-    }
+    let firm = key.is_some_and(|k| !soft && !PARENTS.contains(&k));
     let mut sorted: Vec<_> = votes.to_vec();
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
     let Some(&(winner, n)) = sorted.first() else {
         return current;
     };
     let second = sorted.get(1).map_or(0, |x| x.1);
-    let (min_n, ratio) = if soft { (5, 3) } else { (2, 2) };
+    let (min_n, ratio) = if soft || firm { (5, 3) } else { (2, 2) };
     if n < min_n || n < ratio * second {
         return current;
     }
     let parent_ok = match key {
         None => true,
         Some(SOFT_DEFAULT) => {
-            winner != SOFT_DEFAULT
-                && (winner.starts_with("CIVIL") || winner.starts_with("COMMERCIAL"))
+            winner != SOFT_DEFAULT && matches!(parent(winner), "CIVIL" | "COMMERCIAL" | "SOCIAL")
         }
+        Some(k) if firm => parent(winner) == parent(k),
         Some(k) => winner.starts_with(k),
     };
     if !parent_ok {
@@ -439,22 +398,7 @@ pub fn legal_domain_uid<'a>(
         // départage déterministe : poids, puis ordre lexical inverse (stable).
         .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .map(|(domain, _)| domain);
-    // La chambre colore les votes génériques du code civil : les obligations
-    // devant la chambre commerciale sont du contentieux commercial, devant
-    // la chambre sociale du contrat de travail ; l'action civile devant la
-    // chambre criminelle reste du contentieux pénal.
     let winner = match winner {
-        Some(_) if ctx.criminal => Some("CRIMINEL"),
-        Some("CIVIL_DROIT_RESPONSABILITE_CONTRATS" | "CIVIL") if ctx.commercial => {
-            Some("COMMERCIAL_DROIT_CONTRATS")
-        }
-        Some("CIVIL_DROIT_RESPONSABILITE_CONTRATS" | "CIVIL") if ctx.social => {
-            Some("SOCIAL_DROIT_TRAVAIL")
-        }
-        None if ctx.criminal => Some("CRIMINEL"),
-        None if ctx.social => Some("SOCIAL_DROIT_TRAVAIL"),
-        None if ctx.commercial => Some("COMMERCIAL"),
-        None if ctx.civil_chamber => Some("CIVIL"),
         // Vote muet ou générique en admin : le vocabulaire du texte raffine.
         None | Some("PUBLIC") if ctx.admin && ctx.hint.is_some() => ctx.hint,
         // Contentieux administratif sans texte substantiel : générique.
@@ -669,9 +613,28 @@ mod tests {
             refine_with_terms(None, &votes).as_deref(),
             Some("legal_domain:CIVIL_DROIT_LOCATIF")
         );
+        // A firm leaf now yields to a sibling of the same parent, at the
+        // reinforced threshold: 5 occurrences, 3x the runner-up. Measured on
+        // the bench: +9 correct, -9 wrong.
         assert_eq!(
             refine_with_terms(Some("legal_domain:CIVIL_DROIT_ASSURANCES".into()), &votes)
                 .as_deref(),
+            Some("legal_domain:CIVIL_DROIT_LOCATIF")
+        );
+        assert_eq!(
+            refine_with_terms(
+                Some("legal_domain:CIVIL_DROIT_ASSURANCES".into()),
+                &[("CIVIL_DROIT_LOCATIF", 4), ("CIVIL_DROIT_SUCCESSIONS", 1)]
+            )
+            .as_deref(),
+            Some("legal_domain:CIVIL_DROIT_ASSURANCES")
+        );
+        assert_eq!(
+            refine_with_terms(
+                Some("legal_domain:CIVIL_DROIT_ASSURANCES".into()),
+                &[("COMMERCIAL_DROIT_CONTRATS", 9)]
+            )
+            .as_deref(),
             Some("legal_domain:CIVIL_DROIT_ASSURANCES")
         );
         assert_eq!(
@@ -685,40 +648,6 @@ mod tests {
                 &[("CIVIL_DROIT_LOCATIF", 3), ("CIVIL_DROIT_SUCCESSIONS", 2)]
             ),
             None
-        );
-    }
-
-    #[test]
-    fn chamber_criminelle_recolore_l_action_civile() {
-        let cites = || vec![("LEGITEXT000006070721", Some("1240"))];
-        let cr = DomainContext {
-            criminal: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            legal_domain_uid(cites(), cr).as_deref(),
-            Some("legal_domain:CRIMINEL")
-        );
-        assert_eq!(
-            legal_domain_uid(cites(), DomainContext::default()).as_deref(),
-            Some("legal_domain:CIVIL_DROIT_RESPONSABILITE")
-        );
-        assert_eq!(
-            legal_domain_uid(vec![], cr).as_deref(),
-            Some("legal_domain:CRIMINEL")
-        );
-    }
-
-    #[test]
-    fn tcom_colore_les_obligations_en_commercial() {
-        let cites = vec![("LEGITEXT000006070721", Some("1103"))];
-        let ctx = DomainContext {
-            commercial: true,
-            ..Default::default()
-        };
-        assert_eq!(
-            legal_domain_uid(cites, ctx).as_deref(),
-            Some("legal_domain:COMMERCIAL_DROIT_CONTRATS")
         );
     }
 

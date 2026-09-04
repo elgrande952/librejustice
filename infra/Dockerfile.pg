@@ -1,7 +1,7 @@
 # Image de base ParadeDB pinnée (pg_search + pgvector + pg_cron). Jamais
 # `:latest` : un bump demande un `ALTER EXTENSION pg_search UPDATE` dans la base
 # et une revérification des hypothèses de pushdown à l'EXPLAIN.
-ARG PARADEDB_VERSION=0.24.3
+ARG PARADEDB_VERSION=0.25.6
 ARG PG_MAJOR=18
 FROM docker.io/paradedb/paradedb:${PARADEDB_VERSION}-pg${PG_MAJOR}
 

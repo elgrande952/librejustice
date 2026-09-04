@@ -5,15 +5,11 @@
 //! acronymes/civilités. Purement cosmétique, côté affichage : n'altère ni le
 //! texte source stocké ni l'index BM25 (lui-même lowercasé/ascii-foldé).
 //!
-//! Désambiguïsation contextuelle des homographes que le filtre de dominance
-//! laisse sans accent, tranchée sur les mots voisins repliés :
-//! - `a` (auxiliaire) / `à` (préposition) — cf. `disambiguate_a` ;
-//! - `ou`/`où`, `des`/`dès`, `du`/`dû` — cf. `disambiguate_closed` ;
-//! - participe `-é` homographe d'un présent/nom (« condamne »/« condamné »,
-//!   « arrête »/« arrêté »), y compris adjectival sans auxiliaire (« l'arrêt
-//!   attaqué ») : tranché par un modèle contextuel appris hors-ligne sur le corpus
-//!   (cf. `PARTICIPLE_CTX`), avec repli sur la règle auxiliaire
-//!   (`participle_fires`) pour les formes hors-modèle.
+//! Les homographes que le filtre de dominance laisse sans accent sont tranchés
+//! sur les mots voisins repliés : `a`/`à` (`disambiguate_a`), `ou`/`où`,
+//! `des`/`dès`, `du`/`dû` (`disambiguate_closed`), et le participe `-é`
+//! homographe d'un présent ou d'un nom, par un modèle contextuel appris
+//! hors-ligne (`PARTICIPLE_CTX`) avec repli sur la règle auxiliaire.
 //!
 //! Pas de noms de personnes.
 

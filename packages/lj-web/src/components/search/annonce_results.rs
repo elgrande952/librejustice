@@ -25,18 +25,16 @@ use lj_dtos::{
 
 use crate::api::ApiClient;
 use crate::components::layout::{CONTENT_COL, GRID_3COL, SIDE_RAIL};
-use crate::helpers::{format_results_count_exact, group_thousands, total_pages};
+use crate::helpers::{format_results_count, group_thousands, total_pages, SEARCH_PAGE_SIZE};
 use crate::pages::decision_page::data::sendable;
 
 use super::compact_search::query_state;
-use super::facet_widgets::{scroll_lock_ref, FilterSearchInput, Nav};
+use super::facet_widgets::{stale_counts, FilterSearchInput, Nav, StaleCounts};
 use super::filter_dropdown::{FilterDropdown, OpenDropdown};
 use super::CompactSearch;
 
 /// Annonces ramenées par page et par fond.
-const LIMIT: u32 = 20;
 /// Plafond de pages affichées (le service borne l'offset à 5 000).
-const MAX_PAGES_DISPLAY: i64 = 40;
 /// Lignes par bloc de facettes du rail.
 const RAIL_ROWS: usize = 6;
 /// Au-delà de ce nombre de valeurs, un axe ne se lit plus par le poids : sa
@@ -106,6 +104,16 @@ impl AnnoncesQuery {
         }
     }
 
+    /// Ce dont dépendent le total et les axes : la question et ses filtres, la
+    /// page et le tri parcourant le même ensemble.
+    fn count_key(&self) -> Self {
+        Self {
+            page: 1,
+            sort: None,
+            ..self.clone()
+        }
+    }
+
     /// Valeur active d'un axe, quelle que soit sa clé — le front ne connaît pas
     /// les axes par leur nom, il les lit comme le serveur les déclare.
     fn valeurs(&self, key: &str) -> Vec<String> {
@@ -137,8 +145,8 @@ impl AnnoncesQuery {
                 Some("nouveautes") => AnnonceSort::Nouveautes,
                 _ => AnnonceSort::Echeance,
             },
-            limit: LIMIT,
-            offset: self.page.max(1).saturating_sub(1) * LIMIT,
+            limit: SEARCH_PAGE_SIZE,
+            offset: self.page.max(1).saturating_sub(1) * SEARCH_PAGE_SIZE,
         }
     }
 }
@@ -159,12 +167,19 @@ pub fn AnnoncesView() -> impl IntoView {
     // qu'une page charge.
     let axes = RwSignal::new(Vec::<AnnonceFacetAxis>::new());
     let volume = RwSignal::new(None::<i64>);
+    // État que comptent les nombres en main : filtre changé, ils comptent celui
+    // d'avant le clic, donc ils se taisent le temps de la réponse.
+    let counted = RwSignal::new(None::<AnnoncesQuery>);
     Effect::new(move |_| {
         if let Some(Ok(resp)) = results.get() {
             axes.set(resp.axes);
             volume.set(Some(resp.total));
+            counted.set(Some(state.get_untracked().count_key()));
         }
     });
+    let stale = Memo::new(move |_| counted.get() != Some(state.get().count_key()));
+    provide_context(StaleCounts(stale.into()));
+    let shown_volume = Signal::derive(move || volume.get().filter(|_| !stale.get()));
 
     view! {
         <div class=GRID_3COL>
@@ -176,13 +191,13 @@ pub fn AnnoncesView() -> impl IntoView {
                     <CompactSearch />
                     <div class="flex items-baseline gap-3 lg:hidden">
                         {move || {
-                            volume
+                            shown_volume
                                 .get()
                                 .map(|total| {
                                     view! {
                                         <p class="text-sm text-[var(--color-ink-subtle)]">
                                             <span class="font-medium text-[var(--color-ink)]">
-                                                {format_results_count_exact(total)}
+                                                {format_results_count(total)}
                                             </span>
                                         </p>
                                     }
@@ -214,7 +229,7 @@ pub fn AnnoncesView() -> impl IntoView {
                 </div>
             </div>
             <aside aria-label="Voir aussi" class=SIDE_RAIL>
-                <AnnoncesSummary volume=volume state=state />
+                <AnnoncesSummary volume=shown_volume state=state />
             </aside>
         </div>
     }
@@ -241,7 +256,7 @@ fn AnnoncesSummary(
                     {move || {
                         volume
                             .get()
-                            .map(format_results_count_exact)
+                            .map(format_results_count)
                             .unwrap_or_else(|| "Recherche en cours…".to_string())
                     }}
                 </h2>
@@ -373,6 +388,7 @@ fn rail_block(axe: AnnonceFacetAxis, actives: &[String]) -> AnyView {
     }
     let query_map = use_query_map();
     let nav = Nav::new();
+    let stale = stale_counts();
     let key = axe.key.clone();
     let rows = axe
         .choices
@@ -380,6 +396,7 @@ fn rail_block(axe: AnnonceFacetAxis, actives: &[String]) -> AnyView {
         .take(RAIL_ROWS)
         .map(|c| {
             let is_active = actives.iter().any(|a| a == &c.value);
+            let count = c.count;
             let label_class = if is_active {
                 "truncate text-[13px] leading-snug font-medium text-[var(--color-bordeaux)]"
             } else {
@@ -397,9 +414,11 @@ fn rail_block(axe: AnnonceFacetAxis, actives: &[String]) -> AnyView {
                     }
                 >
                     <span class=label_class>{c.label.clone()}</span>
-                    <span class="shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]">
-                        {group_thousands(c.count)}
-                    </span>
+                    <Show when=move || !stale.get()>
+                        <span class="shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]">
+                            {group_thousands(count)}
+                        </span>
+                    </Show>
                 </button>
             }
         })
@@ -494,6 +513,7 @@ fn FacetList(
 ) -> impl IntoView {
     let query_map = use_query_map();
     let nav = Nav::new();
+    let stale = stale_counts();
     let saisie = RwSignal::new(String::new());
     let rows = Memo::new(move |_| {
         let choices = choices.get();
@@ -506,6 +526,7 @@ fn FacetList(
                 value: a,
                 count: 0,
                 parent: None,
+                hint: None,
             })
             .collect();
         out.extend(choices);
@@ -529,8 +550,7 @@ fn FacetList(
             <FilterSearchInput value=saisie placeholder="Filtrer (ex. Guyane…)" />
         </Show>
         <div
-            node_ref=scroll_lock_ref()
-            class="filter-scroll flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto"
+            class="filter-scroll flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto overscroll-contain"
         >
             <Show when=move || visible.with(|r| r.is_empty())>
                 <p class="px-2 py-1 text-xs text-[var(--color-ink-subtle)]">"Aucune valeur"</p>
@@ -581,7 +601,7 @@ fn FacetList(
                             }
                         >
                             <span class="flex-1 truncate leading-tight">{label}</span>
-                            <Show when=move || { count.get() > 0 }>
+                            <Show when=move || { count.get() > 0 && !stale.get() }>
                                 <span class="tabular-nums text-xs text-[var(--color-ink-subtle)]">
                                     {move || group_thousands(count.get())}
                                 </span>
@@ -720,7 +740,7 @@ fn AnnoncesResults(resp: AnnonceSearchResponse, state: AnnoncesQuery) -> impl In
     }
     let seul = resp.groupes.len() == 1;
     let pages = if seul {
-        total_pages(resp.groupes[0].total, LIMIT as i64, MAX_PAGES_DISPLAY) as u32
+        total_pages(resp.groupes[0].total) as u32
     } else {
         0
     };
@@ -902,6 +922,24 @@ mod tests {
         assert!(MULTI_KEYS.contains(&"fond"));
         assert!(!MULTI_KEYS.contains(&"echeanceJours"));
         assert!(FILTER_KEYS.contains(&"fond"));
+    }
+
+    /// Page et tri parcourent le même ensemble : leurs nombres ne se taisent pas.
+    #[test]
+    fn count_key_ignore_page_et_tri() {
+        let base = AnnoncesQuery::default();
+        let ailleurs = AnnoncesQuery {
+            page: 4,
+            sort: Some("publication".to_string()),
+            ..base.clone()
+        };
+        assert_eq!(base.count_key(), ailleurs.count_key());
+
+        let filtre = AnnoncesQuery {
+            departement: vec!["75".to_string()],
+            ..base.clone()
+        };
+        assert_ne!(base.count_key(), filtre.count_key());
     }
 
     #[test]

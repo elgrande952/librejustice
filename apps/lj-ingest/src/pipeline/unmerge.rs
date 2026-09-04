@@ -1,24 +1,18 @@
 //! Réparation rétroactive des faux merges **intra-source** judilibre.
 //!
-//! La dédup historique (axe `canonical_ref`) a fusionné des décisions
-//! **distinctes** d'une même source judilibre partageant `numbers`+cour+date (lot
-//! d'audience, RG réutilisé, arrêt sur déférée). Le `full_text` du **perdant** a
-//! été détruit (la ligne `decisions` n'en garde qu'un, l'autorité) → pour le
-//! re-créer il faut son corps de texte. On le relit du **cache local** judilibre
-//! (miroir complet, rangé `<jur>/<AAAAMM-du-decision_date>.jsonl.gz`), sans appel
-//! API. Le cache `compact` retire les tombstonés : une provenance supprimée n'y
-//! est plus, donc jamais re-matérialisée.
+//! Une dédup sur `canonical_ref` a fusionné des décisions distinctes partageant
+//! `numbers`+cour+date (lot d'audience, RG réutilisé, arrêt sur déférée). Le
+//! texte du perdant a été détruit : on le relit du cache local judilibre, sans
+//! appel API. Le cache `compact` retire les tombstonés, donc une provenance
+//! supprimée n'est jamais re-matérialisée.
 //!
-//! Passe, par perdante, inverse d'une fusion :
-//! 1. `create_split_decision([loser_uid])` : détache la provenance perdante vers
-//!    une **nouvelle** décision squelette (l'autorité `rn=1` reste sur l'origine,
-//!    son texte y est déjà) ;
-//! 2. relit le payload du perdant dans son fichier cache et `drain_batch_in_txn`
-//!    (`IngestMode::All`, re-chunk + re-embed **vLLM strict**) le matérialise sur
-//!    la décision scindée. Split + matérialisation **dans une seule transaction**.
+//! Par perdante, inverse d'une fusion :
+//! 1. `create_split_decision` détache la provenance vers une décision squelette,
+//!    l'autorité `rn=1` restant sur l'origine ;
+//! 2. le payload relu du cache la matérialise (re-chunk + re-embed **local
+//!    strict**). Les deux **dans une seule transaction**.
 //!
-//! `--dry-run` (défaut CLI) : compte seulement (cache-hit/miss), aucune écriture,
-//! aucun GPU. `--limit N` : rollout borné.
+//! `--dry-run` (défaut) : compte seulement, aucune écriture, aucun GPU.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
@@ -29,7 +23,7 @@ use serde_json::Value;
 use lj_store::repository::DecisionRepository;
 
 use super::batch::drain_batch_in_txn;
-use super::embed::build_vllm_strict;
+use super::embed::build_local_strict;
 use super::files::read_jsonl_gz_lines;
 use super::prepare::classify_judilibre;
 use super::resplit::{provenance_canonical_ref, provenance_jurisdiction_type};
@@ -109,9 +103,8 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
     let repo = DecisionRepository::new(&conn);
     let cache_root = settings.cache_dir().join("judilibre");
 
-    // Re-embed vLLM **strict** (jamais Cloudflare, coût) — seulement en execute.
     let embedder = if execute {
-        Some(build_vllm_strict(&settings).await?)
+        Some(build_local_strict(&settings).await?)
     } else {
         None
     };
@@ -247,7 +240,7 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
     } else {
         "DRY-RUN (read-only)"
     };
-    println!("\n=== unmerge-same-source [{mode}] (ADR 0104) ===");
+    println!("\n=== unmerge-same-source [{mode}] ===");
     println!(
         "perdantes judilibre (rn>1)            : {}",
         stats.losers_total

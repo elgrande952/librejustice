@@ -100,14 +100,25 @@ fn truncate_at_word(text: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// `<meta description>` : phrase 1 du summary (ou fallback titre), tronquee sur
-/// une frontiere de mot.
+/// `<meta description>` : premier paragraphe du summary (ou fallback titre),
+/// tronque sur une frontiere de mot.
+///
+/// Coupe en milieu de phrase plutot qu'a la phrase 1, qui fait 99 chars de
+/// moyenne sur le corpus (mediane 97) et laisse 40 % du budget SERP inutilise.
 pub fn meta_description(detail: &DecisionDetail, title: &str) -> String {
     let raw = match detail.summary.as_deref() {
-        Some(summary) => first_sentence(summary),
-        None => title.to_string(),
+        Some(summary) => first_paragraph(summary),
+        None => title,
     };
-    truncate_at_word(&raw, META_DESCRIPTION_MAX)
+    truncate_at_word(raw, META_DESCRIPTION_MAX)
+}
+
+/// Texte jusqu'au premier separateur paragraphe `\n\n`.
+fn first_paragraph(summary: &str) -> &str {
+    match summary.find("\n\n") {
+        Some(idx) => summary[..idx].trim_end(),
+        None => summary.trim_end(),
+    }
 }
 
 /// Construit le JSON-LD `@graph` LegalCase + Article.

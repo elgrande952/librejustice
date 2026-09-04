@@ -1,5 +1,5 @@
 {
-"_doc": "Gazetteer CCN (ADR 0123) — conteneurs KALICONT titrés « Convention collective » du fond KALI, titre nettoyé (tête avant statut/extension/avenant/date-JORF). Régén : SELECT text_uid,title FROM legal_text WHERE text_uid LIKE 'KALICONT%' AND title ILIKE 'convention collective%' ; puis clean_title (cf. working-note). Skeleton de matching en Rust.",
+"_doc": "Gazetteer CCN — conteneurs KALICONT titrés « Convention collective » du fond KALI, titre nettoyé (tête avant statut/extension/avenant/date-JORF). Régén : SELECT text_uid,title FROM legal_text WHERE text_uid LIKE 'KALICONT%' AND title ILIKE 'convention collective%' ; puis clean_title. Skeleton de matching en Rust.",
 "conventions": [
 {
 "kalicont": "KALICONT000005635085",

@@ -2,16 +2,13 @@
 //! utilisateur.
 //!
 //! Les handlers axum vivent dans `routes.rs` ; ce module porte la logique
-//! d'accès aux données + Supabase, exposée comme fonctions de service prenant le
-//! pool / l'`AppState`.
+//! d'accès aux données, exposée comme fonctions de service prenant le pool /
+//! l'`AppState`.
 
 use chrono::{DateTime, Utc};
 use deadpool_postgres::Pool;
 use lj_dtos::UserProfile;
-use reqwest_middleware::ClientBuilder;
-use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 
-use crate::config::Settings;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -51,28 +48,6 @@ pub async fn fetch_profile(pool: &Pool, sub: &str) -> Result<UserProfile, ApiErr
 
 /// `GET /me`.
 pub async fn get_me(state: &AppState, user_sub: &str) -> Result<UserProfile, ApiError> {
-    fetch_profile(&state.pool, user_sub).await
-}
-
-/// `PATCH /me` — met à jour le `display_name` puis relit le profil.
-pub async fn patch_me(
-    state: &AppState,
-    user_sub: &str,
-    display_name: Option<&str>,
-) -> Result<UserProfile, ApiError> {
-    {
-        let conn = state
-            .pool
-            .get()
-            .await
-            .map_err(|e| ApiError::Internal(format!("pool: {e}")))?;
-        conn.execute(
-            "UPDATE users SET display_name = $1 WHERE sub = $2",
-            &[&display_name, &user_sub],
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("patch_me: {e}")))?;
-    }
     fetch_profile(&state.pool, user_sub).await
 }
 
@@ -127,58 +102,12 @@ pub async fn set_activity_tracking(
     fetch_profile(&state.pool, user_sub).await
 }
 
-/// Supprime l'utilisateur dans Supabase Auth via l'Admin API.
-///
-/// Requiert `supabase_url` + `supabase_secret_key`. Strictement côté serveur.
-/// 200/204 attendus ; 404 toléré (déjà supprimé → idempotence) ; tout autre code
-/// = 502.
-async fn delete_supabase_user(cfg: &Settings, sub: &str) -> Result<(), ApiError> {
-    let (url_base, key) = match (
-        cfg.supabase_url.as_deref(),
-        cfg.supabase_secret_key.as_deref(),
-    ) {
-        (Some(u), Some(k)) => (u, k),
-        _ => {
-            return Err(ApiError::Internal("account_deletion_unavailable".into()));
-        }
-    };
-    let url = format!(
-        "{}/auth/v1/admin/users/{}",
-        url_base.trim_end_matches('/'),
-        sub
-    );
-    // TracingMiddleware -> span HTTP client pour l'appel Supabase admin en Tempo.
-    let inner = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| ApiError::Internal(format!("supabase http client: {e}")))?;
-    let client = ClientBuilder::new(inner)
-        .with(TracingMiddleware::<SpanBackendWithUrl>::new())
-        .build();
-    let resp = client
-        .delete(&url)
-        .bearer_auth(key)
-        .header("apikey", key)
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(format!("supabase request: {e}")))?;
-    let status = resp.status().as_u16();
-    if !matches!(status, 200 | 204 | 404) {
-        let body = resp.text().await.unwrap_or_default();
-        let body_head: String = body.chars().take(200).collect();
-        tracing::error!(status, body = %body_head, "supabase admin deleteUser failed");
-        return Err(ApiError::Internal("supabase_delete_failed".into()));
-    }
-    Ok(())
-}
-
 /// `DELETE /me` — suppression définitive du compte.
 ///
-/// Ordre : Supabase Auth d'abord (échec → DB locale intacte, l'utilisateur peut
-/// retenter). Puis `DELETE FROM users` qui cascade sur bookmarks / history /
-/// decision_views / mcp_tokens / mcp_auth_codes (ON DELETE CASCADE).
+/// Un seul `DELETE FROM users`, qui cascade sur bookmarks / history /
+/// decision_views / identités / sessions web / mcp_tokens / mcp_auth_codes
+/// (ON DELETE CASCADE).
 pub async fn delete_me(state: &AppState, user_sub: &str) -> Result<(), ApiError> {
-    delete_supabase_user(&state.settings, user_sub).await?;
     let conn = state
         .pool
         .get()

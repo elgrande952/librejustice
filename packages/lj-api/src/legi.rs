@@ -16,9 +16,9 @@ use lj_dtos::{
     ArticleSearchResponse, CitationSpan, CitationTarget, CitingDecisionHit, CoCitedArticle,
     CodeCatalogueEntry, CodeCatalogueResponse, CodeTocResponse, Commentaire, FacetChoice,
     JurisdictionType, LawArticleResponse, LawArticleVersion, LawCodeSummary, LawCompareOp,
-    LawCompareResponse, LawCompareSegment, LawSectionItem, LawSectionRef, LawSectionResponse,
-    LinkedTextRef, ModificationItem, SectionCitingText, Significance, TocEntry, TocNode,
-    TopCitedArticle,
+    LawCompareResponse, LawCompareRow, LawCompareRowKind, LawCompareSegment, LawSectionItem,
+    LawSectionRef, LawSectionResponse, LinkedTextRef, ModificationItem, SectionCitingText,
+    TocEntry, TocNode, TopCitedArticle,
 };
 use lj_store::repository::{
     ArticleNeighborRow, ArticleSearchRow, ArticleSearchStats, CitingDecisionRow,
@@ -232,7 +232,6 @@ fn version_dto(row: LawVersionRow) -> LawArticleVersion {
 async fn article_response(
     state: &AppState,
     repo: &DecisionRepository<'_>,
-    code: &str,
     text: &TextRef,
     article: LegalArticleRow,
     consult_date: &str,
@@ -285,15 +284,21 @@ async fn article_response(
     let travaux_parlementaires = travaux_refs(&links);
     let (modifications, modified_by, cited_by) = link_blocks(links);
     // Commentaires de norme : bundles ancrés sur (texte, article) et sur le texte
-    // entier, forme `commentaires[]` partagée avec la décision. Ancre = le `code`
-    // d'URL (slug) : la clé que la page porte, pas l'identité physique du texte —
+    // entier, forme `commentaires[]` partagée avec la décision. Ancre = le slug
+    // canonique : la clé que la page porte, pas l'identité physique du texte —
     // celle-ci bouge en source.
-    let commentaires = match repo.article_commentaires(code, &article.num_key).await? {
+    let commentaires = match repo
+        .article_commentaires(&text.slug, &article.num_key)
+        .await?
+    {
         Some(v) => serde_json::from_value::<Vec<Commentaire>>(v)
             .map_err(|e| ApiError::Internal(format!("commentaires invalides: {e}")))?,
         None => Vec::new(),
     };
     let date_debut = display_start_date(article.date_debut);
+    let expired = article
+        .date_fin
+        .is_some_and(|f| f < chrono::Utc::now().date_naive());
     let date_fin = article.date_fin.map(|d| d.to_string());
     // Lien « source » unique : l'URL curée si présente (droit étranger, traités),
     // sinon — pour un article natif Légifrance — la page Légifrance versionnée.
@@ -313,7 +318,7 @@ async fn article_response(
         }
         None => None,
     };
-    let source_authority = source_authority(&article.source).label().to_string();
+    let authority = source_authority(&article.source);
     // Titre humain du texte pour l'en-tête « Article N du … » : le `code` d'URL est un
     // slug. Porté par la résolution du slug — même ligne `legal_text`, déjà lue.
     let code_title = text.title.clone();
@@ -334,14 +339,14 @@ async fn article_response(
         .into_iter()
         .map(|(label, cid)| LinkedTextRef {
             label,
-            href: cid.map(|c| format!("/texte/{code}/section/{c}")),
+            href: cid.map(|c| format!("/texte/{}/section/{c}", text.slug)),
             date: None,
         })
         .collect();
     Ok(LawArticleResponse {
         legiarti: article.source_uid,
         legitext: article.text_uid,
-        code: code.to_string(),
+        code: text.slug.clone(),
         code_title,
         num: article.num,
         num_key: article.num_key,
@@ -351,13 +356,15 @@ async fn article_response(
         titre_text: article.title_path,
         breadcrumb,
         date_fin,
+        expired,
         texte: article.texte,
         texte_spans,
         texte_original: article.texte_original,
         lang_original: article.lang_original,
         translation: article.translation,
         source_asof,
-        source_authority,
+        source_authority: authority.label().to_string(),
+        source_official: authority.is_official(),
         source_url,
         source_upstream_url: article.source_upstream_url,
         nota: article.nota,
@@ -414,17 +421,20 @@ fn neighbor_dto(row: ArticleNeighborRow) -> ArticleNeighbor {
 }
 
 /// Identité d'un texte de référentiel résolue depuis son slug d'URL : le
-/// `text_uid` qui clé toutes les requêtes en aval, et le titre humain de
-/// l'en-tête. Valeur du cache [`AppState::text_ref_cache`], partagée par `Arc`.
+/// `text_uid` qui clé toutes les requêtes en aval, le **slug canonique** que
+/// portent les DTO, et le titre humain de l'en-tête. Valeur du cache
+/// [`AppState::text_ref_cache`], partagée par `Arc`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextRef {
     pub text_uid: String,
+    pub slug: String,
     pub title: Option<String>,
 }
 
-/// Résout le `code` d'URL en identité de texte de référentiel par lookup
-/// **exact** du slug. 404 si le slug est inconnu : nos liens internes portent le
-/// slug canonique (DTO).
+/// Résout le `code` d'URL en identité de texte de référentiel. Le lookup suit
+/// les renommages de slug : le DTO rend alors le slug d'aujourd'hui,
+/// et la page SSR, qui lit l'écart avec l'URL demandée, répond 301. 404 si le
+/// slug n'est ni vivant ni redirigé.
 ///
 /// Servi depuis le cache in-process (TTL 1 h) : le référentiel ne bouge qu'à
 /// l'ingest.
@@ -439,7 +449,13 @@ async fn resolve_text(
     let found = repo
         .referential_ref(code)
         .await?
-        .map(|(text_uid, title)| Arc::new(TextRef { text_uid, title }));
+        .map(|(text_uid, slug, title)| {
+            Arc::new(TextRef {
+                text_uid,
+                slug,
+                title,
+            })
+        });
     state
         .text_ref_cache
         .insert(code.to_string(), found.clone())
@@ -465,6 +481,115 @@ async fn ingest_freshness(
     Ok(asof)
 }
 
+/// Version d'un article à une date, `None` valant « en vigueur », clé compacte
+/// rattrapée (`l80a` pour `l80-a`) et motif à la place du `not_found` muet.
+///
+/// Rend la clé servie : timeline, contexte et URL doivent porter la même, sinon
+/// la réponse mélange deux articles.
+async fn served_version(
+    repo: &DecisionRepository<'_>,
+    text_uid: &str,
+    num_key: &str,
+    date: Option<NaiveDate>,
+) -> Result<(String, LegalArticleRow)> {
+    if let Some(article) = repo.law_article_at_date(text_uid, num_key, date).await? {
+        return Ok((num_key.to_string(), article));
+    }
+    let separee = lj_core::article_key::letter_suffix_separated(num_key);
+    if let Some(cle) = &separee {
+        if let Some(article) = repo.law_article_at_date(text_uid, cle, date).await? {
+            tracing::info!(demande = num_key, servi = %cle, "article : clé rattrapée");
+            return Ok((cle.clone(), article));
+        }
+    }
+    if let Some(cle) = lj_core::article_key::without_spoken_word(num_key) {
+        if let Some(article) = repo.law_article_at_date(text_uid, cle, date).await? {
+            tracing::info!(demande = num_key, servi = %cle, "article : clé rattrapée");
+            return Ok((cle.to_string(), article));
+        }
+    }
+    let mut cle = num_key.to_string();
+    let mut versions = repo.law_article_versions(text_uid, num_key).await?;
+    if versions.is_empty() {
+        if let Some(c) = &separee {
+            versions = repo.law_article_versions(text_uid, c).await?;
+            cle = c.clone();
+        }
+    }
+    // Asymétrie voulue : après la dernière fenêtre, le texte tel qu'il a cessé de
+    // s'appliquer répond. Avant la première, servir la plus ancienne version
+    // l'appliquerait à des faits qu'elle ne régissait pas, donc erreur.
+    if let (Some(d), Some(fin)) = (date, derniere_fin(&versions)) {
+        if d > fin {
+            if let Some(article) = repo
+                .law_article_last_version_before(text_uid, &cle, d)
+                .await?
+            {
+                return Ok((cle, article));
+            }
+        }
+    }
+    Err(no_version_error(&versions, date))
+}
+
+/// Fin de la dernière fenêtre de validité, `None` si une version court toujours
+/// ou si aucune n'est bornée.
+fn derniere_fin(versions: &[LawVersionRow]) -> Option<NaiveDate> {
+    if versions.iter().any(|v| v.date_fin.is_none()) {
+        return None;
+    }
+    versions
+        .iter()
+        .filter_map(|v| v.date_fin.as_deref())
+        .filter_map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .max()
+}
+
+/// Motif d'une lecture qui ne rend rien, à partir du seul jeu de versions.
+///
+/// Une version `VIGUEUR*` sans couverture de la date est une incohérence de
+/// notre stock, pas une abrogation : sur les 8 échecs mesurés de la semaine du
+/// 22/08/2026, 5 étaient de cette forme. Le message n'y affirme donc rien du
+/// droit.
+fn no_version_error(versions: &[LawVersionRow], date: Option<NaiveDate>) -> ApiError {
+    if versions.is_empty() {
+        return ApiError::NotFound;
+    }
+    let debut = versions
+        .iter()
+        .filter_map(|v| v.date_debut.as_deref())
+        .min();
+    let fin = versions.iter().filter_map(|v| v.date_fin.as_deref()).max();
+    if versions.iter().any(|v| v.status.starts_with("VIGUEUR")) {
+        // Date DANS l'intervalle couvert : le trou est chez nous. Hors bornes, il
+        // n'y a rien à réparer, et la lecture en vigueur n'arrive jamais ici,
+        // faute de test de fenêtre.
+        if let (Some(d), Some(a), Some(b)) = (date.map(|d| d.to_string()), debut, fin) {
+            if d.as_str() >= a && d.as_str() <= b {
+                tracing::warn!(
+                    date = %d,
+                    debut = a,
+                    fin = b,
+                    "article : version en vigueur sans couverture"
+                );
+            }
+        }
+        return ApiError::NoVersionAtDate(match (debut, fin) {
+            (Some(a), Some(b)) => format!(
+                "law article exists but no version covers that date \
+                 (known versions span {a} to {b})"
+            ),
+            _ => "law article exists but no version covers that date".to_string(),
+        });
+    }
+    ApiError::NoVersionAtDate(match fin {
+        Some(b) => format!(
+            "law article repealed: no version in force at that date, the last one ran to {b}"
+        ),
+        None => "law article repealed: no version in force at that date".to_string(),
+    })
+}
+
 /// Version en vigueur d'un article (`GET /api/texte/{code}/{num}`), avec sa
 /// timeline. 404 si le code ou l'article n'est pas en vigueur.
 #[instrument(skip(state), fields(db.system = "postgresql", code = %code, num = %num))]
@@ -480,17 +605,13 @@ pub async fn article_in_force(
     let text_uid = &text.text_uid;
     let num_key = &lj_core::article_key::identity_key(num);
 
-    let article = repo
-        .law_article_at_date(text_uid, num_key, None)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let (num_key, article) = served_version(&repo, text_uid, num_key, None).await?;
     let consult_date = date_debut_display(article.date_debut);
-    let versions = repo.law_article_versions(text_uid, num_key).await?;
-    let context = repo.article_context(text_uid, num_key, None).await?;
+    let versions = repo.law_article_versions(text_uid, &num_key).await?;
+    let context = repo.article_context(text_uid, &num_key, None).await?;
     article_response(
         state,
         &repo,
-        code,
         &text,
         article,
         &consult_date,
@@ -517,17 +638,13 @@ pub async fn article_at_date(
     let text_uid = &text.text_uid;
     let num_key = &lj_core::article_key::identity_key(num);
 
-    let article = repo
-        .law_article_at_date(text_uid, num_key, Some(date))
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let (num_key, article) = served_version(&repo, text_uid, num_key, Some(date)).await?;
     let consult_date = date.to_string();
-    let versions = repo.law_article_versions(text_uid, num_key).await?;
-    let context = repo.article_context(text_uid, num_key, Some(date)).await?;
+    let versions = repo.law_article_versions(text_uid, &num_key).await?;
+    let context = repo.article_context(text_uid, &num_key, Some(date)).await?;
     article_response(
         state,
         &repo,
-        code,
         &text,
         article,
         &consult_date,
@@ -650,39 +767,55 @@ pub async fn article_compare(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    let segments = lj_core::compare::compare_texts(
+    let rows = lj_core::compare::align_texts(
         from_row.texte.as_deref().unwrap_or(""),
         to_row.texte.as_deref().unwrap_or(""),
     )
     .into_iter()
-    .map(|s| LawCompareSegment {
-        op: match s.op {
-            lj_core::compare::CompareOp::Equal => LawCompareOp::Equal,
-            lj_core::compare::CompareOp::Insert => LawCompareOp::Insert,
-            lj_core::compare::CompareOp::Delete => LawCompareOp::Delete,
+    .map(|r| LawCompareRow {
+        kind: match r.kind {
+            lj_core::compare::RowKind::Equal => LawCompareRowKind::Equal,
+            lj_core::compare::RowKind::Changed => LawCompareRowKind::Changed,
+            lj_core::compare::RowKind::Added => LawCompareRowKind::Added,
+            lj_core::compare::RowKind::Removed => LawCompareRowKind::Removed,
         },
-        text: s.text,
+        left: r.left.into_iter().map(compare_segment_dto).collect(),
+        right: r.right.into_iter().map(compare_segment_dto).collect(),
     })
     .collect();
 
     let versions = repo.law_article_versions(text_uid, num_key).await?;
     Ok(LawCompareResponse {
-        code: code.to_string(),
+        code: text.slug.clone(),
         code_title: text.title.clone(),
         num: to_row.num.clone(),
         num_key: to_row.num_key.clone(),
         from: row_version_dto(&from_row),
         to: row_version_dto(&to_row),
-        segments,
+        rows,
         versions: versions.into_iter().map(version_dto).collect(),
     })
+}
+
+fn compare_segment_dto(segment: lj_core::compare::CompareSegment) -> LawCompareSegment {
+    LawCompareSegment {
+        op: match segment.op {
+            lj_core::compare::CompareOp::Equal => LawCompareOp::Equal,
+            lj_core::compare::CompareOp::Insert => LawCompareOp::Insert,
+            lj_core::compare::CompareOp::Delete => LawCompareOp::Delete,
+        },
+        text: segment.text,
+    }
 }
 
 /// Convertit une ligne `law_decisions_citing` en DTO citant : le `title`
 /// machine est dérivé des métadonnées (même source que le détail/MCP), le
 /// libellé de repli du type venant du référentiel, la portée du groupe de
 /// `publication_codes`.
-fn citing_dto(row: CitingDecisionRow, refs: &crate::referential::Referential) -> CitingDecisionHit {
+pub(crate) fn citing_dto(
+    row: CitingDecisionRow,
+    refs: &crate::referential::Referential,
+) -> CitingDecisionHit {
     let dockets = row.docket_numbers.filter(|d| !d.is_empty());
     let title = decision_title(
         refs.jurisdiction_type_label(&row.jurisdiction_type)
@@ -690,22 +823,16 @@ fn citing_dto(row: CitingDecisionRow, refs: &crate::referential::Referential) ->
         row.jurisdiction_name.as_deref(),
         None,
         row.date_lecture.as_deref(),
+        None,
         dockets.as_deref(),
     );
     let jurisdiction_type = parse_jur_type(&row.jurisdiction_type).unwrap_or(JurisdictionType::Ta);
-    let significance =
-        match lj_core::publication::significance_key(&row.publication_codes.unwrap_or_default()) {
-            "MAJEURE" => Significance::Majeure,
-            "IMPORTANTE" => Significance::Importante,
-            "LIMITEE" => Significance::Limitee,
-            _ => Significance::Indeterminee,
-        };
     CitingDecisionHit {
         id: row.public_id,
         title,
         jurisdiction_type,
         date_lecture: row.date_lecture,
-        significance,
+        publication_codes: row.publication_codes.unwrap_or_default(),
         summary: row.summary,
         cited_articles: row.cited_num_keys,
     }
@@ -752,10 +879,8 @@ pub async fn article_citing(
 
     // Version servie (même résolution que l'en-tête d'article) → sa fenêtre de
     // validité borne les citantes. `date_debut` NOT NULL en base.
-    let article = repo
-        .law_article_at_date(text_uid, num_key, date)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let (num_key, article) = served_version(&repo, text_uid, num_key, date).await?;
+    let num_key = num_key.as_str();
     let date_debut = article
         .date_debut
         .ok_or_else(|| ApiError::Internal("version d'article sans date_debut".to_string()))?;
@@ -876,6 +1001,49 @@ pub async fn article_co_cited(
         .collect())
 }
 
+/// Relaxed resolution of an URL `code`: slug, text name or acronym. The browser
+/// only ever emits slugs and keeps the exact lookup of [`resolve_text`]; `mcp.rs`
+/// resolves through the same repository call but keeps the candidates, of which
+/// it makes a "did you mean".
+pub async fn resolve_code(state: &AppState, raw: &str) -> Result<String> {
+    use lj_store::repository::InstrumentResolution as R;
+    let conn = state.pool.get().await?;
+    let repo = DecisionRepository::new(&conn);
+    match repo.resolve_instrument(raw).await? {
+        R::Direct { slug, .. } | R::Rattrape { slug, .. } => Ok(slug),
+        R::Inconnu { .. } => Err(ApiError::NotFound),
+    }
+}
+
+/// What `/texte/{code}` answers with no article segment.
+pub enum LawRoot {
+    /// A text with no articles *is* its body (circulaire, publication decree,
+    /// guidelines): 42,563 texts of the corpus, readable no other way.
+    Body(LawCodeSummary),
+    Toc(LawCodeSummary, CodeTocResponse),
+}
+
+pub async fn law_root(state: &AppState, code: &str) -> Result<LawRoot> {
+    let summary = code_summary(state, code).await?;
+    if summary.article_count == 0 && summary.body.is_some() {
+        return Ok(LawRoot::Body(summary));
+    }
+    let toc = code_toc(state, code, None).await?;
+    Ok(LawRoot::Toc(summary, toc))
+}
+
+/// `(code, num_key)` targets of a `LEGIARTI…`. Every version of one article
+/// shares its id, so the id almost always designates a single target.
+pub async fn article_refs_by_source_uid(
+    state: &AppState,
+    uid: &str,
+) -> Result<Vec<(String, String)>> {
+    let conn = state.pool.get().await?;
+    Ok(DecisionRepository::new(&conn)
+        .article_refs_by_source_uid(uid)
+        .await?)
+}
+
 /// Sommaire d'un code (`GET /api/texte/{code}`) : métadonnées + nombre d'articles
 /// en vigueur. 404 si le slug est inconnu.
 #[instrument(skip(state), fields(db.system = "postgresql", code = %code))]
@@ -883,13 +1051,13 @@ pub async fn code_summary(state: &AppState, code: &str) -> Result<LawCodeSummary
     let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
+    // Passe par `resolve_text` pour suivre un renommage de slug : la requête de
+    // sommaire, elle, filtre sur le slug vivant.
+    let slug = resolve_text(state, &repo, code).await?.slug.clone();
     let row = repo
-        .law_code_summary(code)
+        .law_code_summary(&slug)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // `slug` est non-NULL pour un code résolu par son slug (la requête filtre
-    // `WHERE slug = $1`).
-    let slug = row.slug.unwrap_or_else(|| code.to_string());
     let mut upcoming_versions: Vec<String> = row
         .upcoming_versions
         .iter()
@@ -968,8 +1136,11 @@ const ARTICLE_SNIPPET_MAX: usize = 280;
         librejustice.search.source = tracing::field::Empty,
         librejustice.search.query = tracing::field::Empty,
         librejustice.search.identity = tracing::field::Empty,
-        librejustice.search.session = tracing::field::Empty,
-        librejustice.search.context = tracing::field::Empty,
+            librejustice.search.context = tracing::field::Empty,
+        librejustice.search.origin = tracing::field::Empty,
+        librejustice.search.caller = tracing::field::Empty,
+        user_agent.original = tracing::field::Empty,
+        librejustice.search.visit = tracing::field::Empty,
         librejustice.search.page = tracing::field::Empty,
         librejustice.search.filters = tracing::field::Empty,
         librejustice.search.results_count = tracing::field::Empty,
@@ -988,6 +1159,7 @@ pub async fn search_textes(
     limit: i64,
     offset: i64,
     caller: crate::usage::Caller,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
 ) -> Result<ArticleSearchResponse> {
     const ENGINE: lj_dtos::SearchEngine = lj_dtos::SearchEngine::Textes;
     let filters = textes_filters(code, jurisdiction, nature, source, scope, at).to_string();
@@ -996,6 +1168,151 @@ pub async fn search_textes(
         filters: &filters,
     };
     caller.record_span(ENGINE, q, shape);
+    let uncached = || {
+        search_textes_uncached(
+            state,
+            q,
+            code,
+            jurisdiction,
+            nature,
+            source,
+            scope,
+            at,
+            limit,
+            offset,
+            budget_key,
+        )
+    };
+    let key = textes_cache_key(
+        q,
+        code,
+        jurisdiction,
+        nature,
+        source,
+        scope,
+        at,
+        limit,
+        offset,
+    );
+    let mut own_err: Option<ApiError> = None;
+    let mut paye = false;
+    let hit = state
+        .textes_cache
+        .optionally_get_with(key, async {
+            paye = true;
+            match uncached().await {
+                Ok(resp) => Some(std::sync::Arc::new(resp)),
+                Err(err) => {
+                    own_err = Some(err);
+                    None
+                }
+            }
+        })
+        .await;
+    crate::cache_metrics::record_access("textes", !paye);
+    let resp = match (hit, own_err) {
+        (Some(resp), _) => resp,
+        (None, Some(err)) => return Err(err),
+        (None, None) => std::sync::Arc::new(uncached().await?),
+    };
+    caller.record_outcome(ENGINE, q, shape, resp.total);
+    Ok((*resp).clone())
+}
+
+/// Clé du cache textes, fenêtre comprise : le SQL pagine. Des arguments bruts et
+/// jamais de [`textes_filters`], sérialisation d'affichage dont un champ retiré
+/// ferait partager une entrée à deux requêtes distinctes.
+#[allow(clippy::too_many_arguments)]
+fn textes_cache_key(
+    q: &str,
+    code: Option<&str>,
+    jurisdiction: Option<&str>,
+    nature: Option<&str>,
+    source: Option<&str>,
+    scope: Option<&str>,
+    at: Option<chrono::NaiveDate>,
+    limit: i64,
+    offset: i64,
+) -> String {
+    serde_json::json!([
+        q,
+        code,
+        jurisdiction,
+        nature,
+        source,
+        scope,
+        at.map(|d| d.to_string()),
+        limit,
+        offset,
+    ])
+    .to_string()
+}
+
+/// Poids d'une réponse pour le plafond mémoire du cache.
+pub(crate) fn response_weight(resp: &ArticleSearchResponse) -> usize {
+    let hits: usize = resp
+        .hits
+        .iter()
+        .map(|h| {
+            std::mem::size_of::<lj_dtos::ArticleSearchHit>()
+                + h.code.len()
+                + h.code_title.len()
+                + h.num.len()
+                + h.num_key.len()
+                + h.titre_path.as_ref().map_or(0, String::len)
+                + h.snippet.len()
+                + h.source.len()
+                + h.status.as_ref().map_or(0, String::len)
+                + h.date_debut.as_ref().map_or(0, String::len)
+        })
+        .sum();
+    let f = &resp.facets;
+    let facets: usize = [&f.code, &f.jurisdiction, &f.nature, &f.source, &f.scope]
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            std::mem::size_of::<lj_dtos::FacetChoice>()
+                + c.value.len()
+                + c.label.len()
+                + c.parent.as_ref().map_or(0, String::len)
+        })
+        .sum();
+    hits + facets
+}
+
+/// Séparé de [`search_textes`] pour que single-flight, jeton et permit ne portent
+/// que sur le MISS.
+#[allow(clippy::too_many_arguments)]
+async fn search_textes_uncached(
+    state: &AppState,
+    q: &str,
+    code: Option<&str>,
+    jurisdiction: Option<&str>,
+    nature: Option<&str>,
+    source: Option<&str>,
+    scope: Option<&str>,
+    at: Option<chrono::NaiveDate>,
+    limit: i64,
+    offset: i64,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
+) -> Result<ArticleSearchResponse> {
+    if state
+        .budgets
+        .take(crate::ratelimit::Cost::Search, budget_key)
+        .await
+        == crate::ratelimit::Verdict::Exhausted
+        && state.settings.search_budget_enforce
+    {
+        return Err(ApiError::TooManyRequests);
+    }
+    // Le sémaphore des décisions, pas un second : deux bornes sur un pool unique
+    // demanderaient 62 connexions sur 32.
+    let _db_permit = state
+        .search_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|e| ApiError::Internal(format!("search semaphore: {e}")))?;
     let checkout = || async { state.pool.get().await.map_err(ApiError::from) };
     let (conn_hits, conn_stats) = tokio::try_join!(checkout(), checkout())?;
     let repo_hits = DecisionRepository::new(&conn_hits);
@@ -1030,6 +1347,27 @@ pub async fn search_textes(
             ))
         }
     };
+    // Requête vide : parcours du corpus, listé par entrée en vigueur. Total et
+    // facettes portent sur les articles seuls, comme la liste.
+    if q.trim().is_empty() {
+        let browse = lj_store::repository::ArticleBrowseFilters {
+            text_uid: text_uid.as_deref(),
+            jurisdiction,
+            nature,
+            source,
+            nature_set,
+            at,
+        };
+        let (rows, stats) = tokio::try_join!(
+            repo_hits.browse_articles(browse, limit, offset),
+            repo_stats.article_browse_stats(browse),
+        )?;
+        return Ok(ArticleSearchResponse {
+            hits: hits_with_snippets(rows, q),
+            total: stats.total,
+            facets: facets_dto(stats),
+        });
+    }
     let (rows, stats) = tokio::try_join!(
         repo_hits.search_articles(
             q,
@@ -1054,7 +1392,6 @@ pub async fn search_textes(
             at,
         ),
     )?;
-    caller.record_outcome(ENGINE, q, shape, stats.total);
     Ok(ArticleSearchResponse {
         hits: hits_with_snippets(rows, q),
         total: stats.total,
@@ -1108,6 +1445,7 @@ fn facets_dto(stats: ArticleSearchStats) -> ArticleSearchFacets {
                 value: row.value,
                 count: row.count,
                 parent: None,
+                hint: None,
             })
             .collect()
     };
@@ -1128,6 +1466,7 @@ fn facets_dto(stats: ArticleSearchStats) -> ArticleSearchFacets {
             value: value.to_string(),
             count,
             parent: None,
+            hint: None,
         })
         .collect();
     scope.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.value.cmp(&b.value)));
@@ -1144,8 +1483,25 @@ fn facets_dto(stats: ArticleSearchStats) -> ArticleSearchFacets {
 /// Catalogue des codes navigables (`GET /api/codes`) : un texte de référentiel
 /// par entrée, avec son nombre d'articles. `slug` du texte = `code` du DTO (lien
 /// `/texte/{code}`).
+/// Une entrée de cache par `head_only`, TTL 12 h : le comptage des articles en
+/// vigueur, corrélé par texte, brasse 270 k lignes de `legal_article` et ne se
+/// recalcule pas par requête (mesuré à 1,4 s).
+pub async fn code_catalogue(
+    state: &AppState,
+    head_only: bool,
+) -> Result<Arc<CodeCatalogueResponse>> {
+    state
+        .code_catalogue_cache
+        .try_get_with(head_only, load_code_catalogue(state, head_only))
+        .await
+        .map_err(|e: Arc<ApiError>| ApiError::Internal(format!("catalogue codes: {e}")))
+}
+
 #[instrument(skip(state), fields(db.system = "postgresql"))]
-pub async fn code_catalogue(state: &AppState, head_only: bool) -> Result<CodeCatalogueResponse> {
+async fn load_code_catalogue(
+    state: &AppState,
+    head_only: bool,
+) -> Result<Arc<CodeCatalogueResponse>> {
     let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
@@ -1155,7 +1511,7 @@ pub async fn code_catalogue(state: &AppState, head_only: bool) -> Result<CodeCat
         .into_iter()
         .map(catalogue_entry)
         .collect();
-    Ok(CodeCatalogueResponse { entries })
+    Ok(Arc::new(CodeCatalogueResponse { entries }))
 }
 
 fn catalogue_entry(row: LegalTextCatalogRow) -> CodeCatalogueEntry {
@@ -1172,7 +1528,7 @@ fn catalogue_entry(row: LegalTextCatalogRow) -> CodeCatalogueEntry {
 // (chips) ; en deçà, la vue-lecture intégrale — un texte court (BOFiP, décret,
 // arrêté, loi ordinaire) se lit sur sa page. Partagé avec le front (éligibilité
 // d'une division à l'accordéon).
-use lj_dtos::INLINE_READING_MAX;
+use lj_dtos::{INLINE_READING_MAX, INLINE_READING_MAX_BYTES};
 
 /// Table des matières d'un code (`GET /api/texte/{code}/sommaire`) : articles
 /// ordonnés, chacun avec son fil d'Ariane et son état. Textes courts
@@ -1197,11 +1553,7 @@ pub async fn code_toc(
     if !tree.is_empty() {
         let n_articles = tree.iter().filter(|r| r.child_kind == "article").count();
         let reading = if n_articles <= INLINE_READING_MAX {
-            repo.toc_text_reading(text_uid, at)
-                .await?
-                .into_iter()
-                .map(section_item)
-                .collect()
+            lecture_bornee(repo.toc_text_reading(text_uid, at).await?)
         } else {
             Vec::new()
         };
@@ -1213,17 +1565,14 @@ pub async fn code_toc(
     }
     let rows = repo.code_table_of_contents(text_uid).await?;
     if rows.len() <= INLINE_READING_MAX {
-        let reading = repo
-            .flat_text_reading(text_uid)
-            .await?
-            .into_iter()
-            .map(section_item)
-            .collect();
-        return Ok(CodeTocResponse {
-            entries: Vec::new(),
-            tree: Vec::new(),
-            reading,
-        });
+        let reading = lecture_bornee(repo.flat_text_reading(text_uid).await?);
+        if !reading.is_empty() {
+            return Ok(CodeTocResponse {
+                entries: Vec::new(),
+                tree: Vec::new(),
+                reading,
+            });
+        }
     }
     Ok(CodeTocResponse {
         entries: rows.into_iter().map(toc_entry).collect(),
@@ -1256,8 +1605,9 @@ pub async fn law_section(
     let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
+    let slug = resolve_text(state, &repo, code).await?.slug.clone();
     let summary = repo
-        .law_code_summary(code)
+        .law_code_summary(&slug)
         .await?
         .ok_or(ApiError::NotFound)?;
     // Sous-arbre et corps à la date demandée, sinon en vigueur aujourd'hui.
@@ -1268,11 +1618,12 @@ pub async fn law_section(
         .ok_or(ApiError::NotFound)?;
     let tree = repo.toc_tree(&summary.text_uid, at).await?;
     let (ancestors, prev, next) = section_nav(&tree, cid);
-    let items: Vec<LawSectionItem> = items.into_iter().map(section_item).collect();
-    let top_cited = section_top_cited(&repo, &summary.text_uid, code, &items).await?;
+    let mut items: Vec<LawSectionItem> = items.into_iter().map(section_item).collect();
+    let omitted = borner_lecture(&mut items);
+    let top_cited = section_top_cited(&repo, &summary.text_uid, &slug, &items).await?;
     let citing_texts = section_citing_texts(&repo, &summary.text_uid, &items).await?;
     Ok(LawSectionResponse {
-        code: code.to_string(),
+        code: slug,
         code_title: Some(summary.title),
         cid: cid.to_string(),
         title,
@@ -1280,9 +1631,38 @@ pub async fn law_section(
         prev,
         next,
         items,
+        omitted,
         top_cited,
         citing_texts,
     })
+}
+
+/// La même règle au cas racine, où le sommaire est le repli : au-delà d'une
+/// borne, la vue-lecture est vide et l'arbre reprend la main.
+fn lecture_bornee(rows: Vec<TocReadingRow>) -> Vec<LawSectionItem> {
+    let mut items: Vec<LawSectionItem> = rows.into_iter().map(section_item).collect();
+    if borner_lecture(&mut items).is_some() {
+        return Vec::new();
+    }
+    items
+}
+
+/// La règle de lecture en place, à ses deux bornes. Rend le nombre d'articles
+/// réduits à leur index, les items gardant numéro et lien.
+fn borner_lecture(items: &mut [LawSectionItem]) -> Option<usize> {
+    let articles = items.iter().filter(|i| i.kind == "article").count();
+    let octets: usize = items
+        .iter()
+        .map(|i| i.texte.as_deref().map_or(0, str::len) + i.nota.as_deref().map_or(0, str::len))
+        .sum();
+    if articles <= INLINE_READING_MAX && octets <= INLINE_READING_MAX_BYTES {
+        return None;
+    }
+    for item in items.iter_mut() {
+        item.texte = None;
+        item.nota = None;
+    }
+    Some(articles)
 }
 
 /// Les [`SECTION_TOP_CITED`] articles les plus cités du sous-arbre **déjà lu** :
@@ -1442,6 +1822,7 @@ fn toc_entry(row: TocArticleRow) -> TocEntry {
         num_key: row.num_key,
         title_path: row.title_path,
         status: row.status,
+        expired: row.expired,
     }
 }
 
@@ -1588,13 +1969,137 @@ mod tests {
             summary: None,
             cited_num_keys: Vec::new(),
         };
-        let refs = crate::referential::Referential::new(Vec::new(), Vec::new());
+        let refs = crate::referential::Referential::new(Vec::new(), Vec::new(), Vec::new());
         let hit = citing_dto(row, &refs);
         assert_eq!(hit.id, "CETATEXT000012345678");
         assert_eq!(hit.jurisdiction_type, JurisdictionType::Ce);
         assert_eq!(hit.title, "Conseil d'État, 13 février 2024, 123456");
         assert_eq!(hit.date_lecture.as_deref(), Some("2024-02-13"));
-        // « A » = Recueil Lebon → portée majeure.
-        assert_eq!(hit.significance, Significance::Majeure);
+        assert_eq!(hit.publication_codes, vec!["A".to_string()]);
+    }
+
+    fn version(status: &str, debut: &str, fin: Option<&str>) -> LawVersionRow {
+        LawVersionRow {
+            source_uid: format!("LEGIARTI{status}"),
+            status: status.to_string(),
+            date_debut: Some(debut.to_string()),
+            date_fin: fin.map(str::to_string),
+        }
+    }
+
+    fn motif(versions: &[LawVersionRow], date: &str) -> String {
+        let d = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+        match no_version_error(versions, Some(d)) {
+            ApiError::NotFound => "not_found".to_string(),
+            ApiError::NoVersionAtDate(m) => m,
+            other => panic!("motif inattendu : {other}"),
+        }
+    }
+
+    /// Quelle date déclenche le repli sur la dernière version : après la fin de
+    /// la dernière fenêtre seulement. Une version encore ouverte, ou une date
+    /// antérieure à tout, laissent `derniere_fin` sans borne à dépasser.
+    #[test]
+    fn le_repli_ne_s_ouvre_qu_apres_la_derniere_fenetre() {
+        let jour = |d: &str| NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap();
+
+        let abroge = [
+            version("MODIFIE", "2000-09-21", Some("2019-05-23")),
+            version("ABROGE", "2019-05-24", Some("2021-05-01")),
+        ];
+        assert_eq!(derniere_fin(&abroge), Some(jour("2021-05-01")));
+
+        let en_vigueur = [
+            version("MODIFIE", "2000-09-21", Some("2019-05-23")),
+            version("VIGUEUR", "2019-05-24", None),
+        ];
+        assert_eq!(derniere_fin(&en_vigueur), None);
+
+        assert_eq!(derniere_fin(&[]), None);
+    }
+
+    /// Trois issues, et une seule prononce l'abrogation : dire « abrogé » d'un
+    /// article dont une version est `VIGUEUR` rapporterait notre trou de
+    /// couverture comme du droit.
+    #[test]
+    fn le_motif_n_affirme_l_abrogation_que_sans_version_en_vigueur() {
+        assert_eq!(motif(&[], "2026-08-17"), "not_found");
+
+        let abroge = [
+            version("MODIFIE", "2000-09-21", Some("2019-05-23")),
+            version("ABROGE", "2019-05-24", Some("2025-10-01")),
+        ];
+        assert!(motif(&abroge, "2026-08-17").starts_with("law article repealed"));
+        assert!(motif(&abroge, "2026-08-17").contains("2025-10-01"));
+
+        let trou = [
+            version("VIGUEUR", "2006-03-24", Some("2007-12-31")),
+            version("MODIFIE_MORT_NE", "2008-01-01", Some("2006-03-24")),
+        ];
+        let m = motif(&trou, "2026-08-01");
+        assert!(m.contains("no version covers that date"), "{m}");
+        assert!(!m.contains("repealed"), "{m}");
+        assert!(m.contains("2006-03-24") && m.contains("2007-12-31"), "{m}");
+    }
+
+    /// `VIGUEUR_DIFF` est une entrée en vigueur différée, pas une abrogation :
+    /// le préfixe suffit à la ranger du bon côté.
+    #[test]
+    fn la_vigueur_differee_ne_vaut_pas_abrogation() {
+        let differe = [
+            version("MODIFIE", "1950-04-30", Some("2026-01-01")),
+            version("VIGUEUR_DIFF", "2027-01-01", Some("2027-08-31")),
+        ];
+        assert!(!motif(&differe, "2026-08-17").contains("repealed"));
+    }
+
+    /// Une clé par requête servie : deux appels identiques partagent l'entrée,
+    /// et rien de ce qui change la réponse ne collisionne — ni un filtre déplacé
+    /// d'un axe à l'autre, ni la fenêtre, que le SQL applique.
+    #[test]
+    fn textes_cache_key_separe_ce_qui_change_la_reponse() {
+        let key = |code, jur, offset| {
+            textes_cache_key("nosocomiale", code, jur, None, None, None, None, 10, offset)
+        };
+        assert_eq!(key(Some("csp"), None, 0), key(Some("csp"), None, 0));
+        assert_ne!(key(Some("csp"), None, 0), key(None, Some("csp"), 0));
+        assert_ne!(key(Some("csp"), None, 0), key(None, None, 0));
+        assert_ne!(key(Some("csp"), None, 0), key(Some("csp"), None, 10));
+    }
+
+    fn item(kind: &str, texte: Option<&str>) -> LawSectionItem {
+        LawSectionItem {
+            kind: kind.into(),
+            depth: 1,
+            label: "Article 1".into(),
+            cid: None,
+            num_key: Some("1".into()),
+            etat: "VIGUEUR".into(),
+            texte: texte.map(str::to_string),
+            nota: None,
+        }
+    }
+
+    /// Les deux bornes de la lecture en place mordent chacune de leur cote,
+    /// et laissent l'index quand elles mordent.
+    #[test]
+    fn la_lecture_en_place_a_deux_bornes() {
+        let mut court = vec![item("article", Some("corps")); 3];
+        assert_eq!(borner_lecture(&mut court), None);
+        assert!(court.iter().all(|i| i.texte.is_some()));
+
+        let mut trop_d_articles = vec![item("article", Some("x")); INLINE_READING_MAX + 1];
+        assert_eq!(
+            borner_lecture(&mut trop_d_articles),
+            Some(INLINE_READING_MAX + 1)
+        );
+        assert!(trop_d_articles.iter().all(|i| i.texte.is_none()));
+        assert!(trop_d_articles.iter().all(|i| i.num_key.is_some()));
+
+        // Peu d'articles, mais du poids : le compte seul laissait passer 420 ko.
+        let gros = "a".repeat(INLINE_READING_MAX_BYTES / 2 + 1);
+        let mut trop_lourd = vec![item("article", Some(&gros)); 2];
+        assert_eq!(borner_lecture(&mut trop_lourd), Some(2));
+        assert!(trop_lourd.iter().all(|i| i.texte.is_none()));
     }
 }

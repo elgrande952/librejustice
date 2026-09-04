@@ -3,7 +3,7 @@
 //! base, joint au hot path) : les deux vues sont instantanées, sans aucun fetch.
 //!
 //! Navigation : lien `/decision/{id}`. Au clic, on pose la graine de navigation
-//! (`ResultNavSeed` : `hit_ids`/position/total + origine recherche) consommée par
+//! (`ResultNavSeed` : `hit_ids` + origine recherche) consommée par
 //! la barre décision de la page cible (cf. `components::decision_bar`).
 
 use std::sync::Arc;
@@ -18,13 +18,7 @@ use crate::components::decision_bar::{
 use crate::helpers::{format_decision_jurisdiction, format_iso_date};
 
 use super::compact_search::highlight::Highlighted;
-
-/// Vue de contenu courante : extrait ou résumé.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CardView {
-    Snippet,
-    Summary,
-}
+use super::view_prefs::CardView;
 
 /// Origine recherche capturée au clic : query string + scroll courant. Vide en
 /// SSR (le clic n'y survient pas).
@@ -50,12 +44,10 @@ fn navigation_origin() -> (String, f64) {
 /// via une valeur réactive : un `StoredValue` est lié à l'owner de `ResultList`,
 /// disposé au re-render (revalidation SWR) → `get_value()` paniquerait dans ce
 /// handler de clic différé, avortant la pose de graine.
-fn set_nav_seed(seed: ResultNavSignal, position: i64, total: i64, hit_ids: &[String]) {
+fn set_nav_seed(seed: ResultNavSignal, hit_ids: &[String]) {
     let (search, scroll_y) = navigation_origin();
     seed.set(Some(ResultNavSeed {
         nav: Some(ResultNav {
-            position,
-            total,
             hit_ids: hit_ids.to_vec(),
         }),
         from_search: Some(FromSearch { search, scroll_y }),
@@ -67,38 +59,45 @@ pub fn ResultCard(
     hit: SearchHit,
     index: usize,
     page: u32,
-    #[prop(optional)] total: i64,
     page_size: u32,
     hit_ids: Arc<Vec<String>>,
-    auto_load_summary: bool,
+    /// Vue voulue par la bascule d'en-tête. Une carte peut y déroger ; le
+    /// prochain geste sur la bascule reprend la main sur toutes.
+    #[prop(into)]
+    default_view: Signal<CardView>,
     animate: bool,
     /// Badge contextuel optionnel, en tête des badges de facettes (ex. rôle de
     /// l'entité sur sa fiche : Demandeur / Défendeur / Conseil).
     #[prop(optional_no_strip)]
     role_badge: Option<String>,
 ) -> impl IntoView {
-    let view_sig = RwSignal::new(if auto_load_summary {
-        CardView::Summary
-    } else {
-        CardView::Snippet
+    // Dérogation locale, effacée dès que la bascule d'en-tête bouge : sans ça
+    // une carte dérogée resterait sourde à une commande d'ensemble.
+    let local = RwSignal::new(None::<CardView>);
+    Effect::new(move |prev: Option<CardView>| {
+        let wanted = default_view.get();
+        if prev.is_some_and(|before| before != wanted) {
+            local.set(None);
+        }
+        wanted
     });
+    let view_sig = Signal::derive(move || local.get().unwrap_or_else(|| default_view.get()));
 
     let position = (page as usize - 1) * page_size as usize + index + 1;
     let numeral = format!("{position:02}");
     let decision_href = format!("/decision/{}", hit.id);
 
     // Graine de navigation posée au clic : la barre décision de la page cible la
-    // consomme (origine recherche + position/total + liste d'`id` pour prev/next).
+    // consomme (origine recherche + liste d'`id` pour prev/next).
     // Inerte en SSR (le clic ne s'y produit pas ; `navigation_origin` y est vide).
     let seed = use_result_nav();
-    let seed_position = position as i64;
     let on_navigate_title = {
         let hit_ids = hit_ids.clone();
-        move |_| set_nav_seed(seed, seed_position, total, &hit_ids)
+        move |_| set_nav_seed(seed, &hit_ids)
     };
     let on_navigate_footer = {
         let hit_ids = hit_ids.clone();
-        move |_| set_nav_seed(seed, seed_position, total, &hit_ids)
+        move |_| set_nav_seed(seed, &hit_ids)
     };
 
     // Titre : `title_html` sinon fallback construit (juridiction, date, n° rôle).
@@ -227,14 +226,14 @@ pub fn ResultCard(
                     <div class="flex items-center gap-1.5">
                         <button
                             type="button"
-                            on:click=move |_| view_sig.set(CardView::Snippet)
+                            on:click=move |_| local.set(Some(CardView::Snippet))
                             class=move || toggle_class(CardView::Snippet)
                         >
                             "Extrait"
                         </button>
                         <button
                             type="button"
-                            on:click=move |_| view_sig.set(CardView::Summary)
+                            on:click=move |_| local.set(Some(CardView::Summary))
                             class=move || toggle_class(CardView::Summary)
                         >
                             "Résumé"
@@ -269,16 +268,16 @@ fn ResultMetaBadges(
     publication_codes: Vec<String>,
 ) -> impl IntoView {
     use crate::components::ui::{Badge, BadgeTone};
-    use crate::pages::decision_page::labels::significance_badge;
+    use crate::pages::decision_page::labels::publication_badge;
 
     let solution_badge = solution.filter(|t| t.key != "AUTRE").map(|t| t.label);
     let procedure_badge = procedure.map(|t| t.label);
-    let significance = significance_badge(&publication_codes);
+    let publication = publication_badge(&publication_codes);
 
     view! {
         {solution_badge
             .map(|label| view! { <Badge tone=BadgeTone::Outline>{label}</Badge> })}
         {procedure_badge.map(|label| view! { <Badge tone=BadgeTone::Accent>{label}</Badge> })}
-        {significance.map(|label| view! { <Badge tone=BadgeTone::Neutral>{label}</Badge> })}
+        {publication.map(|label| view! { <Badge tone=BadgeTone::Neutral>{label}</Badge> })}
     }
 }

@@ -15,7 +15,7 @@ use lj_dtos::{DecisionPreview, LawArticleResponse};
 
 use crate::components::ui::{Badge, BadgeTone};
 use crate::helpers::format_iso_date;
-use crate::pages::decision_page::labels::significance_badge;
+use crate::pages::decision_page::labels::publication_badge;
 use crate::pages::law_page::article_title;
 
 /// Cible prévisualisable d'un lien de référence. `date` (article) = date de la
@@ -293,13 +293,13 @@ fn article_card(article: LawArticleResponse) -> AnyView {
 fn decision_card(preview: DecisionPreview) -> AnyView {
     let solution = preview.solution.map(|s| s.label);
     let procedure = preview.procedure.map(|v| v.label);
-    let significance = significance_badge(&preview.publication_codes);
-    let badges = (solution.is_some() || procedure.is_some() || significance.is_some()).then(|| {
+    let publication = publication_badge(&preview.publication_codes);
+    let badges = (solution.is_some() || procedure.is_some() || publication.is_some()).then(|| {
         view! {
             <span class="mt-1.5 flex flex-wrap gap-1.5">
                 {solution.map(|label| view! { <Badge tone=BadgeTone::Outline>{label}</Badge> })}
                 {procedure.map(|label| view! { <Badge tone=BadgeTone::Accent>{label}</Badge> })}
-                {significance.map(|label| view! { <Badge tone=BadgeTone::Neutral>{label}</Badge> })}
+                {publication.map(|label| view! { <Badge tone=BadgeTone::Neutral>{label}</Badge> })}
             </span>
         }
     });

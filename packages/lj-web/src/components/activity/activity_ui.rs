@@ -10,9 +10,9 @@ use crate::helpers::cn;
 
 /// Onglets du hub (routes distinctes, panneau selon le path).
 const TABS: [(&str, &str); 3] = [
-    ("/activite/recherches", "Recherches"),
-    ("/activite/lectures", "Lectures"),
-    ("/activite/signets", "Signets"),
+    ("/activity/searches", "Recherches"),
+    ("/activity/readings", "Lectures"),
+    ("/activity/bookmarks", "Signets"),
 ];
 
 /// Shell 2 colonnes (contenu + aside) des pages d'activite.
@@ -190,7 +190,6 @@ pub fn EmptyState(children: Children) -> impl IntoView {
     }
 }
 
-/// Pastille du canal d'origine : web (contour neutre) vs MCP (bleu plein).
 #[component]
 pub fn SourceBadge(source: ActivitySource) -> impl IntoView {
     match source {
@@ -211,6 +210,16 @@ pub fn SourceBadge(source: ActivitySource) -> impl IntoView {
             >
                 <Dot filled=false />
                 " Web"
+            </span>
+        }
+        .into_any(),
+        ActivitySource::Api => view! {
+            <span
+                title="Action effectuée via l'API publique, avec une clé"
+                class="inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--color-rule)] px-2 py-0.5 text-[10px] font-medium tracking-wide text-[var(--color-ink-subtle)] uppercase"
+            >
+                <Dot filled=false />
+                " API"
             </span>
         }
         .into_any(),
@@ -305,27 +314,23 @@ pub fn InfiniteSentinel(
     {
         use wasm_bindgen::prelude::*;
 
-        #[wasm_bindgen(module = "/src/components/activity/sentinel.js")]
-        extern "C" {
-            #[wasm_bindgen(js_name = "observeIntersection")]
-            fn observe_intersection(node: &JsValue, cb: &Closure<dyn FnMut()>) -> JsValue;
-        }
-
-        // L'observateur et sa fn de deconnexion tiennent des handles JS (pas
-        // `Send`) : on les garde dans des slots `LocalStorage` et on deconnecte
-        // l'observateur precedent a chaque passage.
+        // L'observateur et son closure tiennent des handles JS (pas `Send`) : on
+        // les garde dans des slots `LocalStorage` et on deconnecte l'observateur
+        // precedent a chaque passage.
         let on_reach = std::rc::Rc::new(on_reach);
-        let disconnect_slot: StoredValue<Option<JsValue>, leptos::reactive::owner::LocalStorage> =
-            StoredValue::new_local(None);
+        let observer_slot: StoredValue<
+            Option<web_sys::IntersectionObserver>,
+            leptos::reactive::owner::LocalStorage,
+        > = StoredValue::new_local(None);
+        type EntriesClosure = Closure<dyn FnMut(js_sys::Array)>;
+
         let closure_slot: StoredValue<
-            Option<Closure<dyn FnMut()>>,
+            Option<EntriesClosure>,
             leptos::reactive::owner::LocalStorage,
         > = StoredValue::new_local(None);
         Effect::new(move |_| {
-            if let Some(prev) = disconnect_slot.try_update_value(Option::take).flatten() {
-                if let Ok(f) = prev.dyn_into::<js_sys::Function>() {
-                    let _ = f.call0(&JsValue::NULL);
-                }
+            if let Some(prev) = observer_slot.try_update_value(Option::take).flatten() {
+                prev.disconnect();
             }
             let Some(node) = node_ref.get() else {
                 return;
@@ -334,10 +339,26 @@ pub fn InfiniteSentinel(
                 return;
             }
             let cb_fn = on_reach.clone();
-            let closure = Closure::new(move || cb_fn());
-            let node_js: JsValue = node.into();
-            let disconnect = observe_intersection(&node_js, &closure);
-            disconnect_slot.set_value(Some(disconnect));
+            let closure =
+                Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+                    let entree = entries.get(0);
+                    if entree
+                        .dyn_ref::<web_sys::IntersectionObserverEntry>()
+                        .is_some_and(web_sys::IntersectionObserverEntry::is_intersecting)
+                    {
+                        cb_fn();
+                    }
+                });
+            let options = web_sys::IntersectionObserverInit::new();
+            options.set_root_margin("400px 0px");
+            let Ok(observer) = web_sys::IntersectionObserver::new_with_options(
+                closure.as_ref().unchecked_ref(),
+                &options,
+            ) else {
+                return;
+            };
+            observer.observe(&node);
+            observer_slot.set_value(Some(observer));
             closure_slot.set_value(Some(closure));
         });
     }

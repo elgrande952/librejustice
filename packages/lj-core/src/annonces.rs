@@ -347,13 +347,13 @@ pub struct AnnonceBrute {
     pub procedure: Option<String>,
 }
 
-/// Ordre de confiance pour élire les champs canoniques : les sources
-/// structurées d'abord (BOAMP eForms, APIs JSON), les scrapers ensuite. Sert
-/// aussi à choisir, parmi les canaux d'une annonce, celui dont on ira lire la
-/// page de détail. Klekoon ferme la marche : son hôte coupe l'IP au moindre
-/// débit.
-pub const PRIORITE: [&str; 12] = [
+/// Trust order for the canonical fields, and the order in which a notice's
+/// channels get their detail page read.
+pub const PRIORITE: [&str; 14] = [
     "boamp",
+    // TED est aussi structuré que le BOAMP (eForms) mais il abrège l'objet à
+    // 200 caractères : il passe derrière, devant les scrapers.
+    "ted",
     "atexo",
     "safetender",
     "aws",
@@ -365,6 +365,10 @@ pub const PRIORITE: [&str; 12] = [
     "xmarches",
     "modula",
     "klekoon",
+    // La presse ferme la marche : titre de composition, acheteur en capitales,
+    // aucun champ structuré. Elle apporte l'avis qu'aucun autre canal n'a, pas
+    // la meilleure version de celui que tous ont.
+    "presse",
 ];
 
 fn priorite(moteur: &str) -> usize {

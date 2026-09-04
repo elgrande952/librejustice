@@ -12,6 +12,8 @@
 //! `ORDER BY` SQL et du tri final sur le score puis l'id.
 
 mod adaptive;
+mod aggregate;
+mod browse;
 mod dates;
 mod filters;
 mod hydrate;
@@ -34,59 +36,75 @@ use crate::signals;
 use crate::state::AppState;
 
 use lj_dtos::{
-    FacetChoice, LegalInstrumentFacet, QueryMode, SearchFacets, SearchHit, SearchRequest,
-    SearchResponse, SortOrder,
+    FacetChoice, LegalInstrumentFacet, PinnedDecision, QueryMode, SearchFacets, SearchHit,
+    SearchRequest, SearchResponse, SortOrder,
 };
 
 use adaptive::compute_adaptive_weights;
+use aggregate::aggregate_facets;
 use hydrate::{
-    assemble_page, display_title, fetch_pub_ids_and_facets, hydrate_decisions, DecisionMeta,
+    assemble_page, display_title, facets_from_counters, fetch_pub_ids, hydrate_decisions,
+    DecisionMeta,
 };
 use legs::{
-    ann_leg, bm25_leg, bm25_parse_leg, fuse_ranks, pool_max_per_decision, title_leg,
-    truncate_fused, LegHit,
+    ann_leg, bm25_leg, bm25_parse_leg, docket_leg, fuse_ranks, pool_max_per_decision, title_leg,
+    truncate_fused, LegHit, Legs,
 };
-use query::{detect_query_mode, is_boolean_query, query_lacks_searchable_terms, translate_boolean};
+use query::{
+    detect_query_mode, has_boolean_operator, is_boolean_query, query_lacks_searchable_terms,
+    translate_boolean,
+};
 
+pub(crate) use browse::has_filters;
 pub(crate) use dates::{parse_search_date, DateError, DATE_GE, DATE_LE};
 pub use query::{body_query_for_arm, BodyArm};
 
-// ── API bancs offline (lj-bench rank-arms / arm-latency / rank-bsweep) ────────
+// ── API des bancs offline ────────────────────────────────────────────────────
 
-/// Récupération lexicale pure pour l'A/B de ranking offline (`lj-bench
-/// rank-arms`) : jambe BM25 body (corps construit selon `arm`) + jambe titre,
-/// fusion RRF aux poids de base, troncature relative. Renvoie les `decision_id` en
-/// ordre de pertinence.
+/// Whether the offline benches run the title leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleLeg {
+    On,
+    Off,
+}
+
+/// Pure lexical retrieval for the offline ranking A/B: BM25 body leg (body built
+/// per `arm`), title leg, RRF at base weights, relative truncation.
 pub async fn lexical_rank_for_arm(
     conn: &Client,
     query: &str,
     arm: BodyArm,
     leg_limit: i64,
+    title: TitleLeg,
 ) -> anyhow::Result<Vec<i64>> {
     let req: SearchRequest = serde_json::from_value(serde_json::json!({ "query": query }))?;
     let body_query = body_query_for_arm(query, arm);
     let bm25_scores = bm25_parse_leg(conn, &req, &body_query, leg_limit).await?;
-    let title_scores = title_leg(conn, &req, leg_limit).await?;
+    let title_scores = match title {
+        TitleLeg::On => title_leg(conn, &req, leg_limit).await?,
+        TitleLeg::Off => HashMap::new(),
+    };
     let empty: HashMap<i64, LegHit> = HashMap::new();
+    let no_docket: HashMap<i64, f64> = HashMap::new();
     let fused = truncate_fused(fuse_ranks(
-        &bm25_scores,
-        &empty,
-        &title_scores,
-        signals::BASE_WEIGHTS.bm25,
-        signals::BASE_WEIGHTS.ann,
-        signals::BASE_WEIGHTS.title,
+        Legs {
+            bm25: &bm25_scores,
+            ann: &empty,
+            title: &title_scores,
+            docket: &no_docket,
+        },
+        signals::BASE_WEIGHTS,
     ));
     Ok(fused.into_iter().map(|(d, _, _)| d).collect())
 }
 
-/// Récupération hybride pour l'A/B de ranking offline (`lj-bench rank-arms --mode
-/// hybrid`) : embedding requête + jambes body / ANN / titre, poids RRF adaptatifs,
-/// troncature relative. Seule la jambe BM25 varie entre bras. Renvoie les
-/// `decision_id` en ordre de pertinence RRF.
+/// Hybrid retrieval for the offline ranking A/B: query embedding, body / ANN /
+/// title legs, adaptive RRF weights, relative truncation.
 pub async fn hybrid_rank_for_arm(
     state: &AppState,
     query: &str,
     arm: BodyArm,
+    title: TitleLeg,
 ) -> anyhow::Result<Vec<i64>> {
     let req: SearchRequest = serde_json::from_value(serde_json::json!({ "query": query }))?;
     let leg_limit = state.settings.leg_limit as i64;
@@ -101,29 +119,126 @@ pub async fn hybrid_rank_for_arm(
     let (bm25_scores, ann_hits, title_scores) = tokio::try_join!(
         bm25_parse_leg(&bm25_conn, &req, &body_query, leg_limit),
         ann_leg(&mut ann_conn, &req, &query_vec, leg_limit, vchord_probes),
-        title_leg(&title_conn, &req, leg_limit),
+        async {
+            match title {
+                TitleLeg::On => title_leg(&title_conn, &req, leg_limit).await,
+                TitleLeg::Off => Ok(HashMap::new()),
+            }
+        },
     )?;
     let ann_best = pool_max_per_decision(&ann_hits, leg_limit as usize);
     let weights = compute_adaptive_weights(state, &req.query, &bm25_scores, &ann_hits).await?;
+    let no_docket: HashMap<i64, f64> = HashMap::new();
     let fused = truncate_fused(fuse_ranks(
-        &bm25_scores,
-        &ann_best,
-        &title_scores,
-        weights.bm25,
-        weights.ann,
-        weights.title,
+        Legs {
+            bm25: &bm25_scores,
+            ann: &ann_best,
+            title: &title_scores,
+            docket: &no_docket,
+        },
+        weights,
     ));
     Ok(fused.into_iter().map(|(d, _, _)| d).collect())
 }
 
-/// Recherche complète SANS le cache résultats moka (banc `lj-bench load`) :
-/// exécute toujours récupération + RRF + facettes + hydratation + assemblage de
+/// Ce qu'un balayage de plancher ANN observe ([`hybrid_rank_ann_floor_sweep`]).
+pub struct AnnFloorSweep {
+    /// Similarité cosinus du chunk gagnant, par décision atteinte par la jambe.
+    pub ann_similarity: HashMap<i64, f64>,
+    /// Similarité du dernier chunk rendu, avant plancher. Sous un plancher, la
+    /// jambe a épuisé ses appariements et son décompte devient exact.
+    pub ann_worst_similarity: Option<f64>,
+    /// Classement fusionné, un par plancher, dans l'ordre des `floors` reçus.
+    pub rankings: Vec<Vec<i64>>,
+}
+
+/// Balayage offline d'un plancher sur la jambe ANN : une seule récupération, une
+/// fusion par plancher, poids adaptatifs recalculés sur la jambe filtrée.
+/// `floors` en similarité cosinus minimale, `f64::NEG_INFINITY` valant prod.
+pub async fn hybrid_rank_ann_floor_sweep(
+    state: &AppState,
+    query: &str,
+    floors: &[f64],
+    ann_limit: i64,
+) -> anyhow::Result<AnnFloorSweep> {
+    let req: SearchRequest = serde_json::from_value(serde_json::json!({ "query": query }))?;
+    let leg_limit = state.settings.leg_limit as i64;
+
+    let query_vec = embed_query_cached(state, &req.query).await?;
+    let bm25_conn = client(state).await?;
+    let mut ann_conn = client(state).await?;
+    let title_conn = client(state).await?;
+    let (bm25_scores, ann_hits, title_scores) = tokio::try_join!(
+        bm25_leg(&bm25_conn, &req, leg_limit),
+        ann_leg(
+            &mut ann_conn,
+            &req,
+            &query_vec,
+            ann_limit,
+            state.settings.vchord_probes
+        ),
+        title_leg(&title_conn, &req, leg_limit),
+    )?;
+    let no_docket: HashMap<i64, f64> = HashMap::new();
+
+    let mut rankings = Vec::with_capacity(floors.len());
+    for floor in floors {
+        let kept: Vec<LegHit> = ann_hits
+            .iter()
+            .filter(|h| h.raw_score >= *floor)
+            .cloned()
+            .collect();
+        let ann_best = pool_max_per_decision(&kept, ann_limit as usize);
+        let weights = compute_adaptive_weights(state, &req.query, &bm25_scores, &kept).await?;
+        let fused = truncate_fused(fuse_ranks(
+            Legs {
+                bm25: &bm25_scores,
+                ann: &ann_best,
+                title: &title_scores,
+                docket: &no_docket,
+            },
+            weights,
+        ));
+        rankings.push(fused.into_iter().map(|(d, _, _)| d).collect());
+    }
+
+    Ok(AnnFloorSweep {
+        ann_similarity: pool_max_per_decision(&ann_hits, ann_limit as usize)
+            .into_iter()
+            .map(|(d, h)| (d, h.raw_score))
+            .collect(),
+        ann_worst_similarity: ann_hits
+            .iter()
+            .map(|h| h.raw_score)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+        rankings,
+    })
+}
+
+/// Recherche complète SANS le cache résultats moka (banc de charge, sonde
+/// profonde) : exécute toujours récupération + RRF + hydratation + assemblage de
 /// page, en conservant le permit d'admission et le cache embeddings. `ai_mode`
-/// ignoré.
+/// ignoré. Le décompte n'en fait pas partie, comme sur le chemin prod.
 pub async fn search_nocache(state: &AppState, req: &SearchRequest) -> Result<SearchResponse> {
+    nocache(state, req, false).await
+}
+
+/// La même chose, décompte résolu sur la MÊME récupération : ce qui permet de
+/// comparer le total annoncé à la liste servie.
+pub async fn search_nocache_counted(
+    state: &AppState,
+    req: &SearchRequest,
+) -> Result<SearchResponse> {
+    nocache(state, req, true).await
+}
+
+async fn nocache(
+    state: &AppState,
+    req: &SearchRequest,
+    avec_decompte: bool,
+) -> Result<SearchResponse> {
     let leg_limit = state.settings.leg_limit as i64;
     let vchord_probes = state.settings.vchord_probes;
-    let query_mode = effective_query_mode(req);
     let t0 = std::time::Instant::now();
     let (ranked, retrieval_ms) = {
         let _db_permit = state
@@ -132,25 +247,22 @@ pub async fn search_nocache(state: &AppState, req: &SearchRequest) -> Result<Sea
             .acquire_owned()
             .await
             .map_err(|e| ApiError::Internal(format!("search semaphore: {e}")))?;
-        let fused = if query_lacks_searchable_terms(&req.query) {
-            Vec::new()
-        } else {
-            match query_mode {
-                QueryMode::Lexical => retrieve_boolean(state, req, leg_limit).await?,
-                QueryMode::Hybrid => retrieve_hybrid(state, req, leg_limit, vchord_probes).await?,
-            }
-        };
+        let resolution = resolve(state, req).await?;
+        let (retrieval, mode) = retrieve(state, req, resolution, leg_limit, vchord_probes).await?;
         let retrieval_ms = t0.elapsed().as_secs_f64() * 1000.0;
         (
-            std::sync::Arc::new(rank_results(state, fused, query_mode).await?),
+            std::sync::Arc::new(rank_results(state, retrieval, mode).await?),
             retrieval_ms,
         )
     };
     let hydrate_ms = t0.elapsed().as_secs_f64() * 1000.0 - retrieval_ms;
+    if avec_decompte {
+        comptage(state, req, &ranked).await?;
+    }
     let t1 = std::time::Instant::now();
     let resp = paginate(state, req, &ranked, None).await?;
     tracing::info!(
-        target: "lj_bench_timing",
+        target: "lj_api::timing",
         retrieval_ms,
         hydrate_ms,
         paginate_ms = t1.elapsed().as_secs_f64() * 1000.0,
@@ -182,8 +294,7 @@ async fn embed_query_cached(state: &AppState, text: &str) -> anyhow::Result<Vec<
     Ok(arr.iter().copied().collect())
 }
 
-/// Latence isolée de la jambe BM25 body pour un bras (banc `lj-bench
-/// arm-latency`) — la seule jambe qui varie entre bras. Renvoie `(nb_hits, durée
+/// Latence isolée de la jambe BM25 body pour un bras — la seule jambe qui varie entre bras. Renvoie `(nb_hits, durée
 /// d'UN appel)` ; l'appelant boucle pour la statistique.
 pub async fn time_body_leg_for_arm(
     conn: &Client,
@@ -313,42 +424,287 @@ fn sort_fused(
     }
 }
 
+/// Retrieval output: the fused list, and the card above it when the resolution
+/// carries one.
+struct Retrieval {
+    fused: Vec<(i64, f64, LegHit)>,
+    lexicales: std::collections::HashSet<i64>,
+    pinned: Vec<i64>,
+}
+
+/// How many decisions the card above a content list holds.
+const PINNED_MAX: usize = 3;
+
+/// What `auto` decides for a query, or what a stated mode collapses to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    Reference,
+    Lexical,
+    Semantic,
+    LexicalWithCard,
+    SemanticWithCard,
+}
+
+impl Resolution {
+    fn query_mode(self) -> QueryMode {
+        match self {
+            Resolution::Reference => QueryMode::Reference,
+            Resolution::Lexical | Resolution::LexicalWithCard => QueryMode::Lexical,
+            Resolution::Semantic | Resolution::SemanticWithCard => QueryMode::Hybrid,
+        }
+    }
+
+    fn with_card(self) -> bool {
+        matches!(
+            self,
+            Resolution::LexicalWithCard | Resolution::SemanticWithCard
+        )
+    }
+}
+
+/// What a content query designates besides what it asks: a docket number, or a
+/// case name the corpus knows, by its matched key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Designation {
+    Number,
+    Name(String),
+}
+
+impl Designation {
+    /// The designation is the whole query: nothing is left to embed.
+    fn consumes(&self, query: &str) -> bool {
+        match self {
+            Designation::Number => lj_core::docket_key::is_bare_number(query),
+            Designation::Name(key) => lj_core::case_names::case_name_key(query) == *key,
+        }
+    }
+
+    /// The rest of the query cites the designation, a court named: the query
+    /// is a reference. A number takes every word carrying a digit with it.
+    fn cited(&self, query: &str) -> bool {
+        let folded = lj_core::case_names::case_name_key(query);
+        let words: Vec<&str> = folded.split(' ').collect();
+        let around: Vec<&str> = match self {
+            Designation::Number => words
+                .into_iter()
+                .filter(|w| !w.chars().any(|c| c.is_ascii_digit()))
+                .collect(),
+            Designation::Name(key) => lj_core::case_names::words_around(&words, key),
+        };
+        lj_core::case_names::remainder_cites(&around)
+    }
+}
+
+/// A stated mode is served as stated, without a card; `auto` settles the
+/// declared reference on the query shape and leaves the rest to [`resolve_content`].
+fn resolve_shape(req: &SearchRequest) -> Option<Resolution> {
+    match req.mode {
+        lj_dtos::SearchMode::Lexical => Some(Resolution::Lexical),
+        lj_dtos::SearchMode::Semantic => Some(Resolution::Semantic),
+        lj_dtos::SearchMode::Auto => {
+            (lj_core::docket_key::declares_reference_explicitly(&req.query)
+                && !has_boolean_operator(&req.query))
+            .then_some(Resolution::Reference)
+        }
+    }
+}
+
+/// The content mode, and a card above it when the query designates a decision.
+/// A designation cited with its court is the reference; one that consumes the
+/// query leaves nothing for the ANN: lexical.
+fn resolve_content(query: &str, designation: Option<Designation>) -> Resolution {
+    let lexical = detect_query_mode(query) == QueryMode::Lexical;
+    match designation {
+        None if lexical => Resolution::Lexical,
+        None => Resolution::Semantic,
+        Some(d) if d.cited(query) && !has_boolean_operator(query) => Resolution::Reference,
+        Some(d) if lexical || d.consumes(query) => Resolution::LexicalWithCard,
+        Some(_) => Resolution::SemanticWithCard,
+    }
+}
+
+async fn designation(state: &AppState, query: &str) -> Result<Option<Designation>> {
+    if !lj_core::docket_key::query_docket_keys(query).is_empty() {
+        return Ok(Some(Designation::Number));
+    }
+    let keys = lj_core::case_names::candidate_keys(query);
+    if !crate::referential::referential(state)
+        .await?
+        .names_a_case(&keys)
+    {
+        return Ok(None);
+    }
+    let conn = client(state).await?;
+    Ok(DecisionRepository::new(&conn)
+        .case_name_match(&keys)
+        .await
+        .map_err(ApiError::Store)?
+        .map(|m| Designation::Name(m.key)))
+}
+
+async fn resolve(state: &AppState, req: &SearchRequest) -> Result<Resolution> {
+    if let Some(resolution) = resolve_shape(req) {
+        return Ok(resolution);
+    }
+    let designation = designation(state, &req.query).await?;
+    Ok(resolve_content(&req.query, designation))
+}
+
+/// The legs a resolution runs, and the mode served. A card outcome runs the
+/// reference retrieval after the content one, connections released in between,
+/// and keeps its top [`PINNED_MAX`]; an empty content list is replaced by it.
+async fn retrieve(
+    state: &AppState,
+    req: &SearchRequest,
+    resolution: Resolution,
+    leg_limit: i64,
+    vchord_probes: u32,
+) -> Result<(Retrieval, QueryMode)> {
+    let mode = resolution.query_mode();
+    if query_lacks_searchable_terms(&req.query) {
+        let empty = Retrieval {
+            fused: Vec::new(),
+            lexicales: std::collections::HashSet::new(),
+            pinned: Vec::new(),
+        };
+        return Ok((empty, mode));
+    }
+    let mut retrieval = match mode {
+        QueryMode::Reference => retrieve_reference(state, req, leg_limit).await?,
+        QueryMode::Hybrid => retrieve_hybrid(state, req, leg_limit, vchord_probes).await?,
+        _ => retrieve_boolean(state, req, leg_limit).await?,
+    };
+    if resolution.with_card() {
+        let card = retrieve_reference(state, req, leg_limit).await?;
+        if retrieval.fused.is_empty() && !card.fused.is_empty() {
+            return Ok((card, QueryMode::Reference));
+        }
+        retrieval.pinned = card
+            .fused
+            .iter()
+            .take(PINNED_MAX)
+            .map(|(d, _, _)| *d)
+            .collect();
+    }
+    Ok((retrieval, mode))
+}
+
+/// Exact key sub-leg of the reference retrieval: the bearers of the query's
+/// docket keys, or of the numbers of the decisions its case name resolves to.
+async fn key_leg(
+    state: &AppState,
+    req: &SearchRequest,
+    leg_limit: i64,
+) -> Result<HashMap<i64, f64>> {
+    let numbers = lj_core::docket_key::query_docket_keys(&req.query);
+    let name_keys = match numbers.is_empty() {
+        true => lj_core::case_names::candidate_keys(&req.query),
+        false => Vec::new(),
+    };
+    if numbers.is_empty()
+        && !crate::referential::referential(state)
+            .await?
+            .names_a_case(&name_keys)
+    {
+        return Ok(HashMap::new());
+    }
+    let conn = client(state).await?;
+    let (keys, within) = match numbers.is_empty() {
+        false => (numbers, None),
+        true => {
+            let Some(named) = DecisionRepository::new(&conn)
+                .case_name_match(&name_keys)
+                .await
+                .map_err(ApiError::Store)?
+            else {
+                return Ok(HashMap::new());
+            };
+            (
+                named
+                    .decisions
+                    .iter()
+                    .flat_map(|d| &d.docket_numbers)
+                    .map(|n| lj_core::docket_key::docket_key(n))
+                    .collect(),
+                Some(named.decisions.iter().map(|d| d.id).collect::<Vec<i64>>()),
+            )
+        }
+    };
+    docket_leg(&conn, req, &keys, within.as_deref(), leg_limit)
+        .await
+        .map_err(ApiError::Store)
+}
+
+/// Retrieval for a query that designates a decision: exact key leg plus title leg,
+/// the only two that index a decision's identity. No embedding and no ANN, so an
+/// absent reference answers with an empty list instead of its neighbours.
+#[tracing::instrument(skip(state, req), fields(leg_limit))]
+async fn retrieve_reference(
+    state: &AppState,
+    req: &SearchRequest,
+    leg_limit: i64,
+) -> Result<Retrieval> {
+    let title_conn = client(state).await?;
+    let title_scores = title_leg(&title_conn, req, leg_limit)
+        .await
+        .map_err(ApiError::Store)?;
+    let key_scores = key_leg(state, req, leg_limit).await?;
+    let weights = signals::Weights {
+        docket: signals::PURE_REFERENCE_DOCKET_WEIGHT,
+        ..signals::BASE_WEIGHTS
+    };
+    let empty: HashMap<i64, LegHit> = HashMap::new();
+    let no_bm25: HashMap<i64, f64> = HashMap::new();
+    let fused = truncate_fused(fuse_ranks(
+        Legs {
+            bm25: &no_bm25,
+            ann: &empty,
+            title: &title_scores,
+            docket: &key_scores,
+        },
+        weights,
+    ));
+    Ok(Retrieval {
+        fused,
+        lexicales: title_scores.keys().copied().collect(),
+        pinned: Vec::new(),
+    })
+}
+
 #[tracing::instrument(skip(state, req), fields(leg_limit))]
 async fn retrieve_boolean(
     state: &AppState,
     req: &SearchRequest,
     leg_limit: i64,
-) -> Result<Vec<(i64, f64, LegHit)>> {
+) -> Result<Retrieval> {
     let bm25_conn = client(state).await?;
-    let title_conn = client(state).await?;
     let body_query = if is_boolean_query(&req.query) {
         translate_boolean(&req.query)
     } else {
         req.query.clone()
     };
-    let (bm25_scores, title_scores) = if is_boolean_query(&req.query) {
-        tokio::try_join!(
-            bm25_parse_leg(&bm25_conn, req, &body_query, leg_limit),
-            title_leg(&title_conn, req, leg_limit),
-        )
+    let bm25_scores = if is_boolean_query(&req.query) {
+        bm25_parse_leg(&bm25_conn, req, &body_query, leg_limit).await
     } else {
-        tokio::try_join!(
-            bm25_leg(&bm25_conn, req, leg_limit),
-            title_leg(&title_conn, req, leg_limit),
-        )
+        bm25_leg(&bm25_conn, req, leg_limit).await
     }
     .map_err(ApiError::Store)?;
-
     let empty: HashMap<i64, LegHit> = HashMap::new();
+    let none: HashMap<i64, f64> = HashMap::new();
     let fused = truncate_fused(fuse_ranks(
-        &bm25_scores,
-        &empty,
-        &title_scores,
-        signals::BASE_WEIGHTS.bm25,
-        signals::BASE_WEIGHTS.ann,
-        signals::BASE_WEIGHTS.title,
+        Legs {
+            bm25: &bm25_scores,
+            ann: &empty,
+            title: &none,
+            docket: &none,
+        },
+        signals::BASE_WEIGHTS,
     ));
-    Ok(fused)
+    Ok(Retrieval {
+        fused,
+        lexicales: bm25_scores.keys().copied().collect(),
+        pinned: Vec::new(),
+    })
 }
 
 #[tracing::instrument(skip(state, req), fields(leg_limit, vchord_probes))]
@@ -357,10 +713,14 @@ async fn retrieve_hybrid(
     req: &SearchRequest,
     leg_limit: i64,
     vchord_probes: u32,
-) -> Result<Vec<(i64, f64, LegHit)>> {
+) -> Result<Retrieval> {
     let query_arr = match state.embedding_cache.get(&req.query).await {
-        Some(vec) => vec,
+        Some(vec) => {
+            crate::cache_metrics::record_access("embedding", true);
+            vec
+        }
         None => {
+            crate::cache_metrics::record_access("embedding", false);
             let arr = state
                 .embedder
                 .embed_query(std::slice::from_ref(&req.query))
@@ -376,32 +736,36 @@ async fn retrieve_hybrid(
     };
     let query_vec: Vec<f32> = query_arr.iter().copied().collect();
 
-    // Les 3 connexions des jambes sont relâchées dès le `try_join` fini, AVANT
+    // Les connexions des jambes sont relâchées dès le `try_join` fini, AVANT
     // `compute_adaptive_weights` qui en reprend 2 : le pic reste à
     // `PEAK_CONNS_PER_SEARCH`.
-    let (bm25_scores, ann_hits, title_scores) = {
+    let (bm25_scores, ann_hits) = {
         let bm25_conn = client(state).await?;
         let mut ann_conn = client(state).await?;
-        let title_conn = client(state).await?;
         tokio::try_join!(
             bm25_leg(&bm25_conn, req, leg_limit),
             ann_leg(&mut ann_conn, req, &query_vec, leg_limit, vchord_probes),
-            title_leg(&title_conn, req, leg_limit),
         )
         .map_err(ApiError::Store)?
     };
 
     let ann_best = pool_max_per_decision(&ann_hits, leg_limit as usize);
     let weights = compute_adaptive_weights(state, &req.query, &bm25_scores, &ann_hits).await?;
+    let none: HashMap<i64, f64> = HashMap::new();
     let fused = truncate_fused(fuse_ranks(
-        &bm25_scores,
-        &ann_best,
-        &title_scores,
-        weights.bm25,
-        weights.ann,
-        weights.title,
+        Legs {
+            bm25: &bm25_scores,
+            ann: &ann_best,
+            title: &none,
+            docket: &none,
+        },
+        weights,
     ));
-    Ok(fused)
+    Ok(Retrieval {
+        fused,
+        lexicales: bm25_scores.keys().copied().collect(),
+        pinned: Vec::new(),
+    })
 }
 
 /// Clé du cache rerank : `(query, ensemble TRIÉ du top-[`RERANK_K`])`. Trié parce
@@ -558,7 +922,12 @@ async fn llm_order(
 
     // Un jeton = un rerank, quel que soit le nombre d'appels qu'il déclenche : le
     // cache de notes le fait varier de ~4 à 15. Le jeton est calé sur le pire cas.
-    if state.rerank_budget.take(budget_key).await == crate::ratelimit::Verdict::Exhausted {
+    if state
+        .budgets
+        .take(crate::ratelimit::Cost::Rerank, budget_key)
+        .await
+        == crate::ratelimit::Verdict::Exhausted
+    {
         return None;
     }
 
@@ -631,10 +1000,14 @@ pub struct RankedResults {
     /// Metadata hydratée de tous les hits (≤100), `summary` inclus. Sert au tri par
     /// date, à l'assemblage de page et de texte-source au rerank. Pas de highlight.
     meta: HashMap<i64, DecisionMeta>,
-    facets: SearchFacets,
     /// `decision_id → public_id` de tous les hits.
     pub_ids: HashMap<i64, String>,
-    total: i64,
+    /// Servies que la question n'apparie pas, portées ici pour que le décompte
+    /// décrive la récupération qui a servi CETTE liste.
+    hors_question: Vec<i64>,
+    comptage: tokio::sync::OnceCell<(i64, SearchFacets)>,
+    /// Decisions the query designates, hydrated once with the bundle.
+    pinned: Vec<PinnedDecision>,
     /// Tier 2 — pages déjà highlightées, mémoïsées par `(ai_mode, sort, offset,
     /// limit)`. `ai_mode` est dans la clé car le rerank change l'ordre, donc le contenu
     /// de la page. `std::sync::Mutex` : verrou jamais tenu à travers un `await`.
@@ -643,8 +1016,8 @@ pub struct RankedResults {
 
 impl RankedResults {
     /// Poids approximatif de l'entrée en octets, pour le `weigher` du cache moka.
-    /// Dominé par la metadata hydratée. Le `page_memo` n'est pas pesé — moka ne
-    /// ré-évalue pas le poids après insertion.
+    /// Dominé par la metadata hydratée. Ni le `page_memo` ni le décompte ne sont
+    /// pesés, tous deux remplis après insertion : moka ne ré-évalue pas le poids.
     pub fn approx_weight(&self) -> u32 {
         let fused: usize = self
             .fused
@@ -659,7 +1032,7 @@ impl RankedResults {
             .values()
             .map(|s| std::mem::size_of::<i64>() + std::mem::size_of::<String>() + s.len())
             .sum();
-        (fused + meta + ids + facets_weight(&self.facets)).min(u32::MAX as usize) as u32
+        (fused + meta + ids).min(u32::MAX as usize) as u32
     }
 }
 
@@ -688,7 +1061,7 @@ fn meta_weight(m: &DecisionMeta) -> usize {
 }
 
 /// Octets approximatifs d'un bloc de facettes (libellés + overhead des buckets).
-fn facets_weight(f: &SearchFacets) -> usize {
+pub(crate) fn facets_weight(f: &SearchFacets) -> usize {
     fn choices(v: &[FacetChoice]) -> usize {
         v.iter()
             .map(|c| {
@@ -699,10 +1072,11 @@ fn facets_weight(f: &SearchFacets) -> usize {
             })
             .sum()
     }
-    choices(&f.jurisdiction)
+    choices(&f.seat)
+        + choices(&f.office)
         + choices(&f.legal_domain)
         + choices(&f.solution)
-        + choices(&f.significance)
+        + choices(&f.procedure)
         + choices(&f.publication)
         + choices(&f.date_lecture_year)
         + f.legal_instrument
@@ -719,50 +1093,98 @@ fn facets_weight(f: &SearchFacets) -> usize {
 /// Clé de cache du bundle retrieval : query, filtres, mode. Exclut
 /// `offset`/`limit`, `sort` et `ai_mode` — une seule entrée sert les deux modes,
 /// toutes les pages et tous les tris.
-fn ranked_cache_key(req: &SearchRequest, query_mode: QueryMode) -> String {
+fn ranked_cache_key(req: &SearchRequest) -> String {
     let mut norm = req.clone();
     norm.offset = 0;
     norm.limit = 0;
     norm.sort = lj_dtos::SortOrder::Relevance;
     norm.ai_mode = false;
-    format!(
-        "{query_mode:?}|{}",
-        serde_json::to_string(&norm).unwrap_or_default()
-    )
+    serde_json::to_string(&norm).unwrap_or_default()
 }
 
-/// Récupération (RRF) + facettes + hydratation → bundle [`RankedResults`], la
-/// partie coûteuse mise en cache et ai_mode-indépendante.
+/// Récupération (RRF) + hydratation → bundle [`RankedResults`], la partie
+/// coûteuse mise en cache et ai_mode-indépendante. Le décompte n'en fait pas
+/// partie : [`comptage`] le calcule à la demande dans le bundle.
 async fn rank_results(
     state: &AppState,
-    fused: Vec<(i64, f64, LegHit)>,
+    retrieval: Retrieval,
     query_mode: QueryMode,
 ) -> Result<RankedResults> {
+    let Retrieval {
+        fused,
+        lexicales,
+        pinned,
+    } = retrieval;
     let all_ids: Vec<i64> = fused.iter().map(|(d, _, _)| *d).collect();
-    let total = fused.len() as i64;
+    let hors_question: Vec<i64> = all_ids
+        .iter()
+        .copied()
+        .filter(|d| !lexicales.contains(d))
+        .collect();
 
-    // `fetch_pub_ids_and_facets` et `hydrate_all` sont indépendants : lancés en
-    // parallèle. Pic de connexions 1 + 1 = 2 ≤ `PEAK_CONNS_PER_SEARCH`.
-    let refs = referential(state).await?;
-    let facets_conn = client(state).await?;
-    let ((pub_ids, facets), meta) = tokio::try_join!(
+    // Les deux sont indépendants : lancés en parallèle. Pic de connexions
+    // 1 + 1 = 2 ≤ `PEAK_CONNS_PER_SEARCH`.
+    let cite_conn = client(state).await?;
+    let (pub_ids, meta) = tokio::try_join!(
         async {
-            fetch_pub_ids_and_facets(&facets_conn, &all_ids, &refs)
+            fetch_pub_ids(&cite_conn, &all_ids)
                 .await
                 .map_err(ApiError::Store)
         },
         hydrate_all(state, &fused),
     )?;
+    let pinned = pinned_decisions(state, &pinned).await?;
 
     Ok(RankedResults {
         query_mode,
         fused,
         meta,
-        facets,
         pub_ids,
-        total,
+        hors_question,
+        comptage: tokio::sync::OnceCell::new(),
+        pinned,
         page_memo: std::sync::Mutex::new(HashMap::new()),
     })
+}
+
+/// Title and public id of the designated decisions, in the leg's order.
+async fn pinned_decisions(state: &AppState, ids: &[i64]) -> Result<Vec<PinnedDecision>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = client(state).await?;
+    let meta = hydrate_decisions(&conn, ids)
+        .await
+        .map_err(ApiError::Store)?;
+    let refs = referential(state).await?;
+    Ok(ids
+        .iter()
+        .filter_map(|d| meta.get(d))
+        .map(|m| PinnedDecision {
+            id: m.public_id.clone(),
+            title: display_title(m, &refs),
+        })
+        .collect())
+}
+
+/// Total exact et facettes du bundle, calculés une seule fois : les demandeurs
+/// suivants attendent le même résultat, et aucun ne relance la récupération.
+async fn comptage<'a>(
+    state: &AppState,
+    req: &SearchRequest,
+    ranked: &'a RankedResults,
+) -> Result<&'a (i64, SearchFacets)> {
+    ranked
+        .comptage
+        .get_or_try_init(|| async {
+            let conn = client(state).await?;
+            let refs = referential(state).await?;
+            let (total, counters) = aggregate_facets(&conn, req, &ranked.hors_question)
+                .await
+                .map_err(|e| ApiError::Internal(format!("facettes agrégées : {e}")))?;
+            Ok((total, facets_from_counters(&counters, &refs)))
+        })
+        .await
 }
 
 /// Tier 2 : applique l'ordre relevance effectif (reranké si mode IA, sinon RRF du
@@ -821,27 +1243,17 @@ async fn paginate(
         hits
     };
 
+    let comptage = ranked.comptage.get();
     Ok(SearchResponse {
         query: req.query.clone(),
-        total: ranked.total,
+        total: comptage.map(|(total, _)| *total),
         hits: page,
         query_mode: ranked.query_mode,
-        facets: Some(ranked.facets.clone()),
+        facets: comptage.map(|(_, facets)| facets.clone()),
         all_hit_ids,
+        reranked: rerank_ids.is_some(),
+        pinned: ranked.pinned.clone(),
     })
-}
-
-/// Mode de recherche effectif (parité du `match` de dispatch) : `Lexical` si la
-/// requête est explicitement lexicale, ou détectée booléenne en `auto` ; sinon
-/// `Hybrid`.
-fn effective_query_mode(req: &SearchRequest) -> QueryMode {
-    match req.mode {
-        lj_dtos::SearchMode::Lexical => QueryMode::Lexical,
-        lj_dtos::SearchMode::Auto if detect_query_mode(&req.query) == QueryMode::Lexical => {
-            QueryMode::Lexical
-        }
-        _ => QueryMode::Hybrid,
-    }
 }
 
 /// Bundle retrieval depuis le cache moka, sinon calculé (récupération + RRF +
@@ -853,18 +1265,18 @@ fn effective_query_mode(req: &SearchRequest) -> QueryMode {
 async fn ranked_results_cached(
     state: &AppState,
     req: &SearchRequest,
-    query_mode: QueryMode,
     leg_limit: i64,
     vchord_probes: u32,
     budget_key: Option<&crate::ratelimit::CallerKey>,
 ) -> Result<std::sync::Arc<RankedResults>> {
-    let key = ranked_cache_key(req, query_mode);
+    let key = ranked_cache_key(req);
     let mut own_err: Option<ApiError> = None;
+    let mut computed = false;
     let hit = state
         .search_cache
         .optionally_get_with(key, async {
-            match rank_uncached(state, req, query_mode, leg_limit, vchord_probes, budget_key).await
-            {
+            computed = true;
+            match rank_uncached(state, req, leg_limit, vchord_probes, budget_key).await {
                 Ok(ranked) => Some(ranked),
                 Err(err) => {
                     own_err = Some(err);
@@ -873,27 +1285,28 @@ async fn ranked_results_cached(
             }
         })
         .await;
+    crate::cache_metrics::record_access("recherche", !computed);
     match (hit, own_err) {
         (Some(ranked), _) => Ok(ranked),
         (None, Some(err)) => Err(err),
-        (None, None) => {
-            rank_uncached(state, req, query_mode, leg_limit, vchord_probes, budget_key).await
-        }
+        (None, None) => rank_uncached(state, req, leg_limit, vchord_probes, budget_key).await,
     }
 }
 
-/// Le calcul du bundle lui-même — budget, permit DB, récupération, ranking.
-/// Séparé de [`ranked_results_cached`] pour que le single-flight ne porte que sur
-/// le cache.
+/// Budget, DB permit, resolution, retrieval, ranking. Kept apart from
+/// [`ranked_results_cached`] so the single flight covers the cache alone.
 async fn rank_uncached(
     state: &AppState,
     req: &SearchRequest,
-    query_mode: QueryMode,
     leg_limit: i64,
     vchord_probes: u32,
     budget_key: Option<&crate::ratelimit::CallerKey>,
 ) -> Result<std::sync::Arc<RankedResults>> {
-    if state.search_budget.take(budget_key).await == crate::ratelimit::Verdict::Exhausted
+    if state
+        .budgets
+        .take(crate::ratelimit::Cost::Search, budget_key)
+        .await
+        == crate::ratelimit::Verdict::Exhausted
         && state.settings.search_budget_enforce
     {
         return Err(ApiError::TooManyRequests);
@@ -904,16 +1317,10 @@ async fn rank_uncached(
         .acquire_owned()
         .await
         .map_err(|e| ApiError::Internal(format!("search semaphore: {e}")))?;
-    let fused = if query_lacks_searchable_terms(&req.query) {
-        Vec::new()
-    } else {
-        match query_mode {
-            QueryMode::Lexical => retrieve_boolean(state, req, leg_limit).await?,
-            QueryMode::Hybrid => retrieve_hybrid(state, req, leg_limit, vchord_probes).await?,
-        }
-    };
+    let resolution = resolve(state, req).await?;
+    let (retrieval, mode) = retrieve(state, req, resolution, leg_limit, vchord_probes).await?;
     Ok(std::sync::Arc::new(
-        rank_results(state, fused, query_mode).await?,
+        rank_results(state, retrieval, mode).await?,
     ))
 }
 
@@ -935,11 +1342,18 @@ async fn rank_uncached(
     librejustice.search.query = tracing::field::Empty,
     librejustice.search.mode = tracing::field::Empty,
     librejustice.search.identity = tracing::field::Empty,
-    librejustice.search.session = tracing::field::Empty,
     librejustice.search.context = tracing::field::Empty,
+    librejustice.search.origin = tracing::field::Empty,
+    librejustice.search.caller = tracing::field::Empty,
+    user_agent.original = tracing::field::Empty,
+    librejustice.search.visit = tracing::field::Empty,
     librejustice.search.page = tracing::field::Empty,
     librejustice.search.filters = tracing::field::Empty,
     librejustice.search.results_count = tracing::field::Empty,
+    librejustice.search.hit_ids = tracing::field::Empty,
+    librejustice.search.retrieval_ms = tracing::field::Empty,
+    librejustice.search.rerank_ms = tracing::field::Empty,
+    librejustice.search.paginate_ms = tracing::field::Empty,
 ))]
 pub async fn search(
     state: &AppState,
@@ -957,12 +1371,26 @@ pub async fn search(
     caller.record_span(ENGINE, req.query.as_str(), shape);
     tracing::Span::current().record("librejustice.search.mode", tracing::field::debug(req.mode));
 
+    if req.query.trim().is_empty() {
+        let resp = browse::browse(state, req).await?;
+        caller.record_outcome(
+            ENGINE,
+            req.query.as_str(),
+            shape,
+            resp.total.unwrap_or_default(),
+        );
+        return Ok(resp);
+    }
+
     let leg_limit = state.settings.leg_limit as i64;
     let vchord_probes = state.settings.vchord_probes;
-    let query_mode = effective_query_mode(req);
-    let ranked =
-        ranked_results_cached(state, req, query_mode, leg_limit, vchord_probes, budget_key).await?;
+    let t = std::time::Instant::now();
+    let ranked = ranked_results_cached(state, req, leg_limit, vchord_probes, budget_key).await?;
+    let retrieval = t.elapsed();
+    let t = std::time::Instant::now();
     let rerank_ids = reranked_order(state, req, &ranked, budget_key).await?;
+    let rerank = t.elapsed();
+    let t = std::time::Instant::now();
     let resp = paginate(
         state,
         req,
@@ -971,6 +1399,211 @@ pub async fn search(
     )
     .await?;
 
-    caller.record_outcome(ENGINE, req.query.as_str(), shape, resp.total);
+    let span = tracing::Span::current();
+    span.record(
+        "librejustice.search.retrieval_ms",
+        retrieval.as_millis() as u64,
+    );
+    span.record("librejustice.search.rerank_ms", rerank.as_millis() as u64);
+    span.record(
+        "librejustice.search.paginate_ms",
+        t.elapsed().as_millis() as u64,
+    );
+    // Served order up to the reranker horizon: the rank of the decision a caller
+    // opens next reads nowhere else, and it is what says whether the window is
+    // too narrow or too wide.
+    span.record(
+        "librejustice.search.hit_ids",
+        resp.all_hit_ids
+            .iter()
+            .take(crate::rerank::RERANK_K)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",")
+            .as_str(),
+    );
+    // Le total exact ne se paie plus ici : `results_count` porte le nombre servi.
+    caller.record_outcome(
+        ENGINE,
+        req.query.as_str(),
+        shape,
+        resp.all_hit_ids.len() as i64,
+    );
     Ok(resp)
+}
+
+/// Décompte exact et facettes, pour les mêmes paramètres que la recherche : le
+/// bundle vient du cache que celle-ci vient de remplir, et l'agrégat ne tourne
+/// qu'une fois par bundle. N'émet aucun événement d'usage : une recherche en
+/// deux appels reste une recherche.
+pub async fn count(
+    state: &AppState,
+    req: &SearchRequest,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
+) -> Result<lj_dtos::SearchCountResponse> {
+    if req.query.trim().is_empty() {
+        let refs = referential(state).await?;
+        let counts = browse::totals_and_facets(state, req, &refs).await?;
+        return Ok(lj_dtos::SearchCountResponse {
+            total: counts.0,
+            facets: counts.1.clone(),
+        });
+    }
+    let ranked = ranked_results_cached(
+        state,
+        req,
+        state.settings.leg_limit as i64,
+        state.settings.vchord_probes,
+        budget_key,
+    )
+    .await?;
+    let (total, facets) = comptage(state, req, &ranked).await?;
+    Ok(lj_dtos::SearchCountResponse {
+        total: *total,
+        facets: facets.clone(),
+    })
+}
+
+/// Recherche d'un appelant qui ne reviendra pas chercher son décompte : MCP,
+/// dont le schéma de sortie exige `total` et `facets`.
+pub async fn search_with_count(
+    state: &AppState,
+    req: &SearchRequest,
+    caller: crate::usage::Caller,
+    budget_key: Option<&crate::ratelimit::CallerKey>,
+) -> Result<SearchResponse> {
+    let mut resp = search(state, req, caller, budget_key).await?;
+    if resp.total.is_none() {
+        let compte = count(state, req, budget_key).await?;
+        resp.total = Some(compte.total);
+        resp.facets = Some(compte.facets);
+    }
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(query: &str, mode: &str) -> SearchRequest {
+        serde_json::from_value(serde_json::json!({ "query": query, "mode": mode })).unwrap()
+    }
+
+    #[test]
+    fn la_requete_qui_designe_une_decision_part_en_reference() {
+        for q in [
+            "\"18-25.770\"",
+            "n° 250747",
+            "n° 1702092",
+            "21PA01295",
+            "31399/23",
+        ] {
+            assert_eq!(
+                resolve_shape(&req(q, "auto")),
+                Some(Resolution::Reference),
+                "{q}"
+            );
+        }
+        for q in [
+            "\"12-11.666\" OU valeur des parts de l'associé retrayant",
+            "\"12-15.373\" ET \"cour d'appel de Douai\"",
+            "21PA01295 SAUF référé",
+            "387763 Czabaj délai raisonnable",
+            "75013",
+            "Danthony",
+        ] {
+            assert_eq!(resolve_shape(&req(q, "auto")), None, "{q}");
+        }
+    }
+
+    #[test]
+    fn le_mode_demande_est_servi_tel_quel_sans_carte() {
+        for q in ["\"18-25.770\"", "Danthony", "75013", "expulsion locative"] {
+            assert_eq!(
+                resolve_shape(&req(q, "lexical")),
+                Some(Resolution::Lexical),
+                "{q}"
+            );
+            assert_eq!(
+                resolve_shape(&req(q, "semantic")),
+                Some(Resolution::Semantic),
+                "{q}"
+            );
+        }
+    }
+
+    #[test]
+    fn la_designation_dans_une_requete_de_contenu_pose_une_carte() {
+        let number = || Some(Designation::Number);
+        let danthony = || Some(Designation::Name("danthony".into()));
+        let beziers = || Some(Designation::Name("commune de beziers".into()));
+        let beziers_court = || Some(Designation::Name("beziers".into()));
+        for (q, designation, attendu) in [
+            ("expulsion locative", None, Resolution::Semantic),
+            ("Conseil d'État 2024 expulsion", None, Resolution::Semantic),
+            ("congés ET payés", None, Resolution::Lexical),
+            ("\"force majeure\"", None, Resolution::Lexical),
+            ("75013", number(), Resolution::LexicalWithCard),
+            (" 1702092 ", number(), Resolution::LexicalWithCard),
+            (
+                "387763 Czabaj délai raisonnable",
+                number(),
+                Resolution::SemanticWithCard,
+            ),
+            (
+                "barème 500000 accident de la circulation",
+                number(),
+                Resolution::SemanticWithCard,
+            ),
+            (
+                "\"12-11.666\" OU valeur des parts",
+                number(),
+                Resolution::LexicalWithCard,
+            ),
+            ("Danthony", danthony(), Resolution::LexicalWithCard),
+            ("\"Danthony\"", danthony(), Resolution::LexicalWithCard),
+            (
+                "Danthony vice de procédure",
+                danthony(),
+                Resolution::SemanticWithCard,
+            ),
+            ("Commune de Béziers", beziers(), Resolution::LexicalWithCard),
+            (
+                "Commune de Béziers absence de transmission",
+                beziers(),
+                Resolution::SemanticWithCard,
+            ),
+            ("Béziers", beziers_court(), Resolution::LexicalWithCard),
+            (
+                "Béziers 2001",
+                beziers_court(),
+                Resolution::SemanticWithCard,
+            ),
+            (
+                "jurisprudence Béziers II",
+                beziers_court(),
+                Resolution::SemanticWithCard,
+            ),
+            (
+                "Béziers conseil d'État",
+                beziers_court(),
+                Resolution::Reference,
+            ),
+            ("Béziers CE 2001", beziers_court(), Resolution::Reference),
+            ("Danthony CE", danthony(), Resolution::Reference),
+            ("362324 conseil d'État", number(), Resolution::Reference),
+            (
+                "Béziers OU Danthony CE",
+                beziers_court(),
+                Resolution::LexicalWithCard,
+            ),
+            (
+                "Béziers conseil d'État loyauté contractuelle",
+                beziers_court(),
+                Resolution::SemanticWithCard,
+            ),
+        ] {
+            assert_eq!(resolve_content(q, designation), attendu, "{q}");
+        }
+    }
 }

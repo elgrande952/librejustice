@@ -294,9 +294,9 @@ pub async fn ingest_dila(fond: Fond) -> Result<()> {
 }
 
 /// Ingère une liste d'archives DILA (stock et/ou incréments) dans l'ordre
-/// fourni, puis logge le total. Partagé par [`ingest_dila`] (toutes les
-/// archives sur disque) et [`sync_dila`] (uniquement les archives fraîchement
-/// téléchargées).
+/// fourni, puis logge le total. Sert [`ingest_dila`], qui reprend les archives
+/// du disque et n'a aucun filigrane à tenir ; [`sync_dila`] a sa propre boucle,
+/// qui pose le filigrane derrière chaque archive.
 async fn ingest_dila_paths(
     conn: &Connection,
     fond: Fond,
@@ -312,19 +312,23 @@ async fn ingest_dila_paths(
         deleted_total += deleted;
         total.merge(&counts);
     }
+    log_dila_total(fond, paths.len(), &total, deleted_total);
+    Ok(())
+}
 
+/// Total d'une passe d'ingestion DILA, quelle que soit la boucle qui l'a menée.
+fn log_dila_total(fond: Fond, tarballs: usize, total: &IngestCounts, deleted: u64) {
     tracing::info!(
         fond = ?fond,
-        tarballs = paths.len(),
+        tarballs,
         created = total.created,
         updated = total.updated,
         skipped = total.skipped,
         errors = total.errors,
         chunks = total.chunks_created,
-        deleted = deleted_total,
+        deleted,
         "ingest_dila_total"
     );
-    Ok(())
 }
 
 /// Ingère UNE archive DILA (stock ou incrément) en streaming, renvoie
@@ -521,9 +525,9 @@ async fn ingest_dila_tarball(
 /// Sync d'un fond DILA, **auto-switch cold ↔ warm** en un seul point d'entrée
 /// (miroir de [`sync_legi`]) : [`lj_sources::dila::sync_dila`] télécharge le
 /// stock global au 1er run puis les incréments postérieurs au watermark sous
-/// `<cache>/dila/<fond>/tarballs/`, PUIS [`ingest_dila_paths`] ingère
-/// uniquement les archives fraîchement téléchargées. Le watermark avance à
-/// chaque téléchargement → idempotent et reprenable.
+/// `<cache>/dila/<fond>/tarballs/`, puis chaque archive fraîche est ingérée et
+/// **suivie de son filigrane** : interrompue au milieu du lot, la passe laisse à
+/// reprendre exactement ce qu'elle n'a pas appliqué.
 ///
 /// [`sync_legi`]: super::legi::sync_legi
 pub async fn sync_dila(fond: Fond) -> Result<()> {
@@ -532,12 +536,12 @@ pub async fn sync_dila(fond: Fond) -> Result<()> {
     // le Drop de son runtime interne panique s'il tombe dans le contexte async
     // d'un worker tokio. Il doit donc tourner sur un thread bloquant dédié.
     let (cache_dir, src) = (settings.cache_dir(), fond.source());
-    let downloaded =
+    let mut batch =
         tokio::task::spawn_blocking(move || lj_sources::dila::sync_dila(&cache_dir, src))
             .await
             .map_err(|e| anyhow!("sync_dila join {:?}: {e}", fond))?
             .map_err(|e| anyhow!("sync_dila {:?}: {e}", fond))?;
-    if downloaded.is_empty() {
+    if batch.archives.is_empty() {
         tracing::info!(fond = ?fond, "sync_dila : rien de neuf (≤ watermark)");
         return Ok(());
     }
@@ -549,16 +553,27 @@ pub async fn sync_dila(fond: Fond) -> Result<()> {
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
 
-    tracing::info!(fond = ?fond, downloaded = downloaded.len(), "sync_dila : ingestion des archives fraîches");
+    tracing::info!(fond = ?fond, downloaded = batch.archives.len(), "sync_dila : ingestion des archives fraîches");
     let (embedder, require_embeddings) = build_embedder_opt(&settings).await?;
-    ingest_dila_paths(
-        &conn,
-        fond,
-        &downloaded,
-        embedder.as_ref(),
-        require_embeddings,
-    )
-    .await
+    let mut total = IngestCounts::default();
+    let mut deleted_total: u64 = 0;
+    for archive in batch.archives.clone() {
+        let (counts, deleted) = ingest_dila_tarball(
+            &conn,
+            fond,
+            &archive.path,
+            embedder.as_ref(),
+            require_embeddings,
+        )
+        .await?;
+        deleted_total += deleted;
+        total.merge(&counts);
+        batch
+            .commit(&archive)
+            .map_err(|e| anyhow!("filigrane {:?} {}: {e}", fond, archive.watermark))?;
+    }
+    log_dila_total(fond, batch.archives.len(), &total, deleted_total);
+    Ok(())
 }
 
 #[cfg(test)]

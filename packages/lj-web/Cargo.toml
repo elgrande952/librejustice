@@ -26,6 +26,9 @@ lj-dtos = { workspace = true }
 # tls/gzip inertes). Present dans les deux cibles : un seul code client. ---
 reqwest = { workspace = true }
 
+# --- Solveur de preuve de travail : present dans les deux cibles, pur Rust ---
+base64 = { workspace = true }
+
 # --- serveur uniquement (SSR), gates dep: dans la feature ssr ---
 leptos_axum = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
@@ -44,14 +47,40 @@ wasm-bindgen = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
 js-sys = { workspace = true, optional = true }
 console_error_panic_hook = { workspace = true, optional = true }
-# `Window`/`Location` : origine de la page pour bâtir l'URL absolue du client
-# `/api` (reqwest-wasm rejette une URL relative → "builder error").
-# `History` : fragment aligné sans entrée d'historique à la matérialisation
-# d'une division (accordéon de lecture).
-# `Element`/`HtmlFormElement` : clic sur une suggestion → `requestSubmit` du
-# formulaire englobant (suggest_box).
-web-sys = { workspace = true, optional = true, features = ["Window", "Location", "History", "Element", "HtmlFormElement"] }
+# Les features de web-sys sont additives : une interface qui manque est une
+# ligne à ajouter ici, pas un shim JS à écrire.
+web-sys = { workspace = true, optional = true, features = [
+  "Window",
+  "Location",
+  "History",
+  "Element",
+  "HtmlFormElement",
+  "Navigator",
+  "Clipboard",
+  "Storage",
+  "IntersectionObserver",
+  "IntersectionObserverEntry",
+  "IntersectionObserverInit",
+  "Document",
+  "DomTokenList",
+  "MediaQueryList",
+  "EventTarget",
+  "AddEventListenerOptions",
+  "EventListenerOptions",
+  "Selection",
+  "Range",
+  "DomRect",
+  "Node",
+  "HtmlCollection",
+  "ScrollIntoViewOptions",
+  "ScrollBehavior",
+  "ScrollLogicalPosition",
+] }
 send_wrapper = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Implementation officielle du protocole, confrontee a notre solveur par un test
+# hote : le crate ne compile pas en wasm, un dev-dependency ne part pas au front.
 
 [features]
 # default = ssr : un `cargo build`/`clippy`/`test` workspace host compile le binaire
