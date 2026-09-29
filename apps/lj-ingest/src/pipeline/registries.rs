@@ -3,13 +3,13 @@
 //!
 //! Découverte + download via `lj_sources::registries` (API dataset data.gouv,
 //! URLs de ressources datées) ; chargement par remplacement de namespace + COPY
-//! binaire (`lj_store`, idempotent). Le pliage des dénominations est
-//! `fold_stable` (le MÊME que l'extraction NER — la résolution comparera plié à
-//! plié) avec blancs réduits à un.
+//! binaire (`lj_store`, idempotent).
+//!
+//! Denominations fold with `lj_fold::fold`, the same fold as the NER extraction
+//! and the SQL `lj_fold`: resolution compares folded to folded.
 
 use crate::config::Settings;
 use anyhow::{anyhow, Result};
-use lj_core::text::fold_stable;
 use lj_sources::error::SourceError;
 use lj_sources::registries::{
     datagouv_latest_resource, decode_field, download_resource, for_each_csv_record,
@@ -40,23 +40,15 @@ pub enum RegistrySource {
 
 const BATCH: usize = 20_000;
 
-/// Pliage canonique de résolution : `fold_stable` + blancs réduits à un.
-fn canon(s: &str) -> String {
-    fold_stable(s)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Slug d'uid : pliage canonique, blancs et apostrophes en tirets.
+/// Slug d'uid : pliage des uids, blancs et apostrophes en tirets.
 pub(super) fn slug(s: &str) -> String {
-    canon(s).replace([' ', '\''], "-")
+    lj_fold::fold(s).replace([' ', '\''], "-")
 }
 
 /// Clé patronyme composé : nom-seul plié, tirets normalisés en espaces —
 /// `None` si mono-token (le nom-seul simple reste irrésoluble).
 pub(super) fn surname_key(nom: &str) -> Option<String> {
-    let k = canon(nom)
+    let k = lj_fold::fold(nom)
         .replace('-', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -68,7 +60,7 @@ pub(super) fn surname_key(nom: &str) -> Option<String> {
 /// (les raisons sociales OACC portent virgules, `&`, points — hors uid).
 fn firm_slug(s: &str) -> String {
     let mut out = String::new();
-    for c in canon(s).chars() {
+    for c in lj_fold::fold(s).chars() {
         if c.is_alphanumeric() {
             out.push(c);
         } else if !out.ends_with('-') {
@@ -84,7 +76,7 @@ pub async fn load_registries(source: RegistrySource, with_history: bool) -> Resu
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -126,8 +118,8 @@ pub async fn load_registries(source: RegistrySource, with_history: bool) -> Resu
     .await?;
     let (namespace, loaded) = result?;
     let count = repo.entity_count(namespace).await?;
-    tracing::info!(namespace, loaded, count, "registre chargé");
-    println!("registries {namespace} : {loaded} entités chargées ({count} en base).");
+    tracing::info!(namespace, loaded, count, "registry loaded");
+    println!("registries {namespace}: {loaded} entities loaded ({count} in the database).");
     Ok(())
 }
 
@@ -322,7 +314,7 @@ async fn load_sirene(
 
     conn.batch_execute("BEGIN").await?;
     let cleared = repo.entity_namespace_clear("siren").await?;
-    tracing::info!(cleared, "namespace siren vidé");
+    tracing::info!(cleared, "siren namespace emptied");
 
     // Sirens chargés (u32 : 9 chiffres) — filtre d'intégrité de l'historique.
     let mut sirens: HashSet<u32> = HashSet::new();
@@ -392,7 +384,7 @@ async fn load_sirene(
             let sigle = Some(field(rec, sigle)).filter(|s| !s.is_empty());
             let ape = Some(field(rec, ape)).filter(|a| !a.is_empty());
             let uid = format!("siren:{siren}");
-            let folded = canon(&denom);
+            let folded = lj_fold::fold(&denom);
             let category = sirene_category(nature, ape.as_deref(), &folded);
             loader.push(EntityWriteItem {
                 uid,
@@ -450,10 +442,10 @@ async fn load_sirene(
             Ok(loader.loaded)
         })?;
         let merged = repo.entity_history_merge().await?;
-        tracing::info!(merged, "historique fusionné dans entity.denominations");
+        tracing::info!(merged, "history merged into entity.denominations");
     }
     conn.batch_execute("COMMIT").await?;
-    tracing::info!(loaded, hist_rows, "sirene chargé");
+    tracing::info!(loaded, hist_rows, "sirene loaded");
     Ok(loaded)
 }
 
@@ -475,7 +467,7 @@ async fn load_rna(
     .await?;
     conn.batch_execute("BEGIN").await?;
     let cleared = repo.entity_namespace_clear("rna").await?;
-    tracing::info!(cleared, "namespace rna vidé");
+    tracing::info!(cleared, "rna namespace emptied");
     let loaded = tokio::task::block_in_place(|| -> Result<u64, SourceError> {
         let mut loader = Loader::new(repo);
         let mut cols = Cols::new();
@@ -731,7 +723,11 @@ fn cnb_diff(
 
 /// Télécharge le snapshot CNB courant et le parse (filtres pieds de fichier
 /// + identité). Partagé entre le reload upsert et le re-key one-shot.
-pub(super) async fn fetch_avocat_rows(dir: &Path) -> Result<(Vec<AvocatRow>, chrono::NaiveDate)> {
+///
+/// `None` when the snapshot carries no `avCnbfCode`, the key of the registry.
+pub(super) async fn fetch_avocat_rows(
+    dir: &Path,
+) -> Result<Option<(Vec<AvocatRow>, chrono::NaiveDate)>> {
     let (res, path) = fetch(
         "annuaire-des-avocats-de-france",
         dir,
@@ -741,6 +737,16 @@ pub(super) async fn fetch_avocat_rows(dir: &Path) -> Result<(Vec<AvocatRow>, chr
     .await?;
     let snapshot =
         snapshot_date_from_title(&res.title).unwrap_or_else(|| chrono::Utc::now().date_naive());
+    let mut header = Vec::new();
+    std::io::BufRead::read_until(
+        &mut std::io::BufReader::new(std::fs::File::open(&path)?),
+        b'\n',
+        &mut header,
+    )?;
+    if !header.windows(10).any(|w| w == b"avCnbfCode") {
+        tracing::warn!(snapshot = %snapshot, file = %path.display(), "cnb snapshot without avCnbfCode");
+        return Ok(None);
+    }
 
     // Parse complet en mémoire : le diff a besoin du snapshot entier face à
     // l'état en base.
@@ -786,7 +792,7 @@ pub(super) async fn fetch_avocat_rows(dir: &Path) -> Result<(Vec<AvocatRow>, chr
         })?;
         Ok(rows)
     })?;
-    Ok((rows, snapshot))
+    Ok(Some((rows, snapshot)))
 }
 
 async fn load_avocats(
@@ -794,7 +800,9 @@ async fn load_avocats(
     conn: &lj_store::db::Connection,
     dir: &Path,
 ) -> Result<u64> {
-    let (rows, snapshot) = fetch_avocat_rows(dir).await?;
+    let Some((rows, snapshot)) = fetch_avocat_rows(dir).await? else {
+        return Ok(0);
+    };
     // L'UPDATE en masse du registre (index GIN d'entity) dépasse le
     // `statement_timeout` du pool.
     conn.batch_execute("BEGIN; SET LOCAL statement_timeout = 0")
@@ -945,7 +953,7 @@ fn mail_key(email: Option<&String>) -> Option<String> {
 ///
 /// Uid : `oacc:<nom>-<prenom>` (avocats, comme cnb sans segment barreau) et
 /// `oacc:firm-<raison-pliée>` (sociétés). Dénomination « Prénom NOM » /
-/// raison sociale, pliée `fold_stable`.
+/// raison sociale, pliée `lj_fold::fold`.
 async fn load_avocats_conseils(
     repo: &DecisionRepository<'_>,
     conn: &lj_store::db::Connection,
@@ -1037,7 +1045,7 @@ async fn load_avocats_conseils(
 
     conn.batch_execute("BEGIN").await?;
     let cleared = repo.entity_namespace_clear("oacc").await?;
-    tracing::info!(cleared, "namespace oacc vidé");
+    tracing::info!(cleared, "oacc namespace emptied");
     repo.entity_copy(&ents).await?;
 
     let open = repo.affiliation_open_edges("oacc").await?;
@@ -1081,7 +1089,7 @@ async fn load_avocats_conseils(
         edges = desired.len(),
         edges_closed,
         edges_opened,
-        "oacc chargé"
+        "oacc loaded"
     );
     Ok(ents.len() as u64)
 }

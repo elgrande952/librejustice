@@ -5,24 +5,26 @@
 //! Le fond en table (`marche`) est servi ici ; les fonds à API publique
 //! (`bodacc`, `joafe`) sont dispatchés vers leur proxy live.
 //!
-//! **Facettes seulement** : pas de BM25 ni d'embeddings sur des objets d'une
-//! ligne. `q` est un filtre par mot (`ILIKE` sur titre et acheteur). Chaque page
-//! coûte quatre agrégats (page, total, trois axes), servis depuis le cache
+//! Facets first, and no embeddings over one-line objects: `q` is a BM25 match of
+//! every word on the title or the buyer. A page and its axes are served from
 //! `annonces_cache` (TTL 15 min).
 
 use std::sync::Arc;
 
-use lj_core::referential_labels::departement_label;
 use lj_dtos::{
-    annonce_acteur_role, annonce_fond_a_echeance, annonce_fond_label, AnnonceCanalDto,
-    AnnonceCatalogueResponse, AnnonceDepartementEntry, AnnonceDetailResponse, AnnonceEntiteDto,
-    AnnonceFacetAxis, AnnonceFondGroup, AnnonceHit, AnnonceLienDto, AnnonceLotDto,
-    AnnonceResultatDto, AnnonceSearchRequest, AnnonceSearchResponse, AnnonceSort,
-    EntityAnnonceGroupDto, FacetChoice, FacetTag, ANNONCE_FOND_BODACC, ANNONCE_FOND_JOAFE,
-    ANNONCE_FOND_MARCHE,
+    annonce_acteur_role, annonce_fond_label, AnnonceCanalDto, AnnonceCatalogueResponse,
+    AnnonceDetailResponse, AnnonceEntiteDto, AnnonceFacetAxis, AnnonceFondGroup, AnnonceHit,
+    AnnonceLienDto, AnnonceLotDto, AnnonceLotOuvertDto, AnnonceMontantDto, AnnonceResultatDto,
+    AnnonceSearchRequest, AnnonceSearchResponse, AnnonceSort, AnnonceZoneEntry,
+    EntityAnnonceGroupDto, FacetChoice, FacetTag,
 };
+use lj_norm::referential_labels::departement_label;
 use lj_store::repository::{
     AnnonceAxe, AnnonceFiltre, AnnonceOrdre, AnnonceRow, DecisionRepository, EntityAnnonceRow,
+};
+use lj_vocab::{
+    zone_est_departement, ANNONCE_FOND_BODACC, ANNONCE_FOND_JOAFE, ANNONCE_FOND_MARCHE,
+    ZONE_FRANCE, ZONE_SANS, ZONE_UE,
 };
 use tracing::instrument;
 
@@ -31,17 +33,11 @@ use crate::annonces_joafe;
 use crate::error::{ApiError, Result};
 use crate::state::AppState;
 
-/// Fenêtres d'échéance offertes en facette (« ferme sous 7 / 30 jours »).
-const FENETRES_ECHEANCE: [i32; 2] = [7, 30];
 /// Annonces par rôle sur une fiche entité.
 const PAR_ROLE: i64 = 5;
 /// Plafond d'items d'un flux.
 pub const FEED_MAX_ITEMS: u32 = 100;
 
-/// Une page du moteur, facettes comprises, servie depuis le cache in-process.
-///
-/// Le span est nommé explicitement : sans ça il prend le nom de la fonction et
-/// percute `search`, le span du signal d'usage ([`crate::usage`]).
 #[instrument(
     name = "annonces_search",
     skip(state, req),
@@ -115,7 +111,7 @@ async fn load_search(
         let (hits, total) = match page {
             Ok(page) => page,
             Err(e) => {
-                tracing::warn!(fond, error = %e, "fond indisponible, groupe retiré");
+                tracing::warn!(fond, error = %e, "fond unavailable, group removed");
                 continue;
             }
         };
@@ -198,14 +194,11 @@ async fn axes(
     };
     match propres {
         Ok(propres) => axes.extend(propres),
-        Err(e) => tracing::warn!(fond, error = %e, "facettes du fond indisponibles"),
+        Err(e) => tracing::warn!(fond, error = %e, "fond facets unavailable"),
     }
     axes
 }
 
-/// Les axes d'un fond en table (`marche`, `attribution`) : département,
-/// nature, CPV — plus les fenêtres d'échéance pour le seul fond qui en a
-/// (un fait constaté n'a rien à fermer). Quatre agrégats SQL sur la fenêtre.
 async fn axes_stockes(
     state: &AppState,
     req: &AnnonceSearchRequest,
@@ -214,20 +207,20 @@ async fn axes_stockes(
     let filtre = filtre_from(req, fond);
     let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
-    let (departement, famille, cpv) = tokio::try_join!(
-        repo.annonces_facette(&filtre, AnnonceAxe::Departement),
+    let (zone, famille, cpv, metier) = tokio::try_join!(
+        repo.annonces_facette(&filtre, AnnonceAxe::Zone),
         repo.annonces_facette(&filtre, AnnonceAxe::Famille),
         repo.annonces_facette(&filtre, AnnonceAxe::Cpv),
+        repo.annonces_facette(&filtre, AnnonceAxe::Metier),
     )?;
     let refs = crate::referential::referential(state).await?;
-    let mut departement = AnnonceFacetAxis {
-        key: "departement".to_string(),
-        label: "Département".to_string(),
+    let mut zone = AnnonceFacetAxis {
+        key: "zone".to_string(),
+        label: "Zone".to_string(),
         choices: par_poids(
-            departement
-                .into_iter()
+            zone.into_iter()
                 .map(|(code, _, count)| FacetChoice {
-                    label: departement_nom(&code),
+                    label: zone_nom(&code),
                     value: code,
                     count,
                     parent: None,
@@ -236,48 +229,28 @@ async fn axes_stockes(
                 .collect(),
         ),
     };
-    completer_selection(&mut departement, &req.departement, departement_nom);
-    let mut famille = AnnonceFacetAxis {
-        key: "famille".to_string(),
-        // Quatre valeurs, toutes visibles : l'ordre éditorial de
-        // `facet_value` (Travaux, Services, Fournitures…).
-        label: "Nature".to_string(),
-        choices: choices_referentiel(famille),
-    };
-    completer_selection(&mut famille, &req.famille, |v| {
-        refs.label(&format!("nature_marche:{}", v.to_uppercase()))
-            .to_string()
-    });
+    completer_selection(&mut zone, &req.zone, zone_nom);
     let mut cpv = AnnonceFacetAxis {
         key: "cpv".to_string(),
-        label: "Domaine (CPV)".to_string(),
-        choices: par_poids(choices_referentiel(cpv)),
+        label: "Domaine".to_string(),
+        choices: sous_les_natures(famille, cpv),
     };
     completer_selection(&mut cpv, &req.cpv, |v| {
-        refs.label(&format!("cpv:{v}")).to_string()
+        let uid = match v.starts_with(NATURE_PREFIXE) {
+            true => v.to_string(),
+            false => format!("cpv:{v}"),
+        };
+        refs.label(&uid).to_string()
     });
-    let mut axes = vec![departement, famille, cpv];
-    if !annonce_fond_a_echeance(fond) {
-        return Ok(axes);
-    }
-    let fenetres = repo
-        .annonces_fenetres_echeance(&filtre, &FENETRES_ECHEANCE)
-        .await?;
-    axes.push(AnnonceFacetAxis {
-        key: "echeanceJours".to_string(),
-        label: "Échéance".to_string(),
-        choices: fenetres
-            .into_iter()
-            .map(|(jours, count)| FacetChoice {
-                value: jours.to_string(),
-                label: format!("Ferme sous {jours} jours"),
-                count,
-                parent: None,
-                hint: None,
-            })
-            .collect(),
+    let mut metier = AnnonceFacetAxis {
+        key: "metier".to_string(),
+        label: "Métier".to_string(),
+        choices: par_poids(choices_referentiel(metier)),
+    };
+    completer_selection(&mut metier, &req.metier, |v| {
+        lj_annonces::metiers::libelle(v).to_string()
     });
-    Ok(axes)
+    Ok(vec![zone, cpv, metier])
 }
 
 /// Rend à l'axe les valeurs cochées que son agrégat ne compte plus. Une facette
@@ -314,20 +287,69 @@ fn par_poids(mut choices: Vec<FacetChoice>) -> Vec<FacetChoice> {
 /// Choix d'un axe référentiel : la **valeur de filtre est le suffixe d'uid**
 /// (`TRAVAUX`, `45`), comme partout ailleurs dans l'API.
 fn choices_referentiel(rows: Vec<(String, Option<String>, i64)>) -> Vec<FacetChoice> {
+    choices_sous(rows, |_| None)
+}
+
+/// The domain facet, two levels in one axis, same shape as `juridiction`: the
+/// root carries the full uid (`nature_marche:TRAVAUX`), the leaf the bare
+/// division code with its root in `parent`. One key means one selection list,
+/// and a division opens without emptying the natures beside it.
+const NATURE_PREFIXE: &str = "nature_marche:";
+
+fn sous_les_natures(
+    natures: Vec<(String, Option<String>, i64)>,
+    divisions: Vec<(String, Option<String>, i64)>,
+) -> Vec<FacetChoice> {
+    let racines: Vec<FacetChoice> = natures
+        .into_iter()
+        .map(|(uid, label, count)| FacetChoice {
+            label: label.unwrap_or_else(|| uid.clone()),
+            value: uid,
+            count,
+            parent: None,
+            hint: None,
+        })
+        .collect();
+    let feuilles = par_poids(choices_sous(divisions, |uid| {
+        lj_annonces::cpv::nature_probable(uid).map(|n| n.facet_uid().to_string())
+    }));
+    let mut out = Vec::with_capacity(racines.len() + feuilles.len());
+    for racine in racines {
+        let sous: Vec<FacetChoice> = feuilles
+            .iter()
+            .filter(|f| f.parent.as_deref() == Some(racine.value.as_str()))
+            .cloned()
+            .collect();
+        out.push(racine);
+        out.extend(sous);
+    }
+    let orphelines: Vec<FacetChoice> = feuilles
+        .into_iter()
+        .filter(|f| !out.iter().any(|c| c.value == f.value))
+        .collect();
+    out.extend(orphelines);
+    out
+}
+
+/// Same, with the parent each uid hangs from, as the parent axis's own value.
+fn choices_sous(
+    rows: Vec<(String, Option<String>, i64)>,
+    parent: impl Fn(&str) -> Option<String>,
+) -> Vec<FacetChoice> {
     rows.into_iter()
         .map(|(uid, label, count)| FacetChoice {
             label: label.unwrap_or_else(|| uid.clone()),
+            parent: parent(&uid),
             value: suffixe(&uid).to_string(),
             count,
-            parent: None,
             hint: None,
         })
         .collect()
 }
 
-/// Fiche d'une consultation (`/marche/{uid}`) : l'annonce, ses liens profonds
-/// par usage, ses canaux et ses arêtes vers le graphe. Les lignes closes restent
-/// servies — elles ont été indexées, et c'est l'archive.
+/// A tender's page (`/notice/{juris}/{uid}`): the notice, its deep links by use,
+/// its channels and its edges into the graph. Closed rows are still served: they
+/// were indexed, and they are the archive.
 #[instrument(skip(state))]
 pub async fn detail(state: &AppState, uid: &str) -> Result<AnnonceDetailResponse> {
     let conn = state.pool.get().await?;
@@ -350,6 +372,24 @@ pub async fn detail(state: &AppState, uid: &str) -> Result<AnnonceDetailResponse
     )?;
     Ok(AnnonceDetailResponse {
         liens: liens_from(&row),
+        lots_ouverts: lots_ouverts_from(&row),
+        criteres: row
+            .details
+            .get("criteres")
+            .and_then(|v| v.as_array())
+            .map(|c| {
+                c.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        montant_estime: row.details.get("montant_estime").and_then(|m| {
+            Some(AnnonceMontantDto {
+                valeur: m.get("valeur")?.as_f64()?,
+                devise: m.get("devise").and_then(|d| d.as_str()).map(str::to_string),
+            })
+        }),
         resultat: resultat_from(&row),
         annonce: hit_from(&row),
         canaux_detail: canaux
@@ -368,20 +408,19 @@ pub async fn detail(state: &AppState, uid: &str) -> Result<AnnonceDetailResponse
                 Some(AnnonceEntiteDto {
                     role: e.role,
                     label: e.denomination.unwrap_or_else(|| e.entity_uid.clone()),
-                    href: format!("/entite/{ns}/{id}"),
+                    href: lj_vocab::entity_path(ns, id),
                 })
             })
             .collect(),
     })
 }
 
-/// Catalogue du fond : le stock ouvert ventilé par département et par nature —
-/// les chemins de crawl vers les pages `/annonces/departement/{code}`. Une seule
-/// entrée de cache, TTL 1 h.
+/// Open stock broken down by département and by nature: the crawl paths to
+/// `/annonces/departement/{code}`. One cache entry, TTL 1 h.
 pub async fn catalogue(state: &AppState) -> Result<Arc<AnnonceCatalogueResponse>> {
     state
         .annonces_catalogue_cache
-        .try_get_with((), load_catalogue(state))
+        .try_get_with(String::new(), load_catalogue(state))
         .await
         .map_err(|e: Arc<ApiError>| ApiError::Internal(format!("catalogue annonces: {e}")))
 }
@@ -390,18 +429,21 @@ async fn load_catalogue(state: &AppState) -> Result<Arc<AnnonceCatalogueResponse
     let filtre = AnnonceFiltre::nouveau(ANNONCE_FOND_MARCHE);
     let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
-    let (total, departements, familles) = tokio::try_join!(
+    let (total, zones, familles) = tokio::try_join!(
         repo.annonces_total(&filtre),
-        repo.annonces_facette(&filtre, AnnonceAxe::Departement),
+        repo.annonces_facette(&filtre, AnnonceAxe::Zone),
         repo.annonces_facette(&filtre, AnnonceAxe::Famille),
     )?;
     Ok(Arc::new(AnnonceCatalogueResponse {
         fond: ANNONCE_FOND_MARCHE.to_string(),
         total,
-        departements: departements
+        zones: zones
             .into_iter()
-            .map(|(code, _, count)| AnnonceDepartementEntry {
-                label: departement_nom(&code),
+            // The catalogue is the crawl surface, one page per département:
+            // nationwide and Europe-wide are facets, not pages.
+            .filter(|(code, _, _)| zone_est_departement(code))
+            .map(|(code, _, count)| AnnonceZoneEntry {
+                label: zone_nom(&code),
                 code,
                 count,
             })
@@ -449,6 +491,36 @@ fn role_label(role: &str) -> &str {
 
 // ── Projection ligne → contrat ──────────────────────────────────────────────
 
+/// Whether a source published a code. It lands in two places, the listing's
+/// `cpv` and the notice page's, and 4 228 of the 15 923 open markets carrying a
+/// division on 17/09/2026 had it in the second alone.
+fn code_cpv_publie(details: &serde_json::Value) -> bool {
+    let pose = |v: Option<&serde_json::Value>| v.is_some_and(|v| !v.is_null());
+    pose(details.get("cpv")) || pose(details.get("detail").and_then(|d| d.get("cpv")))
+}
+
+/// A trade neither the descriptors nor the works lots publish was read off the title.
+fn metiers_deduits(row: &AnnonceRow) -> bool {
+    let tableau = |chemin: &str| {
+        row.details
+            .pointer(chemin)
+            .and_then(|v| v.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    };
+    let descripteurs: Vec<&str> = tableau("/descripteurs")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    let codes_des_lots: Vec<&str> = tableau("/lots")
+        .iter()
+        .chain(tableau("/detail/lots"))
+        .filter_map(|l| l.get("cpv").and_then(|c| c.as_str()))
+        .collect();
+    let publies = lj_annonces::metiers::metiers_publies(&descripteurs, &codes_des_lots);
+    row.metiers.iter().any(|m| !publies.contains(m))
+}
+
 fn hit_from(row: &AnnonceRow) -> AnnonceHit {
     let texte = |cle: &str| {
         row.details
@@ -464,11 +536,28 @@ fn hit_from(row: &AnnonceRow) -> AnnonceHit {
         acteur_role: annonce_acteur_role(&row.fond).to_string(),
         fond: row.fond.clone(),
         titre: row.titre.clone(),
+        description: row.description.clone(),
         acteur: row.acteur_libelle.clone(),
-        departement_label: row.departement.as_deref().map(departement_nom),
-        departement: row.departement.clone(),
+        zones: row
+            .zones
+            .iter()
+            .map(|c| FacetTag {
+                label: zone_nom(c),
+                key: c.clone(),
+            })
+            .collect(),
         famille: tag(&row.famille_uid, &row.famille_label),
         cpv: tag(&row.cpv_uid, &row.cpv_label),
+        cpv_deduit: row.cpv_uid.is_some() && !code_cpv_publie(&row.details),
+        metiers: row
+            .metiers
+            .iter()
+            .map(|u| FacetTag {
+                label: lj_annonces::metiers::libelle(u).to_string(),
+                key: u.clone(),
+            })
+            .collect(),
+        metiers_deduits: metiers_deduits(row),
         date_publication: row.date_publication.to_string(),
         echeance: row.echeance.map(|t| t.to_rfc3339()),
         // Même définition que la fenêtre servie : l'échéance passée, rien
@@ -493,6 +582,26 @@ fn hit_from(row: &AnnonceRow) -> AnnonceHit {
     }
 }
 
+/// The allotment the notice publishes, before any award.
+fn lots_ouverts_from(row: &AnnonceRow) -> Vec<AnnonceLotOuvertDto> {
+    let texte =
+        |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    row.details
+        .get("lots")
+        .and_then(|v| v.as_array())
+        .map(|lots| {
+            lots.iter()
+                .map(|l| AnnonceLotOuvertDto {
+                    nom: texte(l, "nom"),
+                    description: texte(l, "description"),
+                    cpv: texte(l, "cpv"),
+                })
+                .filter(|l| l.nom.is_some() || l.description.is_some())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Le bloc attribution d'une fiche de marché — ce qui rend `attribue` vrai. Les
 /// lots viennent de `details.resultat`, posé par l'ingest sur la ligne de la
 /// consultation qu'ils clôturent.
@@ -508,7 +617,7 @@ fn resultat_from(row: &AnnonceRow) -> Option<AnnonceResultatDto> {
                 .filter_map(|l| {
                     Some(AnnonceLotDto {
                         titulaire: texte(l, "titulaire")?,
-                        href: texte(l, "siren").map(|s| format!("/entite/siren/{s}")),
+                        href: texte(l, "siren").map(|s| lj_vocab::entity_path("siren", &s)),
                         description: texte(l, "description"),
                         montant: l.get("montant").and_then(|v| v.as_f64()),
                         devise: texte(l, "devise"),
@@ -573,10 +682,18 @@ fn liens_from(row: &AnnonceRow) -> Vec<AnnonceLienDto> {
                 .nth(2)
                 .unwrap_or_default()
                 .trim_start_matches("www.");
+            // A deposit URL carrying a consultation identifier is that
+            // consultation's page, and not a platform root.
+            let designe = !lj_annonces::cles_jointure_depuis_urls(std::iter::once(url)).is_empty();
             if !out.iter().any(|l| l.url == url) {
                 out.push(AnnonceLienDto {
-                    kind: "depot".to_string(),
-                    label: "Plateforme de dépôt".to_string(),
+                    kind: if designe { "consultation" } else { "depot" }.to_string(),
+                    label: if designe {
+                        "Page de la consultation"
+                    } else {
+                        "Plateforme de dépôt"
+                    }
+                    .to_string(),
                     url: url.to_string(),
                     moteur: hote.to_string(),
                 });
@@ -586,9 +703,15 @@ fn liens_from(row: &AnnonceRow) -> Vec<AnnonceLienDto> {
     out
 }
 
-/// Nom du département, ou son code quand il sort de la nomenclature.
-fn departement_nom(code: &str) -> String {
-    departement_label(code).unwrap_or(code).to_string()
+/// A département, the two scopes that are not places, and the name of what no
+/// source located.
+fn zone_nom(code: &str) -> String {
+    match code {
+        ZONE_FRANCE => "France entière".to_string(),
+        ZONE_UE => "Union européenne".to_string(),
+        ZONE_SANS => "Zone indéterminée".to_string(),
+        d => departement_label(d).unwrap_or(d).to_string(),
+    }
 }
 
 /// Suffixe d'un uid de référentiel (`cpv:45` → `45`).
@@ -608,13 +731,25 @@ pub fn filtre_from(req: &AnnonceSearchRequest, fond: &str) -> AnnonceFiltre {
         // Le repository ne sert qu'un fond : le dispatch a déjà choisi.
         fond: fond.to_string(),
         q: req.q.clone(),
-        departements: req.departement.clone(),
+        zones: req.zone.clone(),
         familles: req
             .famille
             .iter()
             .map(|s| format!("nature_marche:{}", s.to_uppercase()))
+            .chain(
+                req.cpv
+                    .iter()
+                    .filter(|s| s.starts_with(NATURE_PREFIXE))
+                    .cloned(),
+            )
             .collect(),
-        cpv: req.cpv.iter().map(|s| format!("cpv:{s}")).collect(),
+        cpv: req
+            .cpv
+            .iter()
+            .filter(|s| !s.starts_with(NATURE_PREFIXE))
+            .map(|s| format!("cpv:{s}"))
+            .collect(),
+        metiers: req.metier.iter().map(|s| format!("metier:{s}")).collect(),
         echeance_jours: req.echeance_jours.map(|j| j as i32),
         closes: req.closes,
         ordre: match req.sort {
@@ -641,7 +776,7 @@ pub async fn hits_flux(state: &AppState, req: &AnnonceSearchRequest) -> Result<V
     for fond in actifs {
         match page_fond(state, &part, fond, true).await {
             Ok((page, _)) => hits.extend(page),
-            Err(e) => tracing::warn!(fond, error = %e, "fond indisponible, absent du flux"),
+            Err(e) => tracing::warn!(fond, error = %e, "fond unavailable, absent from the feed"),
         }
     }
     Ok(hits)
@@ -653,7 +788,7 @@ pub async fn hits_flux(state: &AppState, req: &AnnonceSearchRequest) -> Result<V
 /// source officielle quand elle est proxifiée.
 fn lien_hit(hit: &AnnonceHit, base: &str) -> String {
     if hit.fond == ANNONCE_FOND_MARCHE {
-        format!("{base}/marche/{}", hit.uid)
+        format!("{base}{}", lj_vocab::notice_path(&hit.uid))
     } else {
         hit.url_action.clone()
     }
@@ -665,11 +800,11 @@ pub fn titre_filtre(req: &AnnonceSearchRequest) -> String {
     if let Some(q) = req.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         bouts.push(format!("« {q} »"));
     }
-    if !req.departement.is_empty() {
+    if !req.zone.is_empty() {
         bouts.push(
-            req.departement
+            req.zone
                 .iter()
-                .map(|c| departement_nom(c))
+                .map(|c| zone_nom(c))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -705,13 +840,18 @@ pub fn rss(req: &AnnonceSearchRequest, hits: &[AnnonceHit], self_url: &str, base
             .as_deref()
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
             .map(|t| t.to_rfc2822())
+            .or_else(|| date_publication_rfc2822(&hit.date_publication))
             .unwrap_or_default();
         items.push_str(&format!(
-            "<item><title>{}</title><link>{}</link>\
-             <guid isPermaLink=\"true\">{}</guid>{}<description>{}</description></item>",
-            xml_escape(&format!("{} — {}", hit.acteur, hit.titre)),
-            xml_escape(&lien),
-            xml_escape(&lien),
+            "<item><title>{}</title>{}\
+             <guid isPermaLink=\"false\">{}</guid>{}<description>{}</description></item>",
+            xml_escape(&titre_hit(hit)),
+            if lien.is_empty() {
+                String::new()
+            } else {
+                format!("<link>{}</link>", xml_escape(&lien))
+            },
+            xml_escape(&hit.uid),
             if date.is_empty() {
                 String::new()
             } else {
@@ -728,7 +868,7 @@ pub fn rss(req: &AnnonceSearchRequest, hits: &[AnnonceHit], self_url: &str, base
          <language>fr</language>\
          <atom:link href=\"{}\" rel=\"self\" type=\"application/rss+xml\"/>{items}</channel></rss>",
         xml_escape(&format!("LibreJustice — {titre}")),
-        xml_escape(&format!("{base}/annonces")),
+        xml_escape(&self_url.replacen("/notice-search.rss", "/notice-search", 1)),
         xml_escape(&format!(
             "{titre}. Une alerte est un état de filtres : cette URL est l'abonnement."
         )),
@@ -758,7 +898,11 @@ pub fn ics(req: &AnnonceSearchRequest, hits: &[AnnonceHit], base: &str) -> Strin
         out.push_str(&format!("UID:{}@librejustice.fr\r\n", hit.uid));
         out.push_str(&format!("DTSTAMP:{stamp}\r\n"));
         out.push_str(&format!("DTSTART:{debut}\r\n"));
-        out.push_str(&format!("DTEND:{debut}\r\n"));
+        // RFC 5545 3.8.2.2 requires DTEND strictly later than DTSTART.
+        out.push_str(&format!(
+            "DTEND:{}\r\n",
+            ics_stamp(echeance.with_timezone(&chrono::Utc) + chrono::Duration::minutes(30))
+        ));
         out.push_str(&ics_line(
             "SUMMARY",
             &format!("Clôture — {} ({})", hit.titre, hit.acteur),
@@ -771,11 +915,39 @@ pub fn ics(req: &AnnonceSearchRequest, hits: &[AnnonceHit], base: &str) -> Strin
     out
 }
 
+const SEPARATEUR: &str = "\u{2014}";
+
+/// Proxied fonds already build their title on the actor's name, so prefixing it
+/// would repeat it.
+fn titre_hit(hit: &AnnonceHit) -> String {
+    if hit.acteur.is_empty() || hit.titre.contains(&hit.acteur) {
+        hit.titre.clone()
+    } else {
+        format!("{} {SEPARATEUR} {}", hit.acteur, hit.titre)
+    }
+}
+
+fn date_publication_rfc2822(date: &str) -> Option<String> {
+    Some(
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(0, 0, 0)?
+            .and_utc()
+            .to_rfc2822(),
+    )
+}
+
 /// Corps commun aux deux flux : ce qu'il faut savoir pour décider d'y aller.
 fn description(hit: &AnnonceHit) -> String {
     let mut bouts = vec![hit.acteur.clone()];
-    if let Some(d) = hit.departement_label.as_deref() {
-        bouts.push(d.to_string());
+    if !hit.zones.is_empty() {
+        bouts.push(
+            hit.zones
+                .iter()
+                .map(|z| z.label.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
     if let Some(f) = hit.famille.as_ref() {
         bouts.push(f.label.clone());
@@ -837,21 +1009,82 @@ fn xml_escape(value: &str) -> String {
 mod tests {
     use super::*;
 
+    /// One key holds both levels, as `juridiction` does: the root is told from
+    /// the leaf by its prefix, and each goes to the column it filters.
+    #[test]
+    fn la_cle_du_domaine_route_la_nature_et_la_division_vers_leur_colonne() {
+        let req = AnnonceSearchRequest {
+            cpv: vec!["45".into(), "nature_marche:SERVICES".into()],
+            ..Default::default()
+        };
+        let f = filtre_from(&req, ANNONCE_FOND_MARCHE);
+        assert_eq!(f.cpv, ["cpv:45"]);
+        assert_eq!(f.familles, ["nature_marche:SERVICES"]);
+    }
+
+    #[test]
+    fn chaque_division_pend_sous_sa_nature_et_la_suit_dans_la_liste() {
+        let natures = vec![
+            (
+                "nature_marche:TRAVAUX".to_string(),
+                Some("Travaux".into()),
+                9,
+            ),
+            (
+                "nature_marche:SERVICES".to_string(),
+                Some("Services".into()),
+                7,
+            ),
+        ];
+        let divisions = vec![
+            (
+                "cpv:45".to_string(),
+                Some("Travaux de construction".into()),
+                9,
+            ),
+            (
+                "cpv:79".to_string(),
+                Some("Services aux entreprises".into()),
+                7,
+            ),
+        ];
+        let out = sous_les_natures(natures, divisions);
+        let vus: Vec<(&str, Option<&str>)> = out
+            .iter()
+            .map(|c| (c.value.as_str(), c.parent.as_deref()))
+            .collect();
+        assert_eq!(
+            vus,
+            [
+                ("nature_marche:TRAVAUX", None),
+                ("45", Some("nature_marche:TRAVAUX")),
+                ("nature_marche:SERVICES", None),
+                ("79", Some("nature_marche:SERVICES")),
+            ]
+        );
+    }
+
     fn hit() -> AnnonceHit {
         AnnonceHit {
+            metiers: Vec::new(),
+            metiers_deduits: false,
             uid: "marche:abc".into(),
             fond: ANNONCE_FOND_MARCHE.into(),
             fond_label: "Marchés publics".into(),
             titre: "Travaux de voirie, réfection".into(),
+            description: None,
             acteur: "Commune d'Ax".into(),
             acteur_role: "Acheteur".into(),
-            departement: Some("09".into()),
-            departement_label: Some("Ariège".into()),
+            zones: vec![FacetTag {
+                key: "09".into(),
+                label: "Ariège".into(),
+            }],
             famille: Some(FacetTag {
                 key: "TRAVAUX".into(),
                 label: "Travaux".into(),
             }),
             cpv: None,
+            cpv_deduit: false,
             date_publication: "2026-08-01".into(),
             echeance: Some("2026-09-12T15:00:00+00:00".into()),
             closed: false,
@@ -866,18 +1099,20 @@ mod tests {
 
     fn row(details: serde_json::Value) -> AnnonceRow {
         AnnonceRow {
+            metiers: Vec::new(),
             uid: "marche:abc".into(),
             fond: ANNONCE_FOND_MARCHE.into(),
             famille_uid: None,
             famille_label: None,
             titre: "Travaux de voirie".into(),
             acteur_libelle: "Commune d'Ax".into(),
-            departement: None,
+            zones: Vec::new(),
             cpv_uid: None,
             cpv_label: None,
             date_publication: chrono::NaiveDate::from_ymd_opt(2026, 8, 1).expect("date valide"),
             echeance: None,
             url_action: "https://exemple.fr/c/1".into(),
+            description: None,
             details,
             canaux: vec!["aws".into()],
             premiere_vue: None,
@@ -901,6 +1136,37 @@ mod tests {
         // Page visitée, muette sur la procédure : le bloc est là, le champ non.
         let muet = hit_from(&row(serde_json::json!({"procedure": null, "detail": {}})));
         assert_eq!(muet.procedure, None);
+    }
+
+    #[test]
+    fn a_trade_is_declared_deduced_unless_what_the_market_publishes_folds_to_it() {
+        let deduit = |descripteurs: serde_json::Value, metiers: &[&str]| {
+            let mut r = row(serde_json::json!({ "descripteurs": descripteurs }));
+            r.metiers = metiers.iter().map(|m| m.to_string()).collect();
+            hit_from(&r).metiers_deduits
+        };
+        assert!(!deduit(
+            serde_json::json!(["Couverture"]),
+            &["metier:charpente-couverture"]
+        ));
+        assert!(deduit(
+            serde_json::json!(["Prestations de services"]),
+            &["metier:vrd"]
+        ));
+        assert!(deduit(serde_json::Value::Null, &["metier:vrd"]));
+        assert!(!deduit(serde_json::json!(["Prestations de services"]), &[]));
+
+        let mut lots = row(serde_json::json!({
+            "descripteurs": ["Prestations de services"],
+            "lots": [{"nom": "Menuiseries", "cpv": "45421000"}, {"nom": "Divers"}],
+        }));
+        lots.metiers = vec!["metier:menuiserie".to_string()];
+        assert!(!hit_from(&lots).metiers_deduits);
+        let mut page = row(serde_json::json!({"detail": {"lots": [{"cpv": "45330000"}]}}));
+        page.metiers = vec!["metier:genie-climatique".to_string()];
+        assert!(!hit_from(&page).metiers_deduits);
+        page.metiers.insert(0, "metier:vrd".to_string());
+        assert!(hit_from(&page).metiers_deduits);
     }
 
     #[test]
@@ -954,12 +1220,44 @@ mod tests {
         let rss = rss(
             &AnnonceSearchRequest::default(),
             &[hit()],
-            "https://lj.fr/annonces.rss",
+            "https://lj.fr/notice-search.rss",
             "https://lj.fr",
         );
         // Le curseur d'alerte est la première vue chez nous, pas la parution.
         assert!(rss.contains("<pubDate>Sun, 2 Aug 2026 04:10:00 +0000</pubDate>"));
-        assert!(rss.contains("<guid isPermaLink=\"true\">https://lj.fr/marche/marche:abc</guid>"));
+        assert!(rss.contains("<link>https://lj.fr/notice/fr/marche:abc</link>"));
+        let filtre = super::rss(
+            &AnnonceSearchRequest::default(),
+            &[],
+            "https://lj.fr/notice-search.rss?fond=marche&zone=973",
+            "https://lj.fr",
+        );
+        assert!(
+            filtre.contains("<link>https://lj.fr/notice-search?fond=marche&amp;zone=973</link>")
+        );
+    }
+
+    /// JOAFE parutions ship with no unitary PDF, so a whole batch used to share
+    /// one empty `guid` and a reader kept a single entry out of it.
+    #[test]
+    fn sans_lien_chaque_entree_garde_son_identite() {
+        let sans_cible = |uid: &str| AnnonceHit {
+            uid: uid.into(),
+            fond: ANNONCE_FOND_JOAFE.into(),
+            url_action: String::new(),
+            first_seen_at: None,
+            ..hit()
+        };
+        let rss = rss(
+            &AnnonceSearchRequest::default(),
+            &[sans_cible("joafe:1"), sans_cible("joafe:2")],
+            "https://lj.fr/notice-search.rss",
+            "https://lj.fr",
+        );
+        assert!(rss.contains("<guid isPermaLink=\"false\">joafe:1</guid>"));
+        assert!(rss.contains("<guid isPermaLink=\"false\">joafe:2</guid>"));
+        assert!(!rss.contains("<link></link>"));
+        assert!(rss.contains("<pubDate>Sat, 1 Aug 2026 00:00:00 +0000</pubDate>"));
     }
 
     #[test]
@@ -980,7 +1278,7 @@ mod tests {
     fn le_titre_du_flux_nomme_le_fond_et_le_filtre() {
         let req = AnnonceSearchRequest {
             fond: vec![ANNONCE_FOND_MARCHE.into()],
-            departement: vec!["09".into()],
+            zone: vec!["09".into()],
             echeance_jours: Some(7),
             ..AnnonceSearchRequest::default()
         };

@@ -1,5 +1,5 @@
 //! Ponts croisés entre les deux moteurs : bloc « Dans les textes » dans le
-//! rail de `/decisions`, « Dans les décisions » dans celui de `/textes`.
+//! rail de `/decision-search`, « Dans les décisions » dans celui de `/norm-search`.
 //!
 //! Le fetch part en parallèle de la recherche principale, depuis un `Effect`
 //! vers un signal. Zéro résultat ou erreur ⇒ le bloc disparaît. Le signal porte
@@ -22,8 +22,8 @@ use super::compact_search::highlight::Highlighted;
 /// Hits affichés par teaser.
 const TEASER_ROWS: usize = 3;
 
-/// Bloc « Dans les textes » du rail `/decisions` : top-3 articles du moteur
-/// textes pour la même requête + lien vers `/textes?q=…`.
+/// "Dans les textes" block of the `/decision-search` rail: top 3 articles of the
+/// text engine for the same query + a link to `/norm-search?q=…`.
 #[component]
 pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
     let title = "Dans les textes";
@@ -43,6 +43,8 @@ pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
                         limit: TEASER_ROWS as u32,
                         offset: 0,
                     },
+                    // A teaser ranks a decisions query; it designates nothing.
+                    lj_dtos::SearchMode::Lexical,
                     SearchContext::Teaser,
                 )
                 .await;
@@ -75,11 +77,12 @@ pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
             .map(|h| {
                 // `numKey` vide : hit « texte entier » → page du texte ; sinon page de
                 // l'article.
+                let text = lj_vocab::norm_path(&h.jurisdiction, &h.code);
                 let (href, label) = if h.num_key.is_empty() {
-                    (format!("/texte/{}", h.code), h.code_title)
+                    (text, h.code_title)
                 } else {
                     (
-                        format!("/texte/{}/{}", h.code, h.num_key),
+                        format!("{text}/{}", h.num_key),
                         format!("Art. {} · {}", format_article_num(&h.num), h.code_title),
                     )
                 };
@@ -94,14 +97,14 @@ pub fn TextesTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
         teaser_block(
             title,
             rows.into_any(),
-            format!("/textes?q={}", encode_query(&q)),
+            format!("/norm-search?q={}", encode_query(&q)),
             more_label,
         )
     }
 }
 
-/// Bloc « Dans les décisions » du rail `/textes` : top-3 décisions du moteur
-/// jurisprudence pour la même requête + lien vers `/decisions?q=…`.
+/// "Dans les décisions" block of the `/norm-search` rail: top 3 decisions of the
+/// case law engine for the same query + a link to `/decision-search?q=…`.
 #[component]
 pub fn DecisionsTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
     let title = "Dans les décisions";
@@ -145,7 +148,7 @@ pub fn DecisionsTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
             .map(|h| {
                 view! {
                     <DecisionTeaserRow
-                        href=format!("/decision/{}", h.id)
+                        href=lj_dtos::decision_path(h.jurisdiction_type, &h.id)
                         title_html=h.title_html
                         snippet=h.best_chunk.snippet
                     />
@@ -157,7 +160,7 @@ pub fn DecisionsTeaser(#[prop(into)] query: Signal<String>) -> impl IntoView {
         teaser_block(
             title,
             rows.into_any(),
-            format!("/decisions?q={}", encode_query(&q)),
+            format!("/decision-search?q={}", encode_query(&q)),
             "Voir les décisions".to_string(),
         )
     }

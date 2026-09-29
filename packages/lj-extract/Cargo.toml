@@ -12,15 +12,13 @@ license.workspace = true
 # garble) via include_str! sous packages/lj-extract/data/.
 [dependencies]
 lj-core = { workspace = true }
-lj-dtos = { workspace = true }
+lj-parse = { workspace = true }
+lj-norm = { workspace = true }
+lj-versions = { workspace = true }
+lj-fold = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
 aho-corasick = { workspace = true }
 rustc-hash = { workspace = true }
-quick-xml = { workspace = true }
-html-escape = { workspace = true }
-rayon = { workspace = true }
-xxhash-rust = { workspace = true }
-thiserror = { workspace = true }
 jiff = { workspace = true }

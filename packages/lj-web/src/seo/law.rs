@@ -6,16 +6,16 @@ use lj_dtos::LawArticleResponse;
 
 use super::generic::CANONICAL_BASE;
 
-/// URL canonique d'un article LEGI (`/texte/{code}/{num}`). La version-à-date
-/// (`…/{date}`) n'est jamais canonique : toutes les versions canonicalisent vers
-/// l'article courant pour ne pas fragmenter le SEO.
-pub fn article_canonical_url(code: &str, num: &str) -> String {
-    format!("{CANONICAL_BASE}/texte/{code}/{num}")
+/// The canonical URL of a LEGI article (`/norm/{juris}/{code}/{num}`).
+/// A version at a date (`…/{date}`) is never canonical: every version
+/// canonicalises to the current article, so the SEO does not fragment.
+pub fn article_canonical_url(juris: &str, code: &str, num: &str) -> String {
+    format!("{CANONICAL_BASE}{}/{num}", lj_vocab::norm_path(juris, code))
 }
 
-/// URL canonique d'un code (`/texte/{code}`).
-pub fn code_canonical_url(code: &str) -> String {
-    format!("{CANONICAL_BASE}/texte/{code}")
+/// URL canonique d'un code (`/norm/{juris}/{code}`).
+pub fn code_canonical_url(juris: &str, code: &str) -> String {
+    format!("{CANONICAL_BASE}{}", lj_vocab::norm_path(juris, code))
 }
 
 /// `<meta description>` d'un article : début du texte de l'article (ou son
@@ -109,7 +109,7 @@ pub fn build_article_json_ld(
 
     // URL sur la clé canonique (`numKey`), cohérente avec le `<link rel=canonical>`
     // et résolue en lookup exact côté serve.
-    let url = article_canonical_url(&article.code, &article.num_key);
+    let url = article_canonical_url(&article.jurisdiction, &article.code, &article.num_key);
     let mut node = Map::new();
     node.insert("@type".into(), json!("Legislation"));
     node.insert("name".into(), json!(title));

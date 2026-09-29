@@ -19,11 +19,11 @@ use axum::Router;
 use crate::cache::CACHE_SITEMAP;
 use crate::error::{ApiError, Result};
 use crate::state::AppState;
-use lj_core::crawlers::{SITEMAPS_PREFIX, SITEMAP_PATH};
+use lj_crawlers::{SITEMAPS_PREFIX, SITEMAP_PATH};
 use lj_store::repository::DecisionRepository;
 
 /// Routes sitemap, montées à la racine (hors `/api`) par `assemble_routes`.
-/// Les chemins viennent de `lj_core::crawlers`, partagés avec la règle WAF qui
+/// Les chemins viennent de `lj_crawlers`, partagés avec la règle WAF qui
 /// les réserve aux bots vérifiés.
 pub fn router() -> Router<AppState> {
     Router::new()

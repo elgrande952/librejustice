@@ -1,12 +1,17 @@
-//! Panneau « Textes cités » : recherche/saisie libre
-//! (« + Ajouter »), instruments dépliables avec leurs articles (clés composites
-//! « instrument|article » dans `la`).
+//! « Textes cités » panel: expandable instruments with their articles
+//! (composite « instrument|article » keys in `la`), and an input that queries
+//! the whole catalogue, the facet only serving the head of it.
+
+use std::collections::{HashMap, HashSet};
 
 use leptos::prelude::*;
-use lj_dtos::{LegalInstrumentFacet, SearchFacets};
+use leptos_router::hooks::use_query_map;
+use lj_dtos::{FacetChoice, LegalInstrumentFacet, SearchFacets};
 
 use crate::helpers::cn;
 
+use super::compact_search::search_data::instruments_resource;
+use super::compact_search::search_state::key_from_map;
 use super::facet_widgets::{CheckboxOption, FilterSearchInput};
 
 #[component]
@@ -18,9 +23,38 @@ pub fn LegalInstrumentPanel(
     #[prop(into)] on_toggle_article: Callback<String>,
 ) -> impl IntoView {
     let filter_text = RwSignal::new(String::new());
+    let query_map = use_query_map();
 
-    // Liste fusionnée orphelins + facettes, filtrée par needle. `Memo` : lue par le
-    // signal `facet` de chaque ligne, lookup par valeur.
+    // `FilterSearchInput` debounces, so the key turns once per pause and not
+    // once per keystroke.
+    let suggest = instruments_resource(Signal::derive(move || {
+        (
+            key_from_map(&query_map.get()).count_key(),
+            filter_text.get().trim().to_string(),
+        )
+    }));
+    let suggested = Signal::derive(move || {
+        suggest
+            .get()
+            .map(|s| s.legal_instrument)
+            .unwrap_or_default()
+    });
+    // The keys the catalogue answered for, instruments bare and articles under
+    // their composite. They enter the list whatever the typed text looks like:
+    // « L761-2 du code de la consommation » matches no label of its own row.
+    let designated = Memo::new(move |_| {
+        let mut out: HashSet<String> = HashSet::new();
+        for f in suggested.get() {
+            for a in &f.articles {
+                out.insert(format!("{}|{}", f.value, a.value));
+            }
+            out.insert(f.value);
+        }
+        out
+    });
+
+    // Orphans, facets and catalogue in one list. `Memo`: read by the `facet`
+    // signal of each row, looked up by value.
     let all_facets = Memo::new(move |_| {
         let facet_list: Vec<LegalInstrumentFacet> = facets
             .get()
@@ -40,10 +74,36 @@ pub fn LegalInstrumentPanel(
             .collect();
         let mut out = orphans;
         out.extend(facet_list);
+        for row in suggested.get() {
+            match out.iter_mut().find(|f| f.value == row.value) {
+                Some(known) => {
+                    if known.label == known.value {
+                        known.label = row.label;
+                    }
+                    known.slug = known.slug.take().or(row.slug);
+                    known.count = known.count.max(row.count);
+                    for article in row.articles {
+                        if !known.articles.iter().any(|a| a.value == article.value) {
+                            known.articles.push(article);
+                        }
+                    }
+                }
+                None => out.push(row),
+            }
+        }
         out
     });
 
     let needle = Signal::derive(move || filter_text.get().to_lowercase());
+
+    let rank = Memo::new(move |_| {
+        suggested
+            .get()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.value.clone(), i))
+            .collect::<HashMap<String, usize>>()
+    });
 
     let visible = Memo::new(move |_| {
         let needle = filter_text.get().to_lowercase();
@@ -51,68 +111,39 @@ pub fn LegalInstrumentPanel(
         if needle.is_empty() {
             return facets;
         }
-        facets
+        let mut out: Vec<LegalInstrumentFacet> = facets
             .into_iter()
             .filter(|f| {
                 f.label.to_lowercase().contains(&needle)
                     || f.articles
                         .iter()
-                        .any(|a| a.value.to_lowercase().contains(&needle))
+                        .any(|a| a.label.to_lowercase().contains(&needle))
+                    || designated.with(|d| d.contains(&f.value))
             })
-            .collect()
+            .collect();
+        out.sort_by_key(|f| rank.with(|r| r.get(&f.value).copied().unwrap_or(usize::MAX)));
+        out
     });
 
-    let trimmed = Signal::derive(move || filter_text.get().trim().to_string());
-    let can_add = Signal::derive(move || {
-        let t = trimmed.get();
-        let needle = t.to_lowercase();
-        !t.is_empty()
-            && !selected_instruments.get().contains(&t)
-            && !selected_articles.get().contains(&t)
-            && !all_facets
-                .get()
-                .iter()
-                .any(|f| f.value.to_lowercase() == needle)
-    });
-
-    let handle_add = move || {
-        on_toggle_article.run(trimmed.get_untracked());
-        filter_text.set(String::new());
-    };
-    let handle_add_enter = handle_add;
+    // Nothing found is a claim about the catalogue, which only its answer can
+    // make: while that flies, the panel says it is looking.
+    let waiting = Signal::derive(move || suggest.get().is_none());
 
     view! {
-        <FilterSearchInput
-            value=filter_text
-            placeholder="Filtrer ou saisir un article…"
-            on_enter=Callback::new(move |_| {
-                if can_add.get_untracked() {
-                    handle_add_enter();
-                }
-            })
-        />
+        <FilterSearchInput value=filter_text placeholder="Filtrer ou chercher un article…" />
         <div
             class="filter-scroll flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto overscroll-contain"
         >
-            <Show when=move || can_add.get()>
-                <button
-                    type="button"
-                    on:click=move |_| handle_add()
-                    class="flex w-full items-center gap-1.5 rounded px-2 py-1 text-left text-xs text-[var(--color-accent)] transition-colors hover:bg-[var(--color-vellum)]"
-                >
-                    <span class="font-medium">"+"</span>
-                    " Ajouter «"{move || trimmed.get()}"»"
-                </button>
-            </Show>
-            <Show when=move || visible.get().is_empty() && !can_add.get()>
+            <Show when=move || visible.get().is_empty()>
                 <p class="px-2 py-1 text-xs text-[var(--color-ink-subtle)]">
-                    "Aucun résultat"
+                    {move || {
+                        if waiting.get() { "Recherche au catalogue…" } else { "Aucun résultat" }
+                    }}
                 </p>
             </Show>
-            // `<For>` keyé par instrument : les lignes persistent à travers les
-            // changements de requête. `LegalInstrumentRow` lit son compteur et ses
-            // articles dans `all_facets` (réactif), donc un toggle d'article ne
-            // reconstruit pas la liste.
+            // `<For>` keyed by instrument: rows survive a change of question.
+            // `LegalInstrumentRow` reads its counter and its articles off
+            // `all_facets`, so ticking an article does not rebuild the list.
             <For
                 each=move || visible.get()
                 key=|f: &LegalInstrumentFacet| f.value.clone()
@@ -129,6 +160,7 @@ pub fn LegalInstrumentPanel(
                             selected=selected
                             selected_articles=selected_articles
                             needle=needle
+                            designated=designated
                             on_toggle_instrument=Callback::new(move |_| on_toggle_instrument
                                 .run(value_cb.clone()))
                             on_toggle_article=on_toggle_article
@@ -153,6 +185,10 @@ fn LegalInstrumentRow(
     #[prop(into)] selected: Signal<bool>,
     #[prop(into)] selected_articles: Signal<Vec<String>>,
     #[prop(into)] needle: Signal<String>,
+    /// Composite keys the catalogue answered for: they survive the needle
+    /// filter, which reads a label they do not have to contain.
+    #[prop(into)]
+    designated: Signal<HashSet<String>>,
     #[prop(into)] on_toggle_instrument: Callback<()>,
     #[prop(into)] on_toggle_article: Callback<String>,
 ) -> impl IntoView {
@@ -193,17 +229,30 @@ fn LegalInstrumentRow(
             .filter_map(|a| a.strip_prefix(&my_prefix).map(str::to_string))
             .collect::<Vec<_>>()
     });
-    // all_articles = sélectionnés ∪ facette (dédup, sélectionnés d'abord).
+    // Selected ∪ facet, deduplicated, selected first. A selected article
+    // absent from the facet has no label of its own: its key stands in.
     let all_articles = Memo::new(move |_| {
-        let mut names = my_selected.get();
-        for a in facet_articles.get() {
-            if !names.contains(&a.value) {
-                names.push(a.value);
+        let known = facet_articles.get();
+        let mut out: Vec<FacetChoice> = Vec::new();
+        for value in my_selected.get() {
+            let choice = known.iter().find(|c| c.value == value).cloned();
+            out.push(choice.unwrap_or(FacetChoice {
+                label: value.clone(),
+                value,
+                count: 0,
+                parent: None,
+                hint: None,
+            }));
+        }
+        for choice in known {
+            if !out.iter().any(|o| o.value == choice.value) {
+                out.push(choice);
             }
         }
-        names
+        out
     });
-    // Sous needle, ne garder que les articles matchant ou déjà sélectionnés.
+    // Under a needle, keep what matches it, what the catalogue named, and what
+    // is already ticked.
     let visible_articles = Memo::new(move |_| {
         let needle = needle.get();
         let all = all_articles.get();
@@ -211,29 +260,35 @@ fn LegalInstrumentRow(
             return all;
         }
         let sel = my_selected.get();
+        let prefix = format!("{}|", value_key.get_value());
         all.into_iter()
-            .filter(|a| a.to_lowercase().contains(&needle) || sel.contains(a))
+            .filter(|c| {
+                c.label.to_lowercase().contains(&needle)
+                    || sel.contains(&c.value)
+                    || designated.with(|d| d.contains(&format!("{prefix}{}", c.value)))
+            })
             .collect::<Vec<_>>()
     });
     let has_articles = Signal::derive(move || !visible_articles.get().is_empty());
     let needle_active = Signal::derive(move || !needle.get().is_empty());
 
-    // `Memo` : ne notifie qu'au changement effectif du bool (auto-dépli stable).
     let has_selection = Memo::new(move |_| !my_selected.get().is_empty());
-    let expanded = RwSignal::new(has_selection.get_untracked());
-    // Auto-dépli sens unique : déplie quand une sélection apparaît, jamais l'inverse.
-    // Décocher le dernier article laisse l'instrument déplié (repli au chevron seul).
+    let expanded = RwSignal::new(has_selection.get_untracked() || needle_active.get_untracked());
     Effect::new(move |_| {
         if has_selection.get() {
             expanded.set(true);
         }
     });
-    // Lazy-mount des articles : on ne monte les lignes-articles d'un instrument
-    // qu'au premier dépli (clic, sélection présente, ou recherche active). Monté une
-    // fois au dépli, gardé.
-    let has_opened = RwSignal::new(has_selection.get_untracked());
+    Effect::new(move |was: Option<bool>| {
+        let active = needle_active.get();
+        if was != Some(active) {
+            expanded.set(active || has_selection.get_untracked());
+        }
+        active
+    });
+    let has_opened = RwSignal::new(expanded.get_untracked());
     Effect::new(move |_| {
-        if expanded.get() || needle_active.get() {
+        if expanded.get() {
             has_opened.set(true);
         }
     });
@@ -288,7 +343,7 @@ fn LegalInstrumentRow(
                     style=move || {
                         format!(
                             "grid-template-rows: {}; transition: grid-template-rows 200ms ease-out",
-                            if expanded.get() || needle_active.get() { "1fr" } else { "0fr" },
+                            if expanded.get() { "1fr" } else { "0fr" },
                         )
                     }
                 >
@@ -303,9 +358,9 @@ fn LegalInstrumentRow(
                                         view! {
                                             <For
                                                 each=move || visible_articles.get()
-                                                key=|art: &String| art.clone()
-                                                children=move |art: String| {
-                                                    let art_count = art.clone();
+                                                key=|art: &FacetChoice| art.value.clone()
+                                                children=move |art: FacetChoice| {
+                                                    let art_count = art.value.clone();
                                                     let count = Signal::derive(move || {
                                                         facet_articles
                                                             .with(|a| {
@@ -314,16 +369,16 @@ fn LegalInstrumentRow(
                                                                     .map_or(0, |c| c.count)
                                                             })
                                                     });
-                                                    let art_sel = art.clone();
+                                                    let art_sel = art.value.clone();
                                                     let is_sel = Signal::derive(move || {
                                                         my_selected.with(|s| s.contains(&art_sel))
                                                     });
                                                     // Clé composite « instrument|article »
                                                     // émise dans `la`.
-                                                    let art_key = format!("{}|{}", value_key.get_value(), art);
+                                                    let art_key = format!("{}|{}", value_key.get_value(), art.value);
                                                     view! {
                                                         <CheckboxOption
-                                                            label=art.clone()
+                                                            label=art.label.clone()
                                                             count=count
                                                             selected=is_sel
                                                             on_toggle=Callback::new(move |_| on_toggle_article

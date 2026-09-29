@@ -357,7 +357,9 @@ pub async fn replay_cnb_history(apply: bool) -> Result<()> {
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
     let repo = DecisionRepository::new(&conn);
 
-    let (current, _) = fetch_avocat_rows(&dir).await?;
+    let (current, _) = fetch_avocat_rows(&dir)
+        .await?
+        .ok_or_else(|| anyhow!("current cnb snapshot carries no avCnbfCode"))?;
 
     let resources: Vec<RegistryResource> = tokio::task::spawn_blocking(|| {
         datagouv_resources(
@@ -380,7 +382,7 @@ pub async fn replay_cnb_history(apply: bool) -> Result<()> {
         snapshots = dates.len(),
         premier = %dates.first().map(|d| d.to_string()).unwrap_or_default(),
         dernier = %dates.last().map(|d| d.to_string()).unwrap_or_default(),
-        "rejeu cnb : snapshots retenus"
+        "cnb replay: snapshots kept"
     );
 
     // Deux passes sur les mêmes fichiers (le premier téléchargement les met en
@@ -394,7 +396,7 @@ pub async fn replay_cnb_history(apply: bool) -> Result<()> {
     }
     tracing::info!(
         noms = multi_porteurs.len(),
-        "noms multi-porteurs — pont par nom seul retiré"
+        "names borne by several people, name-only bridge removed"
     );
     let bridge = Bridge::build(&current, &multi_porteurs);
 
@@ -419,7 +421,7 @@ pub async fn replay_cnb_history(apply: bool) -> Result<()> {
             id.barreau.clone_from(&r.barreau);
             id.barreau_slug.clone_from(&r.barreau_slug);
         }
-        tracing::info!(%date, rows = rows.len(), identites = identities.len(), "snapshot rejoué");
+        tracing::info!(%date, rows = rows.len(), identites = identities.len(), "snapshot replayed");
     }
 
     let existing = repo.entity_cnb_states().await?;
@@ -439,7 +441,7 @@ pub async fn replay_cnb_history(apply: bool) -> Result<()> {
         plan.edges.len(),
     );
     if !apply {
-        println!("(dry-run — relancer avec --apply pour écrire)");
+        println!("(dry-run, re-run with --apply to write)");
         return Ok(());
     }
 
@@ -468,7 +470,7 @@ pub async fn replay_cnb_history(apply: bool) -> Result<()> {
         updated,
         edges,
         dropped,
-        "rejeu cnb appliqué"
+        "cnb replay applied"
     );
     println!(
         "cnb-history appliqué : {} entités, {updated} activités, {edges} arêtes \

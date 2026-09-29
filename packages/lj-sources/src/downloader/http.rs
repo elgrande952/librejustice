@@ -37,7 +37,7 @@ pub(crate) fn get_with_body_retrying(
         match attempt().and_then(read) {
             Ok(v) => return Ok(v),
             Err(e) => {
-                tracing::warn!(url, try_no, error = %e, "GET échoué (envoi ou corps), retry");
+                tracing::warn!(url, try_no, error = %e, "GET failed (send or body), retry");
                 last_err = Some(e);
                 if try_no < MAX_TRIES {
                     std::thread::sleep(backoff);
@@ -87,7 +87,7 @@ pub(crate) fn get_to_file_retrying(
         match attempt().map_err(SourceError::from).and_then(&stream) {
             Ok(v) => return Ok(v),
             Err(e) => {
-                tracing::warn!(url, try_no, error = %e, "GET→fichier échoué (envoi/corps/disque), retry");
+                tracing::warn!(url, try_no, error = %e, "GET to file failed (send/body/disk), retry");
                 last_err = Some(e);
                 if try_no < MAX_TRIES {
                     std::thread::sleep(backoff);

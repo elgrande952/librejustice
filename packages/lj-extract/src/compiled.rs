@@ -19,27 +19,30 @@ use std::sync::{LazyLock, OnceLock};
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use lj_core::address::CaseAddress;
+
 use crate::data::instrument_aliases;
 use crate::data::LINK_ALIASES_TSV;
 use crate::extract::common::ART_NUM_SUFFIX;
 use crate::extract::common::FOREIGN_NATIONALITY_STEMS;
+use crate::extract::common::{names_territory, territory_qualifier_len};
 use crate::extract::key_signals::Citability;
 use crate::extract::{normalize_article, normalize_instrument};
 use crate::link::{link_citation_analyzed, KeyAnalysis};
 use crate::link::{CatalogText, Forum, LinkSnapshot, LinkTarget};
 
-pub(crate) use lj_core::text::{fold_char, fold_stable};
+use lj_fold::fold_chars;
 
-/// `fold_stable(s).starts_with(prefix)` sans allouer — `prefix` déjà plié.
+/// `fold_chars(s).starts_with(prefix)` without allocating, `prefix` already folded.
 fn starts_with_folded(s: &str, prefix: &str) -> bool {
-    let mut it = s.chars().map(fold_char);
+    let mut it = s.chars().flat_map(lj_fold::fold_char);
     prefix.chars().all(|pc| it.next() == Some(pc))
 }
 
-/// Pliage canonique de comparaison : `fold_stable` + espaces réduits à un.
+/// Pliage canonique de comparaison : `fold_chars` + espaces réduits à un.
 /// Forme des clés de `full_titles` / `code_titles` et des candidats du walker.
 fn canon_fold(s: &str) -> String {
-    fold_stable(s)
+    fold_chars(s)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -657,6 +660,13 @@ fn gentile_ext(folded: &str, be: usize) -> Option<usize> {
     }
 }
 
+/// Territory named after the title (« code de procédure civile de la
+/// Polynésie française »): the mention extends over it, as over a foreign
+/// demonym.
+fn territory_ext(folded: &str, be: usize) -> Option<usize> {
+    territory_qualifier_len(&folded[be..]).map(|len| be + len)
+}
+
 /// Surface originale d'un span plié (offsets bytes → chars).
 fn span_surface(chars: &[char], byte2char: &[usize], bs: usize, be: usize) -> String {
     chars[byte2char[bs]..byte2char[be]].iter().collect()
@@ -746,7 +756,7 @@ fn lex_code(
     let skip = usize::from(&folded[bs..be] == "nouveau code");
     let hit = longest_title_end(&vocab.code_titles, folded, bs, be, skip);
     if let Some((e, tk)) = hit {
-        if let Some(e2) = gentile_ext(folded, e) {
+        if let Some(e2) = gentile_ext(folded, e).or_else(|| territory_ext(folded, e)) {
             return Some((
                 Mention {
                     e: e2,
@@ -1049,7 +1059,7 @@ fn lex_constitution(
 pub struct CompiledCase {
     pub char_start: usize,
     pub char_end: usize,
-    pub target_ref: String,
+    pub address: CaseAddress,
 }
 
 /// Fenêtre avale bornée (frontière de char sûre) pour les sondes de contexte.
@@ -1066,12 +1076,12 @@ fn push_case(
     byte2char: &[usize],
     abs_s: usize,
     abs_e: usize,
-    target_ref: String,
+    address: CaseAddress,
 ) {
     out.push(CompiledCase {
         char_start: byte2char[abs_s],
         char_end: byte2char[abs_e],
-        target_ref,
+        address,
     });
 }
 
@@ -1162,7 +1172,7 @@ fn lex_case(
                 if let Some(c) = RE_CASE_REF_CE.captures(win) {
                     let g = c.get(1).expect("groupe n° CE");
                     if !cut_by_window(folded, be, win, g.end()) {
-                        let key = format!("ce|{}", g.as_str());
+                        let key = CaseAddress::new("ce", g.as_str(), "");
                         push_case(out, byte2char, be + g.start(), be + g.end(), key);
                     }
                 }
@@ -1231,11 +1241,11 @@ fn cut_by_window(folded: &str, be: usize, win: &str, end: usize) -> bool {
             .is_some_and(|b| b.is_ascii_digit())
 }
 
-/// Clé pourvoi : chiffres seuls (« 18-23.954 » → `cc|1823954`), même
-/// normalisation que la sonde de résolution.
-fn cc_key(num: &str) -> String {
+/// Digits only, the normalisation the resolution probe applies to the stored
+/// graphy: `18-23.954` and `1823954` must reach the same decision.
+fn cc_key(num: &str) -> CaseAddress {
     let digits: String = num.chars().filter(char::is_ascii_digit).collect();
-    format!("cc|{digits}")
+    CaseAddress::new("cc", &digits, "")
 }
 
 fn case_cc(
@@ -1305,7 +1315,7 @@ fn push_ce_enum(
         byte2char,
         off + g.start(),
         off + g.end(),
-        format!("ce|{}", g.as_str()),
+        CaseAddress::new("ce", g.as_str(), ""),
     );
     let mut pos = g.end();
     while let Some(c) = RE_CASE_CE_NEXT.captures(&win[pos..]) {
@@ -1314,7 +1324,7 @@ fn push_ce_enum(
             break;
         }
         let (s, e) = (off + pos + g.start(), off + pos + g.end());
-        push_case(out, byte2char, s, e, format!("ce|{}", g.as_str()));
+        push_case(out, byte2char, s, e, CaseAddress::new("ce", g.as_str(), ""));
         pos += g.end();
     }
 }
@@ -1337,7 +1347,7 @@ fn case_ce(folded: &str, byte2char: &[usize], bs: usize, be: usize, out: &mut Ve
         let tail = &up[nums.last().expect("non vide").1..];
         if !RE_CASE_OTHER_JUR.is_match(tail) {
             for (s, e) in nums {
-                let key = format!("ce|{}", &up[s..e]);
+                let key = CaseAddress::new("ce", &up[s..e], "");
                 push_case(out, byte2char, ws + s, ws + e, key);
             }
         }
@@ -1368,7 +1378,7 @@ fn case_constit(
     if let Some(c) = RE_CASE_CONSTIT_BACK.captures(&folded[ws..bs]) {
         let g = c.get(1).expect("groupe n° constit");
         // Clé sans le suffixe DC/QPC : les `docket_numbers` CONSTIT sont nus.
-        let key = format!("constit|{}", g.as_str());
+        let key = CaseAddress::new("constit", g.as_str(), "");
         push_case(out, byte2char, ws + g.start(), ws + g.end(), key);
     }
     let win = case_window(folded, be, 100);
@@ -1384,21 +1394,27 @@ fn case_constit(
         byte2char,
         be + g.start(),
         be + g.end(),
-        format!("constit|{}", g.as_str()),
+        CaseAddress::new("constit", g.as_str(), ""),
     );
     let mut pos = g.end();
     while let Some(c) = RE_CASE_CONSTIT_NEXT.captures(&win[pos..]) {
         let g = c.get(1).expect("groupe n° constit");
         let (s, e) = (be + pos + g.start(), be + pos + g.end());
-        push_case(out, byte2char, s, e, format!("constit|{}", g.as_str()));
+        push_case(
+            out,
+            byte2char,
+            s,
+            e,
+            CaseAddress::new("constit", g.as_str(), ""),
+        );
         pos += g.end();
     }
 }
 
 /// Clé Tribunal des conflits : espaces et points ôtés du texte plié. « C 4174 »
 /// tombe sur `c4174`, « 14-03.959 » sur `14-03959`, graphie année-numéro.
-fn tc_key(num: &str) -> String {
-    format!("tc|{}", lj_core::docket_key::tc_ordinal(num))
+fn tc_key(num: &str) -> CaseAddress {
+    CaseAddress::new("tc", &lj_core::docket_key::tc_ordinal(num), "")
 }
 
 /// Citation du Tribunal des conflits, « TC, 8 février 1873, [U], n° 00012 » ou
@@ -1565,7 +1581,7 @@ fn case_cedh(
 
 fn push_cedh(out: &mut Vec<CompiledCase>, byte2char: &[usize], s: usize, e: usize, num: &str) {
     let num: String = num.chars().filter(|ch| !ch.is_whitespace()).collect();
-    push_case(out, byte2char, s, e, format!("cedh|{num}"));
+    push_case(out, byte2char, s, e, CaseAddress::new("cedh", &num, ""));
 }
 
 /// « son arrêt n° 29217/12, Tarakhel c./ Suisse » : requête CEDH derrière
@@ -1597,26 +1613,26 @@ fn case_cedh_arret(
             byte2char,
             be + g.start(),
             be + g.end(),
-            format!("rg||{num}"),
+            CaseAddress::new("", &num, ""),
         );
     } else {
         push_cedh(out, byte2char, be + g.start(), be + g.end(), g.as_str());
     }
 }
 
-/// Clé CJUE : préfixe de rôle conservé quand présent (`cjue|c-561/19`), nu
-/// sinon (« aff. 6/64 » → `cjue|6/64` — la résolution essaie le préfixe C-).
-/// Le séparateur graphié tiret (« C-631-13 ») est ramené à la barre oblique.
-fn cjue_key(prefix: Option<&str>, num: &str) -> String {
+/// A bare number (`aff. 6/64`) keeps no role prefix, and the resolution tries
+/// `C-` against it. The dash separator (`C-631-13`) comes back to a slash.
+fn cjue_key(prefix: Option<&str>, num: &str) -> CaseAddress {
     let num: String = num
         .chars()
         .filter(|c| !c.is_whitespace())
         .map(|c| if c == '-' { '/' } else { c })
         .collect();
-    match prefix {
-        Some(p) => format!("cjue|{p}-{num}"),
-        None => format!("cjue|{num}"),
-    }
+    let docket = match prefix {
+        Some(p) => format!("{p}-{num}"),
+        None => num,
+    };
+    CaseAddress::new("cjue", &docket, "")
 }
 
 fn case_cjue_aff(
@@ -1634,20 +1650,28 @@ fn case_cjue_aff(
     let n = c.get(2).expect("groupe slashnum");
     let (first, second) = n.as_str().split_once('/').expect("slashnum");
     let (s, e, key) = match c.get(1) {
+        Some(p) if over_series_ceiling(p.as_str(), n.as_str()) => {
+            cjue_scan(folded, chars, byte2char, be, win, n.end(), out);
+            return;
+        }
         Some(p) => (p.start(), n.end(), cjue_key(Some(p.as_str()), n.as_str())),
         None if first.trim().len() >= 4 => {
             push_cedh(out, byte2char, be + n.start(), be + n.end(), n.as_str());
             cjue_scan(folded, chars, byte2char, be, win, n.end(), out);
             return;
         }
-        None if second.trim().len() >= 5 => {
+        // A case number of the Court carries a two-digit year after the slash,
+        // `6/64` as `561/19`; longer is a French docket written short, `affaire
+        // n° 20/515`. Measured 10/09/2026: the bound at five sent 1 131 dockets
+        // to a family that cannot bear them, and saved 2 citations of 15 384.
+        None if second.trim().len() > 2 => {
             let num = rg_num_key(chars, byte2char, be + n.start(), be + n.end());
             push_case(
                 out,
                 byte2char,
                 be + n.start(),
                 be + n.end(),
-                format!("rg||{num}"),
+                CaseAddress::new("", &num, ""),
             );
             return;
         }
@@ -1689,7 +1713,11 @@ fn cjue_scan(
             pos += n.end();
             continue;
         }
-        if pourvoi_tail(folded, off + pos + n.end()) {
+        if pourvoi_tail(folded, n.as_str(), off + pos + n.end()) {
+            pos += n.end();
+            continue;
+        }
+        if over_series_ceiling(p.as_str(), n.as_str()) {
             pos += n.end();
             continue;
         }
@@ -1708,7 +1736,9 @@ fn cjue_scan(
         pos += n.end();
         while let Some(c) = RE_CASE_CJUE_RANGE.captures(&win[pos..]) {
             let n = c.get(1).expect("slashnum");
-            if pourvoi_tail(folded, off + pos + n.end()) {
+            if pourvoi_tail(folded, n.as_str(), off + pos + n.end())
+                || over_series_ceiling(&prefix, n.as_str())
+            {
                 break;
             }
             let key = cjue_key(Some(&prefix), n.as_str());
@@ -1724,11 +1754,32 @@ fn cjue_scan(
     }
 }
 
-/// Un « .NNN » collé derrière un slashnum est la fin d'un n° de pourvoi
-/// Cassation (« T 17-21.405 ») — pas un rôle CJUE.
-fn pourvoi_tail(folded: &str, abs_e: usize) -> bool {
+/// Only the General Court numbers past three digits, `T-1193/23`. Measured
+/// 10/09/2026 over 13 358 linked refs: 941 at most for `c`, 148 for `f`, 1 193
+/// for `t`. A four-digit `c` is a flattened ECLI or a French docket, never a
+/// case: 255 citations, none of them ever linked.
+fn over_series_ceiling(prefix: &str, num: &str) -> bool {
+    prefix != "t"
+        && num
+            .split(['/', '-'])
+            .next()
+            .is_some_and(|first| first.trim().len() > 3)
+}
+
+/// A `.NNN` behind a slashnum ends a Cassation pourvoi (`T 17-21.405`), not a
+/// CJEU docket. Spaced, the guard only holds without a slash (`F 12-13. 669`):
+/// after one, the dot closes the sentence and the digits number a paragraph
+/// (`C-495/10. 31`). Measured 10/09/2026: 749 pourvois in, 246 of them linked.
+fn pourvoi_tail(folded: &str, num: &str, abs_e: usize) -> bool {
     let rest = &folded.as_bytes()[abs_e..];
-    rest.first() == Some(&b'.') && rest.get(1).is_some_and(u8::is_ascii_digit)
+    if rest.first() != Some(&b'.') {
+        return false;
+    }
+    match rest.get(1) {
+        Some(b) if b.is_ascii_digit() => true,
+        Some(b'\x20') if !num.contains('/') => rest.get(2).is_some_and(u8::is_ascii_digit),
+        _ => false,
+    }
 }
 
 /// Reconstruit le numéro depuis le texte ORIGINAL (les dockets TCOM/CAA
@@ -1785,12 +1836,8 @@ fn rg_jurisdiction(
         let words: Vec<&str> = region.split_whitespace().collect();
         for k in (1..=words.len().min(6)).rev() {
             let city = words[..k].join(" ");
-            if let Some(loc) = chrono.location(jt, &city) {
-                return Some(if jt == "TCOM" {
-                    format!("tcom{loc}")
-                } else {
-                    loc.to_string()
-                });
+            if let Some(code) = chrono.code(jt, &city) {
+                return Some(code.to_string());
             }
         }
         want?;
@@ -1866,7 +1913,6 @@ fn rg_emit(
     let code = rg_jurisdiction(folded, chrono, (ws, bs), (be + g.end(), down_end), None)
         .unwrap_or_default();
     let num = rg_canon(rg_num_key(chars, byte2char, be + g.start(), be + g.end()));
-    let fam = fond_family(&code);
     if code.is_empty() && !num.contains('/') {
         return;
     }
@@ -1875,7 +1921,7 @@ fn rg_emit(
         byte2char,
         be + g.start(),
         be + g.end(),
-        format!("{fam}|{code}|{num}"),
+        CaseAddress::new(&code, &num, ""),
     );
     let mut pos = g.end();
     while let Some(c) = RE_CASE_RG_NEXT.captures(&win[pos..]) {
@@ -1894,21 +1940,9 @@ fn rg_emit(
             byte2char,
             be + pos + g.start(),
             be + pos + g.end(),
-            format!("{fam}|{code}|{num}"),
+            CaseAddress::new(&code, &num, ""),
         );
         pos += g.end();
-    }
-}
-
-/// Famille de la clé d'un jugement du fond selon le `jurisdiction_code` : `af`
-/// (fond administratif TA/CAA) pour `ta_*`/`caa*`, `rg` (fond judiciaire)
-/// sinon — dont code vide → `rg||NUM` nue. Le sigle `tass_` (judiciaire) ne
-/// matche pas `ta_`.
-fn fond_family(code: &str) -> &'static str {
-    if code.starts_with("ta_") || code.starts_with("caa") {
-        "af"
-    } else {
-        "rg"
     }
 }
 
@@ -2007,7 +2041,7 @@ fn case_arret_ord(
         byte2char,
         be + g.start(),
         be + g.end(),
-        format!("rg||{num}"),
+        CaseAddress::new("", &num, ""),
     );
 }
 
@@ -2038,7 +2072,7 @@ fn case_ce_arret(
             byte2char,
             be + g.start(),
             be + g.end(),
-            format!("ce|{}", g.as_str()),
+            CaseAddress::new("ce", g.as_str(), ""),
         );
     }
 }
@@ -2080,7 +2114,6 @@ fn case_admin(
             Some(want),
         )
         .unwrap_or_default();
-        let fam = fond_family(&code);
         let num = rg_num_key(chars, byte2char, be + g.start(), be + g.end());
         if code.is_empty() && !num.contains('/') {
             return;
@@ -2090,7 +2123,7 @@ fn case_admin(
             byte2char,
             be + g.start(),
             be + g.end(),
-            format!("{fam}|{code}|{num}"),
+            CaseAddress::new(&code, &num, ""),
         );
         let mut pos = g.end();
         while let Some(c) = re_next.captures(&win[pos..]) {
@@ -2104,7 +2137,7 @@ fn case_admin(
                 byte2char,
                 be + pos + g.start(),
                 be + pos + g.end(),
-                format!("{fam}|{code}|{num}"),
+                CaseAddress::new(&code, &num, ""),
             );
             pos += g.end();
         }
@@ -2359,7 +2392,7 @@ fn scan_all(
                         }
                     }
                 }
-                if let Some(e2) = gentile_ext(folded, end) {
+                if let Some(e2) = gentile_ext(folded, end).or_else(|| territory_ext(folded, end)) {
                     end = e2;
                     tk = String::new();
                     icode = false;
@@ -2451,7 +2484,7 @@ fn scan_all(
                                 if let Some(c) = RE_CASE_ORD_CE.captures(win) {
                                     let g = c.get(1).expect("groupe n° CE");
                                     if !cut_by_window(folded, be, win, g.end()) {
-                                        let key = format!("ce|{}", g.as_str());
+                                        let key = CaseAddress::new("ce", g.as_str(), "");
                                         push_case(
                                             cases,
                                             byte2char,
@@ -2708,39 +2741,44 @@ pub struct CompiledCitation {
     pub bare: bool,
 }
 
-/// Préparation d'un document pour les scans automate : texte original en
-/// chars, texte plié (`fold_stable`, 1:1 char-stable) et tables byte(plié) ↔
-/// char(original). Construite UNE fois par document et partagée entre les
-/// automates (vocabulaire citations ici, marqueurs `crate::scan`).
+/// A document prepared for the automaton scans: the source text as chars, the
+/// folded text (`lj_fold`, one char giving several or none) and the
+/// byte(folded) to char(source) tables. Built once per document and shared by
+/// the automata (citation vocabulary here, markers in `crate::scan`).
 ///
-/// `chars` mappe chaque blanc (saut de ligne, tabulation, nbsp…) vers l'espace
-/// simple, 1:1 comme `fold_stable` : les composeurs testent l'espace
-/// uniformément, les tranches verbatim sortent mono-ligne, et les offsets
-/// restent ceux du texte d'entrée.
+/// `chars` maps every whitespace (line break, tab, nbsp) to a plain space, one
+/// to one with the input: composers test the space uniformly, verbatim slices
+/// come out on one line, and offsets stay those of the input. Every folded
+/// offset goes back through `byte2char`.
 pub struct Norm {
     pub chars: Vec<char>,
     pub folded: String,
     pub byte2char: Vec<usize>,
     pub char2byte: Vec<usize>,
+    /// Where the input text broke the line. `chars` maps that break to a plain
+    /// space, and a source separating its paragraphs with a single break would
+    /// leave no trace of it, the break being the only paragraph boundary an
+    /// administrative judgment has.
+    pub breaks: Vec<bool>,
 }
 
 impl Norm {
-    /// UNE passe sur le texte : chars mappés, pliage et les deux tables
-    /// ensemble. `byte2char` n'est lu qu'aux frontières de chars pliés
-    /// (positions de match automate) — les octets de continuation restent 0.
+    /// One pass over the text: mapped chars, fold and both tables together.
+    /// Every folded byte points to the source char that produced it; a char the
+    /// fold drops has no byte, and `char2byte` merges it with the next one.
     pub fn new(text: &str) -> Self {
         let n = text.len();
         let mut chars: Vec<char> = Vec::with_capacity(n);
         let mut folded = String::with_capacity(n);
         let mut byte2char: Vec<usize> = Vec::with_capacity(n + 1);
         let mut char2byte: Vec<usize> = Vec::with_capacity(n + 1);
+        let mut breaks: Vec<bool> = Vec::with_capacity(n);
         for (ci, c) in text.chars().enumerate() {
             chars.push(if c.is_whitespace() { ' ' } else { c });
+            breaks.push(c == '\n' || c == '\r');
             char2byte.push(folded.len());
-            let fc = fold_char(c);
-            byte2char.push(ci);
-            byte2char.extend(std::iter::repeat_n(0, fc.len_utf8() - 1));
-            folded.push(fc);
+            lj_fold::push_folded(c, &mut folded);
+            byte2char.resize(folded.len(), ci);
         }
         byte2char.push(chars.len());
         char2byte.push(folded.len());
@@ -2749,6 +2787,7 @@ impl Norm {
             folded,
             byte2char,
             char2byte,
+            breaks,
         }
     }
 }
@@ -3040,7 +3079,7 @@ fn instr_keys<'a>(t: &'a Tok, chars: &[char]) -> Option<(String, &'a str, bool)>
 /// Clé d'appariement de l'adoption intra-document d'une forme datée nue : pli
 /// stable + qualificatif de circulaire raboté.
 fn dated_adoption_key(text_key: &str) -> String {
-    fold_stable(
+    fold_chars(
         &crate::link::strip_circulaire_qualifier(text_key).unwrap_or_else(|| text_key.to_string()),
     )
 }
@@ -3230,7 +3269,7 @@ fn compose(
     }
     let full_forms: Vec<(String, String, String)> = instr_resolved
         .values()
-        .filter_map(|(surface, tk, uid)| Some((fold_stable(surface), tk.clone(), uid.clone()?)))
+        .filter_map(|(surface, tk, uid)| Some((fold_chars(surface), tk.clone(), uid.clone()?)))
         .collect();
     for (i, t) in toks.iter().enumerate() {
         let Tok::Instr {
@@ -3246,7 +3285,7 @@ fn compose(
             continue;
         }
         let surface: String = chars[*s..*e].iter().collect();
-        let folded = fold_stable(&surface);
+        let folded = fold_chars(&surface);
         if !*treaty_short && !RE_BARE_DATED_ALIAS.is_match(&folded) {
             continue;
         }
@@ -3262,6 +3301,12 @@ fn compose(
     let mut out: Vec<CompiledCitation> = Vec::new();
     let mut last_instr: Option<usize> = None;
     let quotes = quote_spans(chars);
+    // A document under a territory's own civil procedure: its bare « article 700 »
+    // is that code's.
+    let local_procedure = instr_resolved.values().any(|(_, tk, _)| {
+        let folded = canon_fold(tk);
+        folded.contains("procedure civile") && names_territory(&folded)
+    });
 
     // Adjacence génitive précalculée pour TOUS les Art, puis héritage
     // d'énumération EN ARRIÈRE : seul le dernier item touche le génitif, les
@@ -3312,7 +3357,7 @@ fn compose(
                 Tok::Instr { s: is, e: ie, .. }
                     if is.saturating_sub(gap_from) <= 40 && {
                         let lead: String = chars[gap_from..*is].iter().collect();
-                        RE_REDACTION.is_match(fold_stable(&lead).trim_start_matches([',', ' ']))
+                        RE_REDACTION.is_match(fold_chars(&lead).trim_start_matches([',', ' ']))
                     } =>
                 {
                     gap_from = *ie;
@@ -3473,6 +3518,10 @@ fn compose(
                         resolved = Some((surface.clone(), tk.clone()));
                         break;
                     }
+                    // A territory's own code is the one designated, linked or not.
+                    if names_territory(&canon_fold(tk)) {
+                        break;
+                    }
                 }
             }
         }
@@ -3568,7 +3617,7 @@ fn compose(
         //    aval sur le porteur.
         let owner_claims = owner_text_uid.is_some_and(|u| snap.has_article(u, num_key));
         if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() && !owner_claims {
-            let public_key = lj_core::article_key::article_key(num_key);
+            let public_key = lj_norm::article_key::article_key(num_key);
             if let Some(cands) = vocab.by_num_key.get(&public_key) {
                 let prefixed = num_key.len() > 3
                     && matches!(num_key.as_bytes()[0], b'L' | b'R' | b'D' | b'A')
@@ -3650,7 +3699,7 @@ fn compose(
                     if let Some(uid) = uid.filter(|u| snap.has_article(u, num_key)) {
                         direct_target = Some(LinkTarget {
                             ref_text_uid: Some(uid.to_string()),
-                            ref_num_key: Some(lj_core::article_key::article_key(num_key)),
+                            ref_num_key: Some(lj_norm::article_key::article_key(num_key)),
                         });
                     }
                 }
@@ -3659,7 +3708,8 @@ fn compose(
         // 7. Canon jurisprudentiel : « l'article 700 » nu = frais irrépétibles du
         //    CPC, « 699 » = distraction des dépens — cités sans instrument dans
         //    TOUTES les juridictions judiciaires.
-        if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() {
+        if resolved.is_none() && !adjacent && !orphan && direct_target.is_none() && !local_procedure
+        {
             if let Some(uid) = CANON_BARE_ARTICLES
                 .iter()
                 .find_map(|(nk, uid)| (nk == num_key).then_some(*uid))
@@ -4806,7 +4856,7 @@ mod tests {
         doc_extract(text, &vocab, &snap, &chrono, None, None).cases
     }
 
-    /// (surface, target_ref) des spans émis.
+    /// (surface, `court|docket`) of the emitted spans. A citation has no date.
     fn case_surfaces(text: &str) -> Vec<(String, String)> {
         cases(text)
             .into_iter()
@@ -4816,10 +4866,15 @@ mod tests {
                         .skip(c.char_start)
                         .take(c.char_end - c.char_start)
                         .collect(),
-                    c.target_ref,
+                    addr_str(&c.address),
                 )
             })
             .collect()
+    }
+
+    fn addr_str(a: &CaseAddress) -> String {
+        let c = |o: &Option<String>| o.clone().unwrap_or_default();
+        format!("{}|{}", c(&a.court), c(&a.docket))
     }
 
     fn by_article<'a>(out: &'a [CompiledCitation], art: &str) -> &'a CompiledCitation {
@@ -5684,10 +5739,10 @@ mod tests {
                 "C3952",
             ),
         ] {
-            let key = format!("tc|{}", lj_core::docket_key::tc_ordinal(num));
+            let key = CaseAddress::new("tc", &lj_core::docket_key::tc_ordinal(num), "");
             assert_eq!(
                 case_surfaces(text),
-                vec![(num.to_string(), key)],
+                vec![(num.to_string(), addr_str(&key))],
                 "surface {text:?}"
             );
         }
@@ -5745,10 +5800,10 @@ mod tests {
                 "4238",
             ),
         ] {
-            let key = format!("tc|{}", lj_core::docket_key::tc_ordinal(num));
+            let key = CaseAddress::new("tc", &lj_core::docket_key::tc_ordinal(num), "");
             assert_eq!(
                 case_surfaces(text),
-                vec![(num.to_string(), key)],
+                vec![(num.to_string(), addr_str(&key))],
                 "surface {text:?}"
             );
         }
@@ -5805,10 +5860,10 @@ mod tests {
                 "4320",
             ),
         ] {
-            let key = format!("tc|{}", lj_core::docket_key::tc_ordinal(num));
+            let key = CaseAddress::new("tc", &lj_core::docket_key::tc_ordinal(num), "");
             assert_eq!(
                 case_surfaces(text),
-                vec![(num.to_string(), key)],
+                vec![(num.to_string(), addr_str(&key))],
                 "surface {text:?}"
             );
         }
@@ -5931,22 +5986,22 @@ mod tests {
             case_surfaces(
                 "le jugement du tribunal judiciaire de Paris du 12 mai 2021, RG n° 21/04532"
             ),
-            vec![("21/04532".to_string(), "rg|tj75056|21/04532".to_string())]
+            vec![("21/04532".to_string(), "tj75056|21/04532".to_string())]
         );
         assert_eq!(
             case_surfaces("l'arrêt de la cour d'appel d'Aix-en-Provence (RG 19/12345)"),
             vec![(
                 "19/12345".to_string(),
-                "rg|ca_aix_provence|19/12345".to_string()
+                "ca_aix_provence|19/12345".to_string()
             )]
         );
         assert_eq!(
             case_surfaces("l'affaire enregistrée RG n° 21/04532 au greffe"),
-            vec![("21/04532".to_string(), "rg||21/04532".to_string())]
+            vec![("21/04532".to_string(), "|21/04532".to_string())]
         );
         assert_eq!(
             case_surfaces("le jugement du tribunal judiciaire de Meaux, RG n° 21/04532"),
-            vec![("21/04532".to_string(), "rg||21/04532".to_string())]
+            vec![("21/04532".to_string(), "|21/04532".to_string())]
         );
     }
 
@@ -5965,14 +6020,14 @@ mod tests {
         assert_cases(
             "Par un jugement n° 1901563 du 15 février 2023, le tribunal administratif \
              de Nantes a condamné l'ONIAM à verser une somme",
-            &[("1901563", "af|ta_nantes|1901563")],
+            &[("1901563", "ta_nantes|1901563")],
         );
         assert_cases(
             "Par deux jugements n° 2202850 et n° 2202851 du 16 mars 2023, le tribunal \
              administratif de Nantes a rejeté leurs demandes",
             &[
-                ("2202850", "af|ta_nantes|2202850"),
-                ("2202851", "af|ta_nantes|2202851"),
+                ("2202850", "ta_nantes|2202850"),
+                ("2202851", "ta_nantes|2202851"),
             ],
         );
     }
@@ -5982,7 +6037,7 @@ mod tests {
         assert_cases(
             "Par un arrêt n° 20NT01234 du 5 mai 2022, la cour administrative d'appel \
              de Nantes a rejeté l'appel",
-            &[("20NT01234", "af|caa_nantes|20NT01234")],
+            &[("20NT01234", "caa_nantes|20NT01234")],
         );
     }
 
@@ -6062,11 +6117,11 @@ mod tests {
         let pad = "considérant que la cour a déjà statué ; ".repeat(35);
         assert_cases(
             &format!("{pad}ARRÊT AU FOND DU 25 MARS 2011 N° 2011/183 Rôle N° 10/01539"),
-            &[("2011/183", "rg||2011/183"), ("10/01539", "rg||10/01539")],
+            &[("2011/183", "|2011/183"), ("10/01539", "|10/01539")],
         );
         assert_cases(
             "ARRÊT AU FOND DU 25 MARS 2011 N° 2011/183 Rôle N° 10/01539",
-            &[("10/01539", "rg||10/01539")],
+            &[("10/01539", "|10/01539")],
         );
         assert_cases(
             "l'arrêt rendu au visa de l'article 3 du règlement n° 2988/95 du Conseil",
@@ -6100,6 +6155,38 @@ mod tests {
     }
 
     #[test]
+    fn case_cjue_pourvoi_guard_holds_on_the_spaced_tail_and_spares_the_paragraph_number() {
+        assert_cases(
+            "a rendu l'arrêt suivant : Joint les pourvois n° E 12-11. 828 et n° C 12-12. 907",
+            &[("12-11. 828", "cc|1211828"), ("12-12. 907", "cc|1212907")],
+        );
+        assert_cases(
+            "Cour de justice de l'Union européenne du 21 décembre 2011, n° C-495/10. 31. Dans le cas où",
+            &[("C-495/10", "cjue|c-495/10")],
+        );
+        assert_cases(
+            "un arrêt du 14 mai 2019 (CJUE 14 mai 2019 C 55-18) qui a indiqué que",
+            &[("C 55-18", "cjue|c-55/18")],
+        );
+    }
+
+    #[test]
+    fn case_cjue_only_the_general_court_numbers_past_three_digits() {
+        assert_cases(
+            "arrêt du 16 juillet 2025, Rimorchiatori Riuniti Panfido c/ CINEA (T-1193/23)",
+            &[("T-1193/23", "cjue|t-1193/23")],
+        );
+        assert_cases(
+            "arrêt du 13 septembre 2018, Birkenstock Sales c/ EUIPO, C-26/17 P, EU C2018/714",
+            &[("C-26/17", "cjue|c-26/17")],
+        );
+        assert_cases(
+            "CJUE, arrêt du 27 mars 2014, LCL c/Fesih Kalhan, C6565-12) dans lequel elle",
+            &[],
+        );
+    }
+
+    #[test]
     fn case_cc_paren_ranges_and_dated_enumerations() {
         assert_cases(
             "sur renvoi après cassation par arrêt en date du 29 juin 2017 (16-13.988), \
@@ -6127,18 +6214,35 @@ mod tests {
     }
 
     #[test]
+    fn case_aff_sans_prefixe_le_millesime_a_deux_chiffres_seul_est_une_affaire_de_la_cour() {
+        assert_cases("aff. 6/64, Costa contre ENEL", &[("6/64", "cjue|6/64")]);
+        assert_cases(
+            "l'affaire n° 20/515 a fait l'objet d'une remise au rôle",
+            &[("20/515", "|20/515")],
+        );
+        assert_cases(
+            "jointe au dossier de l'affaire n° 20/1347",
+            &[("20/1347", "|20/1347")],
+        );
+        assert_cases(
+            "l'affaire C-782/19 concerne la même question",
+            &[("C-782/19", "cjue|c-782/19")],
+        );
+    }
+
+    #[test]
     fn case_rg_enrol_deferee_and_own_header_guards() {
         assert_cases(
             "décision attaquée en date du 05 octobre 2020, enregistrée sous le no 20/00325",
-            &[("20/00325", "rg||20/00325")],
+            &[("20/00325", "|20/00325")],
         );
         assert_cases(
             "DÉCISION DÉFÉRÉE :  21/00287  Jugement du TJ HORS JAF",
-            &[("21/00287", "rg||21/00287")],
+            &[("21/00287", "|21/00287")],
         );
         assert_cases(
             "Appel d'une décision (No RG 09/ 29) rendue par le juge de l'expropriation",
-            &[("09/ 29", "rg||09/29")],
+            &[("09/ 29", "|09/29")],
         );
         assert_cases(
             "Vu la requête en prolongation de rétention, enregistrée sous le N°RG \
@@ -6151,17 +6255,17 @@ mod tests {
         );
         assert_cases(
             "jugement du Tribunal de Commerce de PARIS - RG n° 2023063685",
-            &[("2023063685", "rg|tcom7501|2023063685")],
+            &[("2023063685", "tcom7501|2023063685")],
         );
         assert_cases(
             "jugement du Tribunal de Commerce de PARIS du 16 Novembre 2015 enregistré(e) \
              au répertoire général sous le n° 2015F00459",
-            &[("2015F00459", "rg|tcom7501|2015F00459")],
+            &[("2015F00459", "tcom7501|2015F00459")],
         );
         assert_cases(
             "d'un jugement rendu le 10/05/2016 (instance n° 14-08937) par le tribunal \
              de grande instance de Paris",
-            &[("14-08937", "rg|tj75056|14/08937")],
+            &[("14-08937", "tj75056|14/08937")],
         );
     }
 
@@ -6362,5 +6466,100 @@ mod tests {
             None,
         );
         assert_eq!(target_of(&out), (None, None));
+    }
+
+    fn territory_engine() -> (CompiledVocab, LinkSnapshot) {
+        let mut texts = vec![
+            text(
+                "LEGITEXT000006070716",
+                "Code de procédure civile",
+                "Code de procédure civile",
+                "CODE",
+                1500,
+            ),
+            text("LEGI_CC", "Code civil", "Code civil", "CODE", 2800),
+            text(
+                "LEGI_DOU_YT",
+                "Code des douanes de Mayotte",
+                "Code des douanes de Mayotte",
+                "CODE",
+                400,
+            ),
+        ];
+        let mut local = text(
+            "FR-PF/CODE-IMPOTS",
+            "Code des impôts de la Polynésie française",
+            "code des impôts de la polynésie française",
+            "CODE",
+            200,
+        );
+        local.jurisdiction = Some("PF".to_string());
+        texts.push(local);
+        let articles = [
+            ("LEGITEXT000006070716", "700"),
+            ("LEGITEXT000006070716", "455"),
+            ("LEGI_CC", "1240"),
+            ("FR-PF/CODE-IMPOTS", "150"),
+        ]
+        .map(|(uid, nk)| (uid.to_string(), nk.to_string()))
+        .to_vec();
+        let snap = LinkSnapshot::build(texts.clone(), articles);
+        let vocab = CompiledVocab::build(&texts, &snap);
+        (vocab, snap)
+    }
+
+    fn targets(text: &str) -> Vec<Option<String>> {
+        let (vocab, snap) = territory_engine();
+        extract_citations(text, &vocab, &snap, None)
+            .into_iter()
+            .map(|c| c.target.ref_text_uid)
+            .collect()
+    }
+
+    #[test]
+    fn territorial_code_is_not_the_national_one() {
+        for text in [
+            "l'article 700 du code de procédure civile de la Polynésie française",
+            "l'article 700 du Code de Procédure Civile de Nouvelle Calédonie",
+            "l'article 700 du code de procédure civile polynésien",
+            "l'article 1240 du code civil de la Polynésie française",
+        ] {
+            assert_eq!(targets(text), vec![None], "{text}");
+        }
+        let cpc = Some("LEGITEXT000006070716".to_string());
+        assert_eq!(
+            targets("l'article 700 du code de procédure civile applicable en Polynésie française"),
+            vec![cpc]
+        );
+        assert_eq!(
+            targets("l'article 150 du code des impôts de la Polynésie française"),
+            vec![Some("FR-PF/CODE-IMPOTS".to_string())]
+        );
+        assert_eq!(
+            targets("le code des douanes de Mayotte"),
+            vec![Some("LEGI_DOU_YT".to_string())]
+        );
+    }
+
+    #[test]
+    fn same_code_and_bare_700_stop_at_a_territorial_code() {
+        assert_eq!(
+            targets(
+                "vu le code civil ; vu le code de procédure civile de la Polynésie \
+                 française ; l'article 1240 du même code"
+            ),
+            vec![Some("LEGI_CC".to_string()), None, None]
+        );
+        assert_eq!(
+            targets(
+                "l'article 700 du code de procédure civile de la Polynésie française. \
+                 Condamne X au titre de l'article 700"
+            ),
+            vec![None, None]
+        );
+        assert_eq!(
+            targets("Condamne X au titre de l'article 700"),
+            vec![Some("LEGITEXT000006070716".to_string())]
+        );
     }
 }

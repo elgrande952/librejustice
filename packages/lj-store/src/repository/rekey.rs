@@ -2,7 +2,7 @@
 //! `legal_article.num_key`, `legal_citation.ref_num_key`,
 //! `legal_toc_edge.child_num_key`, `legal_link.owner/target_num_key`,
 //! `text_case_citation.owner_num_key`. Le mapping vieille clé → clé publique
-//! est calculé côté Rust (`lj_core::article_key`, unique définition de
+//! est calculé côté Rust (`lj_norm::article_key`, unique définition de
 //! l'alphabet) et posé en table temporaire de session — toutes les passes
 //! partagent donc la même connexion. Les composites
 //! `decisions/decision_chunks.legal_article_composite` se resynchronisent

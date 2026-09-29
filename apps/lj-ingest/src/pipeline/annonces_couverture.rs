@@ -14,9 +14,9 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{anyhow, Result};
 
-use lj_dtos::ANNONCE_FOND_MARCHE;
-use lj_sources::annonces::discover::{canon_host, MOTEURS_CONNECTES};
+use lj_sources_annonces::discover::{canon_host, MOTEURS_CONNECTES};
 use lj_store::repository::DecisionRepository;
+use lj_vocab::ANNONCE_FOND_MARCHE;
 
 use crate::config::Settings;
 
@@ -131,7 +131,7 @@ pub async fn annonces_couverture(limite: usize) -> Result<()> {
             hote = %hote,
             lignes,
             canaux = %canaux,
-            "annonces_couverture : tenant"
+            "annonces_couverture: tenant"
         );
     }
 

@@ -1,0 +1,76 @@
+text_uid	first	last	matter	title
+LEGITEXT000006070721	1	16	civil_rights	Code civil, titre préliminaire et livre Ier, titre Ier, des droits civils
+LEGITEXT000006070721	17	33	nationality	Code civil, livre Ier, titre Ier bis, de la nationalité française
+LEGITEXT000006070721	34	370	personal_status	Code civil, livre Ier, titres II à VIII, des actes de l'état civil à la filiation adoptive
+LEGITEXT000006070721	371	387	parental_authority	Code civil, livre Ier, titre IX, de l'autorité parentale
+LEGITEXT000006070721	388	515	personal_status	Code civil, livre Ier, titres X à XIII, de la minorité, de la majorité et du pacte civil de solidarité
+LEGITEXT000006070721	720	1099	succession_matrimonial	Code civil, livre III, titres Ier et II, des successions et des libéralités
+LEGITEXT000006070721	1387	1581	succession_matrimonial	Code civil, livre III, titre V, des régimes matrimoniaux
+LEGITEXT000006070721			civil_law	Code civil
+LEGITEXT000006070933			administrative_procedure	Code de justice administrative
+JORFTEXT000000469964			administrative_procedure	Code de justice administrative, partie parue au JORF
+JORFTEXT000000825499			administrative_procedure	Code de justice administrative, partie parue au JORF
+LEGITEXT000006071344			administrative_procedure	Code des tribunaux administratifs et des cours administratives d'appel
+LEGITEXT000031366350			administrative_relations	Code des relations entre le public et l'administration
+LEGITEXT000006070716			civil_procedure	Code de procédure civile
+LEGITEXT000006070680			civil_procedure	Code de procédure civile (1807)
+LEGITEXT000005634379			commerce	Code de commerce
+JORFTEXT000000276984			commerce	Code de commerce, partie parue au JORF
+JORFTEXT000000647910			commerce	Code de commerce, partie parue au JORF
+JORFTEXT000000825497			commerce	Code de commerce, partie parue au JORF
+JORFTEXT000000648075			commerce	Code de commerce, partie parue au JORF
+JORFTEXT000000648076			commerce	Code de commerce, partie parue au JORF
+JORFTEXT000000648077			commerce	Code de commerce, partie parue au JORF
+JORFTEXT000000280789			commerce	Code de commerce, partie parue au JORF
+JORFTEXT000000280790			commerce	Code de commerce, partie parue au JORF
+JORFTEXT000000276985			commerce	Code de commerce, partie parue au JORF
+LEGITEXT000006069441			commerce	Code de commerce (ancien)
+LEGITEXT000006069565			consumer	Code de la consommation
+LEGITEXT000006070719			criminal_law	Code pénal
+LEGITEXT000006071029			criminal_law	Code pénal (ancien)
+LEGITEXT000006071154			criminal_procedure	Code de procédure pénale
+LEGITEXT000006071570			customs	Code des douanes
+LEGITEXT000006071307			defence	Code de la défense
+LEGITEXT000006070239			electoral	Code électoral
+LEGITEXT000023983208			energy	Code de l'énergie
+LEGITEXT000006074220			environment	Code de l'environnement
+JORFTEXT000000825495			environment	Code de l'environnement, partie parue au JORF
+LEGITEXT000006074224			expropriation	Code de l'expropriation pour cause d'utilité publique
+LEGITEXT000006070158			foreigners	Code de l'entrée et du séjour des étrangers et du droit d'asile
+LEGITEXT000006072665			health	Code de la santé publique
+JORFTEXT000000280796			health	Code de la santé publique, partie parue au JORF
+JORFTEXT000000470152			health	Code de la santé publique, partie parue au JORF
+JORFTEXT000000648081			health	Code de la santé publique, partie parue au JORF
+JORFTEXT000000825500			health	Code de la santé publique, partie parue au JORF
+JORFTEXT000000470153			health	Code de la santé publique, partie parue au JORF
+JORFTEXT000000648082			health	Code de la santé publique, partie parue au JORF
+LEGITEXT000006074096			housing	Code de la construction et de l'habitation
+LEGITEXT000006073984			insurance	Code des assurances
+LEGITEXT000006072050			labour	Code du travail
+LEGITEXT000006072051			labour	Code du travail maritime
+LEGITEXT000006072026			money_credit	Code monétaire et financier
+JORFTEXT000000280788			money_credit	Code monétaire et financier, partie parue au JORF
+LEGITEXT000006071189			nationality	Code de la nationalité française
+LEGITEXT000006070987			post_telecom	Code des postes et des communications électroniques
+LEGITEXT000006071190			research	Code de la recherche
+LEGITEXT000006074228			road_traffic	Code de la route
+JORFTEXT000000280793			road_traffic	Code de la route, partie parue au JORF
+JORFTEXT000000280794			road_traffic	Code de la route, partie parue au JORF
+JORFTEXT000000648078			road_traffic	Code de la route, partie parue au JORF
+JORFTEXT000000825498			road_traffic	Code de la route, partie parue au JORF
+JORFTEXT000000280795			road_traffic	Code de la route, partie parue au JORF
+LEGITEXT000006074947			road_traffic	Code de la route (ancien)
+LEGITEXT000006070667			roads	Code de la voirie routière
+LEGITEXT000006073189			social_protection	Code de la sécurité sociale
+LEGITEXT000006074069			social_protection	Code de l'action sociale et des familles
+JORFTEXT000000280792			social_protection	Code de l'action sociale et des familles, partie parue au JORF
+LEGITEXT000006072637			social_protection	Code de la famille et de l'aide sociale
+LEGITEXT000006069577			tax	Code général des impôts
+LEGITEXT000006069568			tax	Code général des impôts, annexe I
+LEGITEXT000006069569			tax	Code général des impôts, annexe II
+LEGITEXT000006069574			tax	Code général des impôts, annexe III
+LEGITEXT000006069576			tax	Code général des impôts, annexe IV
+LEGITEXT000006069583			tax	Livre des procédures fiscales
+LEGITEXT000044595989			tax	Code des impositions sur les biens et services
+LEGITEXT000006074073			tourism	Code du tourisme
+LEGITEXT000006074075			urban_planning	Code de l'urbanisme

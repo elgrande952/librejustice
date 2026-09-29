@@ -12,7 +12,7 @@ Rule: a filterless descriptive search over 2 million articles ranks circulaires 
 
 `code: "Convention européenne des droits de l'homme"` errors, and the closest-match suggestion is an unrelated circulaire. The text exists under its official name: « Convention de sauvegarde des droits de l'homme et des libertés fondamentales ». `ceseda` errors with no usable suggestion; the full name « code de l'entrée et du séjour des étrangers et du droit d'asile » works.
 
-Rule: filters resolve slugs and official names only. Acronyms and usual names belong in the query text (alias expansion covers them there), never in `code`. To pin the slug: read `facets.code` on a query that must hit the text, or reuse an inline `/texte/` link from a decision that cites it.
+Rule: filters resolve slugs and official names only. Acronyms and usual names belong in the query text (alias expansion covers them there), never in `code`. To pin the slug: read `facets.code` on a query that must hit the text, or reuse an inline `/norm/` link from a decision that cites it.
 
 ## 3. Foreign texts served in a single unversioned state
 

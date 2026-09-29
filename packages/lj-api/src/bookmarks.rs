@@ -2,8 +2,7 @@
 //!
 //! La ligne `users` parente est garantie par le JIT provisioning ; les FK
 //! `user_bookmarks.user_sub` / `decision_id` (ON DELETE CASCADE) maintiennent
-//! l'intégrité. La création est gatée par `track_activity` directement dans
-//! l'INSERT (`WHERE EXISTS`).
+//! l'intégrité.
 
 use deadpool_postgres::Pool;
 use lj_dtos::{BookmarkItem, JurisdictionType};
@@ -71,7 +70,7 @@ pub async fn fetch_bookmarks(
                to_char(d.date_lecture, 'YYYY-MM-DD') AS date_lecture, \
                d.docket_numbers, \
                d.solution_uid, \
-               d.summary, \
+               (SELECT dt.summary FROM decision_text dt WHERE dt.decision_id = d.id AND dt.lead), \
                b.created_at, \
                COUNT(*) OVER() AS total \
              FROM user_bookmarks b \
@@ -133,7 +132,7 @@ pub async fn list_bookmarks(
 }
 
 /// `PUT /me/bookmarks/{decision_id}` — ajoute un signet (idempotent via
-/// `ON CONFLICT DO NOTHING`), gaté par `track_activity`.
+/// `ON CONFLICT DO NOTHING`).
 pub async fn add_bookmark(
     state: &AppState,
     user_sub: &str,
@@ -146,11 +145,9 @@ pub async fn add_bookmark(
         .await
         .map_err(|e| ApiError::Internal(format!("pool: {e}")))?;
     conn.execute(
-        "INSERT INTO user_bookmarks (user_sub, decision_id) \
-         SELECT $1, $2 \
-         WHERE EXISTS (SELECT 1 FROM users WHERE sub = $3 AND track_activity) \
+        "INSERT INTO user_bookmarks (user_sub, decision_id) VALUES ($1, $2) \
          ON CONFLICT (user_sub, decision_id) DO NOTHING",
-        &[&user_sub, &db_id, &user_sub],
+        &[&user_sub, &db_id],
     )
     .await
     .map_err(|e| ApiError::Internal(format!("add_bookmark: {e}")))?;

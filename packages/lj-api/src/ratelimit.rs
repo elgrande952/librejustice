@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
 
-use crate::identity::Identity;
-use moka::future::Cache;
+use crate::typed_cache::TypedCache;
+use lj_identity::Identity;
 use tokio::sync::Mutex;
 
 /// Cible tracing des dépassements de budget.
@@ -35,14 +35,20 @@ pub enum Cost {
     Rerank,
     /// One row by identifier on the machine surfaces (API, MCP), where loops run.
     Read,
+    /// A decision composed into a PDF, the one route rendering a document per hit.
+    Export,
     /// A password hash, a row created or a mail sent, before any session exists.
     Auth,
     /// An unauthenticated crossing of `/api` or `/mcp`: the `SELECT` of a refusal.
     Porte,
     /// A client incident report.
     ClientIncident,
+    /// A page reporting what it shows.
+    ReadReport,
     /// A support report, which is a mail.
     Signalement,
+    /// A directory query that can name a natural person.
+    Annuaire,
 }
 
 impl Cost {
@@ -51,22 +57,34 @@ impl Cost {
             Cost::Search => "search",
             Cost::Rerank => "rerank",
             Cost::Read => "read",
+            Cost::Export => "export",
             Cost::Auth => "auth",
             Cost::Porte => "porte",
             Cost::ClientIncident => "client",
+            Cost::ReadReport => "lecture",
             Cost::Signalement => "signalement",
+            Cost::Annuaire => "annuaire",
         }
     }
 }
 
 // Sustained allowance per minute of the classes without an environment setting.
-// Read: 2 rows/s leaves an agent its shortlist and stops a corpus loop.
+// Read: 5 rows/s, an agent reading a code article by article peaked at 268/min
+// on 22/09/2026; a corpus loop still takes days.
 // Auth: 20 keeps an office behind one NAT logging in at 9am, and caps argon2.
-pub const READ_PER_MIN: u32 = 120;
+// Export: 10 lets a reader save a batch and bounds a render loop; the harvester of
+// 15/09/2026 sat at 2.8/min, so this class bounds the cost, it does not catch that.
+pub const READ_PER_MIN: u32 = 300;
+pub const EXPORT_PER_MIN: u32 = 10;
 pub const AUTH_PER_MIN: u32 = 20;
 pub const PORTE_PER_MIN: u32 = 120;
 pub const CLIENT_INCIDENTS_PER_MIN: u32 = 5;
+/// A reader opens a page every few seconds at most.
+pub const READ_REPORTS_PER_MIN: u32 = 30;
 pub const SIGNALEMENTS_PER_MIN: u32 = 3;
+// Annuaire: 20 leaves a firm its conflict checks and puts a full harvest of the
+// 93 404 lawyers, 25 rows at a time, past three hours on one nameable account.
+pub const ANNUAIRE_PER_MIN: u32 = 20;
 
 /// Burst tolerated, in minutes of allowance: only the sustained regime meets the refill.
 const BURST_FACTOR: f64 = 2.0;
@@ -143,10 +161,13 @@ pub struct Budgets {
     search: Budget,
     rerank: Budget,
     read: Budget,
+    export: Budget,
     auth: Budget,
     porte: Budget,
     client: Budget,
+    lecture: Budget,
     signalement: Budget,
+    annuaire: Budget,
 }
 
 impl Budgets {
@@ -156,10 +177,13 @@ impl Budgets {
             search: budget(Cost::Search, search_per_min),
             rerank: budget(Cost::Rerank, rerank_per_min),
             read: budget(Cost::Read, READ_PER_MIN),
+            export: budget(Cost::Export, EXPORT_PER_MIN),
             auth: budget(Cost::Auth, AUTH_PER_MIN),
             porte: budget(Cost::Porte, PORTE_PER_MIN),
             client: budget(Cost::ClientIncident, CLIENT_INCIDENTS_PER_MIN),
+            lecture: budget(Cost::ReadReport, READ_REPORTS_PER_MIN),
             signalement: budget(Cost::Signalement, SIGNALEMENTS_PER_MIN),
+            annuaire: budget(Cost::Annuaire, ANNUAIRE_PER_MIN),
         }
     }
 
@@ -170,10 +194,13 @@ impl Budgets {
             Cost::Search => &self.search,
             Cost::Rerank => &self.rerank,
             Cost::Read => &self.read,
+            Cost::Export => &self.export,
             Cost::Auth => &self.auth,
             Cost::Porte => &self.porte,
             Cost::ClientIncident => &self.client,
+            Cost::ReadReport => &self.lecture,
             Cost::Signalement => &self.signalement,
+            Cost::Annuaire => &self.annuaire,
         };
         budget.take(key).await
     }
@@ -183,7 +210,7 @@ impl Budgets {
 #[derive(Clone)]
 struct Budget {
     surface: &'static str,
-    buckets: Cache<String, Arc<Mutex<Bucket>>>,
+    buckets: TypedCache<Arc<Mutex<Bucket>>>,
     capacity: f64,
     refill_per_sec: f64,
 }
@@ -194,8 +221,7 @@ impl Budget {
         let capacity = f64::from(per_min) * BURST_FACTOR;
         Self {
             surface,
-            buckets: Cache::builder()
-                .max_capacity(MAX_KEYS)
+            buckets: TypedCache::builder(MAX_KEYS)
                 .time_to_idle(Duration::from_secs_f64(capacity / refill_per_sec))
                 .build(),
             capacity,
@@ -237,7 +263,7 @@ impl Budget {
             surface = self.surface,
             caller = key.kind(),
             verdict = Verdict::Exhausted.as_str(),
-            "budget épuisé"
+            "budget exhausted"
         );
         Verdict::Exhausted
     }

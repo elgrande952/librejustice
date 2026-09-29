@@ -70,7 +70,7 @@ pub fn SourcesPage() -> impl IntoView {
                 "La Direction de l'information légale et administrative diffuse en bulk "
                 "les bases ouvertes du droit français. LibreJustice en ingère : "
                 "LEGI (codes & lois consolidés, versionnés par article — chaque article "
-                "servi en vigueur ou à une date passée ; source des pages /texte et de la "
+                "servi en vigueur ou à une date passée ; source des pages /norm et de la "
                 "recherche dans les textes), JORF (Journal officiel, dont les traités "
                 "publiés par décret), et la jurisprudence JADE (Conseil d'État, avec "
                 "analyses) ainsi que les décisions du Conseil constitutionnel (CONSTIT). "

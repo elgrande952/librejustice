@@ -1,4 +1,4 @@
-@import "tailwindcss";
+@import "tailwindcss" source("../src");
 
 /*
  * Polices auto-hébergées. cargo-leptos pilote le standalone tailwindcss SANS
@@ -456,7 +456,7 @@
 /*
  * Impression. `window.print()` rejouait la page entière (top-bar sticky, TOC,
  * colonne « similaires », toolbars, aplats teintés) — illisible. On réduit la
- * page au document : titre + synthèse + corps, encre noire sur blanc, marges A4,
+ * page au document : titre + corps + source, encre noire sur blanc, marges A4,
  * proche de l'export PDF serveur. Le chrome structurel est masqué via
  * `print:hidden` (Tailwind) sur ses conteneurs ; le reste est traité ici.
  */
@@ -496,39 +496,23 @@
     line-height: 1.35;
   }
 
-  /* Synthèse + Source : cartes aplaties (pas de fond teinté ni d'ombre). */
-  section[aria-label="Synthèse"],
+  /* Source : carte aplatie (pas de fond teinté ni d'ombre), et courte par
+   * construction, donc insécable. */
   section[aria-label="Source"] {
     background: transparent !important;
     border-color: #bbb !important;
     box-shadow: none !important;
-  }
-
-  /*
-   * La synthèse remplit à elle seule près d'une page (résumé, champs, matières,
-   * références) : insécable, elle laisserait la première page vide sous le
-   * titre. Elle se coupe, jamais au milieu d'un champ ni d'une référence ; la
-   * carte « Source », courte par construction, reste insécable.
-   */
-  section[aria-label="Source"] {
-    break-inside: avoid;
-  }
-
-  section[aria-label="Synthèse"] dl > div,
-  section[aria-label="Synthèse"] li {
     break-inside: avoid;
   }
 
   /* Corps : tout en noir, liens non soulignés et lisibles. */
   .prose-decision,
   .prose-decision *,
-  section[aria-label="Synthèse"] *,
   section[aria-label="Source"] * {
     color: #000 !important;
   }
 
   .prose-decision a,
-  section[aria-label="Synthèse"] a,
   section[aria-label="Source"] a {
     text-decoration: none !important;
   }

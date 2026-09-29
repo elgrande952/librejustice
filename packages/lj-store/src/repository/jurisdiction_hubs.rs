@@ -11,7 +11,7 @@ use crate::error::Result;
 
 impl DecisionRepository<'_> {
     /// Catalogue des juridictions avec volume de décisions actives
-    /// (`/juridictions`). Le total somme **toutes** les années du code, ligne
+    /// (`/decision-index/{juris}`). Le total somme **toutes** les années du code, ligne
     /// `year IS NULL` comprise : les décisions sans date comptent ici, et pas
     /// dans l'histogramme.
     #[tracing::instrument(name = "db.jurisdiction_catalogue", skip(self), fields(db.system = "postgresql"))]
@@ -40,7 +40,7 @@ impl DecisionRepository<'_> {
     }
 
     /// Années couvertes par une juridiction, avec compteur, plus récente en
-    /// tête (`/juridiction/{code}`). Vide si le code est inconnu.
+    /// tête (`/decision-index/{juris}/{code}`). Vide si le code est inconnu.
     #[tracing::instrument(name = "db.jurisdiction_years", skip(self), fields(db.system = "postgresql"))]
     pub async fn jurisdiction_years(&self, code: &str) -> Result<Vec<(i32, i64)>> {
         let rows = self
@@ -56,7 +56,7 @@ impl DecisionRepository<'_> {
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    /// Total d'un couple juridiction×année (`/juridiction/{code}/{annee}`).
+    /// Total d'un couple juridiction×année (`/decision-index/{juris}/{code}/{annee}`).
     /// `None` quand le couple est vide.
     #[tracing::instrument(name = "db.jurisdiction_year_total", skip(self), fields(db.system = "postgresql"))]
     pub async fn jurisdiction_year_total(&self, code: &str, year: i32) -> Result<Option<i64>> {
@@ -71,7 +71,7 @@ impl DecisionRepository<'_> {
         Ok(row.map(|r| r.get(0)))
     }
 
-    /// Couples `(code, [(année, nombre de pages)])` pour la section
+    /// Triplets `(type, code, [(année, nombre de pages)])` pour la section
     /// `juridictions` des sitemaps, années récentes en tête. `page_size` est
     /// celui que sert l'API : au-delà du compte, la page rend un listing vide
     /// en 200.
@@ -85,22 +85,22 @@ impl DecisionRepository<'_> {
         let rows = self
             .conn
             .query(
-                "SELECT c.jurisdiction_code, c.year, \
+                "SELECT j.jurisdiction_type, c.jurisdiction_code, c.year, \
                         ceil(c.decision_count::float8 / $1::bigint::float8)::bigint \
                  FROM jurisdiction_year_counts c \
                  JOIN jurisdiction j ON j.code = c.jurisdiction_code \
                  WHERE c.year IS NOT NULL \
-                 ORDER BY 1, 2 DESC",
+                 ORDER BY 2, 3 DESC",
                 &[&page_size],
             )
             .await?;
         let mut out: JurisdictionHubPages = Vec::new();
         for r in rows {
-            let code: String = r.get(0);
-            let year = (r.get(1), r.get(2));
+            let code: String = r.get(1);
+            let year = (r.get(2), r.get(3));
             match out.last_mut() {
-                Some((c, years)) if *c == code => years.push(year),
-                _ => out.push((code, vec![year])),
+                Some((_, c, years)) if *c == code => years.push(year),
+                _ => out.push((r.get(0), code, vec![year])),
             }
         }
         Ok(out)
@@ -145,7 +145,7 @@ impl DecisionRepository<'_> {
     }
 
     /// Page de décisions d'une juridiction×année, date décroissante
-    /// (`/juridiction/{code}/{annee}?page=N`).
+    /// (`/decision-index/{juris}/{code}/{annee}?page=N`).
     #[tracing::instrument(name = "db.jurisdiction_year_decisions", skip(self), fields(db.system = "postgresql"))]
     pub async fn jurisdiction_year_decisions(
         &self,

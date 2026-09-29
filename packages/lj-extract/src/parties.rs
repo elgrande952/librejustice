@@ -4,7 +4,7 @@
 //! `full_text`).
 //!
 //! Les spans se dérivent par matching replié déterministe de la valeur dans le
-//! texte (fold_stable, runs d'espaces équivalents). Une valeur de provenance
+//! texte (`lj_fold`, runs d'espaces équivalents). Une valeur de provenance
 //! métadonnée sans occurrence corps a des spans vides. Le pliage et la clé de
 //! résolution sont calculés ICI, le SQL ne replie jamais.
 //!
@@ -13,7 +13,7 @@
 //! `barreau` (slug officiel CNB). Le rôle explicite se capte au même endroit et
 //! les côtés contradictoires fusionnent en côté indéterminé.
 
-use crate::compiled::fold_stable;
+use lj_fold::fold_chars;
 
 /// Sigles de forme juridique dépouillés en tête de clé (les dénominations
 /// SIRENE ne portent pas la forme — colonne `forme` séparée).
@@ -50,20 +50,11 @@ const SOC_QUALIFS: &[&str] = &[
     "d'exercice",
 ];
 
-/// Pliage canonique (fold_stable + blancs réduits) — identique au chargeur
-/// de registres.
-fn canon(s: &str) -> String {
-    fold_stable(s)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Clé de résolution : pliage canonique, tête dépouillée (article, sigle de
 /// forme, « société » et ses qualificatifs). Vide après dépouille → repli
 /// sur le pliage entier (une valeur qui n'est QU'une forme reste elle-même).
 pub fn resolve_key(value: &str) -> String {
-    let c = canon(value);
+    let c = lj_fold::fold(value);
     let mut s = c.as_str();
     for art in ["la ", "le ", "les ", "l'"] {
         if let Some(r) = s.strip_prefix(art) {
@@ -412,7 +403,7 @@ pub fn nature(quality: &str, value: &str) -> Option<Nature> {
         "law_firm" => return Some(Nature::MoralePrivee),
         _ => {}
     }
-    let c = canon(value);
+    let c = lj_fold::fold(value);
     let mut s = c.as_str();
     for art in ["la ", "le ", "les ", "l'"] {
         if let Some(r) = s.strip_prefix(art) {
@@ -453,12 +444,11 @@ fn word_bounded(s: &str, h: &str) -> bool {
 }
 
 /// Occurrences d'une valeur dans le texte plié : spans `[start, end)` en
-/// codepoints (fold_stable est 1:1 char-stable — les indices sont ceux de
-/// `full_text`). Un espace de la valeur apparie un run d'espaces du texte
+/// chars pliés. Un espace de la valeur apparie un run d'espaces du texte
 /// (les valeurs de métadonnée sont à blancs simples, le texte non).
 /// Non-chevauchant glouton gauche→droite.
 pub fn evidence_spans(folded: &[char], value: &str) -> (Vec<i32>, Vec<i32>) {
-    let needle: Vec<char> = fold_stable(value).chars().collect();
+    let needle: Vec<char> = fold_chars(value).chars().collect();
     let needle: &[char] = needle
         .iter()
         .position(|c| *c != ' ')
@@ -526,7 +516,7 @@ fn counsel_evidence(
     starts: &[i32],
     ends: &[i32],
 ) -> (String, Option<String>, Option<&'static str>) {
-    let c = canon(value);
+    let c = lj_fold::fold(value);
     let key = if c.contains(' ') {
         c
     } else {
@@ -740,7 +730,7 @@ fn barreau_after(folded: &[char], end: usize) -> Option<String> {
 fn barreau_outremer(place: &str) -> Option<&'static str> {
     lj_core::outremer::equivalents(place).iter().find_map(|q| {
         BARREAU_SLUGS.iter().copied().find(|k| {
-            let k = lj_core::text::slug(k);
+            let k = lj_fold::slug(k, '-');
             k == *q || k.strip_prefix(q).is_some_and(|r| r.starts_with('-'))
         })
     })
@@ -826,12 +816,24 @@ impl<'a> Cell<'a> {
 /// Le texte est plié UNE fois ; chaque valeur reçoit ses spans-évidences,
 /// sa nature et sa clé de résolution.
 pub fn actor_rows(full_text: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
-    actor_rows_folded(&fold_stable(full_text), cells)
+    let norm = crate::compiled::Norm::new(full_text);
+    rows_on(&norm.folded, &norm.byte2char, cells)
 }
 
-/// Variante à texte déjà plié (`DocScan::folded`, chemin prod) — évite un
-/// second pliage par décision.
-pub fn actor_rows_folded(folded: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
+/// Same, on the text the scan already folded (prod path): no second fold per
+/// decision.
+pub fn actor_rows_scanned(scan: &crate::scan::DocScan, cells: &[Cell<'_>]) -> Vec<ActorRow> {
+    rows_on(scan.folded(), scan.byte2char(), cells)
+}
+
+/// Les spans se calculent sur les chars pliés et sortent en chars de
+/// `full_text`, un char source pouvant se plier en plusieurs.
+fn rows_on(folded: &str, byte2char: &[usize], cells: &[Cell<'_>]) -> Vec<ActorRow> {
+    let source: Vec<usize> = folded
+        .char_indices()
+        .map(|(b, _)| byte2char[b])
+        .chain(std::iter::once(byte2char[folded.len()]))
+        .collect();
     let folded: Vec<char> = folded.chars().collect();
     let mut rows = Vec::new();
     for cell in cells {
@@ -869,7 +871,7 @@ pub fn actor_rows_folded(folded: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
             out.push(r);
             continue;
         }
-        match counsel_at.entry(canon(&r.value)) {
+        match counsel_at.entry(lj_fold::fold(&r.value)) {
             std::collections::hash_map::Entry::Occupied(e) => {
                 let prev = &mut out[*e.get()];
                 if prev.side != r.side {
@@ -961,6 +963,25 @@ pub fn actor_rows_folded(folded: &str, cells: &[Cell<'_>]) -> Vec<ActorRow> {
                 .map(|(j, _)| *j as i32);
         }
     }
+    for row in &mut out {
+        let mut starts: Vec<i32> = Vec::with_capacity(row.char_starts.len());
+        let mut ends: Vec<i32> = Vec::with_capacity(row.char_ends.len());
+        for (s, e) in row.char_starts.iter().zip(&row.char_ends) {
+            let s = source[*s as usize] as i32;
+            // The char holding the last folded char: a span ending inside an
+            // expansion (the `o` of `œ`) keeps that source char.
+            let e = source[*e as usize - 1] as i32 + 1;
+            match ends.last_mut() {
+                Some(last) if s < *last => *last = (*last).max(e),
+                _ => {
+                    starts.push(s);
+                    ends.push(e);
+                }
+            }
+        }
+        row.char_starts = starts;
+        row.char_ends = ends;
+    }
     out
 }
 
@@ -1019,7 +1040,7 @@ mod tests {
     #[test]
     fn evidence_spans_exact_et_runs_espaces() {
         let text = "La SOCIÉTÉ  Yoplait\nFrance demande. La société Yoplait France gagne.";
-        let folded: Vec<char> = fold_stable(text).chars().collect();
+        let folded: Vec<char> = fold_chars(text).chars().collect();
         let (s, e) = evidence_spans(&folded, "société Yoplait France");
         assert_eq!(s.len(), 2);
         assert_eq!((s[0], e[0]), (3, 26));
@@ -1032,8 +1053,41 @@ mod tests {
     }
 
     #[test]
+    fn les_spans_sortent_en_chars_source_quand_le_pliage_s_allonge() {
+        let text = "Le BŒUF et la société Cœur de Lœw gagnent.";
+        let value = vec!["société Cœur de Lœw".to_string()];
+        let rows = actor_rows(text, &[Cell::new("party", Some("applicant"), &value)]);
+        let (s, e) = (
+            rows[0].char_starts[0] as usize,
+            rows[0].char_ends[0] as usize,
+        );
+        let verbatim: String = text.chars().skip(s).take(e - s).collect();
+        assert_eq!(verbatim, "société Cœur de Lœw");
+    }
+
+    #[test]
+    fn un_span_qui_finit_dans_une_expansion_garde_son_char_source() {
+        let text = "O contre la maîtrise d'œuvre et Œ.";
+        let value = vec!["O".to_string()];
+        let rows = actor_rows(text, &[Cell::new("party", Some("applicant"), &value)]);
+        let r = &rows[0];
+        let spans: Vec<(i32, i32)> = r
+            .char_starts
+            .iter()
+            .copied()
+            .zip(r.char_ends.iter().copied())
+            .collect();
+        assert!(spans.len() > 1, "{spans:?}");
+        let mut prev_end = i32::MIN;
+        for (s, e) in &spans {
+            assert!(s < e && *s >= prev_end, "{spans:?}");
+            prev_end = *e;
+        }
+    }
+
+    #[test]
     fn evidence_spans_absent_metadonnee() {
-        let folded: Vec<char> = fold_stable("aucun rapport ici").chars().collect();
+        let folded: Vec<char> = fold_chars("aucun rapport ici").chars().collect();
         let (s, e) = evidence_spans(&folded, "Me Ludivine Pontmercy");
         assert!(s.is_empty() && e.is_empty());
     }
@@ -1073,7 +1127,7 @@ mod tests {
     }
 
     fn counsel(text: &str, value: &str) -> (String, Option<String>, Option<&'static str>) {
-        let folded: Vec<char> = fold_stable(text).chars().collect();
+        let folded: Vec<char> = fold_chars(text).chars().collect();
         let (s, e) = evidence_spans(&folded, value);
         counsel_evidence(&folded, value, &s, &e)
     }
@@ -1194,7 +1248,7 @@ mod tests {
         );
         let chenildieu: Vec<_> = rows
             .iter()
-            .filter(|r| canon(&r.value) == "chenildieu")
+            .filter(|r| lj_fold::fold(&r.value) == "chenildieu")
             .collect();
         assert_eq!(chenildieu.len(), 1);
         assert_eq!(chenildieu[0].side, None);

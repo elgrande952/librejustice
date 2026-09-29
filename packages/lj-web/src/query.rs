@@ -8,7 +8,7 @@
 //!   un retour de nav peint la version stale instantanement puis revalide en
 //!   arriere-plan.
 //!
-//! Un chargement de `/decisions?q=…` n'execute aucune recherche cote serveur : le
+//! Un chargement de `/decision-search?q=…` n'execute aucune recherche cote serveur : le
 //! SSR peint le squelette (`search_is_loading` vrai, la ressource n'est jamais
 //! lue). Tout span `search` `context=user` vient donc du fetch CLIENT.
 //!

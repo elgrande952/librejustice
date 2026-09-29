@@ -1,4 +1,4 @@
-//! Page `/entite/{ns}/{id}` (fiche entité). Identité registre
+//! Page `/entity/{juris}/{ns}/{id}` (fiche entité). Identité registre
 //! (`entity`/`entity_denomination`) + agrégats contentieux dérivés du
 //! reverse-lookup `decision_party`. En-tête + agrégats bloquants SSR (SEO dans le
 //! document initial), liste de décisions citantes streamée (`PartiallyBlocked`),
@@ -13,9 +13,9 @@ use leptos_meta::{Link, Meta, Title};
 use leptos_router::components::A;
 use leptos_router::hooks::{use_params_map, use_query_map};
 use lj_dtos::{
-    EntityCounselDto, EntityDecisionHitDto, EntityDecisionsResponse, EntityHeaderDto,
-    EntityKeyCountDto, EntityPageResponse, EntityRegistreResponse, EntityStatsDto,
-    EntityYearCountDto, RegistreEntrepriseDto,
+    EntityDecisionHitDto, EntityDecisionsResponse, EntityHeaderDto, EntityKeyCountDto,
+    EntityPageResponse, EntityRegistreResponse, EntityStatsDto, EntityYearCountDto,
+    RegistreEntrepriseDto,
 };
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +81,7 @@ pub async fn fetch_entity_decisions(ns: String, id: String, page: i64) -> Entity
     }
 }
 
-/// Segments `ns`/`id` de la route `/entite/:ns/:id`.
+/// Segments `ns`/`id` de la route `/entity/:juris/:ns/:id`.
 fn entity_params() -> (Signal<String>, Signal<String>) {
     let params = use_params_map();
     let ns = Signal::derive(move || params.read().get("ns").unwrap_or_default());
@@ -227,10 +227,12 @@ fn EntityLoaded(
     registre: Resource<Option<EntityRegistreResponse>>,
     page: Signal<i64>,
 ) -> impl IntoView {
+    #[cfg(feature = "hydrate")]
+    Effect::new(|_| crate::reads::report(lj_dtos::ReadKind::Entity));
     let EntityPageResponse { header, stats } = data;
     let (ns, local) = split_entity_uid(&header.uid);
     let (ns, local) = (ns.to_string(), local.to_string());
-    let base_path = format!("/entite/{ns}/{local}");
+    let base_path = lj_vocab::entity_path(&ns, &local);
 
     let category = namespace_label(&ns);
     let title = header.denomination.clone();
@@ -239,6 +241,7 @@ fn EntityLoaded(
     let description = meta_description(&header, &stats, category);
     let jsonld = build_json_ld(&header, &url, category);
 
+    let is_lawyer = matches!(ns.as_str(), "cnb" | "oacc") && header.nature == "physique";
     let denominations = denominations_section(&header);
     let contentieux = contentieux_section(&stats, matches!(ns.as_str(), "cnb" | "oacc"));
 
@@ -252,6 +255,7 @@ fn EntityLoaded(
         <Meta property="og:url" content=url.clone() />
         <Meta property="og:locale" content="fr_FR" />
         <Meta property="og:image" content=crate::seo::OG_IMAGE />
+        {is_lawyer.then(|| view! { <Meta name="robots" content="noindex" /> })}
         <Link rel="canonical" href=url />
         <leptos_meta::Script type_="application/ld+json">{jsonld}</leptos_meta::Script>
 
@@ -487,7 +491,6 @@ fn contentieux_section(stats: &EntityStatsDto, is_avocat: bool) -> AnyView {
 
     let by_jurisdiction = jurisdiction_block(&stats.by_jurisdiction);
     let by_year = year_block(&stats.by_year);
-    let counsel = counsel_block(&stats.top_counsel);
 
     view! {
         <section aria-label="Contentieux" class="mt-10">
@@ -497,7 +500,6 @@ fn contentieux_section(stats: &EntityStatsDto, is_avocat: bool) -> AnyView {
                 {by_jurisdiction}
                 {by_year}
             </div>
-            {counsel}
         </section>
     }
     .into_any()
@@ -631,56 +633,6 @@ fn bar_row(label: &str, full: &str, count: i64, max: i64) -> AnyView {
         </li>
     }
     .into_any()
-}
-
-/// Conseils observés aux côtés de l'entité (décroissant). Chaque conseil résolu
-/// au registre lie vers sa propre fiche.
-fn counsel_block(items: &[EntityCounselDto]) -> Option<AnyView> {
-    if items.is_empty() {
-        return None;
-    }
-    let rows = items.iter().cloned().map(counsel_row).collect_view();
-    Some(
-        view! {
-            <div class="mt-6 flex flex-col gap-2">
-                <h3 class="text-xs uppercase tracking-[0.16em] text-[var(--color-ink-subtle)]">
-                    "Conseils observés"
-                </h3>
-                <ul class="flex flex-col gap-1.5">{rows}</ul>
-            </div>
-        }
-        .into_any(),
-    )
-}
-
-fn counsel_row(item: EntityCounselDto) -> AnyView {
-    let count = view! {
-        <span class="shrink-0 text-xs tabular-nums text-[var(--color-ink-subtle)]">
-            {format!("{} déc.", group_thousands(item.count))}
-        </span>
-    };
-    let name = match &item.uid {
-        Some(uid) => {
-            let (ns, local) = split_entity_uid(uid);
-            let href = format!("/entite/{ns}/{local}");
-            view! {
-                <A
-                    href=href
-                    attr:class="min-w-0 truncate text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
-                >
-                    {item.name.clone()}
-                </A>
-            }
-            .into_any()
-        }
-        None => view! {
-            <span class="min-w-0 truncate text-sm text-[var(--color-ink-muted)]">
-                {item.name.clone()}
-            </span>
-        }
-        .into_any(),
-    };
-    view! { <li class="flex items-baseline justify-between gap-3">{name} {count}</li> }.into_any()
 }
 
 // ── Registre et annonces ────────────────────────────────────────────────────
@@ -826,11 +778,10 @@ fn format_euros(value: i64) -> String {
     format!("{} €", group_thousands(value))
 }
 
-/// Les annonces de l'entité, un bloc par groupe. Le groupe est un rôle d'arête
-/// pour nos lignes (« Marchés publics en cours »), un fond pour le live DILA
-/// (« Vie des entreprises », « Journal officiel des associations »). Une ligne à
-/// nous mène à sa fiche `/marche/{uid}` ; une ligne live pointe vers la source
-/// officielle, jamais proxifiée.
+/// The entity's notices, one block per group. The group is an edge role for our
+/// rows ("Marchés publics en cours"), a fond for the live DILA ("Vie des
+/// entreprises", "Journal officiel des associations"). One of our rows leads to its
+/// page `/notice/fr/{uid}`; a live row points to the official source, never proxied.
 fn annonces_section(groups: Vec<lj_dtos::EntityAnnonceGroupDto>) -> Option<AnyView> {
     if groups.is_empty() {
         return None;
@@ -885,10 +836,10 @@ fn annonce_row(a: lj_dtos::AnnonceHit) -> AnyView {
     };
     // Nos lignes ont une fiche chez nous ; les lignes live n'ont que leur source,
     // et un fond sans `url_action` (un JOAFE sans PDF) ne pose pas de lien.
-    let cible = if a.fond == lj_dtos::ANNONCE_FOND_MARCHE {
+    let cible = if a.fond == lj_vocab::ANNONCE_FOND_MARCHE {
         EitherOf3::A(view! {
             <A
-                href=format!("/marche/{}", a.uid)
+                href=lj_vocab::notice_path(&a.uid)
                 attr:class="min-w-0 flex-1 truncate text-sm text-[var(--color-ink)] hover:text-[var(--color-accent)]"
             >
                 {libelle}
@@ -996,13 +947,18 @@ fn decisions_view(resolved: EntityDecisionsResult, base_path: &str, page: i64) -
     // Même carte que les résultats de recherche (`ResultCard`, unité de rendu) :
     // hits `SearchHit` complets, badge de rôle de l'entité par carte, graine de
     // navigation prev/next bornée aux décisions de la page courante.
-    let hit_ids: std::sync::Arc<Vec<String>> =
-        std::sync::Arc::new(response.items.iter().map(|i| i.hit.id.clone()).collect());
+    let hit_paths: std::sync::Arc<Vec<String>> = std::sync::Arc::new(
+        response
+            .items
+            .iter()
+            .map(|i| lj_dtos::decision_path(i.hit.jurisdiction_type, &i.hit.id))
+            .collect(),
+    );
     let cards = response
         .items
         .into_iter()
         .enumerate()
-        .map(|(index, item)| decision_result_card(item, index, page, hit_ids.clone()))
+        .map(|(index, item)| decision_result_card(item, index, page, hit_paths.clone()))
         .collect_view();
     let pagination = pagination_view(base_path, page, total_pages);
     view! {
@@ -1018,7 +974,7 @@ fn decision_result_card(
     item: EntityDecisionHitDto,
     index: usize,
     page: i64,
-    hit_ids: std::sync::Arc<Vec<String>>,
+    hit_paths: std::sync::Arc<Vec<String>>,
 ) -> AnyView {
     let role = role_label(item.side.as_deref(), &item.quality).map(str::to_string);
     view! {
@@ -1028,7 +984,7 @@ fn decision_result_card(
                 index=index
                 page=page as u32
                 page_size=PAGE_SIZE as u32
-                hit_ids=hit_ids
+                hit_paths=hit_paths
                 default_view=Signal::derive(|| CardView::Snippet)
                 animate=false
                 role_badge=role

@@ -8,7 +8,7 @@ use leptos_meta::{Meta, Title};
 const SUJETS: &[(&str, &str)] = &[
     ("technique", "Problème technique sur le site"),
     ("manque", "Donnée manquante ou incomplète"),
-    ("compte", "Compte, connexion, connecteur MCP"),
+    ("compte", "Compte, connexion, connecteur"),
     ("autre", "Autre"),
 ];
 

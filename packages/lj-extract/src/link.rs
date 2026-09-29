@@ -28,7 +28,7 @@ use crate::data::LINK_ALIASES_TSV;
 use crate::extract::common::FOREIGN_NATIONALITY_STEMS;
 use crate::extract::key_signals::{key_signals, Citability, KeyNature, KeySignals};
 use crate::gazetteer::gazetteer;
-use lj_core::text::fold;
+use lj_fold::fold;
 
 /// Ligne texte du catalogue, hydratée par l'appelant (une par `legal_text`).
 #[derive(Debug, Clone)]
@@ -214,10 +214,7 @@ pub struct LinkSnapshot {
 impl LinkSnapshot {
     /// Bâtit le snapshot depuis les lignes catalogue. `articles` = paires
     /// `(text_uid, num_key)` distinctes. Pur et déterministe.
-    pub fn build(
-        texts: Vec<CatalogText>,
-        articles: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
+    pub fn build(texts: Vec<CatalogText>, articles: Vec<(String, String)>) -> Self {
         let mut article_sets: HashMap<String, HashSet<String>> = HashMap::new();
         for (uid, num_key) in articles {
             article_sets.entry(uid).or_default().insert(num_key);
@@ -228,8 +225,8 @@ impl LinkSnapshot {
         // apostrophes typographiques.
         let mut best: HashMap<String, (usize, i64, bool)> = HashMap::new();
         for (i, t) in texts.iter().enumerate() {
-            let key = fold_link(&t.title_key);
-            if !title_names_text(&key) || is_rectificatif(&fold_link(&t.title)) {
+            let key = fold(&t.title_key);
+            if !title_names_text(&key) || is_rectificatif(&fold(&t.title)) {
                 continue;
             }
             match best.get_mut(&key) {
@@ -252,7 +249,7 @@ impl LinkSnapshot {
         let mut title_brothers: HashMap<String, Vec<String>> = HashMap::new();
         for t in &texts {
             title_brothers
-                .entry(fold_link(&t.title_key))
+                .entry(fold(&t.title_key))
                 .or_default()
                 .push(t.text_uid.clone());
         }
@@ -316,8 +313,8 @@ impl LinkSnapshot {
         let mut prefix_agnostic: HashMap<String, HashMap<String, String>> = HashMap::new();
 
         for t in &texts {
-            let folded_title = fold_link(&t.title);
-            let folded_tk = fold_link(&t.title_key);
+            let folded_title = fold(&t.title);
+            let folded_tk = fold(&t.title_key);
 
             if is_rectificatif(&folded_title) {
                 continue;
@@ -496,7 +493,7 @@ impl LinkSnapshot {
         // catalogue — alias direct, même autorité que le TSV.
         for t in &texts {
             if t.nature == "BOFIP" {
-                alias_text.insert(fold_link(&t.text_uid), t.text_uid.clone());
+                alias_text.insert(fold(&t.text_uid), t.text_uid.clone());
             }
         }
         let mut alias_article = HashMap::new();
@@ -514,12 +511,12 @@ impl LinkSnapshot {
             }
             // Clés pliées (`fold`) des deux côtés du lookup.
             if ak.is_empty() {
-                alias_text.insert(fold_link(tk), uid.to_string());
+                alias_text.insert(fold(tk), uid.to_string());
             } else {
                 // La 4e colonne est curée en forme citée ; la clé stockée est la clé
                 // publique.
-                let forced = (!num.is_empty()).then(|| lj_core::article_key::article_key(num));
-                alias_article.insert((fold_link(tk), ak.to_string()), (uid.to_string(), forced));
+                let forced = (!num.is_empty()).then(|| lj_norm::article_key::article_key(num));
+                alias_article.insert((fold(tk), ak.to_string()), (uid.to_string(), forced));
             }
         }
 
@@ -628,7 +625,7 @@ impl LinkSnapshot {
     /// d'alphabet que [`Self::num_key_for`] : clé citée → clé publique avant
     /// consultation du catalogue.
     pub fn has_article(&self, uid: &str, num_key: &str) -> bool {
-        let ak = &lj_core::article_key::article_key(num_key);
+        let ak = &lj_norm::article_key::article_key(num_key);
         self.articles.get(uid).is_some_and(|s| s.contains(ak))
             || !self.prefixed_variants(uid, ak).is_empty()
     }
@@ -711,9 +708,9 @@ impl LinkSnapshot {
     /// passe le gate d'acte individuel. La forme canonique compte aussi
     /// (qualificatif de circulaire raboté) : c'est le même acte.
     pub(crate) fn has_text_alias(&self, text_key: &str) -> bool {
-        self.alias_text.contains_key(&fold_link(text_key))
+        self.alias_text.contains_key(&fold(text_key))
             || strip_circulaire_qualifier(text_key)
-                .is_some_and(|k| self.alias_text.contains_key(&fold_link(&k)))
+                .is_some_and(|k| self.alias_text.contains_key(&fold(&k)))
     }
 
     /// `ref_num_key` par existence au catalogue, sinon via la table
@@ -721,7 +718,7 @@ impl LinkSnapshot {
     /// clé citée arrive en forme `normalize_article` (« L. 761-1 »), le
     /// catalogue est en clé publique slug — conversion ici.
     pub fn num_key_for(&self, uid: &str, article_key: Option<&str>) -> Option<String> {
-        let ak = &lj_core::article_key::article_key(article_key?);
+        let ak = &lj_norm::article_key::article_key(article_key?);
         if ak.is_empty() {
             return None;
         }
@@ -753,7 +750,7 @@ impl KeyAnalysis {
     pub fn new(text_key: &str) -> Self {
         Self {
             lower: text_key.to_lowercase(),
-            folded: fold_link(text_key),
+            folded: fold(text_key),
             sig: key_signals(text_key),
         }
     }
@@ -890,14 +887,11 @@ pub fn link_citation_analyzed(
 pub(crate) fn strip_circulaire_qualifier(text_key: &str) -> Option<String> {
     let mut words = text_key.split_whitespace();
     let head = words.next()?;
-    if fold_link(head) != "circulaire" {
+    if fold(head) != "circulaire" {
         return None;
     }
     let qual = words.next()?;
-    if !matches!(
-        fold_link(qual).as_str(),
-        "ministerielle" | "interministerielle"
-    ) {
+    if !matches!(fold(qual).as_str(), "ministerielle" | "interministerielle") {
         return None;
     }
     let rest: Vec<&str> = words.collect();
@@ -935,7 +929,7 @@ fn linked_text_uid(
     // 3. Acte daté par numéro — prime sur le titre (les frères d'une même date
     // collapsent sur le même title_key, le numéro tranche).
     let dated_shape = RE_DATED_ACT_SHAPE.is_match(folded);
-    let raw = dated_shape.then(|| fold_link(instrument));
+    let raw = dated_shape.then(|| fold(instrument));
     let head_num = raw.as_deref().and_then(head_act_num);
     // Composantes d'identité opposables — seulement sous le for d'un texte
     // étranger. Le numéro cité est lu en graphie LIBRE : les numérotations non
@@ -1284,7 +1278,7 @@ fn gentile_stem(gentile: &str) -> String {
 /// désignations du pays du texte LUI-MÊME tombent.
 fn home_families(folded_tk: &str, iso: &str) -> Vec<String> {
     let mut out = vec![strip_gentile_words(folded_tk)];
-    if let Some((codes, stripped)) = lj_core::jurisdictions::strip_query_jurisdictions(folded_tk) {
+    if let Some((codes, stripped)) = lj_norm::jurisdictions::strip_query_jurisdictions(folded_tk) {
         if codes.contains(&iso) {
             out.push(drop_dangling_prepositions(&stripped));
         }
@@ -1366,22 +1360,6 @@ fn title_names_text(folded_tk: &str) -> bool {
     matches!(head, "code" | "livre" | "constitution")
         || words.nth(1).is_some()
         || folded_tk.bytes().any(|b| b.is_ascii_digit())
-}
-
-fn fold_link(s: &str) -> String {
-    let folded = fold(s);
-    if folded.chars().any(is_format_char) {
-        folded.chars().filter(|c| !is_format_char(*c)).collect()
-    } else {
-        folded
-    }
-}
-
-fn is_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}' | '\u{FEFF}'
-    )
 }
 
 /// Cœur numérique d'un `num_key` : préfixe d'instrument retiré jusqu'au

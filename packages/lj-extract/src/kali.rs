@@ -17,7 +17,7 @@ use crate::legi::{
     clean_contenu, collect_liens, collect_titre_tm, date_or_none, find_anywhere, LegiLien,
 };
 use lj_core::error::CoreError;
-use lj_core::parsing::{build_tree, node_text};
+use lj_parse::{build_tree, node_text};
 
 /// Une version d'article du fond KALI (`KALIARTI*.xml`, racine `<ARTICLE>`).
 /// `kalicont` = conteneur (la convention) sur lequel on ancre le `text_uid` —
@@ -91,7 +91,7 @@ pub fn parse_kali_article(raw: &[u8]) -> Result<KaliArticle, CoreError> {
     // NUM souvent vide en KALI (articles organisés par titre de section) :
     // num/num_key vides, rendus quand même (cf. doc).
     let num = node_text(find_anywhere(&root, "META_ARTICLE/NUM")).unwrap_or_default();
-    let num_key = lj_core::article_key::identity_key(&num);
+    let num_key = lj_norm::article_key::identity_key(&num);
 
     // Présence obligatoire, valeur gardée brute : sur `DATE_DEBUT` la sentinelle
     // marque l'absence de fenêtre de validité, pas un début inconnu (cf.
@@ -176,8 +176,8 @@ pub fn parse_kali_conteneur(raw: &[u8]) -> Result<KaliConteneur, CoreError> {
 
 /// `LIEN_TXT@idtxt` du sommaire (`STRUCTURE_TXT`, imbriqués sous des `TM`),
 /// dans l'ordre du fichier. Vide si le conteneur n'a pas de sommaire.
-fn collect_lien_txt(root: &lj_core::parsing::XmlNode) -> Vec<String> {
-    fn walk(node: &lj_core::parsing::XmlNode, out: &mut Vec<String>) {
+fn collect_lien_txt(root: &lj_parse::XmlNode) -> Vec<String> {
+    fn walk(node: &lj_parse::XmlNode, out: &mut Vec<String>) {
         for child in &node.children {
             if child.tag == "LIEN_TXT" {
                 if let Some(id) = child.attr("idtxt").filter(|v| !v.is_empty()) {

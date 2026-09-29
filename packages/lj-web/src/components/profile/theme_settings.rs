@@ -38,7 +38,6 @@ impl Theme {
 
 #[cfg(feature = "hydrate")]
 mod bridge {
-    use wasm_bindgen::prelude::*;
 
     const STORAGE_KEY: &str = "lj-theme";
     const AUTH_FLAG: &str = "lj-auth";
@@ -108,32 +107,6 @@ mod bridge {
             basculer_dark(false);
         }
     }
-
-    /// Abonne au changement de `prefers-color-scheme`. `Drop` desabonne.
-    pub fn subscribe_prefers_dark(cb: impl FnMut() + 'static) -> PrefersDarkSubscription {
-        let closure = Closure::<dyn FnMut()>::new(cb);
-        let media = web_sys::window().and_then(|w| w.match_media(PREFERS_DARK).ok().flatten());
-        if let Some(mq) = &media {
-            let _ = mq.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref());
-        }
-        PrefersDarkSubscription { closure, media }
-    }
-
-    pub struct PrefersDarkSubscription {
-        closure: Closure<dyn FnMut()>,
-        media: Option<web_sys::MediaQueryList>,
-    }
-
-    impl Drop for PrefersDarkSubscription {
-        fn drop(&mut self) {
-            if let Some(mq) = &self.media {
-                let _ = mq.remove_event_listener_with_callback(
-                    "change",
-                    self.closure.as_ref().unchecked_ref(),
-                );
-            }
-        }
-    }
 }
 
 /// Bridge thème ↔ auth (appelé depuis `App` à l'hydratation) : pose/retire le
@@ -156,28 +129,12 @@ pub fn ThemeSettings() -> impl IntoView {
 
     #[cfg(feature = "hydrate")]
     {
-        // Persistance + application a chaque changement.
+        let prefers_dark = leptos_use::use_preferred_dark();
         Effect::new(move |_| {
             let t = theme.get();
+            prefers_dark.track();
             bridge::persist_theme(t.as_str());
             bridge::apply_theme(t.as_str());
-        });
-        // En mode Systeme : suivre `prefers-color-scheme`. L'abonnement vit dans un
-        // `StoredValue` local (non-`Send`, normal cote wasm) : chaque passage remplace
-        // l'abonnement precedent — le `Drop` de l'ancien desabonne.
-        let sub_slot: StoredValue<
-            Option<bridge::PrefersDarkSubscription>,
-            leptos::reactive::owner::LocalStorage,
-        > = StoredValue::new_local(None);
-        Effect::new(move |_| {
-            if theme.get() != Theme::System {
-                sub_slot.set_value(None);
-                return;
-            }
-            let subscription = bridge::subscribe_prefers_dark(move || {
-                bridge::apply_theme("system");
-            });
-            sub_slot.set_value(Some(subscription));
         });
     }
 

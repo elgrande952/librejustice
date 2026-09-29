@@ -22,9 +22,8 @@ pub async fn run(chunks: usize, min_citations: i64, workers: usize) -> Result<()
         let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
         let repo = lj_store::repository::DecisionRepository::new(&conn);
         let identities = repo.usage_terms_pool(min_citations).await?;
-        let reset = repo.usage_terms_reset().await?;
         println!(
-            "pool : {} identités (≥{min_citations} citations), {chunks} chunks, {workers} workers ; reset : {reset} sacs",
+            "pool: {} identities (>={min_citations} citations), {chunks} chunks, {workers} workers",
             identities.len()
         );
         Arc::new(identities)
@@ -53,14 +52,21 @@ pub async fn run(chunks: usize, min_citations: i64, workers: usize) -> Result<()
                 let repo = lj_store::repository::DecisionRepository::new(&conn);
                 let n = repo.usage_terms_fill_batch(&uids, &nums).await?;
                 total.fetch_add(n, Ordering::Relaxed);
-                println!("chunk {chunk}/{chunks} : {n} sacs");
+                println!("chunk {chunk}/{chunks}: {n} bags");
             }
         });
     }
     while let Some(joined) = set.join_next().await {
         joined.map_err(|e| anyhow!("worker: {e}"))??;
     }
-    println!("sacs matérialisés : {}", total.load(Ordering::Relaxed));
+    println!("bags materialised: {}", total.load(Ordering::Relaxed));
+
+    let (uids, nums): (Vec<String>, Vec<String>) = identities.iter().cloned().unzip();
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    let pruned = lj_store::repository::DecisionRepository::new(&conn)
+        .usage_terms_prune(&uids, &nums)
+        .await?;
+    println!("bags pruned: {pruned}");
 
     Ok(())
 }

@@ -228,7 +228,7 @@ fn strip_act_reference(texte: &str) -> Option<&str> {
 /// consolidation a posée devant elle. La reconnaissance ne peut qu'AJOUTER
 /// `ABROGE` : un corps déjà reconnu en tête n'est jamais rouvert, et un reliquat
 /// vide n'en fait pas un.
-fn article_status(texte: &str) -> &'static str {
+pub(crate) fn article_status(texte: &str) -> &'static str {
     const MAX_PREFIXES: usize = 4;
     let mut t = texte.trim();
     if t.is_empty() {
@@ -289,14 +289,14 @@ pub async fn load_legal_corpus(only: Option<&str>) -> Result<()> {
         });
     }
     if files.is_empty() {
-        tracing::warn!(dir = %dir.display(), "aucun dataset legal-corpus (.local vide)");
+        tracing::warn!(dir = %dir.display(), "no legal-corpus dataset (.local empty)");
         return Ok(());
     }
 
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -371,7 +371,7 @@ pub(crate) async fn load_dataset_file(
         for (pos, art) in doc.articles.iter().enumerate() {
             // Clé d'identité sans perte, injective par texte : la dé-collision base
             // « 164 » / sous-articles « 164/1 » est intrinsèque.
-            let num_key = lj_core::article_key::identity_key(&art.num);
+            let num_key = lj_norm::article_key::identity_key(&art.num);
             match (&art.texte, &art.versions) {
                 (Some(_), Some(_)) | (None, None) => bail!(
                     "dataset {} article {} : `texte` (mono) et `versions` (multi) exclusifs, un requis",
@@ -434,7 +434,7 @@ pub(crate) async fn load_dataset_file(
                                 .clone()
                                 .or_else(|| doc.source_upstream_url.clone()),
                         };
-                        repo.upsert_legal_article(&row)
+                        repo.upsert_legal_article(&row, lj_store::repository::Fraicheur::Autoritaire)
                             .await
                             .map_err(|e| anyhow!("upsert {}: {e}", row.source_uid))?;
                         n += 1;
@@ -485,7 +485,7 @@ pub(crate) async fn load_dataset_file(
                         source_asof,
                         source_upstream_url: doc.source_upstream_url.clone(),
                     };
-                    repo.upsert_legal_article(&row)
+                    repo.upsert_legal_article(&row, lj_store::repository::Fraicheur::Autoritaire)
                         .await
                         .map_err(|e| anyhow!("upsert {}: {e}", row.source_uid))?;
                     n += 1;
@@ -580,7 +580,7 @@ pub(crate) async fn run_corpus_finishers(
         .classify_text_roles_scoped(&uids)
         .await
         .map_err(|e| anyhow!("classify_text_roles_scoped: {e}"))?;
-    repo.refresh_article_denorm()
+    repo.refresh_article_denorm(None)
         .await
         .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
     // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
@@ -601,7 +601,7 @@ pub async fn reading_ranks() -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -610,7 +610,7 @@ pub async fn reading_ranks() -> Result<()> {
         .await
         .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
     tracing::info!(texts, rows, "reading ranks");
-    println!("reading-ranks : {texts} textes recalculés, {rows} lignes écrites.");
+    println!("reading-ranks: {texts} texts recomputed, {rows} rows written.");
     Ok(())
 }
 
@@ -623,7 +623,7 @@ pub async fn stamp_freshness() -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -635,7 +635,7 @@ pub async fn stamp_freshness() -> Result<()> {
             .await
             .map_err(|e| anyhow!("upsert_ingest_freshness {source}: {e}"))?;
     }
-    tracing::info!(asof = %today, "ingest_freshness rafraîchie (legifrance/kali)");
+    tracing::info!(asof = %today, "ingest_freshness refreshed (legifrance/kali)");
     Ok(())
 }
 
@@ -643,7 +643,7 @@ pub async fn stamp_freshness() -> Result<()> {
 /// `eu-law`, `official-fr`, `traduction-automatique`) en libellés de **diffuseur**
 /// réels :
 /// 1. lignes portant une URL → libellé dérivé de `source_url`
-///    ([`lj_core::source_authority::diffuseur_label_from_url`], source de vérité
+///    ([`lj_norm::source_authority::diffuseur_label_from_url`], source de vérité
 ///    partagée) ;
 /// 2. traités du **bulk JORF** (sans URL, `source_uid=JORFARTI…`) → `jorf` ;
 /// 3. reliquat sans URL hors bulk (chaînes curées de traités, vieux codes
@@ -667,7 +667,7 @@ pub async fn relabel_sources() -> Result<()> {
         .map_err(|e| anyhow!("distinct_category_source_urls: {e}"))?;
     let mut relabelled = 0u64;
     for (old, url) in &pairs {
-        let new = lj_core::source_authority::diffuseur_label_from_url(url)
+        let new = lj_norm::source_authority::diffuseur_label_from_url(url)
             .ok_or_else(|| anyhow!("source_url sans hôte exploitable: {url:?}"))?;
         let n = repo
             .relabel_source_by_url(old, url, &new)
@@ -687,7 +687,7 @@ pub async fn relabel_sources() -> Result<()> {
     // Reclasse en bloc les `source` catégorie/méthode hérités en libellés de
     // **diffuseur** réels :
     // 1. lignes portant une URL → libellé dérivé de `source_url`
-    //    ([`lj_core::source_authority::diffuseur_label_from_url`]) ;
+    //    ([`lj_norm::source_authority::diffuseur_label_from_url`]) ;
     // 2. traités du bulk JORF (sans URL, `source_uid=JORFARTI…`) → `jorf` ;
     // 3. reliquat sans URL hors bulk : laissé au reload de curation, compté et logué,
     //    jamais réécrit en aveugle.
@@ -701,21 +701,21 @@ pub async fn relabel_sources() -> Result<()> {
         tracing::warn!(
             source = %src,
             rows = n,
-            "source catégorie restante (URL vide) — corriger par reload de curation"
+            "source category left over (empty URL), fix it with a curation reload"
         );
     }
     tracing::info!(
         relabelled,
         jorf_bulk,
         leftovers = leftovers.iter().map(|(_, n)| n).sum::<i64>(),
-        "relabel-sources terminé"
+        "relabel-sources done"
     );
     Ok(())
 }
 
 /// Canonicalise les **variantes d'hôte** d'un même diffuseur vers son libellé
 /// unique — la dérivation canonique vit dans
-/// [`lj_core::source_authority::diffuseur_label_from_url`], cette commande rabat
+/// [`lj_norm::source_authority::diffuseur_label_from_url`], cette commande rabat
 /// les lignes DÉJÀ stockées. Idempotent. À étendre si d'autres variantes d'hôte
 /// apparaissent.
 pub async fn canonicalize_source_labels() -> Result<()> {
@@ -734,10 +734,10 @@ pub async fn canonicalize_source_labels() -> Result<()> {
             .canonicalize_source_label(from, to)
             .await
             .map_err(|e| anyhow!("canonicalize_source_label {from}→{to}: {e}"))?;
-        tracing::info!(from = %from, to = %to, rows = n, "canonicalise libellé diffuseur");
+        tracing::info!(from = %from, to = %to, rows = n, "canonicalising the publisher label");
         total += n;
     }
-    println!("canonicalize-source-labels : {total} lignes rabattues sur leur libellé canonique.");
+    println!("canonicalize-source-labels: {total} rows folded onto their canonical label.");
     Ok(())
 }
 

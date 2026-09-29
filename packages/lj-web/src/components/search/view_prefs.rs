@@ -30,12 +30,12 @@ fn pref() -> RwSignal<Option<(String, CardView)>> {
         .unwrap_or_else(|| RwSignal::new(None))
 }
 
-/// Vue automatique d'un mode résolu : le sémantique s'ouvre sur le résumé, le
-/// lexical sur l'extrait surligné, qui est le passage ayant répondu aux
-/// opérateurs saisis.
+/// Lexical opens on the snippet, the passage that answered the operators.
+/// Reference has no matched passage (`synthetic_title_only`), so its snippet is
+/// the head of the text and only the summary tells its carriers apart.
 fn auto_view(mode: Option<QueryMode>) -> CardView {
     match mode {
-        Some(QueryMode::Hybrid) => CardView::Summary,
+        Some(QueryMode::Hybrid) | Some(QueryMode::Reference) => CardView::Summary,
         _ => CardView::Snippet,
     }
 }
@@ -61,9 +61,16 @@ pub fn effective_card_view(
 #[component]
 pub fn ViewControls(
     #[prop(into)] query: Signal<String>,
-    #[prop(into)] mode: Signal<Option<QueryMode>>,
+    /// Last resolved mode: it holds the page's shape, so it survives a refetch.
+    #[prop(into)]
+    mode: Signal<Option<QueryMode>>,
+    /// The same, `None` while a response is in flight: it asserts, so it greys
+    /// on nothing rather than on the previous query's mode.
+    #[prop(into)]
+    served: Signal<Option<QueryMode>>,
     #[prop(into)] rerank: Signal<bool>,
     #[prop(into)] on_rerank: Callback<bool>,
+    #[prop(into)] reranked: Signal<Option<bool>>,
     #[prop(optional)] spread: bool,
     #[prop(optional)] children: Option<Children>,
 ) -> impl IntoView {
@@ -75,7 +82,7 @@ pub fn ViewControls(
     view! {
         <div class=class>
             <CardViewToggle query=query mode=mode />
-            <RerankToggle active=rerank on_toggle=on_rerank mode=mode />
+            <RerankToggle active=rerank on_toggle=on_rerank mode=served reranked=reranked />
             {children.map(|c| c())}
         </div>
     }
@@ -144,23 +151,34 @@ fn SegmentButton(
     }
 }
 
-/// Bascule du tri IA. Inerte et grisée en lexical, où il n'a rien à réordonner :
-/// la commande dit qu'elle ne s'applique pas, au lieu de laisser croire qu'elle
-/// agit.
+/// Greying is visual only: the toggle stays live and its position keeps showing
+/// the setting, which the next semantic search honours. Disabling it would hide
+/// a state the caller owns and cannot otherwise reach. It is the only thing on
+/// the page saying whether the LLM sorted, so it greys on the server's answer
+/// too, not on the three conditions the front can predict.
 #[component]
 fn RerankToggle(
     #[prop(into)] active: Signal<bool>,
     #[prop(into)] on_toggle: Callback<bool>,
     #[prop(into)] mode: Signal<Option<QueryMode>>,
+    #[prop(into)] reranked: Signal<Option<bool>>,
 ) -> impl IntoView {
-    let disabled = Signal::derive(move || mode.get() == Some(QueryMode::Lexical));
-    let on = Signal::derive(move || active.get() && !disabled.get());
+    let query_map = leptos_router::hooks::use_query_map();
+    let par_date = Signal::derive(move || {
+        matches!(
+            query_map.get().get("sort").as_deref(),
+            Some("date_desc") | Some("date_asc")
+        )
+    });
+    let hors_mode = Signal::derive(move || matches!(mode.get(), Some(m) if m != QueryMode::Hybrid));
+    let renonce = Signal::derive(move || active.get() && reranked.get() == Some(false));
+    let sans_effet = Signal::derive(move || hors_mode.get() || par_date.get() || renonce.get());
 
     let class = move || {
         crate::helpers::cn([
-            "flex items-center gap-2 rounded border px-2 py-1 text-xs transition-colors",
-            if disabled.get() {
-                "cursor-not-allowed border-[var(--color-rule)] text-[var(--color-ink-subtle)] opacity-50"
+            "flex items-center gap-2 rounded border px-2 py-1 text-xs transition-all",
+            if sans_effet.get() {
+                "border-[var(--color-rule)] text-[var(--color-ink-subtle)] opacity-50 hover:opacity-100"
             } else {
                 "border-[var(--color-rule)] text-[var(--color-ink)] hover:border-[var(--color-ink)]"
             },
@@ -169,7 +187,7 @@ fn RerankToggle(
     let track = move || {
         crate::helpers::cn([
             "relative h-3.5 w-6 rounded-full transition-colors",
-            if on.get() {
+            if active.get() {
                 "bg-[var(--color-accent)]"
             } else {
                 "bg-[var(--color-rule)]"
@@ -179,13 +197,17 @@ fn RerankToggle(
     let knob = move || {
         crate::helpers::cn([
             "absolute top-0.5 h-2.5 w-2.5 rounded-full bg-[var(--color-parchment)] transition-all",
-            if on.get() { "left-3" } else { "left-0.5" },
+            if active.get() { "left-3" } else { "left-0.5" },
         ])
     };
     let title = move || {
-        if disabled.get() {
-            "Le tri IA ne s'applique pas à une recherche à opérateurs : les résultats y sont classés par score de correspondance aux termes saisis."
-        } else if on.get() {
+        if par_date.get() {
+            "Le tri IA ne s'applique pas à un classement par date, qui impose déjà son ordre."
+        } else if hors_mode.get() {
+            "Le tri IA ne s'applique qu'à une recherche sémantique : une recherche à opérateurs classe par correspondance aux termes saisis, une recherche par référence par l'identité de la décision."
+        } else if renonce.get() {
+            "Le tri IA n'a pas trié cette liste : trop peu de résultats, ou le service était saturé. Le classement affiché est celui du score de recherche."
+        } else if active.get() {
             "Une IA a trié les 50 premiers résultats selon votre question. Cliquer pour revenir au classement par score de recherche."
         } else {
             "Faire trier les 50 premiers résultats par une IA, selon votre question."
@@ -196,8 +218,7 @@ fn RerankToggle(
         <button
             type="button"
             role="switch"
-            aria-checked=move || on.get().to_string()
-            prop:disabled=move || disabled.get()
+            aria-checked=move || active.get().to_string()
             on:click=move |_| on_toggle.run(!active.get_untracked())
             title=title
             class=class

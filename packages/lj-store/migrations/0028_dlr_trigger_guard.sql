@@ -1,19 +1,3 @@
--- Migration 0028 — Guard ``IS DISTINCT FROM`` dans le trigger
--- ``dlr_sync_chunks_legal_instruments``.
---
--- Le trigger 0027 recalcule et UPDATE ``decision_chunks.legal_instruments``
--- inconditionnellement à chaque DML sur ``decision_legal_references``. PG
--- crée alors une nouvelle tuple version même quand l'array recalculé est
--- identique → BM25 + vec ré-indexent ces chunks pour rien → bloat.
---
--- Ce cas est dominant lors d'un cleanup au niveau articles (regrouper deux
--- variants typographiques d'un même article-FK sans toucher au code) :
--- l'array ``legal_instruments`` (= les CODES cités, pas les articles)
--- reste strictement identique. Avec le guard, zéro chunk touché.
---
--- Coût : un SELECT-into supplémentaire pour pré-calculer l'array, mais
--- le UPDATE est exécuté seulement quand utile. Net positif.
-
 CREATE OR REPLACE FUNCTION sync_chunks_legal_instruments() RETURNS TRIGGER AS $$
 DECLARE
     target_decision_id BIGINT;

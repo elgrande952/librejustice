@@ -67,13 +67,13 @@ impl DecisionRepository<'_> {
         let rows = self
             .conn
             .query(
-                "SELECT d.id, d.full_text
-                 FROM decisions d
+                "SELECT d.decision_id, d.full_text
+                 FROM decision_text d
                  WHERE d.id @@@ paradedb.parse_with_field('full_text', $1)
                    AND d.deleted_at IS NULL
-                   AND d.full_text IS NOT NULL
-                   AND d.id > $2
-                 ORDER BY d.id
+                   AND d.lang = 'fr'
+                   AND d.decision_id > $2
+                 ORDER BY d.decision_id
                  LIMIT $3",
                 &[&"\"dite loi\" OR \"loi dite\"", &apres, &taille],
             )

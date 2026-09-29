@@ -99,36 +99,9 @@ static ART_RE: LazyLock<Regex> = LazyLock::new(|| {
 static APOSTROPHE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[’'`]").unwrap());
 static SUFFIX_WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
-/// Strip les diacritiques combinables des lettres latines (équivalent
-/// fonctionnel de `unicodedata.normalize("NFKD")` + filtrage `combining` sur
-/// la plage utile aux libellés de codes français).
-pub fn strip_accents(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
-            'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => 'A',
-            'ç' => 'c',
-            'Ç' => 'C',
-            'è' | 'é' | 'ê' | 'ë' => 'e',
-            'È' | 'É' | 'Ê' | 'Ë' => 'E',
-            'ì' | 'í' | 'î' | 'ï' => 'i',
-            'Ì' | 'Í' | 'Î' | 'Ï' => 'I',
-            'ñ' => 'n',
-            'Ñ' => 'N',
-            'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
-            'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => 'O',
-            'ù' | 'ú' | 'û' | 'ü' => 'u',
-            'Ù' | 'Ú' | 'Û' | 'Ü' => 'U',
-            'ý' | 'ÿ' => 'y',
-            'Ý' => 'Y',
-            other => other,
-        })
-        .collect()
-}
-
 /// Associe un libellé libre (« code de la santé publique ») à un sigle canonique.
 fn norm_suffix(raw_suffix: &str) -> Option<String> {
-    let s = strip_accents(&raw_suffix.to_lowercase());
+    let s = lj_fold::fold_chars(raw_suffix);
     let s = APOSTROPHE_RE.replace_all(&s, " ");
     let s = SUFFIX_WS_RE.replace_all(&s, " ");
     let s = s.trim_matches(|c| c == ' ' || c == '.' || c == ',' || c == ';' || c == ':');

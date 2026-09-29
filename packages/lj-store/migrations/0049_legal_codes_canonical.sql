@@ -1,33 +1,11 @@
--- Migration 0049 — Couche canonique du vocabulaire d'instruments.
---
--- ``legal_codes.canonical_id`` : auto-référence vers la ligne canonique
--- (NULL = la forme EST canonique, jamais self). Posée par la passe de
--- consolidation batch (``lj-ingest consolidate-legal-refs`` : squelette +
--- alias puis snap fuzzy ancré sur la fréquence, ``lj_core::canon``),
--- recomputable — re-tuner les seuils = recompute du mapping + re-sync chunks,
--- sans ré-ingérer. Les 5,5 M ``decision_legal_references`` continuent de
--- pointer la ligne brute ; seule la dénormalisation chunks résout
--- ``raw → canonical`` au sync. No-op tant que ``canonical_id`` est NULL.
-
 ALTER TABLE legal_codes
     ADD COLUMN IF NOT EXISTS canonical_id BIGINT REFERENCES legal_codes(id);
 
 ALTER TABLE legal_codes
     ADD CONSTRAINT legal_codes_canonical_not_self CHECK (canonical_id <> id);
 
--- Sert la garde GC (une cible canonique n'est jamais orpheline), le diff de
--- re-sync et la vérification d'acyclicité de la consolidation.
 CREATE INDEX IF NOT EXISTS idx_legal_codes_canonical
     ON legal_codes (canonical_id) WHERE canonical_id IS NOT NULL;
-
--- =====================================================================
--- Le sync chunks lit la forme CANONIQUE (instruments + composite).
--- =====================================================================
---
--- Reprise du helper de 0048 : ``COALESCE(canon.name, lc.name)`` remplace
--- ``lc.name`` dans ``instruments_arr`` et ``composite_arr``. ``la.label``
--- est inchangé — les labels/numéros d'articles ne sont JAMAIS fuzzés
--- (garde du snap fuzzy).
 
 CREATE OR REPLACE FUNCTION _sync_chunks_legal_instruments_for(p_ids bigint[])
 RETURNS void AS $$

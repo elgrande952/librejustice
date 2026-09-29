@@ -22,7 +22,7 @@ pub fn DecisionRenvoyants(renvoyants: Vec<Renvoyant>) -> impl IntoView {
     view! {
         <section
             aria-label=title
-            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6"
+            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6 print:hidden"
         >
             <h2 class="font-sans text-base text-[var(--color-ink)]">{title}</h2>
             <ul class="mt-4 flex flex-col gap-2">{lignes}</ul>
@@ -38,11 +38,12 @@ pub fn DecisionRenvoyants(renvoyants: Vec<Renvoyant>) -> impl IntoView {
 fn RenvoyantLigne(renvoyant: Renvoyant) -> impl IntoView {
     let Renvoyant {
         id,
+        jurisdiction_type,
         label,
         date,
         docket_numbers,
     } = renvoyant;
-    let href = format!("/decision/{id}");
+    let href = lj_dtos::decision_path(jurisdiction_type, &id);
     let intitule = match date.as_deref() {
         Some(d) => format!("{label}, {}", format_iso_date(Some(d))),
         None => label,

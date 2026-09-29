@@ -46,7 +46,7 @@ pub async fn seed_article_commentaires() -> Result<()> {
         upserted = report.upserted,
         unchanged = report.unchanged,
         tombstoned = report.tombstoned,
-        "seed_article_commentaires terminé"
+        "seed_article_commentaires done"
     );
     Ok(())
 }
@@ -59,13 +59,13 @@ pub async fn reconcile_article_commentaires() -> Result<CommentaireSeedReport> {
     if report.dangling > 0 {
         tracing::warn!(
             dangling = report.dangling,
-            "commentaires curés : ancres mortes — dataset à corriger"
+            "curated comments: dead anchors, dataset to fix"
         );
     }
     if report.tombstoned > 0 {
         tracing::warn!(
             tombstoned = report.tombstoned,
-            "commentaires curés : lignes hors dataset retirées"
+            "curated comments: rows outside the dataset removed"
         );
     }
     Ok(report)
@@ -89,7 +89,7 @@ async fn run(strict: bool) -> Result<CommentaireSeedReport> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -169,7 +169,7 @@ async fn dangling_reason(
     slug: &str,
     num_key: Option<&str>,
 ) -> Result<Option<String>> {
-    let Some((text_uid, _, _)) = repo.referential_ref(slug).await? else {
+    let Some((text_uid, _, _, _)) = repo.referential_ref(slug, None).await? else {
         return Ok(Some(format!(
             "slug de texte inconnu au référentiel: {slug}"
         )));

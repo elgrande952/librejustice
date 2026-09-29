@@ -1,41 +1,54 @@
-//! `sync-eu-law` : le fond UE suit la **dernière version consolidée
-//! applicable** de chaque acte, sourcée en Formex 4 via CELLAR.
+//! `sync-eu-law`: the EU fund carries the WHOLE consolidated series of each act,
+//! sourced as Formex 4 through CELLAR, so an article reads at the date it is
+//! asked for and not only today.
 //!
-//! Registre des actes = les datasets `eu-*.json` de `<state_dir>/ingest/corpus/`
-//! (uid `EU/…` ou fiche JORFTEXT unique). Pour chaque acte : notice branch →
-//! dernière version consolidée applicable (date ≤ aujourd'hui, repli CELEX de
-//! base) → si différente de la version **en base** (celex des `source_url` du
-//! texte — l'autorité du skip, pas le fichier), fetch du Formex, parse pur
-//! (`lj_core::formex`), régénération du dataset, puis rechargement par le
-//! loader legal-corpus (purge par texte, TOC, finisseurs) — un seul chemin
-//! d'écriture DB, aucun watermark : la comparaison disponible/ingéré est
-//! auto-réparante, et le marqueur `consolidated_celex` du fichier n'est qu'un
-//! cache de fetch (run interrompu entre écriture et chargement).
+//! Act registry = the `eu-*.json` datasets of `<state_dir>/ingest/corpus/`. Per
+//! act: notice branch → the applicable snapshots (base act, then every
+//! consolidated version dated today or earlier) → fetch of those the dataset has
+//! not read → pure parse (`lj_parse::formex`) → merge into dated versions → the
+//! legal-corpus loader, single DB write path.
 //!
-//! Les actes sans Formex (pré-format ~1983, directives purement modificatives)
-//! gardent leur dataset et leur stock : comptés `no_formex`, jamais réécrits
-//! en aveugle. Les échecs réseau sont comptés par acte ; au-delà de 5 % la
-//! passe sort en erreur après avoir chargé ce qui a réussi.
+//! A version is born from a CHANGE OF BODY, never from a consolidation: a
+//! snapshot repeating an article extends its version, a changed body closes the
+//! previous one the day before, a vanished article closes its own. The dataset
+//! holding the whole history is what makes the pass incremental: its
+//! `snapshots` list says which are already read, and only the new one is
+//! fetched. Lost (fresh machine), the history rebuilds from CELLAR.
+//!
+//! No watermark: comparing available against ingested is self-repairing. The
+//! skip has two stages, dataset at target and DB carrying its last version (a
+//! run interrupted between write and load).
+//!
+//! Acts with no Formex (pre-format ~1983, purely amending directives) keep their
+//! dataset and their stock: counted `no_formex`, never rewritten blind. Network
+//! failures are counted per act; past 5 % the pass exits in error after loading
+//! what succeeded.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
+use chrono::{Datelike, NaiveDate};
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use lj_core::formex::parse_formex_articles;
+use lj_parse::formex::{parse_formex_articles, FormexArticle};
 use lj_sources::cjue::CjueClient;
 use lj_store::repository::DecisionRepository;
 
 use crate::config::Settings;
 
-/// Concurrence des fetchs CELLAR (notices + Formex).
-const FETCH_CONCURRENCY: usize = 4;
+/// Acts never visited the weekly net probes on top of those in force, newest
+/// first: the net already takes 4,542 s of its 5,400 s watchdog. A stock
+/// catch-up goes through `--backlog`, run by hand.
+const UNVISITED_PER_NET: usize = 2_000;
 
-/// Champs d'identité relus depuis le dataset existant — le sync ne fabrique
-/// jamais une fiche, il rafraîchit le corps d'un acte déjà au registre.
+/// CELLAR resource base a dataset URL is built on.
+const CELEX_BASE_URL: &str = "http://publications.europa.eu/resource/celex";
+
+/// Identity fields read back from the existing dataset: the sync never mints a
+/// fiche, it refreshes the body of an act already in the registry.
 #[derive(Deserialize)]
 struct SeedDoc {
     text_uid: String,
@@ -48,10 +61,43 @@ struct SeedDoc {
     date_texte: Option<String>,
     #[serde(default)]
     source_url: Option<String>,
-    /// Marqueur d'idempotence posé par ce sync ; absent, le dataset est régénéré
-    /// au premier run.
+    /// Snapshots already merged into this dataset, oldest first. Empty (fiche
+    /// seeded from the DB, or dataset predating the series) rebuilds the history.
     #[serde(default)]
-    consolidated_celex: Option<String>,
+    snapshots: Vec<SnapshotRef>,
+    #[serde(default)]
+    articles: Vec<SeedArticle>,
+}
+
+#[derive(Deserialize)]
+struct SeedArticle {
+    num: String,
+    #[serde(default)]
+    title_path: Option<String>,
+    #[serde(default)]
+    versions: Vec<SeedVersion>,
+}
+
+#[derive(Deserialize)]
+struct SeedVersion {
+    #[serde(default)]
+    date_debut: Option<String>,
+    #[serde(default)]
+    date_fin: Option<String>,
+    status: String,
+    texte: String,
+    #[serde(default)]
+    source_url: Option<String>,
+}
+
+/// One form of the act: the CELEX serving it, and the date it takes effect.
+/// `date` is absent only for a base act of unknown adoption date, whose version
+/// then carries an open bound.
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct SnapshotRef {
+    celex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    date: Option<String>,
 }
 
 /// Un acte du registre, prêt à sonder.
@@ -87,14 +133,15 @@ fn celex_base_from_url(url: &str) -> Option<String> {
     Some(celex.to_string())
 }
 
-/// Partition des versions d'une notice : dernière **applicable** (date ≤
-/// aujourd'hui) et versions **futures** pré-publiées — gardées en attente au
-/// manifeste et re-sondées à leur échéance.
-fn split_versions<'a>(
-    versions: &'a [String],
-    today_compact: &str,
-) -> (Option<&'a String>, Vec<String>) {
-    let applicable = versions.iter().rfind(|v| v.as_str() <= today_compact);
+/// Splits a notice's versions: the applicable ones (dated today or earlier),
+/// oldest first, and the pre-published future ones, kept in the manifest and
+/// re-probed at their term.
+fn split_versions<'a>(versions: &'a [String], today_compact: &str) -> (Vec<&'a str>, Vec<String>) {
+    let applicable = versions
+        .iter()
+        .filter(|v| v.as_str() <= today_compact)
+        .map(String::as_str)
+        .collect();
     let futures = versions
         .iter()
         .filter(|v| v.as_str() > today_compact)
@@ -103,50 +150,239 @@ fn split_versions<'a>(
     (applicable, futures)
 }
 
-/// Sonde un acte et régénère son dataset si une version plus récente est
-/// applicable. Le skip s'appuie sur l'état **DB** (`db_celex`) — le marqueur
-/// fichier ne sert que de cache de fetch : un dataset déjà régénéré pour la
-/// cible mais jamais chargé (crash entre écriture et chargement) est resservi
-/// tel quel au loader. `force` re-fetche et recharge sans regarder ni l'un ni
-/// l'autre. Rend aussi les versions futures lues dans la notice.
-async fn refresh_act(
-    client: &CjueClient,
-    seed: &SeedAct,
-    db_celex: Option<&str>,
-    today_compact: &str,
-    force: bool,
-) -> Result<(Outcome, Vec<String>)> {
-    let versions = client
-        .consolidated_versions(&seed.celex_base)
-        .await
-        .map_err(|e| anyhow!("notice {}: {e}", seed.celex_base))?;
-    let (applicable, futures) = split_versions(&versions, today_compact);
-    let target = match applicable {
-        Some(v) => format!("0{}-{v}", &seed.celex_base[1..]),
-        None => seed.celex_base.clone(),
+/// `20070101` to `2007-01-01`.
+fn iso_date(compact: &str) -> String {
+    format!("{}-{}-{}", &compact[0..4], &compact[4..6], &compact[6..8])
+}
+
+fn parse_iso(iso: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(iso, "%Y-%m-%d").map_err(|e| anyhow!("date {iso:?} invalide: {e}"))
+}
+
+/// The snapshots to read for an act: the base act, then each applicable
+/// consolidated version. The base act is dropped when a consolidation shares its
+/// date, two forms taking effect the same day leaving one unreachable.
+fn snapshot_targets(
+    celex_base: &str,
+    date_texte: Option<&str>,
+    applicable: &[&str],
+) -> Vec<SnapshotRef> {
+    let mut out = Vec::with_capacity(applicable.len() + 1);
+    let premiere = applicable.first().map(|v| iso_date(v));
+    let base_avant = match (date_texte, premiere.as_deref()) {
+        (Some(d), Some(p)) => d < p,
+        _ => true,
     };
-    if !force {
-        if db_celex == Some(target.as_str()) {
-            return Ok((Outcome::Unchanged, futures));
-        }
-        if seed.doc.consolidated_celex.as_deref() == Some(target.as_str()) {
-            // Fichier déjà à la cible, base en retard : rechargement sans refetch.
-            return Ok((Outcome::Updated(seed.path.clone()), futures));
-        }
+    if base_avant {
+        out.push(SnapshotRef {
+            celex: celex_base.to_string(),
+            date: date_texte.map(str::to_string),
+        });
     }
-    let documents = client
-        .formex_act_fr(&target)
-        .await
-        .map_err(|e| anyhow!("formex {target}: {e}"))?;
-    if documents.is_empty() {
-        // Pas de repli consolidé → base : régresser au texte d'origine écraserait
-        // un stock potentiellement plus riche (bootstrap XHTML).
-        return Ok((Outcome::NoFormex, futures));
+    for v in applicable {
+        out.push(SnapshotRef {
+            celex: format!("0{}-{v}", &celex_base[1..]),
+            date: Some(iso_date(v)),
+        });
     }
-    // A consolidated act carries its annexes inline, an original act publishes
-    // them as separate volumes of the same manifestation. Reading both sources
-    // emits every annex twice, under the key the loader takes for a primary key.
-    let mut articles = parse_formex_articles(&documents[0]);
+    out
+}
+
+/// A dated version of an article, as it will land in the dataset.
+struct VersionAcc {
+    date_debut: Option<String>,
+    date_fin: Option<String>,
+    status: String,
+    texte: String,
+    celex: String,
+}
+
+struct ArticleAcc {
+    num: String,
+    title_path: Option<String>,
+    versions: Vec<VersionAcc>,
+}
+
+/// The act's history under construction, one entry per article identity.
+#[derive(Default)]
+struct History {
+    articles: HashMap<String, ArticleAcc>,
+    /// Reading order of the last snapshot applied.
+    order: Vec<String>,
+}
+
+impl History {
+    /// Rebuilds the accumulator from a dataset that already carries its series.
+    /// `None` when the file predates it, or lost the CELEX a version came from:
+    /// the history is then refetched whole rather than extended on a guess.
+    fn from_seed(doc: &SeedDoc) -> Option<Self> {
+        if doc.snapshots.is_empty() || doc.articles.is_empty() {
+            return None;
+        }
+        let mut articles = HashMap::with_capacity(doc.articles.len());
+        let mut order = Vec::with_capacity(doc.articles.len());
+        for a in &doc.articles {
+            let mut versions = Vec::with_capacity(a.versions.len());
+            for v in &a.versions {
+                let celex = celex_from_url(v.source_url.as_deref()?)?;
+                versions.push(VersionAcc {
+                    date_debut: v.date_debut.clone(),
+                    date_fin: v.date_fin.clone(),
+                    status: v.status.clone(),
+                    texte: v.texte.clone(),
+                    celex,
+                });
+            }
+            if versions.is_empty() {
+                return None;
+            }
+            let key = lj_norm::article_key::identity_key(&a.num);
+            order.push(key.clone());
+            articles.insert(
+                key,
+                ArticleAcc {
+                    num: a.num.clone(),
+                    title_path: a.title_path.clone(),
+                    versions,
+                },
+            );
+        }
+        Some(History { articles, order })
+    }
+
+    /// Merges one snapshot: an unchanged body extends its version, a changed one
+    /// opens the next and closes the previous the day before, and an article the
+    /// snapshot no longer carries closes its own.
+    fn apply(&mut self, celex: &str, date: Option<NaiveDate>, articles: &[FormexArticle]) {
+        let debut = date.map(|d| d.to_string());
+        let veille = date.map(|d| (d - chrono::Duration::days(1)).to_string());
+        let mut order = Vec::with_capacity(articles.len());
+        let mut present: HashSet<String> = HashSet::with_capacity(articles.len());
+        for a in articles {
+            let key = lj_norm::article_key::identity_key(&a.num);
+            if !present.insert(key.clone()) {
+                continue;
+            }
+            order.push(key.clone());
+            // The Formex subtitle (« Définitions ») opens the body: LEGI has no
+            // per-article title, the body is its only carrier.
+            let texte = match &a.subtitle {
+                Some(s) => format!("{s}\n{}", a.texte),
+                None => a.texte.clone(),
+            };
+            let acc = self.articles.entry(key).or_insert_with(|| ArticleAcc {
+                num: a.num.clone(),
+                title_path: a.title_path.clone(),
+                versions: Vec::new(),
+            });
+            acc.num.clone_from(&a.num);
+            acc.title_path.clone_from(&a.title_path);
+            match acc.versions.last_mut() {
+                Some(last) if last.date_fin.is_none() && last.texte == texte => continue,
+                Some(last) if last.date_fin.is_none() => last.date_fin.clone_from(&veille),
+                _ => {}
+            }
+            acc.versions.push(VersionAcc {
+                status: super::legal_corpus::article_status(&texte).to_string(),
+                date_debut: debut.clone(),
+                date_fin: None,
+                texte,
+                celex: celex.to_string(),
+            });
+        }
+        for (key, acc) in self.articles.iter_mut() {
+            if present.contains(key) {
+                continue;
+            }
+            if let Some(last) = acc.versions.last_mut() {
+                if last.date_fin.is_none() {
+                    last.date_fin.clone_from(&veille);
+                }
+            }
+        }
+        self.order = order;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.articles.is_empty()
+    }
+
+    /// Version rows the loader will write, the count the DB must match.
+    fn total_versions(&self) -> usize {
+        self.articles.values().map(|a| a.versions.len()).sum()
+    }
+
+    /// CELEX of the most recent version written: what the DB carries once the
+    /// act is loaded. A consolidation that changed no article leaves it behind,
+    /// which is why the skip reads it here and not from the snapshot list.
+    fn last_celex(&self) -> Option<&str> {
+        self.articles
+            .values()
+            .filter_map(|a| a.versions.last())
+            .max_by(|x, y| x.date_debut.cmp(&y.date_debut))
+            .map(|v| v.celex.as_str())
+    }
+
+    /// Dataset articles, in the reading order of the last snapshot; the ones it
+    /// no longer carries follow, by identity key.
+    fn into_json(self) -> Vec<serde_json::Value> {
+        let History {
+            mut articles,
+            mut order,
+        } = self;
+        let vus: HashSet<&String> = order.iter().collect();
+        let mut restes: Vec<String> = articles
+            .keys()
+            .filter(|k| !vus.contains(k))
+            .cloned()
+            .collect();
+        restes.sort();
+        drop(vus);
+        order.extend(restes);
+        order
+            .iter()
+            .filter_map(|k| articles.remove(k))
+            .map(|a| {
+                let versions: Vec<serde_json::Value> = a
+                    .versions
+                    .into_iter()
+                    .map(|v| {
+                        serde_json::json!({
+                            "date_debut": v.date_debut,
+                            "date_fin": v.date_fin,
+                            "status": v.status,
+                            "texte": v.texte,
+                            "source_url": format!("{CELEX_BASE_URL}/{}", v.celex),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "num": a.num,
+                    "title_path": a.title_path,
+                    "versions": versions,
+                })
+            })
+            .collect()
+    }
+}
+
+/// CELEX carried by a dataset URL (`…/resource/celex/{celex}`).
+fn celex_from_url(url: &str) -> Option<String> {
+    url.rsplit("/celex/")
+        .next()
+        .filter(|c| !c.is_empty() && *c != url)
+        .map(str::to_string)
+}
+
+/// Articles of one snapshot. A consolidated act carries its annexes inline, an
+/// original act publishes them as separate volumes of the same manifestation;
+/// reading both sources emits every annex twice, under the key the loader takes
+/// for a primary key.
+fn snapshot_articles(documents: &[String], celex: &str, text_uid: &str) -> Vec<FormexArticle> {
+    let Some(acte) = documents.first() else {
+        return Vec::new();
+    };
+    let mut articles = parse_formex_articles(acte);
     if !articles.iter().any(|a| a.num.starts_with("Annexe")) {
         articles.extend(
             documents[1..]
@@ -157,48 +393,100 @@ async fn refresh_act(
     let mut seen = HashSet::new();
     let mut collisions: Vec<String> = Vec::new();
     articles.retain(|a| {
-        let kept = seen.insert(lj_core::article_key::identity_key(&a.num));
+        let kept = seen.insert(lj_norm::article_key::identity_key(&a.num));
         if !kept {
             collisions.push(a.num.clone());
         }
         kept
     });
     if !collisions.is_empty() {
-        tracing::warn!(celex = %target, text_uid = %seed.doc.text_uid, numeros = ?collisions, "clé d'article en double, contenu écarté");
+        tracing::warn!(celex = %celex, text_uid = %text_uid, numeros = ?collisions, "duplicate article key, content dropped");
     }
-    if articles.is_empty() {
-        tracing::warn!(celex = %target, text_uid = %seed.doc.text_uid, "Formex sans article, dataset conservé");
+    articles
+}
+
+/// What the DB holds of an act, which says whether its series is loaded.
+#[derive(Clone, Copy, Default)]
+struct EtatBase<'a> {
+    celex: Option<&'a str>,
+    versions: Option<i64>,
+}
+
+/// Probes an act and extends its dataset with the snapshots it has not read.
+/// Two skips, in this order: the dataset is at target and the DB holds its
+/// series, nothing to do; the dataset is at target and the DB is behind (crash
+/// between write and load), reload without refetching. `force` refetches the
+/// whole series. Also returns the future versions read in the notice.
+async fn refresh_act(
+    client: &CjueClient,
+    seed: &SeedAct,
+    db: EtatBase<'_>,
+    today_compact: &str,
+    force: bool,
+) -> Result<(Outcome, Vec<String>)> {
+    let versions = client
+        .consolidated_versions(&seed.celex_base)
+        .await
+        .map_err(|e| anyhow!("notice {}: {e}", seed.celex_base))?;
+    let (applicable, futures) = split_versions(&versions, today_compact);
+    let targets = snapshot_targets(
+        &seed.celex_base,
+        seed.doc.date_texte.as_deref(),
+        &applicable,
+    );
+
+    // An intermediate consolidation published after the fact breaks the prefix:
+    // the series is then rebuilt whole rather than grafted onto the wrong past.
+    let repris = match History::from_seed(&seed.doc) {
+        Some(h) if !force && targets.starts_with(&seed.doc.snapshots) => Some(h),
+        _ => None,
+    };
+    let (mut history, lus) = match repris {
+        Some(h) => {
+            if seed.doc.snapshots.len() == targets.len() {
+                let charge =
+                    db.celex == h.last_celex() && db.versions == Some(h.total_versions() as i64);
+                let outcome = if charge {
+                    Outcome::Unchanged
+                } else {
+                    Outcome::Updated(seed.path.clone())
+                };
+                return Ok((outcome, futures));
+            }
+            let lus = seed.doc.snapshots.len();
+            (h, lus)
+        }
+        None => (History::default(), 0),
+    };
+
+    for target in &targets[lus..] {
+        let documents = client
+            .formex_act_fr(&target.celex)
+            .await
+            .map_err(|e| anyhow!("formex {}: {e}", target.celex))?;
+        let articles = snapshot_articles(&documents, &target.celex, &seed.doc.text_uid);
+        if articles.is_empty() {
+            tracing::warn!(celex = %target.celex, text_uid = %seed.doc.text_uid, "Formex without an article, snapshot skipped");
+            continue;
+        }
+        let date = target.date.as_deref().map(parse_iso).transpose()?;
+        history.apply(&target.celex, date, &articles);
+    }
+    if history.is_empty() {
+        // Regressing to nothing would erase a possibly richer stock (XHTML
+        // bootstrap, act older than Formex).
         return Ok((Outcome::NoFormex, futures));
     }
 
-    // `effect_date` : date de la version consolidée servie ; un acte jamais
-    // consolidé vaut depuis son adoption (`date_texte`, sinon borne ouverte).
-    let effect_date = match applicable {
-        Some(v) => Some(format!("{}-{}-{}", &v[0..4], &v[4..6], &v[6..8])),
-        None => seed.doc.date_texte.clone(),
-    };
-    let today_iso = format!(
-        "{}-{}-{}",
-        &today_compact[0..4],
-        &today_compact[4..6],
-        &today_compact[6..8]
-    );
-    let arts_json: Vec<serde_json::Value> = articles
+    let today_iso = iso_date(today_compact);
+    let derniere = targets
+        .last()
+        .ok_or_else(|| anyhow!("acte sans instantané: {}", seed.celex_base))?;
+    let articles = history.into_json();
+    let versions_ecrites: usize = articles
         .iter()
-        .map(|a| {
-            // Le sous-titre Formex (« Définitions ») ouvre le corps : LEGI n'a
-            // pas de titre par article, le corps est le seul porteur.
-            let texte = match &a.subtitle {
-                Some(s) => format!("{s}\n{}", a.texte),
-                None => a.texte.clone(),
-            };
-            serde_json::json!({
-                "num": a.num,
-                "title_path": a.title_path,
-                "texte": texte,
-            })
-        })
-        .collect();
+        .filter_map(|a| a["versions"].as_array().map(Vec::len))
+        .sum();
     let doc = serde_json::json!({
         "text_uid": seed.doc.text_uid,
         "source": "eur-lex",
@@ -207,23 +495,21 @@ async fn refresh_act(
         "title_key": seed.doc.title_key,
         "nature": seed.doc.nature,
         "translation": "officiel",
-        // Un article supprimé par amendement reste dans le Formex consolidé
-        // en coquille vide (`<ALINEA/>`) : corps vide ⇒ `ABROGE` (loader).
-        "detect_abrogation": true,
-        "source_url": format!("http://publications.europa.eu/resource/celex/{target}"),
+        "source_url": format!("{CELEX_BASE_URL}/{}", derniere.celex),
         "source_asof": today_iso,
         "date_texte": seed.doc.date_texte,
-        "effect_date": effect_date,
-        "consolidated_celex": target,
-        "articles": arts_json,
+        "snapshots": targets,
+        "articles": articles,
     });
     std::fs::write(&seed.path, serde_json::to_vec_pretty(&doc)?)
         .map_err(|e| anyhow!("write {}: {e}", seed.path.display()))?;
     tracing::info!(
         text_uid = %seed.doc.text_uid,
-        celex = %target,
+        celex = %derniere.celex,
+        instantanes = targets.len(),
         articles = articles.len(),
-        "dataset eu-law régénéré"
+        versions = versions_ecrites,
+        "eu-law dataset regenerated"
     );
     Ok((Outcome::Updated(seed.path.clone()), futures))
 }
@@ -232,15 +518,10 @@ async fn refresh_act(
 /// text_uid)`). Un acte abrogé ne fait paraître aucune consolidation : le delta
 /// ne le voit jamais, d'où un registre **entier** à chaque passe.
 async fn poser_bornes(
-    client: &CjueClient,
     repo: &DecisionRepository<'_>,
+    ends: &HashMap<String, NaiveDate>,
     registre: &[(String, String)],
 ) -> Result<()> {
-    let bases: Vec<String> = registre.iter().map(|(base, _)| base.clone()).collect();
-    let ends = client
-        .acts_end_of_validity(&bases)
-        .await
-        .map_err(|e| anyhow!("bornes de validité: {e}"))?;
     let closures: Vec<(String, chrono::NaiveDate)> = registre
         .iter()
         .filter_map(|(base, uid)| ends.get(base).map(|fin| (uid.clone(), *fin)))
@@ -252,7 +533,7 @@ async fn poser_bornes(
     tracing::info!(
         actes = closures.len(),
         articles,
-        "sync-eu-law : bornes de validité posées"
+        "sync-eu-law: validity bounds set"
     );
     Ok(())
 }
@@ -284,7 +565,7 @@ fn seed_acts(dir: &Path, only: Option<&str>) -> Result<Vec<SeedAct>> {
             .and_then(celex_base_from_url)
             .filter(|c| c.len() >= 2)
         else {
-            tracing::warn!(dataset = %path.display(), "dataset eu-law sans CELEX exploitable, ignoré");
+            tracing::warn!(dataset = %path.display(), "eu-law dataset without a usable CELEX, ignored");
             continue;
         };
         seeds.push(SeedAct {
@@ -297,44 +578,45 @@ fn seed_acts(dir: &Path, only: Option<&str>) -> Result<Vec<SeedAct>> {
     Ok(seeds)
 }
 
-/// Registry refresh window in steady state. Two passes overlap widely, which
-/// catches up a missed chain run with no watermark to corrupt.
-const FENETRE_REGISTRE_JOURS: i64 = 90;
-
-/// Passe `sync-eu-law` : régénère les datasets dont une version consolidée
-/// plus récente est applicable, recharge ces seuls datasets. Deux cadences :
-/// **delta** (défaut en régime — une requête SPARQL liste les consolidations
-/// parues depuis le watermark, seuls les actes touchés ou à échéance de
-/// version future sont sondés) et **balayage intégral** (`full`, filet hebdo
-/// auto-réparant ; aussi le bootstrap quand le manifeste est vierge). Un run
-/// partiel (`limit`/`only`, debug) balaie son sous-ensemble sans toucher le
-/// manifeste.
+/// `sync-eu-law` pass: regenerates the datasets a newer consolidated version
+/// applies to, and reloads those alone. Two cadences: **delta** (the default,
+/// one SPARQL query lists the consolidations published since the watermark, and
+/// only the acts touched, come due or just catalogued are probed) and **full**
+/// (the weekly self-repairing net, also the bootstrap on a blank manifest). The
+/// net probes the acts in force and a batch of those never visited; `backlog`
+/// probes every act never visited, the stock catch-up. A partial run
+/// (`limit`/`only`, debugging) sweeps its subset without touching the manifest.
 pub async fn sync_eu_law(
     limit: Option<usize>,
     only: Option<&str>,
     force: bool,
     full: bool,
+    backlog: bool,
+    concurrency: usize,
 ) -> Result<()> {
     let settings = Settings::from_env()?;
     let dir = settings.legal_corpus_dir();
     // The registry is refreshed before being followed: without this pass, an act
     // nobody cited never enters. A partial run is debugging and has no business
     // growing the corpus.
-    if limit.is_none() && only.is_none() {
-        let aujourdhui = chrono::Utc::now().date_naive();
-        super::eu_catalog::sync_eu_catalog(
-            aujourdhui - chrono::Duration::days(FENETRE_REGISTRE_JOURS),
-            aujourdhui,
-            None,
-        )
-        .await?;
-    }
+    // A full registry pass brings in the stock, whose bodies are the net's
+    // queue: probing them today would run the daily step past its watchdog.
+    let fresh: HashSet<String> = if limit.is_none() && only.is_none() {
+        let pass = super::eu_catalog::sync_eu_catalog(false, None).await?;
+        if pass.full {
+            HashSet::new()
+        } else {
+            pass.entered.into_iter().collect()
+        }
+    } else {
+        HashSet::new()
+    };
     let mut seeds = seed_acts(&dir, only)?;
 
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -345,12 +627,12 @@ pub async fn sync_eu_law(
         .eu_law_registry()
         .await
         .map_err(|e| anyhow!("eu_law_registry: {e}"))?;
-    let db_celex: std::collections::HashMap<String, String> = registry
+    let etat_base: std::collections::HashMap<String, (String, i64)> = registry
         .iter()
-        .map(|(uid, celex, ..)| (uid.clone(), celex.clone()))
+        .map(|(uid, celex, versions, ..)| (uid.clone(), (celex.clone(), *versions)))
         .collect();
     let on_disk: HashSet<String> = seeds.iter().map(|s| s.doc.text_uid.clone()).collect();
-    for (uid, celex, title, nature, jurisdiction, date_texte) in registry {
+    for (uid, celex, _versions, title, nature, jurisdiction, date_texte) in registry {
         if on_disk.contains(&uid) {
             continue;
         }
@@ -360,9 +642,9 @@ pub async fn sync_eu_law(
                 continue;
             }
         }
-        let url = format!("http://publications.europa.eu/resource/celex/{celex}");
+        let url = format!("{CELEX_BASE_URL}/{celex}");
         let Some(celex_base) = celex_base_from_url(&url).filter(|c| c.len() >= 2) else {
-            tracing::warn!(text_uid = %uid, celex = %celex, "acte en base sans CELEX exploitable, ignoré");
+            tracing::warn!(text_uid = %uid, celex = %celex, "act in the database without a usable CELEX, ignored");
             continue;
         };
         seeds.push(SeedAct {
@@ -375,7 +657,8 @@ pub async fn sync_eu_law(
                 jurisdiction,
                 date_texte: date_texte.map(|d| d.to_string()),
                 source_url: Some(url),
-                consolidated_celex: None,
+                snapshots: Vec::new(),
+                articles: Vec::new(),
             },
             celex_base,
         });
@@ -385,7 +668,7 @@ pub async fn sync_eu_law(
         seeds.truncate(n);
     }
     if seeds.is_empty() {
-        tracing::warn!(dir = %dir.display(), "sync-eu-law : aucun acte au registre");
+        tracing::warn!(dir = %dir.display(), "sync-eu-law: no act in the registry");
         return Ok(());
     }
     let today_compact = chrono::Utc::now().format("%Y%m%d").to_string();
@@ -397,16 +680,27 @@ pub async fn sync_eu_law(
     let mut manifest = lj_sources::cjue::EuLawManifest::load(&manifest_path)
         .map_err(|e| anyhow!("manifest eu-law: {e}"))?;
     let all_bases: HashSet<String> = seeds.iter().map(|s| s.celex_base.clone()).collect();
-    // Capturé avant le filtre du delta : la borne de validité se pose sur tout
-    // le registre, pas sur les seuls actes que la fenêtre du jour a touchés.
+    // Captured before the delta filter: the validity bound is set on the whole
+    // registry, not only on the acts the day's window touched. A catalogue-only
+    // entry has no article to close.
     let registre: Vec<(String, String)> = seeds
         .iter()
+        .filter(|s| !s.doc.snapshots.is_empty() || etat_base.contains_key(&s.doc.text_uid))
         .map(|s| (s.celex_base.clone(), s.doc.text_uid.clone()))
         .collect();
 
     let client = Arc::new(CjueClient::new());
+    let ends = client
+        .acts_end_of_validity(
+            &registre
+                .iter()
+                .map(|(base, _)| base.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|e| anyhow!("bornes de validité: {e}"))?;
     let mut mode = "full";
-    if !full && !force && !partial {
+    if !full && !backlog && !force && !partial {
         if let Some(since) = manifest.last_delta_date.clone() {
             let refs = client
                 .consolidations_since(&since)
@@ -414,7 +708,7 @@ pub async fn sync_eu_law(
                 .map_err(|e| anyhow!("delta consolidations: {e}"))?;
             if refs.len() >= lj_sources::cjue::CONSOLIDATIONS_LIMIT {
                 // Watermark trop ancien pour une fenêtre fiable.
-                tracing::warn!(since = %since, "delta consolidations plein : bascule en balayage intégral");
+                tracing::warn!(since = %since, "consolidation delta full: switching to a full sweep");
             } else {
                 mode = "delta";
                 let touched: HashSet<&str> = refs.iter().map(|r| r.body.as_str()).collect();
@@ -425,17 +719,67 @@ pub async fn sync_eu_law(
                     .map(|(base, _)| base.clone())
                     .collect();
                 seeds.retain(|s| {
-                    touched.contains(&s.celex_base[1..]) || due.contains(&s.celex_base)
+                    touched.contains(&s.celex_base[1..])
+                        || due.contains(&s.celex_base)
+                        || fresh.contains(&s.doc.text_uid)
                 });
                 tracing::info!(
                     since = %since,
                     parues = refs.len(),
                     echues = due.len(),
+                    entrees = fresh.len(),
                     matched = seeds.len(),
-                    "sync-eu-law : delta consolidations"
+                    "sync-eu-law: consolidation delta"
                 );
             }
         }
+    }
+    if mode == "full" && !force && !partial {
+        // A visited act out of force changes only by a consolidation, which the
+        // daily delta sees; one visited without a body had no Formex.
+        let today = chrono::Utc::now().date_naive();
+        let bodied: HashSet<&str> = registre.iter().map(|(b, _)| b.as_str()).collect();
+        let in_force = |s: &SeedAct| {
+            bodied.contains(s.celex_base.as_str())
+                && ends.get(&s.celex_base).is_none_or(|fin| *fin >= today)
+        };
+        let (mut keep, mut unvisited): (Vec<SeedAct>, Vec<SeedAct>) = seeds
+            .into_iter()
+            .filter(|s| in_force(s) || !manifest.visited.contains_key(&s.celex_base))
+            .partition(|s| in_force(s));
+        // Five acts in six have no Formex to find, every one before 2000 but
+        // ~600: one listing marks them visited without a request.
+        let mut sans_formex = 0usize;
+        if !unvisited.is_empty() {
+            let with_formex = client
+                .acts_with_formex(super::eu_catalog::PREMIERE_ANNEE..=today.year())
+                .await
+                .map_err(|e| anyhow!("actes avec Formex: {e}"))?;
+            unvisited.retain(|s| {
+                let found = with_formex.contains(&s.celex_base);
+                if !found {
+                    manifest
+                        .visited
+                        .insert(s.celex_base.clone(), today_iso.clone());
+                    sans_formex += 1;
+                }
+                found
+            });
+        }
+        let backlog_total = unvisited.len();
+        if !backlog {
+            unvisited.sort_by(|a, b| b.doc.date_texte.cmp(&a.doc.date_texte));
+            unvisited.truncate(UNVISITED_PER_NET);
+        }
+        tracing::info!(
+            in_force = keep.len(),
+            unvisited = unvisited.len(),
+            backlog_total,
+            sans_formex,
+            "sync-eu-law: net selection"
+        );
+        keep.extend(unvisited);
+        seeds = keep;
     }
 
     let total = seeds.len();
@@ -443,15 +787,15 @@ pub async fn sync_eu_law(
         // Delta vide : rien de paru pour le registre, le watermark avance. La
         // borne de validité se pose quand même — c'est le cas le plus fréquent,
         // et une clôture d'acte ne fait paraître aucune consolidation.
-        poser_bornes(&client, &repo, &registre).await?;
+        poser_bornes(&repo, &ends, &registre).await?;
         manifest.last_delta_date = Some(today_iso);
         manifest
             .save(&manifest_path)
             .map_err(|e| anyhow!("manifest save: {e}"))?;
-        println!("sync-eu-law : delta vide, bornes de validité posées.");
+        println!("sync-eu-law: empty delta, validity bounds set.");
         return Ok(());
     }
-    tracing::info!(total, force, mode, "sync-eu-law : balayage CELLAR");
+    tracing::info!(total, force, mode, "sync-eu-law: CELLAR sweep");
 
     /// Résultat d'une sonde : `futures` absent sur échec (le manifeste garde
     /// alors les versions en attente connues plutôt que de les effacer).
@@ -463,7 +807,13 @@ pub async fn sync_eu_law(
     let probes: Vec<Probe> = futures::stream::iter(seeds.iter().map(|seed| {
         let client = Arc::clone(&client);
         let today = today_compact.clone();
-        let db = db_celex.get(&seed.doc.text_uid).map(String::as_str);
+        let db = match etat_base.get(&seed.doc.text_uid) {
+            Some((celex, versions)) => EtatBase {
+                celex: Some(celex.as_str()),
+                versions: Some(*versions),
+            },
+            None => EtatBase::default(),
+        };
         async move {
             match refresh_act(&client, seed, db, &today, force).await {
                 Ok((outcome, futures)) => Probe {
@@ -476,7 +826,7 @@ pub async fn sync_eu_law(
                         text_uid = %seed.doc.text_uid,
                         celex = %seed.celex_base,
                         error = %e,
-                        "sync-eu-law : acte en échec, stock conservé"
+                        "sync-eu-law: act failed, stock kept"
                     );
                     Probe {
                         celex_base: seed.celex_base.clone(),
@@ -487,7 +837,7 @@ pub async fn sync_eu_law(
             }
         }
     }))
-    .buffer_unordered(FETCH_CONCURRENCY)
+    .buffer_unordered(concurrency)
     .collect()
     .await;
 
@@ -507,7 +857,13 @@ pub async fn sync_eu_law(
         // Versions futures en attente : remplacées par ce que la notice du jour
         // annonce pour chaque acte sondé, purgées des actes sortis du registre.
         manifest.pending.retain(|base, _| all_bases.contains(base));
+        manifest.visited.retain(|base, _| all_bases.contains(base));
         for p in &probes {
+            if !matches!(p.outcome, Outcome::Failed) {
+                manifest
+                    .visited
+                    .insert(p.celex_base.clone(), today_iso.clone());
+            }
             if let Some(futures) = &p.futures {
                 if futures.is_empty() {
                     manifest.pending.remove(&p.celex_base);
@@ -543,7 +899,7 @@ pub async fn sync_eu_law(
     }
 
     // APRÈS le loader : une régénération réécrirait la fermeture.
-    poser_bornes(&client, &repo, &registre).await?;
+    poser_bornes(&repo, &ends, &registre).await?;
 
     tracing::info!(
         total,
@@ -552,7 +908,7 @@ pub async fn sync_eu_law(
         unchanged,
         no_formex,
         failed,
-        "sync-eu-law terminé"
+        "sync-eu-law done"
     );
     println!(
         "sync-eu-law ({mode}) : {} rechargés, {unchanged} à jour, {no_formex} sans Formex, \
@@ -584,10 +940,24 @@ pub async fn sync_eu_law(
 
 #[cfg(test)]
 mod tests {
-    use super::{celex_base_from_url, split_versions};
+    use super::{celex_base_from_url, snapshot_targets, split_versions, History};
+    use lj_parse::formex::FormexArticle;
 
-    /// Spec : la dernière applicable sert la cible du jour, les futures
-    /// pré-publiées partent en attente au manifeste.
+    fn art(num: &str, texte: &str) -> FormexArticle {
+        FormexArticle {
+            num: num.to_string(),
+            subtitle: None,
+            title_path: None,
+            texte: texte.to_string(),
+        }
+    }
+
+    fn jour(iso: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(iso, "%Y-%m-%d").expect("date de test")
+    }
+
+    /// Spec: every applicable version makes a snapshot, the pre-published ones
+    /// wait in the manifest.
     #[test]
     fn split_versions_separe_applicable_et_futures() {
         let versions = vec![
@@ -596,12 +966,104 @@ mod tests {
             "20260918".to_string(),
         ];
         let (applicable, futures) = split_versions(&versions, "20260808");
-        assert_eq!(applicable.map(String::as_str), Some("20260501"));
+        assert_eq!(applicable, vec!["20240101", "20260501"]);
         assert_eq!(futures, vec!["20260918".to_string()]);
-        // Jamais consolidé à date : pas d'applicable, tout en attente.
+        // Never consolidated as of that day: nothing applicable, all waiting.
         let (applicable, futures) = split_versions(&versions, "20230101");
-        assert_eq!(applicable, None);
+        assert!(applicable.is_empty());
         assert_eq!(futures.len(), 3);
+    }
+
+    /// Spec: the base act opens the series, unless a consolidation takes effect
+    /// on the day it was adopted.
+    #[test]
+    fn snapshot_targets_ouvre_sur_l_acte_de_base() {
+        let cibles = snapshot_targets("32006L0112", Some("2006-11-28"), &["20070101", "20100415"]);
+        let vus: Vec<(&str, Option<&str>)> = cibles
+            .iter()
+            .map(|s| (s.celex.as_str(), s.date.as_deref()))
+            .collect();
+        assert_eq!(
+            vus,
+            vec![
+                ("32006L0112", Some("2006-11-28")),
+                ("02006L0112-20070101", Some("2007-01-01")),
+                ("02006L0112-20100415", Some("2010-04-15")),
+            ]
+        );
+        // Never consolidated: the base act is the whole series.
+        let cibles = snapshot_targets("32006L0112", Some("2006-11-28"), &[]);
+        assert_eq!(cibles.len(), 1);
+        // Consolidated on the day of adoption: it replaces the base act, two
+        // forms opening the same day leaving one unreachable.
+        let cibles = snapshot_targets("32006L0112", Some("2007-01-01"), &["20070101"]);
+        assert_eq!(cibles.len(), 1);
+        assert_eq!(cibles[0].celex, "02006L0112-20070101");
+    }
+
+    /// Spec: a version is born from a change of body, not from a consolidation.
+    /// A repeated body extends its version, a changed one closes the previous
+    /// the day before.
+    #[test]
+    fn apply_ouvre_une_version_au_changement_de_corps() {
+        let mut h = History::default();
+        h.apply(
+            "32006L0112",
+            Some(jour("2006-11-28")),
+            &[art("1", "corps d'origine"), art("2", "stable")],
+        );
+        h.apply(
+            "02006L0112-20070101",
+            Some(jour("2007-01-01")),
+            &[art("1", "corps d'origine"), art("2", "stable")],
+        );
+        h.apply(
+            "02006L0112-20100415",
+            Some(jour("2010-04-15")),
+            &[art("1", "corps amendé"), art("2", "stable")],
+        );
+        let json = h.into_json();
+        assert_eq!(json.len(), 2);
+        let un = &json[0]["versions"];
+        assert_eq!(un.as_array().map(Vec::len), Some(2));
+        assert_eq!(un[0]["date_debut"], "2006-11-28");
+        assert_eq!(un[0]["date_fin"], "2010-04-14");
+        assert_eq!(un[1]["date_debut"], "2010-04-15");
+        assert!(un[1]["date_fin"].is_null());
+        // Two consolidations, an unchanged body: one open version.
+        assert_eq!(json[1]["versions"].as_array().map(Vec::len), Some(1));
+        assert!(json[1]["versions"][0]["date_fin"].is_null());
+    }
+
+    /// Spec: an article a snapshot no longer carries closes its version and
+    /// keeps its history; an empty shell reads as `ABROGE`.
+    #[test]
+    fn apply_ferme_l_article_disparu_et_date_l_abrogation() {
+        let mut h = History::default();
+        h.apply(
+            "32006L0112",
+            Some(jour("2006-11-28")),
+            &[art("1", "corps"), art("2", "corps")],
+        );
+        h.apply(
+            "02006L0112-20070101",
+            Some(jour("2007-01-01")),
+            &[art("1", "corps"), art("2", "")],
+        );
+        h.apply(
+            "02006L0112-20100415",
+            Some(jour("2010-04-15")),
+            &[art("1", "corps")],
+        );
+        let json = h.into_json();
+        let deux = json
+            .iter()
+            .find(|a| a["num"] == "2")
+            .expect("l'article disparu garde son historique");
+        assert_eq!(deux["versions"].as_array().map(Vec::len), Some(2));
+        assert_eq!(deux["versions"][0]["date_fin"], "2006-12-31");
+        assert_eq!(deux["versions"][1]["status"], "ABROGE");
+        assert_eq!(deux["versions"][1]["date_fin"], "2010-04-14");
     }
 
     #[test]

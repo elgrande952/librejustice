@@ -68,6 +68,7 @@ const RICH_PREDICATES: &[&str] = &[
     "case-law_national-judgement",
     "case-law_uses_procedure_language",
     "resource_legal_uses_originally_language",
+    "case-law_joins_case_court",
     "work_cites_work",
     "case-law_interpretes_resource_legal",
     "case-law_published_in_erecueil",
@@ -100,13 +101,46 @@ SELECT DISTINCT ?celex ?date ?ecli WHERE {{\n\
 /// (subject-matter, juge rapporteur / AG / formation, `work_cites_work`,
 /// `interpretes_resource_legal`, procédure, pays de renvoi…), que la liste paginée
 /// ne fournit pas. Le work est désigné par son `resource_legal_id_celex`.
+///
+/// `case-law_joins_case_court` takes a branch of its own: its object is
+/// sometimes a URI bearing the case number, sometimes a cellar UUID bearing
+/// none, and only the case resource holds the `dossier_identifier` that names
+/// it. Without that hop one link in six names nothing (1,606 of 9,315, measured
+/// 08/09/2026).
 fn work_describe_sparql(celex: &str) -> String {
     format!(
         "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
 SELECT ?p ?o WHERE {{\n\
   ?work cdm:resource_legal_id_celex \"{celex}\"^^<http://www.w3.org/2001/XMLSchema#string> .\n\
-  ?work ?p ?o .\n\
+  {{ ?work ?p ?o . FILTER(?p != cdm:case-law_joins_case_court) }}\n\
+  UNION\n\
+  {{ ?work cdm:case-law_joins_case_court ?case .\n\
+     OPTIONAL {{ ?case cdm:dossier_identifier ?id }}\n\
+     BIND(cdm:case-law_joins_case_court AS ?p)\n\
+     BIND(COALESCE(?id, STR(?case)) AS ?o) }}\n\
 }}"
+    )
+}
+
+/// Joined cases of one CELEX year: `?celex` is the work that judges, `?joint` the
+/// case it settles with it, in the same shape as [`work_describe_sparql`]. Feeds
+/// the catch-up over the already ingested corpus, which the per-CELEX describe
+/// does not replay.
+///
+/// The year is what partitions the sweep, and it is not a convenience: Virtuoso
+/// refuses a sorted query whose `OFFSET + LIMIT` passes 10,000, and the relation
+/// held 9,315 links on 08/09/2026, so an unpartitioned sweep dies at the second
+/// page of a corpus barely larger than today's.
+pub fn joined_cases_sparql(year: i32, offset: usize, limit: usize) -> String {
+    format!(
+        "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
+SELECT ?celex ?joint WHERE {{\n\
+  ?work cdm:case-law_joins_case_court ?case .\n\
+  ?work cdm:resource_legal_id_celex ?celex .\n\
+  FILTER(STRSTARTS(STR(?celex), \"6{year}\"))\n\
+  OPTIONAL {{ ?case cdm:dossier_identifier ?id }}\n\
+  BIND(COALESCE(?id, STR(?case)) AS ?joint)\n\
+}}\nORDER BY ?celex ?joint\nOFFSET {offset}\nLIMIT {limit}"
     )
 }
 
@@ -183,10 +217,11 @@ SELECT DISTINCT ?celex ?end WHERE {{\n\
 /// `RECO`, `CORRIGENDUM` and the budgets.
 const LEGISLATION_TYPES: &[&str] = &["REG", "DIR", "REG_IMPL", "REG_DEL", "DIR_IMPL", "DIR_DEL"];
 
-/// SPARQL listing of one year of secondary law (sector 3), FR title and document
-/// date included. The title is joined here rather than asked act by act: a page
-/// of 1,000 comes back in ~0.6 s, a thousand notices cost a thousand requests.
-fn legislation_page_sparql(year: i32, offset: usize, limit: usize) -> String {
+/// SPARQL listing of secondary law (sector 3) matching `filter` on `?work`, FR
+/// title and document date included. The title is joined here rather than asked
+/// act by act: a page of 1,000 comes back in ~0.6 s, a thousand notices cost a
+/// thousand requests.
+fn legislation_sparql(filter: &str, offset: usize, limit: usize) -> String {
     let types = LEGISLATION_TYPES
         .iter()
         .map(|t| format!("<http://publications.europa.eu/resource/authority/resource-type/{t}>"))
@@ -201,12 +236,98 @@ SELECT DISTINCT ?celex ?date ?title WHERE {{\n\
   ?work cdm:resource_legal_id_celex ?celex .\n\
   FILTER(STRSTARTS(STR(?celex), \"3\") && !CONTAINS(STR(?celex), \"R(\"))\n\
   ?work cdm:work_date_document ?date .\n\
-  FILTER(?date >= \"{year}-01-01\"^^xsd:date && ?date < \"{next}-01-01\"^^xsd:date)\n\
+  {filter}\n\
   ?exp cdm:expression_belongs_to_work ?work .\n\
   ?exp cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/FRA> .\n\
   ?exp cdm:expression_title ?title .\n\
+}}\nORDER BY ?celex\nOFFSET {offset}\nLIMIT {limit}"
+    )
+}
+
+/// One year of the registry, by document date: the partition of the full sweep,
+/// a year staying under the OFFSET cap of 10,000.
+fn legislation_page_sparql(year: i32, offset: usize, limit: usize) -> String {
+    legislation_sparql(
+        &format!(
+            "FILTER(?date >= \"{year}-01-01\"^^xsd:date && ?date < \"{next}-01-01\"^^xsd:date)",
+            next = year + 1
+        ),
+        offset,
+        limit,
+    )
+}
+
+/// The acts CELLAR registered since `since` (AAAA-MM-JJ, inclusive). Keyed on
+/// the registration and not on the document date, which precedes the OJ
+/// publication by up to a year (32026R0144, dated 14/01/2025, published
+/// 21/01/2026). The property is on every act of the six types.
+fn legislation_since_sparql(since: &str, offset: usize, limit: usize) -> String {
+    legislation_sparql(
+        &format!(
+            "?work cdm:work_date_creation_legacy ?created .\n  \
+             FILTER(?created >= \"{since}\"^^xsd:date)"
+        ),
+        offset,
+        limit,
+    )
+}
+
+/// One year of the registry acts whose FR expression has a Formex 4
+/// manifestation, the only ones `formex_act_fr` can read a base act from.
+fn formex_fr_sparql(year: i32, offset: usize, limit: usize) -> String {
+    let types = LEGISLATION_TYPES
+        .iter()
+        .map(|t| format!("<http://publications.europa.eu/resource/authority/resource-type/{t}>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+SELECT DISTINCT ?celex WHERE {{\n\
+  ?work cdm:work_has_resource-type ?type .\n\
+  VALUES ?type {{ {types} }}\n\
+  ?work cdm:resource_legal_id_celex ?celex .\n\
+  FILTER(STRSTARTS(STR(?celex), \"3\") && !CONTAINS(STR(?celex), \"R(\"))\n\
+  ?work cdm:work_date_document ?date .\n\
+  FILTER(?date >= \"{year}-01-01\"^^xsd:date && ?date < \"{next}-01-01\"^^xsd:date)\n\
+  ?exp cdm:expression_belongs_to_work ?work .\n\
+  ?exp cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/FRA> .\n\
+  ?manif cdm:manifestation_manifests_expression ?exp .\n\
+  ?manif cdm:manifestation_type \"fmx4\"^^xsd:string .\n\
 }}\nORDER BY ?celex\nOFFSET {offset}\nLIMIT {limit}",
         next = year + 1
+    )
+}
+
+/// Base CELEX (sector 3) of every regulation or directive that has a
+/// consolidated series: ~7,600 bases on 26/09/2026, under the OFFSET cap.
+fn consolidated_bases_sparql(offset: usize, limit: usize) -> String {
+    format!(
+        "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
+SELECT DISTINCT ?base WHERE {{\n\
+  ?w cdm:act_consolidated_date ?v .\n\
+  ?w cdm:resource_legal_id_celex ?celex .\n\
+  FILTER(STRSTARTS(STR(?celex), \"0\"))\n\
+  BIND(CONCAT(\"3\", SUBSTR(STRBEFORE(STR(?celex), \"-\"), 2)) AS ?base)\n\
+  FILTER(REGEX(?base, \"^3[0-9]{{4}}[RL]\"))\n\
+}}\nORDER BY ?base\nOFFSET {offset}\nLIMIT {limit}"
+    )
+}
+
+/// FR Formex 4 manifestation of a base act. The CELEX alias
+/// `{celex}.FRA.fmx4` answers 404 for base acts, the OJ publishing act by act
+/// under its own alias (`resource/oj/L_202302831.FRA.fmx4`); a consolidated
+/// version still resolves through it.
+fn formex_manifestation_sparql(celex: &str) -> String {
+    format!(
+        "PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>\n\
+SELECT ?manif WHERE {{\n\
+  ?work cdm:resource_legal_id_celex \"{celex}\"^^<http://www.w3.org/2001/XMLSchema#string> .\n\
+  ?exp cdm:expression_belongs_to_work ?work .\n\
+  ?exp cdm:expression_uses_language <http://publications.europa.eu/resource/authority/language/FRA> .\n\
+  ?manif cdm:manifestation_manifests_expression ?exp .\n\
+  ?manif cdm:manifestation_type \"fmx4\"^^<http://www.w3.org/2001/XMLSchema#string> .\n\
+}} LIMIT 1"
     )
 }
 
@@ -291,7 +412,7 @@ impl CjueClient {
                 // Erreur d'envoi (timeout, connexion coupée) = transitoire : on réessaie sur une
                 // connexion neuve tant qu'il reste des tentatives.
                 Err(e) if attempt + 1 < CJUE_RETRIES => {
-                    tracing::warn!(what, attempt, error = %e, "requête eur-lex échouée (envoi/timeout), retry");
+                    tracing::warn!(what, attempt, error = %e, "eur-lex request failed (send/timeout), retry");
                     continue;
                 }
                 Err(e) => return Err(SourceError::Invalid(format!("requête {what}: {e}"))),
@@ -339,8 +460,24 @@ impl CjueClient {
         year: i32,
         offset: usize,
     ) -> Result<Vec<(String, String, String)>> {
+        self.legislation_query(legislation_page_sparql(year, offset, PAGE_SIZE))
+            .await
+    }
+
+    /// One page of the acts registered since `since`, same shape as
+    /// [`Self::legislation_page`].
+    pub async fn legislation_since_page(
+        &self,
+        since: &str,
+        offset: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        self.legislation_query(legislation_since_sparql(since, offset, PAGE_SIZE))
+            .await
+    }
+
+    async fn legislation_query(&self, query: String) -> Result<Vec<(String, String, String)>> {
         let params: [(&str, String); 2] = [
-            ("query", legislation_page_sparql(year, offset, PAGE_SIZE)),
+            ("query", query),
             ("format", "application/sparql-results+json".to_string()),
         ];
         let (status, text) = self
@@ -373,6 +510,73 @@ impl CjueClient {
         Ok(out)
     }
 
+    /// Base CELEX of every act a probe can find a Formex for: its base act has
+    /// a FR Formex 4 manifestation, or it has a consolidated series. One SPARQL
+    /// listing per year, where probing an act without costs a notice and a
+    /// manifestation request each.
+    pub async fn acts_with_formex(
+        &self,
+        years: std::ops::RangeInclusive<i32>,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        for year in years {
+            let mut offset = 0usize;
+            loop {
+                let page = self
+                    .sparql_column(formex_fr_sparql(year, offset, PAGE_SIZE), "celex")
+                    .await?;
+                let pleine = page.len() >= PAGE_SIZE;
+                out.extend(page);
+                if !pleine {
+                    break;
+                }
+                offset += PAGE_SIZE;
+            }
+        }
+        let mut offset = 0usize;
+        loop {
+            let page = self
+                .sparql_column(consolidated_bases_sparql(offset, PAGE_SIZE), "base")
+                .await?;
+            let pleine = page.len() >= PAGE_SIZE;
+            out.extend(page);
+            if !pleine {
+                break;
+            }
+            offset += PAGE_SIZE;
+        }
+        Ok(out)
+    }
+
+    async fn sparql_column(&self, query: String, var: &str) -> Result<Vec<String>> {
+        let params: [(&str, String); 2] = [
+            ("query", query),
+            ("format", "application/sparql-results+json".to_string()),
+        ];
+        let (status, text) = self
+            .get_with_retry(
+                &self.sparql_url,
+                &params,
+                "application/sparql-results+json",
+                None,
+                "sparql formex",
+            )
+            .await?;
+        if status != 200 {
+            return Err(SourceError::Invalid(format!(
+                "eur-lex sparql formex statut {status}: {}",
+                text.chars().take(200).collect::<String>()
+            )));
+        }
+        let page: Value = sonic_rs::from_str(&text)?;
+        Ok(page["results"]["bindings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row[var]["value"].as_str().map(str::to_string))
+            .collect())
+    }
+
     /// Date à laquelle chaque acte cesse d'être en vigueur, par CELEX de base ;
     /// absent = sans terme. La clôture d'un acte est un **ensemble** qu'on
     /// demande d'un coup — 3 740 CELEX en ~6 s, là où la même réponse coûte
@@ -390,6 +594,11 @@ impl CjueClient {
     ) -> Result<std::collections::HashMap<String, NaiveDate>> {
         let mut ends = std::collections::HashMap::new();
         let mut sans_terme = std::collections::HashSet::new();
+        // A CELEX twice in one `VALUES` stalls CELLAR's Virtuoso: 11 s for a
+        // lone pair, past the 120 s timeout inside a chunk of 150.
+        let mut bases = bases.to_vec();
+        bases.sort_unstable();
+        bases.dedup();
         for chunk in bases.chunks(VALIDITY_CHUNK) {
             let params: [(&str, String); 2] = [
                 ("query", validity_sparql(chunk)),
@@ -417,49 +626,42 @@ impl CjueClient {
         Ok(ends)
     }
 
-    /// Texte d'un CELEX, **FR-prioritaire avec repli EN**. Pour chaque langue (`fra`
-    /// puis `eng`), cascade d'`Accept` (xhtml puis html). Renvoie `Ok(Some((texte,
-    /// lang)))` dès qu'une rendition 200 est servie (`lang` = code obtenu, tracé sur la
-    /// décision) ; `Ok(None)` si ni FR ni EN n'est disponible (404/406/3xx partout →
-    /// SKIP, l'affaire n'est pas publiée dans une de nos deux langues). Une autre
-    /// erreur HTTP remonte franchement.
-    pub async fn resource_text(&self, celex: &str) -> Result<Option<(String, &'static str)>> {
+    /// Text of a CELEX in one language (`lang`, Publications Office code in
+    /// lowercase: `fra`, `deu`…), through the `Accept` cascade (xhtml then html).
+    /// `Ok(None)` when no rendition is served in that language (404/406/3xx);
+    /// any other HTTP status is an error.
+    pub async fn resource_text_in(&self, celex: &str, lang: &str) -> Result<Option<String>> {
         let url = format!("{}/{celex}", self.resource_base);
-        for lang in ["fra", "eng"] {
-            let mut last_status = 0u16;
-            for accept in ACCEPT_CASCADE {
-                let (status, text) = self
-                    .get_with_retry(
-                        &url,
-                        &[],
-                        accept,
-                        Some(lang),
-                        &format!("eur-lex resource {url} ({lang})"),
-                    )
-                    .await?;
-                if status == 200 {
-                    return Ok(Some((strip_html(&text), lang)));
-                }
-                last_status = status;
-                // 404/406 = pas de rendition dans cette langue pour cet `Accept`. 3xx (notamment
-                // 300 Multiple Choices) = EUR-Lex ne sert pas une représentation unique pour ce
-                // CELEX. Dans les deux cas on poursuit : cascade d'`Accept` puis langue suivante.
-                // Tout autre statut (4xx auth/bad-request…) reste une erreur franche.
-                let skippable = status == 404 || status == 406 || (300..400).contains(&status);
-                if !skippable {
-                    return Err(SourceError::Invalid(format!(
-                        "eur-lex resource statut {status} {celex} (accept={accept}, lang={lang})"
-                    )));
-                }
+        let mut last_status = 0u16;
+        for accept in ACCEPT_CASCADE {
+            let (status, text) = self
+                .get_with_retry(
+                    &url,
+                    &[],
+                    accept,
+                    Some(lang),
+                    &format!("eur-lex resource {url} ({lang})"),
+                )
+                .await?;
+            if status == 200 {
+                return Ok(Some(strip_html(&text)));
             }
-            if last_status != 404 && last_status != 406 {
-                tracing::warn!(
-                    celex,
-                    lang,
-                    status = last_status,
-                    "eur-lex resource sans rendition unique (3xx/non-404)"
-                );
+            last_status = status;
+            // 3xx (notably 300 Multiple Choices): EUR-Lex serves no single representation.
+            let skippable = status == 404 || status == 406 || (300..400).contains(&status);
+            if !skippable {
+                return Err(SourceError::Invalid(format!(
+                    "eur-lex resource statut {status} {celex} (accept={accept}, lang={lang})"
+                )));
             }
+        }
+        if last_status != 404 && last_status != 406 {
+            tracing::warn!(
+                celex,
+                lang,
+                status = last_status,
+                "eur-lex resource without a single rendition (3xx/non-404)"
+            );
         }
         Ok(None)
     }
@@ -490,6 +692,30 @@ impl CjueClient {
         }
         let raw: Value = sonic_rs::from_str(&text)?;
         Ok(map_predicates(&raw))
+    }
+
+    /// One raw page of [`joined_cases_sparql`].
+    pub async fn joined_cases_page(&self, year: i32, offset: usize, limit: usize) -> Result<Value> {
+        let params: [(&str, String); 2] = [
+            ("query", joined_cases_sparql(year, offset, limit)),
+            ("format", "application/sparql-results+json".to_string()),
+        ];
+        let (status, text) = self
+            .get_with_retry(
+                &self.sparql_url,
+                &params,
+                "application/sparql-results+json",
+                None,
+                &format!("sparql affaires jointes {year} offset={offset}"),
+            )
+            .await?;
+        if status != 200 {
+            return Err(SourceError::Invalid(format!(
+                "eur-lex sparql affaires jointes {year} offset={offset} statut {status}: {}",
+                text.chars().take(200).collect::<String>()
+            )));
+        }
+        Ok(sonic_rs::from_str(&text)?)
     }
 
     /// Métadonnées FR d'un acte législatif UE par CELEX : titre officiel français +
@@ -612,9 +838,28 @@ impl CjueClient {
     /// `<ARTICLE>`) first, then the annex volumes (`<ANNEX>`) a base act
     /// publishes as separate documents; a consolidated one carries its own
     /// inline, as `<CONS.ANNEX>`. Empty: no manifestation (pre-Formex act,
-    /// purely amending directive) or an act document with no article.
+    /// purely amending directive), an act document with no article, or an item
+    /// CELLAR does not serve.
+    ///
+    /// One unserved item abandons the manifestation instead of returning what
+    /// came through: the caller dates what it reads, and a half-fetched form
+    /// would close the articles that merely failed to download. Old consolidated
+    /// versions answer 500 item after item, ~40 s each, 22 min on
+    /// `01997L0017-20070101` before the loop was cut short.
     pub async fn formex_act_fr(&self, celex: &str) -> Result<Vec<String>> {
-        let url = format!("{}/{celex}.FRA.fmx4", self.resource_base);
+        let url = if celex.starts_with('3') {
+            match self
+                .sparql_column(formex_manifestation_sparql(celex), "manif")
+                .await?
+                .into_iter()
+                .next()
+            {
+                Some(manif) => manif,
+                None => return Ok(Vec::new()),
+            }
+        } else {
+            format!("{}/{celex}.FRA.fmx4", self.resource_base)
+        };
         let (status, rdf) = self
             .get_with_retry(
                 &url,
@@ -649,8 +894,13 @@ impl CjueClient {
                 .get_bytes_with_retry(doc, &format!("cellar item {doc}"))
                 .await?;
             if status != 200 {
-                tracing::warn!(celex, doc, status, "item cellar non servi, ignoré");
-                continue;
+                tracing::warn!(
+                    celex,
+                    doc,
+                    status,
+                    "cellar item not served, manifestation dropped"
+                );
+                return Ok(Vec::new());
             }
             let bodies = if bytes.starts_with(b"PK") {
                 zip_xml_members(&bytes)?
@@ -691,7 +941,7 @@ impl CjueClient {
             let resp = match req.send().await {
                 Ok(resp) => resp,
                 Err(e) if attempt + 1 < CJUE_RETRIES => {
-                    tracing::warn!(what, attempt, error = %e, "requête cellar échouée (envoi/timeout), retry");
+                    tracing::warn!(what, attempt, error = %e, "cellar request failed (send/timeout), retry");
                     continue;
                 }
                 Err(e) => return Err(SourceError::Invalid(format!("requête {what}: {e}"))),
@@ -768,6 +1018,36 @@ pub fn parse_sparql(resp: &Value) -> Vec<CjueResult> {
     out
 }
 
+/// Groups a [`joined_cases_sparql`] page into `(celex, joined cases)`, in the
+/// order the response gives, duplicates dropped. The values are what
+/// `case-law_joins_case_court` carries in `source_fields`, so the catch-up
+/// writes exactly what the ingest would have written.
+pub fn parse_joined_cases(resp: &Value) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let Some(bindings) = resp["results"]["bindings"].as_array() else {
+        return out;
+    };
+    for b in bindings {
+        let (Some(celex), Some(joint)) =
+            (b["celex"]["value"].as_str(), b["joint"]["value"].as_str())
+        else {
+            continue;
+        };
+        if celex.is_empty() || joint.is_empty() {
+            continue;
+        }
+        match out.iter_mut().find(|(c, _)| c == celex) {
+            Some((_, joints)) => {
+                if !joints.iter().any(|j| j == joint) {
+                    joints.push(joint.to_string());
+                }
+            }
+            None => out.push((celex.to_string(), vec![joint.to_string()])),
+        }
+    }
+    out
+}
+
 /// Nom local d'un prédicat CDM (`…/cdm#case-law_ecli` → `case-law_ecli`,
 /// `…22-rdf-syntax-ns#type` → `type`). Queue après `#`, repli sur le dernier
 /// segment de chemin.
@@ -789,6 +1069,16 @@ fn authority_code_or_uri(uri: &str) -> String {
         }
     }
     uri.to_string()
+}
+
+/// Shape a predicate takes in `source_fields`: scalar on a single value, JSON
+/// array beyond. The catch-up over the corpus writes through here, so it cannot
+/// hand `parse_cjue` a shape the ingest never produces.
+pub fn predicate_value(mut vals: Vec<String>) -> Value {
+    match vals.len() {
+        1 => Value::String(vals.pop().expect("len==1")),
+        _ => Value::Array(vals.into_iter().map(Value::String).collect()),
+    }
 }
 
 /// Mappe le dump SPARQL `?p ?o` d'un work en `source_fields` lisibles. Ne retient
@@ -829,13 +1119,8 @@ pub fn map_predicates(resp: &Value) -> Value {
         }
     }
     let mut out = Map::new();
-    for (key, mut vals) in collected {
-        let v = if vals.len() == 1 {
-            J::String(vals.pop().expect("len==1"))
-        } else {
-            J::Array(vals.into_iter().map(J::String).collect())
-        };
-        out.insert(key, v);
+    for (key, vals) in collected {
+        out.insert(key, predicate_value(vals));
     }
     J::Object(out)
 }
@@ -914,6 +1199,15 @@ pub struct EuLawManifest {
     /// re-sondées à échéance puis remplacées par ce que la notice du jour dit.
     #[serde(default)]
     pub pending: std::collections::BTreeMap<String, Vec<String>>,
+    /// Inclusive bound (AAAA-MM-JJ) of the next registry delta of
+    /// `sync-eu-catalog`; absent, the registry is swept whole.
+    #[serde(default)]
+    pub catalog_since: Option<String>,
+    /// Day each act (CELEX base) was last probed with an answer, Formex or none.
+    /// The weekly net skips a visited act no longer in force, which the daily
+    /// delta still sees if a consolidation appears.
+    #[serde(default)]
+    pub visited: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub fetched_at: Option<String>,
 }
@@ -1186,7 +1480,9 @@ mod tests {
         );
         assert_eq!(
             m["case-law_delivered_by_judge"],
-            json!("http://publications.europa.eu/resource/cellar/6bc92600-f3ca-4c3d-b588-d733c0128593")
+            json!(
+                "http://publications.europa.eu/resource/cellar/6bc92600-f3ca-4c3d-b588-d733c0128593"
+            )
         );
         assert_eq!(
             m["work_cites_work"],
@@ -1197,7 +1493,9 @@ mod tests {
         );
         assert_eq!(
             m["case-law_interpretes_resource_legal"],
-            json!("http://publications.europa.eu/resource/cellar/b81af559-84bd-45b3-9d0e-c3f70a22516e")
+            json!(
+                "http://publications.europa.eu/resource/cellar/b81af559-84bd-45b3-9d0e-c3f70a22516e"
+            )
         );
         assert_eq!(m["case-law_published_in_erecueil"], json!("1"));
         assert_eq!(
@@ -1248,6 +1546,17 @@ Notion de \u{201c}mineur non accompagné\u{201d} » Dans l'affaire C-560/20, aya
         assert!(q.contains("cdm:act_consolidated_date"));
         assert!(q.contains(&format!("LIMIT {CONSOLIDATIONS_LIMIT}")));
         assert!(q.contains("DISTINCT"));
+    }
+
+    #[test]
+    fn registry_delta_keys_on_registration_not_document_date() {
+        let q = legislation_since_sparql("2026-08-27", 1000, PAGE_SIZE);
+        assert!(q.contains("cdm:work_date_creation_legacy ?created"));
+        assert!(q.contains("?created >= \"2026-08-27\"^^xsd:date"));
+        assert!(!q.contains("?date >="));
+        assert!(q.contains("OFFSET 1000"));
+        let y = legislation_page_sparql(2024, 0, PAGE_SIZE);
+        assert!(y.contains("?date >= \"2024-01-01\"^^xsd:date && ?date < \"2025-01-01\""));
     }
 
     #[test]

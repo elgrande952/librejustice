@@ -33,11 +33,11 @@ pub fn AuthorizeMcpPage() -> impl IntoView {
     };
 
     view! {
-        <Title text="Autoriser l'accès MCP - LibreJustice" />
+        <Title text="Autoriser l'accès - LibreJustice" />
         <Meta name="robots" content="noindex" />
         <div class="mx-auto flex max-w-sm flex-col gap-8 px-4 py-16">
             <div class="flex flex-col gap-2">
-                <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Autoriser l'accès MCP"</h1>
+                <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Autoriser l'accès"</h1>
                 <p class="text-sm text-[var(--color-ink-muted)]">
                     <Suspense fallback=move || annonce(None)>
                         {move || declare.get().map(annonce)}
@@ -51,6 +51,7 @@ pub fn AuthorizeMcpPage() -> impl IntoView {
                 <ul class="mt-2 list-inside list-disc">
                     <li>"Recherche dans les décisions de justice"</li>
                     <li>"Lecture du texte intégral des décisions"</li>
+                    <li>"Votre adresse e-mail"</li>
                 </ul>
             </div>
 
@@ -86,8 +87,9 @@ pub fn AuthorizeMcpPage() -> impl IntoView {
 async fn nom_client(client_id: String) -> Option<String> {
     #[cfg(feature = "ssr")]
     {
-        let state = use_context::<lj_api::state::AppState>()?;
-        lj_api::oauth::client_name(&state, &client_id).await.ok()?
+        crate::api::ApiClient::from_context()
+            .oauth_client_name(&client_id)
+            .await
     }
     #[cfg(not(feature = "ssr"))]
     {

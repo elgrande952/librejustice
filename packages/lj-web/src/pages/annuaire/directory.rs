@@ -1,29 +1,30 @@
-//! Page `/annuaire/{kind}` : listing paginé d'une catégorie, trié par contentieux
-//! décroissant (côté API). Filtre barreau pour les avocats. Gabarit rail +
-//! contenu commun (cf. `pages::annuaire`) : rail des catégories dans la gouttière
-//! gauche, chips de catégories en mobile. Rendu SSR crawlable
-//! (`PartiallyBlocked`) : head (title / description / canonical, `noindex`
-//! au-delà de la page 1) + listing **bloquant** dans le HTML initial. Catégorie
-//! inconnue ⇒ 404 doux (noindex).
+//! Page `/entity-index/{juris}/{kind}`: a paginated listing for legal persons, blocking in
+//! the SSR HTML and `noindex` past page 1.
+//!
+//! [`Kind::names_natural_persons`] takes the other branch: a name search with no
+//! listing, `noindex` from page 1. SSR is anonymous there, so the API refuses it
+//! and results only load from the client, where the session cookie rides along.
 
-use leptos::either::Either;
+use leptos::either::EitherOf3;
 use leptos::prelude::*;
 use leptos_meta::{Link, Meta, Title};
 use leptos_router::components::A;
 use leptos_router::hooks::{use_params_map, use_query_map};
-use lj_dtos::EntityDirectoryResponse;
+use lj_dtos::{EntityDirectoryItemDto, EntityDirectoryResponse};
 
 use crate::components::layout::{CONTENT_COL, GRID_2COL, SHELL};
 use crate::components::own_page_description;
 use crate::helpers::group_thousands;
+#[cfg(feature = "hydrate")]
+use crate::pages::annuaire::common::fetch_named;
 use crate::pages::annuaire::common::{
     category_chips, entity_row, fetch_directory, list_skeleton, max_decision_count, stats_resource,
-    status_note, AnnuaireRail, Kind, MAX_PAGES, PAGE_SIZE,
+    status_note, AnnuaireRail, Kind, MAX_PAGES, PAGE_SIZE, SEARCH_MIN_QUERY,
 };
 use crate::pages::decision_page::data::{sendable, PageError};
 use crate::seo::CANONICAL_BASE;
 
-/// Slug `kind` de la route `/annuaire/:kind`.
+/// Slug `kind` de la route `/entity-index/:juris/:kind`.
 fn kind_slug() -> Signal<String> {
     let params = use_params_map();
     Signal::derive(move || params.read().get("kind").unwrap_or_default())
@@ -42,16 +43,10 @@ fn page_param() -> Signal<i64> {
     })
 }
 
-/// Filtre barreau depuis `?barreau=` (vide si absent).
-fn barreau_param() -> Signal<Option<String>> {
+/// Name search term from `?q=`, empty when absent.
+fn query_term() -> Signal<String> {
     let query = use_query_map();
-    Signal::derive(move || {
-        query
-            .read()
-            .get("barreau")
-            .map(|b| b.trim().to_string())
-            .filter(|b| !b.is_empty())
-    })
+    Signal::derive(move || query.read().get("q").unwrap_or_default().trim().to_string())
 }
 
 #[component]
@@ -60,22 +55,19 @@ pub fn AnnuaireDirectoryPage() -> impl IntoView {
 
     let slug = kind_slug();
     let page = page_param();
-    let barreau = barreau_param();
+    let term = query_term();
 
     move || match Kind::from_slug(&slug.get()) {
-        Some(kind) => {
-            Either::Left(view! { <DirectoryLoaded kind=kind page=page barreau=barreau /> })
+        Some(kind) if kind.names_natural_persons() => {
+            EitherOf3::A(view! { <NamedSearchPage kind=kind term=term /> })
         }
-        None => Either::Right(view! { <DirectoryUnknown /> }),
+        Some(kind) => EitherOf3::B(view! { <DirectoryLoaded kind=kind page=page /> }),
+        None => EitherOf3::C(view! { <DirectoryUnknown /> }),
     }
 }
 
 #[component]
-fn DirectoryLoaded(
-    kind: Kind,
-    page: Signal<i64>,
-    barreau: Signal<Option<String>>,
-) -> impl IntoView {
+fn DirectoryLoaded(kind: Kind, page: Signal<i64>) -> impl IntoView {
     let stats = stats_resource();
     let title = format!("Annuaire des {} - LibreJustice", plural_lower(kind));
     let description = format!(
@@ -84,7 +76,7 @@ fn DirectoryLoaded(
         kind.plural(),
         kind.tagline()
     );
-    let base = format!("{CANONICAL_BASE}/annuaire/{}", kind.slug());
+    let base = format!("{CANONICAL_BASE}/entity-index/fr/{}", kind.slug());
     let canonical = base.clone();
     // Convention listing : indexer la page 1, `noindex` au-delà.
     let robots = move || (page.get() > 1).then_some("noindex");
@@ -106,7 +98,7 @@ fn DirectoryLoaded(
                     <header class="flex flex-col gap-2">
                         <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
                             <A
-                                href="/annuaire"
+                                href="/entity-search"
                                 attr:class="text-[var(--color-ink-subtle)] no-underline hover:text-[var(--color-accent)]"
                             >
                                 "Annuaire"
@@ -118,71 +110,27 @@ fn DirectoryLoaded(
 
                     {category_chips(Some(kind))}
 
-                    {kind.has_barreau_filter().then(|| view! { <BarreauFilter kind=kind barreau=barreau /> })}
-
-                    <DirectoryList kind=kind page=page barreau=barreau />
+                    <DirectoryList kind=kind page=page />
                 </div>
             </div>
         </div>
     }
 }
 
-/// Filtre barreau (avocats) : formulaire GET natif vers `/annuaire/avocats`.
+/// Blocking listing: in the initial HTML so a crawler reads it, reloaded on each
+/// `?page=`.
 #[component]
-fn BarreauFilter(kind: Kind, barreau: Signal<Option<String>>) -> impl IntoView {
-    let action = format!("/annuaire/{}", kind.slug());
-    let clear_href = action.clone();
-    view! {
-        <div class="flex flex-wrap items-center gap-2">
-            <form method="get" action=action role="search" class="flex min-w-0 flex-1 gap-2">
-                <input
-                    type="search"
-                    name="barreau"
-                    value=move || barreau.get().unwrap_or_default()
-                    placeholder="Filtrer par barreau (ex. « paris »)…"
-                    autocomplete="off"
-                    aria-label="Filtrer par barreau"
-                    class="min-w-0 flex-1 rounded-lg border border-[var(--color-rule)] bg-[var(--color-parchment)] px-4 py-2 text-sm text-[var(--color-ink)] outline-none focus:border-[var(--color-accent)]"
-                />
-                <button
-                    type="submit"
-                    class="shrink-0 rounded-lg border border-[var(--color-rule)] px-4 py-2 text-sm text-[var(--color-ink-muted)] transition-colors hover:border-[var(--color-ink)] hover:text-[var(--color-ink)]"
-                >
-                    "Filtrer"
-                </button>
-            </form>
-            {move || {
-                barreau
-                    .get()
-                    .map(|_| {
-                        view! {
-                            <A
-                                href=clear_href.clone()
-                                attr:class="shrink-0 text-sm text-[var(--color-ink-subtle)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
-                            >
-                                "Réinitialiser"
-                            </A>
-                        }
-                    })
-            }}
-        </div>
-    }
-}
-
-/// Listing paginé, bloquant SSR (contenu dans le HTML initial, crawlable),
-/// rechargé à chaque `?page=` / `?barreau=`. Erreur API rendue en note sobre.
-#[component]
-fn DirectoryList(kind: Kind, page: Signal<i64>, barreau: Signal<Option<String>>) -> impl IntoView {
+fn DirectoryList(kind: Kind, page: Signal<i64>) -> impl IntoView {
     let slug = kind.slug();
     let listing = Resource::new_blocking(
-        move || (page.get(), barreau.get()),
-        move |(page, barreau)| sendable(fetch_directory(slug, barreau, page)),
+        move || page.get(),
+        move |page| sendable(fetch_directory(slug, page)),
     );
 
     view! {
         <Suspense fallback=list_skeleton>
             {move || Suspend::new(async move {
-                directory_view(listing.await, slug, page.get(), barreau.get())
+                directory_view(listing.await, slug, page.get())
             })}
         </Suspense>
     }
@@ -192,7 +140,6 @@ fn directory_view(
     result: Result<EntityDirectoryResponse, PageError>,
     slug: &'static str,
     page: i64,
-    barreau: Option<String>,
 ) -> AnyView {
     let response = match result {
         Ok(response) => {
@@ -223,7 +170,7 @@ fn directory_view(
         .into_iter()
         .map(|item| entity_row(item, max))
         .collect_view();
-    let pagination = pagination_view(slug, barreau.as_deref(), page, total_pages);
+    let pagination = pagination_view(slug, page, total_pages);
 
     view! {
         <p class="flex flex-wrap items-baseline gap-2 text-xs uppercase tracking-[0.14em] text-[var(--color-ink-subtle)]">
@@ -244,36 +191,12 @@ fn directory_view(
     .into_any()
 }
 
-/// Href d'une page en préservant le filtre barreau.
-fn page_href(slug: &str, barreau: Option<&str>, page: i64) -> String {
-    match barreau {
-        Some(b) => format!("/annuaire/{slug}?barreau={}&page={page}", encode_param(b)),
-        None => format!("/annuaire/{slug}?page={page}"),
-    }
-}
-
-/// Percent-encode minimal d'une valeur de query (espaces + caractères non
-/// `A-Za-z0-9-._~`). Suffisant pour un slug de barreau réinjecté dans un href.
-fn encode_param(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
+fn page_href(slug: &str, page: i64) -> String {
+    format!("/entity-index/fr/{slug}?page={page}")
 }
 
 /// Pagination `<A>` (précédent / position / suivant), SSR-friendly (`?page=`).
-fn pagination_view(
-    slug: &str,
-    barreau: Option<&str>,
-    page: i64,
-    total_pages: i64,
-) -> Option<AnyView> {
+fn pagination_view(slug: &str, page: i64, total_pages: i64) -> Option<AnyView> {
     if total_pages <= 1 {
         return None;
     }
@@ -281,7 +204,7 @@ fn pagination_view(
     let prev = (page > 1).then(|| {
         view! {
             <A
-                href=page_href(slug, barreau, page - 1)
+                href=page_href(slug, page - 1)
                 attr:class="inline-flex items-center gap-1 text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
             >
                 <span aria-hidden="true">"←"</span>
@@ -293,7 +216,7 @@ fn pagination_view(
     let next = (page < total_pages).then(|| {
         view! {
             <A
-                href=page_href(slug, barreau, page + 1)
+                href=page_href(slug, page + 1)
                 attr:class="inline-flex items-center gap-1 text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
             >
                 "Suivant"
@@ -319,6 +242,155 @@ fn pagination_view(
     )
 }
 
+/// `Loading` is what SSR renders: the request only fires on hydration, the one
+/// pass that carries the cookie.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "hydrate"), allow(dead_code))]
+enum NamedState {
+    Idle,
+    Loading,
+    Anonymous,
+    Failed(String),
+    Loaded(Vec<EntityDirectoryItemDto>),
+}
+
+#[cfg(feature = "hydrate")]
+fn spawn_named_search(slug: &'static str, q: String, state: RwSignal<NamedState>) {
+    leptos::task::spawn_local(async move {
+        match fetch_named(slug, q.clone()).await {
+            Ok(items) => {
+                crate::reads::report_entity_search(q);
+                state.set(NamedState::Loaded(items));
+            }
+            Err(err) if err.status == 401 => state.set(NamedState::Anonymous),
+            Err(err) => state.set(NamedState::Failed(err.message)),
+        }
+    });
+}
+
+#[cfg(not(feature = "hydrate"))]
+fn spawn_named_search(_slug: &'static str, _q: String, _state: RwSignal<NamedState>) {}
+
+fn named_results(kind: Kind, term: Signal<String>) -> RwSignal<NamedState> {
+    let state = RwSignal::new(NamedState::Idle);
+    let slug = kind.slug();
+    Effect::new(move |_| {
+        let q = term.get();
+        if q.chars().count() < SEARCH_MIN_QUERY {
+            state.set(NamedState::Idle);
+            return;
+        }
+        state.set(NamedState::Loading);
+        spawn_named_search(slug, q, state);
+    });
+    state
+}
+
+/// Natural-person category: name search, no listing.
+#[component]
+fn NamedSearchPage(kind: Kind, term: Signal<String>) -> impl IntoView {
+    let stats = stats_resource();
+    let state = named_results(kind, term);
+    let title = format!("Rechercher un {} - LibreJustice", singular_lower(kind));
+    let description = format!(
+        "Recherchez un {} par son nom dans la jurisprudence française. {}",
+        singular_lower(kind),
+        kind.tagline()
+    );
+    let canonical = format!("{CANONICAL_BASE}/entity-index/fr/{}", kind.slug());
+    let action = format!("/entity-index/fr/{}", kind.slug());
+    let login_href = format!("/login?next=%2Fannuaire%2F{}", kind.slug());
+    let placeholder = format!("Nom de l'{}…", singular_lower(kind));
+    let aria = format!("Rechercher un {} par son nom", singular_lower(kind));
+    let empty = format!(
+        "Aucun {} ne correspond à cette recherche.",
+        singular_lower(kind)
+    );
+
+    view! {
+        <Title text=title />
+        <Meta name="description" content=description />
+        <Link rel="canonical" href=canonical />
+        <Meta name="robots" content="noindex" />
+
+        <div class=format!("{SHELL} flex-1")>
+            <div class=GRID_2COL>
+                <div class="hidden lg:block">
+                    <AnnuaireRail current=kind stats=stats />
+                </div>
+                <div class=CONTENT_COL>
+                    <header class="flex flex-col gap-2">
+                        <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
+                            <A
+                                href="/entity-search"
+                                attr:class="text-[var(--color-ink-subtle)] no-underline hover:text-[var(--color-accent)]"
+                            >
+                                "Annuaire"
+                            </A>
+                        </p>
+                        <h1 class="font-sans text-3xl text-[var(--color-ink)]">{kind.plural()}</h1>
+                        <p class="max-w-prose text-[var(--color-ink-muted)]">
+                            "Cette catégorie ne se parcourt pas : les personnes physiques s'y "
+                            "cherchent par leur nom, depuis un compte."
+                        </p>
+                    </header>
+
+                    {category_chips(Some(kind))}
+
+                    <form method="get" action=action role="search" class="flex w-full gap-2">
+                        <input
+                            type="search"
+                            name="q"
+                            value=move || term.get()
+                            placeholder=placeholder
+                            autocomplete="off"
+                            aria-label=aria
+                            class="min-w-0 flex-1 rounded-lg border border-[var(--color-rule)] bg-[var(--color-parchment)] px-4 py-2.5 text-sm text-[var(--color-ink)] outline-none focus:border-[var(--color-accent)]"
+                        />
+                        <button
+                            type="submit"
+                            class="shrink-0 rounded-lg border border-[var(--color-accent)] bg-[var(--color-accent)] px-4 py-2.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                        >
+                            "Rechercher"
+                        </button>
+                    </form>
+
+                    {move || named_view(state.get(), &login_href, &empty)}
+                </div>
+            </div>
+        </div>
+    }
+}
+
+fn named_view(state: NamedState, login_href: &str, empty: &str) -> AnyView {
+    match state {
+        NamedState::Idle => status_note("Saisissez au moins deux caractères."),
+        NamedState::Loading => list_skeleton().into_any(),
+        NamedState::Anonymous => view! {
+            <p class="mt-4 text-sm text-[var(--color-ink-subtle)]">
+                <A
+                    href=login_href.to_string()
+                    attr:class="text-[var(--color-accent)] underline-offset-4 hover:underline"
+                >
+                    "Connectez-vous"
+                </A>
+                " pour lancer cette recherche."
+            </p>
+        }
+        .into_any(),
+        NamedState::Failed(message) => status_note(format!("Recherche indisponible ({message}).")),
+        NamedState::Loaded(items) if items.is_empty() => status_note(empty.to_string()),
+        NamedState::Loaded(items) => {
+            let max = max_decision_count(&items);
+            let rows = items
+                .into_iter()
+                .map(|item| entity_row(item, max))
+                .collect_view();
+            view! { <ul class="mt-4 flex flex-col gap-3">{rows}</ul> }.into_any()
+        }
+    }
+}
+
 /// Catégorie inconnue : 404 doux (message + noindex), parité `EntityError`.
 #[component]
 fn DirectoryUnknown() -> impl IntoView {
@@ -335,7 +407,7 @@ fn DirectoryUnknown() -> impl IntoView {
             </h1>
             <p class="mt-4 text-sm text-[var(--color-ink-muted)]">
                 <A
-                    href="/annuaire"
+                    href="/entity-search"
                     attr:class="text-[var(--color-accent)] underline-offset-4 hover:underline"
                 >
                     "Retour à l'annuaire"
@@ -385,6 +457,17 @@ fn set_cache_control(status: u16) {
 
 #[cfg(not(feature = "ssr"))]
 fn set_cache_control(_status: u16) {}
+
+/// Lowercase singular, for the title and the search labels.
+fn singular_lower(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Entreprises => "entreprise",
+        Kind::PersonnesPubliques => "personne publique",
+        Kind::Associations => "association",
+        Kind::Avocats => "avocat",
+        Kind::Cabinets => "cabinet d'avocats",
+    }
+}
 
 /// Nom pluriel minuscule pour le title (« annuaire des entreprises… »).
 fn plural_lower(kind: Kind) -> &'static str {

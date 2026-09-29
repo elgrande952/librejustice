@@ -1,8 +1,3 @@
--- Correctif de la 0159 : le champ usage_terms dans
--- legal_article_bm25 fausse la normalisation de longueur BM25 — Tantivy
--- calcule l'avgdl du champ sur TOUS les docs du segment (2,2 M, presque tous
--- vides) et écrase les gros sacs organiques. Le signal d'usage vit dans une
--- table dédiée avec son propre index (stats justes, le design validé au banc).
 DROP INDEX legal_article_bm25;
 ALTER TABLE legal_article DROP COLUMN usage_terms;
 CREATE INDEX legal_article_bm25 ON legal_article USING bm25 (

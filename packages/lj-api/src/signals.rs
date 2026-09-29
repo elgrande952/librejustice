@@ -47,12 +47,6 @@ pub const BASE_WEIGHTS: Weights = Weights {
     docket: 0.0,
 };
 
-/// Key-leg weight in `reference` mode, the only mode the leg enters. Above the
-/// sum of the three other legs, so the exact decision comes up, without
-/// crushing the fusion: the 4.1 % of numbers borne by more than thirty
-/// decisions are still separated by the title and the date.
-pub const PURE_REFERENCE_DOCKET_WEIGHT: f64 = 8.0;
-
 pub fn has_article_reference(query: &str) -> bool {
     ARTICLE_RE.is_match(query)
 }
@@ -155,7 +149,7 @@ mod tests {
     }
 
     fn designates_a_number(query: &str) -> bool {
-        !lj_core::docket_key::query_docket_keys(query).is_empty()
+        !lj_core::docket_key::query_numbers(query).is_empty()
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::pages::decision_page::data::{sendable, PageError};
 use crate::pages::law_page::{rail_block, rail_item};
 
 /// Une catégorie de l'annuaire (namespace × nature), telle qu'exposée dans l'URL
-/// (`/annuaire/{slug}`) et transmise à l'API (`kind`).
+/// (`/entity-index/fr/{slug}`) et transmise à l'API (`kind`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Entreprises,
@@ -78,7 +78,7 @@ impl Kind {
             Kind::Entreprises => "Sociétés et entrepreneurs identifiés par leur SIREN.",
             Kind::PersonnesPubliques => "État, collectivités et établissements publics.",
             Kind::Associations => "Associations déclarées identifiées par leur RNA.",
-            Kind::Avocats => "Avocats et avocats aux Conseils, par barreau.",
+            Kind::Avocats => "Avocats et avocats aux Conseils, cherchés par leur nom.",
             Kind::Cabinets => "Structures d'exercice des avocats : SCP, SELARL, AARPI…",
         }
     }
@@ -104,8 +104,8 @@ impl Kind {
         }
     }
 
-    /// Seuls les avocats portent un filtre barreau.
-    pub fn has_barreau_filter(self) -> bool {
+    /// Natural persons: searched by name behind an account, never listed.
+    pub fn names_natural_persons(self) -> bool {
         matches!(self, Kind::Avocats)
     }
 }
@@ -136,12 +136,25 @@ pub async fn fetch_search(q: String) -> Result<Vec<EntityDirectoryItemDto>, Page
 /// bloquant SSR.
 pub async fn fetch_directory(
     kind: &'static str,
-    barreau: Option<String>,
     page: i64,
 ) -> Result<EntityDirectoryResponse, PageError> {
     ApiClient::from_context()
-        .fetch_entities_directory(kind, barreau.as_deref(), page, PAGE_SIZE)
+        .fetch_entities_directory(kind, page, PAGE_SIZE)
         .await
+        .map_err(PageError::from)
+}
+
+/// Name search in a natural-person category. SSR is anonymous, so this only
+/// succeeds from the client, where the session cookie rides along.
+#[cfg(feature = "hydrate")]
+pub async fn fetch_named(
+    kind: &'static str,
+    q: String,
+) -> Result<Vec<EntityDirectoryItemDto>, PageError> {
+    ApiClient::from_context()
+        .search_entities(&q, Some(kind), SEARCH_LIMIT)
+        .await
+        .map(|r| r.items)
         .map_err(PageError::from)
 }
 
@@ -203,7 +216,7 @@ fn rail_view(current: Option<Kind>, stats: Option<AnnuaireStatsResponse>) -> Any
     items.push(rail_item(
         current.is_none(),
         rail_entry(
-            "/annuaire".to_string(),
+            "/entity-search".to_string(),
             "Toutes",
             current.is_none(),
             total,
@@ -217,7 +230,7 @@ fn rail_view(current: Option<Kind>, stats: Option<AnnuaireStatsResponse>) -> Any
         items.push(rail_item(
             is_current,
             rail_entry(
-                format!("/annuaire/{}", kind.slug()),
+                format!("/entity-index/fr/{}", kind.slug()),
                 kind.plural(),
                 is_current,
                 count,
@@ -296,10 +309,14 @@ pub fn category_chips(current: Option<Kind>) -> AnyView {
         }
         .into_any()
     };
-    let mut chips: Vec<AnyView> = vec![chip("/annuaire".to_string(), "Toutes", current.is_none())];
+    let mut chips: Vec<AnyView> = vec![chip(
+        "/entity-search".to_string(),
+        "Toutes",
+        current.is_none(),
+    )];
     for kind in Kind::ALL {
         chips.push(chip(
-            format!("/annuaire/{}", kind.slug()),
+            format!("/entity-index/fr/{}", kind.slug()),
             kind.plural(),
             current == Some(kind),
         ));
@@ -317,7 +334,7 @@ pub fn category_chips(current: Option<Kind>) -> AnyView {
 /// droite avec sa barre de proportion (relative au max de la liste).
 pub fn entity_row(item: EntityDirectoryItemDto, max_count: i64) -> AnyView {
     let (ns, local) = split_entity_uid(&item.uid);
-    let href = format!("/entite/{ns}/{local}");
+    let href = lj_vocab::entity_path(ns, local);
 
     let decisions = match item.decision_count {
         1 => "1 déc.".to_string(),

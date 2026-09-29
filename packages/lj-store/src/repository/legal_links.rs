@@ -154,7 +154,9 @@ impl DecisionRepository<'_> {
                 "SELECT l.typelien, l.verb, l.direction, l.target_kind, l.target_num, \
                         l.target_nature, l.target_label, l.target_date, l.target_text_uid, \
                         tt.slug AS target_text_slug, tt.title AS target_text_title, \
+                        tt.jurisdiction AS target_text_jurisdiction, \
                         ra.num_key AS resolved_num_key, rt.slug AS resolved_slug, \
+                        rt.jurisdiction AS resolved_jurisdiction, \
                         ts.child_cid AS resolved_section_cid \
                  FROM legal_link l \
                  LEFT JOIN legal_text tt ON tt.text_uid = l.target_text_uid \
@@ -199,7 +201,9 @@ impl DecisionRepository<'_> {
                 target_text_uid: r.get("target_text_uid"),
                 target_text_slug: r.get("target_text_slug"),
                 target_text_title: r.get("target_text_title"),
+                target_text_jurisdiction: r.get("target_text_jurisdiction"),
                 resolved_slug: r.get("resolved_slug"),
+                resolved_jurisdiction: r.get("resolved_jurisdiction"),
                 resolved_num_key: r.get("resolved_num_key"),
                 resolved_section_cid: r.get("resolved_section_cid"),
             })

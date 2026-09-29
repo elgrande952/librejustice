@@ -6,7 +6,7 @@
 
 use crate::backend::{format_query, Embedder, EMBEDDING_DIM, LEGAL_QUERY_INSTRUCTION};
 use crate::error::{EmbedError, Result};
-use lj_core::tokens::CHARS_PER_TOKEN_MEDIAN;
+use lj_vocab::tokens::CHARS_PER_TOKEN_MEDIAN;
 use ndarray::{Array2, Axis};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};

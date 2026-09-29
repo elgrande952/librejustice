@@ -13,19 +13,20 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
+use futures::StreamExt;
 use jiff::tz::TimeZone;
 use jiff::Timestamp;
 
-use lj_core::annonces::{
-    canonicaliser, cpv_division_uid, marche_uid_de_resultat, plie, AnnonceBrute, AnnonceCanonique,
-    LotAttribue, ResultatMarche,
+use lj_annonces::{
+    canonicaliser, cpv_division_uid, marche_uid_de_resultat, AnnonceBrute, AnnonceCanonique,
+    ContenuAnnonce, LotAttribue, ResultatMarche,
 };
-use lj_dtos::ANNONCE_FOND_MARCHE;
-use lj_sources::annonces::{self, HoteVerdict, MoteurRun};
+use lj_sources_annonces::{self as annonces, HoteVerdict, MoteurRun};
 use lj_store::repository::{
     AnnonceAEnrichir, AnnonceChamps, AnnonceSourceWriteItem, AnnonceWriteItem, AnnonceWriteStats,
-    DecisionRepository, DetailPose, ResultatPose,
+    ContenuPose, DecisionRepository, DetailPose, FileEnrichissement, ResultatPose, SondeLiens,
 };
+use lj_vocab::ANNONCE_FOND_MARCHE;
 
 use crate::config::Settings;
 
@@ -57,6 +58,66 @@ fn echecs_et_muets(hotes: &[HoteVerdict], muets: &HashSet<String>) -> (u32, u32)
 /// (12 of 49 on Safetender, 9 of 49 on Atexo) and under the 46 of 49 of 27/08/2026.
 const ECHECS_MAX: f64 = 0.40;
 
+/// No engine may eat the harvest's whole budget: past this, the other sixteen
+/// still have time to land and write.
+const BUDGET_MOTEUR: std::time::Duration = std::time::Duration::from_secs(1_200);
+
+/// A weekly catch-up that finds nothing is what says the daily path holds, so
+/// only one that repaired something rises above `info`.
+macro_rules! rapport_rattrapage {
+    ($repare:expr, $($champ:tt)*) => {
+        match $repare {
+            0 => tracing::info!($($champ)*),
+            _ => tracing::warn!($($champ)*),
+        }
+    };
+}
+
+/// Notices the harvest pulls for the rows it has just written. The ceiling is a
+/// runaway guard, not a ration: a night discovers 400 to 900 markets to visit,
+/// 1 900 at the measured peak. A backlog above it is a catch-up, and it is run
+/// by hand.
+const FICHES_PAR_NUIT: i64 = 6_000;
+
+/// Minutes each engine gets for its notices. One host that rations them sets the
+/// pace of its own branch alone, and past this it hands back, its rows waiting
+/// for the next night.
+const BUDGET_FICHES_MIN: u64 = 30;
+
+/// Markets the harvest searches by reference, the residue no listing shows.
+/// Unchanged from the chain step it replaces.
+const RESOLUTIONS_PAR_NUIT: i64 = 500;
+
+/// Uncategorised markets the weekly net reads back. 304 145 carried no division
+/// the day the classifier landed, so the archive drains over a few weeks.
+const CPV_PAR_SEMAINE: i64 = 60_000;
+const METIER_PAR_SEMAINE: i64 = 200_000;
+
+/// Bounds an enumeration: a hung engine becomes a total failure, which the
+/// verdict below counts, instead of holding the other sixteen to the watchdog.
+async fn borne(
+    f: impl std::future::Future<Output = lj_sources::error::Result<MoteurRun>>,
+) -> Result<MoteurRun> {
+    borne_a(BUDGET_MOTEUR, f).await
+}
+
+async fn borne_a(
+    budget: std::time::Duration,
+    f: impl std::future::Future<Output = lj_sources::error::Result<MoteurRun>>,
+) -> Result<MoteurRun> {
+    match tokio::time::timeout(budget, f).await {
+        Ok(r) => r.map_err(|e| anyhow!("{e}")),
+        Err(_) => Err(anyhow!("budget de {} s dépassé", budget.as_secs())),
+    }
+}
+
+/// The Centrale walks a date window, so its budget follows it instead of the
+/// flat one: 471 s for the seven days of the daily run, measured on 15/09/2026,
+/// and a manual catch-up asks for months.
+fn budget_centrale(jours: i32) -> std::time::Duration {
+    BUDGET_MOTEUR.max(std::time::Duration::from_secs(70 * jours.max(0) as u64))
+}
+
 fn degrade(run: &MoteurRun, echecs_hotes: u32, hotes_vivants: usize) -> bool {
     run.rows.is_empty()
         || run
@@ -66,7 +127,7 @@ fn degrade(run: &MoteurRun, echecs_hotes: u32, hotes_vivants: usize) -> bool {
 }
 
 /// Moisson quotidienne : tous les canaux, puis réconciliation et écriture.
-pub async fn annonces() -> Result<()> {
+pub async fn annonces(centrale_jours: i32, relancer_muets: bool) -> Result<()> {
     let debut = std::time::Instant::now();
     let settings = Settings::from_env()?;
     let pool =
@@ -76,7 +137,7 @@ pub async fn annonces() -> Result<()> {
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -84,16 +145,17 @@ pub async fn annonces() -> Result<()> {
     // Les moteurs multi-tenants énumèrent les hôtes recensés par
     // `annonces-discover` ; sans recensement, ils ne rendent rien (et le
     // sanity check les déclare dégradés, sans fermeture).
+    let plafond_muet = (!relancer_muets).then_some(NUITS_MUETTES);
     let hotes_atexo = repo
-        .hotes_profil_acheteur("atexo")
+        .hotes_profil_acheteur("atexo", plafond_muet)
         .await
         .map_err(|e| anyhow!("hotes atexo: {e}"))?;
     let hotes_safetender = repo
-        .hotes_profil_acheteur("safetender")
+        .hotes_profil_acheteur("safetender", plafond_muet)
         .await
         .map_err(|e| anyhow!("hotes safetender: {e}"))?;
     let hotes_synapse = repo
-        .hotes_profil_acheteur("synapse")
+        .hotes_profil_acheteur("synapse", plafond_muet)
         .await
         .map_err(|e| anyhow!("hotes synapse: {e}"))?;
     // Les plateformes avérées (tous moteurs), validateurs du dépôt de
@@ -109,7 +171,7 @@ pub async fn annonces() -> Result<()> {
         safetender = hotes_safetender.len(),
         synapse = hotes_synapse.len(),
         plateformes = plateformes.len(),
-        "annonces : profils recensés"
+        "annonces: profiles surveyed"
     );
 
     // Les canaux en parallèle — le mur horaire est Klekoon, en série à 1 req/s.
@@ -129,22 +191,36 @@ pub async fn annonces() -> Result<()> {
         aji,
         klekoon,
         modula,
+        centraledesmarches,
+        aws_tenants,
+        provincenord,
+        nicematin,
     ) = tokio::join!(
-        annonces::boamp::enumerate(&plateformes),
-        annonces::ted::enumerate(),
-        annonces::atexo::enumerate(&hotes_atexo),
-        annonces::safetender::enumerate(&hotes_safetender),
-        annonces::aws::enumerate(),
-        annonces::dematis::enumerate(),
-        annonces::achatpublic::enumerate(),
-        annonces::atline::enumerate(),
-        annonces::synapse::enumerate(&hotes_synapse),
-        annonces::xmarches::enumerate(),
-        annonces::aji::enumerate(),
-        annonces::klekoon::enumerate(&settings.egress_url),
-        annonces::modula::enumerate(),
+        borne(annonces::boamp::enumerate(&plateformes)),
+        borne(annonces::ted::enumerate()),
+        borne(annonces::atexo::enumerate(&hotes_atexo)),
+        borne(annonces::safetender::enumerate(&hotes_safetender)),
+        borne(annonces::aws::enumerate()),
+        borne(annonces::dematis::enumerate()),
+        borne(annonces::achatpublic::enumerate()),
+        borne(annonces::atline::enumerate()),
+        borne(annonces::synapse::enumerate(&hotes_synapse)),
+        borne(annonces::xmarches::enumerate()),
+        borne(annonces::aji::enumerate()),
+        borne(annonces::klekoon::enumerate()),
+        borne(annonces::modula::enumerate()),
+        borne_a(
+            budget_centrale(centrale_jours),
+            annonces::centraledesmarches::enumerate(centrale_jours),
+        ),
+        borne(annonces::aws_tenants::enumerate()),
+        borne(annonces::provincenord::enumerate()),
+        borne(annonces::nicematin::enumerate()),
     );
 
+    // An engine whose enumeration returns `Err` yields no `MoteurRun`, so the
+    // degradation test below never sees it.
+    let mut echecs_totaux: Vec<&'static str> = Vec::new();
     let mut runs: Vec<(&'static str, MoteurRun)> = [
         ("boamp", boamp),
         ("ted", ted),
@@ -159,12 +235,17 @@ pub async fn annonces() -> Result<()> {
         ("aji", aji),
         ("klekoon", klekoon),
         ("modula", modula),
+        ("centraledesmarches", centraledesmarches),
+        ("aws-tenants", aws_tenants),
+        ("provincenord", provincenord),
+        ("nicematin", nicematin),
     ]
     .into_iter()
     .filter_map(|(moteur, res)| match res {
         Ok(run) => Some((moteur, run)),
         Err(e) => {
-            tracing::error!(moteur, error = %e, "annonces : moteur en échec total");
+            tracing::error!(moteur, error = %e, "annonces: moteur fully failed");
+            echecs_totaux.push(moteur);
             None
         }
     })
@@ -176,12 +257,12 @@ pub async fn annonces() -> Result<()> {
     match dernier_dump(&settings.paths().presse()) {
         Some(f) => match annonces::presse::enumerate(&f).await {
             Ok(run) => {
-                tracing::info!(dump = %f.display(), "annonces : dump de presse");
+                tracing::info!(dump = %f.display(), "annonces: press dump");
                 runs.push(("presse", run));
             }
-            Err(e) => tracing::error!(error = %e, "annonces : dump de presse illisible"),
+            Err(e) => tracing::error!(error = %e, "annonces: press dump unreadable"),
         },
-        None => tracing::info!("annonces : aucun dump de presse"),
+        None => tracing::info!("annonces: no press dump"),
     }
 
     let muets: HashSet<String> = repo
@@ -191,7 +272,7 @@ pub async fn annonces() -> Result<()> {
         .into_iter()
         .collect();
 
-    let mut degrades: Vec<&'static str> = Vec::new();
+    let mut degrades: Vec<&'static str> = echecs_totaux;
     let mut brutes: Vec<AnnonceBrute> = Vec::new();
     let mut verdicts: Vec<(String, bool)> = Vec::new();
     for (moteur, run) in runs {
@@ -205,7 +286,7 @@ pub async fn annonces() -> Result<()> {
             echecs = run.echecs + echecs_hotes,
             hotes_muets,
             sain,
-            "annonces : moteur"
+            "annonces: moteur"
         );
         if !sain {
             degrades.push(moteur);
@@ -221,9 +302,42 @@ pub async fn annonces() -> Result<()> {
         .date();
     let (canoniques, stats, absorbees) = reconcilier_et_ecrire(&repo, brutes, aujourdhui).await?;
     let relies = repo
-        .relier_annonces_par_denomination()
+        .relier_annonces_par_denomination(None)
         .await
         .map_err(|e| anyhow!("rattachement par dénomination: {e}"))?;
+
+    // The lifecycle of what was just written, then the notices. Order is what
+    // makes this cheap: twinning merges a platform row into the BOAMP one that
+    // already carries the four fields, and 9 936 of the 20 179 open markets with
+    // a platform channel have such a sibling. Pulling first pays for half of them
+    // twice.
+    for (phase, res) in [
+        ("régularisation", regulariser(&repo, false).await),
+        ("jumelage", jumeler(&repo, true).await),
+        (
+            "résolution",
+            resoudre(&repo, RESOLUTIONS_PAR_NUIT, true).await,
+        ),
+    ] {
+        if let Err(e) = res {
+            tracing::error!(phase, error = %e, "annonces: phase failed");
+        }
+    }
+
+    // Here and not in a queue read tomorrow: a queue ordered by closing date
+    // serves what shuts soonest, so a market with a distant one waits behind
+    // every new arrival. Measured before the switch: 46 of the 149 markets
+    // discovered eleven days earlier had had their notice read.
+    if let Err(e) = tirer_les_fiches(
+        &repo,
+        FICHES_PAR_NUIT,
+        BUDGET_FICHES_MIN,
+        FileEnrichissement::NonVisitees,
+    )
+    .await
+    {
+        tracing::error!(error = %e, "annonces: record pull failed");
+    }
 
     // Fond `attribution` : la fenêtre active des avis de résultat. Un échec ne
     // coûte que de la fraîcheur d'enrichissement, pas la moisson.
@@ -235,11 +349,38 @@ pub async fn annonces() -> Result<()> {
                 canaux = s.canaux,
                 aretes = s.aretes,
                 rattaches,
-                "annonces : résultats de marché"
+                "annonces: award results"
             ),
-            Err(e) => tracing::error!(error = %e, "annonces : écriture des résultats en échec"),
+            Err(e) => tracing::error!(error = %e, "annonces: writing results failed"),
         },
-        Err(e) => tracing::error!(error = %e, "annonces : résultats de marché en échec"),
+        Err(e) => tracing::error!(error = %e, "annonces: award results failed"),
+    }
+
+    match annonces::ted::resultats(RESULTATS_TED_JOURS).await {
+        Ok(resultats) => match ecrire_resultats_ted(&repo, resultats).await {
+            Ok((vus, poses)) => {
+                tracing::info!(vus, poses, "annonces: TED awards")
+            }
+            Err(e) => tracing::error!(error = %e, "annonces: writing TED awards"),
+        },
+        Err(e) => tracing::error!(error = %e, "annonces: TED awards failed"),
+    }
+
+    match annonces::aws::attributions().await {
+        Ok(attributions) => match ecrire_resultats_aws(&repo, attributions).await {
+            Ok((vus, rattachees, poses)) => {
+                tracing::info!(vus, rattachees, poses, "annonces: AWS awards")
+            }
+            Err(e) => tracing::error!(error = %e, "annonces: writing AWS awards"),
+        },
+        Err(e) => tracing::error!(error = %e, "annonces: AWS awards failed"),
+    }
+
+    // The fourth award channel, last because it attaches to markets the phases
+    // above have just closed and merged. It opens its own pool, after a download
+    // no connection should sit through.
+    if let Err(e) = annonces_decp(None, true).await {
+        tracing::error!(error = %e, "annonces: DECP failed");
     }
 
     // Tripwire de volumétrie.
@@ -248,7 +389,7 @@ pub async fn annonces() -> Result<()> {
         .await
         .map_err(|e| anyhow!("tailles: {e}"))?
     {
-        tracing::info!(table = %t.table, bytes = t.bytes, "annonces : taille de table");
+        tracing::info!(table = %t.table, bytes = t.bytes, "annonces: table size");
     }
 
     tracing::info!(
@@ -267,7 +408,13 @@ pub async fn annonces() -> Result<()> {
         tracing::error!(
             annonces_moteurs_degrades = degrades.len(),
             moteurs = degrades.join(","),
-            "annonces : moteurs dégradés, couverture partielle"
+            "annonces: moteurs degraded, partial coverage"
+        );
+    }
+    if canoniques == 0 {
+        anyhow::bail!(
+            "annonces: no canonical row, {} moteurs degraded",
+            degrades.len()
         );
     }
     Ok(())
@@ -306,7 +453,7 @@ pub async fn annonces_backfill(
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -319,7 +466,7 @@ pub async fn annonces_backfill(
         .collect();
 
     let repris = depuis.unwrap_or(PLANCHER_BOAMP);
-    tracing::info!(depuis = %repris, jusqu = %jusqu, "backfill : début");
+    tracing::info!(depuis = %repris, jusqu = %jusqu, "backfill: start");
 
     let un_mois = jiff::Span::new().months(1);
     let mut lo = repris.first_of_month();
@@ -357,7 +504,7 @@ pub async fn annonces_backfill(
             orphelins = stats.annonces,
             rattaches,
             elapsed_s = mois.elapsed().as_secs(),
-            "backfill : mois"
+            "backfill: month"
         );
         lo = hi;
     }
@@ -368,7 +515,83 @@ pub async fn annonces_backfill(
         orphelins = orphelins_total,
         rattaches = rattaches_total,
         elapsed_s = debut.elapsed().as_secs(),
-        "backfill : fin"
+        "backfill: end"
+    );
+    Ok(())
+}
+
+/// Refills the four fields on the stock already written, by re-reading the BOAMP
+/// export window by window. It carries no identity: a row is reached by its
+/// channel, so a notice whose market is not in stock writes nothing.
+pub async fn annonces_contenu(
+    depuis: Option<jiff::civil::Date>,
+    jusqu: jiff::civil::Date,
+) -> Result<()> {
+    let debut = std::time::Instant::now();
+    let settings = Settings::from_env()?;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    conn.batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
+        .await
+        .map_err(|e| anyhow!("migrations: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+    let plateformes = HashSet::new();
+
+    let un_mois = jiff::Span::new().months(1);
+    let mut lo = depuis.unwrap_or(PLANCHER_BOAMP).first_of_month();
+    let (mut avis_total, mut poses_total, mut ecrits_total) = (0u64, 0u64, 0u64);
+    while lo < jusqu {
+        let hi = lo
+            .checked_add(un_mois)
+            .map_err(|e| anyhow!("mois suivant de {lo}: {e}"))?;
+        let mois = std::time::Instant::now();
+        let brutes = annonces::boamp::avis_historiques(lo, hi, &plateformes)
+            .await
+            .map_err(|e| anyhow!("avis historiques {lo}: {e}"))?;
+        let poses: Vec<ContenuPose> = brutes
+            .iter()
+            .filter(|b| !b.contenu.est_vide() || !b.descripteurs.is_empty())
+            .map(|b| {
+                let mut contenu = serde_json::json!({});
+                poser_contenu(&mut contenu, &b.contenu, &b.descripteurs);
+                ContenuPose {
+                    source_uid: b.source_uid.clone(),
+                    description: b.contenu.description.clone(),
+                    contenu,
+                }
+            })
+            .collect();
+        let mut ecrits = 0u64;
+        for lot in poses.chunks(2_000) {
+            ecrits += repo
+                .poser_contenu_annonces(lot)
+                .await
+                .map_err(|e| anyhow!("poser le contenu {lo}: {e}"))?;
+        }
+        avis_total += brutes.len() as u64;
+        poses_total += poses.len() as u64;
+        ecrits_total += ecrits;
+        tracing::info!(
+            mois = %lo.strftime("%Y-%m").to_string(),
+            avis = brutes.len(),
+            poses = poses.len(),
+            ecrits,
+            elapsed_s = mois.elapsed().as_secs(),
+            "annonces_contenu: month"
+        );
+        lo = hi;
+    }
+
+    tracing::info!(
+        avis = avis_total,
+        poses = poses_total,
+        ecrits = ecrits_total,
+        elapsed_s = debut.elapsed().as_secs(),
+        "annonces_contenu"
     );
     Ok(())
 }
@@ -422,6 +645,8 @@ async fn reconcilier_et_ecrire(
         .fusionner_annonces(&fusions)
         .await
         .map_err(|e| anyhow!("fusions: {e}"))?;
+    let ecrits: Vec<String> = items.iter().map(|i| i.uid.clone()).collect();
+    replier_les_metiers(repo, Some(&ecrits)).await?;
     Ok((items.len(), stats, absorbees))
 }
 
@@ -433,7 +658,6 @@ async fn reconcilier_et_ecrire(
 /// devinée : elle reste, comptée. Avec `formes`, réapplique aussi les règles de
 /// forme à tout le stock — le filet hebdomadaire.
 pub async fn annonces_regulariser(formes: bool) -> Result<()> {
-    let debut = std::time::Instant::now();
     let settings = Settings::from_env()?;
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
@@ -441,11 +665,15 @@ pub async fn annonces_regulariser(formes: bool) -> Result<()> {
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
+    regulariser(&repo, formes).await
+}
 
+async fn regulariser(repo: &DecisionRepository<'_>, formes: bool) -> Result<()> {
+    let debut = std::time::Instant::now();
     let orphelines = repo
         .annonces_orphelines(ANNONCE_FOND_MARCHE)
         .await
@@ -453,7 +681,7 @@ pub async fn annonces_regulariser(formes: bool) -> Result<()> {
     let mut cles: Vec<String> = Vec::new();
     let mut urls: Vec<String> = Vec::new();
     for o in &orphelines {
-        cles.extend(lj_core::annonces::cles_jointure_depuis_urls(
+        cles.extend(lj_annonces::cles_jointure_depuis_urls(
             o.urls.iter().map(String::as_str),
         ));
         urls.extend(o.urls.iter().cloned());
@@ -497,7 +725,7 @@ pub async fn annonces_regulariser(formes: bool) -> Result<()> {
     let mut compte = CompteRegularisation::default();
     for o in orphelines {
         let mut cibles: Vec<&String> =
-            lj_core::annonces::cles_jointure_depuis_urls(o.urls.iter().map(String::as_str))
+            lj_annonces::cles_jointure_depuis_urls(o.urls.iter().map(String::as_str))
                 .iter()
                 .filter_map(|k| par_source.get(k))
                 .chain(o.urls.iter().filter_map(|u| par_url.get(u)))
@@ -533,15 +761,38 @@ pub async fn annonces_regulariser(formes: bool) -> Result<()> {
     // `nettoyer_acheteur`) doit aussi atteindre le stock clos, que la moisson
     // ne revisite jamais.
     let (mut formes_corrigees, mut resultats_corriges) = (0u64, 0u64);
+    let (mut zones_posees, mut attributions_refondues) = (0u64, 0u64);
+    let (mut descriptions_effacees, mut cpv_deduits) = (0u64, 0u64);
+    let mut descriptions_reparees = 0u64;
+    let mut familles_deduites = 0u64;
+    let mut metiers_poses = 0u64;
+    let mut metiers_deduits = 0u64;
+    let mut demonstrations_purgees = 0u64;
+    let mut echeances_effacees = 0u64;
     if formes {
-        let corrections: Vec<(String, String, String)> = repo
+        let formes = repo
             .formes_annonces()
             .await
-            .map_err(|e| anyhow!("formes: {e}"))?
+            .map_err(|e| anyhow!("formes: {e}"))?;
+        let demonstrations: Vec<&str> = formes
+            .iter()
+            .filter(|(_, titre, acteur)| {
+                lj_annonces::consultation_de_test(acteur, &[titre.as_str()])
+            })
+            .map(|(uid, _, _)| uid.as_str())
+            .collect();
+        demonstrations_purgees = repo
+            .purger_annonces(&demonstrations)
+            .await
+            .map_err(|e| anyhow!("purger démonstrations: {e}"))?;
+        let corrections: Vec<(String, String, String)> = formes
             .into_iter()
+            .filter(|(_, titre, acteur)| {
+                !lj_annonces::consultation_de_test(acteur, &[titre.as_str()])
+            })
             .filter_map(|(uid, titre, acteur)| {
-                let titre_propre = lj_core::annonces::embellir_titre(&titre);
-                let acteur_propre = lj_core::annonces::nettoyer_acheteur(&acteur);
+                let titre_propre = lj_annonces::embellir_titre(&annonces::desechapper(&titre));
+                let acteur_propre = lj_annonces::nettoyer_acheteur(&annonces::desechapper(&acteur));
                 (titre_propre != titre || acteur_propre != acteur).then_some((
                     uid,
                     titre_propre,
@@ -555,6 +806,98 @@ pub async fn annonces_regulariser(formes: bool) -> Result<()> {
                 .await
                 .map_err(|e| anyhow!("corriger formes: {e}"))?;
         }
+
+        // The stock predates the set-valued column: a row no harvest has
+        // zoned yet is seeded from the single code it kept and from the région
+        // its buyer names, rather than waiting a full re-enumeration to exist
+        // on the axis.
+        let zones: Vec<(String, Vec<String>)> = repo
+            .annonces_a_zoner()
+            .await
+            .map_err(|e| anyhow!("zones: {e}"))?
+            .into_iter()
+            .map(|(uid, code, acteur)| (uid, zones_depuis_stock(code.as_deref(), &acteur)))
+            .filter(|(_, z)| !z.is_empty())
+            .collect();
+        for lot in zones.chunks(2_000) {
+            zones_posees += repo
+                .poser_zones(lot)
+                .await
+                .map_err(|e| anyhow!("poser zones: {e}"))?;
+        }
+
+        descriptions_effacees = repo
+            .effacer_descriptions_copiees()
+            .await
+            .map_err(|e| anyhow!("descriptions copiées: {e}"))?;
+        echeances_effacees = repo
+            .effacer_echeances_implausibles(lj_annonces::ECHEANCE_ANS_MAX)
+            .await
+            .map_err(|e| anyhow!("implausible deadlines: {e}"))?;
+
+        let elisions: Vec<(String, String)> = repo
+            .descriptions_a_reparer()
+            .await
+            .map_err(|e| anyhow!("descriptions à réparer: {e}"))?
+            .into_iter()
+            .filter_map(|(uid, texte)| {
+                let propre = lj_annonces::reparer_elisions(&annonces::desechapper(&texte));
+                (propre != texte).then_some((uid, propre))
+            })
+            .collect();
+        for lot in elisions.chunks(2_000) {
+            descriptions_reparees += repo
+                .corriger_descriptions(lot)
+                .await
+                .map_err(|e| anyhow!("corriger descriptions: {e}"))?;
+        }
+
+        metiers_poses = replier_les_metiers(repo, None).await?;
+
+        let deduits: Vec<(String, Vec<String>)> = repo
+            .annonces_sans_metier(METIER_PAR_SEMAINE)
+            .await
+            .map_err(|e| anyhow!("annonces sans métier: {e}"))?
+            .into_iter()
+            .filter_map(|(uid, titre)| {
+                let m = lj_annonces::metiers::metiers_du_titre(&titre);
+                (!m.is_empty()).then_some((uid, m))
+            })
+            .collect();
+        for lot in deduits.chunks(2_000) {
+            metiers_deduits += repo
+                .poser_metiers(lot)
+                .await
+                .map_err(|e| anyhow!("poser métiers déduits: {e}"))?;
+        }
+
+        let sans_cpv = repo
+            .annonces_sans_cpv(CPV_PAR_SEMAINE)
+            .await
+            .map_err(|e| anyhow!("annonces sans cpv: {e}"))?;
+        let deductions: Vec<(String, String)> = sans_cpv
+            .into_iter()
+            .filter_map(|(uid, titre)| {
+                lj_annonces::cpv::division_probable(&titre).map(|d| (uid, d))
+            })
+            .collect();
+        for lot in deductions.chunks(2_000) {
+            cpv_deduits += repo
+                .poser_cpv_deduit(lot)
+                .await
+                .map_err(|e| anyhow!("poser cpv déduit: {e}"))?;
+        }
+
+        let table: Vec<(&str, &str)> = lj_annonces::cpv::natures_par_division().collect();
+        familles_deduites = repo
+            .deduire_famille_depuis_cpv(&table)
+            .await
+            .map_err(|e| anyhow!("déduire famille: {e}"))?;
+
+        attributions_refondues = repo
+            .refondre_attributions()
+            .await
+            .map_err(|e| anyhow!("refondre attributions: {e}"))?;
 
         // Même filet pour les lots d'attribution des blocs `details.resultat`.
         let resultats: Vec<(String, serde_json::Value)> = repo
@@ -574,7 +917,20 @@ pub async fn annonces_regulariser(formes: bool) -> Result<()> {
         }
     }
 
-    tracing::info!(
+    rapport_rattrapage!(
+        absorbees
+            + formes_corrigees
+            + resultats_corriges
+            + zones_posees
+            + attributions_refondues
+            + descriptions_effacees
+            + descriptions_reparees
+            + cpv_deduits
+            + familles_deduites
+            + metiers_poses
+            + metiers_deduits
+            + demonstrations_purgees
+            + echeances_effacees,
         orphelines = total,
         absorbees,
         uniques = compte.uniques,
@@ -584,6 +940,16 @@ pub async fn annonces_regulariser(formes: bool) -> Result<()> {
         ambigues = compte.ambigues,
         formes_corrigees,
         resultats_corriges,
+        zones_posees,
+        attributions_refondues,
+        descriptions_effacees,
+        descriptions_reparees,
+        cpv_deduits,
+        familles_deduites,
+        metiers_poses,
+        metiers_deduits,
+        demonstrations_purgees,
+        echeances_effacees,
         elapsed_s = debut.elapsed().as_secs(),
         "annonces_regulariser"
     );
@@ -617,7 +983,7 @@ enum Resolution<'a> {
 
 /// Les lignes de `cibles` qui portent le même titre et le même acheteur que
 /// `titre`/`acteur`, au pliage canonique du fond près
-/// ([`lj_core::annonces::plie`] — casse, accents, apostrophe typographique,
+/// (`lj_fold::fold` : casse, accents, apostrophe typographique,
 /// blancs). Un acheteur vide d'un côté n'est pas une contradiction : une
 /// observation manquante ne réfute rien. Deux graphies divergentes valent la
 /// même quand les deux lignes portent la même entité acheteur, résolue sans
@@ -629,11 +995,13 @@ fn jumelles<'a>(
     acheteur_uid: Option<&str>,
     cibles: &[&'a AnnonceChamps],
 ) -> Vec<&'a AnnonceChamps> {
-    let (titre, acteur) = (plie(titre), plie(acteur));
+    let (titre, acteur) = (lj_fold::fold(titre), lj_fold::fold(acteur));
     cibles
         .iter()
         .copied()
-        .filter(|c| plie(&c.titre) == titre && acheteur_compatible(&acteur, acheteur_uid, c))
+        .filter(|c| {
+            lj_fold::fold(&c.titre) == titre && acheteur_compatible(&acteur, acheteur_uid, c)
+        })
         .collect()
 }
 
@@ -641,7 +1009,7 @@ fn jumelles<'a>(
 /// approchant : deux graphies égales, une observation manquante d'un côté, ou
 /// la même entité résolue des deux côtés. `acteur` arrive plié.
 fn acheteur_compatible(acteur: &str, acheteur_uid: Option<&str>, c: &AnnonceChamps) -> bool {
-    let ca = plie(&c.acteur_libelle);
+    let ca = lj_fold::fold(&c.acteur_libelle);
     ca == acteur
         || ca.is_empty()
         || acteur.is_empty()
@@ -671,7 +1039,7 @@ fn cible_de_regularisation<'a>(
                     // Aucune à l'échéance de l'orpheline (qui date d'une autre
                     // génération) : si les jumelles sont indiscernables entre
                     // elles, le choix est libre — sinon on ne devine pas.
-                    let cle = |c: &AnnonceChamps| (plie(&c.acteur_libelle), c.echeance);
+                    let cle = |c: &AnnonceChamps| (lj_fold::fold(&c.acteur_libelle), c.echeance);
                     let premiere = cle(jumelles[0]);
                     if jumelles.iter().all(|c| cle(c) == premiere) {
                         Resolution::Indiscernables(
@@ -715,11 +1083,32 @@ const MULTI_TENANTS: [&str; 3] = ["atexo", "safetender", "modula"];
 fn hote_et_moteur(depot: &str, moteurs: &HashMap<String, String>) -> Option<(String, String)> {
     let hote = hote_de(depot)?;
     if let Some(m) = moteurs.get(&hote) {
-        return Some((hote, m.clone()));
+        return Some((hote_de_service(&hote, m, moteurs), m.clone()));
+    }
+    // The census merges through `canon_host` before probing, so the table holds
+    // the canonical host and a declared typo finds nothing: 31 rows on 11/09.
+    let canon = lj_sources_annonces::discover::canon_host(&hote);
+    if let Some(m) = moteurs.get(&canon) {
+        return Some((hote_de_service(&canon, m, moteurs), m.clone()));
     }
     let parent = hote.split_once('.')?.1.to_string();
     let m = moteurs.get(&parent)?.clone();
-    Some((parent, m))
+    Some((hote_de_service(&parent, &m, moteurs), m))
+}
+
+/// The host a connector can question. The notice declares the front door
+/// (`megalis.bretagne.bzh`), the instance serves under `marches.…`, and
+/// `/api/v2/consultations` on the front door answers HTML. One censused
+/// sub-domain of the same engine settles it, several leave it be.
+fn hote_de_service(hote: &str, moteur: &str, moteurs: &HashMap<String, String>) -> String {
+    let suffixe = format!(".{hote}");
+    let mut sous = moteurs
+        .iter()
+        .filter(|(h, m)| m.as_str() == moteur && h.ends_with(&suffixe));
+    match (sous.next(), sous.next()) {
+        (Some((seul, _)), None) => seul.clone(),
+        _ => hote.to_string(),
+    }
 }
 
 fn canal_de_depot(moteur: &str, hote: &str) -> String {
@@ -781,6 +1170,47 @@ struct CompteJumelage {
     ambigues: usize,
     disputees: usize,
     jumelles_disputees: usize,
+    proches: usize,
+    acheteur: usize,
+    sans_corroboration: usize,
+}
+
+/// Title floor of a corroboration, and buyer floor below it: two labels of the
+/// same buyer diverge more than two wordings of the same object.
+const TITRE_CORROBORE: f64 = 0.55;
+const ACHETEUR_CORROBORE: f64 = 0.7;
+
+/// The floor every pair crosses, whatever key proposed it: a close title, the
+/// same deadline to the day, or a buyer that concurs. A reference carrying none
+/// of the three paired a Mayotte market to a Var one on 11/09, on the serial
+/// number `20260006`; it refuses 1 of the 1 014 pairs of the day.
+fn corrobore(ligne: &lj_store::repository::AnnonceAJumeler, jumelle: &AnnonceChamps) -> bool {
+    use lj_annonces::similarite_titres;
+    let meme_echeance = ligne.echeance.is_some()
+        && ligne.echeance.and_then(date_paris) == jumelle.echeance.and_then(date_paris);
+    let meme_acheteur = ligne.acheteur_uid.is_some() && ligne.acheteur_uid == jumelle.acheteur_uid;
+    similarite_titres(&ligne.titre, &jumelle.titre) >= TITRE_CORROBORE
+        || meme_echeance
+        || meme_acheteur
+        || similarite_titres(&ligne.acteur_libelle, &jumelle.acteur_libelle) >= ACHETEUR_CORROBORE
+}
+
+/// The same floor on the consultation a search brings back, which is not in
+/// stock yet and has no buyer entity: 2 of the 78 pairs of the 11/09 pass had
+/// none of the three, one of them naming an airport and holding a heat pump.
+fn corrobore_brute(ligne: &lj_store::repository::AnnonceAJumeler, brute: &AnnonceBrute) -> bool {
+    use lj_annonces::similarite_titres;
+    let meme_echeance = ligne
+        .echeance
+        .and_then(date_paris)
+        .zip(brute.echeance.map(jour_paris))
+        .is_some_and(|(a, b)| a == b);
+    similarite_titres(&ligne.titre, &brute.objet) >= TITRE_CORROBORE
+        || meme_echeance
+        || brute
+            .acheteur
+            .as_deref()
+            .is_some_and(|a| similarite_titres(&ligne.acteur_libelle, a) >= ACHETEUR_CORROBORE)
 }
 
 /// L'issue du jumelage d'une candidate.
@@ -840,13 +1270,13 @@ fn jumelle_par_reference<'a>(
     canal_de_cible: &HashMap<&str, String>,
     canal_declare: Option<&str>,
 ) -> Jumelage<'a> {
-    let Some(reference) = ligne.reference.as_deref().map(plie) else {
+    let Some(reference) = ligne.reference.as_deref().map(lj_fold::fold) else {
         return Jumelage::Aucune;
     };
     // Une référence que deux candidates portent ne départage rien, et une
     // « référence » égale au nom de l'acheteur est un champ mal extrait.
     if reference.is_empty()
-        || reference == plie(&ligne.acteur_libelle)
+        || reference == lj_fold::fold(&ligne.acteur_libelle)
         || portees.get(&reference).copied().unwrap_or(0) > 1
     {
         return Jumelage::Aucune;
@@ -879,21 +1309,64 @@ fn jumelle_par_reference<'a>(
     match (ligne.acheteur_uid.as_deref(), seule.acheteur_uid.as_deref()) {
         // Deux entités acheteur résolues et différentes refusent la paire.
         (Some(a), Some(b)) if a != b => Jumelage::Aucune,
+        (Some(_), Some(_)) => Jumelage::Une(&seule.uid),
+        // A reference of digits alone is a serial number carrying nothing of its
+        // buyer: 8.9 % of those in the open stock are borne by several buyers,
+        // against 0.9 % of those carrying a letter.
+        _ if reference.chars().all(|c| c.is_ascii_digit())
+            && ligne
+                .echeance
+                .and_then(date_paris)
+                .zip(seule.echeance.and_then(date_paris))
+                .is_none_or(|(a, b)| a != b) =>
+        {
+            Jumelage::Aucune
+        }
         _ => Jumelage::Une(&seule.uid),
     }
+}
+
+/// A missing observation on one side refutes nothing; two known and diverging
+/// values reject the pair.
+fn compatible(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// Two channels of one market name overlapping sets, never identical ones: one
+/// publishes the buyer's département, the other every place of performance. A
+/// silent side contradicts nothing.
+fn zones_compatibles(a: &[String], b: &[String]) -> bool {
+    a.is_empty() || b.is_empty() || a.iter().any(|z| b.contains(z))
+}
+
+/// What a row written before the set-valued column can still be zoned from
+/// without a network call: the single code the old schema kept, and the région
+/// its buyer names.
+fn zones_depuis_stock(code: Option<&str>, acteur: &str) -> Vec<String> {
+    let mut zones = lj_annonces::zones::zones_departements(code);
+    if zones.is_empty() {
+        if let Some(region) = lj_annonces::zones::region_citee(acteur) {
+            zones = lj_annonces::zones::zones_departements(
+                lj_annonces::zones::departements_de_region(region),
+            );
+        }
+    }
+    lj_annonces::zones::codes(&zones)
 }
 
 /// La date d'une échéance en heure de Paris : deux canaux du même marché
 /// publient la même date limite avec des heures divergentes (12 h ici, 16 h là).
 fn date_paris(e: chrono::DateTime<chrono::Utc>) -> Option<jiff::civil::Date> {
+    Some(jour_paris(Timestamp::from_second(e.timestamp()).ok()?))
+}
+
+fn jour_paris(t: Timestamp) -> jiff::civil::Date {
     static PARIS: std::sync::LazyLock<TimeZone> =
         std::sync::LazyLock::new(|| TimeZone::get("Europe/Paris").expect("tzdb embarquée"));
-    Some(
-        Timestamp::from_second(e.timestamp())
-            .ok()?
-            .to_zoned(PARIS.clone())
-            .date(),
-    )
+    t.to_zoned(PARIS.clone()).date()
 }
 
 /// La jumelle par titre et date d'échéance, sur tout le stock ouvert : même
@@ -910,21 +1383,81 @@ fn jumelle_par_titre_echeance<'a>(
     let Some(echeance) = ligne.echeance.and_then(date_paris) else {
         return Jumelage::Aucune;
     };
-    let titre = plie(&ligne.titre);
+    let titre = lj_fold::fold(&ligne.titre);
     let Some(cibles) = (!titre.is_empty()).then(|| index.get(&titre)).flatten() else {
         return Jumelage::Aucune;
-    };
-    let compatible = |a: Option<&str>, b: Option<&str>| match (a, b) {
-        (Some(a), Some(b)) => a == b,
-        _ => true,
     };
     let retenues: Vec<&&AnnonceChamps> = cibles
         .iter()
         .filter(|c| c.echeance.and_then(date_paris) == Some(echeance))
-        .filter(|c| compatible(ligne.departement.as_deref(), c.departement.as_deref()))
+        .filter(|c| zones_compatibles(&ligne.zones, &c.zones))
         .filter(|c| compatible(ligne.acheteur_uid.as_deref(), c.acheteur_uid.as_deref()))
         .collect();
     match retenues.as_slice() {
+        [seule] => Jumelage::Une(&seule.uid),
+        [] => Jumelage::Aucune,
+        _ => Jumelage::Ambigue,
+    }
+}
+
+/// Measured on the fund on 11/09: in the 0.75 to 0.85 band, 17 sampled pairs
+/// out of 18 designate the same market, the divergence being a typography, an
+/// article, or the reference the buyer prefixes its own title with.
+const TITRE_PROCHE: f64 = 0.75;
+
+/// The same buyer on both sides, the title then only having to approach. That
+/// corroboration is worth more than the declared canal, which a notice sometimes
+/// writes wrong and sometimes not at all. The folded label answers for the rows
+/// whose buyer entity no registry resolves, the equivalence
+/// [`acheteur_compatible`] already grants. Below `TITRE_PROCHE` two sibling lots
+/// of one buyer merge: "véhicules de PTAC inférieur" against "ptac supérieur",
+/// 0.56.
+fn jumelle_par_acheteur<'a>(
+    ligne: &lj_store::repository::AnnonceAJumeler,
+    par_entite: &HashMap<&str, Vec<&'a AnnonceChamps>>,
+    par_libelle: &HashMap<String, Vec<&'a AnnonceChamps>>,
+) -> Jumelage<'a> {
+    let cibles = match ligne.acheteur_uid.as_deref() {
+        Some(e) => par_entite.get(e),
+        None => match lj_fold::fold(&ligne.acteur_libelle) {
+            l if l.is_empty() => None,
+            l => par_libelle.get(&l),
+        },
+    };
+    let Some(cibles) = cibles else {
+        return Jumelage::Aucune;
+    };
+    let proches: Vec<&'a AnnonceChamps> = cibles
+        .iter()
+        .copied()
+        .filter(|c| lj_annonces::similarite_titres(&ligne.titre, &c.titre) >= TITRE_PROCHE)
+        .collect();
+    match proches.as_slice() {
+        [seule] => Jumelage::Une(&seule.uid),
+        [] => Jumelage::Aucune,
+        _ => Jumelage::Ambigue,
+    }
+}
+
+/// The last key, played once neither the reference, nor the exact title, nor
+/// the deposit has given a pair. What takes the place of the exactness given up
+/// is the vivier: it bounds to the canal, hence to the instance on a
+/// multi-tenant engine, where two tenants share no market.
+fn jumelle_par_titre_proche<'a>(
+    ligne: &lj_store::repository::AnnonceAJumeler,
+    vivier: &[&'a AnnonceChamps],
+) -> Jumelage<'a> {
+    if lj_fold::fold(&ligne.titre).is_empty() {
+        return Jumelage::Aucune;
+    }
+    let proches: Vec<&'a AnnonceChamps> = vivier
+        .iter()
+        .copied()
+        .filter(|c| zones_compatibles(&ligne.zones, &c.zones))
+        .filter(|c| compatible(ligne.acheteur_uid.as_deref(), c.acheteur_uid.as_deref()))
+        .filter(|c| lj_annonces::similarite_titres(&ligne.titre, &c.titre) >= TITRE_PROCHE)
+        .collect();
+    match proches.as_slice() {
         [seule] => Jumelage::Une(&seule.uid),
         [] => Jumelage::Aucune,
         _ => Jumelage::Ambigue,
@@ -945,7 +1478,6 @@ fn jumelle_par_titre_echeance<'a>(
 /// que l'avis déclare désigne cette consultation. Le plus souvent elle est déjà
 /// en stock — la recherche ne l'écrit pas, elle la nomme.
 pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
-    let debut = std::time::Instant::now();
     let settings = Settings::from_env()?;
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
@@ -953,16 +1485,30 @@ pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
+    resoudre(&repo, limite, applique).await
+}
 
+async fn resoudre(repo: &DecisionRepository<'_>, limite: i64, applique: bool) -> Result<()> {
+    let debut = std::time::Instant::now();
+    // A dead census entry is a typo the census probed once and never reached
+    // again (`wwww.marches-publics.gouv.fr`, 22 consecutive failures). Left in,
+    // it wins `hote_de_service` as the only sub-domain of the real host.
+    let muets: HashSet<String> = repo
+        .hotes_muets(NUITS_MUETTES)
+        .await
+        .map_err(|e| anyhow!("hôtes muets: {e}"))?
+        .into_iter()
+        .collect();
     let moteurs: HashMap<String, String> = repo
         .moteurs_par_hote()
         .await
         .map_err(|e| anyhow!("moteurs par hôte: {e}"))?
         .into_iter()
+        .filter(|(h, _)| !muets.contains(h))
         .collect();
     let candidates = repo
         .annonces_a_jumeler(ANNONCE_FOND_MARCHE)
@@ -979,7 +1525,7 @@ pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
                 .reference
                 .as_deref()
                 .filter(|r| r.chars().count() >= 4),
-            lj_core::annonces::cles_jointure_depuis_urls(
+            lj_annonces::cles_jointure_depuis_urls(
                 ligne
                     .urls
                     .iter()
@@ -1006,8 +1552,8 @@ pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
     // portent la même référence sur le même hôte.
     let mut cache: HashMap<(&str, &str), Vec<String>> = HashMap::new();
     let mut paires: Vec<(String, String)> = Vec::new();
-    let (mut trouvees, mut vides, mut echecs, mut sans_adaptateur) =
-        (0usize, 0usize, 0usize, 0usize);
+    let (mut trouvees, mut vides, mut echecs, mut sans_adaptateur, mut sans_corroboration) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut par_moteur: BTreeMap<&str, usize> = BTreeMap::new();
     for (ligne, reference, hote, moteur) in &travail {
         let cle = (*reference, hote.as_str());
@@ -1016,7 +1562,10 @@ pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
             None => {
                 let rows = match moteur.as_str() {
                     "atline" => Some(annonces::atline::chercher(reference).await),
+                    "aws" => Some(annonces::aws::chercher(reference).await),
                     "atexo" => Some(annonces::atexo::chercher(hote, reference).await),
+                    "dematis" => Some(annonces::dematis::chercher(reference).await),
+                    "achatpublic" => Some(annonces::achatpublic::chercher(reference).await),
                     _ => None,
                 };
                 let uids = match rows {
@@ -1054,7 +1603,7 @@ pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
                     }
                     Some(Err(e)) => {
                         echecs += 1;
-                        tracing::warn!(reference, hote, moteur, error = %e, "annonces_resoudre : recherche en échec");
+                        tracing::warn!(reference, hote, moteur, error = %e, "annonces_resoudre: search failed");
                         Vec::new()
                     }
                     None => {
@@ -1074,7 +1623,12 @@ pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
         // cette preuve-là est plus étroite que l'index de références global du
         // jumelage — elle porte l'hôte en plus de la clé.
         if let [source_uid] = trouvailles.as_slice() {
-            paires.push((ligne.uid.clone(), source_uid.clone()));
+            match brutes.iter().find(|b| &b.source_uid == source_uid) {
+                Some(b) if corrobore_brute(ligne, b) => {
+                    paires.push((ligne.uid.clone(), source_uid.clone()));
+                }
+                _ => sans_corroboration += 1,
+            }
         }
     }
 
@@ -1086,7 +1640,7 @@ pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
         let aujourdhui = Timestamp::now()
             .to_zoned(jiff::tz::TimeZone::get("Europe/Paris").expect("tzdb embarquée"))
             .date();
-        let (_, stats, _) = reconcilier_et_ecrire(&repo, brutes, aujourdhui).await?;
+        let (_, stats, _) = reconcilier_et_ecrire(repo, brutes, aujourdhui).await?;
         stats.canaux
     } else {
         0
@@ -1127,6 +1681,7 @@ pub async fn annonces_resoudre(limite: i64, applique: bool) -> Result<()> {
         vides,
         echecs,
         sans_adaptateur,
+        sans_corroboration,
         canaux_ecrits = ecrites,
         paires = fusions.len(),
         absorbees,
@@ -1168,16 +1723,19 @@ fn moteur_statique(moteur: &str) -> &'static str {
 /// Dry-run par défaut : sans `applique`, la passe lit, journalise chaque paire
 /// et n'écrit rien.
 pub async fn annonces_jumeler(applique: bool) -> Result<()> {
-    let debut = std::time::Instant::now();
     let settings = Settings::from_env()?;
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
+    jumeler(&repo, applique).await
+}
 
+async fn jumeler(repo: &DecisionRepository<'_>, applique: bool) -> Result<()> {
+    let debut = std::time::Instant::now();
     // Le recensement `profil_acheteur` est le seul oracle hôte → moteur : il
     // couvre les marques blanches et les instances multi-tenants, qu'aucune
     // liste de domaines ne nomme. Les moteurs qu'on ne moissonne pas n'ont
@@ -1211,8 +1769,8 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
     // l'hôte. Une ligne à deux canaux n'y entre qu'une fois.
     let mut par_reference: HashMap<String, Vec<&AnnonceChamps>> = HashMap::new();
     for c in &canaux {
-        if let Some(r) = c.annonce.reference.as_deref().map(plie) {
-            if !r.is_empty() && r != plie(&c.annonce.acteur_libelle) {
+        if let Some(r) = c.annonce.reference.as_deref().map(lj_fold::fold) {
+            if !r.is_empty() && r != lj_fold::fold(&c.annonce.acteur_libelle) {
                 par_reference.entry(r).or_default().push(&c.annonce);
             }
         }
@@ -1226,12 +1784,27 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
     // second facteur de la clé.
     let mut par_titre: HashMap<String, Vec<&AnnonceChamps>> = HashMap::new();
     for c in &canaux {
-        let t = plie(&c.annonce.titre);
+        let t = lj_fold::fold(&c.annonce.titre);
         if !t.is_empty() {
             par_titre.entry(t).or_default().push(&c.annonce);
         }
     }
     for lignes in par_titre.values_mut() {
+        lignes.sort_by(|a, b| a.uid.cmp(&b.uid));
+        lignes.dedup_by(|a, b| a.uid == b.uid);
+    }
+    let mut par_entite: HashMap<&str, Vec<&AnnonceChamps>> = HashMap::new();
+    let mut par_libelle: HashMap<String, Vec<&AnnonceChamps>> = HashMap::new();
+    for c in &canaux {
+        if let Some(e) = c.annonce.acheteur_uid.as_deref() {
+            par_entite.entry(e).or_default().push(&c.annonce);
+        }
+        let l = lj_fold::fold(&c.annonce.acteur_libelle);
+        if !l.is_empty() {
+            par_libelle.entry(l).or_default().push(&c.annonce);
+        }
+    }
+    for lignes in par_entite.values_mut().chain(par_libelle.values_mut()) {
         lignes.sort_by(|a, b| a.uid.cmp(&b.uid));
         lignes.dedup_by(|a, b| a.uid == b.uid);
     }
@@ -1249,7 +1822,7 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
     // départage plus rien.
     let portees: HashMap<String, usize> = candidates
         .iter()
-        .filter_map(|l| l.reference.as_deref().map(plie))
+        .filter_map(|l| l.reference.as_deref().map(lj_fold::fold))
         .fold(HashMap::new(), |mut m, r| {
             *m.entry(r).or_default() += 1;
             m
@@ -1257,39 +1830,48 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
     let mut compte = CompteJumelage::default();
     let mut paires: Vec<(&lj_store::repository::AnnonceAJumeler, &str, String)> = Vec::new();
     for ligne in &candidates {
-        // Une clé de jointure extraite est un join exact : la moisson la joue
-        // seule, et si elle n'a rien rattaché c'est que la cible n'est pas en
-        // stock — le titre ne doit pas passer par-dessus.
-        if !lj_core::annonces::cles_jointure_depuis_urls(
+        // An extracted join key is an exact join, so no title overrides it. But a
+        // key that attached nothing does not prove the target absent: 15 of those
+        // 42 rows have a unique same-buyer near title (11/09), their only key.
+        let avec_cle = !lj_annonces::cles_jointure_depuis_urls(
             ligne
                 .urls
                 .iter()
                 .map(String::as_str)
                 .chain(std::iter::once(ligne.depot.as_str())),
         )
-        .is_empty()
-        {
+        .is_empty();
+        if avec_cle {
             compte.avec_cle += 1;
-            continue;
         }
         // La référence d'abord : c'est la clé la plus forte, et la seule qui
         // n'a besoin ni du libellé d'acheteur ni de l'hôte déclaré.
         let declare = hote_et_moteur(&ligne.depot, &moteurs)
             .map(|(h, m)| canal_du_stock(canal_de_depot(&m, &h), &vivier));
-        if let Jumelage::Une(uid) = jumelle_par_reference(
-            ligne,
-            &par_reference,
-            &portees,
-            &canal_de_cible,
-            declare.as_deref(),
-        ) {
-            let canal = canal_de_cible.get(uid).cloned().unwrap_or_default();
-            paires.push((ligne, uid, canal));
-            continue;
+        if !avec_cle {
+            if let Jumelage::Une(uid) = jumelle_par_reference(
+                ligne,
+                &par_reference,
+                &portees,
+                &canal_de_cible,
+                declare.as_deref(),
+            ) {
+                let canal = canal_de_cible.get(uid).cloned().unwrap_or_default();
+                paires.push((ligne, uid, canal));
+                continue;
+            }
+            // The title before the deposit: it sees the whole stock, where the
+            // deposit pool is bounded to the declared channel and demands a
+            // concurring buyer.
+            if let Jumelage::Une(uid) = jumelle_par_titre_echeance(ligne, &par_titre) {
+                let canal = canal_de_cible.get(uid).cloned().unwrap_or_default();
+                paires.push((ligne, uid, canal));
+                continue;
+            }
         }
-        // Le titre avant le dépôt : il voit tout le stock, quand le vivier du
-        // dépôt est borné au canal déclaré et exige un acheteur concordant.
-        if let Jumelage::Une(uid) = jumelle_par_titre_echeance(ligne, &par_titre) {
+        // An exact corroboration, so before the deposit, which has none.
+        if let Jumelage::Une(uid) = jumelle_par_acheteur(ligne, &par_entite, &par_libelle) {
+            compte.acheteur += 1;
             let canal = canal_de_cible.get(uid).cloned().unwrap_or_default();
             paires.push((ligne, uid, canal));
             continue;
@@ -1304,8 +1886,15 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
         };
         match jumelle_de_depot(ligne, vivier) {
             Jumelage::Une(uid) => paires.push((ligne, uid, canal)),
-            Jumelage::Aucune => compte.sans_jumelle += 1,
             Jumelage::Ambigue => compte.ambigues += 1,
+            Jumelage::Aucune => match jumelle_par_titre_proche(ligne, vivier) {
+                Jumelage::Une(uid) => {
+                    compte.proches += 1;
+                    paires.push((ligne, uid, canal));
+                }
+                Jumelage::Aucune => compte.sans_jumelle += 1,
+                Jumelage::Ambigue => compte.ambigues += 1,
+            },
         }
     }
     // Une jumelle revendiquée par deux candidates : au plus l'une a raison, et
@@ -1322,6 +1911,10 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
         .iter()
         .map(|c| (c.annonce.uid.as_str(), &c.annonce))
         .collect();
+    let propose = paires.len();
+    paires.retain(|(ligne, uid, _)| champs.get(uid).is_some_and(|j| corrobore(ligne, j)));
+    compte.sans_corroboration = propose - paires.len();
+
     let mut par_moteur: BTreeMap<&str, usize> = BTreeMap::new();
     for (ligne, uid, canal) in &paires {
         *par_moteur
@@ -1339,7 +1932,7 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
             acheteur_uid = ligne.acheteur_uid.as_deref().unwrap_or_default(),
             boamp_echeance = %ligne.echeance.map(|e| e.to_rfc3339()).unwrap_or_default(),
             plateforme_echeance = %jumelle.echeance.map(|e| e.to_rfc3339()).unwrap_or_default(),
-            "annonces_jumeler : paire"
+            "annonces_jumeler: pair"
         );
     }
 
@@ -1373,6 +1966,9 @@ pub async fn annonces_jumeler(applique: bool) -> Result<()> {
         ambigues = compte.ambigues,
         disputees = compte.disputees,
         jumelles_disputees = compte.jumelles_disputees,
+        sans_corroboration = compte.sans_corroboration,
+        proches = compte.proches,
+        acheteur = compte.acheteur,
         elapsed_s = debut.elapsed().as_secs(),
         "annonces_jumeler"
     );
@@ -1489,6 +2085,11 @@ async fn ecrire_resultats(
                         url_avis: None,
                     });
                 }
+                let metiers = lj_annonces::metiers::metiers_du_marche(
+                    &r.descripteurs,
+                    &codes_des_lots(&r.contenu),
+                    &r.objet,
+                );
                 let item = AnnonceWriteItem {
                     uid: marche_uid_de_resultat(&r.idweb, parent_effectif.as_deref()),
                     fond: ANNONCE_FOND_MARCHE.to_string(),
@@ -1496,7 +2097,7 @@ async fn ecrire_resultats(
                     // Déjà en forme : le connecteur forme à la construction.
                     titre: r.objet.chars().take(400).collect(),
                     acteur_libelle: r.acheteur.clone().unwrap_or_default(),
-                    departement: r.departement.clone(),
+                    zones: lj_annonces::zones::codes(&r.zones),
                     cpv_uid: r.cpv.as_deref().and_then(cpv_division_uid),
                     date_publication: date_chrono(r.date_parution),
                     // Sans échéance connue, la ligne n'entre jamais dans la fenêtre
@@ -1504,11 +2105,17 @@ async fn ecrire_resultats(
                     // plus d'offres.
                     echeance: None,
                     url_action: r.url_avis.clone(),
-                    details: serde_json::json!({
-                        "cpv": r.cpv,
-                        "liens": [{"moteur": "boamp", "avis": r.url_avis}],
-                        "resultat": resultat,
-                    }),
+                    description: r.contenu.description.clone(),
+                    metiers,
+                    details: {
+                        let mut d = serde_json::json!({
+                            "cpv": r.cpv,
+                            "liens": [{"moteur": "boamp", "avis": r.url_avis}],
+                            "resultat": resultat,
+                        });
+                        poser_contenu(&mut d, &r.contenu, &r.descripteurs);
+                        d
+                    },
                     aretes_siren: aretes,
                     sources,
                 };
@@ -1555,12 +2162,509 @@ async fn ecrire_resultats(
         stats.canaux += s.canaux;
         stats.aretes += s.aretes;
     }
+    let ecrits: Vec<String> = orphelins.into_iter().map(|i| i.uid).collect();
+    replier_les_metiers(repo, Some(&ecrits)).await?;
     let liens: Vec<ResultatPose> = poses.into_values().map(|(_, p)| p).collect();
     let rattaches = repo
         .poser_resultats(&liens)
         .await
         .map_err(|e| anyhow!("poser les résultats: {e}"))?;
     Ok((resultats.len(), stats, rattaches))
+}
+
+/// An award is final: the window is replayed only to catch a notice published
+/// while the harvest was down.
+const RESULTATS_TED_JOURS: u32 = 30;
+
+/// Poses TED awards on markets already in stock. An award whose consultation is
+/// missing founds no orphan row, unlike the BOAMP one: the TED consultation is
+/// harvested anyway, so its absence is a breakdown, not a gap in coverage.
+async fn ecrire_resultats_ted(
+    repo: &DecisionRepository<'_>,
+    resultats: Vec<lj_sources_annonces::ted::ResultatTed>,
+) -> Result<(usize, u64)> {
+    let cles: Vec<String> = resultats
+        .iter()
+        .flat_map(|r| r.cles_consultation.iter().cloned())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let par_cle: HashMap<String, String> = repo
+        .annonces_par_source(&cles)
+        .await
+        .map_err(|e| anyhow!("marchés des attributions TED: {e}"))?
+        .into_iter()
+        .collect();
+
+    // Lots published apart and corrigenda put several award notices on one
+    // market: the most recent keeps the row.
+    let mut poses: HashMap<String, (jiff::civil::Date, ResultatPose)> = HashMap::new();
+    for r in &resultats {
+        let Some(uid) = r.cles_consultation.iter().find_map(|c| par_cle.get(c)) else {
+            continue;
+        };
+        let mut resultat = serde_json::json!({
+            "lots": r.lots.iter().map(lot_json).collect::<Vec<_>>(),
+            "texte": serde_json::Value::Null,
+            "avis_url": r.url_avis,
+        });
+        embellir_resultat(&mut resultat);
+        let pose = ResultatPose {
+            annonce_uid: uid.clone(),
+            resultat,
+            source: AnnonceSourceWriteItem {
+                source_uid: format!("ted:{}", r.publication),
+                url_avis: Some(r.url_avis.clone()),
+            },
+            aretes_siren: Vec::new(),
+        };
+        let paru = r.date_publication.unwrap_or(jiff::civil::date(1970, 1, 1));
+        match poses.entry(uid.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut e) if e.get().0 < paru => {
+                e.insert((paru, pose));
+            }
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((paru, pose));
+            }
+            _ => {}
+        }
+    }
+    let lot: Vec<ResultatPose> = poses.into_values().map(|(_, p)| p).collect();
+    let n = repo
+        .poser_resultats(&lot)
+        .await
+        .map_err(|e| anyhow!("pose des attributions TED: {e}"))?;
+    Ok((resultats.len(), n))
+}
+
+/// Trigram similarity below which the buyer of an award and the buyer of the
+/// market it would close are not the same. On the 286 unambiguous references of
+/// 15/09/2026, seven named another buyer and all seven fell under 0.4.
+const SEUIL_ACHETEUR_AWS: f64 = 0.4;
+
+const FICHES_AWS_EN_VOL: usize = 8;
+
+/// Poses AWS awards. The notice carries its own publication reference, so the
+/// only handle back to the consultation is the reference the buyer gave, which
+/// says nothing unless it designates one market and one buyer: the store keeps
+/// the first condition, the similarity here the second.
+async fn ecrire_resultats_aws(
+    repo: &DecisionRepository<'_>,
+    attributions: Vec<lj_sources_annonces::aws::AttributionListee>,
+) -> Result<(usize, usize, u64)> {
+    let references: Vec<String> = attributions
+        .iter()
+        .map(|a| a.reference.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let cibles: HashMap<String, (String, String)> = repo
+        .marches_par_reference(&references)
+        .await
+        .map_err(|e| anyhow!("marchés des attributions AWS: {e}"))?
+        .into_iter()
+        .map(|m| (m.reference, (m.uid, m.acteur_libelle)))
+        .collect();
+
+    let vus = attributions.len();
+    let candidates: Vec<(String, lj_sources_annonces::aws::AttributionListee)> = attributions
+        .into_iter()
+        .filter_map(|a| {
+            let (uid, libelle) = cibles.get(&a.reference)?;
+            if lj_annonces::similarite_titres(&a.acheteur, libelle) < SEUIL_ACHETEUR_AWS {
+                return None;
+            }
+            Some((uid.clone(), a))
+        })
+        .collect();
+    let rattachees = candidates.len();
+
+    let fiches = futures::stream::iter(candidates.into_iter().map(|(uid, a)| async move {
+        match annonces::aws::attribution_lots(&a.url_avis).await {
+            Ok(lots) if !lots.is_empty() => Some((uid, a, lots)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, url = %a.url_avis, "annonces: AWS award record unreadable");
+                None
+            }
+        }
+    }))
+    .buffer_unordered(FICHES_AWS_EN_VOL)
+    .filter_map(|r| async move { r })
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut poses: HashMap<String, (jiff::civil::Date, ResultatPose)> = HashMap::new();
+    for (uid, a, lots) in fiches {
+        let mut resultat = serde_json::json!({
+            "lots": lots.iter().map(lot_json).collect::<Vec<_>>(),
+            "texte": serde_json::Value::Null,
+            "avis_url": a.url_avis,
+        });
+        embellir_resultat(&mut resultat);
+        let pose = ResultatPose {
+            annonce_uid: uid.clone(),
+            resultat,
+            source: AnnonceSourceWriteItem {
+                source_uid: format!("aws:pub:{}", a.publication),
+                url_avis: Some(a.url_avis.clone()),
+            },
+            aretes_siren: Vec::new(),
+        };
+        let paru = a.date_publication.unwrap_or(jiff::civil::date(1970, 1, 1));
+        match poses.entry(uid) {
+            Entry::Occupied(mut e) if e.get().0 < paru => {
+                e.insert((paru, pose));
+            }
+            Entry::Vacant(v) => {
+                v.insert((paru, pose));
+            }
+            _ => {}
+        }
+    }
+    let lot: Vec<ResultatPose> = poses.into_values().map(|(_, p)| p).collect();
+    let n = repo
+        .poser_resultats(&lot)
+        .await
+        .map_err(|e| anyhow!("pose des attributions AWS: {e}"))?;
+    Ok((vus, rattachees, n))
+}
+
+/// Walks a DECP export and poses what it can attach.
+pub async fn annonces_decp(depuis: Option<&str>, applique: bool) -> Result<()> {
+    let debut = std::time::Instant::now();
+    let settings = Settings::from_env()?;
+    let fenetre: jiff::civil::Date = match depuis {
+        Some(s) => s
+            .parse()
+            .map_err(|e| anyhow!("annonces-decp : date {s} illisible: {e}"))?,
+        None => Timestamp::now()
+            .to_zoned(TimeZone::UTC)
+            .date()
+            .saturating_sub(jiff::Span::new().days(FENETRE_DECP_JOURS)),
+    };
+    let dir = settings.paths().decp();
+    let mut modifies = BTreeMap::new();
+    for jeu in &annonces::decp::JEUX {
+        let modifie = annonces::decp::modifie_le(jeu)
+            .await
+            .map_err(|e| anyhow!("catalogue DECP {}: {e}", jeu.id))?;
+        modifies.insert(jeu.id.to_string(), modifie);
+    }
+    let mut manifeste =
+        annonces::decp::Manifeste::load(&dir).map_err(|e| anyhow!("manifeste DECP: {e}"))?;
+    if manifeste.deja_vu(&modifies, fenetre) {
+        tracing::info!(
+            depuis = %fenetre,
+            modifies = ?modifies.values().collect::<Vec<_>>(),
+            "annonces: DECP unchanged, nothing to re-read"
+        );
+        return Ok(());
+    }
+
+    // The two datasets overlap on 2022 to 2024 and declare the same contracts
+    // there, which would double every lot of the period.
+    let mut vues = HashSet::new();
+    let mut declarations = Vec::new();
+    for jeu in &annonces::decp::JEUX {
+        let fichier = annonces::decp::telecharger(&dir, jeu, fenetre)
+            .await
+            .map_err(|e| anyhow!("export DECP {}: {e}", jeu.id))?;
+        for d in annonces::decp::lire(&fichier, jeu)
+            .map_err(|e| anyhow!("lecture de l'export DECP {}: {e}", jeu.id))?
+        {
+            if vues.insert((
+                d.acheteur_siren.clone(),
+                d.id.clone(),
+                d.objet.clone(),
+                d.date_notification,
+            )) {
+                declarations.push(d);
+            }
+        }
+    }
+
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    conn.batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
+        .await
+        .map_err(|e| anyhow!("migrations: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+
+    let plancher = chrono::DateTime::from_timestamp(
+        fenetre
+            .to_zoned(TimeZone::UTC)
+            .map_err(|e| anyhow!("fenêtre DECP: {e}"))?
+            .timestamp()
+            .as_second()
+            - i64::from(RECUL_DECP_JOURS) * 86_400,
+        0,
+    )
+    .ok_or_else(|| anyhow!("fenêtre DECP hors bornes"))?;
+    // The buyer edge is what opens the low band and spares the trigram, and the
+    // daily harvest only ever posts it on open rows.
+    let aretes = repo
+        .relier_annonces_par_denomination(applique.then_some(plancher))
+        .await
+        .map_err(|e| anyhow!("rattachement par dénomination: {e}"))?;
+    let (vus, rattachees, via_cpv, poses) =
+        ecrire_resultats_decp(&repo, declarations, plancher, applique).await?;
+    // A dry run must not eat the signal: recording what it read would make the
+    // next real pass skip a publication nobody ever wrote down.
+    if applique {
+        manifeste.modifies = modifies;
+        manifeste.depuis = Some(fenetre.to_string());
+        manifeste
+            .save(&dir)
+            .map_err(|e| anyhow!("manifeste DECP: {e}"))?;
+    }
+    tracing::info!(
+        vus,
+        aretes,
+        rattachees,
+        via_cpv,
+        poses,
+        applique,
+        depuis = %fenetre,
+        elapsed_s = debut.elapsed().as_secs(),
+        "annonces: DECP awards"
+    );
+    Ok(())
+}
+
+/// Trigram similarity below which the buyer a declaration names and the buyer
+/// of the market it would close are not the same. Same frontier as the AWS
+/// channel, measured there on its unambiguous references.
+const SEUIL_ACHETEUR_DECP: f64 = 0.4;
+
+/// Trigram similarity below which an object and a title do not name the same
+/// contract. On 300 declarations drawn on 15/09/2026 the band above is right
+/// without exception; just under, « Assurances pour les besoins du SDIS du
+/// Loir-et-Cher » pairs with « assurances pour les besoins du SIS 68 » at 0.62.
+const SEUIL_OBJET_DECP: i32 = 70;
+
+/// Object threshold when the buyer is the same SIREN and the CPV division
+/// agrees. Both guards earn their place: on 40 pairs drawn on 16/09/2026 the
+/// band holds 1 false under them, and 4 under the CPV alone at 0.45.
+const SEUIL_OBJET_DECP_CPV: i32 = 55;
+
+/// Months a declaration may look back for the consultation it closes.
+const RECUL_DECP_MOIS: i32 = 15;
+const RECUL_DECP_JOURS: i32 = RECUL_DECP_MOIS * 31;
+
+/// Days of notification the scheduled pass walks. The export filters on the
+/// notification date, so a declaration whose buyer took longer than this to
+/// declare it is never in window again: on the 14,820 rows the 2022 set
+/// published between 17/08 and 16/09/2026, 34 % were notified inside 30 days,
+/// 65 % inside 90 and 80 % inside 180. At 180 the pass reads 67,817
+/// declarations in 31 s and resolves its buyer edges in 12 s, where the manual
+/// pass that goes and fetches the rest of the history costs 105 min.
+const FENETRE_DECP_JOURS: i64 = 180;
+
+/// Rare tokens of a title, the blocking key. Comparing every declaration with
+/// every market is 272,000 times 159,000 similarities; a pair above the object
+/// threshold always shares a word of more than four letters.
+fn jetons(s: &str) -> HashSet<String> {
+    lj_fold::fold(s)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|m| m.chars().count() > 4)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Poses the awards a DECP export declares. The buyer guards, the object
+/// decides, and an object that fits two markets decides nothing: attaching an
+/// award to the wrong market costs more than attaching none.
+pub async fn ecrire_resultats_decp(
+    repo: &DecisionRepository<'_>,
+    declarations: Vec<lj_sources_annonces::decp::AttributionDecp>,
+    depuis: chrono::DateTime<chrono::Utc>,
+    applique: bool,
+) -> Result<(usize, usize, usize, u64)> {
+    let marches = repo
+        .marches_clos_sans_resultat(ANNONCE_FOND_MARCHE, depuis)
+        .await
+        .map_err(|e| anyhow!("marchés clos sans résultat: {e}"))?;
+    let sirens: Vec<String> = declarations
+        .iter()
+        .flat_map(|d| std::iter::once(d.acheteur_siren.clone()).chain(d.titulaire_siren.clone()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let denominations: HashMap<String, String> = repo
+        .denominations_par_siren(&sirens)
+        .await
+        .map_err(|e| anyhow!("dénominations DECP: {e}"))?
+        .into_iter()
+        .collect();
+
+    let jetons_marche: Vec<HashSet<String>> = marches.iter().map(|m| jetons(&m.titre)).collect();
+    let mut par_jeton: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, js) in jetons_marche.iter().enumerate() {
+        for j in js {
+            par_jeton.entry(j.as_str()).or_default().push(i);
+        }
+    }
+
+    let vus = declarations.len();
+    // DECP declares one row per lot, so a market takes as many rows as it has
+    // lots: they gather into the single `resultat` block the other channels
+    // write, and the last declaration to name the market carries its channel.
+    let mut lots_par_marche: BTreeMap<String, Vec<LotAttribue>> = BTreeMap::new();
+    let mut apercu: Vec<(i32, String, String)> = Vec::new();
+    let mut rattachees = 0usize;
+    let mut via_cpv = 0usize;
+    let mut bande_cpv: Vec<(i32, String, String)> = Vec::new();
+    for d in &declarations {
+        let fin = chrono::NaiveDate::from_ymd_opt(
+            d.date_notification.year().into(),
+            d.date_notification.month() as u32,
+            d.date_notification.day() as u32,
+        );
+        let (Some(fin), Some(denomination)) = (fin, denominations.get(&d.acheteur_siren)) else {
+            continue;
+        };
+        let debut = fin - chrono::Duration::days(RECUL_DECP_JOURS.into());
+        // The two rarest tokens of the object: scanning « travaux », present on
+        // tens of thousands of titles, would cost the whole stock per
+        // declaration, and one token alone misses the pair whose single rare
+        // word is the one the two wordings spell differently.
+        let mut seaux: Vec<&Vec<usize>> = jetons(&d.objet)
+            .iter()
+            .filter_map(|j| par_jeton.get(j.as_str()))
+            .collect();
+        seaux.sort_unstable_by_key(|ids| ids.len());
+        if seaux.is_empty() {
+            continue;
+        }
+        let candidats: HashSet<usize> = seaux
+            .iter()
+            .take(2)
+            .flat_map(|v| v.iter().copied())
+            .collect();
+        let mut meilleur: Option<(i32, usize)> = None;
+        let mut ex_aequo = false;
+        for i in candidats {
+            let m = &marches[i];
+            let ech = m.echeance.date_naive();
+            if ech > fin || ech < debut {
+                continue;
+            }
+            let siren_sur = m.acheteur_siren.as_deref() == Some(d.acheteur_siren.as_str());
+            let concorde = siren_sur
+                || (m.acheteur_siren.is_none()
+                    && lj_annonces::similarite_titres(&m.acteur_libelle, denomination)
+                        >= SEUIL_ACHETEUR_DECP);
+            if !concorde {
+                continue;
+            }
+            let cpv_concorde = siren_sur
+                && match (&m.cpv_uid, &d.cpv) {
+                    (Some(u), Some(c)) => lj_annonces::cpv_division_uid(c).as_ref() == Some(u),
+                    _ => false,
+                };
+            let seuil = if cpv_concorde {
+                SEUIL_OBJET_DECP_CPV
+            } else {
+                SEUIL_OBJET_DECP
+            };
+            let score = (lj_annonces::similarite_titres(&m.titre, &d.objet) * 100.0) as i32;
+            if score < seuil {
+                continue;
+            }
+            match meilleur {
+                Some((s, _)) if score < s => {}
+                Some((s, _)) if score == s => ex_aequo = true,
+                _ => {
+                    meilleur = Some((score, i));
+                    ex_aequo = false;
+                }
+            }
+        }
+        let Some((score, i)) = meilleur.filter(|_| !ex_aequo) else {
+            continue;
+        };
+        rattachees += 1;
+        if score < SEUIL_OBJET_DECP {
+            via_cpv += 1;
+            bande_cpv.push((score, marches[i].titre.clone(), d.objet.clone()));
+        }
+        if apercu.len() < 25 {
+            apercu.push((score, marches[i].titre.clone(), d.objet.clone()));
+        }
+        let titulaire = d
+            .titulaire_siren
+            .as_ref()
+            .and_then(|s| denominations.get(s))
+            .cloned();
+        let lot = LotAttribue {
+            description: None,
+            titulaire: titulaire.unwrap_or_default(),
+            siren: d.titulaire_siren.clone(),
+            ville: None,
+            montant: d.montant,
+            devise: Some("EUR".to_string()),
+            nb_offres: d.nb_offres,
+            date_attribution: Some(d.date_notification),
+        };
+        lots_par_marche
+            .entry(marches[i].uid.clone())
+            .or_default()
+            .push(lot);
+    }
+
+    let mut lot_a_poser: Vec<ResultatPose> = Vec::new();
+    for (uid, lots) in lots_par_marche {
+        let mut resultat = serde_json::json!({
+            "lots": lots.iter().map(lot_json).collect::<Vec<_>>(),
+            "texte": serde_json::Value::Null,
+            "avis_url": serde_json::Value::Null,
+        });
+        embellir_resultat(&mut resultat);
+        let aretes_siren = lots
+            .iter()
+            .filter_map(|l| l.siren.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(|s| (s, "titulaire".to_string()))
+            .collect();
+        // A declaration carries no identity of its own: its `id` is the number
+        // its buyer gave the contract, and the same buyer repeats it across
+        // contracts. The market it closes is what makes the channel unique, and
+        // a market takes one DECP channel however many lots it declares.
+        let source_uid = format!("decp:{}", uid.trim_start_matches("marche:"));
+        lot_a_poser.push(ResultatPose {
+            annonce_uid: uid,
+            resultat,
+            source: AnnonceSourceWriteItem {
+                source_uid,
+                url_avis: None,
+            },
+            aretes_siren,
+        });
+    }
+    if !applique {
+        for (score, titre, objet) in apercu.iter().take(25) {
+            tracing::info!(score, titre, objet, "annonces: DECP award kept");
+        }
+        for (score, titre, objet) in bande_cpv
+            .iter()
+            .step_by(1.max(bande_cpv.len() / 40))
+            .take(40)
+        {
+            tracing::info!(score, titre, objet, "annonces: DECP award CPV band");
+        }
+        return Ok((vus, rattachees, via_cpv, lot_a_poser.len() as u64));
+    }
+    let n = repo
+        .poser_resultats(&lot_a_poser)
+        .await
+        .map_err(|e| anyhow!("pose des attributions DECP: {e}"))?;
+    Ok((vus, rattachees, via_cpv, n))
 }
 
 fn lot_json(l: &LotAttribue) -> serde_json::Value {
@@ -1587,14 +2691,14 @@ fn embellir_resultat(resultat: &mut serde_json::Value) -> bool {
     let mut change = false;
     for lot in lots {
         if let Some(t) = lot.get("titulaire").and_then(|v| v.as_str()) {
-            let propre = lj_core::annonces::nettoyer_acheteur(t);
+            let propre = lj_annonces::nettoyer_acheteur(t);
             if propre != t {
                 lot["titulaire"] = propre.into();
                 change = true;
             }
         }
         if let Some(d) = lot.get("description").and_then(|v| v.as_str()) {
-            let propre = lj_core::annonces::embellir_titre(d);
+            let propre = lj_annonces::embellir_titre(d);
             if propre != d {
                 lot["description"] = propre.into();
                 change = true;
@@ -1620,20 +2724,27 @@ fn ecrire(c: &AnnonceCanonique) -> AnnonceWriteItem {
             })
         })
         .collect();
-    let details = serde_json::json!({
+    let mut details = serde_json::json!({
         "reference": c.reference,
         "procedure": c.procedure,
         "cpv": c.cpv,
         "liens": liens,
         "depot": c.url_depot,
     });
+    poser_contenu(&mut details, &c.contenu, &c.descripteurs);
+    let metiers = lj_annonces::metiers::metiers_du_marche(
+        &c.descripteurs,
+        &codes_des_lots(&c.contenu),
+        &c.titre,
+    );
     AnnonceWriteItem {
         uid: c.uid.clone(),
         fond: ANNONCE_FOND_MARCHE.to_string(),
         famille_uid: c.famille_uid.map(str::to_string),
         titre: c.titre.chars().take(400).collect(),
+        description: c.contenu.description.clone(),
         acteur_libelle: c.acheteur_libelle.clone(),
-        departement: c.departement.clone(),
+        zones: lj_annonces::zones::codes(&c.zones),
         cpv_uid: c.cpv_uid.clone(),
         date_publication: date_chrono(c.date_publication),
         echeance: c
@@ -1641,6 +2752,7 @@ fn ecrire(c: &AnnonceCanonique) -> AnnonceWriteItem {
             .and_then(|t| chrono::DateTime::from_timestamp_millis(t.as_millisecond())),
         url_action: c.url_action.clone(),
         details,
+        metiers,
         aretes_siren: c
             .sirens
             .iter()
@@ -1657,9 +2769,75 @@ fn ecrire(c: &AnnonceCanonique) -> AnnonceWriteItem {
     }
 }
 
-/// Pause entre deux fiches d'un même moteur. La politesse se mesure par hôte :
-/// les moteurs avancent en parallèle, chacun à ce débit.
+/// Folds the trades again on the merged row, whose lots and descriptors may come
+/// from a channel the batch did not carry. `parmi` bounds the rows.
+async fn replier_les_metiers(
+    repo: &DecisionRepository<'_>,
+    parmi: Option<&[String]>,
+) -> Result<u64> {
+    let metiers: Vec<(String, Vec<String>)> = repo
+        .annonces_a_metier(parmi)
+        .await
+        .map_err(|e| anyhow!("rows to fold: {e}"))?
+        .into_iter()
+        .filter_map(|a| {
+            let m = lj_annonces::metiers::metiers_du_marche(
+                &a.descripteurs,
+                &a.codes_des_lots,
+                &a.titre,
+            );
+            (!m.is_empty() && m != a.metiers).then_some((a.uid, m))
+        })
+        .collect();
+    let mut poses = 0;
+    for lot in metiers.chunks(2_000) {
+        poses += repo
+            .replier_metiers(lot)
+            .await
+            .map_err(|e| anyhow!("fold trades: {e}"))?;
+    }
+    Ok(poses)
+}
+
+fn codes_des_lots(contenu: &ContenuAnnonce) -> Vec<&str> {
+    contenu
+        .lots
+        .iter()
+        .filter_map(|l| l.cpv.as_deref())
+        .collect()
+}
+
+/// Grafts onto a `details` block what the notice carries beyond its title. An
+/// empty field does not enter: the blob stays at the grain of its usage.
+fn poser_contenu(
+    details: &mut serde_json::Value,
+    contenu: &ContenuAnnonce,
+    descripteurs: &[String],
+) {
+    let bloc = details
+        .as_object_mut()
+        .expect("details construit comme objet");
+    if !contenu.lots.is_empty() {
+        bloc.insert("lots".into(), serde_json::json!(contenu.lots));
+    }
+    if !contenu.criteres.is_empty() {
+        bloc.insert("criteres".into(), serde_json::json!(contenu.criteres));
+    }
+    if let Some(m) = &contenu.montant_estime {
+        bloc.insert("montant_estime".into(), serde_json::json!(m));
+    }
+    if !descripteurs.is_empty() {
+        bloc.insert("descripteurs".into(), serde_json::json!(descripteurs));
+    }
+}
+
+/// Pause between two notices on the same HOST. Hosts advance in parallel, each
+/// at this rate.
 const POLITESSE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Hosts pulled at once. The grain is the host and not the engine: 40 distinct
+/// servers run Atexo, and one of them hanging starved the 39 others.
+const HOSTS_IN_FLIGHT: usize = 16;
 
 /// Lots d'écriture — un aller-retour par tranche, pas par fiche.
 const LOT_DETAIL: usize = 200;
@@ -1669,13 +2847,19 @@ const LOT_DETAIL: usize = 200;
 /// la file.
 fn bloc_detail(d: &annonces::DetailAnnonce) -> serde_json::Value {
     let mut bloc = serde_json::Map::new();
+    // The day the current parser read the notice. 1 851 of the 2 017 rows the
+    // content queue held had already answered nothing, and came back weekly.
+    let vu = Timestamp::now().to_zoned(TimeZone::UTC).date().to_string();
+    bloc.insert("vu".into(), serde_json::json!(vu));
     if let Some(cpv) = &d.cpv {
         bloc.insert("cpv".into(), serde_json::json!(cpv));
     }
     if let Some(procedure) = &d.procedure {
         bloc.insert("procedure".into(), serde_json::json!(procedure));
     }
-    serde_json::Value::Object(bloc)
+    let mut bloc = serde_json::Value::Object(bloc);
+    poser_contenu(&mut bloc, &d.contenu, &[]);
+    bloc
 }
 
 /// Enrichissement par page de détail. La file est dérivée — les annonces
@@ -1690,55 +2874,56 @@ fn bloc_detail(d: &annonces::DetailAnnonce) -> serde_json::Value {
 /// budget elle rend la main, ses lignes comptent en `remises` et repassent la
 /// nuit suivante. Un rattrapage manuel monte le plafond pour vider la file
 /// d'une traite — c'est ce budget qui borne, jamais l'hôte.
-pub async fn annonces_enrichir(limite: i64, budget_min: u64, sans_acheteur: bool) -> Result<()> {
+async fn tirer_les_fiches(
+    repo: &DecisionRepository<'_>,
+    limite: i64,
+    budget_min: u64,
+    file: FileEnrichissement,
+) -> Result<()> {
     let debut = std::time::Instant::now();
     let budget = std::time::Duration::from_secs(budget_min * 60);
-    let settings = Settings::from_env()?;
-    let pool =
-        lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
-    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
-        .await
-        .map_err(|e| anyhow!("migrations: {e}"))?;
-    let repo = DecisionRepository::new(&conn);
 
     let file = repo
         .annonces_a_enrichir(
             ANNONCE_FOND_MARCHE,
-            &lj_core::annonces::PRIORITE,
+            &lj_annonces::PRIORITE,
+            &lj_annonces::SANS_FICHE,
             limite,
-            sans_acheteur,
+            file,
         )
         .await
         .map_err(|e| anyhow!("file d'enrichissement: {e}"))?;
-    let mut par_moteur: HashMap<String, Vec<AnnonceAEnrichir>> = HashMap::new();
+    let mut par_hote: HashMap<(String, String), Vec<AnnonceAEnrichir>> = HashMap::new();
     for ligne in file {
-        par_moteur
-            .entry(ligne.moteur.clone())
+        let hote = annonces::discover::hote_de(&ligne.url_avis).unwrap_or_default();
+        par_hote
+            .entry((ligne.moteur.clone(), hote))
             .or_default()
             .push(ligne);
     }
 
-    let egress: &str = &settings.egress_url;
-    let lus =
-        futures::future::join_all(par_moteur.into_iter().map(|(moteur, lignes)| async move {
-            let debut_moteur = std::time::Instant::now();
+    let lus: Vec<_> = futures::stream::iter(par_hote.into_iter().map(
+        |((moteur, _hote), lignes)| async move {
             let (mut poses, mut echecs, mut derniere) = (Vec::new(), 0u32, String::new());
             let mut remises = 0usize;
             for (i, ligne) in lignes.iter().enumerate() {
-                if debut_moteur.elapsed() >= budget {
+                // Deadline global: an unserved group would otherwise start its own
+                // budget on getting a slot, and the run would outlive its watchdog.
+                if debut.elapsed() >= budget {
                     remises = lignes.len() - i;
                     break;
                 }
                 if i > 0 {
                     tokio::time::sleep(POLITESSE).await;
                 }
-                match annonces::detail(&moteur, &ligne.url_avis, egress).await {
+                match annonces::detail(&moteur, &ligne.url_avis).await {
                     Ok(d) => poses.push(DetailPose {
                         annonce_uid: ligne.uid.clone(),
                         cpv_uid: d.cpv.as_deref().and_then(cpv_division_uid),
                         detail: bloc_detail(&d),
+                        description: d.contenu.description.clone(),
                         acheteur: d.acheteur.clone(),
+                        zones: lj_annonces::zones::codes(&d.zones),
                     }),
                     Err(e) => {
                         echecs += 1;
@@ -1747,20 +2932,24 @@ pub async fn annonces_enrichir(limite: i64, budget_min: u64, sans_acheteur: bool
                 }
             }
             (moteur, poses, echecs, derniere, remises)
-        }))
-        .await;
+        },
+    ))
+    .buffer_unordered(HOSTS_IN_FLIGHT)
+    .collect()
+    .await;
 
     let (mut total_ok, mut total_echecs, mut ecrits, mut total_remises) =
         (0usize, 0u32, 0u64, 0usize);
+    let mut par_moteur: BTreeMap<String, (usize, u32, usize, String)> = BTreeMap::new();
+    let mut lues: Vec<String> = Vec::new();
     for (moteur, poses, echecs, derniere, remises) in lus {
-        tracing::info!(
-            moteur = %moteur,
-            ok = poses.len(),
-            echecs,
-            remises,
-            erreur = %derniere,
-            "annonces_enrichir : moteur"
-        );
+        let cumul = par_moteur.entry(moteur.clone()).or_default();
+        cumul.0 += poses.len();
+        cumul.1 += echecs;
+        cumul.2 += remises;
+        if !derniere.is_empty() {
+            cumul.3 = derniere;
+        }
         total_ok += poses.len();
         total_echecs += echecs;
         total_remises += remises;
@@ -1770,6 +2959,19 @@ pub async fn annonces_enrichir(limite: i64, budget_min: u64, sans_acheteur: bool
                 .await
                 .map_err(|e| anyhow!("poser les détails ({moteur}): {e}"))?;
         }
+        lues.extend(poses.into_iter().map(|p| p.annonce_uid));
+    }
+    // The page may be the only place a market lists its works lots.
+    let metiers_replies = replier_les_metiers(repo, Some(&lues)).await?;
+    for (moteur, (ok, echecs, remises, erreur)) in &par_moteur {
+        tracing::info!(
+            moteur = %moteur,
+            ok,
+            echecs,
+            remises,
+            erreur = %erreur,
+            "annonces_enrichir: moteur"
+        );
     }
 
     tracing::info!(
@@ -1777,10 +2979,29 @@ pub async fn annonces_enrichir(limite: i64, budget_min: u64, sans_acheteur: bool
         echecs = total_echecs,
         remises = total_remises,
         ecrits,
+        metiers_replies,
         elapsed_s = debut.elapsed().as_secs(),
         "annonces_enrichir"
     );
     Ok(())
+}
+
+/// Catch-up only: the nightly pull happens inside the harvest, on the rows it
+/// has just written.
+pub async fn annonces_enrichir(
+    limite: i64,
+    budget_min: u64,
+    file: FileEnrichissement,
+) -> Result<()> {
+    let settings = Settings::from_env()?;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
+        .await
+        .map_err(|e| anyhow!("migrations: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+    tirer_les_fiches(&repo, limite, budget_min, file).await
 }
 
 /// Recensement des profils d'acheteurs : les hôtes cités par les avis actifs du
@@ -1794,7 +3015,7 @@ pub async fn annonces_discover() -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -1836,7 +3057,8 @@ pub async fn annonces_discover() -> Result<()> {
             "annonces_discover_temoin"
         );
     }
-    tracing::info!(
+    rapport_rattrapage!(
+        ecrits,
         hotes = recensement.profils.len(),
         ecrits,
         moteurs = recensement
@@ -1854,8 +3076,99 @@ pub async fn annonces_discover() -> Result<()> {
     Ok(())
 }
 
+/// Counts per verdict and one probed URL per verdict, for one engine and kind.
+type CompteVerdicts = (BTreeMap<&'static str, u64>, BTreeMap<&'static str, String>);
+
+/// What the step gives the network. The weekly chain, which carries the daily
+/// one plus its maintenance, has 300 s of margin under the cron period.
+const BUDGET_SONDE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Draws a sample of the links the listings show, probes each one and writes
+/// the verdict of the day. No escalation: a platform that rations the caller
+/// gets its own verdict, which is not a dead link.
+pub async fn annonces_sonder_liens(par_moteur: i64) -> Result<()> {
+    let debut = std::time::Instant::now();
+    let settings = Settings::from_env()?;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
+        .await
+        .map_err(|e| anyhow!("migrations: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+
+    let liens = repo
+        .liens_a_sonder(ANNONCE_FOND_MARCHE, par_moteur)
+        .await
+        .map_err(|e| anyhow!("liens à sonder: {e}"))?;
+    let tirs = annonces::sonde::sonder(&liens, BUDGET_SONDE).await;
+
+    let mut par_cle: BTreeMap<(String, String), CompteVerdicts> = BTreeMap::new();
+    for t in &tirs {
+        let (compte, exemples) = par_cle
+            .entry((t.moteur.clone(), t.kind.clone()))
+            .or_default();
+        *compte.entry(t.verdict.nom()).or_default() += 1;
+        exemples.entry(t.verdict.nom()).or_insert(t.url.clone());
+    }
+
+    let sondes: Vec<SondeLiens> = par_cle
+        .iter()
+        .map(|((moteur, kind), (compte, exemples))| SondeLiens {
+            moteur: moteur.clone(),
+            kind: kind.clone(),
+            verdicts: serde_json::json!(compte),
+            exemples: serde_json::json!(exemples),
+        })
+        .collect();
+    repo.poser_sonde_liens(&sondes)
+        .await
+        .map_err(|e| anyhow!("poser sonde: {e}"))?;
+
+    for ((moteur, kind), (compte, exemples)) in &par_cle {
+        let tires: u64 = compte.values().sum();
+        let ouvrent: u64 = compte
+            .iter()
+            .filter(|(v, _)| matches!(**v, "fichier" | "formulaire" | "fiche"))
+            .map(|(_, n)| *n)
+            .sum();
+        let ferment = compte.get("accueil").copied().unwrap_or_default()
+            + compte.get("mort").copied().unwrap_or_default();
+        if ferment > 0 && ouvrent == 0 {
+            tracing::error!(
+                moteur = moteur.as_str(),
+                kind = kind.as_str(),
+                tires,
+                exemple = exemples
+                    .get("accueil")
+                    .or_else(|| exemples.get("mort"))
+                    .map(String::as_str),
+                "annonces_sonde_lien_ferme"
+            );
+        }
+        tracing::info!(
+            moteur = moteur.as_str(),
+            kind = kind.as_str(),
+            tires,
+            ouvrent,
+            ferment,
+            rationne = compte.get("rationne").copied().unwrap_or_default(),
+            indecidable = compte.get("indecidable").copied().unwrap_or_default(),
+            "annonces_sonde_lien"
+        );
+    }
+    tracing::info!(
+        liens = tirs.len(),
+        moteurs = par_cle.len(),
+        elapsed_s = debut.elapsed().as_secs(),
+        "annonces_sonder_liens"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use lj_store::repository::{AnnonceAJumeler, AnnonceOrpheline};
 
@@ -1888,6 +3201,8 @@ mod tests {
     #[test]
     fn la_flotte_qui_tombe_degrade_meme_quand_les_survivants_servent_tout() {
         let brute = AnnonceBrute {
+            contenu: ContenuAnnonce::default(),
+            descripteurs: Vec::new(),
             moteur: "safetender",
             source_uid: "safetender:h:1".into(),
             cles_jointure: Vec::new(),
@@ -1897,7 +3212,7 @@ mod tests {
             objet: "objet".into(),
             nature: None,
             cpv: None,
-            departement: None,
+            zones: Vec::new(),
             date_publication: None,
             echeance: None,
             url_avis: None,
@@ -1935,7 +3250,7 @@ mod tests {
             titre: titre.into(),
             acteur_libelle: acteur.into(),
             echeance: echeance.map(|e| e.parse().expect("timestamp valide")),
-            departement: None,
+            zones: Vec::new(),
             depot: "https://www.marches-securises.fr".into(),
             urls: Vec::new(),
             acheteur_uid: None,
@@ -1972,7 +3287,7 @@ mod tests {
             titre: titre.into(),
             acteur_libelle: acteur.into(),
             echeance: echeance.map(|e| e.parse().expect("timestamp valide")),
-            departement: None,
+            zones: Vec::new(),
             acheteur_uid: None,
             reference: None,
         }
@@ -1985,7 +3300,7 @@ mod tests {
         fn index<'a>(cibles: &[&'a AnnonceChamps]) -> HashMap<String, Vec<&'a AnnonceChamps>> {
             let mut m: HashMap<String, Vec<&'a AnnonceChamps>> = HashMap::new();
             for c in cibles {
-                m.entry(plie(c.reference.as_deref().unwrap_or_default()))
+                m.entry(lj_fold::fold(c.reference.as_deref().unwrap_or_default()))
                     .or_default()
                     .push(c);
             }
@@ -2062,6 +3377,70 @@ mod tests {
         ));
     }
 
+    /// A reference of digits alone is a serial number two unrelated buyers both
+    /// carry, measured at 8.9 % of the open stock against 0.9 % as soon as a
+    /// letter figures in it. Without a resolved buyer on both sides it needs the
+    /// deadline day to depart.
+    #[test]
+    fn une_reference_de_chiffres_seuls_ne_departage_pas_sans_corroboration() {
+        let plateforme = AnnonceChamps {
+            reference: Some("20260006".into()),
+            ..cible(
+                "marche:p",
+                "Sortie internet",
+                "Agglomération de Mayotte",
+                Some("2026-10-09T10:00:00Z"),
+            )
+        };
+        let index = HashMap::from([("20260006".to_string(), vec![&plateforme])]);
+        let portees = HashMap::from([("20260006".to_string(), 1)]);
+        let ligne = |echeance| AnnonceAJumeler {
+            reference: Some("20260006".into()),
+            ..a_jumeler("Assistance technique", "Agence du Var", echeance)
+        };
+        let joue =
+            |l: &AnnonceAJumeler| jumelle_par_reference(l, &index, &portees, &HashMap::new(), None);
+        assert!(matches!(
+            joue(&ligne(Some("2026-10-02T10:00:00Z"))),
+            Jumelage::Aucune
+        ));
+        assert!(matches!(joue(&ligne(None)), Jumelage::Aucune));
+        assert!(
+            matches!(joue(&ligne(Some("2026-10-09T14:00:00Z"))), Jumelage::Une(u) if u == "marche:p")
+        );
+    }
+
+    #[test]
+    fn une_paire_sans_titre_ni_echeance_ni_acheteur_ne_passe_pas_le_plancher() {
+        let mayotte = cible(
+            "marche:p",
+            "Fourniture d'une sortie internet et de liens Trunk SIP",
+            "Agglomération de Dembéni-Mamoudzou",
+            Some("2026-10-09T10:00:00Z"),
+        );
+        let var = a_jumeler(
+            "Missions d'assistance technique en assainissement collectif",
+            "Agence technique du Var",
+            Some("2026-10-02T10:00:00Z"),
+        );
+        assert!(!corrobore(&var, &mayotte));
+        assert!(corrobore(
+            &AnnonceAJumeler {
+                echeance: mayotte.echeance,
+                ..a_jumeler(&var.titre, &var.acteur_libelle, None)
+            },
+            &mayotte
+        ));
+        assert!(corrobore(
+            &a_jumeler(&mayotte.titre, &var.acteur_libelle, None),
+            &mayotte
+        ));
+        assert!(corrobore(
+            &a_jumeler(&var.titre, &mayotte.acteur_libelle, None),
+            &mayotte
+        ));
+    }
+
     /// Le titre et la date d'échéance font clé sans acheteur ni canal : c'est
     /// la voie des avis dont l'hôte déclaré n'a pas de moteur connecté, ou dont
     /// la plateforme nomme le groupe tenant. L'heure ne compte pas, le jour si ;
@@ -2071,7 +3450,7 @@ mod tests {
         fn index<'a>(cibles: &[&'a AnnonceChamps]) -> HashMap<String, Vec<&'a AnnonceChamps>> {
             let mut m: HashMap<String, Vec<&'a AnnonceChamps>> = HashMap::new();
             for c in cibles {
-                m.entry(plie(&c.titre)).or_default().push(c);
+                m.entry(lj_fold::fold(&c.titre)).or_default().push(c);
             }
             m
         }
@@ -2107,15 +3486,15 @@ mod tests {
         // Deux prétendantes au même jour : le département départage, et deux
         // départements résolus et différents récusent.
         let gard = AnnonceChamps {
-            departement: Some("30".into()),
+            zones: vec!["30".into()],
             ..cible("marche:g", &ligne.titre, "", Some("2026-09-08T10:00:00Z"))
         };
         let aude = AnnonceChamps {
-            departement: Some("11".into()),
+            zones: vec!["11".into()],
             ..cible("marche:a", &ligne.titre, "", Some("2026-09-08T10:00:00Z"))
         };
         let ligne_gard = AnnonceAJumeler {
-            departement: Some("30".into()),
+            zones: vec!["30".into()],
             ..a_jumeler(&ligne.titre, "", Some("2026-09-08T14:00:00Z"))
         };
         assert!(matches!(
@@ -2170,6 +3549,43 @@ mod tests {
         );
     }
 
+    /// The deposit declares the front door, the connector questions the serving
+    /// instance: the search by reference used to fire at `megalis.bretagne.bzh`,
+    /// whose `/api/v2` answers HTML. Two sub-domains settle nothing.
+    #[test]
+    fn the_declared_host_resolves_to_the_instance_a_connector_questions() {
+        let moteurs: HashMap<String, String> = [
+            ("megalis.bretagne.bzh", "atexo"),
+            ("marches.megalis.bretagne.bzh", "atexo"),
+            ("sso.megalis.bretagne.bzh", "safetender"),
+            ("marchespublics.eure.fr", "atexo"),
+            ("exemple.fr", "atexo"),
+            ("a.exemple.fr", "atexo"),
+            ("b.exemple.fr", "atexo"),
+        ]
+        .iter()
+        .map(|(h, m)| ((*h).to_string(), (*m).to_string()))
+        .collect();
+        let r = |depot: &str| hote_et_moteur(depot, &moteurs);
+        assert_eq!(
+            r("https://megalis.bretagne.bzh/"),
+            Some((
+                "marches.megalis.bretagne.bzh".to_string(),
+                "atexo".to_string()
+            )),
+            "the engine bounds the resolution, safetender does not count"
+        );
+        assert_eq!(
+            r("https://marchespublics.eure.fr/"),
+            Some(("marchespublics.eure.fr".to_string(), "atexo".to_string()))
+        );
+        assert_eq!(
+            r("https://exemple.fr/"),
+            Some(("exemple.fr".to_string(), "atexo".to_string())),
+            "two instances leave the front door alone"
+        );
+    }
+
     /// La même cible, rattachée à une entité acheteur.
     fn cible_entite(
         uid: &str,
@@ -2206,12 +3622,26 @@ mod tests {
 
     #[test]
     fn le_bloc_detail_ne_porte_que_ce_que_la_page_a_donne() {
+        // `vu` stamps every visit and dates it, so it is read apart from the
+        // fields the page gave.
+        let lu = |d: &annonces::DetailAnnonce| {
+            let mut bloc = bloc_detail(d);
+            let vu = bloc
+                .as_object_mut()
+                .expect("objet")
+                .remove("vu")
+                .expect("la visite est estampillée");
+            assert_eq!(vu.as_str().map(str::len), Some(10), "date ISO : {vu}");
+            bloc
+        };
         assert_eq!(
-            bloc_detail(&annonces::DetailAnnonce::default()),
+            lu(&annonces::DetailAnnonce::default()),
             serde_json::json!({})
         );
         assert_eq!(
-            bloc_detail(&annonces::DetailAnnonce {
+            lu(&annonces::DetailAnnonce {
+                contenu: ContenuAnnonce::default(),
+                zones: Vec::new(),
                 cpv: Some("45233140-2".into()),
                 procedure: None,
                 acheteur: None,
@@ -2219,7 +3649,9 @@ mod tests {
             serde_json::json!({"cpv": "45233140-2"})
         );
         assert_eq!(
-            bloc_detail(&annonces::DetailAnnonce {
+            lu(&annonces::DetailAnnonce {
+                contenu: ContenuAnnonce::default(),
+                zones: Vec::new(),
                 cpv: Some("45233140-2".into()),
                 procedure: Some("Procédure adaptée".into()),
                 acheteur: None,
@@ -2425,6 +3857,92 @@ mod tests {
         assert!(matches!(
             jumelle_de_depot(&ligne, &[&a, &b]),
             Jumelage::Une("marche:p")
+        ));
+    }
+
+    /// The two titles are the measured false positive of the low band: one
+    /// buyer, two sibling lots that one word separates.
+    #[test]
+    fn deux_lots_freres_ne_se_confondent_pas_sous_le_seuil() {
+        let ligne = a_jumeler_entite(
+            "L'entretien et la réparation des véhicules de PTAC inférieur à 4,5 Tonnes pour le SDIS de la Mayenne",
+            "SDIS",
+            Some("2026-09-04T12:00:00Z"),
+            "siren:215903923",
+        );
+        let frere = AnnonceChamps {
+            acheteur_uid: Some("siren:215903923".into()),
+            ..cible(
+                "marche:p",
+                "Entretien et réparation des véhicules de ptac supérieur ou égal à 4,5 t",
+                "SDIS",
+                Some("2026-09-04T12:00:00Z"),
+            )
+        };
+        let mut index = HashMap::new();
+        index.insert("siren:215903923", vec![&frere]);
+        assert!(matches!(
+            jumelle_par_acheteur(&ligne, &index, &HashMap::new()),
+            Jumelage::Aucune
+        ));
+    }
+
+    /// Both spellings come from the fund: the buyer prefixes its title with its
+    /// internal reference on the platform and not at the BOAMP.
+    #[test]
+    fn le_titre_approchant_rattrape_un_prefixe_de_reference() {
+        let ligne = a_jumeler(
+            "PA 2026-15 : Maintenance préventive des ascenseurs",
+            "Ville",
+            Some("2026-09-04T12:00:00Z"),
+        );
+        let a = cible(
+            "marche:p",
+            "Maintenance préventive des ascenseurs",
+            "Ville",
+            Some("2026-10-02T12:00:00Z"),
+        );
+        let b = cible("marche:q", "Entretien des espaces verts", "Ville", None);
+        assert!(matches!(
+            jumelle_par_titre_proche(&ligne, &[&a, &b]),
+            Jumelage::Une("marche:p")
+        ));
+        // Two pretenders above the threshold are not separated: on this
+        // fallback the deadline is worth nothing, being what failed higher up.
+        let c = cible(
+            "marche:r",
+            "PA 2026-15 : Maintenance préventive des ascenseurs, lot 2",
+            "Ville",
+            Some("2026-09-04T12:00:00Z"),
+        );
+        assert!(matches!(
+            jumelle_par_titre_proche(&ligne, &[&a, &c]),
+            Jumelage::Ambigue
+        ));
+    }
+
+    /// Two resolved and different buyer entities refuse the pair even on
+    /// identical titles: the same object goes to tender in two nearby towns.
+    #[test]
+    fn le_titre_approchant_recuse_une_autre_entite_acheteur() {
+        let ligne = a_jumeler_entite(
+            "Fourniture et livraison de repas en liaison froide",
+            "Commune A",
+            Some("2026-09-04T12:00:00Z"),
+            "siren:215903923",
+        );
+        let a = AnnonceChamps {
+            acheteur_uid: Some("siren:213100555".into()),
+            ..cible(
+                "marche:p",
+                "Fourniture et livraison de repas en liaison froide",
+                "Commune B",
+                Some("2026-09-04T12:00:00Z"),
+            )
+        };
+        assert!(matches!(
+            jumelle_par_titre_proche(&ligne, &[&a]),
+            Jumelage::Aucune
         ));
     }
 

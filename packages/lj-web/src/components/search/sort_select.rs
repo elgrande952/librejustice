@@ -30,16 +30,43 @@ pub fn SortSelect() -> impl IntoView {
     let query_map = use_query_map();
     let navigate = use_navigate();
 
-    let current = Signal::derive(move || {
+    // Without a question `order_by` serves date descending whatever the sort
+    // asked for, so « Pertinence » would name an order nothing produces.
+    let sans_question = Signal::derive(move || {
         query_map
             .get()
+            .get("q")
+            .map(|q| q.trim().is_empty())
+            .unwrap_or(true)
+    });
+    let options = Signal::derive(move || {
+        let toutes = options();
+        match sans_question.get() {
+            true => toutes
+                .into_iter()
+                .filter(|o| o.value != "relevance")
+                .collect(),
+            false => toutes,
+        }
+    });
+
+    let current = Signal::derive(move || {
+        let demande = query_map
+            .get()
             .get("sort")
-            .unwrap_or_else(|| "relevance".to_string())
+            .unwrap_or_else(|| "relevance".to_string());
+        match sans_question.get() && demande == "relevance" {
+            true => "date_desc".to_string(),
+            false => demande,
+        }
     });
 
     let on_change = Callback::new(move |value: String| {
-        // `relevance` (défaut) ⇒ on retire `sort` ; drop `page` ; replace.
-        let next = if value == "relevance" {
+        // The default sort never reaches the URL: `relevance` with a question,
+        // `date_desc` without one, both being what the server serves untold.
+        let defaut =
+            value == "relevance" || (sans_question.get_untracked() && value == "date_desc");
+        let next = if defaut {
             query_state::with_param(&query_map.get_untracked(), "sort", None, true)
         } else {
             query_state::with_param(&query_map.get_untracked(), "sort", Some(&value), true)
@@ -57,7 +84,7 @@ pub fn SortSelect() -> impl IntoView {
         <DropdownSelect
             value=current
             on_change=on_change
-            options=Signal::derive(options)
+            options=options
             aria_label="Trier les résultats"
         />
     }

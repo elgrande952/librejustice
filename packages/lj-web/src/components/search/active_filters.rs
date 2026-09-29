@@ -11,6 +11,7 @@ use leptos_router::hooks::use_query_map;
 use leptos_router::params::ParamsMap;
 use lj_dtos::SearchFacets;
 
+use super::annonce_results::date_fr;
 use super::compact_search::{query_state, DraftQuery};
 use super::facet_widgets::{filter_keys, Nav};
 
@@ -104,9 +105,21 @@ pub fn decision_chips(map: &ParamsMap, facets: Option<&SearchFacets>) -> Vec<Act
             label,
         });
     }
+    let article_label = |uid: &str, art: &str| {
+        instruments
+            .iter()
+            .find(|f| f.value == uid)
+            .and_then(|f| f.articles.iter().find(|a| a.value == art))
+            .map(|a| a.label.clone())
+            .unwrap_or_else(|| art.to_string())
+    };
     for v in all("legalArticle") {
         let label = match v.split_once('|') {
-            Some((uid, art)) => format!("{} · art. {art}", instrument_label(uid)),
+            Some((uid, art)) => format!(
+                "{} · art. {}",
+                instrument_label(uid),
+                article_label(uid, art)
+            ),
             None => v.clone(),
         };
         chips.push(ActiveChip {
@@ -118,10 +131,11 @@ pub fn decision_chips(map: &ParamsMap, facets: Option<&SearchFacets>) -> Vec<Act
 
     let from = map.get("dateFrom").unwrap_or_default();
     let to = map.get("dateTo").unwrap_or_default();
+    let jour = |iso: &str| date_fr(iso).unwrap_or_else(|| iso.to_string());
     let date_label = match (from.is_empty(), to.is_empty()) {
-        (false, false) => Some(format!("Du {from} au {to}")),
-        (false, true) => Some(format!("Depuis le {from}")),
-        (true, false) => Some(format!("Jusqu'au {to}")),
+        (false, false) => Some(format!("Du {} au {}", jour(&from), jour(&to))),
+        (false, true) => Some(format!("Depuis le {}", jour(&from))),
+        (true, false) => Some(format!("Jusqu'au {}", jour(&to))),
         (true, true) => None,
     };
     if let Some(label) = date_label {
@@ -284,8 +298,15 @@ mod tests {
                 label: "Code civil".into(),
                 slug: None,
                 count: 5,
-                articles: Vec::new(),
+                articles: vec![FacetChoice {
+                    value: "l433-1".into(),
+                    label: "L. 433-1".into(),
+                    count: 3,
+                    parent: None,
+                    hint: None,
+                }],
             }],
+            legal_article_top: Vec::new(),
         }
     }
 
@@ -328,6 +349,9 @@ mod tests {
         let chips = decision_chips(&m, Some(&facets()));
         assert_eq!(chips[0].label, "Code civil · art. 1240");
         assert_eq!(chips[0].value, "code-civil|1240");
+        let m = map_of(&[("legalArticle", "code-civil|l433-1")]);
+        let chips = decision_chips(&m, Some(&facets()));
+        assert_eq!(chips[0].label, "Code civil · art. L. 433-1");
     }
 
     #[test]
@@ -340,9 +364,9 @@ mod tests {
         let chips = decision_chips(&m, Some(&facets()));
         let dates: Vec<&ActiveChip> = chips.iter().filter(|c| c.key == "dates").collect();
         assert_eq!(dates.len(), 1);
-        assert_eq!(dates[0].label, "Du 2020-01-01 au 2021-06-30");
+        assert_eq!(dates[0].label, "Du 01/01/2020 au 30/06/2021");
         let m = map_of(&[("dateFrom", "2020-01-01")]);
         let chips = decision_chips(&m, None);
-        assert_eq!(chips[0].label, "Depuis le 2020-01-01");
+        assert_eq!(chips[0].label, "Depuis le 01/01/2020");
     }
 }

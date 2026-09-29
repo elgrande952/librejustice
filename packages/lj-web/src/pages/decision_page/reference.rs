@@ -1,4 +1,4 @@
-//! Références d'une décision (titre complet / abrégé / nom de fichier).
+//! Références d'une décision (titre complet / abrégé).
 
 use lj_dtos::DecisionDetail;
 
@@ -11,15 +11,12 @@ pub struct DecisionReferenceParts {
     pub full: String,
     pub heading: String,
     pub short: String,
-    pub filename: String,
 }
 
 /// Construit les références :
 /// - `full` = `detail.title` (titre canonique servi par l'API, avec siège) ;
 /// - `heading` = `[juridiction complète, date FR, n°]` sans siège ;
-/// - `short`/`filename` = `[juridiction abrégée, date FR, n° dossier]` ;
-///   `filename` remplace le `/` des n° RG judiciaires (« 25/01119 ») par `_`,
-///   interdit dans un nom de fichier.
+/// - `short` = `[juridiction abrégée, date FR, n° dossier]`.
 pub fn build_decision_references(detail: &DecisionDetail) -> DecisionReferenceParts {
     let date = detail
         .date_lecture
@@ -50,7 +47,6 @@ pub fn build_decision_references(detail: &DecisionDetail) -> DecisionReferencePa
     DecisionReferenceParts {
         full: detail.title.clone(),
         heading,
-        filename: short.replace('/', "_"),
         short,
     }
 }

@@ -24,7 +24,7 @@ use crate::components::decision::{
     DecisionSimilar, DecisionSkeleton, DecisionToc,
 };
 use crate::components::own_page_description;
-use crate::seo::decision::{build_json_ld, meta_description};
+use crate::seo::decision::{build_json_ld, meta_description, seo_title};
 use crate::seo::{canonical_url, OG_IMAGE};
 
 use data::{
@@ -131,31 +131,17 @@ fn DecisionLoaded(
     similar: Resource<SimilarResult>,
     parties: Resource<PartiesResult>,
 ) -> impl IntoView {
-    // Lecture enregistrée pour le hub « Mes lectures ». Une vue web est une lecture
-    // humaine délibérée, d'où sa précédence sur MCP. Sans session, rien n'est
-    // envoyé ; le gate `track_activity` vit dans l'INSERT côté serveur.
     #[cfg(feature = "hydrate")]
-    {
-        let id = detail.id.clone();
-        Effect::new(move |_| {
-            let id = id.clone();
-            leptos::task::spawn_local(async move {
-                if crate::auth::has_session().await {
-                    let _ = crate::api::ApiClient::from_context()
-                        .record_decision_view(&id)
-                        .await;
-                }
-            });
-        });
-    }
+    Effect::new(|_| crate::reads::report(lj_dtos::ReadKind::Decision));
 
     let title = detail.title.clone();
     let description = meta_description(&detail, &title);
-    let url = canonical_url(&detail.id);
+    let url = canonical_url(detail.jurisdiction_type, &detail.id);
     let jsonld = serde_json::to_string(&build_json_ld(&detail, &title, &description))
         .unwrap_or_else(|_| "{}".to_string());
     // Fil d'Ariane structuré vers l'arborescence juridiction — absent si la
     // décision n'a pas de code juridiction résolu.
+    let juris = detail.jurisdiction_type.url_segment();
     let breadcrumb_jsonld = detail.jurisdiction_code.as_ref().map(|code| {
         let label = detail
             .jurisdiction_name
@@ -165,11 +151,11 @@ fn DecisionLoaded(
             ("Accueil", "https://librejustice.fr/".to_string()),
             (
                 "Juridictions",
-                "https://librejustice.fr/juridictions".to_string(),
+                format!("https://librejustice.fr/decision-index/{juris}"),
             ),
             (
                 label.as_str(),
-                format!("https://librejustice.fr/juridiction/{code}"),
+                format!("https://librejustice.fr/decision-index/{juris}/{code}"),
             ),
         ];
         let year = detail
@@ -180,16 +166,14 @@ fn DecisionLoaded(
         if let Some(y) = &year {
             items.push((
                 y.as_str(),
-                format!("https://librejustice.fr/juridiction/{code}/{y}"),
+                format!("https://librejustice.fr/decision-index/{juris}/{code}/{y}"),
             ));
         }
         items.push((title.as_str(), url.clone()));
         crate::pages::juridictions_page::breadcrumb_jsonld(&items)
     });
 
-    // `<title>` = titre canonique complet (avec siège), tronqué à l'affichage par
-    // le moteur : les mots-clés priment sur la borne d'affichage.
-    let page_title = format!("{title} - LibreJustice");
+    let page_title = format!("{} - LibreJustice", seo_title(&detail));
     let references_full = build_decision_references(&detail).full;
 
     let body_sections = resolve_decision_sections(&detail);

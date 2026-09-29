@@ -5,7 +5,6 @@
 //! sont remis aux parsers de `lj-core`.
 
 pub mod adde;
-pub mod annonces;
 pub mod ariane;
 pub mod bofip;
 pub mod ce_list;
@@ -17,7 +16,7 @@ pub mod dila;
 pub mod docx;
 pub mod downloader;
 pub mod error;
-pub mod fetch;
+pub mod hal;
 pub mod html_strip;
 pub mod judilibre;
 pub mod legifrance;

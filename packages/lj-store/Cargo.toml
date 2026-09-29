@@ -9,14 +9,20 @@ license.workspace = true
 # @@@ / <=> en SQL brut. Runner de migrations (44 .sql sous migrations/).
 [dependencies]
 lj-core = { workspace = true }
+lj-norm = { workspace = true }
+lj-textsearch = { workspace = true }
+lj-versions = { workspace = true }
+lj-fold = { workspace = true }
+lj-vocab = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }
 pgvector = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+jiff = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+lj-workspace-hack = { version = "0.1", path = "../lj-workspace-hack" }
 # Ancrage RGPD du gold : checksum xxh3-64 de decisions.full_text au load
 # (citation_gold_anchor).

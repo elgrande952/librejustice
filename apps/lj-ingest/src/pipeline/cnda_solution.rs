@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Result};
 
-use lj_core::parsing::cnda_solution_uid_from_source_fields;
+use lj_parse::cnda_solution_uid_from_source_fields;
 use lj_store::repository::DecisionRepository;
 
 use crate::config::Settings;
@@ -55,7 +55,7 @@ pub async fn backfill_cnda_solution(apply: bool) -> Result<()> {
             total,
             a_poser = set_uids.len(),
             a_retirer = remove_uids.len(),
-            "backfill-cnda-solution : dry-run (--apply pour écrire)"
+            "backfill-cnda-solution: dry-run (--apply to write)"
         );
         return Ok(());
     }
@@ -63,6 +63,6 @@ pub async fn backfill_cnda_solution(apply: bool) -> Result<()> {
     let (posees, retirees) = repo
         .align_source_fields_solution_uid(&set_uids, &set_values, &remove_uids)
         .await?;
-    tracing::info!(total, posees, retirees, "backfill-cnda-solution : terminé");
+    tracing::info!(total, posees, retirees, "backfill-cnda-solution: done");
     Ok(())
 }

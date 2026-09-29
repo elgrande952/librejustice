@@ -15,6 +15,7 @@
 use anyhow::{anyhow, Result};
 
 use lj_core::decision::Decision;
+use lj_parse::FromSourceFields;
 use lj_store::repository::DecisionRepository;
 
 use super::batch::drain_batch;
@@ -64,7 +65,10 @@ pub async fn embed_missing(limit: Option<usize>) -> Result<()> {
             let Some((public_id, payload_format, full_text, source_fields, source_uid, checksum)) =
                 complete
             else {
-                tracing::warn!(decision_id = id, "orphelin sans provenance/full_text, skip");
+                tracing::warn!(
+                    decision_id = id,
+                    "orphan without provenance/full_text, skip"
+                );
                 continue;
             };
             // Reconstruction canonique : décision portée par (full_text,
@@ -80,6 +84,7 @@ pub async fn embed_missing(limit: Option<usize>) -> Result<()> {
                 payload_format,
                 write_mode: WriteMode::Full,
                 dila_fond: None,
+                passages: true,
                 prebuilt_source_fields: Some(source_fields),
                 prebuilt_extracted: None,
             });
@@ -116,7 +121,7 @@ pub async fn embed_missing(limit: Option<usize>) -> Result<()> {
         chunks = counts.chunks_created,
         skipped = counts.skipped,
         empty_skipped = counts.empty_skipped,
-        "Re-embed des orphelins terminé"
+        "Orphan re-embed done"
     );
     Ok(())
 }

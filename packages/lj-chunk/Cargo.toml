@@ -1,0 +1,15 @@
+[package]
+name = "lj-chunk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lj-vocab = { workspace = true }
+anyhow = { workspace = true }
+tokenizers = { workspace = true }
+lj-workspace-hack = { version = "0.1", path = "../lj-workspace-hack" }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

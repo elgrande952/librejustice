@@ -66,7 +66,7 @@ pub async fn ingest_eu_rproc(dry_run: bool) -> Result<()> {
             println!("  {} — {}", r.text_uid, r.title);
         }
         println!(
-            "DRY-RUN ingest-eu-rproc : {} instrument(s) ; aucune écriture.",
+            "DRY-RUN ingest-eu-rproc: {} instrument(s); nothing written.",
             RPROCS.len()
         );
         return Ok(());

@@ -30,4 +30,4 @@ Every article carries its source. Official publishers: `legifrance`, `jorf`, `ka
 
 ## URL and key shapes
 
-`https://librejustice.fr/texte/{slug}/{article-key}`, keys lowercase: `1240`, `l761-1`, `r421-1`, `7-bis`. Texts without numbered articles (circulaires, instructions, many BOFiP pages) are served as a single pseudo-article whose URL ends with `/`.
+`https://librejustice.fr/norm/{juris}/{slug}/{article-key}`, keys lowercase: `1240`, `l761-1`, `r421-1`, `7-bis`. Texts without numbered articles (circulaires, instructions, many BOFiP pages) are served as a single pseudo-article whose URL ends with `/`.

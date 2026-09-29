@@ -1,6 +1,6 @@
-//! Langue de l'utilisateur : en-tête `Accept-Language` du navigateur, claim
-//! `locale` de l'id_token. Posée à la première connexion qui la porte, jamais
-//! réécrite.
+//! What the browser says of its user: every tag of `Accept-Language`, in its
+//! order, and the country Cloudflare reads off the address. The id_token
+//! `locale` claim rides along.
 
 use axum::http::{header, HeaderMap};
 
@@ -8,14 +8,37 @@ use crate::error::Result;
 use crate::state::AppState;
 
 const MAX: usize = 16;
+const LANGUES_MAX: usize = 8;
 
-pub fn du_navigateur(entetes: &HeaderMap) -> Option<String> {
-    entetes
-        .get(header::ACCEPT_LANGUAGE)
-        .and_then(|v| v.to_str().ok())?
+#[derive(Debug, Default, PartialEq)]
+pub struct Navigateur {
+    pub langues: Vec<String>,
+    pub pays: Option<String>,
+}
+
+pub fn du_navigateur(entetes: &HeaderMap) -> Navigateur {
+    let texte = |nom: &str| entetes.get(nom).and_then(|v| v.to_str().ok());
+    let mut langues: Vec<String> = Vec::new();
+    for etiquette in texte(header::ACCEPT_LANGUAGE.as_str())
+        .unwrap_or("")
         .split(',')
-        .next()
-        .and_then(normaliser)
+        .filter_map(normaliser)
+    {
+        if !langues.contains(&etiquette) && langues.len() < LANGUES_MAX {
+            langues.push(etiquette);
+        }
+    }
+    Navigateur {
+        langues,
+        pays: texte("cf-ipcountry").and_then(pays),
+    }
+}
+
+/// `XX` is Cloudflare's unknown and `T1` its Tor exit: neither is a country.
+fn pays(brut: &str) -> Option<String> {
+    let code = brut.trim().to_ascii_uppercase();
+    (code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) && code != "XX")
+        .then_some(code)
 }
 
 pub(crate) fn normaliser(brut: &str) -> Option<String> {
@@ -27,23 +50,32 @@ pub(crate) fn normaliser(brut: &str) -> Option<String> {
     forme.then_some(etiquette)
 }
 
+/// The longest language list seen wins, so a row carrying only the first tag
+/// of an older capture fills in at the next visit. The country and the
+/// provider locale are set once.
 pub async fn retenir(
     state: &AppState,
     sub: &str,
-    navigateur: Option<&str>,
+    navigateur: &Navigateur,
     fournisseur: Option<&str>,
 ) -> Result<()> {
-    if navigateur.is_none() && fournisseur.is_none() {
+    if navigateur == &Navigateur::default() && fournisseur.is_none() {
         return Ok(());
     }
+    let langues = (!navigateur.langues.is_empty()).then_some(&navigateur.langues);
     let conn = state.pool.get().await?;
     conn.execute(
-        "UPDATE users SET browser_locale = coalesce(browser_locale, $2), \
-                          provider_locale = coalesce(provider_locale, $3) \
+        "UPDATE users SET \
+           browser_languages = CASE \
+             WHEN cardinality($2::text[]) > coalesce(cardinality(browser_languages), 0) \
+             THEN $2 ELSE browser_languages END, \
+           country = coalesce(country, $3), \
+           provider_locale = coalesce(provider_locale, $4) \
           WHERE sub = $1 \
-            AND ((browser_locale IS NULL AND $2::text IS NOT NULL) \
-              OR (provider_locale IS NULL AND $3::text IS NOT NULL))",
-        &[&sub, &navigateur, &fournisseur],
+            AND (cardinality($2::text[]) > coalesce(cardinality(browser_languages), 0) \
+              OR (country IS NULL AND $3::text IS NOT NULL) \
+              OR (provider_locale IS NULL AND $4::text IS NOT NULL))",
+        &[&sub, &langues, &navigateur.pays, &fournisseur],
     )
     .await?;
     Ok(())
@@ -54,21 +86,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn premiere_etiquette_de_l_entete() {
+    fn toute_la_liste_dans_son_ordre_sans_doublon() {
         let mut entetes = HeaderMap::new();
         entetes.insert(
             header::ACCEPT_LANGUAGE,
-            "fr-FR,fr;q=0.9,en;q=0.8".parse().unwrap(),
+            "en-US,en;q=0.9,fr;q=0.8,*;q=0.5,EN".parse().unwrap(),
         );
-        assert_eq!(du_navigateur(&entetes).as_deref(), Some("fr-fr"));
+        entetes.insert("cf-ipcountry", "fr".parse().unwrap());
+        assert_eq!(
+            du_navigateur(&entetes),
+            Navigateur {
+                langues: vec!["en-us".into(), "en".into(), "fr".into()],
+                pays: Some("FR".into()),
+            }
+        );
     }
 
     #[test]
     fn entete_absent_ou_sans_etiquette() {
-        assert_eq!(du_navigateur(&HeaderMap::new()), None);
+        assert_eq!(du_navigateur(&HeaderMap::new()), Navigateur::default());
         let mut entetes = HeaderMap::new();
         entetes.insert(header::ACCEPT_LANGUAGE, "*".parse().unwrap());
-        assert_eq!(du_navigateur(&entetes), None);
+        assert_eq!(du_navigateur(&entetes), Navigateur::default());
+    }
+
+    #[test]
+    fn un_pays_inconnu_ou_tor_n_est_pas_un_pays() {
+        for brut in ["XX", "T1", "", "FRA"] {
+            assert_eq!(pays(brut), None, "{brut:?}");
+        }
+        assert_eq!(pays("BE").as_deref(), Some("BE"));
     }
 
     #[test]

@@ -174,7 +174,7 @@ pub fn refine_with_nac(current: Option<String>, nac: Option<&str>) -> Option<Str
 /// [`Decision::themes`]: lj_core::decision::Decision::themes
 pub fn theme_domain(themes: &[String]) -> Option<&'static str> {
     let first = themes.first()?;
-    let blob = crate::compiled::fold_stable(&themes.join(" | "));
+    let blob = lj_fold::fold_chars(&themes.join(" | "));
     // JLD étrangers : rétention / zone d'attente / nationalité, à n'importe
     // quelle profondeur du titrage.
     if (blob.contains("retention") && blob.contains("etranger")) || blob.contains("zone d'attente")
@@ -182,7 +182,7 @@ pub fn theme_domain(themes: &[String]) -> Option<&'static str> {
         return Some("PUBLIC_DROIT_ETRANGERS_NATIONALITE");
     }
     // matière = premier thème, préfixe de moyen raboté.
-    let folded = crate::compiled::fold_stable(first);
+    let folded = lj_fold::fold_chars(first);
     let mut m = folded.trim();
     if m.starts_with('(') {
         if let Some(p) = m.find(')') {

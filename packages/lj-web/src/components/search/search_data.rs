@@ -96,6 +96,33 @@ pub fn count_resource(key: Signal<SearchKey>) -> Resource<CountResult> {
     client.resource(count_scope(), move || key.get().count_key())
 }
 
+/// What the « Textes cités » input names, and the search it is counted on. The
+/// count key and not the full one: paging does not change what a text is worth.
+pub type InstrumentKey = (SearchKey, String);
+
+/// Empty needle, no call: the panel then shows the facet, which the search has
+/// already brought back.
+async fn run_instruments(key: InstrumentKey) -> lj_dtos::LegalInstrumentSuggestions {
+    let (search, needle) = key;
+    if needle.trim().chars().count() < 2 {
+        return lj_dtos::LegalInstrumentSuggestions::default();
+    }
+    ApiClient::from_context()
+        .search_instruments(&request_from_key(&search), &needle)
+        .await
+        .unwrap_or_default()
+}
+
+fn instruments_scope() -> QueryScope<InstrumentKey, lj_dtos::LegalInstrumentSuggestions> {
+    QueryScope::new(|key: InstrumentKey| sendable(run_instruments(key)))
+}
+
+pub fn instruments_resource(
+    key: Signal<InstrumentKey>,
+) -> Resource<lj_dtos::LegalInstrumentSuggestions> {
+    expect_context::<QueryClient>().resource(instruments_scope(), move || key.get())
+}
+
 /// Lecture SYNCHRONE du cache pour une clé donnée. `Some` au retour depuis une
 /// décision (recherche déjà chargée cette session) → la liste est rendue dans la
 /// frame de montage. `None` au premier chargement (cache froid) → le `<Suspense>`

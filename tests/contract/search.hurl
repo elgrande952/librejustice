@@ -4,8 +4,7 @@
 # Asserts HTTP status + JSON STRUCTURAL invariants only (field presence, types,
 # enum value sets, ordering contracts). NOT exact live-data values.
 # Variable: {{base}} = host root (e.g. http://localhost:8300).
-# The route is auth-OPTIONAL: public callers get results; a JWT only triggers
-# search-history recording (no response-shape change).
+# The route is auth-OPTIONAL: a session changes nothing in the response.
 # Facettes = référentiel (jurisdiction/legalDomain/solution/publication/
 # dateLectureYear/legalInstrument).
 # ============================================================================
@@ -30,12 +29,12 @@ jsonpath "$.queryMode" isString
 jsonpath "$.queryMode" matches /^(lexical|hybrid|browse)$/
 # auto + natural language ⇒ resolved hybrid
 jsonpath "$.queryMode" == "hybrid"
-jsonpath "$.allHitIds" isCollection
+jsonpath "$.allHitPaths" isCollection
 # no assertion on total/facets: the count is a second call, and this response
 # hands over one already resolved on its bundle, for free. Their presence
 # depends on what ran before; the count route below is where the number holds.
 # the ranked list itself stays capped at MAX_RESULTS
-jsonpath "$.allHitIds" count <= 100
+jsonpath "$.allHitPaths" count <= 100
 
 
 # ── 1b. The count route: exact total + the facet axes, same query params ─────
@@ -151,7 +150,7 @@ HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
 jsonpath "$.hits" count <= 1
-jsonpath "$.allHitIds" isCollection
+jsonpath "$.allHitPaths" isCollection
 
 
 # ── 14. Single filter: jurisdictionType (repeated query param) ────────────────
@@ -449,6 +448,33 @@ jsonpath "$.hits[0].titleHtml" contains "362324"
 jsonpath "$.pinned" not exists
 
 
+# ── 41b. A bare run of six digits or more is the request, not a clue in one ──
+GET {{base}}/internal/search?q=2503146
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.hits" count >= 10
+jsonpath "$.hits[0].titleHtml" contains "2503146"
+jsonpath "$.pinned" not exists
+
+
+# ── 41c. Five digits stay a postcode: a content list under a card ────────────
+GET {{base}}/internal/search?q=75013
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "lexical"
+jsonpath "$.pinned" count >= 1
+
+
+# ── 41d. The stated mode serves the citing decisions the bare run gave up ────
+GET {{base}}/internal/search?q=2503146&mode=lexical
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "lexical"
+jsonpath "$.hits" count >= 1
+jsonpath "$.pinned" not exists
+
+
 # ── 42. A case name beside its court is a declared reference ─────────────────
 GET {{base}}/internal/search?q=B%C3%A9ziers%20conseil%20d%27%C3%89tat
 HTTP 200
@@ -457,12 +483,107 @@ jsonpath "$.queryMode" == "reference"
 jsonpath "$.hits" count >= 3
 jsonpath "$.hits[0].titleHtml" contains "Béziers"
 jsonpath "$.pinned" not exists
+[Captures]
+servies: jsonpath "$.allHitPaths" count
+
+
+# ── 42b. Reference counts its own list: its question bounds nothing ──────────
+GET {{base}}/internal/search/decompte?q=B%C3%A9ziers%20conseil%20d%27%C3%89tat
+HTTP 200
+[Asserts]
+jsonpath "$.total" == {{servies}}
+
+
+# ── 43. A court and a full day, no name, no number: a reference ──────────────
+GET {{base}}/internal/search?q=caa%20paris%2017%20juillet%202024
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.hits" count >= 10
+jsonpath "$.hits[0].titleHtml" contains "Cour administrative d'appel de"
+jsonpath "$.hits[0].titleHtml" contains "PA"
+jsonpath "$.pinned" not exists
+
+
+# ── 44. The QPC graphy is a docket key of the Conseil constitutionnel ────────
+GET {{base}}/internal/search?q=2010-104%20QPC
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.hits" count == 1
+jsonpath "$.hits[0].titleHtml" contains "Conseil constitutionnel"
+jsonpath "$.pinned" not exists
+
+
+# ── 45. An ECLI is a key of its own ──────────────────────────────────────────
+GET {{base}}/internal/search?q=ECLI:FR:CCASS:2007:C200527
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.hits" count == 1
+jsonpath "$.hits[0].titleHtml" contains "06-12.066"
+jsonpath "$.pinned" not exists
+
+
+# ── 46. A named article is counted by name, whatever its rank in the facet ───
+GET {{base}}/internal/search/instruments?q=&needle=L761-2%20du%20code%20de%20la%20consommation
+HTTP 200
+[Captures]
+citantes: jsonpath "$.legalInstrument[0].articles[0].count"
+[Asserts]
+jsonpath "$.legalInstrument[0].label" == "Code de la consommation"
+jsonpath "$.legalInstrument[0].value" == "LEGITEXT000006069565"
+jsonpath "$.legalInstrument[0].articles[0].label" == "L. 761-2"
+jsonpath "$.legalInstrument[0].articles[0].value" == "l761-2"
+jsonpath "$.legalInstrument[0].articles[0].count" > 0
+
+
+# ── 46b. And that count is the total the composite filter serves ─────────────
+GET {{base}}/internal/search/decompte?q=&legalArticle=LEGITEXT000006069565%7Cl761-2
+HTTP 200
+[Asserts]
+jsonpath "$.total" == {{citantes}}
+
+
+# ── 47. A bare number is an article here, and usage decides which code ───────
+GET {{base}}/internal/search/instruments?q=&needle=700
+HTTP 200
+[Asserts]
+jsonpath "$.legalInstrument[0].label" == "Code de procédure civile"
+jsonpath "$.legalInstrument[0].articles[0].label" == "700"
+
+
+# ── 48. The rail counts articles, the procedure bank out of that view alone ──
+GET {{base}}/internal/search/decompte?q=clause%20abusive&limit=10
+HTTP 200
+[Asserts]
+jsonpath "$.facets.legalArticleTop" count >= 5
+jsonpath "$.facets.legalArticleTop[0].value" matches /\|/
+jsonpath "$.facets.legalArticleTop[0].label" matches / · /
+jsonpath "$.facets.legalArticleTop[*].label" not contains "700 · Code de procédure civile"
+jsonpath "$.facets.legalInstrument[0].articles[*].value" contains "700"
+
+
+# ── 48b. In browse mode, the composite filter serves what the facet counts ──
+# Unfiltered, the facet count is read from the nightly snapshot; the filtered
+# total is counted live. The snapshot trails the fund and never leads it, so the
+# filter serves at least what the facet advertises. Measured during an ingest,
+# the gap is what has been written since the last recount: 0.2 % on the most
+# cited article of the civil code.
+GET {{base}}/internal/search/decompte?q=&limit=10
+HTTP 200
+[Captures]
+cite: jsonpath "$.facets.legalArticleTop[?(@.value=='LEGITEXT000006070721|1240')].count" nth 0
+
+GET {{base}}/internal/search/decompte?q=&legalArticle=LEGITEXT000006070721%7C1240
+HTTP 200
+[Asserts]
+jsonpath "$.total" >= {{cite}}
 
 
 
 # ============================================================================
 # AUTHED VARIANT (runner injects {{token}})
 # The search endpoint is auth-OPTIONAL, so there is NO 401 contract: an
-# unauthenticated call returns 200 with results. A bearer token only causes the
-# query to be recorded in search-history; the response body is byte-identical.
+# unauthenticated call returns 200 with results, byte-identical with a token.
 # ============================================================================

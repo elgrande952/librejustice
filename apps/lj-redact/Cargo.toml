@@ -1,0 +1,32 @@
+[package]
+name = "lj-redact"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["getrandom"]
+
+# Loaded on demand by the browser, never linked into the hydrate bundle: one
+# module reads a PDF, a scan and a Word document.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = { workspace = true }
+# By path, without `embed-cmaps`: the page fetches the CMaps a document asks for.
+lj-redact-core = { path = "../../packages/lj-redact-core", default-features = false, features = ["pdf", "office"] }
+lj-draw = { workspace = true }
+lj-office = { workspace = true }
+lj-pdf = { workspace = true }
+serde = { workspace = true }
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = { workspace = true }
+
+# The PDF crypto reaches getrandom 0.2 through rand_core, and on wasm32 it has
+# no backend unless `js` names the browser CSPRNG.
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lj-workspace-hack = { version = "0.1", path = "../../packages/lj-workspace-hack" }

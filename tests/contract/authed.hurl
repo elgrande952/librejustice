@@ -23,12 +23,12 @@ POST {{base}}/internal/auth/login
 [FormParams]
 email: {{email}}
 password: {{password}}
-next: /decisions
+next: /decision-search
 HTTP 303
 [Captures]
 session: cookie "__Host-lj_session"
 [Asserts]
-header "Location" == "/decisions"
+header "Location" == "/decision-search"
 cookie "__Host-lj_session" exists
 cookie "__Host-lj_session[HttpOnly]" exists
 cookie "__Host-lj_session[Secure]" exists
@@ -44,15 +44,14 @@ jsonpath "$.sub" isString
 jsonpath "$.email" == "{{email}}"
 jsonpath "$.createdAt" isString
 jsonpath "$.lastSeenAt" isString
-jsonpath "$.trackActivity" isBoolean
 
 # ── 3. La page de connexion refuse un porteur de session ─────────────────────
 # La garde serveur répond 303 vers `next` avant tout rendu : un connecté n'a
 # rien à faire sur /login.
-GET {{base}}/login?next=%2Fdecisions
+GET {{base}}/login?next=%2Fdecision-search
 HTTP 303
 [Asserts]
-header "Location" == "/decisions"
+header "Location" == "/decision-search"
 
 # ── 4. Le consentement MCP se rend avec la session, en privé ─────────────────
 # La garde laisse passer le porteur du cookie, l'écran hérite du défaut privé.
@@ -83,7 +82,7 @@ GET {{base}}/internal/search?q=trouble+anormal+de+voisinage&limit=3
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
-jsonpath "$.allHitIds" isCollection
+jsonpath "$.allHitPaths" isCollection
 
 # ── 7. Enregistrement dynamique du client (RFC 7591) ─────────────────────────
 POST {{base}}/oauth/register
@@ -140,9 +139,21 @@ access: jsonpath "$.access_token"
 refresh: jsonpath "$.refresh_token"
 [Asserts]
 jsonpath "$.token_type" == "Bearer"
-jsonpath "$.scope" == "mcp"
+jsonpath "$.scope" == "mcp openid email"
 jsonpath "$.expires_in" isInteger
 jsonpath "$.refresh_token" isString
+jsonpath "$.id_token" isString
+jsonpath "$.id_token" matches "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"
+
+# ── 9bis. UserInfo : le jeton rend l'identité de son compte ──────────────────
+GET {{base}}/oauth/userinfo
+Authorization: Bearer {{access}}
+HTTP 200
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.sub" isString
+jsonpath "$.email" contains "@"
+jsonpath "$.email_verified" isBoolean
 
 # ── 10. Le jeton MCP ouvre un appel d'outil réel ─────────────────────────────
 POST {{base}}/mcp
@@ -220,9 +231,9 @@ HTTP 200
 jsonpath "$.result.isError" not == true
 jsonpath "$.result.structuredContent.pinned" not exists
 
-# A room is one level of the seat tree: MCP serves the `seat` facet, whose keys
-# are dotted paths, handed back verbatim to the `seat` filter. A room with no
-# number is named by its specialisation.
+# The retired key narrows the set and does not open a rank: only a `seat` filter
+# does. A caller still on it reads the paths off the hits, where `seat` carries
+# the room, and the facet answers with the types alone.
 POST {{base}}/mcp
 Authorization: Bearer {{access}}
 Accept: application/json, text/event-stream
@@ -239,15 +250,37 @@ Content-Type: application/json
 HTTP 200
 [Asserts]
 jsonpath "$.result.isError" not == true
-# Le total sort de la cellule différée : MCP la résout, et les facettes ne
-# s'ouvrent que parce qu'il dépasse la fenêtre servie.
+# The total comes out of the deferred cell, which MCP resolves, and the facets
+# open only because it overflows the served window.
 jsonpath "$.result.structuredContent.total" isInteger
 jsonpath "$.result.structuredContent.total" > 1
-jsonpath "$.result.structuredContent.facets.seat['CC.C3_CIVILE']" isInteger
-jsonpath "$.result.structuredContent.facets.seat['CC.COMMERCIALE']" isInteger
 # `cc` has no court segment: its code names the type, so a room's path holds in
 # two segments and the root carries the court's count.
 jsonpath "$.result.structuredContent.facets.seat.CC" isInteger
+jsonpath "$.result.structuredContent.facets.seat['CC.COMMERCIALE']" not exists
+
+# A filtered seat opens the rank right below it, whole: MCP serves the `seat`
+# facet, whose keys are dotted paths, handed back verbatim to the `seat` filter.
+# A room with no number is named by its specialisation.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "method": "tools/call",
+  "params": {
+    "name": "search_decisions",
+    "arguments": { "query": "bail commercial", "seat": ["CC"], "limit": 1 }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.facets.seat.CC" isInteger
+jsonpath "$.result.structuredContent.facets.seat['CC.C3_CIVILE']" isInteger
+jsonpath "$.result.structuredContent.facets.seat['CC.COMMERCIALE']" isInteger
 
 # ── 10 bis. La liste servie est enregistrable telle quelle par un client ─────
 # Un combinateur à la racine d'un `inputSchema` fait omettre l'outil par le
@@ -260,13 +293,12 @@ Content-Type: application/json
 { "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }
 HTTP 200
 [Asserts]
-jsonpath "$.result.tools" count == 5
-jsonpath "$.result.tools[*].name" contains "get_legal_text"
+jsonpath "$.result.tools" count == 4
+jsonpath "$.result.tools[*].name" contains "get_norm"
 jsonpath "$.result.tools[0].inputSchema.anyOf" not exists
 jsonpath "$.result.tools[1].inputSchema.anyOf" not exists
 jsonpath "$.result.tools[2].inputSchema.anyOf" not exists
 jsonpath "$.result.tools[3].inputSchema.anyOf" not exists
-jsonpath "$.result.tools[4].inputSchema.anyOf" not exists
 
 # ── 10 ter. Les rattrapages de désignation, que seul un vrai jeton atteint ───
 # Un client MCP est un modèle : il compose la forme d'appel qui lui paraît
@@ -281,7 +313,7 @@ Content-Type: application/json
   "id": 11,
   "method": "tools/call",
   "params": {
-    "name": "get_legal_text",
+    "name": "get_norm",
     "arguments": { "code_name": "Code de procédure pénale", "article_number": "706-88" }
   }
 }
@@ -300,7 +332,7 @@ Content-Type: application/json
   "jsonrpc": "2.0",
   "id": 12,
   "method": "tools/call",
-  "params": { "name": "get_legal_text", "arguments": { "textId": "LEGIARTI000006419282" } }
+  "params": { "name": "get_norm", "arguments": { "textId": "LEGIARTI000006419282" } }
 }
 HTTP 200
 [Asserts]
@@ -318,7 +350,7 @@ Content-Type: application/json
   "id": 13,
   "method": "tools/call",
   "params": {
-    "name": "get_legal_text",
+    "name": "get_norm",
     "arguments": { "url": "/texte/circulaire-imig0800044c-du-20-novembre-2008-relative-a-l-accord-franco-gabonais" }
   }
 }
@@ -339,7 +371,7 @@ Content-Type: application/json
   "jsonrpc": "2.0",
   "id": 14,
   "method": "tools/call",
-  "params": { "name": "get_legal_text", "arguments": { "url": "/texte/code-du-travail" } }
+  "params": { "name": "get_norm", "arguments": { "url": "/texte/code-du-travail" } }
 }
 HTTP 200
 [Asserts]
@@ -348,6 +380,38 @@ jsonpath "$.result.structuredContent.articleCount" > 1000
 jsonpath "$.result.structuredContent.articles" isCollection
 jsonpath "$.result.structuredContent.omitted" isInteger
 jsonpath "$.result.structuredContent.text" not exists
+
+# A division read by its path, and by its Légifrance id, which lands on the same.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 14,
+  "method": "tools/call",
+  "params": { "name": "get_norm", "arguments": { "url": "/norm/fr/code-civil/livre-i/titre-v" } }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.title" == "Titre V : Du mariage"
+jsonpath "$.result.structuredContent.url" endsWith "/norm/fr/code-civil/livre-i/titre-v"
+
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 14,
+  "method": "tools/call",
+  "params": { "name": "get_norm", "arguments": { "textId": "LEGISCTA000006117710" } }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.url" endsWith "/norm/fr/code-civil/livre-i/titre-v"
 
 # Nom de texte écrit juste mais autrement ponctué, et code de juridiction au
 # tiret : deux rattrapages qui ne réécrivent que ce qui devient connu.
@@ -383,7 +447,7 @@ Content-Type: application/json
   "id": 16,
   "method": "tools/call",
   "params": {
-    "name": "search_legal_texts",
+    "name": "search_norms",
     "arguments": { "code": "code-general-des-impots", "query": "exigibilité de la taxe", "limit": 1 }
   }
 }
@@ -400,13 +464,107 @@ Content-Type: application/json
   "id": 17,
   "method": "tools/call",
   "params": {
-    "name": "search_legal_texts",
+    "name": "search_norms",
     "arguments": { "code": "code-inexistant-xyz", "query": "peine", "limit": 1 }
   }
 }
 HTTP 200
 [Asserts]
 jsonpath "$.result.isError" == true
+
+# A citation naming no code has no other door: the search lists the carrying
+# texts instead of ranking the whole fund.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 18,
+  "method": "tools/call",
+  "params": {
+    "name": "search_norms",
+    "arguments": { "query": "article 1240", "limit": 10 }
+  }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.total" < 20
+jsonpath "$.result.structuredContent.facets.code['code-civil']" isInteger
+
+# ── 10 quater. An article carries its amending laws and their travaux ───────
+# `travauxParlementaires` is `modifiedBy` narrowed to the LOI whose JORF text
+# is known, so both lock together: 2279 has two of each, and 350, amended by
+# an ordonnance alone, keeps the first and loses the second. The DILA label
+# breaks its line inside the law number, the JSON does not.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 19,
+  "method": "tools/call",
+  "params": { "name": "get_norm", "arguments": { "url": "/texte/code-civil/2279" } }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.modifiedBy" count == 2
+jsonpath "$.result.structuredContent.travauxParlementaires" count == 2
+jsonpath "$.result.structuredContent.travauxParlementaires[0].date" == "2015-02-16"
+jsonpath "$.result.structuredContent.travauxParlementaires[0].href" == "https://www.legifrance.gouv.fr/jorf/id/JORFTEXT000030248562"
+jsonpath "$.result.structuredContent.travauxParlementaires[1].label" == "LOI n°2008-561 du 17 juin 2008"
+
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 20,
+  "method": "tools/call",
+  "params": { "name": "get_norm", "arguments": { "url": "/texte/code-civil/350" } }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.modifiedBy[0].label" startsWith "Ordonnance n°2022-1292"
+jsonpath "$.result.structuredContent.travauxParlementaires" not exists
+
+# ── 10 quinquies. A retired tool name still calls its tool ──────────────────
+# A client freezes the tool list when the connector is installed: ChatGPT keeps
+# calling the names of before a rename.
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 24,
+  "method": "tools/call",
+  "params": { "name": "get_legal_text", "arguments": { "url": "/norm/fr/code-civil/1240" } }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.num" == "1240"
+
+POST {{base}}/mcp
+Authorization: Bearer {{access}}
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 25,
+  "method": "tools/call",
+  "params": { "name": "search_legal_texts", "arguments": { "query": "responsabilité du fait des choses", "limit": 1 } }
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" not == true
+jsonpath "$.result.structuredContent.total" > 0
 
 # ── 11. Le grant refresh tourne, et rote les deux jetons ─────────────────────
 # Ce chemin n'avait jamais tourné en réel avant la sonde manuelle du 10/08 :
@@ -476,11 +634,11 @@ jsonpath "$.hits[0].title" exists
 jsonpath "$.total" exists
 
 # ── 14 ter. A code is named as a model composes it, an article likewise ──────
-GET {{base}}/api/texte/code%20civil/Article%201240
+GET {{base}}/api/norm/code%20civil/Article%201240
 Authorization: Bearer {{api_key}}
 HTTP 200
 [Asserts]
-jsonpath "$.url" contains "/texte/code-civil/1240"
+jsonpath "$.url" contains "/norm/fr/code-civil/1240"
 jsonpath "$.code" == "code-civil"
 
 # ── 15. La déconnexion efface le cookie côté client ──────────────────────────

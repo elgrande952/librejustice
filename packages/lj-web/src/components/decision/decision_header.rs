@@ -24,12 +24,13 @@ pub fn DecisionHeader(detail: DecisionDetail) -> impl IntoView {
     {
         let title = build_decision_references(&detail).heading;
         let id = detail.id.clone();
+        let path = lj_dtos::decision_path(detail.jurisdiction_type, &id);
         let bar = use_decision_bar();
         let seed = use_result_nav();
         let memory = use_seed_memory();
         Effect::new(move |_| {
             // Consomme la graine (one-shot) en la mémorisant par id ; sans graine (back
-            // navigateur depuis un article de loi, lien direct, activité), on restaure le
+            // navigateur depuis un article de loi, lien direct, signets), on restaure le
             // dernier contexte DE CETTE décision — jamais celui d'une autre. Aucun
             // contexte connu → barre sans nav (titre + retour « Recherche »).
             let consumed = match seed.get_untracked() {
@@ -50,7 +51,7 @@ pub fn DecisionHeader(detail: DecisionDetail) -> impl IntoView {
             seed.set(None);
             bar.set(Some(DecisionBarState {
                 title: title.clone(),
-                id: id.clone(),
+                path: path.clone(),
                 nav: consumed.nav,
                 from_search: consumed.from_search,
             }));
@@ -67,7 +68,6 @@ pub fn DecisionHeader(detail: DecisionDetail) -> impl IntoView {
 pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
     let references = build_decision_references(&detail);
     let pdf_href = format!("/internal/decision/{}/download.pdf", detail.id);
-    let pdf_filename = references.filename.clone();
     let decision_id = detail.id.clone();
 
     let on_print = move |_| {
@@ -91,12 +91,12 @@ pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
                 >
                     <PrintIcon />
                 </button>
-                // `rel="nofollow"` : la cible est sous `/internal/`, que le `robots.txt` refuse à
-                // tous les crawlers et que le WAF bloque.
+                // No `download`, so a navigation: the WAF challenges this route, and a challenge
+                // only renders on one. The filename comes from the API's `Content-Disposition`.
                 <a
                     href=pdf_href
-                    rel="nofollow"
-                    download=pdf_filename
+                    rel="external nofollow noopener"
+                    target="_blank"
                     class="inline-flex shrink-0 items-center gap-2 rounded-sm border border-[var(--color-rule)] px-2.5 py-1.5 text-xs text-[var(--color-ink-muted)] no-underline transition-colors hover:border-[var(--color-ink)] hover:text-[var(--color-ink)]"
                     aria-label="PDF"
                     title="PDF"
@@ -110,13 +110,10 @@ pub fn DecisionActions(detail: DecisionDetail) -> impl IntoView {
 }
 
 /// Bouton « signet », gated par l'auth : masqué tant que la session n'est pas
-/// résolue (jamais au SSR), et masqué si l'enregistrement d'activité est
-/// coupé (mode ZDR). Bascule optimiste add/remove avec rollback en erreur.
+/// résolue (jamais au SSR). Bascule optimiste add/remove avec rollback en erreur.
 #[component]
 fn BookmarkButton(decision_id: String) -> impl IntoView {
     let authed = RwSignal::new(None::<bool>);
-    // `None` = profil non chargé (affiché).
-    let track_activity = RwSignal::new(None::<bool>);
     let is_on = RwSignal::new(false);
     let busy = RwSignal::new(false);
     // `StoredValue` (Copy) : `toggle` est rejoué par `<Show>` (closure `Fn`), il
@@ -133,9 +130,6 @@ fn BookmarkButton(decision_id: String) -> impl IntoView {
             authed.set(Some(session));
             if session {
                 let client = ApiClient::from_context();
-                if let Ok(profile) = client.fetch_me().await {
-                    track_activity.set(Some(profile.track_activity));
-                }
                 if let Ok(bookmarks) = client.list_bookmarks().await {
                     let id = did.get_value();
                     is_on.set(bookmarks.items.iter().any(|b| b.id == id));
@@ -178,9 +172,7 @@ fn BookmarkButton(decision_id: String) -> impl IntoView {
     };
 
     view! {
-        <Show when=move || {
-            authed.get() == Some(true) && track_activity.get() != Some(false)
-        }>
+        <Show when=move || authed.get() == Some(true)>
             <button
                 type="button"
                 on:click=toggle
@@ -196,9 +188,6 @@ fn BookmarkButton(decision_id: String) -> impl IntoView {
     }
 }
 
-/// Bouton « Référence » + menu déroulant (copier complète / abrégée).
-/// Copie via `dom::copy_text`, retour « Copié »
-/// 1,8 s, fermeture au clic extérieur (`pointerdown` document).
 #[component]
 fn CopyReferenceButton(full: String, short: String) -> impl IntoView {
     let open = RwSignal::new(false);
@@ -206,28 +195,15 @@ fn CopyReferenceButton(full: String, short: String) -> impl IntoView {
     let copied = RwSignal::new(None::<&'static str>);
     let container_ref = NodeRef::<leptos::html::Div>::new();
 
-    // Fermeture au clic extérieur.
     #[cfg(feature = "hydrate")]
     {
-        use wasm_bindgen::JsCast;
-        let handle = window_event_listener(leptos::ev::pointerdown, move |ev| {
-            if !open.get_untracked() {
-                return;
-            }
-            let inside = container_ref
-                .get_untracked()
-                .zip(ev.target())
-                .and_then(|(el, target)| {
-                    target
-                        .dyn_ref::<web_sys::Node>()
-                        .map(|node| el.contains(Some(node)))
-                })
-                .unwrap_or(false);
-            if !inside {
-                open.set(false);
-            }
-        });
-        on_cleanup(move || handle.remove());
+        use crate::components::ui::panel::{dismiss, Dismiss};
+        dismiss(
+            container_ref,
+            move || open.get_untracked(),
+            move || open.set(false),
+            Dismiss::default(),
+        );
     }
 
     let copy = move |value: String, kind: &'static str| {

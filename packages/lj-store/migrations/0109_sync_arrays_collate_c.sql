@@ -1,10 +1,3 @@
--- 0109 — Les arrays de facettes citations sont désormais calculés en Rust par
--- l'écrivain (tri bytewise, cf. citations.rs::citation_facet_arrays) ; les
--- fonctions de resync (détecteur de dérive, resync_legal_arrays_range) doivent
--- ordonner À L'IDENTIQUE pour que `IS DISTINCT FROM` ne signale pas de fausses
--- dérives : ORDER BY en COLLATE "C" (= ordre bytewise, la base est en
--- en_US.utf8).
-
 CREATE OR REPLACE FUNCTION _sync_decisions_legal_instruments_for(p_ids bigint[])
 RETURNS bigint
 LANGUAGE sql

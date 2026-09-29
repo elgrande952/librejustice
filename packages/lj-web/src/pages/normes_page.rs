@@ -1,9 +1,9 @@
-//! Hubs du catalogue des normes — l'arborescence navigable vers
-//! les textes : `/normes` (catalogue par fond) → `/normes/{fond}` (années)
-//! → `/normes/{fond}/{annee}?page=N` (liste paginée de liens `/texte/{slug}` ;
-//! `annee` = année ou `sans-date`). Pages SSR crawlables. Le fond `codes`
-//! a son propre catalogue `/normes/codes` (sommaire par code, pas un hub
-//! année — `CodeCataloguePage`).
+//! Hubs of the norms catalogue, the browsable tree down to a jurisdiction's texts:
+//! `/norm-index/{juris}` (catalogue by fond) → `/norm-index/{juris}/{fond}` (years)
+//! → `/norm-index/{juris}/{fond}/{annee}?page=N` (paginated list of
+//! `/norm/{juris}/{slug}` links; `annee` = a year or `sans-date`). Crawlable SSR
+//! pages. The French `codes` fond has its own catalogue `/norm-index/fr/codes`
+//! (table of contents per code, not a year hub, `CodeCataloguePage`).
 
 use leptos::either::Either;
 use leptos::prelude::*;
@@ -40,7 +40,7 @@ fn year_token(year: Option<i32>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// /normes — catalogue par fond
+// /norm-index/{juris}, catalogue par fond
 // ---------------------------------------------------------------------------
 
 #[component]
@@ -50,14 +50,26 @@ pub fn NormesPage() -> impl IntoView {
     // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
     own_page_description();
 
+    let params = use_params_map();
     let catalogue = Resource::new_blocking(
-        || (),
-        |_| {
-            sendable(async {
-                ApiClient::from_context()
+        move || params.get().get("juris").unwrap_or_default(),
+        |juris| {
+            sendable(async move {
+                let catalogue = ApiClient::from_context()
                     .fetch_normes()
                     .await
-                    .map_err(PageError::from)
+                    .map_err(PageError::from)?;
+                if !catalogue
+                    .jurisdictions
+                    .iter()
+                    .any(|j| j.jurisdiction == juris)
+                {
+                    return Err(PageError {
+                        status: 404,
+                        message: "Juridiction inconnue".to_string(),
+                    });
+                }
+                Ok((juris, catalogue))
             })
         },
     );
@@ -66,9 +78,9 @@ pub fn NormesPage() -> impl IntoView {
         <Suspense fallback=HubSkeleton>
             {move || Suspend::new(async move {
                 match catalogue.await {
-                    Ok(r) => {
+                    Ok((juris, r)) => {
                         set_cache_control(200);
-                        Either::Left(view! { <NormesLoaded response=r /> })
+                        Either::Left(view! { <NormesLoaded juris=juris response=r /> })
                     }
                     Err(err) => {
                         set_cache_control(err.status);
@@ -81,12 +93,27 @@ pub fn NormesPage() -> impl IntoView {
 }
 
 #[component]
-fn NormesLoaded(response: NormCatalogueResponse) -> impl IntoView {
-    let title = "Catalogue des normes - LibreJustice";
+fn NormesLoaded(juris: String, response: NormCatalogueResponse) -> impl IntoView {
+    let (current, others): (Vec<_>, Vec<_>) = response
+        .jurisdictions
+        .into_iter()
+        .partition(|j| j.jurisdiction == juris);
+    let fonds = current
+        .into_iter()
+        .flat_map(|j| j.fonds)
+        .collect::<Vec<_>>();
+    let title = if juris == "fr" {
+        "Catalogue des normes - LibreJustice".to_string()
+    } else {
+        format!(
+            "Catalogue des normes ({}) - LibreJustice",
+            juris.to_uppercase()
+        )
+    };
     let description = "Tous les textes du corpus normatif — codes, lois et ordonnances, \
          décrets, arrêtés, conventions collectives, textes européens, traités, circulaires, \
          BOFiP — par fond puis par année.";
-    let url = "https://librejustice.fr/normes".to_string();
+    let url = format!("https://librejustice.fr/norm-index/{juris}");
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", "https://librejustice.fr/".to_string()),
         ("Normes", url.clone()),
@@ -111,11 +138,10 @@ fn NormesLoaded(response: NormCatalogueResponse) -> impl IntoView {
             </header>
 
             <ul class="flex flex-col divide-y divide-[var(--color-rule)]">
-                {response
-                    .fonds
+                {fonds
                     .into_iter()
                     .map(|f| {
-                        let href = format!("/normes/{}", f.fond);
+                        let href = format!("/norm-index/{juris}/{}", f.fond);
                         let count = format!(
                             "{} texte{}",
                             fmt_count(f.text_count),
@@ -139,12 +165,52 @@ fn NormesLoaded(response: NormCatalogueResponse) -> impl IntoView {
                     })
                     .collect_view()}
             </ul>
+
+            <section class="flex flex-col gap-3">
+                <h2 class="text-xs uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                    "Autres juridictions"
+                </h2>
+                <ul class="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+                    {others
+                        .into_iter()
+                        .map(|j| {
+                            let href = format!("/norm-index/{}", j.jurisdiction);
+                            let label = format!(
+                                "{} ({})",
+                                j.jurisdiction.to_uppercase(),
+                                fmt_count(j.text_count),
+                            );
+                            view! {
+                                <li>
+                                    <A
+                                        href=href
+                                        attr:class="text-[var(--color-ink-muted)] hover:text-[var(--color-accent)]"
+                                    >
+                                        {label}
+                                    </A>
+                                </li>
+                            }
+                        })
+                        .collect_view()}
+                </ul>
+            </section>
+
+            <p class="max-w-prose text-sm text-[var(--color-ink-muted)]">
+                "Ce catalogue liste tous les textes du fonds. Pour ne garder que ceux qui s'appliquent en un territoire, à une date donnée : "
+                <A
+                    href="/norm-index/fr/in-force"
+                    attr:class="text-[var(--color-accent)] underline underline-offset-2 hover:opacity-80"
+                >
+                    "ce qui s'applique en un lieu"
+                </A>
+                "."
+            </p>
         </div>
     }
 }
 
 // ---------------------------------------------------------------------------
-// /normes/{fond} — hub d'un fond (années)
+// /norm-index/{juris}/{fond}, hub d'un fond (années)
 // ---------------------------------------------------------------------------
 
 #[component]
@@ -156,11 +222,17 @@ pub fn NormFondPage() -> impl IntoView {
 
     let params = use_params_map();
     let hub = Resource::new_blocking(
-        move || params.get().get("fond").unwrap_or_default(),
-        |fond| {
+        move || {
+            let p = params.get();
+            (
+                p.get("juris").unwrap_or_default(),
+                p.get("fond").unwrap_or_default(),
+            )
+        },
+        |(juris, fond)| {
             sendable(async move {
                 ApiClient::from_context()
-                    .fetch_norm_fond(&fond)
+                    .fetch_norm_fond(&juris, &fond)
                     .await
                     .map_err(PageError::from)
             })
@@ -193,10 +265,11 @@ fn NormFondLoaded(hub: NormFondResponse) -> impl IntoView {
         fmt_count(hub.text_count),
         hub.label,
     );
-    let url = format!("https://librejustice.fr/normes/{}", hub.fond);
+    let index = format!("/norm-index/{}", hub.jurisdiction);
+    let url = format!("https://librejustice.fr{index}/{}", hub.fond);
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", "https://librejustice.fr/".to_string()),
-        ("Normes", "https://librejustice.fr/normes".to_string()),
+        ("Normes", format!("https://librejustice.fr{index}")),
         (&hub.label, url.clone()),
     ]);
     let dated: Vec<i32> = hub.years.iter().filter_map(|y| y.year).collect();
@@ -215,7 +288,7 @@ fn NormFondLoaded(hub: NormFondResponse) -> impl IntoView {
             <header class="flex flex-col gap-3">
                 <HubBreadcrumb items=vec![
                     ("Accueil".to_string(), Some("/".to_string())),
-                    ("Normes".to_string(), Some("/normes".to_string())),
+                    ("Normes".to_string(), Some(index.clone())),
                     (hub.label.clone(), None),
                 ] />
                 <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
@@ -236,7 +309,7 @@ fn NormFondLoaded(hub: NormFondResponse) -> impl IntoView {
                         .years
                         .into_iter()
                         .map(|y| {
-                            let href = format!("/normes/{}/{}", hub.fond, year_token(y.year));
+                            let href = format!("{index}/{}/{}", hub.fond, year_token(y.year));
                             let count = format!(
                                 "{} texte{}",
                                 fmt_count(y.count),
@@ -266,7 +339,7 @@ fn NormFondLoaded(hub: NormFondResponse) -> impl IntoView {
 }
 
 // ---------------------------------------------------------------------------
-// /normes/{fond}/{annee} — liste paginée des textes d'une année
+// /norm-index/{juris}/{fond}/{annee}, liste paginée des textes d'une année
 // ---------------------------------------------------------------------------
 
 #[component]
@@ -281,6 +354,7 @@ pub fn NormYearPage() -> impl IntoView {
     let page_data = Resource::new_blocking(
         move || {
             (
+                params.get().get("juris").unwrap_or_default(),
                 params.get().get("fond").unwrap_or_default(),
                 params.get().get("annee").unwrap_or_default(),
                 query
@@ -290,7 +364,7 @@ pub fn NormYearPage() -> impl IntoView {
                     .unwrap_or(1),
             )
         },
-        |(fond, annee, page)| {
+        |(juris, fond, annee, page)| {
             sendable(async move {
                 let year: Option<i32> = if annee == UNDATED_TOKEN {
                     None
@@ -301,7 +375,7 @@ pub fn NormYearPage() -> impl IntoView {
                     })?)
                 };
                 ApiClient::from_context()
-                    .fetch_norm_year(&fond, year, page)
+                    .fetch_norm_year(&juris, &fond, year, page)
                     .await
                     .map_err(PageError::from)
             })
@@ -352,11 +426,10 @@ fn NormYearLoaded(page: NormYearResponse) -> impl IntoView {
             page.label,
         ),
     };
-    let base_url = format!(
-        "https://librejustice.fr/normes/{}/{}",
-        page.fond,
-        year_token(page.year),
-    );
+    let index = format!("/norm-index/{}", page.jurisdiction);
+    let hub_href = format!("{index}/{}", page.fond);
+    let year_href = format!("{hub_href}/{}", year_token(page.year));
+    let base_url = format!("https://librejustice.fr{year_href}");
     // Canonical par page (?page=N au-delà de la première) : chaque page de la
     // pagination est un document distinct, pas un doublon de la première.
     let canonical = if page.page > 1 {
@@ -364,14 +437,10 @@ fn NormYearLoaded(page: NormYearResponse) -> impl IntoView {
     } else {
         base_url.clone()
     };
-    let hub_href = format!("/normes/{}", page.fond);
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", "https://librejustice.fr/".to_string()),
-        ("Normes", "https://librejustice.fr/normes".to_string()),
-        (
-            &page.label,
-            format!("https://librejustice.fr/normes/{}", page.fond),
-        ),
+        ("Normes", format!("https://librejustice.fr{index}")),
+        (&page.label, format!("https://librejustice.fr{hub_href}")),
         (&ylabel, base_url.clone()),
     ]);
 
@@ -385,7 +454,7 @@ fn NormYearLoaded(page: NormYearResponse) -> impl IntoView {
             <header class="flex flex-col gap-3">
                 <HubBreadcrumb items=vec![
                     ("Accueil".to_string(), Some("/".to_string())),
-                    ("Normes".to_string(), Some("/normes".to_string())),
+                    ("Normes".to_string(), Some(index.clone())),
                     (page.label.clone(), Some(hub_href.clone())),
                     (ylabel.clone(), None),
                 ] />
@@ -411,7 +480,7 @@ fn NormYearLoaded(page: NormYearResponse) -> impl IntoView {
                     .texts
                     .into_iter()
                     .map(|t| {
-                        let href = format!("/texte/{}", t.slug);
+                        let href = lj_vocab::norm_path(&t.jurisdiction, &t.slug);
                         view! {
                             <li class="py-2.5">
                                 <A
@@ -427,7 +496,7 @@ fn NormYearLoaded(page: NormYearResponse) -> impl IntoView {
             </ul>
 
             <YearPagination
-                base=format!("/normes/{}/{}", page.fond, year_token(page.year))
+                base=year_href
                 page=page.page
                 page_count=page_count
             />

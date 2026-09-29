@@ -102,7 +102,7 @@ pub fn McpGuide() -> impl IntoView {
 
                 <div class="flex flex-col gap-3">
                     <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Claude et ChatGPT s'installent par les boutons en haut de page. Les autres clients n'ont pas encore de fiche LibreJustice dans leur répertoire : ils l'ajoutent comme connecteur personnalisé, à partir de l'URL de l'endpoint."
+                        "Claude et ChatGPT s'installent par les boutons en haut de page. Les autres clients n'ont pas encore de fiche LibreJustice dans leur répertoire : ils l'ajoutent comme connecteur personnalisé, à partir de l'adresse du connecteur."
                     </p>
                     <CopyEndpoint url=mcp_url />
                 </div>
@@ -129,7 +129,7 @@ pub fn McpGuide() -> impl IntoView {
                         <strong>"+ Ajouter un connecteur → Connecteur MCP personnalisé"</strong>
                         ". Nommez (ex. "
                         <em>"LibreJustice"</em>
-                        "), collez l'URL, méthode "
+                        "), collez l'adresse, méthode "
                         <strong>"OAuth"</strong>
                         "."
                     </Step>
@@ -162,7 +162,7 @@ pub fn McpGuide() -> impl IntoView {
                         <strong>"Connecteur personnalisé"</strong>
                         ". Renseignez le nom (ex. "
                         <em>"LibreJustice"</em>
-                        ") et collez l'URL de l'endpoint."
+                        ") et collez l'adresse du connecteur."
                     </Step>
                     <Step n=4>
                         "Choisissez "
@@ -212,13 +212,13 @@ pub fn McpGuide() -> impl IntoView {
                     </Step>
                     <Step n=3>
                         <strong>"Ajouter → Téléverser une compétence"</strong>
-                        ", puis sélectionnez le zip. Elle s'active dans vos conversations (le connecteur MCP ajouté ci-dessus reste nécessaire)."
+                        ", puis sélectionnez le zip. Elle s'active dans vos conversations (le connecteur ajouté ci-dessus reste nécessaire)."
                     </Step>
                 </ClientHowto>
 
                 <ClientHowto title="ChatGPT">
                     <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Le plugin du répertoire installe les deux compétences avec le connecteur."
+                        "L'application du répertoire installe les deux compétences avec le connecteur."
                     </p>
                 </ClientHowto>
             </section>
@@ -227,18 +227,18 @@ pub fn McpGuide() -> impl IntoView {
             <section class="flex flex-col gap-4">
                 <SectionLabel>"Exemples de requêtes"</SectionLabel>
                 <p class="text-sm text-[var(--color-ink-subtle)]">
-                    "Copiez ces prompts dans votre client IA pour tester l'intégration."
+                    "Copiez ces requêtes dans votre client IA pour tester l'intégration."
                 </p>
                 <ul class="flex flex-col gap-2">{prompts.collect_view()}</ul>
             </section>
 
             // Installation par prompt : le plugin complet (connecteur MCP + compétences)
             <section class="flex flex-col gap-8">
-                <SectionLabel>"Installation par prompt"</SectionLabel>
+                <SectionLabel>"Installation par instruction"</SectionLabel>
 
                 <ClientHowto title="ChatGPT Desktop, Claude Desktop…">
                     <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
-                        "Ces applications peuvent installer LibreJustice elles-mêmes, connecteur MCP et compétences d'un coup : collez ce prompt, l'assistant suit le guide "
+                        "Ces applications peuvent installer LibreJustice elles-mêmes, connecteur et compétences d'un coup : collez cette instruction, l'assistant suit le guide "
                         <a
                             href="https://github.com/librejustice/librejustice/blob/main/llms-install.md"
                             target="_blank"
@@ -309,7 +309,7 @@ fn CopyEndpoint(url: String) -> impl IntoView {
             <button
                 type="button"
                 on:click=on_copy
-                aria-label="Copier l'URL"
+                aria-label="Copier l'adresse"
                 class="shrink-0 rounded px-2 py-1 text-xs text-[var(--color-ink-subtle)] transition-colors hover:bg-[var(--color-rule)] hover:text-[var(--color-ink)]"
             >
                 {move || if copied.get() { "Copié ✓" } else { "Copier" }}
@@ -389,7 +389,7 @@ fn CopyPrompt(text: &'static str) -> impl IntoView {
             <button
                 type="button"
                 on:click=on_copy
-                aria-label="Copier le prompt"
+                aria-label="Copier l'instruction"
                 class="shrink-0 rounded px-2 py-1 text-xs text-[var(--color-ink-subtle)] transition-colors hover:bg-[var(--color-rule)] hover:text-[var(--color-ink)]"
             >
                 {move || if copied.get() { "Copié ✓" } else { "Copier" }}

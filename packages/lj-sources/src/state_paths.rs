@@ -23,6 +23,7 @@ pub(crate) const CNDA_DIR: &str = "cnda";
 pub(crate) const CJUE_DIR: &str = "cjue";
 pub(crate) const EU_LAW_DIR: &str = "eu_law";
 pub(crate) const PRESSE_DIR: &str = "presse";
+pub(crate) const DECP_DIR: &str = "decp";
 
 /// Résout et compose les chemins sous `state_dir`.
 #[derive(Debug, Clone)]
@@ -124,6 +125,12 @@ impl StatePaths {
     pub fn presse(&self) -> PathBuf {
         self.cache().join(PRESSE_DIR)
     }
+
+    /// `ingest/cache/decp` : exports CSV des données essentielles de la
+    /// commande publique, un fichier par fenêtre de notification.
+    pub fn decp(&self) -> PathBuf {
+        self.cache().join(DECP_DIR)
+    }
 }
 
 /// `$HOME/.local/share/librejustice`.
@@ -157,5 +164,6 @@ mod tests {
         assert_eq!(p.cnda(), PathBuf::from("/s/ingest/cache/cnda"));
         assert_eq!(p.cjue(), PathBuf::from("/s/ingest/cache/cjue"));
         assert_eq!(p.eu_law(), PathBuf::from("/s/ingest/cache/eu_law"));
+        assert_eq!(p.decp(), PathBuf::from("/s/ingest/cache/decp"));
     }
 }

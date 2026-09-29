@@ -1,7 +1,7 @@
 //! Service HTTP du `robots.txt`, rendu depuis la table de `lj-core`.
 //!
 //! Le fichier n'existe pas dans le bundle : il est rendu ici pour que la politique
-//! n'ait qu'une écriture (`lj_core::crawlers`), partagée avec les expressions WAF
+//! n'ait qu'une écriture (`lj_crawlers`), partagée avec les expressions WAF
 //! que pousse `lj-ingest crawler-policy sync`.
 
 use axum::extract::State;
@@ -13,14 +13,14 @@ use axum::Router;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
-    Router::new().route(lj_core::crawlers::ROBOTS_PATH, get(robots_txt))
+    Router::new().route(lj_crawlers::ROBOTS_PATH, get(robots_txt))
 }
 
 async fn robots_txt(State(state): State<AppState>) -> Response {
     let sitemap = format!(
         "{}{}",
         state.settings.public_base_url.trim_end_matches('/'),
-        lj_core::crawlers::SITEMAP_PATH
+        lj_crawlers::SITEMAP_PATH
     );
     (
         [
@@ -33,7 +33,7 @@ async fn robots_txt(State(state): State<AppState>) -> Response {
                 HeaderValue::from_static("public, max-age=3600"),
             ),
         ],
-        lj_core::crawlers::robots_txt(&sitemap),
+        lj_crawlers::robots_txt(&sitemap),
     )
         .into_response()
 }

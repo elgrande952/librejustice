@@ -1,30 +1,30 @@
-//! Accordéon « Commentaires » : analyses officielles, conclusions du rapporteur
-//! public, notes de doctrine — en fin de page décision comme article de norme,
-//! **fermé par défaut**. Style uniforme : une analyse (body porté localement) se
-//! déplie sur place ; les conclusions du rapporteur public (droits réservés,
-//! jamais stockées) sont une ligne-lien externe vers ArianeWeb, composée côté
-//! API.
+//! « Commentaires » accordion: the rapporteur public's conclusions, the court's
+//! related documents, doctrinal notes, at the foot of a decision page as of a
+//! statute article, **collapsed by default**. A single form, the outgoing link
+//! line: nothing is redistributed here, the court's own sommaire having become
+//! the summary of the decision.
 use leptos::prelude::*;
 use lj_dtos::Commentaire;
 
 #[component]
 pub fn DecisionCommentaires(commentaires: Vec<Commentaire>) -> impl IntoView {
-    if commentaires.is_empty() {
+    let liens: Vec<Commentaire> = commentaires
+        .into_iter()
+        .filter(|c| c.url.is_some())
+        .collect();
+    if liens.is_empty() {
         return ().into_any();
     }
     let title = "Commentaires";
-    let items = commentaires
+    let items = liens
         .into_iter()
-        .map(|c| match c.url {
-            Some(_) => view! { <CommentaireLien commentaire=c /> }.into_any(),
-            None => view! { <CommentaireAnalyse commentaire=c /> }.into_any(),
-        })
+        .map(|c| view! { <CommentaireLien commentaire=c /> })
         .collect_view();
 
     view! {
         <section
             aria-label=title
-            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/30"
+            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/30 print:hidden"
         >
             <details class="group p-6">
                 <summary class="flex cursor-pointer list-none items-center justify-between gap-4 font-sans text-base text-[var(--color-ink)] [&::-webkit-details-marker]:hidden">
@@ -43,62 +43,12 @@ pub fn DecisionCommentaires(commentaires: Vec<Commentaire>) -> impl IntoView {
     .into_any()
 }
 
-/// Analyse officielle : rubriques du plan de classement, sommaire doctrinal,
-/// renvois, signature (auteur + date).
-#[component]
-fn CommentaireAnalyse(commentaire: Commentaire) -> impl IntoView {
-    let rubriques = (!commentaire.rubriques.is_empty()).then(|| {
-        let lis = commentaire
-            .rubriques
-            .into_iter()
-            .map(|r| view! { <li>{r}</li> })
-            .collect_view();
-        view! {
-            <ul class="flex flex-col gap-1 text-xs text-[var(--color-ink-subtle)]">{lis}</ul>
-        }
-    });
-    let renvois = (!commentaire.renvois.is_empty()).then(|| {
-        let lis = commentaire
-            .renvois
-            .into_iter()
-            .map(|r| view! { <li>{r}</li> })
-            .collect_view();
-        view! {
-            <ul class="flex flex-col gap-1 text-xs italic text-[var(--color-ink-subtle)]">
-                {lis}
-            </ul>
-        }
-    });
-    let signature = match (commentaire.author, commentaire.date) {
-        (Some(a), Some(d)) => Some(format!("{a} — {d}")),
-        (Some(a), None) => Some(a),
-        (None, Some(d)) => Some(d),
-        (None, None) => None,
-    };
-    view! {
-        <article class="flex flex-col gap-3 border-t border-[var(--color-rule)] pt-5 first:border-t-0 first:pt-0">
-            {rubriques}
-            <p class="whitespace-pre-line text-sm leading-relaxed text-[var(--color-ink)]">
-                {commentaire.body}
-            </p>
-            {renvois}
-            {signature
-                .map(|s| {
-                    view! {
-                        <p class="text-xs uppercase tracking-[0.16em] text-[var(--color-ink-subtle)]">
-                            {s}
-                        </p>
-                    }
-                })}
-        </article>
-    }
-}
-
 /// Ligne-lien externe. Deux formes : conclusions du rapporteur public (droits
 /// réservés, lien nu vers ArianeWeb) ou document lié titré (rapport/avis Cass,
 /// note de doctrine) avec éditeur et, le cas échéant, mention d'accès abonnés.
 #[component]
 fn CommentaireLien(commentaire: Commentaire) -> impl IntoView {
+    let reference = commentaire.reference();
     let Commentaire {
         url,
         title,
@@ -121,6 +71,12 @@ fn CommentaireLien(commentaire: Commentaire) -> impl IntoView {
             >
                 {format!("{label} — {source}")}
             </a>
+            {reference
+                .map(|r| {
+                    view! {
+                        <span class="text-sm text-[var(--color-ink-subtle)]">{r}</span>
+                    }
+                })}
             {abonnes
                 .then(|| {
                     view! {

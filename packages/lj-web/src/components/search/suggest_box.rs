@@ -292,13 +292,23 @@ pub fn SuggestPanel(ctrl: SuggestController) -> impl IntoView {
 /// dénomination de l'annuaire, qui remplace la requête entière) ⇒ tout est
 /// apport.
 fn split_added(kept: &str, replaced: &str, suggestion: &str) -> (String, String) {
+    let typed: Vec<char> = replaced.chars().flat_map(lj_fold::fold_char).collect();
     let mut cut = 0;
-    let mut chars = suggestion.chars();
-    for typed in replaced.chars() {
-        match chars.next() {
-            Some(c) if fold(c) == fold(typed) => cut += c.len_utf8(),
-            _ => break,
+    let mut at = 0;
+    for c in suggestion.chars() {
+        if at == typed.len() {
+            break;
         }
+        let folded: Vec<char> = lj_fold::fold_char(c).collect();
+        let rest = &typed[at..];
+        if rest.starts_with(&folded) {
+            at += folded.len();
+        } else if folded.starts_with(rest) {
+            at = typed.len();
+        } else {
+            break;
+        }
+        cut += c.len_utf8();
     }
     // L'espace qui suit appartient au déjà-tapé : la frappe s'arrêtait dessus.
     cut += suggestion[cut..].len() - suggestion[cut..].trim_start().len();
@@ -308,22 +318,6 @@ fn split_added(kept: &str, replaced: &str, suggestion: &str) -> (String, String)
     }
     typed.push_str(&suggestion[..cut]);
     (typed, suggestion[cut..].to_string())
-}
-
-/// Repli d'un caractère pour cette comparaison seulement (casse et accents
-/// français) : `lj-core`, qui porte le repli de l'index, ne compile pas en wasm.
-fn fold(c: char) -> char {
-    match c.to_lowercase().next().unwrap_or(c) {
-        'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' => 'a',
-        'ç' => 'c',
-        'è' | 'é' | 'ê' | 'ë' => 'e',
-        'ì' | 'í' | 'î' | 'ï' => 'i',
-        'ñ' => 'n',
-        'ò' | 'ó' | 'ô' | 'ö' | 'õ' => 'o',
-        'ù' | 'ú' | 'û' | 'ü' => 'u',
-        'ý' | 'ÿ' => 'y',
-        other => other,
-    }
 }
 
 /// Soumet le formulaire qui contient la suggestion cliquée (son `on:submit`

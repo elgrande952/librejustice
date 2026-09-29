@@ -19,8 +19,6 @@ services:
       POSTGRES_PASSWORD: ${LIBREJUSTICE_PG_PASSWORD}
       POSTGRES_HOST_AUTH_METHOD: scram-sha-256
     ports:
-      # Deux ports loopback vers le même Postgres : 5432 pour l'accès local sur
-      # la machine, 5433 comme cible du proxy qui l'expose aux machines de dev.
       - "127.0.0.1:5432:5432"
       - "127.0.0.1:5433:5432"
     volumes:
@@ -147,7 +145,7 @@ services:
     env_file: ../.env
     environment:
       LIBREJUSTICE_DB_URL: postgresql://librejustice:${LIBREJUSTICE_PG_PASSWORD}@postgres:5432/librejustice
-      LIBREJUSTICE_EGRESS_URL: ${LIBREJUSTICE_EGRESS_URL}
+      LIBREJUSTICE_EGRESS_PROXY: ${LIBREJUSTICE_EGRESS_PROXY}
       LIBREJUSTICE_STATE_DIR: /var/lib/librejustice
       LOG_FORMAT: json
       LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT: ${LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT}
@@ -158,7 +156,19 @@ services:
       LIBREJUSTICE_CONTAINER_NAME: librejustice-cron
     volumes:
       - ${LIBREJUSTICE_STATE_DIR}/ingest:/var/lib/librejustice/ingest
+    # An exit that is down fails the harvest rather than falling back.
+    networks:
+      - default
+      - egress
     depends_on:
       postgres:
         condition: service_healthy
     command: ["supercronic", "/etc/librejustice/crontab"]
+
+# `default` is implicit until this block exists, and podman-compose then refuses
+# the file until it is named here too.
+networks:
+  default:
+  egress:
+    external: true
+    name: ${LIBREJUSTICE_EGRESS_NETWORK:-podman}

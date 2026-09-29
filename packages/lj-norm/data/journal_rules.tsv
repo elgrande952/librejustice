@@ -1,0 +1,164 @@
+journal	place	matter	regime	since	until	source
+JORF	geo:FR-M	*	default			La loi s'applique sur le territoire métropolitain dès son entrée en vigueur (art. 1er du code civil)
+JORF	geo:FR-ALS	*	default	1925-01-01		Loi du 1er juin 1924 mettant en vigueur la législation civile française dans les départements du Bas-Rhin, du Haut-Rhin et de la Moselle, en vigueur le 1er janvier 1925
+JORF	geo:GP	*	default	1946-03-19		Loi n° 46-451 du 19 mars 1946 tendant au classement comme départements français de la Guadeloupe, de la Martinique, de la Réunion et de la Guyane française
+JORF	geo:MQ	*	default	1946-03-19		Loi n° 46-451 du 19 mars 1946 tendant au classement comme départements français de la Guadeloupe, de la Martinique, de la Réunion et de la Guyane française
+JORF	geo:GF	*	default	1946-03-19		Loi n° 46-451 du 19 mars 1946 tendant au classement comme départements français de la Guadeloupe, de la Martinique, de la Réunion et de la Guyane française
+JORF	geo:RE	*	default	1946-03-19		Loi n° 46-451 du 19 mars 1946 tendant au classement comme départements français de la Guadeloupe, de la Martinique, de la Réunion et de la Guyane française
+JORF	geo:YT	*	express		2001-07-13	Loi n° 76-1212 du 24 décembre 1976 relative à l'organisation de Mayotte, art. 10 : les lois nouvelles ne sont applicables à Mayotte que sur mention expresse
+JORF	geo:YT	*	express	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, IV : les autres lois ne sont applicables à Mayotte que sur mention expresse
+JORF	geo:YT	nationality	default	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, I, 1° : de plein droit à Mayotte, la nationalité
+JORF	geo:YT	personal_status	default	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, I, 2° : de plein droit à Mayotte, l'état et la capacité des personnes
+JORF	geo:YT	succession_matrimonial	default	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, I, 3° : de plein droit à Mayotte, les régimes matrimoniaux, les successions et les libéralités
+JORF	geo:YT	criminal_law	default	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, I, 4° : de plein droit à Mayotte, le droit pénal
+JORF	geo:YT	criminal_procedure	default	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, I, 5° : de plein droit à Mayotte, la procédure pénale
+JORF	geo:YT	administrative_procedure	default	2001-01-01	2008-01-01	Ordonnance n° 2000-387 du 4 mai 2000, art. 5 : le code de justice administrative s'applique à Mayotte ; de plein droit depuis la loi n° 2001-616 du 11 juillet 2001, art. 3, I, 6°
+JORF	geo:YT	administrative_relations	default	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, I, 6° : de plein droit à Mayotte, la procédure administrative non contentieuse
+JORF	geo:YT	electoral	default	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, I, 7° : de plein droit à Mayotte, le droit électoral
+JORF	geo:YT	post_telecom	default	2001-07-13	2008-01-01	Loi n° 2001-616 du 11 juillet 2001 relative à Mayotte, art. 3, I, 8° : de plein droit à Mayotte, les postes et télécommunications
+JORF	geo:YT	*	default	2008-01-01		Article LO 6113-1 du code général des collectivités territoriales : identité législative à Mayotte depuis le 1er janvier 2008 ; département depuis le 31 mars 2011 (loi organique n° 2010-1486 du 7 décembre 2010)
+JORF	geo:YT	tax	express	2008-01-01	2011-03-31	Article LO 6113-1 du code général des collectivités territoriales, 1° : les impôts, droits et taxes ne s'appliquent à Mayotte que sur mention expresse
+JORF	geo:YT	urban_planning	express	2008-01-01	2011-03-31	Article LO 6113-1 du code général des collectivités territoriales, 2° : l'urbanisme ne s'applique à Mayotte que sur mention expresse
+JORF	geo:YT	housing	express	2008-01-01	2011-03-31	Article LO 6113-1 du code général des collectivités territoriales, 2° : la construction, l'habitation et le logement ne s'appliquent à Mayotte que sur mention expresse
+JORF	geo:YT	expropriation	express	2008-01-01	2011-03-31	Article LO 6113-1 du code général des collectivités territoriales, 2° : l'expropriation ne s'applique à Mayotte que sur mention expresse
+JORF	geo:YT	social_protection	express	2008-01-01	2011-03-31	Article LO 6113-1 du code général des collectivités territoriales, 3° : la protection et l'action sociales ne s'appliquent à Mayotte que sur mention expresse
+JORF	geo:YT	labour	express	2008-01-01	2011-03-31	Article LO 6113-1 du code général des collectivités territoriales, 4° : le droit du travail, de l'emploi et de la formation professionnelle ne s'applique à Mayotte que sur mention expresse
+JORF	geo:YT	foreigners	express	2008-01-01	2011-03-31	Article LO 6113-1 du code général des collectivités territoriales, 5° : l'entrée et le séjour des étrangers et le droit d'asile ne s'appliquent à Mayotte que sur mention expresse
+JORF	geo:YT	labour	excluded	2011-03-31	2018-01-01	Le code du travail applicable à Mayotte y tient lieu de code du travail jusqu'au 1er janvier 2018 (ordonnance n° 2017-1491 du 25 octobre 2017, art. 1er et 31)
+JORF	geo:YT	tax	excluded	2011-03-31	2014-01-01	Le code général des impôts applicable à Mayotte y tient lieu de code général des impôts jusqu'au 1er janvier 2014 (ordonnance n° 2013-837 du 19 septembre 2013)
+JORF	geo:YT	customs	excluded	2008-01-01	2014-01-01	Le code des douanes de Mayotte y tient lieu de code des douanes jusqu'au 1er janvier 2014 (ordonnance n° 2013-837 du 19 septembre 2013)
+JORF	geo:BL	*	default	1946-03-19	2007-07-15	Loi n° 46-451 du 19 mars 1946 tendant au classement comme départements français de la Guadeloupe, de la Martinique, de la Réunion et de la Guyane française : Saint-Barthélemy, commune de la Guadeloupe
+JORF	geo:BL	*	default	2007-07-15		Article LO 6213-1 du code général des collectivités territoriales : identité législative, hors les matières que l'article LO 6214-3 donne à la collectivité de Saint-Barthélemy
+JORF	geo:BL	foreigners	express	2007-07-15		Article LO 6213-1 du code général des collectivités territoriales : l'entrée et le séjour des étrangers et le droit d'asile ne s'appliquent à Saint-Barthélemy que sur mention expresse
+JORF	geo:BL	tax	default	2007-07-15		Article LO 6214-4 du code général des collectivités territoriales : une personne établie à Saint-Barthélemy depuis moins de cinq ans y garde son domicile fiscal en métropole et relève des impôts de l'État
+JORF	geo:BL	urban_planning	excluded	2007-07-15		Article LO 6214-3 du code général des collectivités territoriales, I, 2° : l'urbanisme relève de la collectivité de Saint-Barthélemy, qui a son code
+JORF	geo:BL	environment	excluded	2007-07-15		Article LO 6214-3 du code général des collectivités territoriales, I, 5° : l'environnement relève de la collectivité de Saint-Barthélemy, qui a son code
+JORF	geo:BL	housing	frozen	2007-07-15		Article LO 6214-3 du code général des collectivités territoriales, I, 2° : la construction, l'habitation et le logement relève de la collectivité de Saint-Barthélemy
+JORF	geo:BL	road_traffic	frozen	2007-07-15		Article LO 6214-3 du code général des collectivités territoriales, I, 3° : la circulation routière relève de la collectivité de Saint-Barthélemy
+JORF	geo:BL	roads	frozen	2007-07-15		Article LO 6214-3 du code général des collectivités territoriales, I, 4° : la voirie relève de la collectivité de Saint-Barthélemy
+JORF	geo:BL	energy	frozen	2007-07-15		Article LO 6214-3 du code général des collectivités territoriales, I, 7° : l'énergie relève de la collectivité de Saint-Barthélemy
+JORF	geo:BL	tourism	frozen	2007-07-15		Article LO 6214-3 du code général des collectivités territoriales, I, 8° : le tourisme relève de la collectivité de Saint-Barthélemy
+JORF	geo:MF	*	default	1946-03-19	2007-07-15	Loi n° 46-451 du 19 mars 1946 tendant au classement comme départements français de la Guadeloupe, de la Martinique, de la Réunion et de la Guyane française : Saint-Martin, commune de la Guadeloupe
+JORF	geo:MF	*	default	2007-07-15		Article LO 6313-1 du code général des collectivités territoriales : identité législative, hors les matières que l'article LO 6314-3 donne à la collectivité de Saint-Martin
+JORF	geo:MF	foreigners	express	2007-07-15		Article LO 6313-1 du code général des collectivités territoriales : l'entrée et le séjour des étrangers et le droit d'asile ne s'appliquent à Saint-Martin que sur mention expresse
+JORF	geo:MF	tax	default	2007-07-15		Article LO 6314-4 du code général des collectivités territoriales : une personne domiciliée dans un département pendant les cinq ans qui précèdent son établissement à Saint-Martin relève des impôts de l'État tant qu'elle n'y a pas résidé cinq ans
+JORF	geo:MF	road_traffic	frozen	2007-07-15		Article LO 6314-3 du code général des collectivités territoriales, I, 2° : la circulation routière relève de la collectivité de Saint-Martin
+JORF	geo:MF	roads	frozen	2007-07-15		Article LO 6314-3 du code général des collectivités territoriales, I, 3° : la voirie relève de la collectivité de Saint-Martin
+JORF	geo:MF	tourism	frozen	2007-07-15		Article LO 6314-3 du code général des collectivités territoriales, I, 5° : le tourisme relève de la collectivité de Saint-Martin
+JORF	geo:MF	urban_planning	frozen	2012-01-01		Article LO 6314-3 du code général des collectivités territoriales, II, 1° : l'urbanisme relève de la collectivité de Saint-Martin depuis la première réunion de son conseil territorial renouvelé après le 1er janvier 2012, date prise ici au 1er janvier 2012
+JORF	geo:MF	housing	frozen	2012-01-01		Article LO 6314-3 du code général des collectivités territoriales, II, 1° : la construction, l'habitation et le logement relèvent de la collectivité de Saint-Martin depuis la première réunion de son conseil territorial renouvelé après le 1er janvier 2012, date prise ici au 1er janvier 2012
+JORF	geo:MF	energy	frozen	2012-01-01		Article LO 6314-3 du code général des collectivités territoriales, II, 2° : l'énergie relève de la collectivité de Saint-Martin depuis la première réunion de son conseil territorial renouvelé après le 1er janvier 2012, date prise ici au 1er janvier 2012
+JORF	geo:PM	*	express		1985-06-14	Loi n° 76-664 du 19 juillet 1976 relative à l'organisation de Saint-Pierre-et-Miquelon : le régime d'avant 1985 n'est pas lu ici
+JORF	geo:PM	*	default	1985-06-14	2008-01-01	Loi n° 85-595 du 11 juin 1985 relative au statut de l'archipel de Saint-Pierre-et-Miquelon, art. 22 : la loi est applicable de plein droit à Saint-Pierre-et-Miquelon, hors les matières de l'art. 21
+JORF	geo:PM	*	default	2008-01-01		Article LO 6413-1 du code général des collectivités territoriales : identité législative, hors les matières que l'article LO 6414-1, II, donne à la collectivité de Saint-Pierre-et-Miquelon
+JORF	geo:PM	tax	excluded	1985-06-14		Loi n° 85-595 du 11 juin 1985 relative au statut de l'archipel de Saint-Pierre-et-Miquelon, art. 21, puis article LO 6414-1 du code général des collectivités territoriales, II, 1° : les impôts relèvent de la collectivité de Saint-Pierre-et-Miquelon, qui a son code local des impôts
+JORF	geo:PM	urban_planning	frozen	1985-06-14		Loi n° 85-595 du 11 juin 1985 relative au statut de l'archipel de Saint-Pierre-et-Miquelon, art. 21, puis article LO 6414-1 du code général des collectivités territoriales, II, 3° : l'urbanisme relève de la collectivité de Saint-Pierre-et-Miquelon
+JORF	geo:PM	housing	frozen	1985-06-14		Loi n° 85-595 du 11 juin 1985 relative au statut de l'archipel de Saint-Pierre-et-Miquelon, art. 21, puis article LO 6414-1 du code général des collectivités territoriales, II, 3° : le logement relève de la collectivité de Saint-Pierre-et-Miquelon
+JORF	geo:PF	*	express			Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 7 : dans les matières de l'État, une loi ne s'applique en Polynésie française que sur mention expresse
+JORF	geo:PF	defence	default	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 7, 2° : de plein droit en Polynésie française, la défense nationale
+JORF	geo:PF	nationality	default	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 7, 4° : de plein droit en Polynésie française, la nationalité
+JORF	geo:PF	personal_status	default	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 7, 4° : de plein droit en Polynésie française, l'état et la capacité des personnes
+JORF	geo:PF	administrative_procedure	default	2001-01-01		Ordonnance n° 2000-387 du 4 mai 2000, art. 5 : le code de justice administrative s'applique en Polynésie française ; de plein droit depuis le 9 décembre 2007 (Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 7, 6°)
+JORF	geo:PF	administrative_relations	default	2007-12-09		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 7, 7° : de plein droit en Polynésie française depuis le 9 décembre 2007, les droits des citoyens dans leurs relations avec les administrations
+JORF	geo:PF	civil_procedure	excluded	1984-09-07		Loi n° 84-820 du 6 septembre 1984, puis Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : la procédure civile relève de la Polynésie française, qui a son code de procédure civile
+JORF	geo:PF	labour	excluded	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : le droit du travail relève de la Polynésie française, qui a son code du travail
+JORF	geo:PF	tax	excluded	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : les impôts relèvent de la Polynésie française, qui a son code des impôts
+JORF	geo:PF	urban_planning	excluded	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : l'urbanisme relève de la Polynésie française, qui a son code de l'aménagement
+JORF	geo:PF	civil_law	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : le droit civil, hors les matières de l'art. 14, 1°, relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	commerce	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : le droit commercial relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	health	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : la santé relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	social_protection	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : la protection sociale relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	insurance	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : le droit des assurances relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	consumer	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : la consommation relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	housing	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : la construction et le logement relèvent de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	environment	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : l'environnement relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	energy	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : l'énergie relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	tourism	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : le tourisme relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	road_traffic	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : la circulation routière relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:PF	roads	frozen	2004-03-02		Loi organique n° 2004-192 du 27 février 2004 portant statut d'autonomie de la Polynésie française, art. 13 et 14 : la voirie relève de la Polynésie française depuis le 2 mars 2004
+JORF	geo:NC	*	express			Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 6-2 : dans les matières de l'État, une loi ne s'applique en Nouvelle-Calédonie que sur mention expresse
+JORF	geo:NC	defence	default	2009-08-07		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 6-2, 2° : de plein droit en Nouvelle-Calédonie, la défense nationale
+JORF	geo:NC	nationality	default	2009-08-07		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 6-2, 4° : de plein droit en Nouvelle-Calédonie, la nationalité
+JORF	geo:NC	personal_status	default	2009-08-07	2013-07-01	Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 6-2, 4° : de plein droit en Nouvelle-Calédonie, l'état et la capacité des personnes, jusqu'au transfert du droit civil
+JORF	geo:NC	administrative_procedure	default	2001-01-01		Ordonnance n° 2000-387 du 4 mai 2000, art. 5 : le code de justice administrative s'applique en Nouvelle-Calédonie ; de plein droit depuis le 7 août 2009 (Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 6-2, 6°)
+JORF	geo:NC	administrative_relations	default	2009-08-07		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 6-2, 7° : de plein droit en Nouvelle-Calédonie, les droits des citoyens dans leurs relations avec les administrations
+JORF	geo:NC	civil_procedure	excluded	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 18° : la procédure civile relève de la Nouvelle-Calédonie, qui a son code de procédure civile
+JORF	geo:NC	labour	excluded	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 2° : le droit du travail relève de la Nouvelle-Calédonie, qui a son code du travail
+JORF	geo:NC	tax	excluded	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 1° : les impôts relèvent de la Nouvelle-Calédonie, qui a son code des impôts
+JORF	geo:NC	urban_planning	excluded	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 21° : l'urbanisme relève de la Nouvelle-Calédonie, qui a son code de l'urbanisme
+JORF	geo:NC	health	frozen	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 4° : la santé relève de la Nouvelle-Calédonie
+JORF	geo:NC	social_protection	frozen	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 4° : la protection sociale relève de la Nouvelle-Calédonie
+JORF	geo:NC	insurance	frozen	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 16° : le droit des assurances relève de la Nouvelle-Calédonie
+JORF	geo:NC	consumer	frozen	2009-08-07		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 19°, dans sa rédaction du 7 août 2009 : la consommation relève de la Nouvelle-Calédonie
+JORF	geo:NC	road_traffic	frozen	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 12° : la circulation routière relève de la Nouvelle-Calédonie
+JORF	geo:NC	roads	frozen	1999-03-21		Loi organique n° 99-209 du 19 mars 1999 relative à la Nouvelle-Calédonie, art. 22, 13° : le réseau routier de la Nouvelle-Calédonie relève de la Nouvelle-Calédonie
+JORF	geo:NC	civil_rights	frozen	2013-07-01		Loi du pays n° 2012-2 du 20 janvier 2012 et art. 21, III, 4°, et 26 de la loi organique n° 99-209 : le droit civil, les règles de l'état civil et le droit commercial relèvent de la Nouvelle-Calédonie depuis le 1er juillet 2013
+JORF	geo:NC	personal_status	frozen	2013-07-01		Loi du pays n° 2012-2 du 20 janvier 2012 et art. 21, III, 4°, et 26 de la loi organique n° 99-209 : le droit civil, les règles de l'état civil et le droit commercial relèvent de la Nouvelle-Calédonie depuis le 1er juillet 2013
+JORF	geo:NC	parental_authority	frozen	2013-07-01		Loi du pays n° 2012-2 du 20 janvier 2012 et art. 21, III, 4°, et 26 de la loi organique n° 99-209 : le droit civil, les règles de l'état civil et le droit commercial relèvent de la Nouvelle-Calédonie depuis le 1er juillet 2013
+JORF	geo:NC	succession_matrimonial	frozen	2013-07-01		Loi du pays n° 2012-2 du 20 janvier 2012 et art. 21, III, 4°, et 26 de la loi organique n° 99-209 : le droit civil, les règles de l'état civil et le droit commercial relèvent de la Nouvelle-Calédonie depuis le 1er juillet 2013
+JORF	geo:NC	civil_law	frozen	2013-07-01		Loi du pays n° 2012-2 du 20 janvier 2012 et art. 21, III, 4°, et 26 de la loi organique n° 99-209 : le droit civil, les règles de l'état civil et le droit commercial relèvent de la Nouvelle-Calédonie depuis le 1er juillet 2013
+JORF	geo:NC	commerce	frozen	2013-07-01		Loi du pays n° 2012-2 du 20 janvier 2012 et art. 21, III, 4°, et 26 de la loi organique n° 99-209 : le droit civil, les règles de l'état civil et le droit commercial relèvent de la Nouvelle-Calédonie depuis le 1er juillet 2013
+JORF	geo:WF	*	express			Loi n° 61-814 du 29 juillet 1961 conférant aux îles Wallis et Futuna le statut de territoire d'outre-mer, art. 4 : une loi ne s'y applique que sur mention expresse
+JORF	geo:WF	administrative_procedure	default	2004-02-01		Ordonnance n° 2000-387 du 4 mai 2000, art. 5, dans sa rédaction du 1er février 2004 : le code de justice administrative s'applique dans les îles Wallis et Futuna
+JORF	geo:TF	*	express			Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1 : dans les matières de l'État, une loi ne s'applique dans les Terres australes et antarctiques françaises que sur mention expresse
+JORF	geo:TF	administrative_procedure	default	2001-01-01		Ordonnance n° 2000-387 du 4 mai 2000, art. 5 : le code de justice administrative s'applique dans les Terres australes et antarctiques françaises ; de plein droit depuis le 1er janvier 2008 (Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 8°)
+JORF	geo:TF	administrative_relations	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 8° : de plein droit dans les Terres australes et antarctiques françaises, la procédure administrative non contentieuse
+JORF	geo:TF	defence	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 2° : de plein droit dans les Terres australes et antarctiques françaises, la défense nationale
+JORF	geo:TF	nationality	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 3° : de plein droit dans les Terres australes et antarctiques françaises, la nationalité
+JORF	geo:TF	civil_rights	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 4° : de plein droit dans les Terres australes et antarctiques françaises, le droit civil
+JORF	geo:TF	personal_status	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 4° : de plein droit dans les Terres australes et antarctiques françaises, le droit civil
+JORF	geo:TF	parental_authority	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 4° : de plein droit dans les Terres australes et antarctiques françaises, le droit civil
+JORF	geo:TF	succession_matrimonial	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 4° : de plein droit dans les Terres australes et antarctiques françaises, le droit civil
+JORF	geo:TF	civil_law	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 4° : de plein droit dans les Terres australes et antarctiques françaises, le droit civil
+JORF	geo:TF	criminal_law	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 5° : de plein droit dans les Terres australes et antarctiques françaises, le droit pénal
+JORF	geo:TF	criminal_procedure	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 5° : de plein droit dans les Terres australes et antarctiques françaises, la procédure pénale
+JORF	geo:TF	money_credit	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 6° : de plein droit dans les Terres australes et antarctiques françaises, la monnaie, le Trésor, le crédit et les changes
+JORF	geo:TF	commerce	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 7° : de plein droit dans les Terres australes et antarctiques françaises, le droit commercial
+JORF	geo:TF	insurance	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 7° : de plein droit dans les Terres australes et antarctiques françaises, le droit des assurances
+JORF	geo:TF	research	default	2008-01-01		Loi n° 55-1052 du 6 août 1955 portant statut des Terres australes et antarctiques françaises, art. 1-1, 10° : de plein droit dans les Terres australes et antarctiques françaises, la recherche
+JOUE	geo:FR-M	*	default	1958-01-01		Traité instituant la Communauté économique européenne, en vigueur le 1er janvier 1958
+JOUE	geo:FR-ALS	*	default	1958-01-01		Traité instituant la Communauté économique européenne, en vigueur le 1er janvier 1958
+JOUE	geo:GP	*	default	1958-01-01		Traité CEE, art. 227 § 2, départements d'outre-mer ; art. 349 TFUE
+JOUE	geo:MQ	*	default	1958-01-01		Traité CEE, art. 227 § 2 ; art. 349 TFUE
+JOUE	geo:GF	*	default	1958-01-01		Traité CEE, art. 227 § 2 ; art. 349 TFUE
+JOUE	geo:RE	*	default	1958-01-01		Traité CEE, art. 227 § 2 ; art. 349 TFUE
+JOUE	geo:MF	*	default	1958-01-01		Partie de la Guadeloupe jusqu'en 2007, région ultrapériphérique depuis (art. 349 TFUE)
+JOUE	geo:BL	*	default	1958-01-01	2012-01-01	Partie de la Guadeloupe, puis décision 2010/718/UE du Conseil européen : pays et territoire d'outre-mer au 1er janvier 2012
+JOUE	geo:YT	*	default	2014-01-01		Décision 2012/419/UE du Conseil européen : région ultrapériphérique au 1er janvier 2014
+JOUE	geo:DE	*	default	1958-01-01		Traité de Rome
+JOUE	geo:IT	*	default	1958-01-01		Traité de Rome
+JOUE	geo:NL	*	default	1958-01-01		Traité de Rome
+JOUE	geo:BE	*	default	1958-01-01		Traité de Rome
+JOUE	geo:LU	*	default	1958-01-01		Traité de Rome
+JOUE	geo:DK	*	default	1973-01-01		Traité d'adhésion de 1972
+JOUE	geo:IE	*	default	1973-01-01		Traité d'adhésion de 1972
+JOUE	geo:GB	*	default	1973-01-01	2021-01-01	Traité d'adhésion de 1972 ; accord de retrait du 24 janvier 2020, art. 127, fin de la période de transition le 31 décembre 2020
+JOUE	geo:GR	*	default	1981-01-01		Traité d'adhésion de 1979
+JOUE	geo:ES	*	default	1986-01-01		Traité d'adhésion de 1985
+JOUE	geo:PT	*	default	1986-01-01		Traité d'adhésion de 1985
+JOUE	geo:AT	*	default	1995-01-01		Traité d'adhésion de 1994
+JOUE	geo:FI	*	default	1995-01-01		Traité d'adhésion de 1994
+JOUE	geo:SE	*	default	1995-01-01		Traité d'adhésion de 1994
+JOUE	geo:CY	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:CZ	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:EE	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:HU	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:LT	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:LV	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:MT	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:PL	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:SI	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:SK	*	default	2004-05-01		Traité d'adhésion de 2003
+JOUE	geo:BG	*	default	2007-01-01		Traité d'adhésion de 2005
+JOUE	geo:RO	*	default	2007-01-01		Traité d'adhésion de 2005
+JOUE	geo:HR	*	default	2013-07-01		Traité d'adhésion de 2011
+JO-OHADA	geo:SN	*	default	1995-09-18		Traité de Port-Louis du 17 octobre 1993, en vigueur le 18 septembre 1995 ; Sénégal ratifié le 14 juin 1994
+JO-OHADA	geo:GN	*	default	2000-11-21		Adhésion de la Guinée, dépôt des instruments le 22 septembre 2000, en vigueur le 21 novembre 2000
+JO-OHADA	geo:CD	*	default	2012-09-12		Adhésion de la République démocratique du Congo, en vigueur le 12 septembre 2012
+JONC	geo:NC	*	default			Journal officiel de la Nouvelle-Calédonie
+JOPF	geo:PF	*	default			Journal officiel de la Polynésie française
+MB	geo:BE	*	default			Moniteur belge, art. 190 de la Constitution
+RO	geo:CH	*	default			Recueil officiel du droit fédéral, loi sur les publications officielles (RS 170.512)
+JORADP	geo:DZ	*	default			Journal officiel de la République algérienne
+JORS	geo:SN	*	default			Journal officiel de la République du Sénégal
+JO-LU	geo:LU	*	default			Journal officiel du Grand-Duché de Luxembourg

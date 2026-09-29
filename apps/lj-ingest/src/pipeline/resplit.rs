@@ -23,6 +23,7 @@ use serde_json::Value;
 
 use lj_core::decision::Decision;
 use lj_llm::backend::AnyEmbedder;
+use lj_parse::FromSourceFields;
 use lj_sources::judilibre::JudilibreClient;
 use lj_store::db::Connection;
 use lj_store::repository::DecisionRepository;
@@ -256,7 +257,7 @@ pub async fn resplit_false_merges(
                             tracing::info!(
                                 limit = ?limit,
                                 repaired = stats.repairable_clusters,
-                                "resplit-false-merges : borne --limit atteinte, arrêt"
+                                "resplit-false-merges: --limit reached, stopping"
                             );
                             break 'batches;
                         }
@@ -281,41 +282,41 @@ pub async fn resplit_false_merges(
     };
     println!("\n=== resplit-false-merges [{mode}] ===");
     println!(
-        "clusters multi-provenances vus           : {}",
+        "multi-provenance clusters seen           : {}",
         stats.clusters_seen
     );
-    println!("  fusion légitime (clé unique)           : {}", stats.legit);
+    println!("  legitimate merge (unique key)          : {}", stats.legit);
     println!(
-        "  ambigu (≥1 clé None, gardé)            : {}",
+        "  ambiguous (>=1 key None, kept)         : {}",
         stats.ambiguous
     );
     println!(
-        "  déjà scindé (≤1 provenance, SKIP)      : {}",
+        "  already split (<=1 provenance, SKIP)   : {}",
         stats.already_split
     );
     println!(
-        "  FAUX MERGE réparable                   : {}",
+        "  REPAIRABLE FALSE MERGE                 : {}",
         stats.repairable_clusters
     );
     println!(
-        "  → décisions à reconstituer             : {}",
+        "  -> decisions to rebuild                : {}",
         stats.decisions_to_reconstruct
     );
     println!(
-        "  → source_uids à re-fetch               : {}",
+        "  -> source_uids to re-fetch             : {}",
         stats.source_uids_to_refetch
     );
     if !dry_run {
         println!(
-            "  décisions scindées créées              : {}",
+            "  split decisions created                : {}",
             stats.split_decisions_created
         );
         println!(
-            "  re-fetch échoués (groupe sauté)        : {}",
+            "  re-fetch failed (group skipped)        : {}",
             stats.refetch_failed
         );
     }
-    println!("\nÉchantillon de plan (canonical_id | garde | scinde) :");
+    println!("\nPlan sample (canonical_id | keeps | splits):");
     for line in &examples {
         println!("{line}");
     }
@@ -352,7 +353,7 @@ async fn execute_resplit(
                 .filter_map(|u| u.strip_prefix("judilibre/").map(str::to_string))
                 .collect();
             if object_ids.is_empty() {
-                tracing::warn!(?group, "groupe sans ObjectId judilibre, skip");
+                tracing::warn!(?group, "group without a judilibre ObjectId, skip");
                 continue;
             }
 
@@ -379,7 +380,7 @@ async fn execute_resplit(
                 Ok(()) => {}
                 Err(e) => {
                     failed += 1;
-                    tracing::warn!(new_id, ?object_ids, error = %e, "re-fetch échoué, groupe conservé vide");
+                    tracing::warn!(new_id, ?object_ids, error = %e, "re-fetch failed, group kept empty");
                 }
             }
         }
@@ -395,10 +396,10 @@ async fn execute_resplit(
             .filter_map(|u| u.strip_prefix("judilibre/").map(str::to_string))
             .collect();
         if keep_object_ids.is_empty() {
-            tracing::warn!(canonical_id, ?keep, "groupe gardé sans ObjectId judilibre");
+            tracing::warn!(canonical_id, ?keep, "kept group without a judilibre ObjectId");
         } else if let Err(e) = refetch_into(conn, client, embedder, &keep_object_ids).await {
             failed += 1;
-            tracing::warn!(canonical_id, ?keep_object_ids, error = %e, "re-fetch groupe gardé échoué, contenu conservé");
+            tracing::warn!(canonical_id, ?keep_object_ids, error = %e, "kept-group re-fetch failed, content kept");
         }
 
         Ok((created, failed))

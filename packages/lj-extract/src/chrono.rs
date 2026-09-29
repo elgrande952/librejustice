@@ -1,27 +1,21 @@
-//! Liens de chronologie entre décisions : depuis une décision d'appel / de
-//! cassation / de renvoi, la référence canonique de la décision ATTAQUÉE. Deux
-//! sources : la métadonnée Judilibre `contested` ([`Decision::attacked`]) et le
-//! texte (« Par un jugement n° X du D, le tribunal administratif de V… »,
-//! « Décision déférée à la Cour : … »).
+//! Chronology links: from a decision on appeal, cassation or remittal, the
+//! address of the decision it ATTACKS. Two sources, the Judilibre `contested`
+//! metadata ([`Decision::attacked`]) and the text itself.
 //!
-//! La cible sort en clé pendante dans la grammaire `canonical_ref` exacte de
-//! [`crate::identity`] (mêmes formes par juridiction, même normalisation) : elle
-//! se résout côté base dès qu'une décision unique et active la porte.
-//!
-//! Une exception : `ca-parties|<code de cour>|<date>`, l'arrêt de CA attaqué par
-//! un pourvoi, que le texte de cassation ne nomme jamais par son RG. La clé
-//! n'égale aucun `canonical_ref` et se résout par les parties communes.
+//! The target goes out as a [`CaseAddress`], resolved on the database side as
+//! soon as one active decision answers to it. A cassation never names the
+//! docket of the arrêt it attacks, so that address goes out with court and date
+//! alone and the common parties settle it.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use lj_core::address::CaseAddress;
 use lj_core::decision::Decision;
 use regex::Regex;
 
 use crate::extract::common::parse_french_date;
-use crate::identity::{
-    looks_like_caa_rg, looks_like_pourvoi, normalize_component, normalize_pourvoi,
-};
+use crate::identity::{looks_like_pourvoi, normalize_component, normalize_pourvoi};
 
 /// Nature du lien, du point de vue de la décision SOURCE (celle qui attaque).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,85 +36,48 @@ impl LinkType {
     }
 }
 
-/// Lien extrait : type + `canonical_ref` de la décision attaquée.
+/// Lien extrait : type + adresse de la décision attaquée.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PriorRef {
     pub link_type: LinkType,
-    pub target_ref: String,
+    pub address: CaseAddress,
 }
-
-/// Préfixe de la famille dont la clé ne porte pas le RG de sa cible.
-const CA_PARTIES: &str = "ca-parties|";
 
 impl PriorRef {
-    /// Même cible que `other`, au grain que le texte peut atteindre : une clé
-    /// `ca-parties|` n'a pas le RG, la comparaison tombe alors sur la cour et la
-    /// date. Sert le banc, dont l'oracle `contested` porte, lui, le RG.
     pub fn same_target_as(&self, other: &PriorRef) -> bool {
-        if self.target_ref == other.target_ref {
-            return true;
-        }
-        if !self.target_ref.starts_with(CA_PARTIES) && !other.target_ref.starts_with(CA_PARTIES) {
-            return false;
-        }
-        match (
-            ca_court_and_date(&self.target_ref),
-            ca_court_and_date(&other.target_ref),
-        ) {
-            (Some(a), Some(b)) => a == b,
-            _ => false,
-        }
+        self.address.same_target_as(&other.address)
     }
 }
 
-/// (cour pliée, date) d'une clé visant un arrêt de CA, dans l'une ou l'autre de
-/// ses deux formes : `ca|<cour>|<rg>|<date>` et `ca-parties|<code>|<date>`.
-fn ca_court_and_date(key: &str) -> Option<(String, &str)> {
-    let mut parts = key.split('|');
-    match parts.next()? {
-        "ca" => {
-            let court = parts.next()?.to_string();
-            parts.next()?;
-            Some((court, parts.next()?))
-        }
-        "ca-parties" => Some((normalize_component(parts.next()?), parts.next()?)),
-        _ => None,
-    }
-}
-
-/// Mapping (type de juridiction, ville pliée) → code de localisation
-/// Judilibre, dérivé du référentiel `jurisdiction` en base au début du run. Les
-/// clés `canonical_ref` CA/TJ/TCOM exigent ce code ; une ville ambiguë (deux
-/// codes pour le même couple) ne mappe pas.
+/// (jurisdiction type, folded city) to the referential `jurisdiction.code`,
+/// which is what `decisions.jurisdiction_code` carries and what every address
+/// joins on. An ambiguous city (two codes under one couple) maps to nothing.
+///
+/// This is the ONLY place a court name is read. A name it does not hold yields
+/// an address without a court, never a raw string.
 pub struct ChronoSnapshot {
     by_type_city: HashMap<(String, String), Option<String>>,
 }
 
 impl ChronoSnapshot {
-    /// `rows` = lignes `(code, jurisdiction_type, city)` du référentiel
-    /// `jurisdiction`. Le code TCOM référentiel est préfixé (`tcom0603`) alors
-    /// que la localisation Judilibre est nue (`0603`) : on déprefixe. TA/CAA
-    /// servent la chaîne du fond administratif ; CPH est vide aujourd'hui et se
-    /// remplit à l'ingest des premières décisions prud'homales.
+    /// `rows` = `(code, jurisdiction_type, city)` of the `jurisdiction`
+    /// referential. CPH is empty today and fills at the ingest of the first
+    /// prud'homales decisions.
     pub fn new(rows: impl IntoIterator<Item = (String, String, String)>) -> Self {
         let mut by_type_city: HashMap<(String, String), Option<String>> = HashMap::new();
         for (code, jt, city) in rows {
             if !matches!(jt.as_str(), "CA" | "TJ" | "TCOM" | "TA" | "CAA" | "CPH") {
                 continue;
             }
-            let location = match jt.as_str() {
-                "TCOM" => code.strip_prefix("tcom").unwrap_or(&code).to_string(),
-                _ => code,
-            };
             for city_key in city_keys(&normalize_component(&city)) {
                 let key = (jt.clone(), city_key);
                 match by_type_city.get(&key) {
-                    Some(Some(prev)) if *prev != location => {
+                    Some(Some(prev)) if *prev != code => {
                         by_type_city.insert(key, None);
                     }
                     Some(_) => {}
                     None => {
-                        by_type_city.insert(key, Some(location.clone()));
+                        by_type_city.insert(key, Some(code.clone()));
                     }
                 }
             }
@@ -134,34 +91,46 @@ impl ChronoSnapshot {
         }
     }
 
-    /// Clé de chronologie d'une cible nommée en clair (« Aix-en-Provence »,
-    /// « 21/00123 ») : le banc part d'une GT écrite à la main là où le moteur
-    /// part du libellé plié du texte, et les deux doivent tomber sur la même clé.
-    pub fn target_key(&self, jt: &str, city: &str, rg: &str, date: &str) -> Option<String> {
-        self.target_key_folded(jt, &normalize_component(city), rg, date)
+    /// Address of a target named in the clear ("Aix-en-Provence", "21/00123"):
+    /// the bench starts from a hand-written GT where the engine starts from the
+    /// folded label, and both must land on the same address.
+    pub fn target_address(
+        &self,
+        jt: &str,
+        city: &str,
+        rg: &str,
+        date: &str,
+    ) -> Option<CaseAddress> {
+        self.target_address_folded(jt, &normalize_component(city), rg, date)
     }
 
-    fn target_key_folded(
+    fn target_address_folded(
         &self,
         jt: &str,
         city_folded: &str,
         rg: &str,
         date: &str,
-    ) -> Option<String> {
-        let location = normalize_component(self.location(jt, city_folded)?);
-        let rg = normalize_component(rg);
-        if location.is_empty() || rg.is_empty() {
-            return None;
-        }
-        Some(format!("{}|{location}|{rg}|{date}", jt.to_lowercase()))
+    ) -> Option<CaseAddress> {
+        let address = CaseAddress::new(self.code(jt, city_folded)?, rg, date);
+        address.docket.is_some().then_some(address)
     }
 
-    /// Consommé aussi par le lexer de citations RG (`compiled::lex_case`) — même
-    /// mapping ville → code que les liens de chronologie.
-    pub(crate) fn location(&self, jt: &str, city_folded: &str) -> Option<&str> {
+    /// Consumed too by the RG citation lexer (`compiled::lex_case`): one city
+    /// to code mapping for citations and chronology alike.
+    pub(crate) fn code(&self, jt: &str, city_folded: &str) -> Option<&str> {
         self.by_type_city
             .get(&(jt.to_string(), city_folded.to_string()))?
             .as_deref()
+    }
+
+    /// The longest prefix in words that names a court of `jt`. Cuts on its own
+    /// what the recogniser over-captured, a trailing pronoun ("de paris lui")
+    /// or a relative ("de nimes auquel la requete"), without a stop list.
+    pub(crate) fn city_prefix_code(&self, jt: &str, city_folded: &str) -> Option<&str> {
+        let words: Vec<&str> = city_folded.split_whitespace().collect();
+        (1..=words.len())
+            .rev()
+            .find_map(|n| self.code(jt, &words[..n].join(" ")))
     }
 }
 
@@ -190,14 +159,14 @@ pub fn prior_decision_refs(
             }
             refs
         }
-        Some("CAA") | Some("CE") => from_admin_text(d).into_iter().collect(),
+        Some("CAA") | Some("CE") => from_admin_text(d, snap).into_iter().collect(),
         _ => Vec::new(),
     }
 }
 
-/// Sous-mot que la regex de l'appelant exige contigu, cherché dans le texte
-/// plié du scan unique. `fold_char` étant 1:1 par caractère, son absence prouve
-/// l'absence de match : le garde est iso-résultat, pas une heuristique.
+/// A literal the caller's regex requires contiguous, looked up in the folded
+/// text of the single scan. Its absence proves the absence of a match: the
+/// guard changes no result.
 fn scan_lacks(scan: &crate::scan::DocScan, litteral: &str) -> bool {
     !scan.folded().contains(litteral)
 }
@@ -222,20 +191,17 @@ fn from_attacked_meta(d: &Decision, snap: &ChronoSnapshot) -> Option<PriorRef> {
         }
         return Some(PriorRef {
             link_type: LinkType::RenvoiApresCassation,
-            target_ref: format!("cc|{pourvoi}|{date}"),
+            address: CaseAddress::new("cc", &pourvoi, date),
         });
     }
 
     let (target_jt, city) = jurisdiction_from_label(&label)?;
-    let target_ref = snap.target_key_folded(target_jt, &city, number, date)?;
+    let address = snap.target_address_folded(target_jt, &city, number, date)?;
     let link_type = match source_jt {
         "CC" => LinkType::PourvoiContre,
         _ => LinkType::AppelDe,
     };
-    Some(PriorRef {
-        link_type,
-        target_ref,
-    })
+    Some(PriorRef { link_type, address })
 }
 
 /// Le greffe met la formation sur une seconde ligne (« cour d'appel de Paris\n
@@ -245,10 +211,14 @@ fn attacked_label(raw: &str) -> String {
     normalize_component(raw.split('\n').next().unwrap_or(raw))
 }
 
-/// Clés de ville d'une ligne référentielle : la forme pliée, plus la forme
-/// sans article de tête (« le havre » → aussi « havre ») — les citations
-/// contractent l'article (« du Havre », « des Sables-d'Olonne ») quand la
-/// ville référentielle le porte en toutes lettres.
+/// Every writing under which a referential city can be cited: the folded form,
+/// the form without its leading article ("le havre" also answers to "havre",
+/// citations contracting it into "du Havre"), and its overseas equivalents.
+///
+/// The administrative order names an overseas court by its territory
+/// ("tribunal administratif de la Guadeloupe") where the judgment under appeal
+/// is cited by its seat ("de Basse-Terre"). Measured 21/09/2026, that single
+/// gap leaves 275 chronology steps unnamed.
 fn city_keys(folded: &str) -> Vec<String> {
     let mut keys = vec![folded.to_string()];
     for article in ["la ", "le ", "les "] {
@@ -259,7 +229,21 @@ fn city_keys(folded: &str) -> Vec<String> {
             break;
         }
     }
+    for graphy in lj_core::outremer::equivalents(&keys[0].replace(' ', "-")) {
+        let key = graphy.replace('-', " ");
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
     keys
+}
+
+/// The referential code a court label names, gazetteer included: the door the
+/// extraction goes through, and the one the backfill of the old keys reuses so
+/// a name reads the same on both sides.
+pub fn court_from_label(label: &str, snap: &ChronoSnapshot) -> Option<String> {
+    let (jt, city) = jurisdiction_from_label(&normalize_component(label))?;
+    snap.city_prefix_code(jt, &city).map(str::to_string)
 }
 
 /// Libellé plié (`cour d appel d aix en provence`) → (type, ville pliée).
@@ -267,6 +251,8 @@ fn city_keys(folded: &str) -> Vec<String> {
 /// ville. CPH, tribunaux paritaires, cours d'assises : hors nomenclature.
 fn jurisdiction_from_label(folded: &str) -> Option<(&'static str, String)> {
     const FORMS: &[(&str, &str)] = &[
+        ("cour administrative d appel ", "CAA"),
+        ("tribunal administratif ", "TA"),
         ("cour d appel ", "CA"),
         ("tribunal judiciaire ", "TJ"),
         ("tribunal de grande instance ", "TJ"),
@@ -284,14 +270,7 @@ fn jurisdiction_from_label(folded: &str) -> Option<(&'static str, String)> {
     ];
     for (prefix, jt) in FORMS {
         if let Some(rest) = folded.strip_prefix(prefix) {
-            let city = rest
-                .strip_prefix("de la ")
-                .or_else(|| rest.strip_prefix("de "))
-                .or_else(|| rest.strip_prefix("d "))
-                .or_else(|| rest.strip_prefix("du "))
-                .or_else(|| rest.strip_prefix("des "))
-                .unwrap_or(rest)
-                .trim();
+            let city = strip_articles(rest);
             if city.is_empty() {
                 return None;
             }
@@ -301,15 +280,32 @@ fn jurisdiction_from_label(folded: &str) -> Option<(&'static str, String)> {
     None
 }
 
-/// Spans inline de la décision ATTAQUÉE (métadonnée Judilibre `contested`) :
-/// les surfaces standard du corps qui la répètent — « l'arrêt attaqué (Paris,
-/// 22 août 2024) », « l'arrêt rendu le 22 août 2024 par la cour d'appel de
-/// Paris » — deviennent des citations de jurisprudence (`case_citation`)
-/// portant le même `target_ref` que le lien de chronologie, résolues côté
-/// base par le pont depuis `decision_links`. Ces mentions n'ont pas de docket
-/// en texte : seule la métadonnée identifie la cible, et ville et date doivent
-/// la matcher. Offsets en chars (grain `case_citation`).
-pub fn attacked_text_spans(d: &Decision, snap: &ChronoSnapshot) -> Vec<(usize, usize, String)> {
+/// Leading articles, repeated: the registry writes "du tribunal administratif
+/// de de Grenoble", and one pass would leave "de grenoble", which names no city.
+fn strip_articles(rest: &str) -> &str {
+    let mut rest = rest.trim();
+    loop {
+        let shorter = ["de la ", "de ", "d ", "du ", "des "]
+            .iter()
+            .find_map(|a| rest.strip_prefix(a));
+        match shorter {
+            Some(s) => rest = s.trim(),
+            None => return rest,
+        }
+    }
+}
+
+/// Inline spans of the ATTACKED decision (Judilibre `contested` metadata): the
+/// standard surfaces of the body that repeat it, « l'arrêt attaqué (Paris,
+/// 22 août 2024) » or « l'arrêt rendu le 22 août 2024 par la cour d'appel de
+/// Paris », become case citations (`case_citation`) carrying the same address
+/// as the chronology link. Those mentions hold no docket in the text: the
+/// metadata alone identifies the target, and city and date must match it.
+/// Offsets in chars (the `case_citation` grain).
+pub fn attacked_text_spans(
+    d: &Decision,
+    snap: &ChronoSnapshot,
+) -> Vec<(usize, usize, CaseAddress)> {
     let Some(r) = from_attacked_meta(d, snap) else {
         return Vec::new();
     };
@@ -367,7 +363,7 @@ pub fn attacked_text_spans(d: &Decision, snap: &ChronoSnapshot) -> Vec<(usize, u
             (
                 text[..bs].chars().count(),
                 text[..be].chars().count(),
-                r.target_ref.clone(),
+                r.address.clone(),
             )
         })
         .collect()
@@ -409,7 +405,7 @@ static RE_PRIOR_ADMIN: LazyLock<Regex> = LazyLock::new(|| {
 /// Réfs admin : toutes les décisions antérieures citées en en-tête ; la
 /// décision ATTAQUÉE est la plus récente (un pourvoi CE cite le jugement TA
 /// puis l'arrêt CAA — c'est l'arrêt qu'il attaque).
-fn from_admin_text(d: &Decision) -> Option<PriorRef> {
+fn from_admin_text(d: &Decision, snap: &ChronoSnapshot) -> Option<PriorRef> {
     let text = &d.texte_integral_clean;
     let header_end = text.char_indices().nth(8000).map_or(text.len(), |(i, _)| i);
     let header = &text[..header_end];
@@ -420,29 +416,18 @@ fn from_admin_text(d: &Decision) -> Option<PriorRef> {
             Some(iso) => iso,
             None => continue,
         };
-        let rg = normalize_component(&cap[1]);
-        let jur = normalize_component(&cap[5]);
-        if rg.is_empty() || jur.is_empty() {
+        // The court comes from the gazetteer or does not come at all; an
+        // address without one still designates by docket and date.
+        let court = court_from_label(&cap[5], snap).unwrap_or_default();
+        let address = CaseAddress::new(&court, &cap[1], &date);
+        if address.docket.is_none() {
             continue;
         }
-        // Grammaire identity : CAA par RG auto-porteur, TA/repli par le nom.
-        let target_ref = if jur.starts_with("cour administrative d appel") && looks_like_caa_rg(&rg)
-        {
-            format!("caa|{rg}|{date}")
-        } else {
-            format!("{jur}|{rg}|{date}")
-        };
         let link_type = match d.jurisdiction_type.as_deref() {
             Some("CE") if header_has_pourvoi(header) => LinkType::PourvoiContre,
             _ => LinkType::AppelDe,
         };
-        let candidate = (
-            date.clone(),
-            PriorRef {
-                link_type,
-                target_ref,
-            },
-        );
+        let candidate = (date.clone(), PriorRef { link_type, address });
         if best.as_ref().is_none_or(|(b, _)| *b <= date) {
             best = Some(candidate);
         }
@@ -451,7 +436,7 @@ fn from_admin_text(d: &Decision) -> Option<PriorRef> {
 }
 
 fn header_has_pourvoi(header: &str) -> bool {
-    crate::compiled::fold_stable(header).contains("pourvoi")
+    lj_fold::fold_chars(header).contains("pourvoi")
 }
 
 /// Étiquettes qui ouvrent la zone où la cour nomme la décision dont elle est
@@ -504,17 +489,6 @@ static RE_DEFEREE_RG: LazyLock<Regex> = LazyLock::new(|| {
     )
     .unwrap()
 });
-
-/// Ville d'un libellé : le plus long préfixe en mots que le référentiel
-/// reconnaît. Coupe seul « PARIS 3ème Chambre » ou « BREST Pole Social », et
-/// garde « SAINT-ETIENNE » qu'un séparateur énuméré tronquerait.
-fn city_prefix(snap: &ChronoSnapshot, jt: &str, city_folded: &str) -> Option<String> {
-    let mots: Vec<&str> = city_folded.split_whitespace().collect();
-    (1..=mots.len())
-        .rev()
-        .map(|n| mots[..n].join(" "))
-        .find(|c| snap.location(jt, c).is_some())
-}
 
 /// Tranche de `head` autour de `pos`, bornée aux frontières de caractères.
 fn fenetre(head: &str, pos: usize, avant: usize, apres: usize) -> &str {
@@ -574,7 +548,7 @@ fn from_deferee_text(d: &Decision, snap: &ChronoSnapshot) -> Option<PriorRef> {
 
     let libelle = normalize_component(&RE_DEFEREE_JUR.captures(zone_jur)?[1]);
     let (target_jt, ville) = jurisdiction_from_label(&libelle)?;
-    let city = city_prefix(snap, target_jt, &ville)?;
+    let court = snap.city_prefix_code(target_jt, &ville)?;
     let date_cap = aval_sinon_amont(&RE_DEFEREE_DATE, aval, amont)?;
     let date = parse_french_date(&date_cap[1], &date_cap[2], &date_cap[3])?;
     if d.date_lecture
@@ -584,9 +558,10 @@ fn from_deferee_text(d: &Decision, snap: &ChronoSnapshot) -> Option<PriorRef> {
         return None;
     }
     let rg_cap = aval_sinon_amont(&RE_DEFEREE_RG, aval, amont)?;
-    Some(PriorRef {
+    let address = CaseAddress::new(court, rg_cap[1].trim(), &date);
+    address.docket.is_some().then_some(PriorRef {
         link_type: LinkType::AppelDe,
-        target_ref: snap.target_key_folded(target_jt, &city, rg_cap[1].trim(), &date)?,
+        address,
     })
 }
 
@@ -622,7 +597,7 @@ fn from_pourvoi_text(
     if d.jurisdiction_type.as_deref() != Some("CC") || scan_lacks(scan, "pourvoi") {
         return None;
     }
-    let target_ref = scan.contre_windows().into_iter().find_map(|w| {
+    let address = scan.contre_windows().into_iter().find_map(|w| {
         RE_POURVOI_RENDU
             .captures(&w)
             .and_then(|c| ca_party_key(snap, &c[4], &c[1], &c[2], &c[3]))
@@ -634,29 +609,25 @@ fn from_pourvoi_text(
     })?;
     Some(PriorRef {
         link_type: LinkType::PourvoiContre,
-        target_ref,
+        address,
     })
 }
 
-/// Le code de localisation entre BRUT dans la clé, là où les autres familles le
-/// plient : la résolution jointe sur `decisions.jurisdiction_code` doit tenir
-/// dans l'index `(jurisdiction_code, date_lecture)`.
+/// The city capture can overrun onto the following words ("Nîmes chambre
+/// sociale"): trimmed word by word from the right until the gazetteer knows it.
 fn ca_party_key(
     snap: &ChronoSnapshot,
     raw_city: &str,
     day: &str,
     month: &str,
     year: &str,
-) -> Option<String> {
+) -> Option<CaseAddress> {
     let date = parse_french_date(day, month, year)?;
-    // Le captage ville peut sur-courir sur les mots suivants (« Nîmes chambre
-    // sociale ») : rogné mot à mot par la droite jusqu'à ce que le référentiel
-    // le reconnaisse.
     let mut end = raw_city.len();
     loop {
         let trimmed = raw_city[..end].trim_end();
-        if let Some(code) = snap.location("CA", &normalize_component(trimmed)) {
-            return Some(format!("{CA_PARTIES}{code}|{date}"));
+        if let Some(code) = snap.code("CA", &normalize_component(trimmed)) {
+            return Some(CaseAddress::court_and_date(code, &date));
         }
         end = trimmed.rfind(char::is_whitespace)?;
     }
@@ -691,9 +662,10 @@ fn from_renvoi_text(d: &Decision, scan: &crate::scan::DocScan) -> Option<PriorRe
         .find_map(|cap| {
             let date = parse_french_date(&cap[1], &cap[2], &cap[3])?;
             // Recomposé au format canonique : `12-20693` vise `12-20.693`.
+            let pourvoi = format!("{}-{}.{}", &cap[4], &cap[5], &cap[6]);
             Some(PriorRef {
                 link_type: LinkType::RenvoiApresCassation,
-                target_ref: format!("cc|{}-{}.{}|{date}", &cap[4], &cap[5], &cap[6]),
+                address: CaseAddress::new("cc", &pourvoi, &date),
             })
         })
 }
@@ -706,13 +678,22 @@ mod tests {
         ChronoSnapshot::new(vec![
             ("ca_nancy".into(), "CA".into(), "Nancy".into()),
             (
-                "ca_aix_provence".into(),
+                "ca_aix_en_provence".into(),
                 "CA".into(),
                 "Aix-en-Provence".into(),
             ),
-            ("tj75056".into(), "TJ".into(), "Paris".into()),
-            ("tj42218".into(), "TJ".into(), "Saint-Étienne".into()),
-            ("tcom7501".into(), "TCOM".into(), "Paris".into()),
+            ("tj_paris".into(), "TJ".into(), "Paris".into()),
+            (
+                "tj_saint_etienne".into(),
+                "TJ".into(),
+                "Saint-Étienne".into(),
+            ),
+            ("tcom_paris".into(), "TCOM".into(), "Paris".into()),
+            ("ta_marseille".into(), "TA".into(), "Marseille".into()),
+            ("ta_poitiers".into(), "TA".into(), "Poitiers".into()),
+            ("ta_lyon".into(), "TA".into(), "Lyon".into()),
+            ("ta_guadeloupe".into(), "TA".into(), "Guadeloupe".into()),
+            ("caa_lyon".into(), "CAA".into(), "Lyon".into()),
         ])
     }
 
@@ -750,6 +731,13 @@ mod tests {
         }
     }
 
+    /// The three components, empty when absent, so an assertion reads as one line.
+    fn cible(r: &PriorRef) -> String {
+        let c = |o: &Option<String>| o.clone().unwrap_or_default();
+        let a = &r.address;
+        format!("{}|{}|{}", c(&a.court), c(&a.docket), c(&a.date))
+    }
+
     /// Le scan unique du même texte, comme en prod : la chronologie s'y garde.
     fn liens(d: &Decision, snap: &ChronoSnapshot) -> Vec<PriorRef> {
         prior_decision_refs(d, snap, &crate::scan::scan(&d.texte_integral_clean))
@@ -766,7 +754,7 @@ mod tests {
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].link_type, LinkType::PourvoiContre);
-        assert_eq!(refs[0].target_ref, "ca|ca nancy|19 00207|2020-12-08");
+        assert_eq!(cible(&refs[0]), "ca_nancy|19/00207|2020-12-08");
     }
 
     #[test]
@@ -782,7 +770,7 @@ mod tests {
             date: Some("2023-01-10".into()),
         });
         let refs = liens(&d, &snap);
-        assert_eq!(refs[0].target_ref, "tj|tj76351|21 00123|2023-01-10");
+        assert_eq!(cible(&refs[0]), "tj76351|21/00123|2023-01-10");
 
         let mut d = decision("CC", "");
         d.attacked = Some(lj_core::decision::AttackedRef {
@@ -791,7 +779,7 @@ mod tests {
             date: Some("2023-06-15".into()),
         });
         let refs = liens(&d, &snap);
-        assert_eq!(refs[0].target_ref, "tj|tj17300|22 00456|2023-06-15");
+        assert_eq!(cible(&refs[0]), "tj17300|22/00456|2023-06-15");
     }
 
     #[test]
@@ -804,7 +792,7 @@ mod tests {
         });
         let refs = liens(&d, &snap());
         assert_eq!(refs[0].link_type, LinkType::RenvoiApresCassation);
-        assert_eq!(refs[0].target_ref, "cc|20-22.085|2022-03-24");
+        assert_eq!(cible(&refs[0]), "cc|20-22.085|2022-03-24");
     }
 
     #[test]
@@ -818,13 +806,10 @@ mod tests {
              Cour : Par une requête enregistrée le 13 octobre 2021, M. A demande à la Cour \
              d'annuler ce jugement.",
         );
-        let refs = liens(&d, &ChronoSnapshot::empty());
+        let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].link_type, LinkType::AppelDe);
-        assert_eq!(
-            refs[0].target_ref,
-            "tribunal administratif de marseille|2107366|2021-09-13"
-        );
+        assert_eq!(cible(&refs[0]), "ta_marseille|2107366|2021-09-13");
     }
 
     #[test]
@@ -839,10 +824,10 @@ mod tests {
              pourvoi, enregistré le 14 février 2022, la société Fryan demande au Conseil \
              d'Etat d'annuler cet arrêt.",
         );
-        let refs = liens(&d, &ChronoSnapshot::empty());
+        let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].link_type, LinkType::PourvoiContre);
-        assert_eq!(refs[0].target_ref, "caa|20ly00096|2021-12-14");
+        assert_eq!(cible(&refs[0]), "caa_lyon|20LY00096|2021-12-14");
     }
 
     #[test]
@@ -853,11 +838,8 @@ mod tests {
              administratif de Poitiers a rejeté leurs demandes. Par une requête, \
              enregistrée le 11 avril 2023, M. C demande à la cour d'annuler ce jugement.",
         );
-        let refs = liens(&d, &ChronoSnapshot::empty());
-        assert_eq!(
-            refs[0].target_ref,
-            "tribunal administratif de poitiers|2202850|2023-03-16"
-        );
+        let refs = liens(&d, &snap());
+        assert_eq!(cible(&refs[0]), "ta_poitiers|2202850|2023-03-16");
     }
 
     #[test]
@@ -872,7 +854,7 @@ mod tests {
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].link_type, LinkType::AppelDe);
-        assert_eq!(refs[0].target_ref, "tj|tj75056|12 81319|2013-11-19");
+        assert_eq!(cible(&refs[0]), "tj_paris|12/81319|2013-11-19");
     }
 
     #[test]
@@ -887,7 +869,7 @@ mod tests {
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].link_type, LinkType::AppelDe);
-        assert_eq!(refs[0].target_ref, "tj|tj75056|21 00002|2025-01-23");
+        assert_eq!(cible(&refs[0]), "tj_paris|21/00002|2025-01-23");
     }
 
     #[test]
@@ -902,7 +884,7 @@ mod tests {
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].link_type, LinkType::RenvoiApresCassation);
-        assert_eq!(refs[0].target_ref, "cc|20-20.708|2022-06-15");
+        assert_eq!(cible(&refs[0]), "cc|20-20.708|2022-06-15");
     }
 
     /// La chaîne procédurale nue de l'en-tête, sans mot de renvoi : la dernière
@@ -920,7 +902,7 @@ mod tests {
         );
         let refs = liens(&d, &snap());
         assert_eq!(refs[0].link_type, LinkType::RenvoiApresCassation);
-        assert_eq!(refs[0].target_ref, "cc|12-35.412|2014-09-11");
+        assert_eq!(cible(&refs[0]), "cc|12-35.412|2014-09-11");
     }
 
     /// Pourvoi écrit sans le point, et l'appel qui subsiste sous le renvoi : un
@@ -941,9 +923,9 @@ mod tests {
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].link_type, LinkType::AppelDe);
-        assert_eq!(refs[0].target_ref, "tj|tj75056|11 00123|2012-01-10");
+        assert_eq!(cible(&refs[0]), "tj_paris|11/00123|2012-01-10");
         assert_eq!(refs[1].link_type, LinkType::RenvoiApresCassation);
-        assert_eq!(refs[1].target_ref, "cc|12-20.693|2013-07-02");
+        assert_eq!(cible(&refs[1]), "cc|12-20.693|2013-07-02");
     }
 
     #[test]
@@ -958,7 +940,7 @@ mod tests {
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].link_type, LinkType::PourvoiContre);
-        assert_eq!(refs[0].target_ref, "ca-parties|ca_nancy|2022-04-05");
+        assert_eq!(cible(&refs[0]), "ca_nancy||2022-04-05");
     }
 
     /// Forme d'avant 2019 : l'adresse des demandeurs sépare « pourvoi » de
@@ -978,7 +960,7 @@ mod tests {
         );
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].target_ref, "ca-parties|ca_nancy|2022-04-05");
+        assert_eq!(cible(&refs[0]), "ca_nancy||2022-04-05");
     }
 
     /// Forme criminelle : ville avant date, et la chambre s'intercale.
@@ -993,7 +975,7 @@ mod tests {
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].link_type, LinkType::PourvoiContre);
-        assert_eq!(refs[0].target_ref, "ca-parties|ca_aix_provence|2021-03-03");
+        assert_eq!(cible(&refs[0]), "ca_aix_en_provence||2021-03-03");
     }
 
     /// La métadonnée du greffe l'emporte : elle porte le RG, donc une clé qui se
@@ -1012,7 +994,7 @@ mod tests {
         });
         let refs = liens(&d, &snap());
         assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].target_ref, "ca|ca nancy|21 00987|2022-04-05");
+        assert_eq!(cible(&refs[0]), "ca_nancy|21/00987|2022-04-05");
     }
 
     /// Hors en-tête, une mention de la Cour de cassation est une citation
@@ -1049,7 +1031,7 @@ mod tests {
         let surfaces: Vec<String> = spans
             .iter()
             .map(|(s, e, r)| {
-                assert_eq!(r, "ca|ca nancy|19 00207|2020-12-08");
+                assert_eq!(r, &CaseAddress::new("ca_nancy", "19/00207", "2020-12-08"));
                 text.chars().skip(*s).take(e - s).collect()
             })
             .collect();
@@ -1076,7 +1058,7 @@ mod tests {
         let surfaces: Vec<String> = attacked_text_spans(&d, &snap())
             .iter()
             .map(|(s, e, r)| {
-                assert_eq!(r, "ca|ca nancy|16 05913|2018-06-15");
+                assert_eq!(r, &CaseAddress::new("ca_nancy", "16/05913", "2018-06-15"));
                 text.chars().skip(*s).take(e - s).collect()
             })
             .collect();
@@ -1104,7 +1086,7 @@ mod tests {
         let surfaces: Vec<String> = attacked_text_spans(&d, &snap())
             .iter()
             .map(|(s, e, r)| {
-                assert_eq!(r, "tj|tj75056|17 59899|2018-04-05");
+                assert_eq!(r, &CaseAddress::new("tj_paris", "17/59899", "2018-04-05"));
                 text.chars().skip(*s).take(e - s).collect()
             })
             .collect();
@@ -1135,6 +1117,6 @@ mod tests {
             ("tj00001".into(), "TJ".into(), "Doublon".into()),
             ("tj00002".into(), "TJ".into(), "Doublon".into()),
         ]);
-        assert!(s.location("TJ", "doublon").is_none());
+        assert!(s.code("TJ", "doublon").is_none());
     }
 }

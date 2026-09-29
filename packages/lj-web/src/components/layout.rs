@@ -1,6 +1,6 @@
 //! Gabarit 3 colonnes canonique — source unique des classes de grille
-//! partagées par la page décision (`DecisionLayout`), `/decisions` et
-//! `/textes` (corps ET skeletons). Les trois pages doivent tomber exactement
+//! partagées par la page décision (`DecisionLayout`), `/decision-search` et
+//! `/norm-search` (corps ET skeletons). Les trois pages doivent tomber exactement
 //! sur les mêmes pistes : rail gauche 240px, contenu `minmax(0,1fr)`, colonne
 //! droite 280px, gouttière 48, dès `lg`. Toute évolution du gabarit se fait
 //! ICI, jamais en dupliquant une chaîne de classes côté page.

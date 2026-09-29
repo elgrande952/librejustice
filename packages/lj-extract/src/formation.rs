@@ -4,7 +4,7 @@
 //! matter naming the room (`matiere:*`), the kind of formation (`formation:*`)
 //! and the role (`office:*` / `procedure:*`).
 //!
-//! Vocabulaire fermé, comparaisons pliées (`compiled::fold_stable`), regex
+//! Vocabulaire fermé, comparaisons pliées (`lj_fold::fold_chars`), regex
 //! génériques de position et jamais par entrée. Résidu de greffe illisible
 //! (jours d'audience TCOM, noms de magistrats TA…) = tous axes `None`.
 
@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use lj_core::chamber::{ChamberId, Container, Joined, Seat, Solemn};
 use regex::Regex;
 
-use crate::compiled::fold_stable;
+use lj_fold::fold_chars;
 
 /// Axes structurés d'une formation. Les uids sont des valeurs complètes de
 /// `facet_value` (FK) ; le siège se stocke par sa clé canonique.
@@ -31,10 +31,6 @@ impl FormationAxes {
             && self.formation_uid.is_none()
             && self.office_uid.is_none()
             && self.procedure_uid.is_none()
-    }
-
-    pub fn chamber_key(&self) -> Option<String> {
-        self.chamber.key()
     }
 
     /// Siège affichable, spécialisation comprise.
@@ -371,7 +367,7 @@ pub fn says_more_than_the_number(key: &str) -> bool {
         )
         .unwrap()
     });
-    rest.replace_all(&fold_stable(key), "")
+    rest.replace_all(&fold_chars(key), "")
         .chars()
         .any(|c| c.is_ascii_alphabetic())
 }
@@ -939,7 +935,7 @@ fn parse_part(
     axes: &mut FormationAxes,
     state: &mut PositionState,
 ) -> bool {
-    let folded_raw = fold_stable(part);
+    let folded_raw = fold_chars(part);
     // Forme lexicale : séparateurs de greffe normalisés en espaces (le tiret
     // aussi — « juge-commissaire » ; les positions gardent le leur via
     // `folded_raw` : « chambre 2-5 », « 2 / 6 ssr »).
@@ -1222,7 +1218,7 @@ pub fn parse_formation(
 /// Suffixe RNSM Cassation (rejet non spécialement motivé) : qualificatif de
 /// publication, pas un axe de formation.
 fn strip_rnsm(part: &str) -> String {
-    fold_stable(part)
+    fold_chars(part)
         .replace("hors rnsm", "")
         .replace("rnsm", "")
 }
@@ -1290,7 +1286,6 @@ mod tests {
             None,
             Some("Formation restreinte hors RNSM"),
         );
-        assert_eq!(axes.chamber_key().as_deref(), Some("C2.CIVILE"));
         assert_eq!(axes.chamber_label().as_deref(), Some("2e chambre civile"));
         assert_eq!(axes.formation_uid, Some("formation:RESTREINTE"));
     }
@@ -1519,7 +1514,8 @@ mod tests {
         assert_eq!(composed("TCOM", "Chambre 00").chamber_label(), None);
         let axes = composed("CA", "Ch civ. 1-4 copropriété");
         assert_eq!(axes.chamber_label().as_deref(), Some("Chambre 1-4"));
-        assert_eq!(axes.chamber_key().as_deref(), Some("C1-4.CIVILE"));
+        assert_eq!(axes.chamber.chamber, Some(ChamberId::Composed(1, 4)));
+        assert_eq!(axes.chamber.specialty, ["matiere:CIVILE"]);
         let axes = composed("CA", "Ch.protection sociale 4-7");
         assert_eq!(
             axes.chamber_label().as_deref(),
@@ -1663,14 +1659,13 @@ mod tests {
     #[test]
     fn ce_ssr_textuel() {
         let axes = composed("CE", "8ème et 3ème sous-sections réunies");
-        assert_eq!(axes.chamber_key().as_deref(), Some("Q3-8"));
         assert_eq!(
             axes.chamber_label().as_deref(),
             Some("Sous-sections 3/8 réunies")
         );
         assert_eq!(
-            composed("CE", "3ème et 8ème sous-sections réunies").chamber_key(),
-            axes.chamber_key()
+            composed("CE", "3ème et 8ème sous-sections réunies").chamber_label(),
+            axes.chamber_label()
         );
         assert_eq!(axes.formation_uid, None);
     }
@@ -1681,7 +1676,7 @@ mod tests {
         assert_eq!(axes.chamber.solemn, Some(Solemn::AssembleePleniere));
         assert_eq!(axes.chamber_label().as_deref(), Some("Assemblée plénière"));
         assert_eq!(axes.formation_uid, None);
-        assert_eq!(axes.chamber_key(), None);
+        assert_eq!(axes.chamber.chamber, None);
         let axes = parse_formation(
             Some("CC"),
             Some("soc"),
@@ -1690,7 +1685,7 @@ mod tests {
             Some("Formation plénière"),
         );
         assert_eq!(axes.formation_uid, Some("formation:PLENIERE"));
-        assert_eq!(axes.chamber_key().as_deref(), Some("SOCIALE"));
+        assert_eq!(axes.chamber.specialty, ["matiere:SOCIALE"]);
     }
 
     /// The litigation Section does not add itself to a room: it IS the room,
@@ -1810,8 +1805,13 @@ mod tests {
             let axes = composed("TA", source);
             assert_eq!(axes.chamber.section, None, "« {source} »");
             assert_eq!(
-                axes.chamber_key().as_deref(),
-                Some("SC4.C1"),
+                axes.chamber.container,
+                Some(Container::Section(4)),
+                "« {source} »"
+            );
+            assert_eq!(
+                axes.chamber.chamber,
+                Some(ChamberId::Number(1)),
                 "« {source} »"
             );
         }
@@ -1819,19 +1819,17 @@ mod tests {
             let axes = composed("TJ", source);
             assert_eq!(axes.chamber.container, None, "« {source} »");
             assert_eq!(
-                axes.chamber_key().as_deref(),
-                Some("C18.S2"),
+                axes.chamber.chamber,
+                Some(ChamberId::Number(18)),
                 "« {source} »"
             );
+            assert_eq!(axes.chamber.section, Some(2), "« {source} »");
         }
         assert_eq!(
-            composed("TA", "8e section").chamber_key().as_deref(),
-            Some("SC8")
+            composed("TA", "8e section").chamber.container,
+            Some(Container::Section(8))
         );
-        assert_eq!(
-            composed("TJ", "8e section").chamber_key().as_deref(),
-            Some("S8")
-        );
+        assert_eq!(composed("TJ", "8e section").chamber.section, Some(8));
     }
 
     #[test]
@@ -1970,7 +1968,6 @@ mod tests {
             Some("Chambre civile et commerciale")
         );
         let barre = composed("CA", "Chambre civile/commerciale");
-        assert_eq!(barre.chamber_key().as_deref(), Some("CIVILE"));
         assert_eq!(
             barre.chamber_label().as_deref(),
             Some("Chambre civile et commerciale")
@@ -1989,13 +1986,14 @@ mod tests {
     fn la_section_et_l_office_ne_font_pas_une_matiere() {
         let jex = composed("CA", "1ère chambre section JEX");
         assert!(jex.chamber.specialty.is_empty());
-        assert_eq!(jex.chamber_key().as_deref(), Some("C1"));
+        assert_eq!(jex.chamber.chamber, Some(ChamberId::Number(1)));
         assert_eq!(jex.office_uid, Some("office:JEX"));
         let colle = composed("CA", "Chambre-1 JEX");
         assert!(colle.chamber.specialty.is_empty());
         assert_eq!(colle.office_uid, Some("office:JEX"));
         let civile = composed("CA", "1ere Chambre sect.Civile");
-        assert_eq!(civile.chamber_key().as_deref(), Some("C1.CIVILE"));
+        assert_eq!(civile.chamber.chamber, Some(ChamberId::Number(1)));
+        assert_eq!(civile.chamber.specialty, ["matiere:CIVILE"]);
     }
 
     /// An audience held away from the public is a procedure, and the numbering
@@ -2025,7 +2023,7 @@ mod tests {
         assert_eq!(service.formation_uid, Some("formation:JUGE_UNIQUE"));
         assert_eq!(service.office_uid, None);
         let cour = composed("CA", "CHAMBRE DES REFERES");
-        assert_eq!(cour.chamber_key().as_deref(), Some("REFERES"));
+        assert_eq!(cour.chamber.specialty, ["matiere:REFERES"]);
         assert_eq!(cour.formation_uid, Some("formation:JUGE_UNIQUE"));
         let nue = composed("CA", "Chambre 1-11 référés");
         assert!(nue.chamber.specialty.is_empty());

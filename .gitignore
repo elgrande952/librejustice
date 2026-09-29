@@ -25,6 +25,7 @@ artifacts/
 repo.txt
 .env.local
 oom
+*_keys.txt
 
 # vim swapfiles (ne jamais committer, peut contenir un snapshot de .env)
 *.swp
@@ -41,3 +42,9 @@ mise.local.toml
 
 # zips des skills servis par /mcp-guide, générés par `mise run build-skill-zips`
 /packages/lj-web/public/skills/
+
+# Build artefacts of the anonymisation tool, posed by `mise run redact-wasm`,
+# `mise run office-fonts` and `mise run ocr-assets`, copied into the bundle by
+# cargo-leptos.
+packages/lj-web/public/redactor/
+packages/lj-web/public/ocr/

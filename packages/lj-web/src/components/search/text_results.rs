@@ -1,7 +1,7 @@
-//! Vue « Lois et règlements » de la page `/textes` : barre de filtres
-//! horizontale `Juridiction ▾ · Nature ▾ · Source ▾` + chips actives + liste
-//! paginée de hits avec total exact. État (requête, filtres, page) dans les
-//! query params, du même nom que ceux de `/internal/search-textes`. Données via
+//! The « Lois et règlements » view of `/norm-search`: a filter bar
+//! `Droit ▾ · Nature ▾ · Source ▾`, the active chips and a paged list of hits
+//! with an exact total. The state (query, filters, page) lives in the query
+//! params, named as those of `/internal/search-textes`; data through
 //! `ApiClient::search_textes`.
 
 use leptos::prelude::*;
@@ -23,12 +23,16 @@ use super::corpus_intro::{corpus_stats, DecisionsCorpusTeaser};
 use super::cross_teaser::DecisionsTeaser;
 use super::facet_widgets::{stale_counts, Nav, StaleCounts};
 use super::filter_dropdown::{FilterDropdown, OpenDropdown};
+use super::freshness::{answered, is_stale};
+use super::mode_select::{ModeSelect, TEXTES_MODES};
 use super::results_rail::{skeleton_block, skeleton_rows, RAIL_COLUMN};
 use super::syntax_hint::{HelpCorpus, SyntaxHint};
 use super::CompactSearch;
 
 /// Clés de filtre portées par l'URL (corpus articles). `code` borne le moteur à
-/// un texte (posé par le formulaire « Rechercher dans ce code » de `/texte/{code}`).
+/// un texte (posé par le formulaire « Rechercher dans ce code » de `/norm/{juris}/{code}`).
+/// `place` is not one of them: the places read from are a setting, not a
+/// filter, so no chip takes them off.
 const FILTER_KEYS: [&str; 5] = ["jurisdiction", "nature", "source", "scope", "code"];
 
 /// État de recherche lu depuis l'URL.
@@ -36,10 +40,12 @@ const FILTER_KEYS: [&str; 5] = ["jurisdiction", "nature", "source", "scope", "co
 struct TextesQuery {
     q: String,
     code: Option<String>,
+    places: Vec<String>,
     jurisdiction: Option<String>,
     nature: Option<String>,
     source: Option<String>,
     scope: Option<String>,
+    mode: lj_dtos::SearchMode,
     page: u32,
 }
 
@@ -56,10 +62,22 @@ impl TextesQuery {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
             code: single("code"),
+            places: map
+                .get_all("place")
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect(),
             jurisdiction: single("jurisdiction"),
             nature: single("nature"),
             source: single("source"),
             scope: single("scope"),
+            mode: match map.get("mode").as_deref() {
+                Some("lexical") => lj_dtos::SearchMode::Lexical,
+                Some("reference") => lj_dtos::SearchMode::Reference,
+                _ => lj_dtos::SearchMode::Auto,
+            },
             page: map
                 .get("page")
                 .and_then(|p| p.parse::<u32>().ok())
@@ -86,6 +104,7 @@ async fn fetch_textes(
 ) -> Result<ArticleSearchResponse, crate::api::client::SearchFailure> {
     let filters = TextesFilters {
         code: state.code.as_deref(),
+        places: &state.places,
         jurisdiction: state.jurisdiction.as_deref(),
         nature: state.nature.as_deref(),
         source: state.source.as_deref(),
@@ -100,6 +119,7 @@ async fn fetch_textes(
                 limit: SEARCH_PAGE_SIZE,
                 offset,
             },
+            state.mode,
             lj_dtos::SearchContext::User,
         )
         .await
@@ -131,26 +151,39 @@ pub fn TextesView() -> impl IntoView {
     // passe en attente plutôt que de résumer les résultats précédents ; filtre
     // changé, il reste interactif mais ses nombres comptent l'ensemble d'avant.
     let counted = RwSignal::new(None::<TextesQuery>);
+    let served_mode = RwSignal::new(None::<lj_dtos::QueryMode>);
+    let served_jurisdictions = RwSignal::new(None::<Vec<String>>);
     Effect::new(move |_| {
         if let Some(Ok(resp)) = results.get() {
             facets.set(Some(resp.facets));
             volume.set(Some(resp.total));
+            served_mode.set(Some(resp.query_mode));
+            served_jurisdictions.set(Some(resp.jurisdictions));
             counted.set(Some(state.get_untracked().count_key()));
         }
     });
     let rail_loading = Signal::derive(move || {
         counted.with(|c| c.as_ref().map(|k| k.q.clone())) != Some(query.get())
     });
-    let stale = Memo::new(move |_| counted.get() != Some(state.get().count_key()));
+    let count_key = Signal::derive(move || state.get().count_key());
+    let stale = Memo::new(move |_| is_stale(counted.into(), count_key).get());
     provide_context(StaleCounts(stale.into()));
-    let shown_volume = Signal::derive(move || volume.get().filter(|_| !stale.get()));
+    let shown_volume = answered(volume.into(), counted.into(), count_key);
+    // The resolved mode asserts, so it goes silent while an answer is in flight.
+    let shown_mode = answered(served_mode.into(), counted.into(), count_key);
+    let shown_jurisdictions = answered(served_jurisdictions.into(), counted.into(), count_key);
     let has_query = Signal::derive(move || !query.get().is_empty());
     let stats = corpus_stats();
 
     view! {
         <div class=GRID_3COL>
             <aside aria-label="Synthèse des résultats" class=SIDE_RAIL>
-                <TextesRail facets=facets state=state loading=rail_loading />
+                <TextesRail
+                    facets=facets
+                    state=state
+                    loading=rail_loading
+                    searched=shown_jurisdictions
+                />
             </aside>
             <div class=CONTENT_COL>
                 <div class="flex flex-col gap-2">
@@ -172,6 +205,9 @@ pub fn TextesView() -> impl IntoView {
                                 })
                         }}
                         <SyntaxHint corpus=HelpCorpus::Textes class="ml-auto shrink-0" />
+                    </div>
+                    <div class="lg:hidden">
+                        <ModeSelect resolved=shown_mode modes=TEXTES_MODES class="w-full" />
                     </div>
                 </div>
                 <div class="flex min-w-0 flex-col gap-4">
@@ -210,6 +246,7 @@ pub fn TextesView() -> impl IntoView {
             <aside aria-label="Voir aussi" class=SIDE_RAIL>
                 <div class="flex flex-col gap-4">
                     <TextesSummary query=query volume=shown_volume />
+                    <ModeSelect resolved=shown_mode modes=TEXTES_MODES class="w-full" />
                     <div class="flex self-start">
                         <SyntaxHint corpus=HelpCorpus::Textes />
                     </div>
@@ -246,9 +283,7 @@ fn TextesSummary(
             }
             return view! {
                 <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">
-                    "Recherche en cours pour "
-                    <em class="not-italic">"«\u{00A0}"{q}"\u{00A0}»"</em>
-                    "…"
+                    "Recherche en cours…"
                 </h2>
             }
             .into_any();
@@ -271,10 +306,6 @@ fn TextesSummary(
                 <h2 class="font-sans text-xl text-[var(--color-ink)]">
                     {format_results_count(total)}
                 </h2>
-                <p class="text-sm leading-snug text-[var(--color-ink-subtle)]">
-                    "pour "
-                    <em class="text-[var(--color-ink)]">"«\u{00A0}"{q}"\u{00A0}»"</em>
-                </p>
                 <p class="text-xs text-[var(--color-ink-subtle)]">"Articles et textes en vigueur"</p>
             </div>
         }
@@ -291,29 +322,129 @@ fn TextResultsLayout(resp: ArticleSearchResponse, state: TextesQuery) -> impl In
     let page = state.page;
     let query = state.q.clone();
     let hits = resp.hits;
+    let pinned = resp.pinned;
+    let more = resp.pinned_more;
+    // A result opens where it was found: the Swiss civil code reached from a
+    // Swiss answer is read from Switzerland, not from the metropole.
+    let place = resp
+        .reader_place
+        .as_ref()
+        .map(|p| format!("?place={}", p.uid))
+        .unwrap_or_default();
 
     view! {
         <section aria-label="Résultats" class="flex min-w-0 flex-col gap-6">
-            <TextResults hits=hits query=query page=page />
+            <PinnedArticlesCard pinned=pinned more=more place=place.clone() />
+            <TextResults hits=hits query=query page=page place=place />
             <TextPagination current_page=page total_pages=pages />
         </section>
+    }
+}
+
+#[component]
+fn PinnedArticlesCard(
+    pinned: Vec<lj_dtos::PinnedArticle>,
+    more: bool,
+    place: String,
+) -> impl IntoView {
+    if pinned.is_empty() {
+        return ().into_any();
+    }
+    let label = match pinned.len() {
+        1 => "Cherchez-vous cet article ?",
+        _ => "Cherchez-vous ces articles ?",
+    };
+    view! {
+        <section
+            aria-label=label
+            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 px-4 py-3"
+        >
+            <p class="font-sans text-sm text-[var(--color-ink-subtle)]">{label}</p>
+            <ul class="mt-2 flex flex-col gap-2">
+                {pinned
+                    .into_iter()
+                    .map(|a| view! { <PinnedArticleRow article=a place=place.clone() /> })
+                    .collect::<Vec<_>>()}
+            </ul>
+            <Show when=move || more>
+                <PinnedArticlesMore />
+            </Show>
+        </section>
+    }
+    .into_any()
+}
+
+#[component]
+fn PinnedArticleRow(article: lj_dtos::PinnedArticle, place: String) -> impl IntoView {
+    let href = format!(
+        "{}/{}{place}",
+        lj_vocab::norm_path(&article.jurisdiction, &article.code),
+        article.num_key
+    );
+    let titre = format!("{}, article {}", article.code_title, article.num);
+    let chemin = article
+        .titre_path
+        .as_deref()
+        .and_then(|p| p.rsplit('>').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    view! {
+        <li class="flex flex-col gap-0.5">
+            <A
+                href=href
+                attr:class="font-sans text-base leading-snug text-[var(--color-ink)] no-underline transition-colors hover:text-[var(--color-accent)]"
+            >
+                {titre}
+            </A>
+            {chemin
+                .map(|c| {
+                    view! {
+                        <p class="truncate font-sans text-xs text-[var(--color-ink-subtle)]">{c}</p>
+                    }
+                })}
+        </li>
+    }
+}
+
+#[component]
+fn PinnedArticlesMore() -> impl IntoView {
+    let query_map = use_query_map();
+    let href = move || {
+        let qs = query_state::with_param(&query_map.get(), "mode", Some("reference"), true);
+        query_state::search_href(&qs)
+    };
+    view! {
+        <A
+            href=href
+            attr:class="mt-3 inline-block text-xs text-[var(--color-ink-subtle)] underline decoration-dotted underline-offset-4 transition-colors hover:text-[var(--color-accent)]"
+        >
+            "D'autres articles portent cette référence"
+        </A>
     }
 }
 
 /// Lignes par bloc de facettes du rail.
 const RAIL_ROWS: usize = 5;
 
-/// Rail gauche de `/textes` : blocs de facettes cliquables (Portée, Nature,
-/// Juridictions, Sources). Chaque clic passe par la même mutation d'URL
-/// mono-sélection que les dropdowns de la barre (valeur active ⇒ re-clic la
-/// retire, retour page 1). `loading` = les facettes en main répondent à une
-/// autre question : lignes muettes plutôt que faux résumé.
+/// Left rail of `/norm-search`: clickable facet blocks (Portée, Nature, Droit,
+/// Sources). A click goes through the same single-choice URL change as the
+/// bar's dropdowns (clicking the active value again removes it, back to page
+/// 1). `loading`: the facets at hand answer another query, so the rows stay
+/// mute rather than summarise wrongly.
 #[component]
 fn TextesRail(
     #[prop(into)] facets: Signal<Option<ArticleSearchFacets>>,
     #[prop(into)] state: Signal<TextesQuery>,
     #[prop(into)] loading: Signal<bool>,
+    #[prop(into)] searched: Signal<Option<Vec<String>>>,
 ) -> impl IntoView {
+    // Held here rather than in the block, which every answer redraws: the list
+    // stays open, and fetched once, while places are ticked one after another.
+    let vocabulary = Resource::new(
+        || (),
+        |_| sendable(crate::pages::law_page::data::fetch_places()),
+    );
+    let picker_open = RwSignal::new(false);
     let scopes = move || {
         rail_facet_block(
             "Portée",
@@ -331,11 +462,13 @@ fn TextesRail(
         )
     };
     let jurisdictions = move || {
-        rail_facet_block(
-            "Juridictions",
-            "jurisdiction",
+        jurisdiction_block(
             facets.get().map(|f| f.jurisdiction).unwrap_or_default(),
             state.get().jurisdiction,
+            searched.get().unwrap_or_default(),
+            vocabulary,
+            state.get().places,
+            picker_open,
         )
     };
     let sources = move || {
@@ -353,7 +486,7 @@ fn TextesRail(
                 <div class=RAIL_COLUMN>
                     {skeleton_block("Portée", skeleton_rows(RAIL_ROWS))}
                     {skeleton_block("Nature", skeleton_rows(RAIL_ROWS))}
-                    {skeleton_block("Juridictions", skeleton_rows(RAIL_ROWS))}
+                    {skeleton_block("Droit", skeleton_rows(RAIL_ROWS))}
                     {skeleton_block("Sources", skeleton_rows(RAIL_ROWS))}
                 </div>
             }
@@ -369,6 +502,254 @@ fn TextesRail(
         }
         .into_any()
     }
+}
+
+const RAIL_ROW: &str = "group flex w-full items-baseline justify-between gap-3 text-left";
+const RAIL_LABEL_ACTIVE: &str =
+    "truncate text-[13px] leading-snug font-medium text-[var(--color-bordeaux)]";
+const RAIL_LABEL: &str = "truncate text-[13px] leading-snug text-[var(--color-ink-muted)] transition-colors group-hover:text-[var(--color-ink)]";
+const RAIL_LABEL_ECHO: &str = "truncate rounded bg-[var(--color-rule)]/60 px-1 text-[13px] leading-snug text-[var(--color-ink-subtle)] transition-colors group-hover:text-[var(--color-ink)]";
+const RAIL_COUNT: &str =
+    "shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]";
+
+/// The places results are read from, set from the rail: what applies in any of
+/// them is served. A heading ticks or clears its places at once; the current URL
+/// is kept, only `place` rewritten, and the default reader alone, or no place
+/// at all, is written as no `place`.
+#[component]
+fn ReaderPlacePicker(
+    vocabulary: Resource<Vec<lj_dtos::PlaceNode>>,
+    current: Vec<String>,
+    open: RwSignal<bool>,
+) -> impl IntoView {
+    let query_map = use_query_map();
+    let nav = Nav::new();
+    let current = match current.is_empty() {
+        true => vec![lj_dtos::DEFAULT_READER_PLACE.to_string()],
+        false => current,
+    };
+    let go = move |next: Vec<String>| {
+        let next = match next.as_slice() {
+            [] => Vec::new(),
+            [only] if only == lj_dtos::DEFAULT_READER_PLACE => Vec::new(),
+            _ => next,
+        };
+        nav.go(query_state::with_values(
+            &query_map.get_untracked(),
+            "place",
+            &next,
+        ));
+    };
+    view! {
+        <Suspense fallback=|| ()>
+            {move || {
+                let current = current.clone();
+                Suspend::new(async move {
+                    let places = vocabulary.await;
+                    if places.is_empty() {
+                        return ().into_any();
+                    }
+                    let groups = crate::pages::law_page::place_groups(&places);
+                    let picked: Vec<String> = groups
+                        .iter()
+                        .flat_map(|(_, members)| members)
+                        .filter(|p| current.contains(&p.uid))
+                        .map(|p| p.label.clone())
+                        .collect();
+                    let summary = match picked.as_slice() {
+                        [] => String::new(),
+                        [one] => one.clone(),
+                        [a, b] => format!("{a}, {b}"),
+                        many => format!("{} lieux", many.len()),
+                    };
+                    let is_default = current == [lj_dtos::DEFAULT_READER_PLACE];
+                    let full = current.len() >= lj_dtos::MAX_READER_PLACES;
+                    let sections = groups
+                        .into_iter()
+                        .map(|(label, members)| {
+                            let uids: Vec<String> = members.iter().map(|p| p.uid.clone()).collect();
+                            let all_on = uids.iter().all(|u| current.contains(u));
+                            let fits = current.len()
+                                + uids.iter().filter(|u| !current.contains(u)).count()
+                                <= lj_dtos::MAX_READER_PLACES;
+                            let heading = {
+                                let current = current.clone();
+                                view! {
+                                    <label class="flex items-center gap-2 pt-2 text-[11px] uppercase tracking-[0.12em] text-[var(--color-ink-subtle)]">
+                                        <input
+                                            type="checkbox"
+                                            prop:checked=all_on
+                                            prop:disabled=!all_on && !fits
+                                            on:change=move |_| {
+                                                let mut next = current.clone();
+                                                if all_on {
+                                                    next.retain(|u| !uids.contains(u));
+                                                } else {
+                                                    for u in &uids {
+                                                        if !next.contains(u) {
+                                                            next.push(u.clone());
+                                                        }
+                                                    }
+                                                }
+                                                go(next);
+                                            }
+                                        />
+                                        {label}
+                                    </label>
+                                }
+                            };
+                            let rows = members
+                                .into_iter()
+                                .map(|p| {
+                                    let on = current.contains(&p.uid);
+                                    let current = current.clone();
+                                    let uid = p.uid.clone();
+                                    view! {
+                                        <label class="flex items-center gap-2 pl-4 text-[13px] text-[var(--color-ink-muted)]">
+                                            <input
+                                                type="checkbox"
+                                                prop:checked=on
+                                                prop:disabled=!on && full
+                                                on:change=move |_| {
+                                                    let mut next = current.clone();
+                                                    if on {
+                                                        next.retain(|u| *u != uid);
+                                                    } else {
+                                                        next.push(uid.clone());
+                                                    }
+                                                    go(next);
+                                                }
+                                            />
+                                            {p.label}
+                                        </label>
+                                    }
+                                })
+                                .collect_view();
+                            view! { <div class="flex flex-col gap-1">{heading}{rows}</div> }
+                        })
+                        .collect_view();
+                    view! {
+                        <div class="flex flex-col gap-1 pt-1">
+                            <button
+                                type="button"
+                                class=RAIL_ROW
+                                aria-expanded=move || open.get().to_string()
+                                on:click=move |_| open.update(|o| *o = !*o)
+                            >
+                                <span class="text-[11px] uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                                    "Lu depuis"
+                                </span>
+                                <span class="truncate text-[13px] text-[var(--color-ink)]">{summary}</span>
+                            </button>
+                            <div
+                                class="flex max-h-80 flex-col gap-1 overflow-y-auto rounded-md border border-[var(--color-rule)] px-2 pb-2"
+                                class:hidden=move || !open.get()
+                            >
+                                {sections}
+                                {(!is_default)
+                                    .then(|| {
+                                        view! {
+                                            <button
+                                                type="button"
+                                                class="pt-2 text-left text-[12px] text-[var(--color-bordeaux)] hover:underline"
+                                                on:click=move |_| go(Vec::new())
+                                            >
+                                                "Revenir à la France métropolitaine"
+                                            </button>
+                                        }
+                                    })}
+                            </div>
+                        </div>
+                    }
+                        .into_any()
+                })
+            }}
+        </Suspense>
+    }
+}
+
+/// The jurisdiction block opens on the automatic position, active while no
+/// filter is stated; the corpora the engine chose are echoed in grey. The
+/// places read from close it, since they are what the automatic position
+/// answers to.
+fn jurisdiction_block(
+    choices: Vec<FacetChoice>,
+    active: Option<String>,
+    searched: Vec<String>,
+    vocabulary: Resource<Vec<lj_dtos::PlaceNode>>,
+    picked: Vec<String>,
+    picker_open: RwSignal<bool>,
+) -> AnyView {
+    if choices.is_empty() {
+        return ().into_any();
+    }
+    let query_map = use_query_map();
+    let nav = Nav::new();
+    let stale = stale_counts();
+    let auto = active.is_none();
+    let auto_row = view! {
+        <button
+            type="button"
+            class=RAIL_ROW
+            aria-pressed=auto.to_string()
+            on:click=move |_| {
+                nav.go(query_state::with_param(&query_map.get_untracked(), "jurisdiction", None, true));
+            }
+        >
+            <span class=if auto { RAIL_LABEL_ACTIVE } else { RAIL_LABEL }>"Automatique"</span>
+        </button>
+    };
+    let rows = choices
+        .into_iter()
+        .map(|c| {
+            let is_active = active.as_deref() == Some(c.value.as_str());
+            let echoed = auto && searched.contains(&c.value);
+            let count = c.count;
+            let counted = count > 0;
+            let label_class = match (is_active, echoed) {
+                (true, _) => RAIL_LABEL_ACTIVE,
+                (false, true) => RAIL_LABEL_ECHO,
+                (false, false) => RAIL_LABEL,
+            };
+            let value = c.value;
+            view! {
+                <button
+                    type="button"
+                    class=RAIL_ROW
+                    title=c.label.clone()
+                    on:click=move |_| {
+                        let next = if is_active {
+                            query_state::with_param(&query_map.get_untracked(), "jurisdiction", None, true)
+                        } else {
+                            query_state::with_param(
+                                &query_map.get_untracked(),
+                                "jurisdiction",
+                                Some(&value),
+                                true,
+                            )
+                        };
+                        nav.go(next);
+                    }
+                >
+                    <span class=label_class>{c.label.clone()}</span>
+                    <Show when=move || counted && !stale.get()>
+                        <span class=RAIL_COUNT>{group_thousands(count)}</span>
+                    </Show>
+                </button>
+            }
+        })
+        .collect_view();
+    view! {
+        <div class="flex flex-col gap-1.5 border-t border-[var(--color-rule)] pt-4">
+            <p class="pb-1 text-[11px] uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                "Droit"
+            </p>
+            {auto_row}
+            {rows}
+            <ReaderPlacePicker vocabulary=vocabulary current=picked open=picker_open />
+        </div>
+    }
+    .into_any()
 }
 
 /// Bloc liste du rail textes : titre + lignes `libellé … compte` cliquables,
@@ -392,15 +773,15 @@ fn rail_facet_block(
             let is_active = active.as_deref() == Some(c.value.as_str());
             let count = c.count;
             let label_class = if is_active {
-                "truncate text-[13px] leading-snug font-medium text-[var(--color-bordeaux)]"
+                RAIL_LABEL_ACTIVE
             } else {
-                "truncate text-[13px] leading-snug text-[var(--color-ink-muted)] transition-colors group-hover:text-[var(--color-ink)]"
+                RAIL_LABEL
             };
             let value = c.value;
             view! {
                 <button
                     type="button"
-                    class="group flex w-full items-baseline justify-between gap-3 text-left"
+                    class=RAIL_ROW
                     title=c.label.clone()
                     on:click=move |_| {
                         let next = if is_active {
@@ -418,9 +799,7 @@ fn rail_facet_block(
                 >
                     <span class=label_class>{c.label.clone()}</span>
                     <Show when=move || !stale.get()>
-                        <span class="shrink-0 font-mono text-[11px] tabular-nums text-[var(--color-ink-subtle)]">
-                            {group_thousands(count)}
-                        </span>
+                        <span class=RAIL_COUNT>{group_thousands(count)}</span>
                     </Show>
                 </button>
             }
@@ -437,10 +816,10 @@ fn rail_facet_block(
     .into_any()
 }
 
-/// Barre de filtres textes (gabarit du secteur « Lois et règlements ») :
-/// `Juridiction ▾ · Nature ▾ · Source ▾`. Chaque facette est mono-sélection :
-/// cliquer une valeur l'active (`?<clé>=<valeur>`), recliquer la retire. Toute
-/// mutation supprime `page` (retour page 1).
+/// Filter bar of the text search (the « Lois et règlements » template):
+/// `Droit ▾ · Nature ▾ · Source ▾`. Each facet takes one value: clicking a
+/// value sets it (`?<key>=<value>`), clicking it again removes it, and any
+/// change drops `page` (back to page 1).
 #[component]
 fn TextesFilterBar(
     #[prop(into)] facets: Signal<Option<ArticleSearchFacets>>,
@@ -457,7 +836,7 @@ fn TextesFilterBar(
         >
             <FilterDropdown
                 id="jurisdiction"
-                label="Juridiction"
+                label="Droit"
                 active_count=Signal::derive(move || {
                     usize::from(state.get().jurisdiction.is_some())
                 })
@@ -713,7 +1092,12 @@ fn TextesActiveChips(
 /// Liste des articles trouvés (ou état vide pour la page courante). Même
 /// gabarit que la liste décisions : gouttière à numéros + filets `border-t`.
 #[component]
-fn TextResults(hits: Vec<ArticleSearchHit>, query: String, page: u32) -> impl IntoView {
+fn TextResults(
+    hits: Vec<ArticleSearchHit>,
+    query: String,
+    page: u32,
+    place: String,
+) -> impl IntoView {
     if hits.is_empty() {
         return view! {
             <div class="border-t border-[var(--color-rule)] py-16">
@@ -727,21 +1111,22 @@ fn TextResults(hits: Vec<ArticleSearchHit>, query: String, page: u32) -> impl In
     let rows = hits
         .into_iter()
         .enumerate()
-        .map(|(i, h)| view! { <TextHit hit=h index=i page=page /> })
+        .map(|(i, h)| view! { <TextHit hit=h index=i page=page place=place.clone() /> })
         .collect_view();
     view! { <ul class="flex flex-col">{rows}</ul> }.into_any()
 }
 
 #[component]
-fn TextHit(hit: ArticleSearchHit, index: usize, page: u32) -> impl IntoView {
+fn TextHit(hit: ArticleSearchHit, index: usize, page: u32, place: String) -> impl IntoView {
     // Lien sur la clé canonique (`numKey`) — le serve résout en lookup exact.
     // `num` reste l'affichage ; `num` vide = hit « texte entier » (texte à corps)
     // → page du texte.
     let is_whole_text = hit.num_key.is_empty();
+    let text = lj_vocab::norm_path(&hit.jurisdiction, &hit.code);
     let href = if is_whole_text {
-        format!("/texte/{}", hit.code)
+        format!("{text}{place}")
     } else {
-        format!("/texte/{}/{}", hit.code, hit.num_key)
+        format!("{text}/{}{place}", hit.num_key)
     };
     let position = (page as usize - 1) * SEARCH_PAGE_SIZE as usize + index + 1;
     let numeral = format!("{position:02}");

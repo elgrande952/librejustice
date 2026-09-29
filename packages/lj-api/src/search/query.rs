@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use lj_core::body_tok::{fold, is_stopword, tokenize as tokenize_body};
+use lj_textsearch::body_tok::{is_stopword, tokenize as tokenize_body};
 use regex::Regex;
 
 use lj_dtos::QueryMode;
@@ -218,7 +218,7 @@ fn enforce_and_precedence(query: &str) -> String {
                 "{prefix}{}",
                 quote_bare_syntax_token(body, TANTIVY_SYNTAX)
             ));
-        } else if is_stopword(&fold(tok)) {
+        } else if is_stopword(&lj_fold::fold_chars(tok)) {
             next_neg = false;
             continue;
         } else if next_neg {
@@ -351,7 +351,7 @@ pub(crate) fn query_lacks_searchable_terms(query: &str) -> bool {
 mod tests {
     use super::*;
 
-    use lj_core::body_tok::content_chunks;
+    use lj_textsearch::body_tok::content_chunks;
 
     #[test]
     fn detect_mode_boolean_operators() {
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn phrase_combo_gazetteer_replaces_split_fragment() {
         let toks = tokenize_body("tribunal de commerce de paris competence litige");
-        let m = lj_core::collocations::Matcher::from_phrases(["tribunal de commerce"]);
+        let m = lj_textsearch::collocations::Matcher::from_phrases(["tribunal de commerce"]);
         let clauses = phrase_combo_clauses(&toks, &m.spans(&toks));
         assert!(
             clauses.iter().any(|c| c == "\"tribunal de commerce\""),
@@ -544,8 +544,10 @@ mod tests {
     #[test]
     fn phrase_combo_gazetteer_two_disjoint_collocations() {
         let toks = tokenize_body("code de la route exces de vitesse permis");
-        let m =
-            lj_core::collocations::Matcher::from_phrases(["code de la route", "exces de vitesse"]);
+        let m = lj_textsearch::collocations::Matcher::from_phrases([
+            "code de la route",
+            "exces de vitesse",
+        ]);
         let clauses = phrase_combo_clauses(&toks, &m.spans(&toks));
         assert!(
             clauses.iter().any(|c| c == "\"code de la route\""),
@@ -564,7 +566,7 @@ mod tests {
     #[test]
     fn phrase_combo_uncovered_content_run_survives() {
         let toks = tokenize_body("tribunal de commerce detention provisoire");
-        let m = lj_core::collocations::Matcher::from_phrases(["tribunal de commerce"]);
+        let m = lj_textsearch::collocations::Matcher::from_phrases(["tribunal de commerce"]);
         let clauses = phrase_combo_clauses(&toks, &m.spans(&toks));
         assert!(
             clauses.iter().any(|c| c == "\"tribunal de commerce\""),

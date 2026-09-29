@@ -32,7 +32,7 @@ use lj_core::error::Result;
 /// La constante elle-même vit dans `lj-core`, ancêtre commun de `lj-extract` qui
 /// la produit et de `lj-store` qui en gate le SQL ; re-exportée ici pour le chemin
 /// stable `extract::EXTRACT_VERSION`.
-pub use lj_core::EXTRACT_VERSION;
+pub use lj_versions::EXTRACT_VERSION;
 
 mod dockets;
 mod formation_label;
@@ -594,7 +594,7 @@ fn blob_word(blob: &str, w: &str) -> bool {
 /// Voie/office/domaine depuis la FORMATION et le code juridiction (métadonnées de
 /// greffe, vocabulaire fermé plié — aucune regex).
 fn procedure_from_chamber(d: &Decision, sig: &crate::scan::ProcSignals) -> Option<ProcedureUids> {
-    let blob = crate::compiled::fold_stable(&format!(
+    let blob = lj_fold::fold_chars(&format!(
         "{} {}",
         d.chamber.as_deref().unwrap_or(""),
         d.formation.as_deref().unwrap_or("")
@@ -668,8 +668,8 @@ fn procedure_key(
     sig: &crate::scan::ProcSignals,
     chamber: &str,
 ) -> Option<&'static str> {
-    let sol = crate::compiled::fold_stable(d.solution.as_deref().unwrap_or(""));
-    let tr = crate::compiled::fold_stable(d.type_recours.as_deref().unwrap_or(""));
+    let sol = lj_fold::fold_chars(d.solution.as_deref().unwrap_or(""));
+    let tr = lj_fold::fold_chars(d.type_recours.as_deref().unwrap_or(""));
     let jt = d.jurisdiction_type.as_deref();
     if sol.contains("qpc") || tr.trim() == "qpc" {
         return Some("QPC");
@@ -779,7 +779,7 @@ pub fn extract_procedure(d: &Decision) -> ProcedureUids {
 pub fn procedure_scanned(d: &Decision, scan: Option<&crate::scan::DocScan>) -> ProcedureUids {
     // texte vide (rare) : signaux à défaut, les fallbacks chambre restent
     let sig = scan.map(|s| s.procedure_signals()).unwrap_or_default();
-    let chamber = crate::compiled::fold_stable(&format!(
+    let chamber = lj_fold::fold_chars(&format!(
         "{} {}",
         d.chamber.as_deref().unwrap_or(""),
         d.formation.as_deref().unwrap_or("")
@@ -914,7 +914,7 @@ fn avocat_requerant_meta(d: &Decision) -> Vec<(String, bool)> {
 /// Cabinet quand l'item ouvre ou finit sur une structure d'avocats, ou mentionne
 /// « avocat »/« cabinet » ; personne sinon.
 fn classe_conseil_meta(compact: String) -> (String, bool) {
-    let f = crate::compiled::fold_stable(&compact);
+    let f = lj_fold::fold_chars(&compact);
     // Structure en tête (« SCP X ») OU en queue (« DHALLUIN SCP ») : la
     // métadonnée écrit les deux ordres.
     let structural = |t: &str| {
@@ -959,14 +959,10 @@ fn trim_counsel_tail(v: String) -> String {
         .unwrap()
     });
     let re_title = RE_TITLE_TAIL.get_or_init(|| regex::Regex::new(r"(?i)\s+avocats?\s*$").unwrap());
-    let folded = crate::compiled::fold_stable(&v);
-    let cut = re_firm.find(&folded).map(|m| m.start());
-    // `fold_stable` est 1:1 en chars : l'offset plié se reporte tel quel.
+    let norm = crate::compiled::Norm::new(&v);
+    let cut = re_firm.find(&norm.folded).map(|m| m.start());
     let v = match cut {
-        Some(at) => {
-            let keep: String = v.chars().take(folded[..at].chars().count()).collect();
-            keep
-        }
+        Some(at) => v.chars().take(norm.byte2char[at]).collect(),
         None => v,
     };
     let mut v = re_title.replace(&v, "").into_owned();
@@ -997,7 +993,7 @@ fn merge_meta_first(metas: Vec<String>, text: Vec<String>) -> Vec<String> {
         return text;
     }
     let mots = |v: &str| -> Vec<String> {
-        crate::compiled::fold_stable(v)
+        lj_fold::fold_chars(v)
             .split_whitespace()
             .map(str::to_string)
             .collect()

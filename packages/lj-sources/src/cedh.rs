@@ -24,8 +24,6 @@ use std::time::Duration;
 
 /// Base HUDOC.
 pub const BASE_URL: &str = "https://hudoc.echr.coe.int";
-/// User-Agent de contact (endpoint public sans auth, courtoisie).
-pub const USER_AGENT: &str = "librejustice-cedh/0.1 (+https://github.com/)";
 /// Throttle de courtoisie entre fetchs.
 pub const THROTTLE: Duration = Duration::from_millis(250);
 /// Tentatives face aux transitoires HUDOC, backoff `THROTTLE << attempt`.
@@ -63,7 +61,7 @@ fn is_transient(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
-/// Client HUDOC (reqwest async + TracingMiddleware, comme `judilibre.rs`).
+/// HUDOC client.
 pub struct CedhClient {
     base_url: String,
     client: ClientWithMiddleware,
@@ -83,12 +81,14 @@ impl CedhClient {
     /// Client sur une base donnée (`base_url` normalisée, trailing `/` retiré).
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
+        // No User-Agent. Cloudflare in front of HUDOC waves through what reads as an
+        // HTTP library and challenges the rest: on 23/09/2026 a browser profile got
+        // 403 on 3 requests of 6, an unknown UA on every one, no UA on none.
         let client = ClientBuilder::new(
             reqwest::Client::builder()
-                .user_agent(USER_AGENT)
-                // Sans borne, une connexion que HUDOC accepte sans jamais honorer parque
-                // `send().await` : le 28/08/2026, `sync-cedh` a tenu ses 3 600 s de watchdog
-                // sans écrire une ligne. Au-delà, la requête erreur et le retry repart.
+                // Unbounded, a connection HUDOC accepts and never honours parks
+                // `send().await`: 28/08/2026, `sync-cedh` held its 3600 s watchdog without
+                // writing a line. Past the bound the request errors and the retry departs.
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(120))
                 // A pooled connection freezes on this path: 31/08/2026, bodies lost in
@@ -148,17 +148,20 @@ impl CedhClient {
             let resp = match envoi {
                 Ok(resp) => resp,
                 Err(e) if attempt + 1 < CEDH_RETRIES => {
-                    tracing::warn!(%url, attempt, error = %e, "requête hudoc results échouée (envoi/timeout), retry");
+                    tracing::warn!(%url, attempt, error = %e, "hudoc results request failed (send/timeout), retry");
                     continue;
                 }
                 Err(e) => {
                     return Err(SourceError::Invalid(format!(
                         "requête hudoc results {url}: {e}"
-                    )))
+                    )));
                 }
             };
             let status = resp.status().as_u16();
-            let text = resp.text().await?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| SourceError::Invalid(format!("corps hudoc results {url}: {e}")))?;
             if status == 200 {
                 return Ok(sonic_rs::from_str(&text)?);
             }
@@ -217,13 +220,13 @@ impl CedhClient {
             let resp = match envoi {
                 Ok(resp) => resp,
                 Err(e) if attempt + 1 < CEDH_RETRIES => {
-                    tracing::warn!(itemid, attempt, error = %e, "requête hudoc body échouée (envoi/timeout), retry");
+                    tracing::warn!(itemid, attempt, error = %e, "hudoc body request failed (send/timeout), retry");
                     continue;
                 }
                 // Même philosophie que le transitoire persistant : un corps injoignable se
                 // diffère, il ne fait pas tomber l'année entière.
                 Err(e) => {
-                    tracing::warn!(itemid, error = %e, "hudoc body injoignable après retries (envoi/timeout), différé (skip)");
+                    tracing::warn!(itemid, error = %e, "hudoc body unreachable after retries (send/timeout), deferred (skip)");
                     return Ok(String::new());
                 }
             };
@@ -236,7 +239,10 @@ impl CedhClient {
                 return Ok(String::new());
             }
             if status == 200 {
-                let raw = resp.text().await?;
+                let raw = resp
+                    .text()
+                    .await
+                    .map_err(|e| SourceError::Invalid(format!("corps hudoc {itemid}: {e}")))?;
                 if let Some(path) = self.body_cache_path(itemid) {
                     if let Some(parent) = path.parent() {
                         fs::create_dir_all(parent)?;
@@ -256,7 +262,7 @@ impl CedhClient {
         tracing::warn!(
             itemid,
             status = last_status,
-            "hudoc body transitoire persistant après retries — différé (skip)"
+            "hudoc body still transient after retries, deferred (skip)"
         );
         Ok(String::new())
     }

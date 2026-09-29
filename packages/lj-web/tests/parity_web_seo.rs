@@ -6,7 +6,7 @@
 //!   `AppShell` depuis `seo::site_default()`, supprimée sur `/decision/*` où la
 //!   page émet la sienne.
 //! - Routes dynamiques : `/decision/:id` (title/desc/OG/canonical/JSON-LD dans le
-//!   HTML initial) et `/decisions` (hérite du shell).
+//!   HTML initial) et `/decision-search` (hérite du shell).
 //!
 //! Ces tests exercent les fonctions SEO pures et l'assemblage de balises, pas le
 //! rendu de l'arbre `App`→`AppShell`→`DecisionPage` complet.
@@ -15,7 +15,7 @@
 #![cfg(feature = "ssr")]
 
 use lj_dtos::{DecisionDetail, JurisdictionType};
-use lj_web::seo::decision::{build_json_ld, meta_description};
+use lj_web::seo::decision::{build_json_ld, meta_description, seo_title};
 use lj_web::seo::{canonical_url, site_default, OG_IMAGE};
 
 fn extract_title(head_html: &str) -> Option<&str> {
@@ -50,6 +50,7 @@ fn fixture_detail() -> DecisionDetail {
         ),
         jurisdiction_code: None,
         jurisdiction_name: Some("Conseil d'État".to_string()),
+        court_place: None,
         date_lecture: Some("2024-03-12".to_string()),
         solution: None,
         procedure: None,
@@ -113,9 +114,9 @@ fn decision_route_head_matches_react_meta_contract() {
     let detail = fixture_detail();
     let title = detail.title.clone();
     let description = meta_description(&detail, &title);
-    let url = canonical_url(&detail.id);
+    let url = canonical_url(detail.jurisdiction_type, &detail.id);
 
-    let page_title = format!("{title} - LibreJustice");
+    let page_title = format!("{} - LibreJustice", seo_title(&detail));
     assert_eq!(
         page_title,
         "Conseil d'État, 12 mars 2024, n° 470537 - LibreJustice"
@@ -127,7 +128,7 @@ fn decision_route_head_matches_react_meta_contract() {
          La haute juridiction renvoie l'affaire."
     );
 
-    assert_eq!(url, "https://librejustice.fr/decision/ce-2024-470537");
+    assert_eq!(url, "https://librejustice.fr/decision/fr/ce-2024-470537");
 
     let head = format!(
         "<title>{page_title}</title>\
@@ -166,7 +167,7 @@ fn decision_jsonld_matches_react_graph() {
     let detail = fixture_detail();
     let title = detail.title.clone();
     let description = meta_description(&detail, &title);
-    let url = canonical_url(&detail.id);
+    let url = canonical_url(detail.jurisdiction_type, &detail.id);
 
     let got = build_json_ld(&detail, &title, &description);
 
@@ -239,4 +240,25 @@ fn decision_description_falls_back_to_title_without_summary() {
     detail.summary = None;
     let description = meta_description(&detail, &detail.title);
     assert_eq!(description, detail.title);
+}
+
+#[test]
+fn seo_title_drops_a_seat_that_carries_its_own_commas() {
+    let mut detail = fixture_detail();
+    detail.seat = Some("pôle 5, 3e chambre · formation à trois".to_string());
+    detail.title =
+        "Cour d'appel de Paris, pôle 5, 3e chambre · formation à trois, 12 mars 2024, 22/01234"
+            .to_string();
+
+    assert_eq!(
+        seo_title(&detail),
+        "Cour d'appel de Paris, 12 mars 2024, 22/01234"
+    );
+}
+
+#[test]
+fn seo_title_is_the_canonical_title_without_a_seat() {
+    let detail = fixture_detail();
+    assert!(detail.seat.is_none());
+    assert_eq!(seo_title(&detail), detail.title);
 }

@@ -6,7 +6,7 @@
 //! résout sa propre cible fermée.
 
 /// Classes d'équivalence, ressort en tête puis villes-sièges et graphies
-/// d'usage, en slug ([`crate::text::slug`]). Un lieu sans nom de ville
+/// d'usage, en slug (`lj_fold::slug`). Un lieu sans nom de ville
 /// d'usage distinct n'y figure pas, et « saint-pierre » est hors table : il
 /// désigne aussi bien Saint-Pierre de La Réunion que la collectivité.
 const RESSORTS: &[&[&str]] = &[

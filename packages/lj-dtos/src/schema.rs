@@ -3,7 +3,7 @@
 //! Schéma unifié : ordre administratif (CE/CAA/TA/CNDA/Cour des comptes/TC) ET
 //! ordre judiciaire (Cour de cassation/CA/TJ/TCOM). Les enums de facettes
 //! ([`Solution`], [`Procedure`], [`Office`], [`Domain`]) sont le **miroir
-//! compilé du seed** de la migration `0100_facet_referentiels.sql` : chaque
+//! compilé du seed** de la migration `0100_facet_value_jurisdiction_tables.sql` : chaque
 //! valeur sérialisée est le suffixe d'un uid `facet_value` — le test
 //! `enums_match_migration_seed` diffe enum ↔ seed, toute dérive est un build
 //! rouge. Les autres enums gardent les chaînes SCREAMING_CASE historiques des
@@ -351,6 +351,30 @@ impl JurisdictionType {
         JurisdictionType::Cnda,
         JurisdictionType::Cnil,
     ];
+
+    /// The jurisdiction segment of a decision URL, in the alphabet of text URLs.
+    pub fn url_segment(self) -> &'static str {
+        match self {
+            JurisdictionType::Cjue => "eu",
+            JurisdictionType::Cedh => "intl",
+            JurisdictionType::Ta
+            | JurisdictionType::Caa
+            | JurisdictionType::Ce
+            | JurisdictionType::Constit
+            | JurisdictionType::Tc
+            | JurisdictionType::Cc
+            | JurisdictionType::Ca
+            | JurisdictionType::Tj
+            | JurisdictionType::Tcom
+            | JurisdictionType::Cnda
+            | JurisdictionType::Cnil => "fr",
+        }
+    }
+
+    /// The variant a stored type code names (`CJUE`, `TA`…).
+    pub fn from_code(code: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(code.to_string())).ok()
+    }
 
     /// Libellé de la date de la décision. « Lecture » est le mot de l'ordre
     /// administratif, jamais celui d'un arrêt de cassation.

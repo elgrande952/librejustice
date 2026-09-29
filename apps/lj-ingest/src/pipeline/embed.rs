@@ -3,15 +3,14 @@
 use anyhow::{anyhow, Result};
 use std::sync::OnceLock;
 
-use lj_llm::backend::{AnyEmbedder, DummyEmbedder, Embedder};
+use lj_chunk::{chunk_bpe, Tokenizer, DEFAULT_OVERLAP_MAX, DEFAULT_OVERLAP_MIN, EMBED_VERSION};
+use lj_llm::backend::{AnyEmbedder, DummyEmbedder, Embedder, LocalHost};
 use lj_llm::cloudflare::CloudflareWorkersAIEmbedder;
 use lj_llm::error::EmbedError;
+use lj_llm::hosts::EmbedHost;
 use lj_llm::openai_http::OpenAIHttpEmbedder;
 use lj_store::repository::{BulkDecisionWrite, ChunkWrite};
 
-use crate::chunking::{
-    chunk_bpe, Tokenizer, DEFAULT_OVERLAP_MAX, DEFAULT_OVERLAP_MIN, EMBED_VERSION,
-};
 use crate::config::Settings;
 
 use super::{PreparedDecision, WriteMode};
@@ -20,16 +19,16 @@ use super::{PreparedDecision, WriteMode};
 /// être filtré par l'appelant : le pipeline n'instancie pas d'embedder dans ce
 /// cas.
 ///
-/// `auto` sonde le local (`embed_url`) : joignable → `openai-http` (GPU local,
-/// gratuit) ; sinon repli sur Cloudflare Workers AI. Le cap
-/// `ingest_neuron_budget` s'applique sur tout chemin Cloudflare.
+/// `auto` chains the local hosts of `embed_hosts` in priority order, each behind
+/// its own breaker, then Cloudflare Workers AI once every host is down. The
+/// `ingest_neuron_budget` cap applies on every Cloudflare path.
 pub(super) async fn build_embedder(settings: &Settings) -> Result<AnyEmbedder> {
     match settings.embed_backend.as_str() {
         "none" => Err(anyhow!(
             "build_embedder appelé avec backend=none (l'appelant doit ne pas embedder)"
         )),
         "dummy" => Ok(AnyEmbedder::Dummy(DummyEmbedder::default())),
-        "openai-http" => Ok(build_openai_http(settings)),
+        "openai-http" => Ok(build_openai_http(single_host(settings)?)),
         "cloudflare" => build_cloudflare(settings),
         "auto" => build_auto(settings).await,
         other => Err(anyhow!(
@@ -55,25 +54,47 @@ pub(super) async fn build_local_strict(settings: &Settings) -> Result<AnyEmbedde
             "re-embed maintenance refuse backend=cloudflare (coût) : configure le local (openai-http/auto)"
         )),
         _ => {
-            if !probe_local(settings).await {
-                return Err(anyhow!(
-                    "re-embed maintenance : backend local injoignable ({}), pas de repli Cloudflare (coût)",
-                    settings.embed_url
-                ));
+            for host in &settings.embed_hosts {
+                if probe_host(host).await {
+                    tracing::info!(url = %host.url, "re-embed maintenance: openai-http reachable, using openai-http (strict)");
+                    return Ok(build_openai_http(host));
+                }
             }
-            tracing::info!(url = %settings.embed_url, "re-embed maintenance : openai-http joignable → openai-http (strict)");
-            Ok(build_openai_http(settings))
+            Err(anyhow!(
+                "re-embed maintenance: no local host reachable ({}), no Cloudflare fallback (cost)",
+                urls(settings)
+            ))
         }
     }
 }
 
 /// Embedder local (`/v1/embeddings` OpenAI-compatible).
-fn build_openai_http(settings: &Settings) -> AnyEmbedder {
+fn build_openai_http(host: &EmbedHost) -> AnyEmbedder {
     AnyEmbedder::OpenAiHttp(OpenAIHttpEmbedder::new(
-        settings.embed_url.clone(),
-        settings.embed_api_key.clone(),
+        host.url.clone(),
+        host.api_key.clone(),
         String::new(),
     ))
+}
+
+/// `openai-http` has no breaker to walk a list with.
+fn single_host(settings: &Settings) -> Result<&EmbedHost> {
+    match settings.embed_hosts.as_slice() {
+        [host] => Ok(host),
+        hosts => Err(anyhow!(
+            "backend=openai-http takes one LIBREJUSTICE_EMBED_URL, got {}: a list needs backend=auto",
+            hosts.len()
+        )),
+    }
+}
+
+fn urls(settings: &Settings) -> String {
+    let urls: Vec<&str> = settings
+        .embed_hosts
+        .iter()
+        .map(|h| h.url.as_str())
+        .collect();
+    urls.join(", ")
 }
 
 async fn build_auto(settings: &Settings) -> Result<AnyEmbedder> {
@@ -81,29 +102,29 @@ async fn build_auto(settings: &Settings) -> Result<AnyEmbedder> {
         settings.cloudflare_account_id.clone(),
         settings.cloudflare_backend_token.clone(),
     ) else {
+        let [host] = settings.embed_hosts.as_slice() else {
+            return Err(anyhow!(
+                "backend=auto over several hosts needs the Cloudflare credentials: the breaker chain ends on Cloudflare"
+            ));
+        };
         tracing::warn!(
-            url = %settings.embed_url,
-            "backend=auto sans identifiants Cloudflare : openai-http seul, aucun repli"
+            url = %host.url,
+            "backend=auto without Cloudflare credentials: openai-http alone, no fallback"
         );
-        return Ok(build_openai_http(settings));
+        return Ok(build_openai_http(host));
     };
     tracing::info!(
-        url = %settings.embed_url,
-        "backend=auto : disjoncteur local ↔ Cloudflare armé"
+        urls = %urls(settings),
+        "backend=auto: local hosts vs Cloudflare breaker armed"
     );
     Ok(AnyEmbedder::Auto {
-        local: OpenAIHttpEmbedder::new(
-            settings.embed_url.clone(),
-            settings.embed_api_key.clone(),
-            String::new(),
-        ),
+        locals: settings.embed_hosts.iter().map(LocalHost::new).collect(),
         cloudflare: CloudflareWorkersAIEmbedder::new(
             account_id,
             token,
             CloudflareWorkersAIEmbedder::DEFAULT_MODEL,
         )
         .with_neuron_budget(settings.ingest_neuron_budget),
-        degraded: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -126,19 +147,18 @@ fn build_cloudflare(settings: &Settings) -> Result<AnyEmbedder> {
     ))
 }
 
-/// Sonde la disponibilité du local : GET `…/v1/models` (dérivé de `embed_url`),
-/// timeout court. Un 2xx ⇒ backend local utilisable. Toute erreur (réseau,
-/// timeout, statut non-2xx) ⇒ `false`. Aucun retry : le repli Cloudflare est la
-/// stratégie de robustesse.
-async fn probe_local(settings: &Settings) -> bool {
-    let base = settings
-        .embed_url
+/// Probes a local host: GET `…/v1/models`, derived from its URL, short timeout.
+/// A 2xx means usable, any error (network, timeout, non-2xx) means `false`, with
+/// no retry.
+async fn probe_host(host: &EmbedHost) -> bool {
+    let base = host
+        .url
         .trim_end_matches('/')
         .trim_end_matches("/v1/embeddings");
     let url = format!("{base}/v1/models");
     let client = reqwest::Client::new();
     let mut req = client.get(&url).timeout(std::time::Duration::from_secs(3));
-    if let Some(key) = &settings.embed_api_key {
+    if let Some(key) = &host.api_key {
         req = req.bearer_auth(key);
     }
     matches!(req.send().await, Ok(resp) if resp.status().is_success())
@@ -179,7 +199,7 @@ pub(super) fn to_bulk_write(
 
     // `canonical_ref` calculé à l'ingest, passé à l'upsert : lj-store ne tire plus
     // l'extracteur.
-    let canonical_ref = lj_ingest::extract::canonical_ref(&prepared.decision);
+    let canonical_ref = lj_extract_rows::canonical_ref(&prepared.decision);
 
     BulkDecisionWrite {
         decision_id: prepared.decision_id,
@@ -226,7 +246,7 @@ fn rechunk_bpe(
     let tokenizer = get_tokenizer();
     let mut out = Vec::with_capacity(writes.len());
     for mut w in writes {
-        if w.write_mode == WriteMode::SourceXmlOnly {
+        if w.write_mode == WriteMode::SourceXmlOnly || w.chunks.is_empty() {
             out.push(w);
             continue;
         }
@@ -310,7 +330,7 @@ pub(super) async fn embed_prepared<E: Embedder>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunking::{DEFAULT_CHUNK_TOKENS, DEFAULT_OVERLAP_MAX, DEFAULT_OVERLAP_MIN};
+    use lj_chunk::{DEFAULT_CHUNK_TOKENS, DEFAULT_OVERLAP_MAX, DEFAULT_OVERLAP_MIN};
 
     /// En mode BPE exact, `embedding_text` d'aucun chunk ne dépasse le budget
     /// token K — invariant qui rend correct le re-chunk de secours (`rechunk_bpe`).

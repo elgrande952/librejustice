@@ -136,7 +136,7 @@ async fn signalement(
 
     // Le succès, pour qu'un robot à qui l'on annonce son refus ne revienne pas.
     if !form.site.trim().is_empty() {
-        tracing::info!(target: LOG_TARGET, "signalement au leurre, jeté");
+        tracing::info!(target: LOG_TARGET, "report to the decoy, dropped");
         return rebond(&de, "sent", "1");
     }
 
@@ -174,7 +174,7 @@ async fn signalement(
     };
 
     let Some(mailer) = state.mailer.clone() else {
-        tracing::error!(target: LOG_TARGET, "signalement reçu, relais non configuré");
+        tracing::error!(target: LOG_TARGET, "report received, relay not configured");
         return rebond(&de, "error", "envoi_impossible");
     };
 
@@ -186,7 +186,7 @@ async fn signalement(
         tracing::error!(
             target: LOG_TARGET,
             plafond = state.settings.signalements_par_jour,
-            "plafond journalier de signalements atteint, message non émis : {message}"
+            "daily report ceiling reached, message not sent: {message}"
         );
         return rebond(&de, "error", "envoi_impossible");
     }
@@ -202,7 +202,7 @@ async fn signalement(
     ) {
         Ok(mail) => mail,
         Err(erreur) => {
-            tracing::error!(target: LOG_TARGET, "signalement irrédigeable : {erreur}");
+            tracing::error!(target: LOG_TARGET, "report cannot be composed: {erreur}");
             return rebond(&de, "error", "envoi_impossible");
         }
     };
@@ -211,7 +211,7 @@ async fn signalement(
         // Sans ce journal, le signalement disparaît avec la réponse SMTP.
         tracing::error!(
             target: LOG_TARGET,
-            "signalement non remis ({erreur}) — page {de}, auteur {}, message : {message}",
+            "report not delivered ({erreur}), page {de}, author {}, message: {message}",
             auteur.as_ref().map(|a| a.email.to_string()).unwrap_or_else(|| "anonyme".into()),
         );
         return rebond(&de, "error", "envoi_impossible");

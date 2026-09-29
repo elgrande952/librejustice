@@ -8,8 +8,8 @@
     {
       "name": "librejustice",
       "source": "./plugins/librejustice",
-      "description": "Free and open source, LibreJustice gives your agent ~3.7 million French and European decisions and ~3.6 million legal articles as they stood on any date: five MCP tools over OAuth, no API key, and two research skills.",
-      "version": "1.17.0",
+      "description": "Free and open source, LibreJustice gives your agent ~3.8 million French-language and European decisions and ~3.9 million legal articles, readable as they stood on any date and linked article by article. Four MCP tools over OAuth, two research skills.",
+      "version": "1.18.0",
       "author": {
         "name": "LibreJustice"
       },

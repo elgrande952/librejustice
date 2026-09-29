@@ -1,12 +1,3 @@
--- Migration 0102 — labels des types de juridiction dans le référentiel
--- (complète le seed 0100).
---
--- Le niveau 1 de l'arbre juridiction est `juridiction_type` ; ses libellés
--- vivaient uniquement en code (triple copie labels.rs). On les porte dans
--- `facet_value` sous le namespace `juridiction:*` — mêmes garanties (uid FK,
--- une source de vérité, servis par l'API depuis le cache référentiel). Les
--- sigles vivent dans `abbr`.
-
 INSERT INTO facet_value (uid, facet, label, abbr, sort) VALUES
     ('juridiction:CE',              'juridiction', 'Conseil d''État',                        'CE',           1),
     ('juridiction:CAA',             'juridiction', 'Cour administrative d''appel',           'CAA',          2),

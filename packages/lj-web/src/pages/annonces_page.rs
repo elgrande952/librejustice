@@ -1,17 +1,16 @@
-//! Pot Annonces — les événements juridiques en cours.
+//! Annonces pot: the legal events under way.
 //!
-//! Trois routes, deux régimes :
+//! Three routes, two regimes:
 //!
-//! - `/annonces` est la **page moteur**, sœur de `/decisions` et `/textes` :
-//!   même gabarit, même barre de filtres, même mécanique de facettes, rendue
-//!   côté client (`ClientOnly`). Le corps vit dans
+//! - `/notice-search` is the **engine page**, sister of `/decision-search` and
+//!   `/norm-search`: same template, same filter bar, same facet mechanics, rendered
+//!   client side (`ClientOnly`). The body lives in
 //!   `components/search/annonce_results.rs`.
-//! - `/annonces/departement`, `/annonces/departement/{code}` et `/marche/{uid}`
-//!   sont les **pages de crawl** : SSR, sans JS, dans le sitemap. C'est là que
-//!   le fond se fait trouver, la page moteur étant un shell comme ses sœurs —
-//!   le catalogue joue pour les annonces le rôle de `/juridictions` pour les
-//!   décisions. Seul le fond `marche` y paraît : les vues proxifiées DILA ne
-//!   sont pas offertes au crawl.
+//! - `/notice-index/fr`, `/notice-index/fr/{code}` and `/notice/fr/{uid}` are the
+//!   **crawl pages**: SSR, no JS, in the sitemap. That is where the fond gets
+//!   found, the engine page being a shell like its sisters; the catalogue plays for
+//!   notices the role `/decision-index/fr` plays for decisions. Only the `marche`
+//!   fond appears there: the proxied DILA views are not offered to the crawl.
 
 use leptos::either::Either;
 use leptos::prelude::*;
@@ -20,16 +19,18 @@ use leptos_router::components::A;
 use leptos_router::hooks::{use_navigate, use_params_map, use_query_map};
 use lj_dtos::{
     AnnonceCatalogueResponse, AnnonceDetailResponse, AnnonceHit, AnnonceSearchRequest,
-    AnnonceSearchResponse, AnnonceSort, ANNONCE_FOND_MARCHE,
+    AnnonceSearchResponse, AnnonceSort, FacetTag,
 };
+use lj_vocab::{zone_est_departement, ANNONCE_FOND_MARCHE};
 
 use crate::api::ApiClient;
 use crate::components::client_only::ClientOnly;
 use crate::components::layout::{CONTENT_COL, GRID_3COL, SHELL};
 use crate::components::own_page_description;
-use crate::components::search::annonce_results::date_fr;
+use crate::components::search::annonce_results::{date_fr, description};
 use crate::components::search::compact_search::DraftQuery;
 use crate::components::search::AnnoncesView;
+use crate::helpers::portee_zones;
 use crate::pages::juridictions_page::{
     breadcrumb_jsonld, fmt_count, set_cache_control, HubBreadcrumb, HubError, HubSkeleton,
     YearPagination,
@@ -40,7 +41,7 @@ use crate::pages::law_page::data::{sendable, PageError};
 const PAGE_SIZE: u32 = 20;
 const BASE: &str = "https://librejustice.fr";
 
-// ── /annonces : la page moteur ──────────────────────────────────────────────
+// ── /notice-search : la page moteur ──────────────────────────────────────────────
 
 #[component]
 pub fn AnnoncesPage() -> impl IntoView {
@@ -110,7 +111,7 @@ fn AnnoncesPageBody() -> impl IntoView {
     }
 }
 
-// ── /annonces/departement : le catalogue de crawl ───────────────────────────
+// ── /notice-index/fr : le catalogue de crawl ───────────────────────────
 
 #[component]
 pub fn AnnoncesCataloguePage() -> impl IntoView {
@@ -154,21 +155,21 @@ fn CatalogueLoaded(catalogue: AnnonceCatalogueResponse) -> impl IntoView {
     );
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", format!("{BASE}/")),
-        ("Annonces", format!("{BASE}/annonces")),
-        ("Par département", format!("{BASE}/annonces/departement")),
+        ("Annonces", format!("{BASE}/notice-search")),
+        ("Par département", format!("{BASE}/notice-index/fr")),
     ]);
 
     view! {
         <Title text="Marchés publics par département - LibreJustice" />
         <Meta name="description" content=description />
-        <Link rel="canonical" href=format!("{BASE}/annonces/departement") />
+        <Link rel="canonical" href=format!("{BASE}/notice-index/fr") />
         <leptos_meta::Script type_="application/ld+json">{jsonld}</leptos_meta::Script>
 
         <div class="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-8 px-4 py-12 sm:px-6 lg:px-8">
             <header class="flex flex-col gap-3">
                 <HubBreadcrumb items=vec![
                     ("Accueil".to_string(), Some("/".to_string())),
-                    ("Annonces".to_string(), Some("/annonces".to_string())),
+                    ("Annonces".to_string(), Some("/notice-search".to_string())),
                     ("Par département".to_string(), None),
                 ] />
                 <h1 class="font-sans text-3xl text-[var(--color-ink)]">
@@ -182,7 +183,7 @@ fn CatalogueLoaded(catalogue: AnnonceCatalogueResponse) -> impl IntoView {
                 </p>
                 <p class="text-sm">
                     <A
-                        href="/annonces"
+                        href="/notice-search"
                         attr:class="text-[var(--color-accent)] hover:underline"
                     >
                         "Chercher dans toutes les annonces"
@@ -196,13 +197,13 @@ fn CatalogueLoaded(catalogue: AnnonceCatalogueResponse) -> impl IntoView {
                 </h2>
                 <ul class="grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3 lg:grid-cols-4">
                     {catalogue
-                        .departements
+                        .zones
                         .into_iter()
                         .map(|d| {
                             view! {
                                 <li>
                                     <A
-                                        href=format!("/annonces/departement/{}", d.code)
+                                        href=format!("/notice-index/fr/{}", d.code)
                                         attr:class="flex items-baseline justify-between gap-2 text-sm text-[var(--color-ink-muted)] hover:text-[var(--color-accent)]"
                                     >
                                         <span>{d.label}</span>
@@ -233,7 +234,7 @@ fn CatalogueLoaded(catalogue: AnnonceCatalogueResponse) -> impl IntoView {
                                             <li>
                                                 <A
                                                     href=format!(
-                                                        "/annonces?fond={ANNONCE_FOND_MARCHE}&famille={}",
+                                                        "/notice-search?fond={ANNONCE_FOND_MARCHE}&cpv=nature_marche:{}",
                                                         f.value,
                                                     )
                                                     attr:class="text-sm text-[var(--color-ink-muted)] hover:text-[var(--color-accent)]"
@@ -252,7 +253,7 @@ fn CatalogueLoaded(catalogue: AnnonceCatalogueResponse) -> impl IntoView {
     }
 }
 
-// ── /annonces/departement/{code} : page de crawl ────────────────────────────
+// ── /notice-index/fr/{code} : page de crawl ────────────────────────────
 
 #[component]
 pub fn AnnoncesDepartementPage() -> impl IntoView {
@@ -277,7 +278,7 @@ pub fn AnnoncesDepartementPage() -> impl IntoView {
                 // libres vivent sur la page moteur.
                 let req = AnnonceSearchRequest {
                     fond: vec![ANNONCE_FOND_MARCHE.to_string()],
-                    departement: vec![code.clone()],
+                    zone: vec![code.clone()],
                     sort: AnnonceSort::Echeance,
                     limit: PAGE_SIZE,
                     offset: (numero - 1) * PAGE_SIZE,
@@ -326,9 +327,10 @@ fn DepartementLoaded(code: String, numero: u32, page: AnnonceSearchResponse) -> 
     // Le nom du département vient de l'API (les hits le portent résolu).
     let nom = hits
         .first()
-        .and_then(|h| h.departement_label.clone())
+        .and_then(|h| h.zones.iter().find(|z| z.key == code))
+        .map(|z| z.label.clone())
         .unwrap_or_else(|| code.clone());
-    let base_path = format!("/annonces/departement/{code}");
+    let base_path = format!("/notice-index/fr/{code}");
     let title = if numero > 1 {
         format!("Marchés publics — {nom} (page {numero}) - LibreJustice")
     } else {
@@ -344,10 +346,10 @@ fn DepartementLoaded(code: String, numero: u32, page: AnnonceSearchResponse) -> 
     } else {
         format!("{BASE}{base_path}")
     };
-    let filtre = format!("?fond={ANNONCE_FOND_MARCHE}&departement={code}");
+    let filtre = format!("?fond={ANNONCE_FOND_MARCHE}&zone={code}");
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", format!("{BASE}/")),
-        ("Annonces", format!("{BASE}/annonces")),
+        ("Annonces", format!("{BASE}/notice-search")),
         (&nom, format!("{BASE}{base_path}")),
     ]);
     let taille = i64::from(PAGE_SIZE);
@@ -357,15 +359,15 @@ fn DepartementLoaded(code: String, numero: u32, page: AnnonceSearchResponse) -> 
         <Title text=title />
         <Meta name="description" content=description />
         <Link rel="canonical" href=canonical />
-        <Link rel="alternate" type_="application/rss+xml" href=format!("{BASE}/annonces.rss{filtre}") />
-        <Link rel="alternate" type_="text/calendar" href=format!("{BASE}/annonces.ics{filtre}") />
+        <Link rel="alternate" type_="application/rss+xml" href=format!("{BASE}/notice-search.rss{filtre}") />
+        <Link rel="alternate" type_="text/calendar" href=format!("{BASE}/notice-search.ics{filtre}") />
         <leptos_meta::Script type_="application/ld+json">{jsonld}</leptos_meta::Script>
 
         <div class="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-8 px-4 py-12 sm:px-6 lg:px-8">
             <header class="flex flex-col gap-3">
                 <HubBreadcrumb items=vec![
                     ("Accueil".to_string(), Some("/".to_string())),
-                    ("Annonces".to_string(), Some("/annonces".to_string())),
+                    ("Annonces".to_string(), Some("/notice-search".to_string())),
                     (nom.clone(), None),
                 ] />
                 <h1 class="font-sans text-3xl text-[var(--color-ink)]">
@@ -379,10 +381,10 @@ fn DepartementLoaded(code: String, numero: u32, page: AnnonceSearchResponse) -> 
                 </p>
                 <p class="text-sm">
                     <A
-                        href=format!("/annonces{filtre}")
+                        href=format!("/notice-search{filtre}")
                         attr:class="text-[var(--color-accent)] hover:underline"
                     >
-                        "Filtrer par nature, domaine ou échéance"
+                        "Filtrer par domaine ou métier"
                     </A>
                 </p>
             </header>
@@ -402,13 +404,13 @@ fn DepartementLoaded(code: String, numero: u32, page: AnnonceSearchResponse) -> 
                 </p>
                 <p class="flex flex-wrap gap-4 text-sm">
                     <a
-                        href=format!("/annonces.rss{filtre}")
+                        href=format!("/notice-search.rss{filtre}")
                         class="text-[var(--color-accent)] hover:underline"
                     >
                         "Flux RSS des nouveautés"
                     </a>
                     <a
-                        href=format!("/annonces.ics{filtre}")
+                        href=format!("/notice-search.ics{filtre}")
                         class="text-[var(--color-accent)] hover:underline"
                     >
                         "Calendrier des échéances (ICS)"
@@ -422,8 +424,9 @@ fn DepartementLoaded(code: String, numero: u32, page: AnnonceSearchResponse) -> 
 /// Une consultation en liste, côté pages de crawl (SSR, sans JS).
 #[component]
 fn AnnonceLigne(hit: AnnonceHit) -> impl IntoView {
-    let href = format!("/marche/{}", hit.uid);
+    let href = format!("/notice/fr/{}", hit.uid);
     let acteur = acteur(&hit);
+    let resume = description(&hit);
     let meta = ligne_meta(&hit);
     view! {
         <li class="flex flex-col gap-1 border-t border-[var(--color-rule)] py-3">
@@ -434,6 +437,14 @@ fn AnnonceLigne(hit: AnnonceHit) -> impl IntoView {
                 {hit.titre.clone()}
             </A>
             {acteur.map(|a| view! { <p class="text-sm text-[var(--color-ink-muted)]">{a}</p> })}
+            {resume
+                .map(|d| {
+                    view! {
+                        <p class="line-clamp-2 text-sm leading-snug text-[var(--color-ink-muted)]">
+                            {d}
+                        </p>
+                    }
+                })}
             <p class="text-xs text-[var(--color-ink-subtle)]">{meta}</p>
         </li>
     }
@@ -461,13 +472,16 @@ fn ligne_meta(hit: &AnnonceHit) -> String {
     if let Some(c) = hit.cpv.as_ref() {
         bouts.push(c.label.clone());
     }
+    for m in &hit.metiers {
+        bouts.push(m.label.clone());
+    }
     if hit.canaux.len() > 1 {
         bouts.push(format!("{} canaux", hit.canaux.len()));
     }
     bouts.join(" · ")
 }
 
-// ── /marche/{uid} ───────────────────────────────────────────────────────────
+// ── /notice/fr/{uid} ───────────────────────────────────────────────────────────
 
 #[component]
 pub fn MarchePage() -> impl IntoView {
@@ -498,7 +512,7 @@ pub fn MarchePage() -> impl IntoView {
                         // l'élu, l'URL doit suivre — 301 côté SSR, navigation
                         // remplacée côté client.
                         Ok(r) if params.get_untracked().get("uid").as_deref() != Some(&r.annonce.uid) => {
-                            let cible = format!("/marche/{}", r.annonce.uid);
+                            let cible = format!("/notice/fr/{}", r.annonce.uid);
                             redirection_permanente(&cible);
                             Effect::new({
                                 let cible = cible.clone();
@@ -551,6 +565,8 @@ fn redirection_permanente(_cible: &str) {}
 
 #[component]
 fn MarcheLoaded(fiche: AnnonceDetailResponse) -> impl IntoView {
+    #[cfg(feature = "hydrate")]
+    Effect::new(|_| crate::reads::report(lj_dtos::ReadKind::Annonce));
     let hit = fiche.annonce;
     let acheteur = acteur(&hit);
     let attribue = hit.attribue;
@@ -560,7 +576,14 @@ fn MarcheLoaded(fiche: AnnonceDetailResponse) -> impl IntoView {
     };
     let echeance = hit.echeance.as_deref().and_then(date_fr);
     let qui = acheteur.clone().unwrap_or_else(|| hit.titre.clone());
-    let description = match (attribue, &echeance, hit.departement_label.as_deref()) {
+    let deps: Vec<&FacetTag> = hit
+        .zones
+        .iter()
+        .filter(|z| zone_est_departement(&z.key))
+        .collect();
+    let departement = (deps.len() == 1).then(|| deps[0]);
+    let portee = portee_zones(&hit.zones);
+    let description = match (attribue, &echeance, departement.map(|z| z.label.as_str())) {
         (true, _, _) => format!(
             "Marché attribué — {qui} : titulaires, montants et nombre d'offres reçues.",
         ),
@@ -571,25 +594,23 @@ fn MarcheLoaded(fiche: AnnonceDetailResponse) -> impl IntoView {
             "Marché public — {qui} : objet, référence, avis et dossier de consultation.",
         ),
     };
-    let url = format!("{BASE}/marche/{}", hit.uid);
+    let url = format!("{BASE}/notice/fr/{}", hit.uid);
     let liens = liens_utiles(&hit, &fiche.liens);
     let releve = releve(&fiche.canaux_detail);
-    let dep_href = hit
-        .departement
-        .as_ref()
-        .map(|c| format!("/annonces/departement/{c}"));
+    let dep_href = departement.map(|z| format!("/notice-index/fr/{}", z.key));
     // Fil d'Ariane structuré seulement, comme `/decision/{id}` : la fiche ne
     // rend pas de fil visible. Les échelons sont les pages de crawl réelles
     // (catalogue → département).
     let jsonld = {
         let mut items = vec![
             ("Accueil", format!("{BASE}/")),
-            ("Marchés publics", format!("{BASE}/annonces/departement")),
+            ("Marchés publics", format!("{BASE}/notice-index/fr")),
         ];
-        if let (Some(label), Some(code)) =
-            (hit.departement_label.as_deref(), hit.departement.as_deref())
-        {
-            items.push((label, format!("{BASE}/annonces/departement/{code}")));
+        if let Some(z) = departement {
+            items.push((
+                z.label.as_str(),
+                format!("{BASE}/notice-index/fr/{}", z.key),
+            ));
         }
         items.push((&hit.titre, url.clone()));
         breadcrumb_jsonld(&items)
@@ -617,6 +638,19 @@ fn MarcheLoaded(fiche: AnnonceDetailResponse) -> impl IntoView {
                     })}
             </header>
 
+            {hit.description
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string)
+                .map(|d| {
+                    view! {
+                        <p class="whitespace-pre-line text-[15px] leading-relaxed text-[var(--color-ink)]">
+                            {d}
+                        </p>
+                    }
+                })}
+
             <dl class="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">
                 <Fait
                     terme="Remise des offres"
@@ -624,14 +658,36 @@ fn MarcheLoaded(fiche: AnnonceDetailResponse) -> impl IntoView {
                 />
                 <Fait terme="Parution" valeur=date_fr(&hit.date_publication).unwrap_or(hit.date_publication.clone()) />
                 {hit.famille.as_ref().map(|f| view! { <Fait terme="Nature" valeur=f.label.clone() /> })}
-                {hit.cpv.as_ref().map(|c| view! { <Fait terme="Catégorie (CPV)" valeur=c.label.clone() /> })}
+                {hit.cpv
+                    .as_ref()
+                    .map(|c| {
+                        let terme = match hit.cpv_deduit {
+                            true => "Catégorie (CPV), déduite du titre",
+                            false => "Catégorie (CPV)",
+                        };
+                        view! { <Fait terme=terme valeur=c.label.clone() /> }
+                    })}
+                {(!hit.metiers.is_empty())
+                    .then(|| {
+                        let metiers = hit
+                            .metiers
+                            .iter()
+                            .map(|m| m.label.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let terme = match hit.metiers_deduits {
+                            true => "Métier, déduit du titre",
+                            false => "Métier",
+                        };
+                        view! { <Fait terme=terme valeur=metiers /> }
+                    })}
                 {hit.reference
                     .as_ref()
                     .map(|r| view! { <Fait terme="Référence acheteur" valeur=r.clone() /> })}
                 {hit.procedure
                     .as_ref()
                     .map(|p| view! { <Fait terme="Procédure" valeur=p.clone() /> })}
-                {hit.departement_label
+                {portee
                     .clone()
                     .map(|d| {
                         let valeur = match &dep_href {
@@ -660,8 +716,22 @@ fn MarcheLoaded(fiche: AnnonceDetailResponse) -> impl IntoView {
                             </div>
                         }
                     })}
+                {fiche
+                    .montant_estime
+                    .map(|m| {
+                        view! {
+                            <Fait
+                                terme="Valeur estimée"
+                                valeur=somme(m.valeur, m.devise.as_deref())
+                            />
+                        }
+                    })}
                 {releve.map(|r| view! { <Fait terme="Relevé" valeur=r /> })}
             </dl>
+
+            {(!fiche.lots_ouverts.is_empty())
+                .then(|| view! { <Allotissement lots=fiche.lots_ouverts /> })}
+            {(!fiche.criteres.is_empty()).then(|| view! { <Criteres criteres=fiche.criteres /> })}
 
             {fiche.resultat.map(|r| view! { <Resultat resultat=r /> })}
 
@@ -729,12 +799,20 @@ fn MarcheLoaded(fiche: AnnonceDetailResponse) -> impl IntoView {
 /// souvent la même adresse en `url_action`, en lien d'avis et en URL de canal.
 /// Le premier libellé rencontré gagne, `url_action` d'abord — c'est le « où
 /// agir » du fond.
+/// On a market that only the BOAMP or the TED publishes, `url_action` is that
+/// notice and no platform page.
+fn libelle_action(url: &str) -> String {
+    let hote = url.split('/').nth(2).unwrap_or_default();
+    match hote.trim_start_matches("www.") {
+        "boamp.fr" => "Avis au BOAMP".to_string(),
+        "ted.europa.eu" => "Avis au JOUE".to_string(),
+        _ => "Page de la consultation sur la plateforme".to_string(),
+    }
+}
+
 fn liens_utiles(hit: &AnnonceHit, liens: &[lj_dtos::AnnonceLienDto]) -> Vec<(String, String)> {
     let mut vus = vec![hit.url_action.clone()];
-    let mut out = vec![(
-        "Page de la consultation sur la plateforme".to_string(),
-        hit.url_action.clone(),
-    )];
+    let mut out = vec![(libelle_action(&hit.url_action), hit.url_action.clone())];
     for l in liens {
         if vus.iter().any(|u| u == &l.url) {
             continue;
@@ -752,6 +830,70 @@ fn releve(canaux: &[lj_dtos::AnnonceCanalDto]) -> Option<String> {
     let date = date_fr(&premier.first_seen_at)?;
     let moteurs: Vec<&str> = canaux.iter().map(|c| c.moteur.as_str()).collect();
     Some(format!("{date} · {}", moteurs.join(", ")))
+}
+
+/// The allotment of a still-open tender, before any awardee.
+#[component]
+fn Allotissement(lots: Vec<lj_dtos::AnnonceLotOuvertDto>) -> impl IntoView {
+    let nombre = lots.len();
+    view! {
+        <section class="flex flex-col gap-3">
+            <h2 class="text-xs uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                {format!("Allotissement · {nombre} lot{}", plur(nombre as i64))}
+            </h2>
+            <ul class="flex flex-col gap-3">
+                {lots
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, lot)| {
+                        let titre = lot.nom.unwrap_or_else(|| format!("Lot {}", i + 1));
+                        view! {
+                            <li class="flex flex-col gap-0.5 border-t border-[var(--color-rule)] pt-3">
+                                <p class="text-sm text-[var(--color-ink)]">{titre}</p>
+                                {lot.description
+                                    .map(|d| {
+                                        view! {
+                                            <p class="text-sm leading-snug text-[var(--color-ink-muted)]">
+                                                {d}
+                                            </p>
+                                        }
+                                    })}
+                                {lot.cpv
+                                    .map(|c| {
+                                        view! {
+                                            <p class="text-xs text-[var(--color-ink-subtle)]">
+                                                {format!("CPV {c}")}
+                                            </p>
+                                        }
+                                    })}
+                            </li>
+                        }
+                    })
+                    .collect_view()}
+            </ul>
+        </section>
+    }
+}
+
+/// Award criteria, verbatim: a notice weighs them, splits them into
+/// sub-criteria or defers to its own rules, and none of that normalises.
+#[component]
+fn Criteres(criteres: Vec<String>) -> impl IntoView {
+    view! {
+        <section class="flex flex-col gap-3">
+            <h2 class="text-xs uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                "Critères d'attribution"
+            </h2>
+            <ul class="flex list-disc flex-col gap-1.5 pl-5">
+                {criteres
+                    .into_iter()
+                    .map(|c| {
+                        view! { <li class="text-sm leading-snug text-[var(--color-ink)]">{c}</li> }
+                    })
+                    .collect_view()}
+            </ul>
+        </section>
+    }
 }
 
 /// L'attribution d'un marché : les lots, et le renvoi vers l'avis
@@ -836,19 +978,7 @@ fn Resultat(resultat: lj_dtos::AnnonceResultatDto) -> impl IntoView {
 fn lot_meta(lot: &lj_dtos::AnnonceLotDto) -> String {
     let mut bouts: Vec<String> = Vec::new();
     if let Some(m) = lot.montant {
-        let entier = format!("{:.0}", m.max(0.0));
-        let groupe: String = entier
-            .as_bytes()
-            .rchunks(3)
-            .rev()
-            .map(|c| String::from_utf8_lossy(c).into_owned())
-            .collect::<Vec<_>>()
-            .join("\u{202f}");
-        let devise = match lot.devise.as_deref() {
-            Some("EUR") | None => "€".to_string(),
-            Some(d) => format!(" {d}"),
-        };
-        bouts.push(format!("{groupe}{devise}"));
+        bouts.push(somme(m, lot.devise.as_deref()));
     }
     if let Some(n) = lot.nb_offres {
         bouts.push(format!("{n} offre{} reçue{}", plur(n), plur(n)));
@@ -857,6 +987,22 @@ fn lot_meta(lot: &lj_dtos::AnnonceLotDto) -> String {
         bouts.push(format!("attribué le {d}"));
     }
     bouts.join(" · ")
+}
+
+/// Whole euros, grouped by thousands: notices carry no reliable cents.
+fn somme(valeur: f64, devise: Option<&str>) -> String {
+    let entier = format!("{:.0}", valeur.max(0.0));
+    let groupe: String = entier
+        .as_bytes()
+        .rchunks(3)
+        .rev()
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join("\u{202f}");
+    match devise {
+        Some("EUR") | None => format!("{groupe} €"),
+        Some(d) => format!("{groupe} {d}"),
+    }
 }
 
 fn plur(n: i64) -> &'static str {

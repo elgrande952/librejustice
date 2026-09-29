@@ -8,23 +8,50 @@
 //! `None` au SSR (session locale) puis peuple cote client : premier rendu =
 //! Connexion, swap apres hydratation.
 
-use leptos::either::Either;
+use leptos::either::{Either, EitherOf3};
 use leptos::prelude::*;
 use leptos_router::components::{ToHref, A};
 use leptos_router::hooks::{use_location, use_navigate};
 use leptos_router::NavigateOptions;
 
 use crate::components::decision_bar::{
-    use_decision_bar, use_result_nav, DecisionBarState, ResultNav, ResultNavSeed,
+    use_decision_bar, use_result_nav, DecisionBarState, ResultNav, ResultNavSeed, WorkbenchSignal,
 };
 use crate::helpers::cn;
 
 #[component]
 pub fn TopBar() -> impl IntoView {
     let bar = use_decision_bar();
-    move || match bar.get() {
-        Some(state) => Either::Left(view! { <DecisionTopBar bar=state /> }),
-        None => Either::Right(view! { <DefaultTopBar /> }),
+    let workbench = expect_context::<WorkbenchSignal>();
+    let open_document = move || {
+        workbench
+            .get()
+            .filter(|session| session.status.get() == crate::pages::redact::Status::Ready)
+    };
+    move || match (open_document(), bar.get()) {
+        (Some(session), _) => EitherOf3::A(view! { <WorkbenchTopBar session=session /> }),
+        (None, Some(state)) => EitherOf3::B(view! { <DecisionTopBar bar=state /> }),
+        (None, None) => EitherOf3::C(view! { <DefaultTopBar /> }),
+    }
+}
+
+/// The anonymisation workbench with a document open: its controls take the
+/// bar, the wordmark giving way below `lg`.
+#[component]
+fn WorkbenchTopBar(session: crate::pages::redact::Session) -> impl IntoView {
+    view! {
+        <header class="sticky top-0 z-30 border-b border-[var(--color-rule)] bg-[var(--color-parchment)]/95 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-[var(--color-parchment)]/80">
+            <div class="flex h-14 items-center gap-2 px-4 sm:gap-3 sm:px-6 lg:px-8">
+                <A
+                    href="/"
+                    attr:class="hidden shrink-0 items-center text-[var(--color-ink)] no-underline hover:opacity-90 lg:flex"
+                >
+                    <Wordmark />
+                </A>
+                <crate::pages::redact::Toolbar session=session />
+                <BurgerMenu />
+            </div>
+        </header>
     }
 }
 
@@ -60,8 +87,8 @@ fn BackButton(from_search: Option<crate::components::decision_bar::FromSearch>) 
     };
     let on_back = move |_| {
         let target = match &from_search {
-            Some(fs) => format!("/decisions{}", fs.search),
-            None => "/decisions".to_string(),
+            Some(fs) => format!("/decision-search{}", fs.search),
+            None => "/decision-search".to_string(),
         };
         // Pose la position à restaurer AVANT de naviguer : `ResultsBody` la consomme
         // à son montage et scrolle dès que la liste est peinte.
@@ -102,7 +129,7 @@ fn BackButton(from_search: Option<crate::components::decision_bar::FromSearch>) 
 fn DecisionTopBar(bar: DecisionBarState) -> impl IntoView {
     let nav_widget = |bar: &DecisionBarState| {
         bar.nav.clone().map(|nav| {
-            view! { <DecisionNavWidget nav=nav current_id=bar.id.clone() from_search=bar.from_search.clone() /> }
+            view! { <DecisionNavWidget nav=nav current_path=bar.path.clone() from_search=bar.from_search.clone() /> }
         })
     };
     let mobile_widget = nav_widget(&bar);
@@ -154,23 +181,23 @@ fn DecisionTopBar(bar: DecisionBarState) -> impl IntoView {
 }
 
 /// Navigation precedent / suivant entre resultats : l'index courant est derive
-/// de la position dans `hit_ids`, la graine de la
+/// de la position dans `hit_paths`, la graine de la
 /// cible est posee avant de naviguer (la barre de la page cible la consomme).
 #[component]
 fn DecisionNavWidget(
     nav: ResultNav,
-    current_id: String,
+    current_path: String,
     from_search: Option<crate::components::decision_bar::FromSearch>,
 ) -> impl IntoView {
     let navigate = StoredValue::new_local(use_navigate());
     let seed = use_result_nav();
 
-    let idx = nav.hit_ids.iter().position(|x| *x == current_id);
-    let len = nav.hit_ids.len();
-    let prev_id = idx.filter(|&i| i > 0).map(|i| nav.hit_ids[i - 1].clone());
-    let next_id = idx
+    let idx = nav.hit_paths.iter().position(|x| *x == current_path);
+    let len = nav.hit_paths.len();
+    let prev_path = idx.filter(|&i| i > 0).map(|i| nav.hit_paths[i - 1].clone());
+    let next_path = idx
         .filter(|&i| i + 1 < len)
-        .map(|i| nav.hit_ids[i + 1].clone());
+        .map(|i| nav.hit_paths[i + 1].clone());
     // Décision hors de la liste servie : le compteur n'a pas de rang à afficher
     // et les deux flèches seraient mortes.
     let Some(rang) = idx else {
@@ -181,25 +208,20 @@ fn DecisionNavWidget(
     let disabled_class = "flex h-7 w-7 items-center justify-center rounded border border-[var(--color-rule)] text-[var(--color-ink-subtle)] opacity-30";
 
     let go = {
-        let hit_ids = nav.hit_ids.clone();
+        let hit_paths = nav.hit_paths.clone();
         let from_search = from_search.clone();
-        move |target_id: String| {
+        move |target: String| {
             seed.set(Some(ResultNavSeed {
                 nav: Some(ResultNav {
-                    hit_ids: hit_ids.clone(),
+                    hit_paths: hit_paths.clone(),
                 }),
                 from_search: from_search.clone(),
             }));
-            navigate.with_value(|n| {
-                n(
-                    &format!("/decision/{target_id}"),
-                    NavigateOptions::default(),
-                )
-            });
+            navigate.with_value(|n| n(&target, NavigateOptions::default()));
         }
     };
 
-    let prev_view = match prev_id {
+    let prev_view = match prev_path {
         Some(pid) => {
             let go = go.clone();
             Either::Left(view! {
@@ -216,7 +238,7 @@ fn DecisionNavWidget(
         None => Either::Right(view! { <span class=disabled_class>"←"</span> }),
     };
 
-    let next_view = match next_id {
+    let next_view = match next_path {
         Some(nid) => {
             let go = go.clone();
             Either::Left(view! {
@@ -249,30 +271,19 @@ fn DecisionNavWidget(
     .into_any()
 }
 
-/// Fermeture d'un panneau flottant au clic exterieur (listener `mousedown`) et
-/// a tout changement de route (ilots client, inertes au SSR).
-fn close_on_outside_or_nav(open: RwSignal<bool>, container_ref: NodeRef<leptos::html::Div>) {
+pub(crate) fn close_on_outside_or_nav(
+    open: RwSignal<bool>,
+    container_ref: NodeRef<leptos::html::Div>,
+) {
     #[cfg(feature = "hydrate")]
     {
-        use wasm_bindgen::JsCast;
-        let handle = window_event_listener(leptos::ev::mousedown, move |ev| {
-            if !open.get_untracked() {
-                return;
-            }
-            let inside = container_ref
-                .get_untracked()
-                .zip(ev.target())
-                .and_then(|(el, target)| {
-                    target
-                        .dyn_ref::<web_sys::Node>()
-                        .map(|node| el.contains(Some(node)))
-                })
-                .unwrap_or(false);
-            if !inside {
-                open.set(false);
-            }
-        });
-        on_cleanup(move || handle.remove());
+        use crate::components::ui::panel::{dismiss, Dismiss};
+        dismiss(
+            container_ref,
+            move || open.get_untracked(),
+            move || open.set(false),
+            Dismiss::default(),
+        );
 
         let location = leptos_router::hooks::use_location();
         Effect::new(move |_| {
@@ -284,7 +295,7 @@ fn close_on_outside_or_nav(open: RwSignal<bool>, container_ref: NodeRef<leptos::
     let _ = (open, container_ref);
 }
 
-/// Corps du menu compte (email + Profil / Mon activité / Déconnexion), affiché
+/// Corps du menu compte (email + Profil / Mes signets / Déconnexion), affiché
 /// dans le panneau du hamburger (`BurgerMenu`) quand une session est active.
 #[component]
 fn AccountItems(email: String, open: RwSignal<bool>) -> impl IntoView {
@@ -321,7 +332,7 @@ fn AccountItems(email: String, open: RwSignal<bool>) -> impl IntoView {
         </div>
         <div class="py-1">
             <DropdownItem href="/profile">"Profil"</DropdownItem>
-            <DropdownItem href="/activity/searches">"Mon activité"</DropdownItem>
+            <DropdownItem href="/bookmarks">"Mes signets"</DropdownItem>
         </div>
         <div class="border-t border-[var(--color-rule)] py-1">
             <button
@@ -374,12 +385,11 @@ fn BurgerMenu() -> impl IntoView {
             >
                 <div class="py-1">
                         <DropdownItem href="/">"Accueil"</DropdownItem>
-                        <DropdownItem href="/decisions">"Décisions"</DropdownItem>
-                        <DropdownItem href="/textes">"Textes"</DropdownItem>
-                        <DropdownItem href="/annuaire">"Annuaire"</DropdownItem>
-                        <DropdownItem href="/annonces">"Annonces"</DropdownItem>
-                        <DropdownItem href="/mcp-guide">"MCP"</DropdownItem>
-                        <DropdownItem href="/api-guide">"API"</DropdownItem>
+                        <DropdownItem href="/decision-search">"Décisions"</DropdownItem>
+                        <DropdownItem href="/norm-search">"Textes"</DropdownItem>
+                        <DropdownItem href="/entity-search">"Annuaire"</DropdownItem>
+                        <DropdownItem href="/notice-search">"Annonces"</DropdownItem>
+                        <DropdownItem href="/tools">"Outils"</DropdownItem>
                     </div>
                     {move || match auth.email.get() {
                         None => Either::Left(view! {

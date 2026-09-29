@@ -34,8 +34,8 @@ pub struct JurisdictionRef {
 ///   ([`canonical_label`]), jamais recopié brut.
 ///
 /// `jurisdiction` = la cour, pour tous les ordres : la Cassation est une
-/// juridiction unique `cc`, la chambre vit dans les axes `chamber_key` /
-/// `matiere_uid`, jamais dans l'identité de juridiction.
+/// juridiction unique `cc`, la chambre vit dans le siège (`seat`), jamais dans
+/// l'identité de juridiction.
 pub fn jurisdiction_ref(
     jurisdiction_type: &str,
     location: Option<&str>,
@@ -79,7 +79,7 @@ pub fn jurisdiction_ref(
         }
         "TA" | "CAA" => {
             let city = jurisdiction_name.and_then(city_from_name)?;
-            let slug = slugify(&city);
+            let slug = lj_fold::slug(&city, '_');
             // Nomenclatures fermées (9 CAA, 42 TA) : une ville hors liste est un nom de
             // greffe corrompu (« CAA de VERSAILLESS », « Tribunal Administratif d Amiens »)
             // → `None`, jamais de code fantôme. CAA : l'appelant replie sur le code cour du
@@ -298,36 +298,7 @@ fn city_from_name(name: &str) -> Option<String> {
 
 /// Normalise un code de localisation : minuscules, espaces → `_`.
 fn normalize_location(loc: &str) -> String {
-    slugify(loc)
-}
-
-fn slugify(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                deaccent(c)
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .split('_')
-        .filter(|p| !p.is_empty())
-        .collect::<Vec<_>>()
-        .join("_")
-}
-
-fn deaccent(c: char) -> char {
-    match c {
-        'à' | 'â' | 'ä' => 'a',
-        'é' | 'è' | 'ê' | 'ë' => 'e',
-        'î' | 'ï' => 'i',
-        'ô' | 'ö' => 'o',
-        'ù' | 'û' | 'ü' => 'u',
-        'ç' => 'c',
-        _ => c,
-    }
+    lj_fold::slug(loc, '_')
 }
 
 #[cfg(test)]

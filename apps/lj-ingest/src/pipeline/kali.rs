@@ -64,7 +64,7 @@ fn kali_date_opt(iso: Option<&str>) -> Result<Option<chrono::NaiveDate>> {
 fn kali_num_key(art: &lj_extract::kali::KaliArticle, tete: Option<&str>) -> String {
     match (tete, art.kalitext.as_deref()) {
         (Some(tete), Some(piece)) if piece != tete => {
-            lj_core::article_key::piece_key(piece, &art.num_key)
+            lj_norm::article_key::piece_key(piece, &art.num_key)
         }
         _ => art.num_key.clone(),
     }
@@ -150,25 +150,46 @@ fn kali_conteneur_row(
 
 /// Ingère un stock ou un incrément KALI (`tar.gz` bulk DILA). Bootstrap manuel
 /// d'un tarball depuis le disque (dev/reprise) sans toucher au watermark.
-pub async fn ingest_kali(path: &Path) -> Result<()> {
+pub async fn ingest_kali(
+    paths: &[std::path::PathBuf],
+    textes: &[String],
+    stock_ancien: bool,
+) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    // Le refresh `code_title` final est un UPDATE-jointure pleine table (scan de tout
-    // `legal_article`) : il dépasse le statement_timeout par défaut → on le lève pour
-    // la session (l'ingest est un batch hors-ligne, pas une requête servie).
+    // The end-of-pass steps are full-table passes, and an ingest is an offline batch
+    // rather than a served request.
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
-    ingest_kali_tarball(&repo, path).await?;
+    let fraicheur = if stock_ancien {
+        lj_store::repository::Fraicheur::Rejeu
+    } else {
+        lj_store::repository::Fraicheur::Autoritaire
+    };
+    let mut touches: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (rang, path) in paths.iter().enumerate() {
+        let (u, s, e) = ingest_kali_tarball(&repo, path, textes, fraicheur, &mut touches).await?;
+        tracing::info!(
+            rang = rang + 1,
+            total = paths.len(),
+            archive = %path.display(),
+            upserted = u, skipped = s, errors = e,
+            "ingest_kali archive"
+        );
+    }
+    // Slugs first: the scoped pass below copies them onto the articles.
+    let slugged = super::slugs::assign_text_slugs(&repo).await?;
+    let portee: Vec<String> = touches.into_iter().collect();
     // Dénormalise le titre de la convention sur ses articles (`search_title`).
     let retitled = repo
-        .refresh_article_denorm()
+        .refresh_article_denorm(Some(&portee))
         .await
         .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
     // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
@@ -178,8 +199,6 @@ pub async fn ingest_kali(path: &Path) -> Result<()> {
         .await
         .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
     tracing::info!(ranked_texts, ranked_rows, "reading ranks");
-    // Slugs des textes nouveaux.
-    let slugged = super::slugs::assign_text_slugs(&repo).await?;
     tracing::info!(retitled, slugged, "ingest_kali refresh code_title");
     Ok(())
 }
@@ -190,6 +209,9 @@ pub async fn ingest_kali(path: &Path) -> Result<()> {
 async fn ingest_kali_tarball(
     repo: &DecisionRepository<'_>,
     path: &Path,
+    textes: &[String],
+    fraicheur: lj_store::repository::Fraicheur,
+    touches: &mut std::collections::HashSet<String>,
 ) -> Result<(usize, usize, usize)> {
     // Pièces de tête relues en base et non dans le tarball : un incrément livre
     // des articles dont le conteneur n'est pas du voyage, et c'est la
@@ -217,9 +239,17 @@ async fn ingest_kali_tarball(
     // canal : RAM ~constante (le stock a ~480 k membres). Le DB reste côté async.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<KaliMsg>(KALI_BATCH_SIZE * 4);
     let tar_path = path.to_path_buf();
+    let filtre: std::collections::HashSet<String> = textes.iter().cloned().collect();
     let reader = tokio::task::spawn_blocking(move || -> Result<()> {
         lj_sources::tar_reader::for_each_member(&tar_path, |name, raw| {
+            // A KALI member does not name its container in its path, unlike LEGI where
+            // the text cid is a directory of the article: the link sits inside the XML,
+            // so a named pass filters after the parse and never on the path.
             if name.to_lowercase().ends_with(".dat") {
+                // A named pass never deletes, so it drops the suppression lists.
+                if !filtre.is_empty() {
+                    return Ok(());
+                }
                 let paths: Vec<String> = String::from_utf8_lossy(&raw)
                     .lines()
                     .map(str::trim)
@@ -234,9 +264,12 @@ async fn ingest_kali_tarball(
             }
             let msg = match classify_kali_member(&name) {
                 KaliMember::Article => match lj_extract::kali::parse_kali_article(&raw) {
-                    // Article sans numéro (non citable) → hors référentiel ;
-                    // le corps des TI les consomme à part.
+                    // A numberless article cannot be cited, so it stays out
+                    // of the referential: the TI bodies consume it apart.
                     Ok(art) if art.num_key.is_empty() => return Ok(()),
+                    Ok(art) if !filtre.is_empty() && !filtre.contains(&art.kalicont) => {
+                        return Ok(())
+                    }
                     Ok(mut art) => {
                         let checksum = xxhash_rust::xxh3::xxh3_64(&raw);
                         let liens = std::mem::take(&mut art.liens);
@@ -252,11 +285,14 @@ async fn ingest_kali_tarball(
                         }
                     }
                     Err(e) => {
-                        tracing::error!(member = %name, error = %e, "kali article: parse échec");
+                        tracing::error!(member = %name, error = %e, "kali article: parse failed");
                         KaliMsg::ParseErr
                     }
                 },
                 KaliMember::Conteneur => match lj_extract::kali::parse_kali_conteneur(&raw) {
+                    Ok(cont) if !filtre.is_empty() && !filtre.contains(&cont.kalicont) => {
+                        return Ok(())
+                    }
                     Ok(cont) => match kali_conteneur_row(cont) {
                         Ok(row) => KaliMsg::Conteneur(Box::new(row)),
                         Err(e) => {
@@ -265,7 +301,7 @@ async fn ingest_kali_tarball(
                         }
                     },
                     Err(e) => {
-                        tracing::error!(member = %name, error = %e, "kali conteneur: parse échec");
+                        tracing::error!(member = %name, error = %e, "kali container: parse failed");
                         KaliMsg::ParseErr
                     }
                 },
@@ -287,13 +323,16 @@ async fn ingest_kali_tarball(
     while let Some(msg) = rx.recv().await {
         match msg {
             KaliMsg::Article(row) => {
+                touches.insert(row.0.text_uid.clone());
                 articles.push(*row);
                 if articles.len() >= KALI_BATCH_SIZE {
                     let batch = std::mem::take(&mut articles);
-                    flush_kali_articles(repo, batch, &mut upserted, &mut skipped).await?;
+                    flush_kali_articles(repo, batch, &mut upserted, &mut skipped, fraicheur)
+                        .await?;
                 }
             }
             KaliMsg::Conteneur(row) => {
+                touches.insert(row.text_uid.clone());
                 conteneurs.push(*row);
                 if conteneurs.len() >= KALI_BATCH_SIZE {
                     let batch = std::mem::take(&mut conteneurs);
@@ -309,7 +348,7 @@ async fn ingest_kali_tarball(
         .map_err(|e| anyhow!("tâche lecture KALI {}: {e}", path.display()))??;
 
     if !articles.is_empty() {
-        flush_kali_articles(repo, articles, &mut upserted, &mut skipped).await?;
+        flush_kali_articles(repo, articles, &mut upserted, &mut skipped, fraicheur).await?;
     }
     if !conteneurs.is_empty() {
         flush_kali_conteneurs(repo, conteneurs).await?;
@@ -350,6 +389,7 @@ async fn flush_kali_articles(
     )>,
     upserted: &mut usize,
     skipped: &mut usize,
+    fraicheur: lj_store::repository::Fraicheur,
 ) -> Result<()> {
     let mut link_items: Vec<(
         lj_store::repository::LegalLinkOwner,
@@ -357,7 +397,7 @@ async fn flush_kali_articles(
     )> = Vec::new();
     for (art, links) in articles {
         if repo
-            .upsert_legal_article(&art)
+            .upsert_legal_article(&art, fraicheur)
             .await
             .map_err(|e| anyhow!("upsert_legal_article {}: {e}", art.source_uid))?
         {
@@ -411,14 +451,22 @@ pub async fn sync_kali() -> Result<()> {
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
 
     let (mut upserted, mut skipped, mut errors) = (0usize, 0usize, 0usize);
+    let mut touches: std::collections::HashSet<String> = std::collections::HashSet::new();
     for archive in batch.archives.clone() {
-        let (u, s, e) = ingest_kali_tarball(&repo, &archive.path).await?;
+        let (u, s, e) = ingest_kali_tarball(
+            &repo,
+            &archive.path,
+            &[],
+            lj_store::repository::Fraicheur::Autoritaire,
+            &mut touches,
+        )
+        .await?;
         upserted += u;
         skipped += s;
         errors += e;
@@ -432,14 +480,20 @@ pub async fn sync_kali() -> Result<()> {
     // plein, donc la requalification suit ici plutôt que dans une étape à elle.
     let requalifies = requalifier_recueils(&repo, &settings, REQUALIF_LOT).await?;
 
-    // Refresh `code_title` une seule fois, après tous les tarballs du run.
-    let retitled = if batch.archives.is_empty() && requalifies == 0 {
-        0
+    // Slugs first: the scoped pass below copies them onto the articles.
+    let slugged = super::slugs::assign_text_slugs(&repo).await?;
+    let portee: Vec<String> = touches.into_iter().collect();
+    // A requalification rewrites texts the archive loop never listed, so it
+    // widens the pass back to the corpus.
+    let cible = if requalifies > 0 {
+        None
     } else {
-        repo.refresh_article_denorm()
-            .await
-            .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?
+        Some(portee.as_slice())
     };
+    let retitled = repo
+        .refresh_article_denorm(cible)
+        .await
+        .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
     // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
     // rangs, ce finisseur les recalcule.
     let (ranked_texts, ranked_rows) = repo
@@ -447,9 +501,6 @@ pub async fn sync_kali() -> Result<()> {
         .await
         .map_err(|e| anyhow!("refresh_reading_ranks: {e}"))?;
     tracing::info!(ranked_texts, ranked_rows, "reading ranks");
-
-    // Slugs des textes nouveaux.
-    let slugged = super::slugs::assign_text_slugs(&repo).await?;
 
     tracing::info!(
         increments = batch.archives.len(),
@@ -553,7 +604,7 @@ fn plan_recueil(
 /// rendre exactement la clé que [`kali_num_key`] écrirait.
 fn prefixe_de_piece(piece: Option<&str>, tete: &str) -> String {
     match piece {
-        Some(piece) if piece != tete => format!("{}-", lj_core::article_key::article_key(piece)),
+        Some(piece) if piece != tete => format!("{}-", lj_norm::article_key::article_key(piece)),
         _ => String::new(),
     }
 }
@@ -568,12 +619,12 @@ pub async fn requalifier_kali(lot: i64) -> Result<()> {
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
     if requalifier_recueils(&repo, &settings, lot).await? > 0 {
-        repo.refresh_article_denorm()
+        repo.refresh_article_denorm(None)
             .await
             .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
         repo.refresh_reading_ranks()
@@ -626,7 +677,7 @@ async fn requalifier_recueils(
             tracing::warn!(
                 recueil = %uid,
                 non_couvertes = transit.non_couvertes,
-                "requalification annulée : des articles en base sont hors du cache"
+                "requalification cancelled: some articles in the database are outside the cache"
             );
             continue;
         }
@@ -785,7 +836,7 @@ mod tests {
     fn la_requalification_vise_la_cle_que_l_ingest_ecrirait() {
         for piece in [Some(TETE), Some(ANNEXE), None] {
             for num in ["1", "2", "11 bis", "L. 3-1"] {
-                let art = art(piece, &lj_core::article_key::identity_key(num));
+                let art = art(piece, &lj_norm::article_key::identity_key(num));
                 let prefixe = prefixe_de_piece(art.kalitext.as_deref(), TETE);
                 assert_eq!(
                     format!("{prefixe}{}", art.num_key),

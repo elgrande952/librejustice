@@ -100,6 +100,15 @@ fn truncate_at_word(text: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// The `<title>` of a decision page: the canonical title minus its seat segment,
+/// which pushes the date and the docket number past the SERP display bound.
+pub fn seo_title(detail: &DecisionDetail) -> String {
+    match detail.seat.as_deref() {
+        Some(seat) => detail.title.replacen(&format!(", {seat}"), "", 1),
+        None => detail.title.clone(),
+    }
+}
+
 /// `<meta description>` : premier paragraphe du summary (ou fallback titre),
 /// tronque sur une frontiere de mot.
 ///
@@ -125,7 +134,7 @@ fn first_paragraph(summary: &str) -> &str {
 pub fn build_json_ld(detail: &DecisionDetail, title: &str, description: &str) -> serde_json::Value {
     use serde_json::{json, Map, Value};
 
-    let url = canonical_url(&detail.id);
+    let url = canonical_url(detail.jurisdiction_type, &detail.id);
     let mut common = Map::new();
     common.insert("name".into(), json!(title));
     common.insert("headline".into(), json!(title));

@@ -59,7 +59,7 @@ pub fn fetch_bofip_vigueur(dir: &Path) -> Result<PathBuf> {
         )));
     }
     fs::rename(&tmp, &dst)?;
-    tracing::info!(octets, "bofip_vigueur téléchargé");
+    tracing::info!(octets, "bofip_vigueur downloaded");
     Ok(dst)
 }
 

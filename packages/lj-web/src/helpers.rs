@@ -4,7 +4,8 @@
 //! - formatters : juridiction, score, comptes, dates FR. Logique pure (pas
 //!   d'I/O) ; les libelles longs viennent des enums DTO.
 
-use lj_dtos::JurisdictionType;
+use lj_dtos::{FacetTag, JurisdictionType};
+use lj_vocab::{zone_est_departement, ZONE_FRANCE};
 
 /// Concatene des fragments de classes Tailwind : trim, drop des vides, join sur un
 /// espace.
@@ -252,9 +253,64 @@ pub fn format_iso_date(value: Option<&str>) -> String {
     lj_dtos::format_date_fr(value)
 }
 
+/// `/decision-search?{key}={value}…`, escaped by `ParamsMap`, where a key given twice
+/// adds a value instead of replacing it: that is how a multi-valued facet passes.
+pub fn decisions_href(params: impl IntoIterator<Item = (&'static str, String)>) -> String {
+    let mut qs = leptos_router::params::ParamsMap::new();
+    for (key, value) in params {
+        qs.insert(key, value);
+    }
+    format!("/decision-search{}", qs.to_query_string())
+}
+
+/// What a market's zone list reads as on one line. A nationwide market carries
+/// every département rather than `fr`, so its first code says no more about
+/// where it is open than any other: 107 of the open markets read « Ain » that
+/// way. `None` when no zone is a département.
+pub fn portee_zones(zones: &[FacetTag]) -> Option<String> {
+    if zones.iter().any(|z| z.key == ZONE_FRANCE) {
+        return Some("France entière".to_string());
+    }
+    let deps: Vec<&FacetTag> = zones
+        .iter()
+        .filter(|z| zone_est_departement(&z.key))
+        .collect();
+    match deps.as_slice() {
+        [] => None,
+        [seul] => Some(seul.label.clone()),
+        plusieurs => Some(format!("{} départements", plusieurs.len())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_article_num;
+    use super::{format_article_num, portee_zones};
+    use lj_dtos::FacetTag;
+
+    fn tag(key: &str, label: &str) -> FacetTag {
+        FacetTag {
+            key: key.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn un_marche_national_ne_se_lit_pas_par_son_premier_departement() {
+        let france: Vec<FacetTag> = ["01", "973", "75"]
+            .iter()
+            .map(|c| tag(c, "peu importe"))
+            .collect();
+        assert_eq!(portee_zones(&france).as_deref(), Some("3 départements"));
+        assert_eq!(
+            portee_zones(&[tag("fr", "France entière"), tag("01", "Ain")]).as_deref(),
+            Some("France entière")
+        );
+        assert_eq!(
+            portee_zones(&[tag("973", "Guyane")]).as_deref(),
+            Some("Guyane")
+        );
+        assert_eq!(portee_zones(&[tag("sans", "Non précisé")]), None);
+    }
 
     #[test]
     fn format_article_num_dots_single_letter_prefixes_only() {

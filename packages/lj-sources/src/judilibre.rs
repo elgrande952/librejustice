@@ -114,8 +114,14 @@ impl JudilibreClient {
             });
         }
         let text = response.text().await?;
-        Ok(sonic_rs::from_str(&text)?)
+        parse_response(&text)
     }
+}
+
+/// Out of the async body, which compiles in its caller, at the caller's opt-level.
+#[inline(never)]
+fn parse_response(text: &str) -> Result<Value> {
+    Ok(sonic_rs::from_str(text)?)
 }
 
 /// Extrait un paramètre d'une querystring (`?key=value` ou `key=value`).

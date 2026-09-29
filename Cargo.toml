@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-# Des globs et non la liste des crates : le manifeste vaut alors pour tout arbre
-# qu'on lui donne, quels que soient les membres présents. Corollaire assumé, un
-# dossier de `packages/` ou `apps/` sans Cargo.toml fait échouer le chargement :
-# ces deux racines ne contiennent que des crates.
+# Globs rather than the crate list: the manifest then holds for any tree it is
+# given, whatever members are present. A folder of `packages/` or `apps/` with
+# no Cargo.toml fails the load, unless it is excluded here.
 members = ["packages/*", "apps/*"]
+exclude = ["apps/lj-pybench"]
 
 [workspace.package]
 edition = "2021"
@@ -31,14 +31,17 @@ tower-http = { version = "0.6", features = [
 ] }
 
 # Sérialisation
-serde = { version = "1", features = ["derive"] }
+# `rc`: serde only impls Serialize for Arc/Rc under this feature, and the moka caches of `lj-api` serialise `Arc<T>`.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value", "alloc"] }
 # sonic-rs : parse JSON SIMD sur le hot-path ingest (Judilibre). serde_json ailleurs.
 sonic-rs = "0.5"
-schemars = { version = "1", features = ["chrono04"] }
 
 # HTTP client, backend rustls uniquement : aucun OpenSSL dans le workspace.
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "form", "rustls", "gzip", "blocking", "cookies"] }
+# BoringSSL: building it wants libclang-dev and pkg-config.
+wreq = { version = "0.16", default-features = false, features = ["json", "query", "form", "gzip", "brotli", "zstd", "cookies", "socks", "tokio-rt", "webpki-roots"] }
+wreq-util = "0.2"
 # Parsing d'URL. Un controle de redirect_uri OAuth compare un HOST, pas un prefixe
 # de chaine : `starts_with("http://localhost")` matche `localhost.attaquant.tld`.
 url = "2"
@@ -52,6 +55,8 @@ reqwest-tracing = "0.7"
 # point-stuffing de DATA, et surtout le refus d'un CRLF dans une adresse -- un
 # `Reply-To` non valide ouvrirait un relais a spam sur un formulaire anonyme.
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1", "pool"] }
+
+async-trait = "0.1"
 
 # Relève IMAP. async-imap est agnostique du TLS (il accepte n'importe quel
 # Read+Write) : tokio-rustls le chiffre avec le fournisseur déjà dans l'arbre,
@@ -83,6 +88,7 @@ quick-xml = "0.41"
 # Texte / regex / single-pass tokenizer
 regex = "1"
 aho-corasick = "1"
+memchr = "2"
 # Diff de rédactions d'articles pour le comparateur de versions.
 similar = { version = "3", features = ["unicode"] }
 html-escape = "0.2"
@@ -137,11 +143,12 @@ aws-lc-rs = "1"
 # getrandom : octets CSPRNG de l'OS (syscall getrandom(2)) pour les secrets
 # OAuth — remplace un read bloquant de /dev/urandom sur le thread async.
 getrandom = "0.4"
+# sha2: the PKCE S256 challenge, the only method the OpenAI device grant takes.
+sha2 = "0.10"
 # argon2 aux parametres OWASP de `Argon2::default()` (19 Mio, t=2, p=1). bcrypt
 # ne verifie plus que les `$2a$10$` herites, reecrits en argon2id a la connexion.
 argon2 = "0.5"
 bcrypt = "0.17"
-rmcp = { version = "1", features = ["server", "macros"] }
 
 # Cache in-process (mono-serveur axum) : remplace le conteneur Valkey. moka
 # try_get_with coalesce les chargements concurrents = lock anti-stampede natif.
@@ -154,8 +161,6 @@ printpdf = { version = "0.9", default-features = false }
 # printpdf en `default-features=false` n'embarque pas le parseur de police
 # (azul-layout) ; on alimente nous-mêmes ses maps glyphes via ttf-parser.
 ttf-parser = "0.25"
-# Extraction texte PDF born-digital, crate pur Rust : aucune dépendance native.
-pdf-extract = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3", "const_xxh64"] }
 # blake3 : MAC à clé (`keyed_hash`) des pseudonymes d'usage. xxh3, déjà là, est
 # non cryptographique et n'offre aucune résistance en clé.
@@ -169,18 +174,16 @@ tar = "0.4"
 ndarray = "0.17"
 tokenizers = "0.23"
 
-# Dates : jiff pour la logique métier (parsing dates FR en extraction) ; chrono
-# conservé uniquement comme codec timestamptz de tokio-postgres.
-# tzdb-bundle-always : l'image de prod (ubuntu:24.04) n'a pas tzdata, or les
-# échéances de marchés (lj-core annonces) se posent en Europe/Paris.
+# jiff for the business logic, chrono only as tokio-postgres' timestamptz codec.
+# tzdb-bundle-always: the prod image (ubuntu:24.04) has no tzdata, and market
+# deadlines (lj-annonces) are set in Europe/Paris.
 jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 chrono = { version = "0.4", features = ["serde"] }
 
-# Front SSR/hydration (Leptos 0.8 + cargo-leptos). default-features=false sur
-# chaque crate : les features ssr/hydrate fan-out depuis lj-web. wasm-bindgen
-# epingle =0.2.108 (force par js-sys 0.3.85 dans l'arbre leptos 0.8.19 ;
-# DOIT matcher le wasm-bindgen-cli pilote par cargo-leptos, sinon hydration
-# cassee au runtime — confirmer le pin du cli au premier `cargo leptos build`).
+# Front SSR/hydration (Leptos 0.8 + cargo-leptos). default-features=false on
+# every crate: the ssr/hydrate features fan out from lj-web. wasm-bindgen is
+# pinned exactly: it MUST equal the `wasm-bindgen` CLI in ~/.local/bin, called
+# by cargo-leptos and by `redact-wasm` (WASM_BINDGEN_VERSION in the bootstrap).
 leptos = { version = "0.8.19", default-features = false }
 leptos_router = { version = "0.8.13", default-features = false }
 leptos_meta = { version = "0.8.6", default-features = false }
@@ -191,22 +194,44 @@ leptos-fetch = { version = "0.4.10", default-features = false }
 # deux statics et notre executeur ne remplacerait plus rien. `install()` echoue
 # franchement si la course est perdue, plutot que de laisser la panne muette.
 any_spawner = "0.3"
-wasm-bindgen = "=0.2.108"
-wasm-bindgen-futures = "0.4.58"
-js-sys = "0.3.85"
+wasm-bindgen = "=0.2.128"
+wasm-bindgen-futures = "0.4.78"
+js-sys = "0.3.105"
 console_error_panic_hook = "0.1.7"
-web-sys = "0.3.85"
+web-sys = "0.3.105"
 # Rend `Send` les futures de fetch cote wasm (single-thread) : les Resource
 # SSR-primees de la page decision exigent `Fut: Send`, mais reqwest/fetch et le
 # shim auth (`JsFuture`) sont `!Send` sur wasm. Meme version que leptos.
 send_wrapper = { version = "0.6", features = ["futures"] }
 
 # Workspace-internal crates
+lj-annonces = { path = "packages/lj-annonces" }
+lj-chunk = { path = "packages/lj-chunk" }
 lj-core = { path = "packages/lj-core" }
+lj-parse = { path = "packages/lj-parse" }
+lj-norm = { path = "packages/lj-norm" }
+lj-textsearch = { path = "packages/lj-textsearch" }
+lj-crawlers = { path = "packages/lj-crawlers" }
+lj-versions = { path = "packages/lj-versions" }
 lj-extract = { path = "packages/lj-extract" }
+lj-extract-rows = { path = "packages/lj-extract-rows" }
+lj-quantum = { path = "packages/lj-quantum" }
+lj-fold = { path = "packages/lj-fold" }
+lj-vocab = { path = "packages/lj-vocab" }
+lj-summary = { path = "packages/lj-summary" }
+lj-suggest = { path = "packages/lj-suggest" }
+lj-identity = { path = "packages/lj-identity" }
+lj-mail = { path = "packages/lj-mail" }
+lj-mcp-tools = { path = "packages/lj-mcp-tools" }
+lj-draw = { path = "packages/lj-draw" }
+lj-image = { path = "packages/lj-image" }
+lj-redact-core = { path = "packages/lj-redact-core" }
+lj-pdf = { path = "packages/lj-pdf", default-features = false }
+lj-office = { path = "packages/lj-office" }
 lj-telemetry = { path = "packages/lj-telemetry" }
 lj-store = { path = "packages/lj-store" }
 lj-sources = { path = "packages/lj-sources" }
+lj-sources-annonces = { path = "packages/lj-sources-annonces" }
 lj-llm = { path = "packages/lj-llm" }
 lj-dtos = { path = "packages/lj-dtos" }
 lj-api = { path = "packages/lj-api" }
@@ -234,6 +259,8 @@ site-addr = "127.0.0.1:3000"
 reload-port = 3001
 lib-features = ["hydrate"]
 lib-default-features = false
+# The erase cfg comes from .cargo/config.toml, the same for every build.
+disable-erase-components = true
 # Noms de bundle content-hashés, donc `/pkg` peut être servi `immutable` un an :
 # un nouveau build donne de nouveaux noms, et le navigateur ne peut pas hydrater
 # un wasm périmé face au HTML SSR neuf. `hash.txt` suit le binaire au
@@ -273,6 +300,7 @@ site-addr = "127.0.0.1:3000"
 reload-port = 3001
 lib-features = ["hydrate"]
 lib-default-features = false
+disable-erase-components = true
 hash-files = false
 front-target-dir = "target/wasm"
 
@@ -292,15 +320,20 @@ codegen-units = 16
 incremental = true
 overflow-checks = true
 
-# opt-0 sur les deux crates serveur les plus lourds à recompiler : un changement
-# en amont de `lj-web` force le recodegen release de cette clôture, qui passe de
-# quatre minutes à une. Les dépendances externes restent opt-3, cachées. Le
-# bundle wasm est protégé par l'override `wasm-release.package.lj-web` plus bas,
-# sinon il hériterait de cet opt-0. En échange, le render SSR double et le
-# binaire grossit de 24 Mo.
+# opt-0 on the four crates almost every build recompiles: lj-web drops from
+# 84 s to 33 s, lj-server from 35 s to 11 s, lj-ingest from 117 s to 22 s, and
+# SSR render is 1.6 times slower where it dominates, on the code tables.
+# External dependencies stay opt-3, cached. `wasm-release.package.lj-web` below
+# keeps the bundle out of it.
 [profile.release.package.lj-web]
 opt-level = 0
 [profile.release.package.lj-api]
+opt-level = 0
+[profile.release.package.lj-server]
+opt-level = 0
+# lj-ingest's hot loops live in opt-3 libraries, synchronous and non-generic:
+# an async body or a generic is compiled in its caller, here at opt-0.
+[profile.release.package.lj-ingest]
 opt-level = 0
 
 # Profil du bundle wasm (lib hydrate), sélectionné via `lib-profile-release`
@@ -342,3 +375,31 @@ tachys = { git = "https://github.com/librejustice/tachys", rev = "d71bd744216275
 # besoin des numéros passe `CARGO_PROFILE_DEV_DEBUG=line-tables-only`.
 [profile.dev]
 debug = 0
+
+# The redaction module draws pages as SVG, and decodes and re-encodes their
+# images: those crates at opt-3, the rest at opt-z. Measured on 24/09/2026, 1 396
+# KB brotli against 1 658 at opt-3 throughout and 1 262 at opt-z throughout,
+# where the heaviest page of a 211-image PDF draws in 348 ms against 209 here.
+# The slow reader spends its time in tract's kernels, at opt-3 throughout.
+[profile.htr-release]
+inherits = "wasm-release"
+opt-level = 3
+overflow-checks = false
+
+[profile.redact-release]
+inherits = "wasm-release"
+overflow-checks = false
+
+[profile.redact-release.package]
+lj-pdf = { opt-level = 3 }
+lj-draw = { opt-level = 3 }
+lj-image = { opt-level = 3 }
+lj-redact-core = { opt-level = 3 }
+miniz_oxide = { opt-level = 3 }
+flate2 = { opt-level = 3 }
+simd-adler32 = { opt-level = 3 }
+hayro-jpeg2000 = { opt-level = 3 }
+hayro-jbig2 = { opt-level = 3 }
+hayro-ccitt = { opt-level = 3 }
+jpeg-decoder = { opt-level = 3 }
+jpeg-encoder = { opt-level = 3 }

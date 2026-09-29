@@ -16,36 +16,33 @@ leptos = { workspace = true }
 leptos_router = { workspace = true }
 leptos_meta = { workspace = true }
 leptos-fetch = { workspace = true }
+leptos-use = { version = "0.19.2", default-features = false, optional = true, features = ["on_click_outside", "use_event_listener", "use_intersection_observer", "use_preferred_dark"] }
 
 # --- DTOs (noyau leger serde-pur ; present ssr ET hydrate/wasm) ---
-# Sans feature `jsonschema` : pur serde, compile en wasm32. PAS de lj-core
-# (tire tokenizers/quick-xml, incompatibles wasm).
+# Without the `jsonschema` feature: pure serde, compiles to wasm32. No lj-core,
+# whose embedded tables weigh 9 MB.
 lj-dtos = { workspace = true }
+lj-fold = { workspace = true }
+lj-vocab = { workspace = true }
 
 # --- Client HTTP (ssr: backend rustls/tokio ; wasm: backend fetch du navigateur,
 # tls/gzip inertes). Present dans les deux cibles : un seul code client. ---
 reqwest = { workspace = true }
 
-# --- Solveur de preuve de travail : present dans les deux cibles, pur Rust ---
-base64 = { workspace = true }
-
 # --- serveur uniquement (SSR), gates dep: dans la feature ssr ---
 leptos_axum = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tower = { workspace = true, optional = true }
-tower-http = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Couche service in-process consommée par le client SSR : search /
-# decisions / ensure_summary appelés sans HTTP. Tirée uniquement par `ssr` →
-# jamais dans la cible wasm (hydrate).
-lj-api = { workspace = true, optional = true }
+# The SSR backend is a trait lj-server implements over lj-api: the front does
+# not depend on the service layer, whose changes would rebuild it.
+async-trait = { workspace = true, optional = true }
 
 # --- client uniquement (hydrate / wasm), gates dep: dans la feature hydrate ---
 wasm-bindgen = { workspace = true, optional = true }
 wasm-bindgen-futures = { workspace = true, optional = true }
 js-sys = { workspace = true, optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
 console_error_panic_hook = { workspace = true, optional = true }
 # Les features de web-sys sont additives : une interface qui manque est une
 # ligne à ajouter ici, pas un shim JS à écrire.
@@ -75,12 +72,29 @@ web-sys = { workspace = true, optional = true, features = [
   "ScrollIntoViewOptions",
   "ScrollBehavior",
   "ScrollLogicalPosition",
+  "Performance",
+  "Blob",
+  "BlobPropertyBag",
+  "CanvasRenderingContext2d",
+  "CssStyleDeclaration",
+  "DataTransfer",
+  "DragEvent",
+  "File",
+  "FileList",
+  "FontFace",
+  "FontFaceSet",
+  "HtmlAnchorElement",
+  "HtmlCanvasElement",
+  "HtmlElement",
+  "HtmlImageElement",
+  "HtmlInputElement",
+  "ImageBitmap",
+  "ImageData",
+  "PointerEvent",
+  "Response",
+  "Url",
 ] }
 send_wrapper = { workspace = true, optional = true }
-
-[dev-dependencies]
-# Implementation officielle du protocole, confrontee a notre solveur par un test
-# hote : le crate ne compile pas en wasm, un dev-dependency ne part pas au front.
 
 [features]
 # default = ssr : un `cargo build`/`clippy`/`test` workspace host compile le binaire
@@ -92,8 +106,10 @@ hydrate = [
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
+    "dep:serde-wasm-bindgen",
     "dep:console_error_panic_hook",
     "dep:web-sys",
+    "dep:leptos-use",
     "dep:send_wrapper",
 ]
 ssr = [
@@ -105,11 +121,10 @@ ssr = [
     # `default` de leptos_axum = handlers fs (file_and_error_handler / ServeDir).
     "leptos_axum/default",
     "dep:axum",
-    "dep:tokio",
-    "dep:tower",
-    "dep:tower-http",
-    "dep:lj-api",
+    "dep:async-trait",
 ]
 
 # La config cargo-leptos vit au niveau workspace (`[[workspace.metadata.leptos]]`
 # dans le Cargo.toml racine) : projet multi-crate bin=lj-server / lib=lj-web.
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]

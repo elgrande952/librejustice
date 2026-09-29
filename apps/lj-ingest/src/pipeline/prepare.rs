@@ -5,14 +5,14 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
 
+use lj_chunk::{chunk_char, DEFAULT_OVERLAP_MAX, DEFAULT_OVERLAP_MIN};
 use lj_core::decision::Decision;
-use lj_core::parsing::{
+use lj_parse::{
     build_source_fields, build_source_fields_dila, build_source_fields_xml, parse_judilibre,
-    parse_xml,
+    parse_xml, FromSourceFields,
 };
+use lj_sources::downloader::parse_decision_line;
 use lj_store::repository::ExistingDecisionState;
-
-use crate::chunking::{chunk_char, DEFAULT_OVERLAP_MAX, DEFAULT_OVERLAP_MIN};
 
 use super::{
     content_checksum, generate_public_id, Candidate, IngestMode, PreparedDecision, WriteMode,
@@ -25,7 +25,7 @@ use super::{
 pub(super) fn classify_xml(raw: Vec<u8>, member: &str, archive_name: &str) -> Option<Candidate> {
     let decision = parse_xml(&raw, member, Some(archive_name));
     if decision.jurisdiction_type.is_none() {
-        tracing::warn!(uid = %decision.source_uid, "UID non reconnu, skip");
+        tracing::warn!(uid = %decision.source_uid, "UID not recognised, skip");
         return None;
     }
     let checksum = content_checksum(&raw);
@@ -38,6 +38,7 @@ pub(super) fn classify_xml(raw: Vec<u8>, member: &str, archive_name: &str) -> Op
         payload_format: "xml".to_string(),
         write_mode: WriteMode::Full,
         dila_fond: None,
+        passages: true,
         prebuilt_source_fields: None,
         prebuilt_extracted: None,
     })
@@ -45,11 +46,10 @@ pub(super) fn classify_xml(raw: Vec<u8>, member: &str, archive_name: &str) -> Op
 
 /// Parse + classe une ligne JSON Judilibre.
 pub(super) fn classify_judilibre(line: Vec<u8>) -> Result<Option<Candidate>> {
-    let payload: serde_json::Value =
-        sonic_rs::from_slice(&line).context("ligne Judilibre JSON invalide")?;
+    let payload = parse_decision_line(&line).context("ligne Judilibre JSON invalide")?;
     let decision = parse_judilibre(&payload, None);
     if decision.jurisdiction_type.is_none() {
-        tracing::warn!(uid = %decision.source_uid, "UID Judilibre non reconnu, skip");
+        tracing::warn!(uid = %decision.source_uid, "Judilibre UID not recognised, skip");
         return Ok(None);
     }
     let checksum = content_checksum(&line);
@@ -62,6 +62,7 @@ pub(super) fn classify_judilibre(line: Vec<u8>) -> Result<Option<Candidate>> {
         payload_format: "json".to_string(),
         write_mode: WriteMode::Full,
         dila_fond: None,
+        passages: true,
         prebuilt_source_fields: None,
         prebuilt_extracted: None,
     }))
@@ -176,7 +177,7 @@ pub(super) fn chunk_write(
         Some(sf) => sf,
         None => match candidate.payload_format.as_str() {
             "json" => {
-                let payload: serde_json::Value = sonic_rs::from_slice(&candidate.raw_payload)
+                let payload = parse_decision_line(&candidate.raw_payload)
                     .with_context(|| format!("re-parse JSON pour source_fields {source_uid}"))?;
                 build_source_fields(&payload, &candidate.decision.sections)
             }
@@ -218,7 +219,7 @@ pub(super) fn chunk_write(
 
     let cleaned = &decision.texte_integral_clean;
     if cleaned.is_empty() {
-        tracing::warn!(uid = %source_uid, "Texte vide après clean, skip");
+        tracing::warn!(uid = %source_uid, "Empty text after clean, skip");
         return Ok(None);
     }
 
@@ -226,16 +227,20 @@ pub(super) fn chunk_write(
     // l'heuristique chars/token sous-estime et qu'un chunk dépasse le contexte de
     // l'embedder, `embed_prepared` re-chunke ce batch en BPE exact (`rechunk_bpe`) et
     // ré-essaie.
-    let chunks = chunk_char(
-        cleaned,
-        &decision.metadata_header,
-        &decision.visa_trim,
-        chunk_tokens,
-        DEFAULT_OVERLAP_MIN,
-        DEFAULT_OVERLAP_MAX,
-        None,
-    )
-    .map_err(|e| anyhow!("chunk_char {source_uid}: {e}"))?;
+    let chunks = if candidate.passages {
+        chunk_char(
+            cleaned,
+            &decision.metadata_header,
+            &decision.visa_trim,
+            chunk_tokens,
+            DEFAULT_OVERLAP_MIN,
+            DEFAULT_OVERLAP_MAX,
+            None,
+        )
+        .map_err(|e| anyhow!("chunk_char {source_uid}: {e}"))?
+    } else {
+        Vec::new()
+    };
 
     Ok(Some(PreparedDecision {
         decision_id: candidate.decision_id,
@@ -264,20 +269,26 @@ pub(super) fn extract_write(
     if prepared.write_mode == WriteMode::SourceXmlOnly {
         return Ok(prepared);
     }
-    let full = lj_ingest::extract::extracted_fields(&prepared.decision, &ctx.snapshots())
+    let full = lj_extract_rows::extracted_fields(&prepared.decision, &ctx.snapshots())
         .map_err(|e| anyhow!("extract {}: {e}", prepared.decision.source_uid))?;
     // Ce qui ne vit que dans `source_fields` (le nom d'affaire du docname CEDH)
     // se relit ici comme à la ré-extraction.
     let prebuilt = prepared.prebuilt_extracted.take().or_else(|| {
-        lj_ingest::extract::prebuilt_from_source_fields(
+        lj_extract_rows::prebuilt_from_source_fields(
             &prepared.decision.source_uid,
             &prepared.source_fields,
         )
     });
-    prepared.extracted = Some(match prebuilt {
-        Some(pre) => lj_ingest::extract::merge_prebuilt(pre, full),
+    let merged = match prebuilt {
+        Some(pre) => lj_extract_rows::merge_prebuilt(pre, full),
         None => full,
-    });
+    };
+    prepared.extracted = Some(lj_extract_rows::with_search_title(
+        merged,
+        prepared.decision.jurisdiction_type.as_deref(),
+        &ctx.jur_labels,
+        None,
+    ));
     Ok(prepared)
 }
 
@@ -299,6 +310,7 @@ mod tests {
                 payload_format: "xml".to_string(),
                 write_mode: WriteMode::Full,
                 dila_fond: None,
+                passages: true,
                 prebuilt_source_fields: None,
                 prebuilt_extracted: None,
             }
@@ -352,6 +364,7 @@ mod tests {
                 payload_format: "xml".to_string(),
                 write_mode: WriteMode::Full,
                 dila_fond: None,
+                passages: true,
                 prebuilt_source_fields: None,
                 prebuilt_extracted: None,
             }
@@ -377,6 +390,7 @@ mod tests {
                 payload_format: "xml".to_string(),
                 write_mode: WriteMode::Full,
                 dila_fond: None,
+                passages: true,
                 prebuilt_source_fields: None,
                 prebuilt_extracted: None,
             }

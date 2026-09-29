@@ -90,7 +90,7 @@ pub async fn rename_texts(dataset: &Path) -> Result<()> {
             None => skipped += 1,
         }
     }
-    let denorm = repo.refresh_article_denorm().await?;
+    let denorm = repo.refresh_article_denorm(None).await?;
     let (ranked_texts, _) = repo.refresh_reading_ranks().await?;
     tracing::info!(
         renamed,

@@ -1,26 +1,5 @@
-//! Logging applicatif.
-//!
-//! - Niveau `TRACE` sous `DEBUG` pour les mesures très verbeuses ;
-//! - Parsing de l'env `LIBREJUSTICE_LOG_LEVEL` (`trace`/`debug`/`info`/
-//!   `warning`/`error`/`critical` ou un entier) ;
-//! - Un seul subscriber stdout global (idempotent) ;
-//! - Format JSON optionnel si `LOG_FORMAT=json`, sinon format texte
-//!   `<ts> <LEVEL> <target>: <msg>`.
-//!
-//! Les données structurées passent en champs de span/event `tracing`
-//! (`info!(count = 42, ms = 3.1, "upsert fait")`), captés nativement par le
-//! formatter.
-//!
-//! L'installation du subscriber vit dans `lj-telemetry`. Ce module se limite à
-//! résoudre le niveau et le format pour les `InitOpts`.
-
 use tracing::Level;
 
-/// Parse un niveau depuis une string (`info`, `trace`, …) ou un entier.
-///
-/// Valeur absente/vide → `INFO`. Pas de `CRITICAL` distinct → `ERROR`. Une
-/// string entière est un seuil : `>= 50` → error, `>= 40` → error, `>= 30` →
-/// warn, `>= 20` → info, `>= 10` → debug, sinon trace.
 fn parse_log_level(value: Option<&str>) -> Level {
     let Some(raw) = value else {
         return Level::INFO;
@@ -35,7 +14,6 @@ fn parse_log_level(value: Option<&str>) -> Level {
         "info" => Level::INFO,
         "warning" | "warn" => Level::WARN,
         "error" => Level::ERROR,
-        // `critical` n'a pas d'équivalent `tracing` : on rabat sur ERROR.
         "critical" => Level::ERROR,
         other => match other.parse::<i32>() {
             Ok(n) => level_from_int(n),
@@ -44,7 +22,6 @@ fn parse_log_level(value: Option<&str>) -> Level {
     }
 }
 
-/// Mappe un seuil entier façon `logging` (CRITICAL=50…TRACE=5) vers `tracing`.
 fn level_from_int(n: i32) -> Level {
     if n >= 40 {
         Level::ERROR
@@ -59,8 +36,6 @@ fn level_from_int(n: i32) -> Level {
     }
 }
 
-/// Résout le niveau de log effectif : argument explicite >
-/// `LIBREJUSTICE_LOG_LEVEL` > `INFO`.
 pub fn resolve_level(level: Option<&str>) -> Level {
     match level {
         Some(value) => parse_log_level(Some(value)),
@@ -68,7 +43,6 @@ pub fn resolve_level(level: Option<&str>) -> Level {
     }
 }
 
-/// Format de sortie du layer fmt : `LOG_FORMAT=json` → JSON, sinon texte.
 pub fn json_format() -> bool {
     matches!(std::env::var("LOG_FORMAT"), Ok(v) if v == "json")
 }

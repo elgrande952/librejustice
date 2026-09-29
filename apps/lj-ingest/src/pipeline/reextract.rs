@@ -7,8 +7,9 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 
 use lj_core::decision::Decision;
+use lj_parse::FromSourceFields;
 use lj_store::db::Pool;
-use lj_store::repository::{DecisionRepository, ExtractedFields, REEXTRACTABLE_FIELDS};
+use lj_store::repository::{Courts, DecisionRepository, ExtractedFields, REEXTRACTABLE_FIELDS};
 
 use crate::config::Settings;
 
@@ -30,7 +31,7 @@ pub async fn reextract_fields(
     fields: Option<&[String]>,
     dry_run: bool,
     full: bool,
-    jurisdiction_types: Option<&[String]>,
+    courts: Option<&Courts>,
     citing_ref_uid: Option<&str>,
     text_query: Option<&str>,
     workers: Option<usize>,
@@ -38,23 +39,18 @@ pub async fn reextract_fields(
     let settings = Settings::from_env()?;
     let selected = normalize_reextract_fields(fields)?;
 
-    // Concurrence DB = nombre de workers (une connexion chacun). Override explicite
-    // `--workers N` ; défaut auto : ~cœurs − 4, borné [2, 8].
-    let workers = workers.map(|w| w.max(1)).unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(4))
-            .unwrap_or(4)
-            .clamp(2, 8)
-    });
+    // Fixed, not sized on the machine: a manual pass lands mid-day on a database
+    // that is serving traffic. The nightly chain asks for 8 explicitly.
+    let workers = workers.map(|w| w.max(1)).unwrap_or(3);
     let pool = lj_store::db::build_pool(&settings.db_url, workers + 1)
         .map_err(|e| anyhow!("build_pool: {e}"))?;
 
-    // Worklist : un seul scan (`stale_decision_ids_for_reextract`). Modes scopés
-    // (`--juridiction-type` / `--citing-ref-uid`) : on draine leur keyset pour bâtir
-    // la même worklist, puis on parallélise pareil.
-    let ids = build_worklist(&pool, full, jurisdiction_types, citing_ref_uid, text_query).await?;
+    // Worklist: one scan (`stale_decision_ids_for_reextract`). A scoped mode
+    // (courts, `--citing-ref-uid`) drains its keyset into the same worklist,
+    // parallelised the same way.
+    let ids = build_worklist(&pool, full, courts, citing_ref_uid, text_query).await?;
     let total = ids.len();
-    tracing::info!(total, workers, "reextract : worklist construite");
+    tracing::info!(total, workers, "reextract: worklist built");
     if ids.is_empty() {
         return Ok(());
     }
@@ -115,7 +111,7 @@ pub async fn reextract_fields(
     tracing::info!(
         processed = processed.load(Ordering::Relaxed),
         errors = errors.load(Ordering::Relaxed),
-        "Re-extraction terminée"
+        "Re-extraction done"
     );
 
     if dry_run {
@@ -135,7 +131,7 @@ pub async fn reextract_fields(
     } else {
         repo.refresh_annuaire_scoped(&ids).await?
     };
-    tracing::info!(annuaire, "annuaire rafraîchi en fin de reextract");
+    tracing::info!(annuaire, "directory refreshed at the end of reextract");
     Ok(())
 }
 
@@ -192,7 +188,7 @@ impl DiffReport {
                 divergent = count,
                 sur = total,
                 exemples = ?samples,
-                "dry-run : colonne que la passe réécrirait"
+                "dry-run: column the pass would rewrite"
             );
         }
         let intactes: Vec<&str> = self
@@ -201,13 +197,13 @@ impl DiffReport {
             .filter(|(_, (c, _))| *c == 0)
             .map(|(f, _)| f.as_str())
             .collect();
-        tracing::info!(?intactes, "dry-run : colonnes identiques à l'extracteur");
+        tracing::info!(?intactes, "dry-run: columns identical to the extractor");
         for (layer, muet) in &self.satellites {
             tracing::info!(
                 layer,
                 extracteur_muet = muet,
                 sur = total,
-                "dry-run : couche satellite que la passe purgerait"
+                "dry-run: satellite layer the pass would purge"
             );
         }
     }
@@ -219,23 +215,29 @@ impl DiffReport {
 async fn build_worklist(
     pool: &Pool,
     full: bool,
-    jurisdiction_types: Option<&[String]>,
+    courts: Option<&Courts>,
     citing_ref_uid: Option<&str>,
     text_query: Option<&str>,
 ) -> Result<Vec<i64>> {
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    conn.batch_execute("SET statement_timeout = 0").await?;
+    // The worklist scan sweeps all of `decisions`; a parallel plan would take up to
+    // 4 of the 10 workers the whole cluster shares, out of the searches being served.
+    conn.batch_execute(
+        "SET statement_timeout = 0; \
+         SET max_parallel_workers_per_gather = 0",
+    )
+    .await?;
     let repo = DecisionRepository::new(&conn);
     if full {
         return Ok(repo.all_decision_ids_for_reextract().await?);
     }
-    match (citing_ref_uid, jurisdiction_types) {
+    match (citing_ref_uid, courts) {
         (None, None) => Ok(repo.stale_decision_ids_for_reextract().await?),
         // Ciblé par texte cité : un seul scan GIN-piloté.
         (Some(uid), _) => Ok(repo
             .decision_ids_for_reextract_by_citing_ref_uid(uid)
             .await?),
-        (None, Some(jts)) => {
+        (None, Some(courts)) => {
             let mut out = Vec::new();
             let mut last_id = 0i64;
             loop {
@@ -243,7 +245,7 @@ async fn build_worklist(
                     .decision_ids_for_reextract_by_juridiction(
                         last_id,
                         SCAN_PAGE as i64,
-                        jts,
+                        courts,
                         text_query,
                     )
                     .await?;
@@ -320,7 +322,7 @@ async fn worker_loop(
             match item {
                 Ok(pair) => items.push(pair),
                 Err(e) => {
-                    tracing::error!(error = %e, "reextract échec");
+                    tracing::error!(error = %e, "reextract failed");
                     batch_errors += 1;
                 }
             }
@@ -386,26 +388,22 @@ fn reextract_one(
     ctx: &super::ExtractCtx,
 ) -> Result<ExtractedFields> {
     let decision = Decision::from_source_fields(full_text, source_fields, source_uid);
-    let full = lj_ingest::extract::extracted_fields(&decision, &ctx.snapshots())
+    let full = lj_extract_rows::extracted_fields(&decision, &ctx.snapshots())
         .map_err(|e| anyhow!("extract id={decision_id}: {e}"))?;
     // Même superposition qu'à l'ingest (`prepare::extract_write`).
-    let mut fields =
-        match lj_ingest::extract::prebuilt_from_source_fields(source_uid, source_fields) {
-            Some(pre) => lj_ingest::extract::merge_prebuilt(pre, full),
-            None => full,
-        };
+    let fields = match lj_extract_rows::prebuilt_from_source_fields(source_uid, source_fields) {
+        Some(pre) => lj_extract_rows::merge_prebuilt(pre, full),
+        None => full,
+    };
     // The stored name does not go back into `case_name`: `set_source_case_names`
     // would rewrite it at rank `source`, above whoever elected it. It only feeds
-    // the title, which nothing else protects from a nameless recomposition.
-    if fields.case_name.is_none() && case_name.is_some() {
-        fields.search_title = lj_ingest::extract::compose_search_title(
-            &fields,
-            decision.jurisdiction_type.as_deref(),
-            &ctx.jur_labels,
-            case_name,
-        );
-    }
-    Ok(fields)
+    // the title.
+    Ok(lj_extract_rows::with_search_title(
+        fields,
+        decision.jurisdiction_type.as_deref(),
+        &ctx.jur_labels,
+        case_name,
+    ))
 }
 
 /// Normalise la liste de champs ré-extractibles.

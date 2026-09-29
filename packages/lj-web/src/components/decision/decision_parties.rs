@@ -53,7 +53,7 @@ pub fn DecisionParties(parties: Vec<DecisionPartyDto>) -> impl IntoView {
     view! {
         <section
             aria-label="Parties"
-            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6"
+            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6 print:hidden"
         >
             <h2 class="font-sans text-base text-[var(--color-ink)]">"Parties"</h2>
             <div class="mt-4 grid gap-6 sm:grid-cols-2">
@@ -169,7 +169,7 @@ fn party_label(party: DecisionPartyDto) -> AnyView {
         .into_any();
     };
     let (ns, local) = split_entity_uid(&uid);
-    let href = format!("/entite/{ns}/{local}");
+    let href = lj_vocab::entity_path(ns, local);
     view! {
         <A
             href=href

@@ -41,7 +41,7 @@ pub async fn ingest_bofip(path: &Path) -> Result<()> {
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -50,7 +50,7 @@ pub async fn ingest_bofip(path: &Path) -> Result<()> {
 
     // Titre du document dénormalisé sur ses § (`search_title`).
     let retitled = repo
-        .refresh_article_denorm()
+        .refresh_article_denorm(None)
         .await
         .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
     // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
@@ -167,7 +167,7 @@ async fn ingest_bofip_doc(
     let mut toc_articles: Vec<super::corpus_toc::TocArticle> =
         Vec::with_capacity(doc.paragraphs.len());
     for (i, p) in doc.paragraphs.into_iter().enumerate() {
-        let num_key = lj_core::article_key::identity_key(&p.num);
+        let num_key = lj_norm::article_key::identity_key(&p.num);
         keep_num_keys.push(num_key.clone());
         toc_articles.push(super::corpus_toc::TocArticle {
             num: p.num.clone(),
@@ -208,7 +208,7 @@ async fn ingest_bofip_doc(
             source_upstream_url: None,
         };
         if repo
-            .upsert_legal_article(&row)
+            .upsert_legal_article(&row, lj_store::repository::Fraicheur::Autoritaire)
             .await
             .map_err(|e| anyhow!("upsert_legal_article {}: {e}", row.source_uid))?
         {

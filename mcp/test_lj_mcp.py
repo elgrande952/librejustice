@@ -1,4 +1,4 @@
-"""What the mapping onto `/api` has to hold: one route per tool, four doors on `get_legal_text`, and the tool spellings translated to the query keys."""
+"""What the mapping onto `/api` has to hold: one route per tool, four doors on `get_norm`, and the tool spellings translated to the query keys."""
 
 import json
 from pathlib import Path
@@ -11,19 +11,17 @@ OPENAPI = Path(lj_mcp.__file__).resolve().parent.parent / "packages/lj-web/publi
 
 DOCUMENTED = {
     "/api/search": "search_decisions",
-    "/api/search-textes": "search_legal_texts",
+    "/api/search-textes": "search_norms",
     "/api/decision/{id}": "get_decision",
-    "/api/texte/{code}": "get_legal_text",
-    "/api/texte/{code}/section/{cid}": "get_legal_text",
-    "/api/texte/{code}/{article}": "get_legal_text",
-    "/api/article/{uid}": "get_legal_text",
+    "/api/norm/{juridiction}/{code}": "get_norm",
+    "/api/norm/{juridiction}/{code}/{article}": "get_norm",
+    "/api/article/{uid}": "get_norm",
 }
 
 
 def test_the_served_tools_are_the_ones_mapped():
     listed = {t["name"] for t in lj_mcp.dispatch({"method": "tools/list"}, {})["tools"]}
     assert listed == set(lj_mcp.ROUTES)
-    assert "list_my_activity" not in listed
 
 
 def test_the_instructions_come_from_the_shared_surface():
@@ -62,25 +60,31 @@ def test_the_rerank_is_on_unless_it_is_refused():
 
 
 def test_a_decision_is_addressed_by_the_url_of_a_hit():
-    path, query = lj_mcp.get_decision({"url": "https://librejustice.fr/decision/HrsWxKX8KYyC"})
+    path, query = lj_mcp.get_decision({"url": "https://librejustice.fr/decision/fr/HrsWxKX8KYyC"})
     assert (path, query) == ("/api/decision/HrsWxKX8KYyC", [])
+    assert lj_mcp.get_decision({"url": "/decision/HrsWxKX8KYyC"})[0] == "/api/decision/HrsWxKX8KYyC"
     with pytest.raises(ValueError, match="not a decision url"):
-        lj_mcp.get_decision({"url": "/texte/code-civil/1240"})
+        lj_mcp.get_decision({"url": "/norm/fr/code-civil/1240"})
 
 
 @pytest.mark.parametrize(
     ("args", "expected"),
     [
-        ({"url": "/texte/code-civil/1240"}, "/api/texte/code-civil/1240"),
-        ({"url": "https://librejustice.fr/texte/code-civil"}, "/api/texte/code-civil"),
+        ({"url": "/norm/fr/code-civil/1240"}, "/api/norm/fr/code-civil/1240"),
+        ({"url": "https://librejustice.fr/norm/fr/code-civil"}, "/api/norm/fr/code-civil"),
+        ({"url": "/norm/fr/code-civil/livre-i/titre-v"}, "/api/norm/fr/code-civil/livre-i/titre-v"),
         (
-            {"url": "/texte/code-civil/section/LEGISCTA000006117617"},
-            "/api/texte/code-civil/section/LEGISCTA000006117617",
+            {"url": "/norm/fr/code-civil/section/LEGISCTA000006117617"},
+            "/api/norm/fr/code-civil/section/LEGISCTA000006117617",
         ),
-        ({"code": "code civil", "article": "L. 121-1"}, "/api/texte/code%20civil/L.%20121-1"),
-        ({"code": "cgi"}, "/api/texte/cgi"),
+        # The older shapes still resolve, so the door passes them through.
+        ({"url": "/texte/fr/code-civil/1240"}, "/api/norm/fr/code-civil/1240"),
+        ({"url": "/texte/code-civil/1240"}, "/api/norm/code-civil/1240"),
+        ({"code": "code civil", "article": "L. 121-1"}, "/api/norm/code%20civil/L.%20121-1"),
+        ({"code": "cgi"}, "/api/norm/cgi"),
         ({"textId": "LEGIARTI000006419282"}, "/api/article/LEGIARTI000006419282"),
         ({"url": "LEGIARTI000006419282"}, "/api/article/LEGIARTI000006419282"),
+        ({"url": "LEGITEXT000006070721"}, "/api/article/LEGITEXT000006070721"),
     ],
 )
 def test_the_four_doors_of_a_legal_text(args, expected):
@@ -93,8 +97,8 @@ def test_a_legal_text_needs_a_designation():
 
 
 def test_a_date_rides_along_whichever_door_was_used():
-    asked = lj_mcp.get_legal_text({"code": "code-civil", "article": "1240", "date": "2015-06-01"})
-    assert asked == ("/api/texte/code-civil/1240", [("date", "2015-06-01")])
+    asked = lj_mcp.get_norm({"code": "code-civil", "article": "1240", "date": "2015-06-01"})
+    assert asked == ("/api/norm/code-civil/1240", [("date", "2015-06-01")])
 
 
 def test_a_call_without_a_key_names_where_to_get_one():
@@ -106,8 +110,25 @@ def test_a_call_without_a_key_names_where_to_get_one():
 
 
 def test_an_unknown_tool_is_refused_before_the_network():
-    with pytest.raises(ValueError, match="unknown tool: list_my_activity"):
-        lj_mcp.call({"name": "list_my_activity"}, {"api_key": "k", "base_url": "x"})
+    with pytest.raises(lj_mcp.UnknownTool, match="Unknown tool: no_such_tool"):
+        lj_mcp.call({"name": "no_such_tool"}, {"api_key": "k", "base_url": "x"})
+
+
+def test_an_unknown_method_is_told_apart_from_a_failed_call():
+    with pytest.raises(lj_mcp.MethodNotFound, match="method not found: resources/list"):
+        lj_mcp.dispatch({"method": "resources/list"}, {"api_key": "k", "base_url": "x"})
+
+
+@pytest.mark.parametrize(
+    ("asked", "answered"),
+    [("2025-06-18", "2025-06-18"), ("2024-11-05", "2024-11-05"), ("1.0.0", None), (None, None)],
+)
+def test_the_protocol_revision_answers_the_client_when_we_speak_it(asked, answered):
+    result = lj_mcp.dispatch(
+        {"method": "initialize", "params": {"protocolVersion": asked}},
+        {"api_key": "k", "base_url": "x"},
+    )
+    assert result["protocolVersion"] == (answered or lj_mcp.PROTOCOL_VERSIONS[0])
 
 
 def test_the_rest_contract_answers_with_the_tool_output_schemas():

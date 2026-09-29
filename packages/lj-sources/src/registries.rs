@@ -108,7 +108,7 @@ pub fn download_resource(res: &RegistryResource, dir: &Path) -> Result<PathBuf> 
     let dst = dir.join(&res.filename);
     if let (Ok(meta), Some(size)) = (fs::metadata(&dst), res.filesize) {
         if meta.len() == size {
-            tracing::info!(file = %dst.display(), size, "registre déjà téléchargé, skip");
+            tracing::info!(file = %dst.display(), size, "registry already downloaded, skip");
             return Ok(dst);
         }
     }
@@ -121,7 +121,7 @@ pub fn download_resource(res: &RegistryResource, dir: &Path) -> Result<PathBuf> 
             res.url
         )));
     }
-    tracing::info!(file = %dst.display(), written, "registre téléchargé");
+    tracing::info!(file = %dst.display(), written, "registry downloaded");
     Ok(dst)
 }
 

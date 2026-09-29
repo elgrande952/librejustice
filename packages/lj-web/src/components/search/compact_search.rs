@@ -38,7 +38,7 @@ use super::suggest_box::{SuggestController, SuggestPanel};
 #[derive(Clone, Copy)]
 pub struct DraftQuery(pub RwSignal<String>);
 
-/// Barre de recherche compacte (page /decisions). Soumet vers `/decisions?q=…`
+/// Barre de recherche compacte (page /decision-search). Soumet vers `/decision-search?q=…`
 /// en conservant la source et les filtres courants.
 #[component]
 pub fn CompactSearch() -> impl IntoView {

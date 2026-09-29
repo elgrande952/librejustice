@@ -109,7 +109,7 @@ impl DecisionRepository<'_> {
             .conn
             .query(
                 "SELECT id FROM decisions WHERE id = ANY($1) AND extract_version > $2",
-                &[&ids, &lj_core::EXTRACT_VERSION],
+                &[&ids, &lj_versions::EXTRACT_VERSION],
             )
             .await?
             .into_iter()
@@ -123,7 +123,7 @@ impl DecisionRepository<'_> {
                         role, firm_ord, party_ord, sub_ord, char_starts, char_ends \
                  FROM decision_party \
                  WHERE decision_id = ANY($1) AND extract_version <= $2",
-                &[&ids, &lj_core::EXTRACT_VERSION],
+                &[&ids, &lj_versions::EXTRACT_VERSION],
             )
             .await?;
         let mut current: HashMap<i64, HashSet<PartyFingerprint>> = HashMap::new();
@@ -215,7 +215,7 @@ impl DecisionRepository<'_> {
                         &r.firm_ord,
                         &r.party_ord,
                         &r.sub_ord,
-                        &lj_core::EXTRACT_VERSION,
+                        &lj_versions::EXTRACT_VERSION,
                     ])
                     .await?;
             }

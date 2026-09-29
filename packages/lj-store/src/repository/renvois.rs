@@ -2,8 +2,13 @@
 //! autre décision. La résolution exige la date en plus du numéro, les numéros se
 //! recyclant entre époques (66145 rend Cadot, 1889, et une décision de 1988).
 
-use chrono::NaiveDate;
+use std::collections::HashSet;
 
+use chrono::NaiveDate;
+use lj_core::address::CaseAddress;
+
+use super::cases::{resolve_case_address_sqls, ResolveScope};
+use super::support::address_columns;
 use super::DecisionRepository;
 use crate::error::Result;
 
@@ -14,8 +19,7 @@ use crate::error::Result;
 pub struct Renvoi {
     pub decision_id: i64,
     pub renvoi_no: i16,
-    pub target_ref: String,
-    pub target_date: Option<NaiveDate>,
+    pub address: CaseAddress,
     pub nom: Option<String>,
 }
 
@@ -95,53 +99,51 @@ impl DecisionRepository<'_> {
         if lot.is_empty() {
             return Ok(0);
         }
-        let ids: Vec<i64> = lot.iter().map(|r| r.decision_id).collect();
-        let nos: Vec<i16> = lot.iter().map(|r| r.renvoi_no).collect();
-        let refs: Vec<&str> = lot.iter().map(|r| r.target_ref.as_str()).collect();
-        let dates: Vec<Option<NaiveDate>> = lot.iter().map(|r| r.target_date).collect();
-        let noms: Vec<Option<&str>> = lot.iter().map(|r| r.nom.as_deref()).collect();
+        // One renvoi quoted twice in a bundle is a single renvoi: the table
+        // no longer carries the constraint, the batch does.
+        let mut vu = HashSet::new();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut nos: Vec<i16> = Vec::new();
+        let mut courts: Vec<Option<&str>> = Vec::new();
+        let mut dockets: Vec<Option<&str>> = Vec::new();
+        let mut dates: Vec<Option<NaiveDate>> = Vec::new();
+        let mut noms: Vec<Option<&str>> = Vec::new();
+        for r in lot {
+            let (court, docket, date) = address_columns(&r.address);
+            if !vu.insert((r.decision_id, r.renvoi_no, court, docket, date)) {
+                continue;
+            }
+            ids.push(r.decision_id);
+            nos.push(r.renvoi_no);
+            courts.push(court);
+            dockets.push(docket);
+            dates.push(date);
+            noms.push(r.nom.as_deref());
+        }
         let n = self
             .conn
             .execute(
                 "INSERT INTO decision_renvoi
-                     (decision_id, renvoi_no, target_ref, target_date, nom)
-                 SELECT i, no, r, d, nom
-                 FROM unnest($1::int8[], $2::int2[], $3::text[], $4::date[], $5::text[])
-                      AS t(i, no, r, d, nom)
-                 ON CONFLICT (decision_id, renvoi_no, target_ref) DO NOTHING",
-                &[&ids, &nos, &refs, &dates, &noms],
+                     (decision_id, renvoi_no, target_court, target_docket, target_date, nom)
+                 SELECT i, no, c, n, d, nom
+                 FROM unnest($1::int8[], $2::int2[], $3::text[], $4::text[], $5::date[],
+                             $6::text[])
+                      AS t(i, no, c, n, d, nom)",
+                &[&ids, &nos, &courts, &dockets, &dates, &noms],
             )
             .await?;
         Ok(n)
     }
 
-    /// Pose `target_decision_id` sur les renvois pendants.
+    /// Sets `target_decision_id` on the pending renvois. Same resolver as the
+    /// citations: the date is no longer required on its own, the uniqueness of
+    /// the holder saying by itself that a docket recycled between two eras
+    /// designates nobody.
     pub async fn resolve_pending_renvois(&self) -> Result<u64> {
-        let n = self
-            .conn
-            .execute(
-                "UPDATE decision_renvoi r
-                 SET target_decision_id = c.id
-                 FROM (
-                     SELECT p.decision_id, p.renvoi_no, p.target_ref, min(d.id) AS id
-                     FROM decision_renvoi p
-                     JOIN decisions d
-                       ON d.jurisdiction_code = split_part(p.target_ref, '|', 1)
-                      AND d.date_lecture = p.target_date
-                      AND d.deleted_at IS NULL
-                      AND lj_docket_keys(d.docket_numbers)
-                          && lj_docket_keys(array[split_part(p.target_ref, '|', 2)])
-                     WHERE p.target_decision_id IS NULL
-                       AND p.target_date IS NOT NULL
-                       AND split_part(p.target_ref, '|', 2) <> ''
-                     GROUP BY p.decision_id, p.renvoi_no, p.target_ref
-                 ) c
-                 WHERE r.decision_id = c.decision_id
-                   AND r.renvoi_no = c.renvoi_no
-                   AND r.target_ref = c.target_ref",
-                &[],
-            )
-            .await?;
+        let mut n = 0u64;
+        for sql in resolve_case_address_sqls("decision_renvoi", ResolveScope::All) {
+            n += self.conn.execute(sql.as_str(), &[]).await?;
+        }
         Ok(n)
     }
 

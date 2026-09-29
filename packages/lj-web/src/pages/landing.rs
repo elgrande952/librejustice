@@ -73,8 +73,8 @@ async fn fetch_stats() -> Result<CorpusStatsResponse, PageError> {
 fn StatsGrid(stats: CorpusStatsResponse) -> impl IntoView {
     view! {
         <section class="mx-auto grid w-full max-w-5xl grid-cols-1 gap-px overflow-hidden rounded-lg border border-[var(--color-rule)] bg-[var(--color-rule)] sm:grid-cols-2">
-            <Stat label="Décisions" value=format_thousands(stats.decisions_count) href="/juridictions" />
-            <Stat label="Textes normatifs" value=format_thousands(stats.texts_count) href="/normes" />
+            <Stat label="Décisions" value=format_thousands(stats.decisions_count) href="/decision-index/fr" />
+            <Stat label="Textes normatifs" value=format_thousands(stats.texts_count) href="/norm-index/fr" />
         </section>
     }
 }

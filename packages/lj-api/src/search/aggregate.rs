@@ -1,7 +1,7 @@
-//! Total et facettes exacts, comptés dans `decisions_bm25` par un seul
-//! `paradedb.aggregate` plutôt que sur la page ramenée, qui n'en donnait qu'une
-//! borne inférieure : 26 juridictions sur 376 sur `responsabilite
-//! contractuelle`, les 350 absentes étant des filtres valides injoignables.
+//! Exact total and facets, counted in `decision_text_bm25` by a single
+//! `paradedb.aggregate` rather than on the page fetched, which only gave a lower
+//! bound: 26 jurisdictions out of 376 on `responsabilite contractuelle`, the
+//! 350 missing being valid filters nobody could reach.
 //!
 //! Piège de l'appel : il ne prend qu'un prédicat, sans clause SQL. Un filtre qui
 //! ne s'y traduit pas fait porter les décomptes sur un ensemble plus large que
@@ -108,12 +108,15 @@ pub(super) fn build_predicate(
     compose(&predicate_parts(req, next_idx, params))
 }
 
+/// Without a question, a decision counts through its lead text alone.
+const LEAD: &str = "paradedb.term('lead', true)";
+
 fn compose(parts: &PredicateParts) -> String {
     let mut must: Vec<String> = parts.question.iter().cloned().collect();
-    must.extend(parts.filters.iter().cloned());
     if must.is_empty() {
-        must.push("paradedb.all()".to_string());
+        must.push(LEAD.to_string());
     }
+    must.extend(parts.filters.iter().cloned());
     format!(
         "paradedb.boolean(must => ARRAY[{}], must_not => ARRAY[paradedb.exists('deleted_at')])",
         must.join(", ")
@@ -121,21 +124,27 @@ fn compose(parts: &PredicateParts) -> String {
 }
 
 fn compose_complement(parts: &PredicateParts, ids: &[i64]) -> Option<String> {
-    let question = parts.question.as_ref()?;
+    let question = parts.question.as_deref().filter(|_| !ids.is_empty())?;
+    Some(compose_ids(&parts.filters, ids, Some(question)))
+}
+
+fn compose_ids(filters: &[String], ids: &[i64], except: Option<&str>) -> String {
     let terms: Vec<String> = ids
         .iter()
-        .map(|id| format!("paradedb.term('id', {id}::bigint)"))
+        .map(|id| format!("paradedb.term('decision_id', {id}::bigint)"))
         .collect();
-    let mut must = vec![format!(
-        "paradedb.term_set(terms => ARRAY[{}])",
-        terms.join(", ")
-    )];
-    must.extend(parts.filters.iter().cloned());
-    Some(format!(
-        "paradedb.boolean(must => ARRAY[{}], \
-         must_not => ARRAY[{question}, paradedb.exists('deleted_at')])",
-        must.join(", ")
-    ))
+    let mut must = vec![
+        format!("paradedb.term_set(terms => ARRAY[{}])", terms.join(", ")),
+        LEAD.to_string(),
+    ];
+    must.extend(filters.iter().cloned());
+    let mut must_not: Vec<&str> = except.into_iter().collect();
+    must_not.push("paradedb.exists('deleted_at')");
+    format!(
+        "paradedb.boolean(must => ARRAY[{}], must_not => ARRAY[{}])",
+        must.join(", "),
+        must_not.join(", ")
+    )
 }
 
 fn predicate_parts(
@@ -144,6 +153,13 @@ fn predicate_parts(
     params: &mut Params,
 ) -> PredicateParts {
     let question = question(req, next_idx, params);
+    PredicateParts {
+        question,
+        filters: filter_parts(req, next_idx, params),
+    }
+}
+
+fn filter_parts(req: &SearchRequest, next_idx: &mut usize, params: &mut Params) -> Vec<String> {
     let mut must: Vec<String> = Vec::new();
     if let Some(types) = present(&req.jurisdiction_type) {
         must.push(term_any(
@@ -182,35 +198,131 @@ fn predicate_parts(
         must.push(expr);
     }
     must.extend(build_array_filter_queries(req, next_idx, params));
-    PredicateParts {
-        question,
-        filters: must,
+    must
+}
+
+/// What the aggregate describes. `Served` exists because `reference` matches no
+/// content: its question bounds nothing, so counting it counts the whole corpus.
+pub(crate) enum Scope<'a> {
+    /// The question, plus the served ids another leg brought in.
+    Question(&'a [i64]),
+    /// The served ids alone.
+    Served(&'a [i64]),
+}
+
+/// Which values the aggregate counts. `Keys` names them: `include` bounds the
+/// term dictionary and the predicate gains their union, without which the scan
+/// covers the whole corpus (785 ms against 380 under a question).
+pub(crate) enum Aggs<'a> {
+    /// The eight axes of the panel, each capped at the head of its vocabulary.
+    All,
+    /// The given keys and nothing else, counted exactly whatever their rank.
+    Keys {
+        instruments: &'a [String],
+        articles: &'a [String],
+    },
+}
+
+impl Aggs<'_> {
+    /// The tree, sized to what it counts: a named key is never truncated, and
+    /// one absent from the buckets is a zero rather than a value out of the top.
+    fn tree(&self) -> String {
+        match self {
+            Aggs::All => agg().to_string(),
+            Aggs::Keys {
+                instruments,
+                articles,
+            } => {
+                let terms = |field: &str, keys: &[String]| {
+                    let include: Vec<String> = keys.iter().map(|k| regex_literal(k)).collect();
+                    serde_json::json!({"terms": {
+                        "field": field,
+                        "size": keys.len().max(1),
+                        "include": include.join("|"),
+                    }})
+                };
+                serde_json::json!({
+                    "inst": terms("legal_instruments", instruments),
+                    "art": terms("legal_article_composite", articles),
+                })
+                .to_string()
+            }
+        }
+    }
+
+    /// The union of the named keys, as a `must` of the predicate.
+    fn restriction(&self, next_idx: &mut usize, params: &mut Params) -> Option<String> {
+        let Aggs::Keys {
+            instruments,
+            articles,
+        } = self
+        else {
+            return None;
+        };
+        let sets: Vec<String> = [
+            ("legal_instruments", *instruments),
+            ("legal_article_composite", *articles),
+        ]
+        .into_iter()
+        .filter(|(_, keys)| !keys.is_empty())
+        .map(|(field, keys)| term_any(field, keys, next_idx, params))
+        .collect();
+        Some(format!(
+            "paradedb.boolean(should => ARRAY[{}], minimum_should_match => 1)",
+            sets.join(", ")
+        ))
     }
 }
 
-/// Total et compteurs de l'ensemble apparié, citations comprises depuis qu'elles
-/// sortent du même balayage. Elles seules ne sont pas exhaustives.
+/// A key as a regular expression literal, `include` taking one: a composite key
+/// carries the `|` that separates alternatives there.
+fn regex_literal(key: &str) -> String {
+    key.chars()
+        .flat_map(|c| match c.is_ascii_alphanumeric() {
+            true => vec![c],
+            false => vec!['\\', c],
+        })
+        .collect()
+}
+
+/// Total and counters of the matched set, citations included since they come
+/// out of the same scan. They alone are not exhaustive.
 pub(crate) async fn aggregate_facets(
     conn: &Client,
     req: &SearchRequest,
-    hors_question: &[i64],
+    scope: Scope<'_>,
+    aggs: Aggs<'_>,
 ) -> std::result::Result<(i64, FacetCounters), tokio_postgres::Error> {
     let mut params: Params = Vec::new();
     let mut idx = 1usize;
-    let parts = predicate_parts(req, &mut idx, &mut params);
-    let predicate = compose(&parts);
-    let complement = if hors_question.is_empty() {
-        None
-    } else {
-        compose_complement(&parts, hors_question)
+    let restriction = aggs.restriction(&mut idx, &mut params);
+    let (predicate, complement, every_text) = match scope {
+        Scope::Served([]) => return Ok((0, FacetCounters::default())),
+        Scope::Served(ids) => {
+            let mut filters = filter_parts(req, &mut idx, &mut params);
+            filters.extend(restriction);
+            (compose_ids(&filters, ids, None), None, false)
+        }
+        Scope::Question(hors_question) => {
+            let mut parts = predicate_parts(req, &mut idx, &mut params);
+            parts.filters.extend(restriction);
+            let every_text = parts.question.is_some();
+            (
+                compose(&parts),
+                compose_complement(&parts, hors_question),
+                every_text,
+            )
+        }
     };
-    // L'index porte des jetons, pas des libellés, et le catalogue fait 1,3 M de
-    // lignes : le titre se joint dans la même instruction, pas en mémoire.
-    let agg = agg();
+    let predicate_params = params.len();
+    // The index carries tokens, not labels, and the catalogue is 1.3 M rows: the
+    // title joins in the same statement rather than in memory.
+    params.push(Box::new(aggs.tree()) as Box<dyn ToSql + Sync + Send>);
+    let agg = format!("${idx}::text::json");
     let sql = format!(
         "WITH agg AS (\
-           SELECT paradedb.aggregate('decisions_bm25', {predicate}, \
-             '{agg}'::json, bucket_limit => 1000000) AS j, \
+           SELECT paradedb.aggregate('decision_text_bm25', {predicate}, \
+             {agg}, bucket_limit => 1000000) AS j, \
              {sup} AS k\
          ) \
          SELECT j::text, \
@@ -223,19 +335,40 @@ pub(crate) async fn aggregate_facets(
          FROM agg",
         sup = match &complement {
             Some(p) => format!(
-                "paradedb.aggregate('decisions_bm25', {p}, '{agg}'::json, bucket_limit => 1000000)"
+                "paradedb.aggregate('decision_text_bm25', {p}, {agg}, bucket_limit => 1000000)"
             ),
             None => "'{}'::jsonb".to_string(),
         },
     );
-    let row = conn.query_one(sql.as_str(), &as_refs(&params)).await?;
+    let refs = as_refs(&params);
+    let (row, duplicates) = futures::try_join!(conn.query_one(sql.as_str(), &refs), async {
+        if every_text {
+            duplicate_texts(conn, &predicate, &refs[..predicate_params]).await
+        } else {
+            Ok(Vec::new())
+        }
+    })?;
     let raw: String = row.get(0);
     let json: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
     let mut counters = FacetCounters::default();
-    let mut total = accumulate_counters(&json, &mut counters);
+    let mut total = accumulate_counters(&json, &mut counters, 1);
     if let Some(raw_sup) = row.get::<_, Option<String>>(2) {
         let sup: Value = serde_json::from_str(&raw_sup).unwrap_or(Value::Null);
-        total += accumulate_counters(&sup, &mut counters);
+        total += accumulate_counters(&sup, &mut counters, 1);
+    }
+    if !duplicates.is_empty() {
+        let terms: Vec<String> = duplicates
+            .iter()
+            .map(|id| format!("paradedb.term('id', {id}::bigint)"))
+            .collect();
+        let sql = format!(
+            "SELECT paradedb.aggregate('decision_text_bm25', \
+               paradedb.term_set(terms => ARRAY[{}]), $1::text::json, bucket_limit => 1000000)::text",
+            terms.join(", ")
+        );
+        let row = conn.query_one(sql.as_str(), &[&aggs.tree()]).await?;
+        let dup: Value = serde_json::from_str(&row.get::<_, String>(0)).unwrap_or(Value::Null);
+        total += accumulate_counters(&dup, &mut counters, -1);
     }
     let libelles: Value = row
         .get::<_, Option<String>>(1)
@@ -256,6 +389,49 @@ pub(crate) async fn aggregate_facets(
     Ok((total, counters))
 }
 
+/// The matched texts beyond the first of each decision, its lead first: a
+/// decision matched in several languages counts once.
+async fn duplicate_texts(
+    conn: &Client,
+    predicate: &str,
+    params: &[&(dyn ToSql + Sync)],
+) -> std::result::Result<Vec<i64>, tokio_postgres::Error> {
+    let sql = format!(
+        "SELECT DISTINCT t.decision_id FROM decision_text t \
+         WHERE t.id @@@ paradedb.boolean(must => ARRAY[{predicate}, paradedb.term('lead', false)])"
+    );
+    let decisions: Vec<i64> = conn
+        .query(sql.as_str(), params)
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    if decisions.is_empty() {
+        return Ok(Vec::new());
+    }
+    let terms: Vec<String> = decisions
+        .iter()
+        .map(|id| format!("paradedb.term('decision_id', {id}::bigint)"))
+        .collect();
+    let sql = format!(
+        "SELECT t.id, t.decision_id FROM decision_text t \
+         WHERE t.id @@@ paradedb.boolean(must => ARRAY[{predicate}, \
+           paradedb.term_set(terms => ARRAY[{}])]) \
+         ORDER BY t.decision_id, t.lead DESC, t.id",
+        terms.join(", ")
+    );
+    let mut previous = None;
+    let mut out = Vec::new();
+    for r in conn.query(sql.as_str(), params).await? {
+        let decision: i64 = r.get(1);
+        if previous == Some(decision) {
+            out.push(r.get(0));
+        }
+        previous = Some(decision);
+    }
+    Ok(out)
+}
+
 fn buckets(node: &Value, key: &str) -> Vec<Value> {
     node.get(key)
         .and_then(|a| a.get("buckets"))
@@ -272,10 +448,10 @@ fn doc_count(b: &Value) -> i64 {
     b.get("doc_count").and_then(Value::as_i64).unwrap_or(0)
 }
 
-fn accumulate_counters(json: &Value, c: &mut FacetCounters) -> i64 {
+fn accumulate_counters(json: &Value, c: &mut FacetCounters, sign: i64) -> i64 {
     for seat in buckets(json, "seat") {
         if let Some(path) = bucket_key(&seat) {
-            *c.seats.entry(path).or_insert(0) += doc_count(&seat);
+            *c.seats.entry(path).or_insert(0) += sign * doc_count(&seat);
         }
     }
     for (axe, dest) in [
@@ -286,7 +462,7 @@ fn accumulate_counters(json: &Value, c: &mut FacetCounters) -> i64 {
     ] {
         for b in buckets(json, axe) {
             if let Some(uid) = bucket_key(&b) {
-                *dest.entry(uid).or_insert(0) += doc_count(&b);
+                *dest.entry(uid).or_insert(0) += sign * doc_count(&b);
             }
         }
     }
@@ -298,7 +474,7 @@ fn accumulate_counters(json: &Value, c: &mut FacetCounters) -> i64 {
         for key in lj_core::publication::publication_keys(&[code]) {
             *c.publication
                 .entry(format!("publication:{key}"))
-                .or_insert(0) += doc_count(&b);
+                .or_insert(0) += sign * doc_count(&b);
         }
     }
     // Un jour ne chevauche jamais deux années civiles, donc replier les seaux
@@ -312,11 +488,11 @@ fn accumulate_counters(json: &Value, c: &mut FacetCounters) -> i64 {
         else {
             continue;
         };
-        *c.year.entry(annee.to_string()).or_insert(0) += doc_count(&b);
+        *c.year.entry(annee.to_string()).or_insert(0) += sign * doc_count(&b);
     }
     for b in buckets(json, "inst") {
         if let Some(uid) = bucket_key(&b) {
-            *c.instrument.counts.entry(uid).or_insert(0) += doc_count(&b);
+            *c.instrument.counts.entry(uid).or_insert(0) += sign * doc_count(&b);
         }
     }
     // Le composite porte son instrument en préfixe, ce qui range les articles
@@ -336,9 +512,10 @@ fn accumulate_counters(json: &Value, c: &mut FacetCounters) -> i64 {
             .entry(uid.to_string())
             .or_default()
             .entry(num_key.to_string())
-            .or_insert(0) += doc_count(&b);
+            .or_insert(0) += sign * doc_count(&b);
     }
-    json.get("total")
+    sign * json
+        .get("total")
         .and_then(|t| t.get("value"))
         .and_then(Value::as_f64)
         .unwrap_or(0.0) as i64
@@ -377,7 +554,7 @@ mod tests {
         );
         assert_eq!(
             p,
-            "paradedb.boolean(must => ARRAY[paradedb.all()], \
+            "paradedb.boolean(must => ARRAY[paradedb.term('lead', true)], \
              must_not => ARRAY[paradedb.exists('deleted_at')])"
         );
     }
@@ -403,13 +580,48 @@ mod tests {
             );
         }
         let (must, must_not) = comp.split_once("must_not =>").expect("must_not posé");
-        assert!(must.contains("paradedb.term('id', 7::bigint)"), "{must}");
-        assert!(must.contains("paradedb.term('id', 9::bigint)"), "{must}");
+        assert!(
+            must.contains("paradedb.term('decision_id', 7::bigint)"),
+            "{must}"
+        );
+        assert!(
+            must.contains("paradedb.term('decision_id', 9::bigint)"),
+            "{must}"
+        );
+        assert!(must.contains("paradedb.term('lead', true)"), "{must}");
         assert!(!must.contains("search_title"), "{must}");
         assert!(must_not.contains("search_title"), "{must_not}");
         assert!(
             must_not.contains("paradedb.exists('deleted_at')"),
             "{must_not}"
+        );
+    }
+
+    /// The question counted 3,059,020 decisions under a list of 5 for « Béziers
+    /// conseil d'État » (07/09/2026), matching on either token of the title.
+    #[test]
+    fn les_servies_se_comptent_sans_la_question() {
+        let r = req(serde_json::json!({
+            "query": "beziers conseil d'etat", "jurisdictionType": ["CE"],
+        }));
+        let mut params: Params = Vec::new();
+        let mut idx = 1usize;
+        let filters = filter_parts(&r, &mut idx, &mut params);
+        let p = compose_ids(&filters, &[7, 9], None);
+        assert_eq!(params.len(), 1, "le type de juridiction seul");
+        assert!(
+            p.contains("paradedb.term('jurisdiction_type', $1::text)"),
+            "{p}"
+        );
+        assert!(p.contains("paradedb.term('decision_id', 7::bigint)"), "{p}");
+        assert!(p.contains("paradedb.term('lead', true)"), "{p}");
+        assert!(
+            !p.contains("search_title") && !p.contains("full_text"),
+            "{p}"
+        );
+        assert!(
+            p.contains("must_not => ARRAY[paradedb.exists('deleted_at')]"),
+            "{p}"
         );
     }
 
@@ -489,7 +701,7 @@ mod tests {
             "total": {"value": 30.0},
         });
         let mut c = FacetCounters::default();
-        let total = accumulate_counters(&json, &mut c);
+        let total = accumulate_counters(&json, &mut c, 1);
         assert_eq!(total, 30);
         assert_eq!(c.seats["CC"], 30);
         assert_eq!(c.seats["CC.SOCIALE"], 18);
@@ -504,7 +716,7 @@ mod tests {
     #[test]
     fn une_reponse_vide_ne_panique_pas() {
         let mut c = FacetCounters::default();
-        let total = accumulate_counters(&Value::Null, &mut c);
+        let total = accumulate_counters(&Value::Null, &mut c, 1);
         assert_eq!(total, 0);
         assert!(c.seats.is_empty() && c.year.is_empty());
     }
@@ -526,6 +738,7 @@ mod tests {
                 ]}
             }),
             &mut c,
+            1,
         );
         assert_eq!(c.instrument.counts["LEGITEXT000006070716"], 12);
         let articles = &c.instrument.articles["LEGITEXT000006070716"];

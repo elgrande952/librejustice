@@ -30,15 +30,15 @@ use tantivy::{Index, Score, Term};
 pub const DEFAULT_MAX_CHARS: usize = 500;
 
 /// Pattern du tokenizer ParadeDB répliqué : la source unique est
-/// `lj_core::body_tok`, dont les migrations `CREATE INDEX ... USING bm25`
+/// `lj_textsearch::body_tok`, dont les migrations `CREATE INDEX ... USING bm25`
 /// portent la copie.
-const TOKENIZER_PATTERN: &str = lj_core::body_tok::TOKEN_PATTERN;
+const TOKENIZER_PATTERN: &str = lj_textsearch::body_tok::TOKEN_PATTERN;
 
 /// Nom du tokenizer custom enregistré dans l'index.
 const TOKENIZER_NAME: &str = "t";
 
 /// Tokenizer ParadeDB répliqué : pattern Unicode
-/// `lj_core::body_tok::TOKEN_PATTERN`, ascii-folding + lowercase, stopwords FR
+/// `lj_textsearch::body_tok::TOKEN_PATTERN`, ascii-folding + lowercase, stopwords FR
 /// optionnels.
 ///
 /// À synchroniser avec les ``text_fields`` JSON dans les migrations

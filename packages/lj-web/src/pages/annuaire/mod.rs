@@ -1,10 +1,10 @@
-//! Annuaire des entités — point d'entrée vers les fiches `/entite/{ns}/{id}`.
+//! Annuaire des entités, point d'entrée vers les fiches `/entity/{juris}/{ns}/{id}`.
 //! Deux surfaces :
 //!
 //! - `/annuaire` ([`AnnuairePage`]) : recherche + cartes de catégories (avec
 //!   compteurs) + résultats quand `?q=` est présent.
-//! - `/annuaire/{kind}` ([`AnnuaireDirectoryPage`]) : listing paginé d'une
-//!   catégorie, filtre barreau pour les avocats.
+//! - `/entity-index/{juris}/{kind}` ([`AnnuaireDirectoryPage`]): a paginated listing, or a name
+//!   search when the category holds natural persons.
 //!
 //! Gabarit commun /decisions · /textes · /texte : conteneur 92rem, grille rail
 //! (240px) + colonne contenu bornée 3xl ; le rail des catégories
@@ -55,7 +55,7 @@ pub fn AnnuairePage() -> impl IntoView {
     let title = "Annuaire des entités - LibreJustice";
     let description = "Parcourez les entreprises, personnes publiques, associations, avocats et \
                        cabinets des registres français. Fiches de contentieux par entité.";
-    let url = format!("{CANONICAL_BASE}/annuaire");
+    let url = format!("{CANONICAL_BASE}/entity-search");
 
     view! {
         <Title text=title />
@@ -102,11 +102,11 @@ pub fn AnnuairePage() -> impl IntoView {
 }
 
 /// Champ de recherche : formulaire GET natif (SSR-friendly, fonctionne sans JS)
-/// vers `/annuaire?q=`.
+/// vers `/entity-search?q=`.
 #[component]
 fn SearchForm(term: Signal<String>) -> impl IntoView {
     view! {
-        <form method="get" action="/annuaire" role="search" class="flex w-full gap-2">
+        <form method="get" action="/entity-search" role="search" class="flex w-full gap-2">
             <input
                 type="search"
                 name="q"
@@ -126,7 +126,7 @@ fn SearchForm(term: Signal<String>) -> impl IntoView {
     }
 }
 
-/// Grille des catégories : cartes SSR crawlables liant `/annuaire/{kind}` ;
+/// Grille des catégories : cartes SSR crawlables liant `/entity-index/{juris}/{kind}` ;
 /// double compteur en tuile (total du registre chargé + entités liées à des
 /// décisions) et barre de proportion (part de la catégorie dans la somme des
 /// registres), streamés — rien tant que les stats ne sont pas là.
@@ -146,7 +146,7 @@ fn CategoryGrid(stats: Resource<Option<AnnuaireStatsResponse>>) -> impl IntoView
 
 #[component]
 fn CategoryCard(kind: Kind, stats: Resource<Option<AnnuaireStatsResponse>>) -> impl IntoView {
-    let href = format!("/annuaire/{}", kind.slug());
+    let href = format!("/entity-index/fr/{}", kind.slug());
     // Chiffres + barre streamés d'un bloc (part de la catégorie dans la somme
     // des registres) ; stats absentes (chargement / erreur) ⇒ bloc vide, la
     // carte reste rendue.
@@ -201,6 +201,9 @@ fn CategoryCard(kind: Kind, stats: Resource<Option<AnnuaireStatsResponse>>) -> i
 #[component]
 fn SearchResults(term: Signal<String>) -> impl IntoView {
     let results = Resource::new_blocking(move || term.get(), |q| sendable(fetch_search(q)));
+    // The parent renders one instance per term.
+    #[cfg(feature = "hydrate")]
+    Effect::new(move |_| crate::reads::report_entity_search(term.get_untracked()));
     view! {
         <section aria-label="Résultats">
             <Suspense fallback=list_skeleton>

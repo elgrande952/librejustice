@@ -43,15 +43,12 @@ jsonpath "$.stats.asApplicant" isInteger
 jsonpath "$.stats.asDefendant" isInteger
 jsonpath "$.stats.byYear" isCollection
 jsonpath "$.stats.byJurisdiction" isCollection
-jsonpath "$.stats.topCounsel" isCollection
 # forme des lignes d'agrégat
 jsonpath "$.stats.byYear[0].year" isInteger
 jsonpath "$.stats.byYear[0].count" isInteger
 jsonpath "$.stats.byJurisdiction[0].key" isString
 jsonpath "$.stats.byJurisdiction[0].label" isString
 jsonpath "$.stats.byJurisdiction[0].count" isInteger
-jsonpath "$.stats.topCounsel[0].name" isString
-jsonpath "$.stats.topCounsel[0].count" isInteger
 
 
 # ---------------------------------------------------------------------------
@@ -183,15 +180,10 @@ jsonpath "$.items[0].decisionCount" isInteger
 
 
 # ---------------------------------------------------------------------------
-# directory: avocats filtrés par barreau (barreau exposé sur l'item)
+# directory: avocats are natural persons, never listed
 # ---------------------------------------------------------------------------
 GET {{base}}/internal/entities/directory?kind=avocats&barreau=paris&page_size=5
-HTTP 200
-[Asserts]
-jsonpath "$.total" > 0
-jsonpath "$.items" count <= 5
-jsonpath "$.items[0].namespace" == "cnb"
-jsonpath "$.items[0].barreau" == "paris"
+HTTP 422
 
 
 # ---------------------------------------------------------------------------

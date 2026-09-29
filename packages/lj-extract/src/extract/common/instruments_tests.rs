@@ -1151,6 +1151,27 @@ fn snap_code_name_gating() {
 }
 
 #[test]
+fn snap_code_name_keeps_the_territory() {
+    for raw in [
+        "Code de procédure civile de la Polynésie française",
+        "Code du travail de Nouvelle-Calédonie",
+        "Code de l'urbanisme de Saint-Barthélemy",
+        "Code de l'environnement de la province Sud",
+        "Code de procédure civile calédonien",
+    ] {
+        assert_eq!(snap_code_name(raw), None, "{raw}");
+    }
+    assert_eq!(
+        snap_code_name("Code des douanes de Mayotte applicable"),
+        Some("Code des douanes de Mayotte".to_string())
+    );
+    assert_eq!(
+        snap_code_name("Code civil applicable en Polynésie française"),
+        Some("Code civil".to_string())
+    );
+}
+
+#[test]
 fn normalize_instrument_german_sigles_with_gloss() {
     for v in [
         "BGB",

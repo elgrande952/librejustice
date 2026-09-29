@@ -1,6 +1,6 @@
 //! Génération PDF à partir d'un [`DecisionDetail`].
 //!
-//! La **logique de composition** (titre / sous-titre / méta / corps,
+//! La **logique de composition** (citation / corps / provenance,
 //! échappement XML du markup, conversion `\n` → `<br/>`) vit dans
 //! [`build_decision_story`], puis on rend les octets PDF avec la crate `printpdf`
 //! en embarquant **Liberation Sans** (Regular + Bold), libre et métric-compatible
@@ -19,15 +19,11 @@ use printpdf::{
     PdfSaveOptions, Pt, Rgb, TextItem, TextMatrix,
 };
 
-use crate::titles::decision_jurisdiction;
-
 /// Style logique d'un bloc de contenu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PdfBlockStyle {
     /// Titre centré.
     Title,
-    /// Sous-titre centré (numéro de rôle).
-    Subtitle,
     /// Ligne de méta.
     Meta,
     /// Paragraphe de corps.
@@ -58,56 +54,19 @@ fn xml_escape(text: &str) -> String {
     out
 }
 
-/// Construit la story (séquence de blocs) d'un PDF de décision.
-///
-/// Ordre : titre (juridiction) → sous-titre (1er numéro de rôle ou `id`) →
-/// lignes de méta (date de lecture, formation) → espaceur si méta → corps.
+/// Blocks of a decision PDF: the canonical citation, the one the print sheet
+/// heads its page with, then the body, then the provenance footer.
 pub fn build_decision_story(detail: &DecisionDetail) -> Vec<PdfBlock> {
-    let jurisdiction =
-        decision_jurisdiction(jur_type_code(detail), detail.jurisdiction_name.as_deref());
-    let docket = detail
-        .docket_numbers
-        .as_ref()
-        .and_then(|d| d.first())
-        .cloned()
-        .unwrap_or_else(|| detail.id.clone());
-
     let mut story: Vec<PdfBlock> = vec![
         PdfBlock {
             style: PdfBlockStyle::Title,
-            content: xml_escape(&jurisdiction),
+            content: xml_escape(&detail.title),
         },
         PdfBlock {
-            style: PdfBlockStyle::Subtitle,
-            content: xml_escape(&docket),
-        },
-    ];
-
-    let mut meta_lines: Vec<String> = Vec::new();
-    if let Some(date) = detail.date_lecture.as_deref().filter(|s| !s.is_empty()) {
-        meta_lines.push(format!(
-            "{} : {}",
-            detail.jurisdiction_type.date_label(),
-            lj_dtos::format_date_fr(date)
-        ));
-    }
-    if let Some(seat) = detail.seat.as_deref().filter(|s| !s.is_empty()) {
-        meta_lines.push(format!("Formation : {seat}"));
-    }
-
-    for line in &meta_lines {
-        story.push(PdfBlock {
-            style: PdfBlockStyle::Meta,
-            content: xml_escape(line),
-        });
-    }
-
-    if !meta_lines.is_empty() {
-        story.push(PdfBlock {
             style: PdfBlockStyle::Spacer,
             content: String::new(),
-        });
-    }
+        },
+    ];
 
     for text in &detail.paragraphs {
         let cleaned = xml_escape(text).replace('\n', "<br/>");
@@ -136,9 +95,8 @@ pub fn build_decision_story(detail: &DecisionDetail) -> Vec<PdfBlock> {
     story
 }
 
-/// Génère le PDF d'une décision (octets). La composition (titre, méta, corps,
-/// échappement) est portée par [`build_decision_story`] ; le rendu binaire passe
-/// par `printpdf`.
+/// Decision PDF as bytes: composition in [`build_decision_story`], binary
+/// rendering by `printpdf`.
 pub fn build_decision_pdf(detail: &DecisionDetail) -> Vec<u8> {
     let story = build_decision_story(detail);
     render_pdf(&story)
@@ -175,10 +133,12 @@ struct StyleAttrs {
 fn style_attrs(style: PdfBlockStyle) -> StyleAttrs {
     match style {
         // #1f2a44
+        // A whole citation, so the print sheet's 1.3rem rather than a display size:
+        // at 18 pt a Cour de cassation citation already spilled onto a second line.
         PdfBlockStyle::Title => StyleAttrs {
             font: "F2", // gras
-            size: 18.0,
-            leading: 22.0,
+            size: 15.5,
+            leading: 19.0,
             centered: true,
             color: (
                 0x1f as f64 / 255.0,
@@ -186,18 +146,6 @@ fn style_attrs(style: PdfBlockStyle) -> StyleAttrs {
                 0x44 as f64 / 255.0,
             ),
             space_after: 8.0,
-        },
-        PdfBlockStyle::Subtitle => StyleAttrs {
-            font: "F2",
-            size: 13.0,
-            leading: 16.0,
-            centered: true,
-            color: (
-                0x1f as f64 / 255.0,
-                0x2a as f64 / 255.0,
-                0x44 as f64 / 255.0,
-            ),
-            space_after: 12.0,
         },
         // #4a5568
         PdfBlockStyle::Meta => StyleAttrs {
@@ -499,27 +447,6 @@ fn assemble_pdf(pages: &[Page]) -> Vec<u8> {
         .save(&PdfSaveOptions::default(), &mut Vec::new())
 }
 
-/// Code `jurisdiction_type` (forme DB « TA »/« CC »…) du DTO, pour
-/// [`decision_jurisdiction`] qui attend le code brut.
-fn jur_type_code(detail: &DecisionDetail) -> &'static str {
-    use lj_dtos::JurisdictionType::*;
-    match detail.jurisdiction_type {
-        Ta => "TA",
-        Caa => "CAA",
-        Ce => "CE",
-        Constit => "CONSTIT",
-        Tc => "TC",
-        Cc => "CC",
-        Ca => "CA",
-        Tj => "TJ",
-        Tcom => "TCOM",
-        Cedh => "CEDH",
-        Cjue => "CJUE",
-        Cnda => "CNDA",
-        Cnil => "CNIL",
-    }
-}
-
 // --- Métriques AFM base-14 (largeurs en 1/1000 d'em, indexées WinAnsi) ------
 //
 // Valeurs des fichiers AFM Adobe officiels (Helvetica.afm / Helvetica-Bold.afm),
@@ -710,7 +637,7 @@ mod tests {
         DecisionDetail {
             id: "abc123".to_string(),
             jurisdiction_type: JurisdictionType::Cc,
-            title: "ignored".to_string(),
+            title: "Cour de cassation, chambre sociale, 29 mai 2026, 24-17.384".to_string(),
             case_name: None,
             paragraphs: vec!["Premier <para> & suite".to_string(), "Second".to_string()],
             paragraph_spans: Vec::new(),
@@ -718,6 +645,7 @@ mod tests {
             summary: None,
             jurisdiction_code: None,
             jurisdiction_name: Some("Cour de cassation".to_string()),
+            court_place: None,
             date_lecture: Some("2026-05-29".to_string()),
             solution: None,
             procedure: None,
@@ -752,45 +680,23 @@ mod tests {
     }
 
     #[test]
-    fn story_structure_matches_python() {
+    fn story_opens_on_the_citation() {
         let story = build_decision_story(&detail());
-        // titre, sous-titre, 2 lignes méta, spacer, 2 paragraphes, spacer, pied
-        // de provenance.
-        assert_eq!(story.len(), 9);
+        assert_eq!(story.len(), 6);
         assert_eq!(story[0].style, PdfBlockStyle::Title);
-        assert_eq!(story[0].content, "Cour de cassation");
-        assert_eq!(story[1].style, PdfBlockStyle::Subtitle);
-        assert_eq!(story[1].content, "24-17.384");
-        assert_eq!(story[2].style, PdfBlockStyle::Meta);
-        assert_eq!(story[2].content, "Date de la décision : 29 mai 2026");
-        assert_eq!(story[3].content, "Formation : Chambre sociale");
-        assert_eq!(story[4].style, PdfBlockStyle::Spacer);
-        assert_eq!(story[5].style, PdfBlockStyle::Body);
-        assert_eq!(story[5].content, "Premier &lt;para&gt; &amp; suite");
-        assert_eq!(story[7].style, PdfBlockStyle::Spacer);
-        assert_eq!(story[8].style, PdfBlockStyle::Meta);
         assert_eq!(
-            story[8].content,
-            "Permalien : https://librejustice.fr/decision/abc123"
+            story[0].content,
+            "Cour de cassation, chambre sociale, 29 mai 2026, 24-17.384"
         );
-    }
-
-    #[test]
-    fn subtitle_falls_back_to_id_without_docket() {
-        let mut d = detail();
-        d.docket_numbers = None;
-        let story = build_decision_story(&d);
-        assert_eq!(story[1].content, "abc123");
-    }
-
-    #[test]
-    fn no_meta_means_no_spacer() {
-        let mut d = detail();
-        d.date_lecture = None;
-        d.seat = None;
-        let story = build_decision_story(&d);
-        // titre, sous-titre, puis directement le corps.
+        assert_eq!(story[1].style, PdfBlockStyle::Spacer);
         assert_eq!(story[2].style, PdfBlockStyle::Body);
+        assert_eq!(story[2].content, "Premier &lt;para&gt; &amp; suite");
+        assert_eq!(story[4].style, PdfBlockStyle::Spacer);
+        assert_eq!(story[5].style, PdfBlockStyle::Meta);
+        assert_eq!(
+            story[5].content,
+            "Permalien : https://librejustice.fr/decision/fr/abc123"
+        );
     }
 
     #[test]

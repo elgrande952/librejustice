@@ -1,0 +1,43 @@
+# Fixture Corpus
+
+Fixtures from open-redact-pdf 0.6.0, kept within the parser and redaction subset it covers:
+
+- `simple-text.pdf`: Minimal single-page PDF with Type1 Helvetica, two text runs. Primary fixture for basic rect and search redaction tests.
+- `multi-page.pdf`: Two pages with independent content streams and a shared font reference.
+- `rotated-text.pdf`: Text matrix `Tm` with a 90-degree rotation. Tests CTM/text-matrix geometry.
+- `type0-search.pdf`: Type0/CIDFontType2 font with Identity-H encoding and an inline ToUnicode CMap. Tests composite font extraction, search, and redaction.
+- `vector-heavy.pdf`: Filled rectangle paint operation before a text run. Tests vector paint neutralization.
+- `image-xobject.pdf`: Image XObject placed via `cm` matrix. Tests image invocation detection and removal.
+- `annotations.pdf`: Page with a Link annotation spanning the text. Tests annotation detection and removal.
+- `metadata-attachments.pdf`: Catalog with embedded file attachment and trailer Info dictionary. Tests metadata and attachment stripping.
+- `incremental-update.pdf`: Two-revision PDF: revision 1 has "Original Secret", revision 2 replaces the content stream with "Updated Secret" via appended xref with `Prev` pointer. Tests incremental update chain reading.
+- `extgstate-font.pdf`: Font set only via ExtGState (`gs` operator), no `Tf` in the content stream. Tests ExtGState font path for text extraction and redaction.
+- `inline-image.pdf`: Inline image (`BI`/`ID`/`EI`) with binary data, plus a `BDC` operator with an inline dictionary operand (`<</MCID 0>>`). Tests content stream parsing of both features.
+- `nested-cm.pdf`: Outer `cm` with 0.5 scale factor, inner `q ... cm 2x ... Q`. Tests correct CTM pre-multiplication order for nested graphics state transforms.
+- `xref-object-stream.pdf`: PDF 1.5 cross-reference stream (`/Type /XRef` with `W [1 3 1]`) pointing at an object stream (`/Type /ObjStm`, FlateDecode-compressed) that holds the Catalog, Pages, Page, and Font dictionaries. The content stream stays as a regular indirect object because streams are not allowed inside an ObjStm. Tests xref-stream parsing, ObjStm member materialization, and redaction against a page tree that is reached only through compressed objects.
+- `winansi-font.pdf`: Type1 Helvetica with `/Encoding /WinAnsiEncoding` and a content stream that shows bytes for `É`, `°`, `€`, `’`. Tests that non-ASCII WinAnsi bytes decode to the right Unicode characters, that search still finds them, and that redaction round-trips correctly.
+- `form-xobject-text.pdf`: A Form XObject with its own `Matrix`, its own `Resources.Font`, and a short text-showing content stream, invoked from the page content via `Do`. Tests that Form XObject text is extracted, that the Form's `Matrix` is applied to the CTM, and that the Form's Resources are preferred over the page's.
+- `form-xobject-nested.pdf`: Three layers: the page invokes `FmOuter`, which invokes `FmInner`, which shows the targeted text. Tests that Form XObject redaction recurses through nested `Do` invocations, rewrites each inner copy, and repoints the outer Form's own `Resources.XObject` at the redacted inner copy.
+- `vector-vy-curves.pdf`: Filled curved shape built from `m` → `v` → `y` → `h f` operators, directly under a text run. Tests that the `v` and `y` curve shorthands (which omit one control point) are included in the path bounds used by vector paint neutralization.
+- `encoding-differences.pdf`: Type1 font with `/Encoding` as a dictionary that declares `/BaseEncoding /WinAnsiEncoding` and a `/Differences` array overriding byte 0x40 with `/AE` (Æ) and byte 0x7B with `/fi` (the fi ligature). Tests that glyph-name resolution through the Adobe Glyph List subset works end-to-end.
+- `ocg-hidden-layer.pdf`: Catalog with `/OCProperties` declaring one OCG that is turned off in the default configuration. Tests that text extraction still works but redaction refuses the document with a clear `Unsupported` error so hidden-layer content cannot slip through.
+- `ocg-hidden-content.pdf`: Same shape as `ocg-hidden-layer.pdf` but the page content stream actually carries a `BDC /OC /Hidden ... EMC` block referencing the hidden OCG. Tests the `sanitizeHiddenOcgs: true` opt-in: the hidden block is stripped before redaction runs, the visible line survives, and the saved PDF no longer contains the hidden bytes.
+- `ocg-base-state-off.pdf`: Same hidden-content shape but the default configuration uses `/BaseState /OFF` instead of a `/OFF` array. Confirms the sanitization pass recognises the alternative form and still strips the hidden block.
+- `lzw-content.pdf`: Page content stream with `/Filter /LZWDecode` using the default `EarlyChange = 1`. Tests parser/decoder for the LZW filter end-to-end.
+- `run-length-content.pdf`: Page content stream with `/Filter /RunLengthDecode` encoded as a sequence of literal runs plus an EOD marker. Tests the RunLengthDecode filter end-to-end.
+- `bx-ex-compat.pdf`: Page content stream wrapping an unknown operator (`sh`) inside a `BX`/`EX` compatibility section. Confirms the redactor passes unrecognized ops through and still redacts the surrounding text.
+- `mac-roman-encoding.pdf`: Type1 Helvetica with `/Encoding /MacRomanEncoding`; content stream shows bytes `0xD2`/`0xD3` that must decode to `U+201C`/`U+201D` under Mac Roman and to different glyphs under WinAnsi.
+- `standard-encoding.pdf`: Type1 Helvetica with `/Encoding /StandardEncoding`; content stream uses bytes `0x27` and `0x60` which Adobe Standard Encoding maps to `quoteright` (`U+2019`) and `quoteleft` (`U+2018`), not ASCII apostrophe/grave.
+- `dense-layout.pdf`: Four rows of 6pt Helvetica placed 2pt apart in `y`. Regression guard for the visual-line grouping heuristic so dense tables stay split.
+- `ultra-dense-layout.pdf`: Three rows of 8pt Helvetica placed exactly 1pt apart in `y`. Regression guard for the float-epsilon comparison in the line grouper; without it the second row would absorb the right-most glyphs of the third row.
+
+Built for `tests/image_redaction.rs`, not by the generator: a 64 x 48 checkerboard of 4-pixel squares, inverted in its bottom-right corner, written by ImageMagick.
+
+- `checker-64x48.g4`: the checkerboard as a raw CCITT Group 4 stream (`convert checker.pbm GROUP4:checker-64x48.g4`). The tests wrap it as a CCITT image, a stencil mask, an inline image, and as the MMR generic region of a JBIG2 stream.
+- `checker-64x48.j2k`: a grey variant as a lossless JPEG 2000 codestream (`convert checker.pgm -define jp2:quality=0 J2K:checker-64x48.j2k`).
+
+Regenerate all fixtures after changes:
+
+```sh
+node tests/fixtures/generate-fixtures.mjs
+```

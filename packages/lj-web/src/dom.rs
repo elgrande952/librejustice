@@ -1,6 +1,6 @@
 //! Helpers DOM par-dessus `web-sys`. Compile UNIQUEMENT sous `hydrate` (le
 //! module est vide en SSR — les appels sont gatés `#[cfg(feature = "hydrate")]`
-//! côté appelant, comme `spawn_local` dans `activity_page` / `DecisionActions`).
+//! côté appelant, comme `spawn_local` dans `DecisionActions`).
 #![cfg(feature = "hydrate")]
 
 use wasm_bindgen::prelude::*;
@@ -67,9 +67,9 @@ extern "C" {
     fn texte(this: &SelectionTexte) -> String;
 }
 
-/// Position et texte de la sélection courante, si elle est dans `article` et que
-/// son rectangle n'est pas dégénéré.
-fn mesurer(article: &web_sys::Element) -> Option<(String, f64, f64)> {
+/// Text of the current selection when it sits in `article`, with the top, the
+/// bottom and the horizontal centre of its rect. `None` on a degenerate rect.
+fn mesurer(article: &web_sys::Element) -> Option<(String, f64, f64, f64)> {
     let selection = web_sys::window()?.get_selection().ok().flatten()?;
     if selection.range_count() == 0 || selection.is_collapsed() {
         return None;
@@ -94,7 +94,8 @@ fn mesurer(article: &web_sys::Element) -> Option<(String, f64, f64)> {
     }
     Some((
         selection.unchecked_ref::<SelectionTexte>().texte(),
-        (rect.top() - 12.0).max(16.0),
+        rect.top(),
+        rect.bottom(),
         rect.left() + rect.width() / 2.0,
     ))
 }
@@ -104,7 +105,7 @@ fn mesurer(article: &web_sys::Element) -> Option<(String, f64, f64)> {
 /// écouteurs à son `Drop`.
 pub fn observe_selection(
     article: web_sys::Element,
-    mut on_change: impl FnMut(Option<(String, f64, f64)>) + 'static,
+    mut on_change: impl FnMut(Option<(String, f64, f64, f64)>) + 'static,
 ) -> Option<SelectionSubscription> {
     let window = web_sys::window()?;
     let document = window.document()?;

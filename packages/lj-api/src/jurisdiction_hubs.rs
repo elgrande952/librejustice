@@ -9,9 +9,10 @@ use crate::state::AppState;
 use lj_dtos::{
     JurisdictionCatalogueResponse, JurisdictionHubDecision, JurisdictionHubEntry,
     JurisdictionHubResponse, JurisdictionTypeGroup, JurisdictionYearCount,
-    JurisdictionYearResponse, HUB_PAGE_SIZE,
+    JurisdictionYearResponse,
 };
 use lj_store::repository::DecisionRepository;
+use lj_vocab::HUB_PAGE_SIZE;
 use std::sync::Arc;
 
 /// Ordre éditorial des familles du catalogue : ordre administratif, ordre
@@ -27,7 +28,7 @@ const TYPE_ORDER: &[&str] = &[
 pub async fn catalogue(state: &AppState) -> Result<Arc<JurisdictionCatalogueResponse>> {
     state
         .jurisdiction_catalogue_cache
-        .try_get_with((), load_catalogue(state))
+        .try_get_with(String::new(), load_catalogue(state))
         .await
         .map_err(|e: Arc<ApiError>| ApiError::Internal(format!("catalogue juridictions: {e}")))
 }
@@ -73,6 +74,12 @@ async fn load_catalogue(state: &AppState) -> Result<Arc<JurisdictionCatalogueRes
     Ok(Arc::new(JurisdictionCatalogueResponse { groups }))
 }
 
+/// Token of the `seat` filter for this court, derived here because the front
+/// compiles to wasm and never sees the vocabulary that renames one.
+fn seat_path(jurisdiction_type: &str, code: &str) -> String {
+    lj_core::chamber::jurisdiction_trunk(jurisdiction_type, Some(code)).join(".")
+}
+
 /// Hub d'une juridiction : années couvertes + volume. 404 si le code est
 /// inconnu du référentiel ou sans décision datée.
 pub async fn hub(state: &AppState, code: &str) -> Result<JurisdictionHubResponse> {
@@ -94,6 +101,7 @@ pub async fn hub(state: &AppState, code: &str) -> Result<JurisdictionHubResponse
     Ok(JurisdictionHubResponse {
         code: code.to_string(),
         label,
+        seat_path: seat_path(&jurisdiction_type, code),
         jurisdiction_type,
         type_label,
         decision_count: years.iter().map(|(_, c)| c).sum(),
@@ -131,6 +139,9 @@ pub async fn year_page(
     Ok(JurisdictionYearResponse {
         code: code.to_string(),
         label,
+        jurisdiction_type: lj_dtos::JurisdictionType::from_code(&entry.jurisdiction_type)
+            .expect("a stored jurisdiction_type is a known variant"),
+        seat_path: seat_path(&entry.jurisdiction_type, code),
         year,
         total,
         page,

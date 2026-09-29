@@ -2,11 +2,12 @@
 
 mod alias_candidats;
 mod analyze;
+mod backfill_addresses;
 mod case_names;
 mod chain;
-mod chunking;
 mod citations_maintenance;
 mod config;
+mod credential;
 mod indexnow;
 mod invariants;
 mod logging;
@@ -22,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use lj_store::repository::Courts;
 use lj_telemetry::{InitOpts, OtlpCreds, TelemetryGuard};
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::EnvFilter;
@@ -70,6 +72,68 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum CredentialAction {
+    #[command(about = "Verse dans un pool les clés que porte une variable")]
+    Import {
+        provider: String,
+        #[arg(help = "Nom de la variable qui porte les clés, séparées par des virgules")]
+        from: String,
+        #[arg(
+            long,
+            help = "Variable CSV nommant la frontière de quota de chaque clé, dans le même ordre"
+        )]
+        tenants: Option<String>,
+        #[arg(long, help = "Compte de console qui détient ces frontières")]
+        account: Option<String>,
+    },
+    #[command(about = "Remplit les pools vides depuis les variables d'amorce, laisse les autres")]
+    Seed,
+    #[command(about = "Affiche le pool tel que la base le tient, jamais le secret")]
+    List,
+    #[command(about = "Nomme la frontière de quota d'une clé et le compte qui la détient")]
+    Name {
+        fingerprint: String,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    #[command(about = "Connexion device d'un siège OpenAI : affiche un code, attend, range")]
+    Login,
+    #[command(about = "Rafraîchit les jetons OAuth qui périment sous deux jours")]
+    Refresh,
+    #[command(
+        about = "Quota vivant des comptes ChatGPT : fenêtres et crédits de réinitialisation"
+    )]
+    Usage,
+    #[command(about = "Brûle un crédit de réinitialisation, la semaine devant être épuisée")]
+    ResetCredit {
+        #[arg(help = "Nom du compte dans le pool")]
+        label: String,
+        #[arg(
+            long,
+            help = "Brûle même si la fenêtre de sept jours a encore de la place"
+        )]
+        force: bool,
+    },
+    #[command(about = "Retire une clé du pool")]
+    Forget { fingerprint: String },
+    #[command(about = "Gare une clé jusqu'au prochain reset mensuel, ou jusqu'à `enable`")]
+    Disable {
+        fingerprint: String,
+        #[arg(long, default_value_t = 402, help = "Statut HTTP constaté au refus")]
+        status: i16,
+        #[arg(
+            long,
+            help = "Garée jusqu'à `credential enable`, pour un compte que son titulaire utilise aussi"
+        )]
+        until_enabled: bool,
+    },
+    #[command(about = "Rend au pool une clé garée")]
+    Enable { fingerprint: String },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Déroule une chaîne planifiée (cron). Chaque étape a son propre délai de
     /// watchdog et un échec n'interrompt pas les suivantes ; la chaîne sort
@@ -86,9 +150,17 @@ enum Command {
     Analyze,
     /// Applique les migrations Postgres.
     Migrate,
+    #[command(about = "Pool de clés LLM : verser, nommer, lire ce que la base tient")]
+    Credential {
+        #[command(subcommand)]
+        action: CredentialAction,
+    },
     /// Projette les renvois des analyses du Conseil d'État en relation de
     /// citation (`decision_renvoi`) et résout les cibles.
     Renvois,
+    /// Remplit les trois colonnes d'adresse des cibles depuis la cible résolue
+    /// ou l'ancienne clé, le temps que la ré-extraction repasse le fonds.
+    BackfillAddresses,
     /// Remplit `alias_candidate` : surnoms d'arrêts et de lois minés depuis les
     /// renvois du Conseil d'État et la locution « dite loi ». N'active rien.
     AliasCandidats {
@@ -142,7 +214,7 @@ enum Command {
         /// la version courante — c'est le relink hebdomadaire (un texte nouveau au
         /// catalogue attire ses citations anciennes ; le skip des sets de citations
         /// inchangés borne les écritures au delta).
-        #[arg(long, conflicts_with_all = ["jurisdiction_type", "citing_ref_uid"])]
+        #[arg(long, conflicts_with_all = ["jurisdiction_type", "jurisdiction_code", "citing_ref_uid"])]
         full: bool,
         /// Cible des `jurisdiction_type` (CSV, ex. `CNDA,CEDH,CJUE,CONSTIT,TC`) à
         /// re-extraire **quelle que soit la `extract_version`** (sans bump global).
@@ -150,6 +222,11 @@ enum Command {
         /// Vide = comportement par défaut (toutes les versions divergentes).
         #[arg(long, value_delimiter = ',')]
         jurisdiction_type: Vec<String>,
+        /// Courts (`decisions.jurisdiction_code`, CSV, e.g. `tj_papeete,ca_papeete`)
+        /// to re-extract whatever their `extract_version`, as `--jurisdiction-type`
+        /// does for a whole order of courts.
+        #[arg(long, value_delimiter = ',', conflicts_with = "jurisdiction_type")]
+        jurisdiction_code: Vec<String>,
         /// Champs à re-extraire (CSV, ex. `legal_references`). Vide = tous les
         /// champs ré-extractibles. Restreindre à `legal_references` ne ré-écrit
         /// que les citations (via `replace_citations`), sans toucher les colonnes.
@@ -165,10 +242,10 @@ enum Command {
         /// `--jurisdiction-type` : ne repasse que le gisement du littéral.
         #[arg(long, requires = "jurisdiction_type")]
         text_query: Option<String>,
-        /// Workers concurrents = connexions DB simultanées (chacun fait
-        /// fetch→extract→write en parallèle). C'est le levier de pression sur la
-        /// base : `--workers 2` reste doux sur une prod qui sert du trafic ; vide =
-        /// défaut agressif (cœurs−4, borné [2,8]).
+        /// Concurrent workers = simultaneous DB connections (each one runs
+        /// fetch, extract and write in parallel). This is the pressure lever on the
+        /// database: empty = 3, gentle on a prod that serves traffic; the nightly
+        /// chain asks for 8, and a pass in a hurry can go as high.
         #[arg(long)]
         workers: Option<usize>,
     },
@@ -193,18 +270,55 @@ enum Command {
     GenerateSummaries {
         #[arg(long)]
         limit: Option<usize>,
-        /// Appels Mistral concurrents (sémaphore). Le débit réel est cadencé
-        /// par le throttle du client ; ce plafond borne juste les appels en vol.
-        /// Défaut (absent) : clés vivantes × 7.
-        #[arg(long)]
-        concurrency: Option<usize>,
         /// Régénère AUSSI les résumés dont le prompt est plus ancien que la
         /// version courante (`summary_prompt_version < SUMMARY_PROMPT_VERSION`).
         /// Sans ce flag, seuls les résumés manquants (`summary IS NULL`) sont
         /// générés.
         #[arg(long)]
         refresh_stale: bool,
+        #[arg(
+            long,
+            help = "Sert d'abord les décisions les plus citées dans le fonds, à partir de ce nombre de citations"
+        )]
+        cited_min: Option<i32>,
+        /// Serves supreme courts first, then appeal, then first instance, most recent first in each.
+        #[arg(long, conflicts_with = "cited_min")]
+        by_jurisdiction: bool,
+        /// The same order backwards, first instance and oldest first: a second
+        /// run that never meets the first.
+        #[arg(long, requires = "by_jurisdiction")]
+        reverse: bool,
+        /// Models this run spends, each until its quota refuses; the chain's when absent.
+        #[arg(long = "model", value_enum)]
+        models: Vec<summary::Model>,
+        /// Credentials this run may spend, by tenant or fingerprint; every live one when absent.
+        #[arg(long = "account")]
+        accounts: Vec<String>,
     },
+    /// Overwrites the summary of the decisions whose court has since published its
+    /// own commentary, pasted rather than generated: 0,96 of F-measure against 0,73.
+    UpgradeSummariesCommentaries {
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Passes back through the current collage what a retired engine wrote, one
+    /// jurisdiction at a time. Selects on `decisions.summary_engine`, the collage
+    /// text having changed without its generation moving: `--refresh-stale` would
+    /// take the whole rewrite corpus along.
+    RecollageSummaries {
+        /// Engine whose summaries are taken back, 7 for `LunaCollageV10`.
+        #[arg(long)]
+        from_engine: i16,
+        /// Jurisdiction type, `CE` for the Conseil d'État. All of them by default.
+        #[arg(long)]
+        jurisdiction: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Replays the deterministic cleaning of `lj-core` over the stored summaries.
+    /// Idempotent, a no-op in steady state; to be run after that cleaning gains a
+    /// rule, which leaves the stock carrying what it now refuses.
+    RecleanSummaries,
     /// Recompute des arrays légaux dénormalisés depuis `legal_citation`
     /// (réparation). Idempotent, lots autocommit ; en régime normal l'écrivain
     /// de citations tient les arrays à jour.
@@ -220,9 +334,6 @@ enum Command {
     /// Recompte `corpus_counts` : total et facettes du fonds entier que sert le
     /// mode parcours, et les trois totaux de la page d'accueil. Idempotent.
     ResyncCorpusCounts,
-    /// Recompose le référentiel `chamber` depuis `decisions` : une chambre par
-    /// paire (cour, clé), sa spécialisation votée par le fonds. Idempotent.
-    ResyncChambers,
     /// Re-key one-shot du namespace cnb: vers l'identité CNBF : ponte les uids
     /// legacy {barreau}:{nom}-{prenom} vers cnb:{avCnbfCode} (snapshot courant),
     /// purge les entités pieds de fichier, réhydrate les liens danglants.
@@ -285,9 +396,28 @@ enum Command {
     /// `tar.gz` bulk DILA local (`Freemium_legi_global_*.tar.gz` ou incrément
     /// `LEGI_*.tar.gz`, téléchargé hors-bande).
     Legi {
-        /// Chemin local de l'archive `tar.gz` LEGI.
+        /// Chemins locaux des archives `tar.gz` LEGI, dans l'ordre chronologique.
         #[arg(required = true)]
-        path: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
+        /// Restricts the pass to these text cids, repeatable. A named pass reads each
+        /// archive whole and applies no suppression list.
+        #[arg(long = "text")]
+        textes: Vec<String>,
+        /// The archives predate what the base holds, so differing bytes never win:
+        /// set it to replay an old global stock, never to feed increments.
+        #[arg(long = "stock-ancien")]
+        stock_ancien: bool,
+    },
+    /// Audits a text's chronicles: compares the versions the `VERSIONS` block of
+    /// the LEGI files declares to the ones we hold, and qualifies each missing one
+    /// (file present, named by a suppression list, or never delivered). Read only.
+    AuditLegiVersions {
+        /// Cid of the audited text (`LEGITEXT000006073189` = code de la sécurité sociale).
+        #[arg(long, required = true)]
+        text: String,
+        /// LEGI `tar.gz` archives to read (global stock, then increments).
+        #[arg(required = true)]
+        paths: Vec<std::path::PathBuf>,
     },
     /// Sync incrémental LEGI : télécharge les incréments `LEGI_*.tar.gz`
     /// postérieurs au watermark puis les ingère (le stock global se bootstrape
@@ -326,9 +456,17 @@ enum Command {
     /// KALICONT → `legal_text`, KALIARTI → `legal_article` (ancrés sur la
     /// convention). Idempotent.
     Kali {
-        /// Chemin local de l'archive `tar.gz` KALI.
+        /// Chemins locaux des archives `tar.gz` KALI, dans l'ordre chronologique.
         #[arg(required = true)]
-        path: std::path::PathBuf,
+        paths: Vec<std::path::PathBuf>,
+        /// Restricts the pass to these container cids, repeatable. A named pass reads
+        /// each archive whole and applies no suppression list.
+        #[arg(long = "text")]
+        textes: Vec<String>,
+        /// The archives predate what the base holds, so differing bytes never win:
+        /// set it to replay an old global stock, never to feed increments.
+        #[arg(long = "stock-ancien")]
+        stock_ancien: bool,
     },
     /// Sync incrémental KALI : cold start télécharge le stock global puis les
     /// incréments `KALI_*.tar.gz` postérieurs au watermark, chacun ingéré.
@@ -348,7 +486,19 @@ enum Command {
     /// réconciliés en lignes canoniques, upsertés. Aucun état stampé ni
     /// supprimé : la moisson n'écrit que ce qu'elle voit, la fenêtre vivante se
     /// calcule à la lecture. Idempotent.
-    Annonces,
+    Annonces {
+        #[arg(
+            long,
+            default_value_t = lj_sources_annonces::centraledesmarches::FENETRE_JOURS,
+            help = "Jours de publication parcourus chez la Centrale des marchés. Le défaut borne la quotidienne à ce qui a paru depuis la veille ; un rattrapage manuel l'élargit, à 14 pages par jour demandé."
+        )]
+        centrale_jours: i32,
+        #[arg(
+            long,
+            help = "Reprend les tenants silencieux depuis sept nuits, que la quotidienne écarte. Réservé à l'hebdomadaire : une plateforme rendue est ainsi retrouvée en sept jours au pire, sans que la quotidienne paie ses sondes tous les soirs."
+        )]
+        relancer_muets: bool,
+    },
     /// Mesure la complétude de la moisson des plateformes : les consultations
     /// ouvertes que seuls les canaux de publication portent (BOAMP, TED,
     /// presse), classées par tenant et par cause — tenant non recensé, moteur
@@ -372,6 +522,18 @@ enum Command {
         #[arg(long)]
         jusqu: String,
     },
+    /// Fills the description, the lots, the award criteria and the estimated
+    /// value on rows already written, by re-reading the BOAMP export month by
+    /// month. Touches neither identity nor channels. Manual, never scheduled.
+    AnnoncesContenu {
+        /// First month included (`YYYY-MM-DD`, pulled back to the 1st). Defaults
+        /// to 2010-01-01, the floor of the dataset.
+        #[arg(long)]
+        depuis: Option<String>,
+        /// Excluded end bound (`YYYY-MM-DD`).
+        #[arg(long)]
+        jusqu: String,
+    },
     /// Enrichit les annonces ouvertes par leur page de détail : le code CPV et
     /// la procédure, que les 11 moteurs de scraping ne portent pas en liste.
     /// File dérivée (ouvertes, sans bloc `detail`, sans canal BOAMP), une page
@@ -390,12 +552,53 @@ enum Command {
         /// sache lire l'acheteur (Atexo). Manuel, jamais planifié.
         #[arg(long, default_value_t = false)]
         sans_acheteur: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Rattrapage : tire les annonces sans zone au lieu des non visitées. Rouvre les fiches lues avant que leur extracteur ne sache lire le lieu d'exécution. Manuel, jamais planifié."
+        )]
+        sans_zone: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Rattrapage : tire les annonces sans description ni lots ni critères ni montant au lieu des non visitées. Rouvre les fiches lues avant que leur extracteur ne sache lire le contenu de l'avis. Manuel, jamais planifié."
+        )]
+        sans_contenu: bool,
+    },
+    #[command(
+        about = "Pose les attributions que déclarent les données essentielles de la commande publique",
+        long_about = "Pose les attributions que déclarent les données essentielles de la commande publique. Quotidien. Sort sans rien télécharger quand le catalogue sert les trois dates de publication de la dernière passe écrite et qu'aucune fenêtre plus large n'est demandée. Idempotent."
+    )]
+    AnnoncesDecp {
+        #[arg(
+            long,
+            help = "Début de la fenêtre de notification (`YYYY-MM-DD`). Le défaut couvre les 180 derniers jours, ce qu'une passe quotidienne rattrape du retard que les acheteurs prennent à déclarer ; un rattrapage manuel remonte à 2018, où commence l'obligation."
+        )]
+        depuis: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Écrit les attributions. Sans ce drapeau, la commande compte et montre ce qu'elle poserait."
+        )]
+        applique: bool,
     },
     /// Recense les profils d'acheteurs cités par les avis BOAMP actifs et les
     /// classe par moteur (`profil_acheteur`) — les moteurs multi-tenants
     /// (Atexo, Safetender, Modula) en dépendent pour savoir quels hôtes énumérer.
     /// Hebdomadaire. Idempotent.
     AnnoncesDiscover,
+    #[command(
+        about = "Sonde les liens que les listes affichent et classe ce que la porte sert",
+        long_about = "Tire un échantillon des liens que les listes affichent, ouvre chacun et classe ce que la porte sert : le fichier, le formulaire de retrait, la fiche, l'accueil de la plateforme, un rationnement de l'appelant, un lien mort. Verdict du jour dans `annonce_lien_sonde`. Quotidien. Idempotent."
+    )]
+    AnnoncesSonderLiens {
+        #[arg(
+            long,
+            default_value_t = 8,
+            help = "Liens tirés par moteur et par nature de lien"
+        )]
+        par_moteur: i64,
+    },
     /// Tient le stock `marche` en conformité : chaque ligne orpheline (uid
     /// abandonné par un re-groupage, plus aucun canal) est résolue par ses
     /// `details.liens` vers la ligne qui porte aujourd'hui ses canaux, puis
@@ -489,6 +692,14 @@ enum Command {
     /// l'ADDE → commentaires doctrine web `kind:"note"` (liens sortants) des
     /// décisions rattachées par (dossier, date). Idempotent, non cherchable.
     SyncAdde,
+    /// Sync HAL: reads the open archive's recent law deposits and attaches
+    /// those citing a docket number as `kind:"note"` commentaries (outbound
+    /// links). Idempotent, not searchable.
+    SyncHal {
+        /// Scan depth: 30 days, 180 days, or the whole fonds.
+        #[arg(long, value_enum, default_value_t = pipeline::HalScan::Daily)]
+        scan: pipeline::HalScan,
+    },
     /// Charge les commentaires de norme curés depuis
     /// `<state_dir>/ingest/article-commentaires.json` → `article_commentaire`
     /// (liens `kind:"note"` sur des articles de loi/traité). Entrées ancrées par
@@ -515,9 +726,31 @@ enum Command {
     /// stock/incréments DILA postérieurs au watermark puis les ingère (mécanique
     /// `sync-legi`). Idempotent, reprenable.
     SyncJorf,
+    /// Writes the text of the unnumbered JORF articles as the body of the texts
+    /// with neither body nor article, from every cached JORF archive. Replayable.
+    JorfBodies,
     /// Assigne les slugs manquants de `legal_text` : backfill puis no-op (la
     /// passe tourne aussi en fin de chaque ingest référentiel).
     AssignSlugs,
+    #[command(
+        about = "Retire des slugs étrangers le suffixe pays alpha-3 que le premier segment d'URL porte désormais, et lègue chaque ancienne adresse en redirection. Rejouable : un slug déjà nu est laissé tel quel"
+    )]
+    DropCountrySuffix,
+    #[command(
+        about = "Renames every text slug the cascade no longer mints from its text, each old address kept as a redirect. Dry-run without --applique; replays as a no-op"
+    )]
+    RemintTextSlugs {
+        #[arg(long)]
+        applique: bool,
+    },
+    #[command(
+        about = "Audits the section paths of every text at today's date: sections addressed, merged, and those that still needed an ordinal. Reads only"
+    )]
+    AuditTocPaths,
+    #[command(
+        about = "Range sous UE les textes de la pile internationale que l'Union édicte : son droit primaire et ce qui le modifie, et ce que ses États membres signent entre eux sur la base de ses traités. Rejouable"
+    )]
+    RefileUnionTexts,
     /// Recalcule `legal_text.role` (classification v1 conservatrice) et aligne
     /// `legal_link.verb` sur le repli verbe/nom courant. Idempotent.
     BackfillTextRoles,
@@ -576,18 +809,15 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Balayage du registre EUR-Lex : tout règlement ou directive (secteur 3,
-    /// actes de base, délégués et d'exécution) publié depuis `--depuis` entre au
-    /// catalogue, cité ou non, en entrée catalogue-seul chargée dans la foulée.
-    /// C'est l'autre porte que `ingest-eu-catalog`, qui ne voit que ce que nos
-    /// décisions nomment. `--depuis` défaut à 90 jours : la fenêtre se recouvre
-    /// d'un jour sur l'autre, ce qui rattrape une passe manquée sans watermark.
-    /// Un rattrapage de fond se demande par une date ancienne. Idempotent.
+    /// EUR-Lex registry: every regulation and directive (sector 3, base,
+    /// delegated and implementing acts) enters the catalogue, cited or not, as
+    /// a catalogue-only entry loaded right away. Delta by default, on the acts
+    /// CELLAR registered since the watermark of the eu-law manifest; `--full`
+    /// sweeps the whole registry, which is also the bootstrap when the
+    /// watermark is absent. Idempotent.
     SyncEuCatalog {
         #[arg(long)]
-        depuis: Option<chrono::NaiveDate>,
-        #[arg(long = "jusqu-a")]
-        jusqu_a: Option<chrono::NaiveDate>,
+        full: bool,
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -611,20 +841,22 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
-    /// Sync quotidien du fond UE : chaque acte du registre (datasets
-    /// `eu-*.json`) suit sa dernière version consolidée applicable, sourcée en
-    /// Formex 4 via CELLAR (notice branch → manifestation `.FRA.fmx4` → item
-    /// cellar). En régime, un **delta SPARQL** (consolidations parues depuis le
-    /// watermark + versions futures à échéance) borne les sondes aux actes
-    /// touchés ; `--full` force le balayage intégral des notices (filet hebdo
-    /// auto-réparant, aussi le bootstrap quand le manifeste est vierge). Seuls
-    /// les datasets dont la version disponible diffère du marqueur
-    /// `consolidated_celex` sont régénérés puis rechargés (loader legal-corpus,
-    /// purge par texte). Les actes sans Formex gardent leur stock. Le skip est
-    /// gagé sur l'état DB (celex de `source_url`), pas sur le fichier.
-    /// `--limit` borne aux N premiers actes, `--only` filtre par sous-chaîne du
-    /// nom de dataset (rodage) — tous deux sans effet sur le manifeste —,
-    /// `--force` re-fetche et recharge tout.
+    /// Daily sync of the EU fund: every act of the registry (`eu-*.json`
+    /// datasets) carries its whole consolidated series, sourced as Formex 4
+    /// through CELLAR (notice branch, `.FRA.fmx4` manifestation, cellar item).
+    /// A version is written per change of body, not per consolidation. In
+    /// steady state a SPARQL delta (consolidations published since the
+    /// watermark, plus future versions come due) bounds the probes to the acts
+    /// touched; `--full` sweeps every notice (weekly net, and the bootstrap
+    /// when the manifest is blank). An act whose dataset already lists every
+    /// applicable snapshot is skipped, unless the DB lags its last written
+    /// version (run interrupted between write and load). Acts with no Formex
+    /// keep their stock. `--limit` bounds to the first N acts, `--only` filters
+    /// by dataset name substring (both leave the manifest alone), `--force`
+    /// refetches the whole series and reloads. The full sweep probes the acts
+    /// in force and a batch of those never visited; `--backlog` probes every
+    /// act never visited, the stock catch-up run by hand, with `--concurrency`
+    /// CELLAR fetches at once.
     SyncEuLaw {
         #[arg(long)]
         limit: Option<usize>,
@@ -634,6 +866,10 @@ enum Command {
         force: bool,
         #[arg(long)]
         full: bool,
+        #[arg(long)]
+        backlog: bool,
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
     },
     /// Ingestion catalogue des règlements de procédure des juridictions UE
     /// (Cour de justice, Tribunal, ex-TFP). Écrit des datasets catalogue curés
@@ -778,13 +1014,21 @@ enum Command {
         #[arg(long)]
         from_year: Option<i32>,
     },
-    /// Bootstrap CJUE (EUR-Lex) : balaye toutes les années, fetch le texte FR
-    /// des arrêts/ordonnances et les ingère. Idempotent.
+    /// CJUE bootstrap (EUR-Lex): sweeps every year and ingests the judgments and
+    /// orders in French, English and their language of procedure. Idempotent.
     IngestCjue,
     /// Sync incrémental CEDH : ne balaye que l'année courante.
     SyncCedh,
     /// Sync incrémental CJUE : ne balaye que l'année courante.
     SyncCjue,
+    /// Catches the CJUE corpus up on joined cases: sweeps
+    /// `case-law_joins_case_court` at CELLAR and poses it in `source_fields`.
+    /// Poses no docket number: chain `reextract-fields --jurisdiction-type CJUE
+    /// --field docket_numbers`, which reads them back.
+    BackfillCjueJoinedCases {
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Bootstrap CNDA (Cour nationale du droit d'asile) : crawl la liste
     /// jurisprudentielle paginée de `cnda.fr`, fusionne fiche HTML + PDF lié par
     /// numéro et les ingère (`source_uid = cnda/<numero>`, ECLI fabriqué).
@@ -870,9 +1114,52 @@ enum Command {
         #[arg(long)]
         dir: std::path::PathBuf,
     },
+    /// Two readings of a campaign, JSONL `{source_uid, quantum}`: the first one's
+    /// record at `PC_READING_VERSION`, its rows under the publication guards.
+    /// Idempotent.
+    LoadQuantumReadings {
+        /// The two readings, first then second.
+        #[arg(long = "lecture", required = true, num_args = 2)]
+        lectures: Vec<std::path::PathBuf>,
+    },
+    /// Deterministic quantum pass, sure mode, over the fonds decisions that name
+    /// a bodily-injury poste; written at `PC_EXTRACT_VERSION`, under the manual
+    /// revisions. Idempotent.
+    QuantumExtract {
+        /// Reads only the first N decisions of the fonds (tuning).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Applicability: the assertions (places, window, version) compiled from the
+    /// versions, the text's counters and the repository's default table.
+    #[command(subcommand)]
+    Assertions(AssertionsCommand),
     /// Maintenance DB (sous-commandes).
     #[command(subcommand)]
     Db(DbCommand),
+}
+
+#[derive(Subcommand, Clone)]
+enum AssertionsCommand {
+    /// Compiles the texts never compiled or modified within `--days` days;
+    /// `--full` rereads the whole fund and writes only what changed.
+    Compile {
+        #[arg(long)]
+        full: bool,
+        #[arg(long, default_value_t = 3)]
+        days: i32,
+        /// A single text, whose rows are printed in dry-run.
+        #[arg(long)]
+        text_uid: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// The three-term control per unfolded place: overlap, gap, inversion, and
+    /// the versions without a state. Reports, breaks nothing.
+    Control,
+    /// Rebuilds `text_place_coverage` and the natures from the assertions
+    /// already written, without recompiling. Replayable.
+    Coverage,
 }
 
 #[derive(Subcommand)]
@@ -901,8 +1188,6 @@ enum DbCommand {
 }
 
 impl Command {
-    /// Libellé stable de phase pour les breadcrumbs / le watchdog (clé de requête
-    /// Loki : `phase="ingest"`). Statique, indépendant des args.
     fn label(&self) -> &'static str {
         match self {
             Command::Chain { .. } => "chain",
@@ -910,7 +1195,9 @@ impl Command {
             Command::JudilibreRanges => "judilibre-ranges",
             Command::Analyze => "analyze",
             Command::Migrate => "migrate",
+            Command::Credential { .. } => "credential",
             Command::Renvois => "renvois",
+            Command::BackfillAddresses => "backfill-addresses",
             Command::AliasCandidats { .. } => "alias-candidats",
             Command::UsageTerms { .. } => "usage-terms",
             Command::Ingest { .. } => "ingest",
@@ -920,11 +1207,13 @@ impl Command {
             Command::EmbedMissing { .. } => "embed-missing",
             Command::PurgeReverses => "purge-reverses",
             Command::GenerateSummaries { .. } => "generate-summaries",
+            Command::UpgradeSummariesCommentaries { .. } => "upgrade-summaries-commentaries",
+            Command::RecollageSummaries { .. } => "recollage-summaries",
+            Command::RecleanSummaries => "reclean-summaries",
             Command::ResyncLegalArrays => "resync-legal-arrays",
             Command::Precompute => "precompute",
             Command::ResyncJurisdictionCounts => "resync-jurisdiction-counts",
             Command::ResyncCorpusCounts => "resync-corpus-counts",
-            Command::ResyncChambers => "resync-chambers",
             Command::RekeyCnb { .. } => "rekey-cnb",
             Command::CnbHistory { .. } => "cnb-history",
             Command::PartiesReconcile { .. } => "parties-reconcile",
@@ -934,17 +1223,21 @@ impl Command {
             Command::Indexnow { .. } => "indexnow",
             Command::Legi { .. } => "legi",
             Command::SyncLegi => "sync-legi",
+            Command::AuditLegiVersions { .. } => "audit-legi-versions",
             Command::BackfillLinks { .. } => "backfill-links",
             Command::BackfillToc { .. } => "backfill-toc",
             Command::BackfillTextes { .. } => "backfill-textes",
             Command::Kali { .. } => "kali",
             Command::SyncKali => "sync-kali",
             Command::RequalifierKali { .. } => "requalifier-kali",
-            Command::Annonces => "annonces",
+            Command::Annonces { .. } => "annonces",
             Command::AnnoncesCouverture { .. } => "annonces-couverture",
             Command::AnnoncesBackfill { .. } => "annonces-backfill",
+            Command::AnnoncesContenu { .. } => "annonces-contenu",
             Command::AnnoncesEnrichir { .. } => "annonces-enrichir",
+            Command::AnnoncesDecp { .. } => "annonces-decp",
             Command::AnnoncesDiscover => "annonces-discover",
+            Command::AnnoncesSonderLiens { .. } => "annonces-sonder-liens",
             Command::AnnoncesRegulariser { .. } => "annonces-regulariser",
             Command::AnnoncesResoudre { .. } => "annonces-resoudre",
             Command::AnnoncesJumeler { .. } => "annonces-jumeler",
@@ -956,11 +1249,17 @@ impl Command {
             Command::SyncAriane { .. } => "sync-ariane",
             Command::SyncCeList => "sync-ce-list",
             Command::SyncAdde => "sync-adde",
+            Command::SyncHal { .. } => "sync-hal",
             Command::SeedArticleCommentaires => "seed-article-commentaires",
             Command::ExtractTextRefs => "extract-text-refs",
             Command::Jorf { .. } => "jorf",
             Command::SyncJorf => "sync-jorf",
+            Command::JorfBodies => "jorf-bodies",
             Command::AssignSlugs => "assign-slugs",
+            Command::DropCountrySuffix => "drop-country-suffix",
+            Command::RemintTextSlugs { .. } => "remint-text-slugs",
+            Command::AuditTocPaths => "audit-toc-paths",
+            Command::RefileUnionTexts => "refile-union-texts",
             Command::BackfillTextRoles => "backfill-text-roles",
             Command::MoveChronicle { .. } => "move-chronicle",
             Command::RenameTexts { .. } => "rename-texts",
@@ -995,6 +1294,7 @@ impl Command {
             Command::IngestCjue => "ingest-cjue",
             Command::SyncCedh => "sync-cedh",
             Command::SyncCjue => "sync-cjue",
+            Command::BackfillCjueJoinedCases { .. } => "backfill-cjue-joined-cases",
             Command::IngestCnda { .. } => "ingest-cnda",
             Command::SyncCnda => "sync-cnda",
             Command::JuricafProbe { .. } => "juricaf-probe",
@@ -1004,6 +1304,11 @@ impl Command {
             Command::Registries { .. } => "registries",
             Command::PartiesRelink { .. } => "parties-relink",
             Command::LoadQuantumGold { .. } => "load-quantum-gold",
+            Command::LoadQuantumReadings { .. } => "load-quantum-readings",
+            Command::QuantumExtract { .. } => "quantum-extract",
+            Command::Assertions(AssertionsCommand::Compile { .. }) => "assertions:compile",
+            Command::Assertions(AssertionsCommand::Control) => "assertions:control",
+            Command::Assertions(AssertionsCommand::Coverage) => "assertions:coverage",
             Command::Db(DbCommand::Analyze) => "db:analyze",
             Command::Db(DbCommand::ReindexSearch) => "db:reindex-search",
             Command::Db(DbCommand::VacuumFull) => "db:vacuum-full",
@@ -1021,6 +1326,7 @@ async fn main() -> Result<()> {
 
     let _telemetry_guard = init_telemetry(&cli.log_level, &settings)?;
     install_panic_hook();
+    lj_sources_annonces::poser_sortie(Some(settings.egress_proxy.clone()));
 
     let result = match cli.command {
         Command::Chain { kind } => chain::run(kind).await,
@@ -1034,19 +1340,11 @@ async fn main() -> Result<()> {
 /// runtime) avant que la sentinelle ne considère le process comme coincé.
 const TEARDOWN_SENTINEL_SECS: u64 = 60;
 
-/// Arme un thread détaché qui, si le process est encore vivant
-/// [`TEARDOWN_SENTINEL_SECS`] après la fin de la commande, dumpe l'état de
-/// tous les threads (`/proc/self/task/*` : comm, état, wchan) sur **stderr**
-/// puis `abort()`.
-///
-/// Le teardown (Drop du `TelemetryGuard` puis du runtime tokio) est la seule
-/// phase qui ne peut ni logger sa fin ni être couverte par le watchdog. À la
-/// sortie normale le thread, détaché et endormi, meurt avec le process.
 fn arm_teardown_sentinel() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(TEARDOWN_SENTINEL_SECS));
         eprintln!(
-            "lj-ingest : teardown bloqué > {TEARDOWN_SENTINEL_SECS} s — état des threads avant abort :"
+            "lj-ingest: teardown stuck > {TEARDOWN_SENTINEL_SECS} s, thread state before abort:"
         );
         if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
             for task in tasks.flatten() {
@@ -1068,7 +1366,7 @@ fn arm_teardown_sentinel() {
                     .unwrap_or("?")
                     .to_string();
                 eprintln!(
-                    "  tid={} comm={} état={} wchan={}",
+                    "  tid={} comm={} state={} wchan={}",
                     task.file_name().to_string_lossy(),
                     read("comm"),
                     state,
@@ -1080,21 +1378,10 @@ fn arm_teardown_sentinel() {
     });
 }
 
-/// Exécute la commande sous un watchdog + breadcrumbs de cycle de vie.
-///
-/// - **Watchdog** : au-delà de `watchdog_secs`, on logge une erreur et on
-///   abandonne avec un `Err` (code non nul) au lieu de rester pendu. Le `&&`
-///   du cron casse alors proprement. `0` = désactivé.
-/// - **Breadcrumbs** : `info!` début + `info!`/`error!` fin, shippés vers
-///   Loki. Un « début » sans « fin » localise un hang.
-///
-/// Le timer du watchdog vit sur le runtime multi-thread : même si la
-/// commande bloque un worker, le timeout se déclenche, `main` rend `Err`, le
-/// guard flush les logs et le process sort.
 async fn run_with_watchdog(command: Command, watchdog_secs: u64) -> Result<()> {
     let phase = command.label();
     let started = Instant::now();
-    tracing::info!(phase, "commande lj-ingest : début");
+    tracing::info!(phase, "lj-ingest command: start");
 
     let result = if watchdog_secs == 0 {
         dispatch(command).await.map(Some)
@@ -1108,7 +1395,7 @@ async fn run_with_watchdog(command: Command, watchdog_secs: u64) -> Result<()> {
     let elapsed_s = started.elapsed().as_secs();
     match result {
         Ok(Some(())) => {
-            tracing::info!(phase, elapsed_s, "commande lj-ingest : succès");
+            tracing::info!(phase, elapsed_s, "lj-ingest command: success");
             Ok(())
         }
         Ok(None) => {
@@ -1116,7 +1403,7 @@ async fn run_with_watchdog(command: Command, watchdog_secs: u64) -> Result<()> {
                 phase,
                 elapsed_s,
                 watchdog_secs,
-                "commande lj-ingest : watchdog — dépassement de délai, abandon"
+                "lj-ingest command: watchdog deadline exceeded, aborting"
             );
             Err(anyhow!(
                 "watchdog: la commande `{phase}` a dépassé {watchdog_secs} s"
@@ -1124,16 +1411,12 @@ async fn run_with_watchdog(command: Command, watchdog_secs: u64) -> Result<()> {
         }
         Err(e) => {
             // `{e:#}` et non `{e}` : l'alternate déplie la chaîne anyhow sur une ligne.
-            tracing::error!(phase, elapsed_s, error = %format!("{e:#}"), "commande lj-ingest : échec");
+            tracing::error!(phase, elapsed_s, error = %format!("{e:#}"), "lj-ingest command: failed");
             Err(e)
         }
     }
 }
 
-/// Hook de panique : logge la panique en `error!` (donc shippée vers Loki via le
-/// bridge) avant de déléguer au hook par défaut (backtrace stderr). Le binaire
-/// `lj-ingest` déroule (`panic=unwind`, seul le wasm est `abort`), donc le `Drop`
-/// du guard flush la pile de logs — y compris cet `error!` — pendant l'unwind.
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1142,8 +1425,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Construit les `InitOpts` (niveau + format + creds OTLP via `Settings`)
-/// et installe la telemetrie partagee. `service.name = librejustice-ingest`.
 fn init_telemetry(log_level: &str, settings: &Settings) -> Result<TelemetryGuard> {
     let level = logging::resolve_level(Some(log_level));
     // `rustls_platform_verifier` loggue en ERROR chaque certificat invalide : le
@@ -1175,7 +1456,6 @@ fn init_telemetry(log_level: &str, settings: &Settings) -> Result<TelemetryGuard
         deployment_environment: settings.deployment_environment.clone(),
         host_name: settings.host_name.clone(),
         container_name: settings.container_name.clone(),
-        // Ingest (cron, bas volume) : on ship INFO+ pour les breadcrumbs de phase.
         otlp_log_filter: Targets::new().with_default(LevelFilter::INFO),
         otlp,
     })
@@ -1188,7 +1468,36 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::JudilibreRanges => cmd_judilibre_ranges().await,
         Command::Analyze => cmd_analyze(),
         Command::Migrate => cmd_migrate().await,
+        Command::Credential { action } => match action {
+            CredentialAction::Import {
+                provider,
+                from,
+                tenants,
+                account,
+            } => credential::import(&provider, &from, tenants.as_deref(), account.as_deref()).await,
+            CredentialAction::Seed => credential::seed().await,
+            CredentialAction::List => credential::list().await,
+            CredentialAction::Name {
+                fingerprint,
+                tenant,
+                account,
+            } => credential::name(&fingerprint, tenant.as_deref(), account.as_deref()).await,
+            CredentialAction::Forget { fingerprint } => credential::forget(&fingerprint).await,
+            CredentialAction::Disable {
+                fingerprint,
+                status,
+                until_enabled,
+            } => credential::disable(&fingerprint, status, until_enabled).await,
+            CredentialAction::Enable { fingerprint } => credential::enable(&fingerprint).await,
+            CredentialAction::Login => credential::login().await,
+            CredentialAction::Refresh => credential::refresh().await,
+            CredentialAction::Usage => credential::usage().await,
+            CredentialAction::ResetCredit { label, force } => {
+                credential::reset_credit(&label, force).await
+            }
+        },
         Command::Renvois => renvois::run().await,
+        Command::BackfillAddresses => backfill_addresses::run().await,
         Command::AliasCandidats { revue } => alias_candidats::run(revue).await,
         Command::UsageTerms {
             chunks,
@@ -1207,6 +1516,7 @@ async fn dispatch(command: Command) -> Result<()> {
             dry_run,
             full,
             jurisdiction_type,
+            jurisdiction_code,
             field,
             citing_ref_uid,
             text_query,
@@ -1216,6 +1526,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 dry_run,
                 full,
                 jurisdiction_type,
+                jurisdiction_code,
                 field,
                 citing_ref_uid,
                 text_query,
@@ -1228,14 +1539,33 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::PurgeReverses => cmd_purge_reverses().await,
         Command::GenerateSummaries {
             limit,
-            concurrency,
             refresh_stale,
-        } => summary_pipeline_generate(limit, concurrency, refresh_stale).await,
+            cited_min,
+            by_jurisdiction,
+            reverse,
+            models,
+            accounts,
+        } => {
+            let order = match (cited_min, by_jurisdiction) {
+                (Some(min), _) => summary::Order::Cited { min },
+                (None, true) => summary::Order::Jurisdiction { reverse },
+                (None, false) => summary::Order::Sweep,
+            };
+            summary_pipeline_generate(limit, refresh_stale, order, models, accounts).await
+        }
+        Command::UpgradeSummariesCommentaries { limit } => {
+            summary::upgrade_summaries_commentaries(500, limit.map(|l| l as i64)).await
+        }
+        Command::RecollageSummaries {
+            from_engine,
+            jurisdiction,
+            limit,
+        } => summary_pipeline_recollage(from_engine, jurisdiction, limit).await,
+        Command::RecleanSummaries => summary::reclean_summaries().await,
         Command::ResyncLegalArrays => citations_maintenance::resync_arrays().await,
         Command::Precompute => pipeline::precompute_all().await,
         Command::ResyncJurisdictionCounts => pipeline::resync_jurisdiction_counts().await,
         Command::ResyncCorpusCounts => pipeline::resync_corpus_counts().await,
-        Command::ResyncChambers => pipeline::resync_chambers().await,
         Command::RekeyCnb { apply } => pipeline::rekey_cnb(apply).await,
         Command::CnbHistory { apply } => pipeline::replay_cnb_history(apply).await,
         Command::PartiesReconcile { workers } => pipeline::reconcile_parties(workers).await,
@@ -1246,15 +1576,29 @@ async fn dispatch(command: Command) -> Result<()> {
             since_hours,
             max_urls,
         } => cmd_indexnow(since_hours, max_urls).await,
-        Command::Legi { path } => pipeline::ingest_legi(&path).await,
+        Command::Legi {
+            paths,
+            textes,
+            stock_ancien,
+        } => pipeline::ingest_legi(&paths, &textes, stock_ancien).await,
         Command::SyncLegi => pipeline::sync_legi().await,
+        Command::AuditLegiVersions { text, paths } => {
+            pipeline::audit_legi_versions(&text, &paths).await
+        }
         Command::BackfillLinks { paths } => pipeline::backfill_links(&paths).await,
         Command::BackfillToc { paths } => pipeline::backfill_toc(&paths).await,
         Command::BackfillTextes { paths } => pipeline::backfill_textes(&paths).await,
-        Command::Kali { path } => pipeline::ingest_kali(&path).await,
+        Command::Kali {
+            paths,
+            textes,
+            stock_ancien,
+        } => pipeline::ingest_kali(&paths, &textes, stock_ancien).await,
         Command::SyncKali => pipeline::sync_kali().await,
         Command::RequalifierKali { lot } => pipeline::requalifier_kali(lot).await,
-        Command::Annonces => pipeline::annonces().await,
+        Command::Annonces {
+            centrale_jours,
+            relancer_muets,
+        } => pipeline::annonces(centrale_jours, relancer_muets).await,
         Command::AnnoncesCouverture { limite } => pipeline::annonces_couverture(limite).await,
         Command::AnnoncesBackfill { depuis, jusqu } => {
             let date = |s: &str| {
@@ -1264,12 +1608,38 @@ async fn dispatch(command: Command) -> Result<()> {
             let depuis = depuis.as_deref().map(date).transpose()?;
             pipeline::annonces_backfill(depuis, date(&jusqu)?).await
         }
+        Command::AnnoncesContenu { depuis, jusqu } => {
+            let date = |s: &str| {
+                s.parse::<jiff::civil::Date>()
+                    .map_err(|e| anyhow!("date {s} illisible: {e}"))
+            };
+            let depuis = depuis.as_deref().map(date).transpose()?;
+            pipeline::annonces_contenu(depuis, date(&jusqu)?).await
+        }
         Command::AnnoncesEnrichir {
             limite,
             budget_min,
             sans_acheteur,
-        } => pipeline::annonces_enrichir(limite, budget_min, sans_acheteur).await,
+            sans_zone,
+            sans_contenu,
+        } => {
+            use lj_store::repository::FileEnrichissement;
+            let file = match (sans_acheteur, sans_zone, sans_contenu) {
+                (true, false, false) => FileEnrichissement::SansAcheteur,
+                (false, true, false) => FileEnrichissement::SansZone,
+                (false, false, true) => FileEnrichissement::SansContenu,
+                (false, false, false) => FileEnrichissement::NonVisitees,
+                _ => anyhow::bail!("annonces-enrichir : une file à la fois"),
+            };
+            pipeline::annonces_enrichir(limite, budget_min, file).await
+        }
+        Command::AnnoncesDecp { depuis, applique } => {
+            pipeline::annonces_decp(depuis.as_deref(), applique).await
+        }
         Command::AnnoncesDiscover => pipeline::annonces_discover().await,
+        Command::AnnoncesSonderLiens { par_moteur } => {
+            pipeline::annonces_sonder_liens(par_moteur).await
+        }
         Command::AnnoncesRegulariser { formes } => pipeline::annonces_regulariser(formes).await,
         Command::AnnoncesResoudre { applique, limite } => {
             pipeline::annonces_resoudre(limite, applique).await
@@ -1287,11 +1657,17 @@ async fn dispatch(command: Command) -> Result<()> {
         } => pipeline::sync_ariane(years, census_only, limit).await,
         Command::SyncCeList => pipeline::sync_ce_list().await,
         Command::SyncAdde => pipeline::sync_adde().await,
+        Command::SyncHal { scan } => pipeline::sync_hal(scan).await,
         Command::SeedArticleCommentaires => pipeline::seed_article_commentaires().await,
         Command::ExtractTextRefs => pipeline::extract_text_refs().await,
         Command::Jorf { paths } => pipeline::ingest_jorf(&paths).await,
         Command::SyncJorf => pipeline::sync_jorf().await,
+        Command::JorfBodies => pipeline::backfill_jorf_bodies().await,
         Command::AssignSlugs => pipeline::assign_slugs().await,
+        Command::DropCountrySuffix => pipeline::drop_country_suffix().await,
+        Command::RemintTextSlugs { applique } => pipeline::remint_text_slugs(applique).await,
+        Command::AuditTocPaths => pipeline::audit_toc_paths().await,
+        Command::RefileUnionTexts => pipeline::refile_union_texts().await,
         Command::BackfillTextRoles => pipeline::backfill_text_roles().await,
         Command::MoveChronicle { vehicle, exclude } => {
             pipeline::move_chronicle(&vehicle, &exclude).await
@@ -1302,14 +1678,8 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::DestarArticleKeys { applique } => pipeline::destar_article_keys(applique).await,
         Command::LoadLegalCorpus { only } => pipeline::load_legal_corpus(only.as_deref()).await,
         Command::IngestEuCatalog { limit } => pipeline::ingest_eu_catalog(limit).await,
-        Command::SyncEuCatalog {
-            depuis,
-            jusqu_a,
-            limit,
-        } => {
-            let aujourdhui = chrono::Utc::now().date_naive();
-            let depuis = depuis.unwrap_or(aujourdhui - chrono::Duration::days(90));
-            pipeline::sync_eu_catalog(depuis, jusqu_a.unwrap_or(aujourdhui), limit).await
+        Command::SyncEuCatalog { full, limit } => {
+            pipeline::sync_eu_catalog(full, limit).await.map(|_| ())
         }
         Command::SyncEuJorf { limit } => pipeline::sync_eu_jorf(limit).await,
         Command::MergeEuSwappedUids { apply } => pipeline::merge_eu_swapped_uids(apply).await,
@@ -1318,7 +1688,9 @@ async fn dispatch(command: Command) -> Result<()> {
             only,
             force,
             full,
-        } => pipeline::sync_eu_law(limit, only.as_deref(), force, full).await,
+            backlog,
+            concurrency,
+        } => pipeline::sync_eu_law(limit, only.as_deref(), force, full, backlog, concurrency).await,
         Command::IngestEuRproc { dry_run } => pipeline::ingest_eu_rproc(dry_run).await,
         Command::StampFreshness => pipeline::stamp_freshness().await,
         Command::Invariants => invariants::run().await,
@@ -1349,6 +1721,9 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::IngestCjue => pipeline::ingest_cjue().await,
         Command::SyncCedh => pipeline::sync_cedh().await,
         Command::SyncCjue => pipeline::sync_cjue().await,
+        Command::BackfillCjueJoinedCases { dry_run } => {
+            pipeline::backfill_cjue_joined_cases(dry_run).await
+        }
         Command::IngestCnda { mode, only } => pipeline::ingest_cnda(mode, only).await,
         Command::SyncCnda => pipeline::sync_cnda().await,
         Command::JuricafProbe { dir } => pipeline::juricaf_probe(dir).await,
@@ -1365,6 +1740,26 @@ async fn dispatch(command: Command) -> Result<()> {
         } => pipeline::load_registries(source, with_history).await,
         Command::PartiesRelink { full } => pipeline::relink_parties(full).await,
         Command::LoadQuantumGold { dir } => pipeline::load_quantum_gold(&dir).await,
+        Command::LoadQuantumReadings { lectures } => {
+            pipeline::load_quantum_readings(&lectures[0], &lectures[1]).await
+        }
+        Command::QuantumExtract { limit } => pipeline::extract_quantum(limit).await,
+        Command::Assertions(AssertionsCommand::Compile {
+            full,
+            days,
+            text_uid,
+            dry_run,
+        }) => {
+            pipeline::assertions_compile(pipeline::CompileOptions {
+                full,
+                days,
+                text_uid,
+                dry_run,
+            })
+            .await
+        }
+        Command::Assertions(AssertionsCommand::Control) => pipeline::assertions_control().await,
+        Command::Assertions(AssertionsCommand::Coverage) => pipeline::assertions_coverage().await,
         Command::Db(db_command) => cmd_db(db_command).await,
     }
 }
@@ -1373,7 +1768,7 @@ async fn pool_with_migrations(settings: &Settings) -> Result<deadpool_postgres::
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     Ok(pool)
@@ -1399,7 +1794,7 @@ async fn cmd_sync() -> Result<()> {
     // reste de la chaîne nocturne. On log et on continue.
     tracing::info!("=== sync opendata_conseil_etat ===");
     if let Err(e) = lj_sources::downloader::sync_opendata(&cache_dir, false) {
-        tracing::error!(error = %e, "sync opendata échoué — on poursuit avec Judilibre");
+        tracing::error!(error = %e, "opendata sync failed, carrying on with Judilibre");
     }
 
     tracing::info!("=== sync judilibre ===");
@@ -1535,13 +1930,14 @@ async fn cmd_migrate() -> Result<()> {
     let settings = Settings::from_env()?;
     let pool = pool_only(&settings, 4).await?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    let applied = lj_store::migrator::apply_migrations(&conn)
-        .await
-        .map_err(|e| anyhow!("migrations: {e}"))?;
+    let applied =
+        lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Apply)
+            .await
+            .map_err(|e| anyhow!("migrations: {e}"))?;
     if applied.is_empty() {
-        println!("Base déjà à jour.");
+        println!("Database already up to date.");
     } else {
-        println!("Migrations appliquées : {applied:?}");
+        println!("Migrations applied: {applied:?}");
     }
     Ok(())
 }
@@ -1560,7 +1956,7 @@ async fn cmd_ingest(with_embeddings: bool, mode: pipeline::IngestMode) -> Result
     let settings = Settings::from_env()?;
     pipeline::ingest_opendata(&settings.paths().opendata(), with_embeddings, mode).await?;
     pipeline::ingest_judilibre(&settings.paths().judilibre(), with_embeddings, mode).await?;
-    Ok(())
+    pipeline::resolve_pending_citations().await
 }
 
 /// Re-ingest ciblé des décisions opendata à `full_text` figé sur une
@@ -1580,22 +1976,30 @@ async fn cmd_reingest_stale_opendata() -> Result<()> {
 /// (vide → keyset par version) cible un sous-ensemble quelle que soit la
 /// version ; `--citing-ref-uid` cible les décisions citant un texte donné ;
 /// `--full` = passe intégrale/relink hebdo (tout le fonds < 1000).
+#[allow(clippy::too_many_arguments)]
 async fn cmd_reextract_fields(
     dry_run: bool,
     full: bool,
     jurisdiction_type: Vec<String>,
+    jurisdiction_code: Vec<String>,
     field: Vec<String>,
     citing_ref_uid: Option<String>,
     text_query: Option<String>,
     workers: Option<usize>,
 ) -> Result<()> {
-    let jts = (!jurisdiction_type.is_empty()).then_some(jurisdiction_type);
+    let courts = if !jurisdiction_code.is_empty() {
+        Some(Courts::Codes(jurisdiction_code))
+    } else if !jurisdiction_type.is_empty() {
+        Some(Courts::Types(jurisdiction_type))
+    } else {
+        None
+    };
     let fields = (!field.is_empty()).then_some(field);
     pipeline::reextract_fields(
         fields.as_deref(),
         dry_run,
         full,
-        jts.as_deref(),
+        courts.as_ref(),
         citing_ref_uid.as_deref(),
         text_query.as_deref(),
         workers,
@@ -1644,7 +2048,7 @@ async fn cmd_purge_reverses() -> Result<()> {
     let summaries = reverses::purge_all(&csv_dir, &repo).await?;
     for s in &summaries {
         println!(
-            "{} : {} lignes, {} décisions marquées supprimées, {} absentes ou déjà purgées.",
+            "{}: {} rows, {} decisions marked deleted, {} missing or already purged.",
             s.file, s.processed, s.newly_deleted, s.already_deleted_or_missing
         );
     }
@@ -1655,20 +2059,55 @@ async fn cmd_purge_reverses() -> Result<()> {
 // generate-summaries
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Backfill des résumés Mistral. `--concurrency` borne les appels Mistral
-/// concurrents (défaut dérivé du nombre de clés).
 async fn summary_pipeline_generate(
     limit: Option<usize>,
-    concurrency: Option<usize>,
     refresh_stale: bool,
+    order: summary::Order,
+    models: Vec<summary::Model>,
+    accounts: Vec<String>,
 ) -> Result<()> {
     summary::backfill_summaries(
-        lj_core::summary::SUMMARY_PROMPT_VERSION,
-        concurrency,
+        lj_summary::SUMMARY_PROMPT_VERSION,
         1000,
         limit.map(|l| l as i64),
         false,
         refresh_stale,
+        order,
+        if refresh_stale {
+            summary::Doors::All
+        } else {
+            summary::Doors::ByRank
+        },
+        if models.is_empty() {
+            summary::CHAIN_MODELS
+        } else {
+            &models
+        },
+        &accounts,
+    )
+    .await
+}
+
+async fn summary_pipeline_recollage(
+    from_engine: i16,
+    jurisdiction: Option<String>,
+    limit: Option<usize>,
+) -> Result<()> {
+    lj_summary::SummaryEngine::from_code(from_engine)
+        .ok_or_else(|| anyhow!("moteur de résumé inconnu : {from_engine}"))?;
+    summary::backfill_summaries(
+        lj_summary::SUMMARY_PROMPT_VERSION,
+        1000,
+        limit.map(|l| l as i64),
+        false,
+        false,
+        summary::Order::Engine {
+            code: from_engine,
+            jurisdiction,
+        },
+        summary::Doors::ByRank,
+        summary::CHAIN_MODELS,
+        &[],
     )
     .await
 }
@@ -1685,9 +2124,9 @@ const ANNONCES_SITEMAP_ARCHIVE_JOURS: i32 = 180;
 /// repo sont async, le trait `SitemapSource` est sync).
 struct LoadedSitemapSource {
     decisions: Vec<(String, sitemap::SourceLastmod)>,
-    referential: Vec<(String, String, sitemap::SourceLastmod)>,
+    referential: Vec<(String, String, String, sitemap::SourceLastmod)>,
     entities: Vec<(String, String, sitemap::SourceLastmod)>,
-    texts: Vec<(String, sitemap::SourceLastmod)>,
+    texts: Vec<(String, String, sitemap::SourceLastmod)>,
     jurisdiction_hubs: sitemap::JurisdictionHubPages,
     norm_hubs: sitemap::NormHubPages,
     annonces: (Vec<(String, sitemap::SourceLastmod)>, Vec<String>),
@@ -1699,13 +2138,13 @@ impl sitemap::SitemapSource for LoadedSitemapSource {
     }
     fn iter_referential_for_sitemap(
         &self,
-    ) -> Result<Vec<(String, String, sitemap::SourceLastmod)>> {
+    ) -> Result<Vec<(String, String, String, sitemap::SourceLastmod)>> {
         Ok(self.referential.clone())
     }
     fn iter_entities_for_sitemap(&self) -> Result<Vec<(String, String, sitemap::SourceLastmod)>> {
         Ok(self.entities.clone())
     }
-    fn iter_texts_for_sitemap(&self) -> Result<Vec<(String, sitemap::SourceLastmod)>> {
+    fn iter_texts_for_sitemap(&self) -> Result<Vec<(String, String, sitemap::SourceLastmod)>> {
         Ok(self.texts.clone())
     }
     fn iter_jurisdiction_hubs_for_sitemap(&self) -> Result<sitemap::JurisdictionHubPages> {
@@ -1719,6 +2158,11 @@ impl sitemap::SitemapSource for LoadedSitemapSource {
     }
 }
 
+fn jurisdiction_type(code: &str) -> Result<lj_dtos::JurisdictionType> {
+    lj_dtos::JurisdictionType::from_code(code)
+        .ok_or_else(|| anyhow!("unknown jurisdiction_type {code}"))
+}
+
 /// Génère les sitemaps et les publie en base.
 ///
 /// Charge les décisions via le repo, construit l'ensemble en mémoire, puis
@@ -1729,7 +2173,7 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
     let settings = Settings::from_env()?;
 
     tracing::info!("=== build sitemaps ===");
-    let hub_page_size = i64::from(lj_dtos::HUB_PAGE_SIZE);
+    let hub_page_size = i64::from(lj_vocab::HUB_PAGE_SIZE);
     let pool = pool_with_migrations(&settings).await?;
     let (decisions, referential, entities, texts, jurisdiction_hubs, norm_hubs, annonces) = {
         let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
@@ -1737,7 +2181,15 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
         let decisions = repo
             .iter_decisions_for_sitemap(sitemap::MAX_URLS_PER_SITEMAP as i64)
             .await
-            .map_err(|e| anyhow!("iter_decisions_for_sitemap: {e}"))?;
+            .map_err(|e| anyhow!("iter_decisions_for_sitemap: {e}"))?
+            .into_iter()
+            .map(|(id, jt, lastmod)| {
+                Ok((
+                    lj_dtos::decision_path(jurisdiction_type(&jt)?, &id),
+                    lastmod,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let referential = repo
             .iter_referential_for_sitemap()
             .await
@@ -1753,15 +2205,27 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
         let jurisdiction_hubs = repo
             .iter_jurisdiction_hubs_for_sitemap(hub_page_size)
             .await
-            .map_err(|e| anyhow!("iter_jurisdiction_hubs_for_sitemap: {e}"))?;
+            .map_err(|e| anyhow!("iter_jurisdiction_hubs_for_sitemap: {e}"))?
+            .into_iter()
+            .map(|(jt, code, years)| {
+                Ok((
+                    jurisdiction_type(&jt)?.url_segment().to_string(),
+                    code,
+                    years,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let norm_hubs = repo
             .iter_norm_hubs_for_sitemap(hub_page_size)
             .await
-            .map_err(|e| anyhow!("iter_norm_hubs_for_sitemap: {e}"))?;
+            .map_err(|e| anyhow!("iter_norm_hubs_for_sitemap: {e}"))?
+            .into_iter()
+            .map(|(juris, fond, tokens)| (lj_vocab::url_segment(&juris), fond, tokens))
+            .collect();
         // Annonces : la fenêtre ouverte + l'archive récente pour les fiches, et
         // les départements qui ont au moins une consultation ouverte pour les
         // hubs — au-delà, la page répond 404.
-        let fond = lj_dtos::ANNONCE_FOND_MARCHE;
+        let fond = lj_vocab::ANNONCE_FOND_MARCHE;
         let fiches = repo
             .annonces_sitemap(fond, ANNONCES_SITEMAP_ARCHIVE_JOURS)
             .await
@@ -1772,7 +2236,7 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
         let departements = repo
             .annonces_facette(
                 &lj_store::repository::AnnonceFiltre::nouveau(fond),
-                lj_store::repository::AnnonceAxe::Departement,
+                lj_store::repository::AnnonceAxe::Zone,
             )
             .await
             .map_err(|e| anyhow!("annonces_facette(departement): {e}"))?
@@ -1804,11 +2268,11 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
     tracing::info!(
         sub_count,
         index = sitemap::SITEMAP_INDEX_NAME,
-        "sitemaps générés"
+        "sitemaps generated"
     );
 
     if dry_run {
-        tracing::info!("--dry-run : pas d'écriture en base.");
+        tracing::info!("--dry-run: nothing written to the database.");
         return Ok(());
     }
 
@@ -1832,7 +2296,7 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
             return Err(anyhow!("replace_sitemaps: {e}"));
         }
     }
-    tracing::info!(count = rows.len(), "sitemaps publiés en base");
+    tracing::info!(count = rows.len(), "sitemaps published to the database");
     Ok(())
 }
 
@@ -1840,12 +2304,8 @@ async fn cmd_sitemap(dry_run: bool) -> Result<()> {
 // indexnow
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Pousse vers IndexNow les décisions récemment mises à jour.
-///
-/// Valide la clé (`LIBREJUSTICE_INDEXNOW_KEY`), collecte les `public_id`
-/// dont `updated_at >= now - since_hours` et les consultations parues dans
-/// la même fenêtre, puis soumet via `indexnow::submit` sous le cap dur
-/// `max_urls` (troncature signalée).
+/// Pushes to IndexNow what changed at the source within the window: decisions whose
+/// provenance was (re)ingested, and consultations published, under the `max_urls` cap.
 async fn cmd_indexnow(since_hours: f64, max_urls: usize) -> Result<()> {
     use chrono::{Duration, Utc};
 
@@ -1860,26 +2320,27 @@ async fn cmd_indexnow(since_hours: f64, max_urls: usize) -> Result<()> {
     let pool = pool_with_migrations(&settings).await?;
     let (urls, truncated) = {
         let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-        // `iter_public_ids_updated_since` pagine en keyset sur `id` mais filtre
-        // `updated_at` (aucun index dédié, par choix). Sur un gros backlog un batch
-        // balaie d'immenses plages d'`id` et dépasse le `statement_timeout` 30 s par
-        // défaut → `query_canceled`. On le lève sur CETTE connexion : la commande
-        // `indexnow` est un process CLI one-shot.
+        // `ingested_at` carries no index, so the selection is a 4.4 GB seq scan that
+        // can outlive the default 30 s `statement_timeout`. Lifted on THIS connection
+        // only: `indexnow` is a one-shot CLI process.
         conn.batch_execute("SET statement_timeout = 0").await?;
         let repo = lj_store::repository::DecisionRepository::new(&conn);
         let decisions = repo
-            .iter_public_ids_updated_since(since, 10_000)
+            .iter_public_ids_ingested_since(since, max_urls as i64)
             .await
-            .map_err(|e| anyhow!("iter_public_ids_updated_since: {e}"))?;
+            .map_err(|e| anyhow!("iter_public_ids_ingested_since: {e}"))?;
         let annonces = repo
-            .annonces_vues_depuis(lj_dtos::ANNONCE_FOND_MARCHE, since, max_urls as i64)
+            .annonces_vues_depuis(lj_vocab::ANNONCE_FOND_MARCHE, since, max_urls as i64)
             .await
             .map_err(|e| anyhow!("annonces_vues_depuis: {e}"))?;
         // Les consultations passent devant : leur fenêtre utile est l'échéance, à
         // trois ou quatre semaines, alors qu'une décision reste indexable des
         // années. Sous le cap, c'est donc la queue des décisions qui cède.
-        let mut all: Vec<String> = annonces.iter().map(|u| indexnow::marche_url(u)).collect();
-        all.extend(decisions.iter().map(|p| indexnow::decision_url(p)));
+        let mut all: Vec<String> = annonces.iter().map(|u| indexnow::notice_url(u)).collect();
+        for (id, jt) in &decisions {
+            let path = lj_dtos::decision_path(jurisdiction_type(jt)?, id);
+            all.push(indexnow::decision_url(&path));
+        }
         let truncated = all.len() > max_urls;
         all.truncate(max_urls);
         (all, truncated)
@@ -1894,7 +2355,7 @@ async fn cmd_indexnow(since_hours: f64, max_urls: usize) -> Result<()> {
         );
     }
     let submitted = indexnow::submit(&urls, key).await?;
-    tracing::info!(submitted, "IndexNow : URL(s) soumises.");
+    tracing::info!(submitted, "IndexNow: URL(s) submitted.");
     Ok(())
 }
 
@@ -1914,9 +2375,9 @@ const MAINTENANCE_STATEMENT_TIMEOUT: &str = "2h";
 /// exécutent du SQL de maintenance — pas de migrations.
 async fn cmd_db(command: DbCommand) -> Result<()> {
     let settings = Settings::from_env()?;
-    // 7 = shared connection below + the 5 parallel tables of `db vacuum-full`
-    // and `db reindex-search` + the blocker sweep the latter holds throughout.
-    let pool = pool_only(&settings, 7).await?;
+    // The shared connection below, one per parallel table of `db vacuum-full`
+    // and `db reindex-search`, and the blocker sweep the latter holds throughout.
+    let pool = pool_only(&settings, SEARCH_TABLES.len() + 2).await?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
     // Relève le statement_timeout pour les ops lourdes. `gc-mcp` (DELETE borné)
     // garde le garde-fou 30 s.
@@ -1945,28 +2406,28 @@ async fn cmd_db(command: DbCommand) -> Result<()> {
 async fn db_purge_orphan_tombstones(conn: &lj_store::db::Connection, apply: bool) -> Result<()> {
     let repo = lj_store::repository::DecisionRepository::new(conn);
     let n = repo.count_orphan_tombstones().await?;
-    println!("Tombstones orphelins (retirés, vidés, sans provenance active) : {n}");
+    println!("Orphan tombstones (withdrawn, emptied, no active provenance): {n}");
     let sample = repo.sample_orphan_tombstones(5).await?;
     if !sample.is_empty() {
-        println!("Échantillon source_uid : {}", sample.join(", "));
+        println!("source_uid sample: {}", sample.join(", "));
     }
     if n == 0 {
-        println!("Rien à purger.");
+        println!("Nothing to purge.");
         return Ok(());
     }
     if !apply {
-        println!("Dry-run : aucune suppression. Relancer avec --apply pour purger.");
+        println!("Dry-run: nothing deleted. Re-run with --apply to purge.");
         return Ok(());
     }
     let deleted = repo.purge_orphan_tombstones().await?;
-    println!("{deleted} décisions supprimées (cascade provenances/chunks/full_text/citations).");
+    println!("{deleted} decisions deleted (cascade provenances/chunks/full_text/citations).");
     let remaining = repo.count_orphan_tombstones().await?;
     if remaining != 0 {
         return Err(anyhow!(
             "purge incomplète : {remaining} orphelins résiduels"
         ));
     }
-    println!("Vérifié : 0 orphelin résiduel.");
+    println!("Verified: 0 orphan left.");
     Ok(())
 }
 
@@ -1977,7 +2438,7 @@ async fn db_analyze(conn: &lj_store::db::Connection) -> Result<()> {
     conn.execute("ANALYZE decision_chunks", &[]).await?;
     conn.execute("ANALYZE decision_full_text", &[]).await?;
     // Stats fraîches pour l'overlay, les backlinks (GIN `lj_cit_terms`) et le
-    // service `/texte/`.
+    // service `/norm/`.
     conn.execute("ANALYZE legal_citation", &[]).await?;
     conn.execute("ANALYZE legal_text", &[]).await?;
     conn.execute("ANALYZE legal_article", &[]).await?;
@@ -1986,7 +2447,7 @@ async fn db_analyze(conn: &lj_store::db::Connection) -> Result<()> {
     conn.execute("ANALYZE annonce", &[]).await?;
     conn.execute("ANALYZE annonce_source", &[]).await?;
     conn.execute("ANALYZE annonce_entity", &[]).await?;
-    println!("ANALYZE terminé.");
+    println!("ANALYZE done.");
     Ok(())
 }
 
@@ -2007,7 +2468,9 @@ async fn drop_invalid_indexes(conn: &lj_store::db::Connection, table: &str) -> R
         .await?;
     for row in &rows {
         let index: String = row.get(0);
-        println!("DROP INDEX CONCURRENTLY {index} (invalide, résidu d'un reindex interrompu) …");
+        println!(
+            "DROP INDEX CONCURRENTLY {index} (invalid, leftover from an interrupted reindex) …"
+        );
         conn.batch_execute(&format!("DROP INDEX CONCURRENTLY {index}"))
             .await?;
     }
@@ -2043,7 +2506,7 @@ async fn cancel_blocking_transactions(conn: &lj_store::db::Connection) -> Result
         let age: i64 = row.get(2);
         conn.execute("SELECT pg_cancel_backend($1)", &[&pid])
             .await?;
-        println!("maintenance : transaction de {age} s annulée (pid {pid}, application {app}).");
+        println!("maintenance: {age} s transaction cancelled (pid {pid}, application {app}).");
     }
     Ok(())
 }
@@ -2071,7 +2534,7 @@ async fn db_reindex_search(pool: &deadpool_postgres::Pool) -> Result<()> {
         loop {
             tokio::time::sleep(MAINTENANCE_SWEEP).await;
             if let Err(e) = cancel_blocking_transactions(&conn).await {
-                eprintln!("maintenance : filet anti-blocage en échec : {e}");
+                eprintln!("maintenance: anti-lock net failed: {e}");
             }
         }
     });
@@ -2087,7 +2550,7 @@ async fn db_reindex_search(pool: &deadpool_postgres::Pool) -> Result<()> {
             .await?;
             drop_invalid_indexes(&conn, table).await?;
 
-            println!("REINDEX TABLE CONCURRENTLY {table} … [aucun lock exclusif]");
+            println!("REINDEX TABLE CONCURRENTLY {table} … [no exclusive lock]");
             let started = std::time::Instant::now();
             let outcome = conn
                 .batch_execute(&format!("REINDEX TABLE CONCURRENTLY {table}"))
@@ -2096,18 +2559,12 @@ async fn db_reindex_search(pool: &deadpool_postgres::Pool) -> Result<()> {
                 drop_invalid_indexes(&conn, table).await?;
                 return Err(anyhow!("REINDEX {table} : {e}"));
             }
-            println!(
-                "REINDEX {table} terminé en {} s.",
-                started.elapsed().as_secs()
-            );
+            println!("REINDEX {table} done in {} s.", started.elapsed().as_secs());
 
             let started = std::time::Instant::now();
             println!("VACUUM {table} …");
             conn.batch_execute(&format!("VACUUM {table}")).await?;
-            println!(
-                "VACUUM {table} terminé en {} s.",
-                started.elapsed().as_secs()
-            );
+            println!("VACUUM {table} done in {} s.", started.elapsed().as_secs());
             Ok::<(), anyhow::Error>(())
         }));
     }
@@ -2129,7 +2586,8 @@ async fn db_reindex_search(pool: &deadpool_postgres::Pool) -> Result<()> {
 
 /// Tables porteuses d'index de recherche, couvertes par la maintenance
 /// hebdomadaire `db reindex-search` et par le repli manuel `db vacuum-full`.
-const SEARCH_TABLES: [&str; 5] = [
+const SEARCH_TABLES: [&str; 6] = [
+    "decision_text",
     "decision_chunks",
     "legal_article",
     "legal_text",
@@ -2166,7 +2624,7 @@ async fn db_vacuum_full(pool: &deadpool_postgres::Pool) -> Result<()> {
             // VACUUM FULL ne peut pas tourner dans un bloc transactionnel.
             conn.batch_execute(&format!("VACUUM FULL {table}")).await?;
             println!(
-                "VACUUM FULL {table} terminé en {} s.",
+                "VACUUM FULL {table} done in {} s.",
                 started.elapsed().as_secs()
             );
             // VACUUM FULL réécrit le heap et laisse la visibility map VIDE. Tant
@@ -2179,10 +2637,7 @@ async fn db_vacuum_full(pool: &deadpool_postgres::Pool) -> Result<()> {
             let started = std::time::Instant::now();
             println!("VACUUM {table} (visibility map) …");
             conn.batch_execute(&format!("VACUUM {table}")).await?;
-            println!(
-                "VACUUM {table} terminé en {} s.",
-                started.elapsed().as_secs()
-            );
+            println!("VACUUM {table} done in {} s.", started.elapsed().as_secs());
             Ok::<(), anyhow::Error>(())
         }));
     }
@@ -2215,7 +2670,7 @@ async fn db_gc_mcp(conn: &lj_store::db::Connection) -> Result<()> {
     let codes = conn
         .execute("DELETE FROM mcp_auth_codes WHERE expires_at < now()", &[])
         .await?;
-    println!("GC MCP : {tokens} access + {refresh} refresh + {codes} code(s) expirés supprimés.");
+    println!("MCP GC: {tokens} access + {refresh} refresh + {codes} expired code(s) deleted.");
     Ok(())
 }
 
@@ -2249,13 +2704,13 @@ async fn db_prewarm(conn: &lj_store::db::Connection) -> Result<()> {
         // Les index du banc vivent dans la même base mais aucune requête servie ne
         // les lit.
         if table.starts_with("bench_") {
-            println!("{index} : écarté (index du banc, hors chemin servi)");
+            println!("{index}: skipped (bench index, off the served path)");
             continue;
         }
 
         let go = octets as f64 / 1e9;
         if am == "vchordrq" {
-            println!("vchordrq_prewarm('{index}') … [{go:.1} Go, épinglé en shared_buffers]");
+            println!("vchordrq_prewarm('{index}') … [{go:.1} GB, pinned in shared_buffers]"); // sql-splice-ok: progress line, the query below binds $1
             let r = conn
                 .query_one("SELECT vchordrq_prewarm($1::text::regclass, 0)", &[&index])
                 .await?;
@@ -2266,7 +2721,7 @@ async fn db_prewarm(conn: &lj_store::db::Connection) -> Result<()> {
                 println!("  {}", ligne.trim_end());
             }
         } else {
-            println!("pg_prewarm('{index}', 'read') … [{go:.1} Go, cache page OS]");
+            println!("pg_prewarm('{index}', 'read') … [{go:.1} GB, OS page cache]"); // sql-splice-ok: progress line, the query below binds $1
             let r = conn
                 .query_one("SELECT pg_prewarm($1::text::regclass, 'read')", &[&index])
                 .await?;
@@ -2276,6 +2731,6 @@ async fn db_prewarm(conn: &lj_store::db::Connection) -> Result<()> {
         }
         chauffes += 1;
     }
-    println!("{chauffes} index préchauffés");
+    println!("{chauffes} indexes prewarmed");
     Ok(())
 }

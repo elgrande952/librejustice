@@ -17,7 +17,7 @@
 
 use crate::legi::{clean_contenu, collect_titre_tm, date_or_none, find_anywhere};
 use lj_core::error::CoreError;
-use lj_core::parsing::{build_tree, node_text};
+use lj_parse::{build_tree, node_text};
 
 /// Une version d'article du fond JORF (`JORFARTI*.xml`, racine `<ARTICLE>`).
 /// Calque [`crate::legi::LegiArticle`] mais `num`/`num_key`/`date_debut` sont
@@ -97,7 +97,7 @@ pub fn parse_jorf_article(raw: &[u8]) -> Result<JorfArticle, CoreError> {
         .to_string();
 
     let num = node_text(find_anywhere(&root, "META_ARTICLE/NUM"));
-    let num_key = num.as_deref().map(lj_core::article_key::identity_key);
+    let num_key = num.as_deref().map(lj_norm::article_key::identity_key);
     let etat = node_text(find_anywhere(&root, "META_ARTICLE/ETAT")).unwrap_or_default();
     // Le fonds JORF ne date pas ses articles : `META_ARTICLE/DATE_DEBUT` et
     // `DATE_FIN` portent la sentinelle. Une entrée de journal est datée par sa
@@ -160,7 +160,7 @@ pub fn parse_jorf_texte(raw: &[u8]) -> Result<JorfTexte, CoreError> {
 }
 
 /// Liens `META_TEXTE_VERSION/LIENS/LIEN` (plusieurs) avec leurs attributs.
-fn collect_liens(root: &lj_core::parsing::XmlNode) -> Vec<JorfLien> {
+fn collect_liens(root: &lj_parse::XmlNode) -> Vec<JorfLien> {
     find_anywhere(root, "LIENS")
         .map(|n| {
             n.children
@@ -228,7 +228,7 @@ pub fn parse_jorf_struct(raw: &[u8]) -> Result<JorfStructOrder, CoreError> {
                         num_key: c
                             .attr("num")
                             .filter(|v| !v.is_empty())
-                            .map(lj_core::article_key::identity_key),
+                            .map(lj_norm::article_key::identity_key),
                     })
                 })
                 .collect()

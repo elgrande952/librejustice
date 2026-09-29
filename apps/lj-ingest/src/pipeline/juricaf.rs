@@ -8,7 +8,7 @@
 use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
 
-use lj_core::parsing::parse_juricaf;
+use lj_parse::parse_juricaf;
 use lj_store::repository::{ExtractedFields, JurisdictionRow};
 
 use crate::config::Settings;
@@ -83,6 +83,7 @@ pub async fn juricaf_probe(dir: Option<std::path::PathBuf>) -> Result<()> {
             payload_format: "html".to_string(),
             write_mode: WriteMode::Full,
             dila_fond: None,
+            passages: true,
         });
     }
 
@@ -90,7 +91,7 @@ pub async fn juricaf_probe(dir: Option<std::path::PathBuf>) -> Result<()> {
         n = candidates.len(),
         skipped = counts.skipped,
         dir = %dir.display(),
-        "sonde juricaf : pages parsées"
+        "juricaf probe: pages parsed"
     );
     if !candidates.is_empty() {
         drain_batch(
@@ -109,7 +110,7 @@ pub async fn juricaf_probe(dir: Option<std::path::PathBuf>) -> Result<()> {
         skipped = counts.skipped,
         errors = counts.errors,
         chunks = counts.chunks_created,
-        "sonde juricaf terminée"
+        "juricaf probe done"
     );
     Ok(())
 }

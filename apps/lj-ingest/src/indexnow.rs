@@ -4,9 +4,6 @@
 //! une clé publiée à `https://<host>/<key>.txt` suffit à signaler aux moteurs
 //! participants (Bing, Yandex…) de venir crawler. Pas d'OAuth, pas de quota
 //! Google. Limite protocole : 10 000 URLs par requête.
-//!
-//! Découplé de la boucle d'ingest : la commande `librejustice indexnow` interroge
-//! `decisions` par `updated_at` et soumet par lots.
 
 use anyhow::{Context, Result};
 use reqwest_middleware::ClientBuilder;
@@ -23,14 +20,12 @@ pub fn key_location(key: &str) -> String {
     format!("https://{INDEXNOW_HOST}/{key}.txt")
 }
 
-/// URL canonique d'une décision.
-pub fn decision_url(public_id: &str) -> String {
-    format!("https://{INDEXNOW_HOST}/decision/{public_id}")
+pub fn decision_url(path: &str) -> String {
+    format!("https://{INDEXNOW_HOST}{path}")
 }
 
-/// URL canonique d'une fiche de consultation (pot Annonces).
-pub fn marche_url(uid: &str) -> String {
-    format!("https://{INDEXNOW_HOST}/marche/{uid}")
+pub fn notice_url(uid: &str) -> String {
+    format!("https://{INDEXNOW_HOST}{}", lj_vocab::notice_path(uid))
 }
 
 /// Corps JSON d'une soumission IndexNow. `urls` doit faire ≤ 10 000 entrées.
@@ -104,12 +99,12 @@ mod tests {
     #[test]
     fn url_helpers() {
         assert_eq!(
-            decision_url("ce_12345"),
-            "https://librejustice.fr/decision/ce_12345"
+            decision_url("/decision/fr/ce_12345"),
+            "https://librejustice.fr/decision/fr/ce_12345"
         );
         assert_eq!(
-            marche_url("marche:1a2b3c"),
-            "https://librejustice.fr/marche/marche:1a2b3c"
+            notice_url("marche:1a2b3c"),
+            "https://librejustice.fr/notice/fr/marche:1a2b3c"
         );
         assert_eq!(key_location("abcdef"), "https://librejustice.fr/abcdef.txt");
     }

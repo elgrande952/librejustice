@@ -21,7 +21,7 @@ const REGISTRY_FIELDS_SQL: &str = "\
 
 /// The authority source of a decision, the one the extraction reads.
 const AUTHORITY_ORDER_SQL: &str =
-    "ds.source_rank DESC, (ds.lang = 'fra') IS TRUE DESC, ds.source_uid ASC";
+    "ds.source_rank DESC, (ds.lang = 'fra') IS TRUE DESC, (ds.lang = 'eng') IS TRUE DESC, ds.source_uid ASC";
 
 /// One row of the seat vocabulary: a seat as written, the registry keys it came
 /// with, and the months the corpus spans under them.
@@ -148,7 +148,7 @@ impl DecisionRepository<'_> {
                     "SELECT t.cle
                      FROM unnest($1::text[]) AS t(cle)
                      WHERE (SELECT count(*) FROM
-                              (SELECT 1 FROM decisions d
+                              (SELECT 1 FROM decision_text d
                                WHERE d.full_text @@@ CASE
                                        WHEN t.cle LIKE '% %' THEN '\"' || t.cle || '\"~2'
                                        ELSE t.cle END
@@ -161,19 +161,70 @@ impl DecisionRepository<'_> {
         Ok(courants)
     }
 
+    /// The texts writing a case name key followed by a roman numeral I to V,
+    /// one phrase query per numeral on the BM25 index: 26 ms and 36 texts for
+    /// « beziers », a name a mall shares.
+    pub async fn ordinal_citation_texts(&self, key: &str, romans: &[&str]) -> Result<Vec<String>> {
+        let phrases: Vec<Vec<String>> = romans
+            .iter()
+            .map(|r| {
+                key.split(' ')
+                    .chain(std::iter::once(*r))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect();
+        let should: Vec<String> = (1..=phrases.len())
+            .map(|i| format!("paradedb.phrase('full_text', ${i}::text[])"))
+            .collect();
+        let sql = format!(
+            "SELECT d.full_text FROM decision_text d
+             WHERE d.id @@@ paradedb.boolean(should => ARRAY[{}])
+               AND d.deleted_at IS NULL
+             LIMIT 300",
+            should.join(", ")
+        );
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = phrases
+            .iter()
+            .map(|p| p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        let rows = self.conn.query(sql.as_str(), &params).await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// `(id, jurisdiction_code, docket keys, reading day ISO)` of decisions.
+    pub async fn decision_anchors(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, Option<String>, Vec<String>, Option<String>)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT d.id, d.jurisdiction_code, lj_docket_keys(d.docket_numbers),
+                        to_char(d.date_lecture, 'YYYY-MM-DD')
+                 FROM decisions d WHERE d.id = ANY($1)",
+                &[&ids],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .collect())
+    }
+
     /// Les noms qu'un corps peut citer : clé de nom, puis identité de la
     /// décision nommée, dont l'appelant tire la clé pendante. Une clé portée par
     /// plusieurs décisions n'en sort pas, le corps ne disant pas laquelle :
     /// 10 059 lignes sur 30 270, dont « GISTI » et « Commune de Béziers ».
     pub async fn unambiguous_case_names(
         &self,
-    ) -> Result<Vec<(String, String, Option<String>, Vec<String>, Option<String>)>> {
+    ) -> Result<Vec<(String, Option<String>, Vec<String>, Option<String>)>> {
         let rows = self
             .conn
             .query(
-                "SELECT cle, jurisdiction_type, jurisdiction_code, docket_numbers,
+                "SELECT cle, jurisdiction_code, docket_numbers,
                         to_char(date_lecture, 'YYYY-MM-DD')
-                 FROM (SELECT k.cle, d.jurisdiction_type, d.jurisdiction_code,
+                 FROM (SELECT k.cle, d.jurisdiction_code,
                               d.docket_numbers, d.date_lecture,
                               count(*) OVER (PARTITION BY k.cle) AS porteurs
                        FROM decisions d, unnest(d.case_name_keys) AS k(cle)
@@ -185,38 +236,49 @@ impl DecisionRepository<'_> {
             .await?;
         Ok(rows
             .iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
             .collect())
     }
 
     /// The corpus room vocabulary: the seat as WRITTEN, and the registry fields
-    /// that produced it. Deduplicated in the database, 3 291 rows for 3.7M
-    /// decisions, 7.5 s measured on 01/09/2026.
-    ///
-    /// ParadeDB's aggregate custom scan returns silently wrong counts on a BM25
-    /// table, so it is cut for the query. An error leaves it cut, which is the
-    /// safe direction. One row per distinct seat and registry key of the
+    /// that produced it. One row per distinct seat and registry key of the
     /// authority source, the one `seat_rows_after` reads, so a decision with
     /// three sources speaks once; with it the first and last month the corpus
     /// wrote that row, as `year * 12 + month`.
+    ///
+    /// A full pass over decisions joined to their sources, 55 s measured on
+    /// 04/09/2026, past the pool's 30 s: the timeout is lifted for the
+    /// transaction. ParadeDB's aggregate custom scan returns silently wrong
+    /// counts on a BM25 table, so it is cut for the same transaction.
     pub async fn seat_vocabulary(&self) -> Result<Vec<SeatSample>> {
-        self.conn
-            .batch_execute("SET paradedb.enable_aggregate_custom_scan = off")
-            .await?;
-        let sql = format!(
-            "SELECT seat, chamber, formation, min(date_lecture), max(date_lecture) FROM (
-                 SELECT d.seat, {REGISTRY_FIELDS_SQL}, d.date_lecture,
-                        row_number() OVER (PARTITION BY ds.decision_id
-                                           ORDER BY {AUTHORITY_ORDER_SQL}) AS rn
-                 FROM decisions d
-                 JOIN decision_sources ds ON ds.decision_id = d.id
-                 WHERE d.seat IS NOT NULL AND d.deleted_at IS NULL
-             ) s WHERE rn = 1 GROUP BY 1, 2, 3"
-        );
-        let rows = self.conn.query(sql.as_str(), &[]).await?;
-        self.conn
-            .batch_execute("RESET paradedb.enable_aggregate_custom_scan")
-            .await?;
+        self.conn.batch_execute("BEGIN").await?;
+        let result: Result<Vec<tokio_postgres::Row>> = async {
+            self.conn
+                .batch_execute(
+                    "SET LOCAL statement_timeout = 0; \
+                     SET LOCAL paradedb.enable_aggregate_custom_scan = off",
+                )
+                .await?;
+            let sql = format!(
+                "SELECT seat, chamber, formation, min(date_lecture), max(date_lecture) FROM (
+                     SELECT d.seat, {REGISTRY_FIELDS_SQL}, d.date_lecture,
+                            row_number() OVER (PARTITION BY ds.decision_id
+                                               ORDER BY {AUTHORITY_ORDER_SQL}) AS rn
+                     FROM decisions d
+                     JOIN decision_sources ds ON ds.decision_id = d.id
+                     WHERE d.seat IS NOT NULL AND d.deleted_at IS NULL
+                 ) s WHERE rn = 1 GROUP BY 1, 2, 3"
+            );
+            Ok(self.conn.query(sql.as_str(), &[]).await?)
+        }
+        .await;
+        match &result {
+            Ok(_) => self.conn.batch_execute("COMMIT").await?,
+            Err(_) => {
+                let _ = self.conn.batch_execute("ROLLBACK").await;
+            }
+        }
+        let rows = result?;
         let month = |d: NaiveDate| d.year() * 12 + d.month0() as i32;
         Ok(rows
             .iter()

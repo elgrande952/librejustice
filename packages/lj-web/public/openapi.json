@@ -298,17 +298,6 @@
                       "additionalProperties": true,
                       "type": "object"
                     },
-                    "filterRewritten": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
                     "hits": {
                       "items": {
                         "additionalProperties": false,
@@ -326,6 +315,15 @@
                           },
                           "chars": {
                             "type": "integer"
+                          },
+                          "citedArticles": {
+                            "additionalProperties": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "type": "object"
                           },
                           "dateLecture": {
                             "anyOf": [
@@ -352,20 +350,6 @@
                               }
                             ],
                             "default": null
-                          },
-                          "jurisdictionCode": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
-                          "jurisdictionType": {
-                            "type": "string"
                           },
                           "legalDomain": {
                             "anyOf": [
@@ -460,8 +444,7 @@
                         "required": [
                           "title",
                           "url",
-                          "chars",
-                          "jurisdictionType"
+                          "chars"
                         ],
                         "type": "object"
                       },
@@ -633,6 +616,25 @@
                       },
                       "type": "array"
                     },
+                    "pinned": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "title": {
+                            "type": "string"
+                          },
+                          "url": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "title",
+                          "url"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
                     "query": {
                       "type": "string"
                     },
@@ -670,7 +672,7 @@
           "Jurisprudence"
         ],
         "summary": "Lire une décision entière",
-        "description": "Texte intégral et métadonnées. L'identifiant est celui que porte chaque résultat de recherche et chaque URL `/decision/{id}` ; il est opaque et ne s'énumère pas.",
+        "description": "Texte intégral et métadonnées. L'identifiant est celui que porte chaque résultat de recherche et chaque URL `/decision/{juridiction}/{id}` ; il est opaque et ne s'énumère pas.",
         "parameters": [
           {
             "name": "id",
@@ -783,17 +785,6 @@
                             ],
                             "default": null
                           },
-                          "body": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
                           "date": {
                             "anyOf": [
                               {
@@ -806,13 +797,34 @@
                             "default": null,
                             "format": "date"
                           },
+                          "issue": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
                           "kind": {
                             "enum": [
-                              "analyse",
                               "conclusions",
                               "note"
                             ],
                             "type": "string"
+                          },
+                          "pages": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
                           },
                           "publisher": {
                             "anyOf": [
@@ -824,18 +836,6 @@
                               }
                             ],
                             "default": null
-                          },
-                          "renvois": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          "rubriques": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
                           },
                           "title": {
                             "anyOf": [
@@ -849,6 +849,17 @@
                             "default": null
                           },
                           "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "volume": {
                             "anyOf": [
                               {
                                 "type": "string"
@@ -1012,7 +1023,7 @@
         }
       }
     },
-    "/api/texte/{code}": {
+    "/api/norm/{juridiction}/{code}": {
       "get": {
         "summary": "Lire un texte sans passer par un article",
         "description": "Un texte sans articles (circulaire, décret de publication, lignes directrices) rend son corps ; un texte qui en porte rend son sommaire, les corps courts attachés dessous.",
@@ -1021,6 +1032,9 @@
         ],
         "operationId": "getLegalTextRoot",
         "parameters": [
+          {
+            "$ref": "#/components/parameters/Jurisdiction"
+          },
           {
             "$ref": "#/components/parameters/CodeSlug"
           }
@@ -1102,17 +1116,6 @@
                             ],
                             "default": null
                           },
-                          "body": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
                           "date": {
                             "anyOf": [
                               {
@@ -1125,13 +1128,34 @@
                             "default": null,
                             "format": "date"
                           },
+                          "issue": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
                           "kind": {
                             "enum": [
-                              "analyse",
                               "conclusions",
                               "note"
                             ],
                             "type": "string"
+                          },
+                          "pages": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
                           },
                           "publisher": {
                             "anyOf": [
@@ -1143,18 +1167,6 @@
                               }
                             ],
                             "default": null
-                          },
-                          "renvois": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          "rubriques": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
                           },
                           "title": {
                             "anyOf": [
@@ -1168,6 +1180,17 @@
                             "default": null
                           },
                           "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "volume": {
                             "anyOf": [
                               {
                                 "type": "string"
@@ -1221,6 +1244,44 @@
                       ],
                       "default": null
                     },
+                    "modifiedBy": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "href": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "label"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
                     "nota": {
                       "anyOf": [
                         {
@@ -1237,6 +1298,22 @@
                     },
                     "omitted": {
                       "type": "integer"
+                    },
+                    "section": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "label": {
+                          "type": "string"
+                        },
+                        "url": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "label",
+                        "url"
+                      ],
+                      "type": "object"
                     },
                     "sourceUrl": {
                       "anyOf": [
@@ -1262,6 +1339,44 @@
                     },
                     "title": {
                       "type": "string"
+                    },
+                    "travauxParlementaires": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "href": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "label"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
                     },
                     "url": {
                       "type": "string"
@@ -1322,348 +1437,18 @@
         }
       }
     },
-    "/api/texte/{code}/section/{cid}": {
+    "/api/norm/{juridiction}/{code}/{article}": {
       "get": {
-        "summary": "Lire une division d'un texte",
-        "description": "La division qu'un sommaire adresse, ses articles attachés. Sans elle, lire un chapitre coûte un appel par article.",
-        "tags": [
-          "Normes"
-        ],
-        "operationId": "getLegalTextSection",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/CodeSlug"
-          },
-          {
-            "name": "cid",
-            "in": "path",
-            "required": true,
-            "description": "Identifiant de division, tel qu'il apparaît dans les URL `/texte/{code}/section/{cid}`.",
-            "schema": {
-              "type": "string"
-            },
-            "example": "LEGISCTA000006117617"
-          },
-          {
-            "name": "date",
-            "in": "query",
-            "description": "Version en vigueur à cette date. Absente, la version en vigueur aujourd'hui. Aucune version à cette date rend un 404.",
-            "schema": {
-              "type": "string",
-              "format": "date"
-            },
-            "example": "2015-06-01"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "La division et ses articles.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "articleCount": {
-                      "type": "integer"
-                    },
-                    "articles": {
-                      "items": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "kind": {
-                            "enum": [
-                              "article",
-                              "section"
-                            ],
-                            "type": "string"
-                          },
-                          "num": {
-                            "type": "string"
-                          },
-                          "section": {
-                            "type": "string"
-                          },
-                          "text": {
-                            "type": "string"
-                          },
-                          "url": {
-                            "type": "string"
-                          }
-                        },
-                        "required": [
-                          "kind",
-                          "num",
-                          "url"
-                        ],
-                        "type": "object"
-                      },
-                      "type": "array"
-                    },
-                    "code": {
-                      "type": "string"
-                    },
-                    "commentaires": {
-                      "items": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "access": {
-                            "anyOf": [
-                              {
-                                "enum": [
-                                  "libre",
-                                  "abonnes"
-                                ],
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
-                          "author": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
-                          "body": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
-                          "date": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null,
-                            "format": "date"
-                          },
-                          "kind": {
-                            "enum": [
-                              "analyse",
-                              "conclusions",
-                              "note"
-                            ],
-                            "type": "string"
-                          },
-                          "publisher": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
-                          "renvois": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          "rubriques": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          "title": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
-                          "url": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          }
-                        },
-                        "required": [
-                          "kind"
-                        ],
-                        "type": "object"
-                      },
-                      "type": "array"
-                    },
-                    "dateDebut": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null,
-                      "format": "date"
-                    },
-                    "dateFin": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null,
-                      "format": "date"
-                    },
-                    "etat": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "nota": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "num": {
-                      "type": "string"
-                    },
-                    "omitted": {
-                      "type": "integer"
-                    },
-                    "sourceUrl": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "text": {
-                      "anyOf": [
-                        {
-                          "type": "string"
-                        },
-                        {
-                          "type": "null"
-                        }
-                      ],
-                      "default": null
-                    },
-                    "title": {
-                      "type": "string"
-                    },
-                    "url": {
-                      "type": "string"
-                    },
-                    "versions": {
-                      "items": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "dateDebut": {
-                            "format": "date",
-                            "type": "string"
-                          },
-                          "dateFin": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null,
-                            "format": "date"
-                          },
-                          "etat": {
-                            "type": "string"
-                          }
-                        },
-                        "required": [
-                          "etat",
-                          "dateDebut"
-                        ],
-                        "type": "object"
-                      },
-                      "type": "array"
-                    }
-                  },
-                  "required": [
-                    "code",
-                    "title",
-                    "url",
-                    "versions"
-                  ],
-                  "type": "object"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthorized"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "422": {
-            "$ref": "#/components/responses/Unprocessable"
-          },
-          "429": {
-            "$ref": "#/components/responses/RateLimited"
-          }
-        }
-      }
-    },
-    "/api/texte/{code}/{article}": {
-      "get": {
-        "summary": "Lire un article",
-        "description": "Un article dans sa version en vigueur, ou telle qu'elle était à la date passée en `date`.",
+        "summary": "Lire un article ou une division",
+        "description": "Un article dans sa version en vigueur, ou telle qu'elle était à la date passée en `date`. Le même emplacement nomme une division du texte par le chemin de ses segments (`livre-i/titre-v`), celui que portent les `url` du sommaire : elle rend ses articles attachés, et lire un chapitre ne coûte qu'un appel.",
         "tags": [
           "Normes"
         ],
         "operationId": "getLegalArticle",
         "parameters": [
+          {
+            "$ref": "#/components/parameters/Jurisdiction"
+          },
           {
             "$ref": "#/components/parameters/CodeSlug"
           },
@@ -1758,17 +1543,6 @@
                             ],
                             "default": null
                           },
-                          "body": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
                           "date": {
                             "anyOf": [
                               {
@@ -1781,13 +1555,34 @@
                             "default": null,
                             "format": "date"
                           },
+                          "issue": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
                           "kind": {
                             "enum": [
-                              "analyse",
                               "conclusions",
                               "note"
                             ],
                             "type": "string"
+                          },
+                          "pages": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
                           },
                           "publisher": {
                             "anyOf": [
@@ -1799,18 +1594,6 @@
                               }
                             ],
                             "default": null
-                          },
-                          "renvois": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          "rubriques": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
                           },
                           "title": {
                             "anyOf": [
@@ -1824,6 +1607,17 @@
                             "default": null
                           },
                           "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "volume": {
                             "anyOf": [
                               {
                                 "type": "string"
@@ -1877,6 +1671,44 @@
                       ],
                       "default": null
                     },
+                    "modifiedBy": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "href": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "label"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
                     "nota": {
                       "anyOf": [
                         {
@@ -1893,6 +1725,22 @@
                     },
                     "omitted": {
                       "type": "integer"
+                    },
+                    "section": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "label": {
+                          "type": "string"
+                        },
+                        "url": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "label",
+                        "url"
+                      ],
+                      "type": "object"
                     },
                     "sourceUrl": {
                       "anyOf": [
@@ -1918,6 +1766,44 @@
                     },
                     "title": {
                       "type": "string"
+                    },
+                    "travauxParlementaires": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "href": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "label"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
                     },
                     "url": {
                       "type": "string"
@@ -1983,8 +1869,8 @@
     },
     "/api/article/{uid}": {
       "get": {
-        "summary": "Lire un article par son identifiant Légifrance",
-        "description": "Toutes les versions d'un article partagent leur `LEGIARTI…`, donc l'identifiant en désigne presque toujours un seul ; ce qui en désigne plusieurs, ou aucun, rend un 404. Les identifiants `LEGITEXT` et les CID ne sont pas des articles.",
+        "summary": "Lire un article, un texte ou une section par son identifiant Légifrance",
+        "description": "Un article (`LEGIARTI`, `JORFARTI`, `KALIARTI`), un texte (`LEGITEXT`, `JORFTEXT`) ou une section (`LEGISCTA`). Toutes les versions d'un article partagent leur identifiant, qui en désigne donc presque toujours un seul ; ce qui en désigne plusieurs, ou aucun, rend un 404.",
         "tags": [
           "Normes"
         ],
@@ -1996,7 +1882,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "pattern": "^LEGIARTI[0-9]+$"
+              "pattern": "^(LEGIARTI|JORFARTI|KALIARTI|LEGITEXT|JORFTEXT|LEGISCTA)[0-9]+$"
             },
             "example": "LEGIARTI000006419282"
           },
@@ -2013,7 +1899,7 @@
         ],
         "responses": {
           "200": {
-            "description": "L'article, son état et ses versions.",
+            "description": "L'article, son état et ses versions ; un texte ou une section, avec ses articles.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2088,17 +1974,6 @@
                             ],
                             "default": null
                           },
-                          "body": {
-                            "anyOf": [
-                              {
-                                "type": "string"
-                              },
-                              {
-                                "type": "null"
-                              }
-                            ],
-                            "default": null
-                          },
                           "date": {
                             "anyOf": [
                               {
@@ -2111,13 +1986,34 @@
                             "default": null,
                             "format": "date"
                           },
+                          "issue": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
                           "kind": {
                             "enum": [
-                              "analyse",
                               "conclusions",
                               "note"
                             ],
                             "type": "string"
+                          },
+                          "pages": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
                           },
                           "publisher": {
                             "anyOf": [
@@ -2129,18 +2025,6 @@
                               }
                             ],
                             "default": null
-                          },
-                          "renvois": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
-                          },
-                          "rubriques": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "type": "array"
                           },
                           "title": {
                             "anyOf": [
@@ -2154,6 +2038,17 @@
                             "default": null
                           },
                           "url": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "volume": {
                             "anyOf": [
                               {
                                 "type": "string"
@@ -2207,6 +2102,44 @@
                       ],
                       "default": null
                     },
+                    "modifiedBy": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "href": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "label"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
                     "nota": {
                       "anyOf": [
                         {
@@ -2223,6 +2156,22 @@
                     },
                     "omitted": {
                       "type": "integer"
+                    },
+                    "section": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "label": {
+                          "type": "string"
+                        },
+                        "url": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "label",
+                        "url"
+                      ],
+                      "type": "object"
                     },
                     "sourceUrl": {
                       "anyOf": [
@@ -2248,6 +2197,44 @@
                     },
                     "title": {
                       "type": "string"
+                    },
+                    "travauxParlementaires": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "date": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null,
+                            "format": "date"
+                          },
+                          "href": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ],
+                            "default": null
+                          },
+                          "label": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "label"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
                     },
                     "url": {
                       "type": "string"
@@ -2327,6 +2314,16 @@
       }
     },
     "parameters": {
+      "Jurisdiction": {
+        "name": "juridiction",
+        "in": "path",
+        "required": true,
+        "description": "La juridiction qui édicte le texte, par son code ISO 3166-1 alpha-2 en minuscules : `fr`, `be`, `ch`, `eu` pour l'Union, `intl` pour ce qu'aucun État n'édicte seul.",
+        "schema": {
+          "type": "string"
+        },
+        "example": "fr"
+      },
       "CodeSlug": {
         "name": "code",
         "in": "path",

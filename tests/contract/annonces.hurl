@@ -2,7 +2,7 @@
 # CONTRACT TESTS — pot Annonces
 # ----------------------------------------------------------------------------
 # GET /internal/annonces, /internal/annonces/catalogue, /internal/annonces/{uid} et les flux
-# d'alerte /annonces.rss + /annonces.ics.
+# d'alerte /notice-search.rss + /notice-search.ics.
 # Asserts HTTP status + JSON STRUCTURAL invariants only.
 # Variable: {{base}} = host root (e.g. http://localhost:3000).
 # Routes publiques, sans auth. Aucun `q` requis : le moteur est facetté, la
@@ -42,15 +42,16 @@ HTTP 200
 jsonpath "$.groupes" count == 1
 jsonpath "$.groupes[0].fond" == "marche"
 jsonpath "$.groupes[0].hits" count <= 20
-# fond + les quatre axes du backend SQL.
-jsonpath "$.axes" count == 5
-jsonpath "$.axes[1].key" == "departement"
-jsonpath "$.axes[2].key" == "famille"
-jsonpath "$.axes[3].key" == "cpv"
-jsonpath "$.axes[4].key" == "echeanceJours"
+# fond plus the three SQL axes. Nature is not one of them: it is the root level
+# of `cpv`, served as a single tree the way `juridiction` is.
+jsonpath "$.axes" count == 4
+jsonpath "$.axes[1].key" == "zone"
+jsonpath "$.axes[2].key" == "cpv"
+jsonpath "$.axes[3].key" == "metier"
+jsonpath "$.axes[2].choices[0].parent" not exists
+jsonpath "$.axes[2].choices[0].value" startsWith "nature_marche:"
 [Captures]
 uid: jsonpath "$.groupes[0].hits[0].uid"
-dept: jsonpath "$.axes[1].choices[0].value"
 
 
 # ── 3. Hit shape (assert sur le premier hit du fond `marche`) ────────────────
@@ -84,7 +85,7 @@ jsonpath "$.groupes[0].hits[0].urlAction" startsWith "https://www.bodacc.fr/"
 # source ne sait pas appliquer.
 jsonpath "$.axes" count == 3
 jsonpath "$.axes[1].key" == "famille"
-jsonpath "$.axes[2].key" == "departement"
+jsonpath "$.axes[2].key" == "zone"
 
 
 # ── 5. Le fond `joafe` est servi en proxy live, mêmes champs ─────────────────
@@ -100,7 +101,7 @@ jsonpath "$.groupes[0].hits[0].acteurRole" == "Association"
 # telles quelles — l'égalité ODSQL est sensible à la casse) et le département.
 jsonpath "$.axes" count == 3
 jsonpath "$.axes[1].key" == "famille"
-jsonpath "$.axes[2].key" == "departement"
+jsonpath "$.axes[2].key" == "zone"
 
 
 # ── 6. Le statut est dérivé, pas un fond ────────────────────────────────────
@@ -118,13 +119,13 @@ jsonpath "$.groupes[0].hits[0].acteurRole" == "Acheteur"
 jsonpath "$.groupes[0].hits[0].attribue" isBoolean
 
 
-# ── 7. Filtre département (code canonique, capturé de l'axe) ─────────────────
-GET {{base}}/internal/annonces?fond=marche&departement={{dept}}
+# ── 7. Zone filter: Paris, which always has open consultations ──────────────
+GET {{base}}/internal/annonces?fond=marche&zone=75
 HTTP 200
 [Asserts]
 jsonpath "$.groupes[0].hits" isCollection
-jsonpath "$.groupes[0].hits[0].departement" == "{{dept}}"
-jsonpath "$.groupes[0].hits[0].departementLabel" isString
+jsonpath "$.groupes[0].hits[0].zones" isCollection
+jsonpath "$.groupes[0].hits[0].zones[*].key" includes "75"
 
 
 # ── 8. Fenêtre d'échéance + tri nouveautés ───────────────────────────────────
@@ -134,25 +135,28 @@ HTTP 200
 jsonpath "$.sort" == "nouveautes"
 jsonpath "$.groupes" isCollection
 
-# La fenêtre garde sa borne basse même quand `closes` retire le prédicat
-# « ouverte » : « ferme sous 7 jours » ne parle que de délais qui courent
-# encore. Sans cette borne, la facette comptait tout l'historique clos.
+# The window keeps its lower bound even when `closes` drops the open predicate:
+# "closing within 7 days" only speaks of deadlines that still run.
 GET {{base}}/internal/annonces?fond=marche&closes=true&echeanceJours=7&limit=3
 HTTP 200
 [Asserts]
 jsonpath "$.groupes[0].hits[0].closed" == false
 jsonpath "$.groupes[0].hits[2].closed" == false
-jsonpath "$.axes[4].key" == "echeanceJours"
-jsonpath "$.axes[4].choices[0].value" == "7"
-[Captures]
-ferme7: jsonpath "$.total"
 
-# Le compte de la facette est celui des résultats du même filtre : l'axe se
-# calcule sans la fenêtre courante, la fenêtre est le seul filtre posé.
-GET {{base}}/internal/annonces?fond=marche&closes=true&echeanceJours=7&limit=3
+
+# ── 8b. A trade narrows the fund. An axis served as a facet but unread by the
+# query parser answers the whole fund to every value, which reads as a working
+# filter; only a count smaller than the unfiltered one proves it applies.
+GET {{base}}/internal/annonces?fond=marche&limit=1
+HTTP 200
+[Captures]
+tous: jsonpath "$.total"
+
+GET {{base}}/internal/annonces?fond=marche&metier=batiment-tce&limit=1
 HTTP 200
 [Asserts]
-jsonpath "$.axes[4].choices[0].count" == {{ferme7}}
+jsonpath "$.total" < {{tous}}
+jsonpath "$.groupes[0].hits[0].metiers[*].key" includes "metier:batiment-tce"
 
 
 # ── 9. Filtre par mot sur titre + acteur ─────────────────────────────────────
@@ -204,10 +208,10 @@ HTTP 200
 [Asserts]
 jsonpath "$.fond" == "marche"
 jsonpath "$.total" isInteger
-jsonpath "$.departements" isCollection
-jsonpath "$.departements[0].code" isString
-jsonpath "$.departements[0].label" isString
-jsonpath "$.departements[0].count" isInteger
+jsonpath "$.zones" isCollection
+jsonpath "$.zones[0].code" isString
+jsonpath "$.zones[0].label" isString
+jsonpath "$.zones[0].count" isInteger
 jsonpath "$.familles" isCollection
 
 
@@ -230,7 +234,7 @@ HTTP 404
 
 
 # ── 15. Flux d'alerte RSS : l'état de filtres comme abonnement ───────────────
-GET {{base}}/annonces.rss?fond=marche&departement={{dept}}
+GET {{base}}/notice-search.rss?fond=marche&zone=75
 HTTP 200
 [Asserts]
 header "Content-Type" contains "application/rss+xml"
@@ -240,7 +244,7 @@ body contains "<channel>"
 
 
 # ── 16. Flux ICS : une échéance = un VEVENT ──────────────────────────────────
-GET {{base}}/annonces.ics?fond=marche&echeanceJours=30
+GET {{base}}/notice-search.ics?fond=marche&echeanceJours=30
 HTTP 200
 [Asserts]
 header "Content-Type" contains "text/calendar"
@@ -250,7 +254,7 @@ body contains "END:VCALENDAR"
 
 
 # ── 17. Un filtre invalide se propage aux flux (même frontière) ──────────────
-GET {{base}}/annonces.rss?fond=inconnu
+GET {{base}}/notice-search.rss?fond=inconnu
 HTTP *
 [Asserts]
 status >= 400

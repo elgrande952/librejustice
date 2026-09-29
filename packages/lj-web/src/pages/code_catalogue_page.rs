@@ -1,14 +1,13 @@
-//! Page `/normes/codes` (CodeCataloguePage) — catalogue des codes et
-//! constitutions du corpus (`legal_text`), groupé par ordre/origine (FR / UE /
-//! international / codes étrangers), chaque code liant son sommaire
-//! `/texte/{code}`. Fond `codes` de l'arborescence des normes : SSR pur, sans
-//! logique client — les autres fonds (lois, décrets…) se parcourent par année
-//! sous `/normes/{fond}`.
+//! Page `/norm-index/{juris}/codes`: the codes and constitutions of one legal
+//! order, each linking its table of contents `/norm/{juris}/{code}`. Pure SSR;
+//! the other collections (statutes, decrees) are browsed by year under
+//! `/norm-index/{juris}/{fond}`.
 
 use leptos::either::Either;
 use leptos::prelude::*;
 use leptos_meta::{Link, Meta, Title};
 use leptos_router::components::A;
+use leptos_router::hooks::use_params_map;
 use lj_dtos::CodeCatalogueEntry;
 
 use crate::api::ApiClient;
@@ -26,15 +25,19 @@ pub fn CodeCataloguePage() -> impl IntoView {
     own_page_description();
 
     // Catalogue complet du fond, bloquant SSR (dans le document initial pour le SEO).
-    let entries = Resource::new_blocking(|| (), |_| sendable(fetch_catalogue()));
+    let params = use_params_map();
+    let entries = Resource::new_blocking(
+        move || params.get().get("juris").unwrap_or_default(),
+        |juris| sendable(fetch_catalogue(juris)),
+    );
 
     view! {
         <Suspense fallback=HubSkeleton>
             {move || Suspend::new(async move {
                 match entries.await {
-                    Ok(r) => {
+                    Ok((juris, entries)) => {
                         set_cache_control(200);
-                        Either::Left(view! { <CatalogueLoaded entries=r.entries /> })
+                        Either::Left(view! { <CatalogueLoaded juris=juris entries=entries /> })
                     }
                     Err(err) => {
                         set_cache_control(err.status);
@@ -46,23 +49,31 @@ pub fn CodeCataloguePage() -> impl IntoView {
     }
 }
 
-/// Charge le catalogue (codes + constitutions). Bloquant SSR.
-async fn fetch_catalogue() -> Result<lj_dtos::CodeCatalogueResponse, PageError> {
-    ApiClient::from_context()
+/// Charge le catalogue (codes + constitutions) d'un ordre juridique. Bloquant SSR.
+async fn fetch_catalogue(juris: String) -> Result<(String, Vec<CodeCatalogueEntry>), PageError> {
+    let mut entries = ApiClient::from_context()
         .fetch_codes_catalogue()
         .await
-        .map_err(PageError::from)
+        .map_err(PageError::from)?
+        .entries;
+    entries.retain(|e| lj_vocab::url_segment(&e.jurisdiction) == juris);
+    if entries.is_empty() {
+        return Err(PageError {
+            status: 404,
+            message: "Juridiction inconnue".to_string(),
+        });
+    }
+    Ok((juris, entries))
 }
 
-/// Groupe d'affichage d'une valeur `jurisdiction` du corpus : `(rang,
-/// libellé)`. Les juridictions étrangères (codes pays) fusionnent dans un seul
-/// groupe « Droit étranger ».
-fn jurisdiction_group(jurisdiction: &str) -> (u8, &'static str) {
+/// Rank of a legal order in the catalogue: France, the Union, international
+/// law, then every other order, by name.
+fn jurisdiction_rank(jurisdiction: &str) -> u8 {
     match jurisdiction {
-        "FR" => (0, "France"),
-        "UE" => (1, "Union européenne"),
-        "INTL" => (2, "International"),
-        _ => (3, "Droit étranger"),
+        "FR" => 0,
+        "UE" => 1,
+        "INTL" => 2,
+        _ => 3,
     }
 }
 
@@ -79,30 +90,32 @@ fn nature_category(nature: &str) -> (u8, &'static str) {
 }
 
 #[component]
-fn CatalogueLoaded(entries: Vec<CodeCatalogueEntry>) -> impl IntoView {
+fn CatalogueLoaded(juris: String, entries: Vec<CodeCatalogueEntry>) -> impl IntoView {
     let title = "Codes : textes consolidés - LibreJustice";
     let description =
-        "Catalogue des codes et constitutions consolidés : droit français, droit de l'Union \
-         européenne, conventions internationales et codes étrangers. Versions à date, articles liés.";
-    let url = "https://librejustice.fr/normes/codes";
+        "Catalogue des codes et constitutions consolidés, un groupe par ordre juridique, de la \
+         France à chaque État ou territoire. Versions à date, articles liés.";
+    let index = format!("/norm-index/{juris}");
+    let url = format!("https://librejustice.fr{index}/codes");
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", "https://librejustice.fr/".to_string()),
-        ("Normes", "https://librejustice.fr/normes".to_string()),
-        ("Codes", url.to_string()),
+        ("Normes", format!("https://librejustice.fr{index}")),
+        ("Codes", url.clone()),
     ]);
     let count_line = format!("{} textes.", entries.len());
 
-    // Groupes ordonnés (FR, UE, INTL, étranger), sous-groupés par nature.
-    let mut groups: Vec<(u8, &'static str, Vec<CodeCatalogueEntry>)> = Vec::new();
+    let mut groups: Vec<(String, String, Vec<CodeCatalogueEntry>)> = Vec::new();
     for entry in entries {
-        let (rank, label) = jurisdiction_group(&entry.jurisdiction);
-        if let Some(g) = groups.iter_mut().find(|(r, _, _)| *r == rank) {
-            g.2.push(entry);
-        } else {
-            groups.push((rank, label, vec![entry]));
+        match groups.iter_mut().find(|(j, _, _)| *j == entry.jurisdiction) {
+            Some(group) => group.2.push(entry),
+            None => groups.push((
+                entry.jurisdiction.clone(),
+                entry.jurisdiction_label.clone(),
+                vec![entry],
+            )),
         }
     }
-    groups.sort_by_key(|(r, _, _)| *r);
+    groups.sort_by_cached_key(|(j, label, _)| (jurisdiction_rank(j), lj_fold::fold(label)));
 
     view! {
         <Title text=title />
@@ -114,7 +127,7 @@ fn CatalogueLoaded(entries: Vec<CodeCatalogueEntry>) -> impl IntoView {
             <header class="flex flex-col gap-3">
                 <HubBreadcrumb items=vec![
                     ("Accueil".to_string(), Some("/".to_string())),
-                    ("Normes".to_string(), Some("/normes".to_string())),
+                    ("Normes".to_string(), Some(index.clone())),
                     ("Codes".to_string(), None),
                 ] />
                 <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
@@ -134,10 +147,9 @@ fn CatalogueLoaded(entries: Vec<CodeCatalogueEntry>) -> impl IntoView {
     }
 }
 
-/// Une section d'ordre/origine : en-tête + sous-sections par nature
-/// (Codes / Constitutions).
+/// A legal order: its heading, then one sub-section per nature.
 #[component]
-fn CatalogueSection(label: &'static str, codes: Vec<CodeCatalogueEntry>) -> impl IntoView {
+fn CatalogueSection(label: String, codes: Vec<CodeCatalogueEntry>) -> impl IntoView {
     // Sous-groupes (catégorie de nature) ordonnés Codes → Constitutions ;
     // chaque sous-groupe garde l'ordre alphabétique d'arrivée.
     let mut categories: Vec<(u8, &'static str, Vec<CodeCatalogueEntry>)> = Vec::new();
@@ -185,7 +197,7 @@ fn CatalogueCategory(label: &'static str, codes: Vec<CodeCatalogueEntry>) -> imp
 
 #[component]
 fn CatalogueRow(entry: CodeCatalogueEntry) -> impl IntoView {
-    let href = format!("/texte/{}", entry.code);
+    let href = lj_vocab::norm_path(&entry.jurisdiction, &entry.code);
     let count = format!(
         "{} article{}",
         entry.article_count,

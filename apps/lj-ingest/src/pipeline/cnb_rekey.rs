@@ -191,12 +191,14 @@ pub async fn rekey_cnb(apply: bool) -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
 
-    let (rows, snapshot) = fetch_avocat_rows(&dir).await?;
+    let (rows, snapshot) = fetch_avocat_rows(&dir)
+        .await?
+        .ok_or_else(|| anyhow!("current cnb snapshot carries no avCnbfCode"))?;
     let existing = repo.entity_cnb_states().await?;
     let dangling = repo.dangling_cnb_party_uids().await?;
     let plan = rekey_plan(&rows, &existing, &dangling, snapshot);
@@ -221,7 +223,7 @@ pub async fn rekey_cnb(apply: bool) -> Result<()> {
         println!("  merge ex.: {old} → {new}");
     }
     if !apply {
-        println!("dry-run — relancer avec --apply pour écrire.");
+        println!("dry-run, re-run with --apply to write.");
         return Ok(());
     }
 
@@ -263,7 +265,7 @@ pub async fn rekey_cnb(apply: bool) -> Result<()> {
         unlinked,
         rehydrated = plan.rehydrate.len(),
         recounted,
-        "rekey-cnb appliqué"
+        "rekey-cnb applied"
     );
     println!(
         "appliqué : {renamed} renames ({rename_links} liens), {merge_links} liens fusionnés, \

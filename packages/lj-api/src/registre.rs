@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use lj_dtos::{
     AnnonceHit, EntityAnnonceGroupDto, EntityRegistreResponse, RegistreDirigeantDto,
-    RegistreEntrepriseDto, RegistreFinanceDto, RegistreLienDto, ANNONCE_FOND_BODACC,
-    ANNONCE_FOND_JOAFE,
+    RegistreEntrepriseDto, RegistreFinanceDto, RegistreLienDto,
 };
+use lj_vocab::{ANNONCE_FOND_BODACC, ANNONCE_FOND_JOAFE};
 use serde::Deserialize;
 use tracing::instrument;
 
@@ -301,10 +301,6 @@ fn groupe_live(fond: &str, (items, total): (Vec<AnnonceHit>, i64)) -> Vec<Entity
 
 // ── Transport ────────────────────────────────────────────────────────────────
 
-/// Nature d'un échec amont, en un mot indexable côté Loki : `timeout`,
-/// `connect`, `status`, `decode`, `body`, `other`. Les conduites à tenir sont
-/// opposées — un `timeout` interroge [`UPSTREAM_TIMEOUT`], un `status` dit que
-/// l'API a répondu et nous a refusés (quota), un `connect` est du réseau.
 fn upstream_kind(e: &reqwest::Error) -> &'static str {
     if e.is_timeout() {
         "timeout"

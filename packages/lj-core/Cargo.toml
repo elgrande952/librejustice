@@ -7,17 +7,11 @@ license.workspace = true
 # PUR : aucune dépendance d'I/O (pas de reqwest, tokio-postgres, redis, zip).
 # Les données statiques (legifrance_codes.json) sont embarquées via include_str!.
 [dependencies]
-# Taxonomie (`schema`) : définie dans lj-dtos, re-exportée ici. lj-dtos est pur
-# serde, donc la frontière pure ↔ I/O tient.
-lj-dtos = { workspace = true }
+lj-fold = { workspace = true }
+lj-vocab = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 regex = { workspace = true }
-aho-corasick = { workspace = true }
-similar = { workspace = true }
-quick-xml = { workspace = true }
 html-escape = { workspace = true }
 thiserror = { workspace = true }
 jiff = { workspace = true }
-# uid canonique des annonces : `marche:<xxh3 de la clé de réconciliation>`.
-xxhash-rust = { workspace = true }

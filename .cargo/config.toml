@@ -1,0 +1,6 @@
+# Leptos views compile type-erased, lj-web in a third of the time. Both sides
+# must agree: an erased server writes markers a typed client cannot hydrate.
+[build]
+# A string, as arrays join across nested checkouts: a worktree inside another
+# would pass the flag twice and rename every artefact.
+rustflags = "--cfg erase_components"

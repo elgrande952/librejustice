@@ -2,4 +2,6 @@
 //! SEUL endroit qui connait l'URL de l'API.
 pub mod client;
 
-pub use client::{ApiClient, ApiError, PageParams, TextesFilters};
+#[cfg(feature = "ssr")]
+pub use client::Backend;
+pub use client::{ApiClient, ApiError, ApiResult, PageParams, TextesFilters};

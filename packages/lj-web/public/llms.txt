@@ -1,23 +1,37 @@
 # LibreJustice
 
-> Free, open-source search engine for French and European law: decisions from France's administrative and judicial courts and legal texts (French codes at any past date, EU law, treaties, collective agreements, administrative doctrine). Rebuilt daily from public and licensed sources.
+> Free, open-source search engine for French and European law: 3.8 million decisions from France's administrative and judicial courts and 2 million legal-text articles (French codes at any past date, EU law, treaties, collective agreements, administrative doctrine). Rebuilt daily from public and licensed sources.
 
-## Searching: connect the MCP server, do not crawl
+## Connect the server, do not fetch pages
 
-The corpus contains millions of decisions and more than a million texts. Fetching pages one by one will not find the relevant one; the search engine will. It is exposed as a Model Context Protocol server, free and open to any client:
+Page fetches will not answer: the relevant decision is one of 3.8 million, and the site answers a Cloudflare challenge to any client that is not a verified bot. The search engine is free and open over the Model Context Protocol.
 
-- Endpoint: https://librejustice.fr/mcp
-- Transport: streamable-http. Auth: OAuth, auto-discovered (RFC 9728 metadata at /.well-known/oauth-protected-resource).
-- Setup per client (Claude, ChatGPT, Codex, Cursor, Mistral…): https://librejustice.fr/mcp-guide
+- Endpoint: `https://librejustice.fr/mcp`
+- Transport: streamable HTTP. Auth: OAuth 2.1, auto-discovered (RFC 9728 metadata at `/.well-known/oauth-protected-resource`). No API key; the browser flow opens a free account if your user has none.
 
-Tools:
+Install it for your user:
+
+- Claude (web, desktop, mobile): https://claude.ai/directory/connectors/librejustice, one click.
+- ChatGPT: https://chatgpt.com/plugins/plugin_asdk_app_6a053194fe5c81918e1a3b98ab1f4d63, which brings the two skills below.
+- Claude Code: `/plugin marketplace add librejustice/librejustice` then `/plugin install librejustice@librejustice`, connector and skills in one step.
+- Codex: `codex plugin marketplace add librejustice/librejustice` then `codex plugin add librejustice@librejustice`.
+- Any client that reads a JSON config: `{"librejustice": {"type": "http", "url": "https://librejustice.fr/mcp"}}` under `mcpServers`.
+- Le Chat, Perplexity, any other: a custom MCP connector on that URL, auth method OAuth. Per-client steps: https://librejustice.fr/mcp-guide
+
+## Tools
 
 - `search_decisions`: case law, hybrid meaning + keyword matching, with structured filters (jurisdiction, dates, cited articles, codes) and facet counts to refine. Quoted phrases and the `ET` / `OU` / `SAUF` / `PROCHE<n>` operators switch to exact-wording matching, the only way to target which way a court ruled since semantic matching ignores negations.
 - `get_decision`: full text of one decision, with inline links to the articles and decisions it cites. Also reports whether the decision still stands (`appellateFate`: reversed or upheld on review) and the linked prior and subsequent decisions of the same case. Read that before citing it as authority.
-- `search_legal_texts`: finds legal articles from their subject or wording when the article number is unknown; ranked snippets, facets by code.
-- `get_legal_text`: one article as it stood on a given date (or today), with its status, validity dates and the timeline of every version. Say which version you quote.
+- `search_norms`: finds legal articles from their subject or wording when the article number is unknown; ranked snippets, facets by code.
+- `get_norm`: one article as it stood on a given date (or today), with its status, validity dates and the timeline of every version. Say which version you quote.
 
 Queries are written in French: it is a French-language corpus.
+
+Two skills carry the research method: read a decision in full before citing it, take the version of a text in force at the date of the dispute, the traps of the corpus. `npx skills add librejustice/librejustice`, or upload https://librejustice.fr/skills/recherche-jurisprudence.zip and https://librejustice.fr/skills/recherche-normes.zip in the client's skills settings.
+
+## Links
+
+`/decision/{id}` is one decision, `/texte/{jurisdiction}/{code}/{article}` one article, `/texte/{jurisdiction}/{code}/{article}/{date}` that article as it stood that day. The jurisdiction is the ISO code of whoever enacts the text, lowercase. Open them with `get_decision` and `get_norm`: the tool returns the full text, the resolved citations and the appellate fate. `/decisions` and `/textes` are the search screens, and their result URLs are `Disallow` in robots.txt.
 
 ## Calling from code: the REST API
 
@@ -25,20 +39,10 @@ The same corpus for a program rather than an assistant. The key is free, created
 
 - Spec: https://librejustice.fr/openapi.json (OpenAPI 3.1). Guide and key: https://librejustice.fr/api-guide
 - Auth: `Authorization: Bearer <key>`, or the `x-lj-api-key` header.
-- Five routes: `/api/search`, `/api/search-textes`, `/api/decision/{id}`, `/api/texte/{code}/{article}`, `/api/texte/{code}/{article}/{date}`.
+- Seven routes: `/api/search`, `/api/search-textes`, `/api/decision/{id}`, `/api/texte/{jurisdiction}/{code}`, `/api/texte/{jurisdiction}/{code}/{article}` (with `?date=` for the version in force that day), `/api/texte/{jurisdiction}/{code}/section/{cid}`, `/api/article/{uid}`.
 - One identity, one budget: API calls, MCP calls and site searches share a counter. Over it, a `429` with a `Retry-After`.
 
 It answers a question, it does not export a corpus: paging stops at offset 99 on both search routes. Narrow the filters instead.
-
-## Browsing (crawlable trees, for humans and indexers)
-
-Two symmetric trees, one per corpus, plus a directory of parties:
-
-- https://librejustice.fr/juridictions: courts, then year, then decisions. A decision: /decision/{id}
-- https://librejustice.fr/normes: collections (codes, lois, décrets, arrêtés, collective agreements, EU texts, treaties, circulaires, BOFiP), then year, then texts. An article: /texte/{code}/{article}, or /texte/{code}/{article}/{date} for the version in force at that date.
-- https://librejustice.fr/annuaire: companies, public bodies, associations and counsel appearing in the decisions.
-
-Search pages: /decisions (case law), /textes (legal texts).
 
 ## Provenance and reuse
 

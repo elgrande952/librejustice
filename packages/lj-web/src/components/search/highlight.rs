@@ -134,35 +134,18 @@ fn CiteMenu(text: String, linked: Vec<(String, String)>) -> impl IntoView {
     let open = RwSignal::new(false);
     let container_ref = NodeRef::<leptos::html::Span>::new();
 
-    // Ilot client : `window_event_listener` est inerte côté SSR (pas de window).
     #[cfg(feature = "hydrate")]
     {
-        use wasm_bindgen::JsCast;
-        let click_handle = window_event_listener(leptos::ev::mousedown, move |ev| {
-            if !open.get_untracked() {
-                return;
-            }
-            let inside = container_ref
-                .get_untracked()
-                .zip(ev.target())
-                .and_then(|(el, target)| {
-                    target
-                        .dyn_ref::<web_sys::Node>()
-                        .map(|node| el.contains(Some(node)))
-                })
-                .unwrap_or(false);
-            if !inside {
-                open.set(false);
-            }
-        });
-        on_cleanup(move || click_handle.remove());
-
-        let esc_handle = window_event_listener(leptos::ev::keydown, move |ev| {
-            if ev.key() == "Escape" && open.get_untracked() {
-                open.set(false);
-            }
-        });
-        on_cleanup(move || esc_handle.remove());
+        use crate::components::ui::panel::{dismiss, Dismiss};
+        dismiss(
+            container_ref,
+            move || open.get_untracked(),
+            move || open.set(false),
+            Dismiss {
+                escape: true,
+                scroll: false,
+            },
+        );
     }
 
     let items = linked
@@ -200,6 +183,34 @@ fn CiteMenu(text: String, linked: Vec<(String, String)>) -> impl IntoView {
     }
 }
 
+/// Chrome's HTML parser splits a text node at 65,536 UTF-16 units, and hydration
+/// then meets two nodes where the server wrote one. A char is at most two units.
+const TEXT_NODE_MAX_CHARS: usize = 32_768;
+
+fn text_node_chunks(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    for (i, (at, _)) in text.char_indices().enumerate() {
+        if i > 0 && i % TEXT_NODE_MAX_CHARS == 0 {
+            chunks.push(&text[start..at]);
+            start = at;
+        }
+    }
+    chunks.push(&text[start..]);
+    chunks
+}
+
+fn plain_text(text: String) -> AnyView {
+    if text.len() <= TEXT_NODE_MAX_CHARS {
+        return text.into_any();
+    }
+    text_node_chunks(&text)
+        .into_iter()
+        .map(|c| view! { <span>{c.to_string()}</span> })
+        .collect_view()
+        .into_any()
+}
+
 /// Rend un paragraphe de décision avec ses citations cliquables. Overlay composé
 /// SERVER-SIDE via [`split_spans`] (cf. [`cite_view`]), le reste en texte brut.
 /// JAMAIS d'`inner_html` — Leptos échappe chaque segment, SSR crawlable. Aucun
@@ -214,12 +225,12 @@ pub fn CitedParagraph(
     at_date: Option<String>,
 ) -> impl IntoView {
     if spans.is_empty() {
-        return view! { <p>{text}</p> }.into_any();
+        return view! { <p>{plain_text(text)}</p> }.into_any();
     }
     let views = split_spans(&text, &spans)
         .into_iter()
         .map(|seg| match seg {
-            CiteSeg::Plain(s) => view! { <span>{s}</span> }.into_any(),
+            CiteSeg::Plain(s) => view! { <span>{plain_text(s)}</span> }.into_any(),
             CiteSeg::Cite { text, targets } => cite_view(text, targets, at_date.as_deref()),
         })
         .collect::<Vec<_>>();
@@ -235,12 +246,12 @@ pub fn CitedParagraph(
 #[component]
 pub fn CitedBlock(text: String, spans: Vec<CitationSpan>, class: &'static str) -> impl IntoView {
     if spans.is_empty() {
-        return view! { <div class=class>{text}</div> }.into_any();
+        return view! { <div class=class>{plain_text(text)}</div> }.into_any();
     }
     let views = split_spans(&text, &spans)
         .into_iter()
         .map(|seg| match seg {
-            CiteSeg::Plain(s) => view! { <span>{s}</span> }.into_any(),
+            CiteSeg::Plain(s) => view! { <span>{plain_text(s)}</span> }.into_any(),
             CiteSeg::Cite { text, targets } => cite_view(text, targets, None),
         })
         .collect::<Vec<_>>();
@@ -281,9 +292,18 @@ mod tests {
     }
 
     #[test]
+    fn text_node_chunks_stay_under_the_parser_split() {
+        let text = "é𝄞a".repeat(30_000);
+        let chunks = text_node_chunks(&text);
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.encode_utf16().count() <= 65_536));
+    }
+
+    #[test]
     fn split_spans_segments_text_cite_text() {
         let text = "voir article 1240 du code";
-        let segs = split_spans(text, &[span(13, 17, Some("/texte/code-civil/1240"))]);
+        let segs = split_spans(text, &[span(13, 17, Some("/norm/fr/code-civil/1240"))]);
         assert_eq!(segs.len(), 3);
         match &segs[0] {
             CiteSeg::Plain(s) => assert_eq!(s, "voir article "),
@@ -292,7 +312,7 @@ mod tests {
         match &segs[1] {
             CiteSeg::Cite { text, targets } => {
                 assert_eq!(text, "1240");
-                assert_eq!(targets[0].href.as_deref(), Some("/texte/code-civil/1240"));
+                assert_eq!(targets[0].href.as_deref(), Some("/norm/fr/code-civil/1240"));
             }
             _ => panic!("segment 1 doit être Cite"),
         }
@@ -338,11 +358,11 @@ mod tests {
             end: text.chars().count(),
             targets: vec![
                 CitationTarget {
-                    href: Some("/texte/code-civil/1382".to_string()),
+                    href: Some("/norm/fr/code-civil/1382".to_string()),
                     label: "1382".to_string(),
                 },
                 CitationTarget {
-                    href: Some("/texte/code-civil/1383".to_string()),
+                    href: Some("/norm/fr/code-civil/1383".to_string()),
                     label: "1383".to_string(),
                 },
             ],

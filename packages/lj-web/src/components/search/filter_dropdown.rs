@@ -13,6 +13,8 @@
 
 use leptos::prelude::*;
 
+#[cfg(feature = "hydrate")]
+use crate::components::ui::panel::{dismiss, Dismiss};
 use crate::helpers::cn;
 
 /// Id du dropdown ouvert dans la barre (`None` = aucun). Fourni par la barre de
@@ -51,44 +53,16 @@ pub fn FilterDropdown(
     // l'ouverture. `None` au SSR / avant mesure.
     let coords = RwSignal::new(None::<(f64, f64, f64)>);
 
-    // Fermeture au clic extérieur + Échap + scroll fenêtre (panneau fixe).
-    // `window_event_listener` est inerte côté SSR — îlot client.
     #[cfg(feature = "hydrate")]
-    {
-        use wasm_bindgen::JsCast;
-        let handle = window_event_listener(leptos::ev::mousedown, move |ev| {
-            if !is_open.get_untracked() {
-                return;
-            }
-            let inside = container_ref
-                .get_untracked()
-                .zip(ev.target())
-                .and_then(|(el, target)| {
-                    target
-                        .dyn_ref::<web_sys::Node>()
-                        .map(|node| el.contains(Some(node)))
-                })
-                .unwrap_or(false);
-            if !inside {
-                open_id.set(None);
-            }
-        });
-        on_cleanup(move || handle.remove());
-
-        let key_handle = window_event_listener(leptos::ev::keydown, move |ev| {
-            if is_open.get_untracked() && ev.key() == "Escape" {
-                open_id.set(None);
-            }
-        });
-        on_cleanup(move || key_handle.remove());
-
-        let scroll_handle = window_event_listener(leptos::ev::scroll, move |_| {
-            if is_open.get_untracked() {
-                open_id.set(None);
-            }
-        });
-        on_cleanup(move || scroll_handle.remove());
-    }
+    dismiss(
+        container_ref,
+        move || is_open.get_untracked(),
+        move || open_id.set(None),
+        Dismiss {
+            escape: true,
+            scroll: true,
+        },
+    );
 
     // Ouverture : mesure du bouton, ancrage bas-gauche, largeur fixe `w-80`
     // clampée au viewport, hauteur capée à l'espace sous le bouton.

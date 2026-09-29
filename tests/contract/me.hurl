@@ -1,7 +1,7 @@
 # ============================================================================
-# Contract tests — route groups `me` (profile, activity-tracking, bookmarks,
-# search-history, decision-views) and `account` (résumé, display-name,
-# password-link, unlink, email-change, delete). All require auth (RequiredUser).
+# Contract tests: route groups `me` (profile, bookmarks) and `account`
+# (résumé, display-name, password-link, unlink, email-change, delete). All
+# require auth (RequiredUser).
 #
 # These tests assert the UNAUTHENTICATED contract (401 shape) for every
 # endpoint. The authenticated path lives in `authed.hurl`, which opens a real
@@ -58,14 +58,6 @@ POST {{base}}/internal/account/delete
 confirm: SUPPRIMER
 HTTP 401
 
-# ── PUT /internal/me/activity-tracking, unauth ──────────────────────────────
-PUT {{base}}/internal/me/activity-tracking
-Content-Type: application/json
-{
-  "enabled": false
-}
-HTTP 401
-
 # ── GET /internal/me/bookmarks, unauth ──────────────────────────────────────
 GET {{base}}/internal/me/bookmarks
 HTTP 401
@@ -76,36 +68,4 @@ HTTP 401
 
 # ── DELETE /internal/me/bookmarks/{id}, unauth ──────────────────────────────
 DELETE {{base}}/internal/me/bookmarks/ABC123
-HTTP 401
-
-# ── GET /internal/me/search-history, unauth ─────────────────────────────────
-GET {{base}}/internal/me/search-history
-HTTP 401
-
-# ── GET /internal/me/search-history with paging params, unauth ──────────────
-GET {{base}}/internal/me/search-history?limit=10&offset=0
-HTTP 401
-
-# ── DELETE /internal/me/search-history/{entry_id}, unauth ───────────────────
-DELETE {{base}}/internal/me/search-history/1
-HTTP 401
-
-# ── DELETE /internal/me/search-history (clear all), unauth ──────────────────
-DELETE {{base}}/internal/me/search-history
-HTTP 401
-
-# ── GET /internal/me/decision-views, unauth ─────────────────────────────────
-GET {{base}}/internal/me/decision-views
-HTTP 401
-
-# ── POST /internal/me/decision-views/{id}, unauth ───────────────────────────
-POST {{base}}/internal/me/decision-views/ABC123
-HTTP 401
-
-# ── DELETE /internal/me/decision-views/{id}, unauth ─────────────────────────
-DELETE {{base}}/internal/me/decision-views/ABC123
-HTTP 401
-
-# ── DELETE /internal/me/decision-views (clear all), unauth ──────────────────
-DELETE {{base}}/internal/me/decision-views
 HTTP 401

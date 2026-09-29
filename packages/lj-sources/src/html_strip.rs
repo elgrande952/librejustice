@@ -40,7 +40,7 @@ pub fn strip_html(html: &str) -> String {
 /// itéré jusqu'au point fixe (borné) : certains corps arrivent double-encodés
 /// (`&amp;#8217;`) et un seul passage laisse une entité. Une entité inconnue est
 /// laissée telle quelle.
-fn decode_entities(s: &str) -> String {
+pub fn decode_entities(s: &str) -> String {
     let mut courant = decode_entities_once(s);
     for _ in 0..2 {
         let suivant = decode_entities_once(&courant);
@@ -50,6 +50,26 @@ fn decode_entities(s: &str) -> String {
         courant = suivant;
     }
     courant
+}
+
+/// A numeric reference in 0x80-0x9F names its Windows-1252 character, as HTML
+/// reads it: `&#156;` is œ, not a control character.
+const WINDOWS_1252: [char; 32] = [
+    '\u{20ac}', '\u{81}', '\u{201a}', '\u{192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{2c6}', '\u{2030}', '\u{160}', '\u{2039}', '\u{152}', '\u{8d}', '\u{17d}', '\u{8f}',
+    '\u{90}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{2dc}', '\u{2122}', '\u{161}', '\u{203a}', '\u{153}', '\u{9d}', '\u{17e}', '\u{178}',
+];
+
+/// A code point of Word's Symbol font, the private area 0xF000-0xF0FF, where
+/// a pasted list keeps its bullets: 998 of them in the procurement fund on
+/// 23/09/2026, and no font renders them.
+fn caractere(cp: u32) -> Option<char> {
+    match cp {
+        0x80..=0x9f => Some(WINDOWS_1252[(cp - 0x80) as usize]),
+        0xf000..=0xf0ff => Some('\u{2022}'),
+        _ => char::from_u32(cp),
+    }
 }
 
 fn decode_entities_once(s: &str) -> String {
@@ -66,7 +86,7 @@ fn decode_entities_once(s: &str) -> String {
                 num.parse::<u32>().ok()
             };
             return cp
-                .and_then(char::from_u32)
+                .and_then(caractere)
                 .map(String::from)
                 .unwrap_or_else(|| caps[0].to_string());
         }
@@ -113,6 +133,8 @@ fn decode_entities_once(s: &str) -> String {
             "oelig" => "œ".to_string(),
             "OElig" => "Œ".to_string(),
             "iquest" => "¿".to_string(),
+            "yuml" => "ÿ".to_string(),
+            "sup2" => "²".to_string(),
             // Trait d'union conditionnel : invisible, il ne porte rien en texte plat.
             "shy" => String::new(),
             "deg" => "\u{b0}".to_string(),
@@ -162,6 +184,14 @@ mod tests {
     fn decodes_numeric_entities_dec_and_hex() {
         let out = strip_html("<p>article &#167; et &#xA7; bis</p>");
         assert_eq!(out, "article § et § bis");
+    }
+
+    #[test]
+    fn a_windows_1252_reference_and_a_symbol_font_bullet_read_as_text() {
+        assert_eq!(
+            decode_entities("c&#156;ur &#150; &#149; lot&#61607;1"),
+            "c\u{153}ur \u{2013} \u{2022} lot\u{2022}1"
+        );
     }
 
     #[test]

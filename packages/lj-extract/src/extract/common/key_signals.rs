@@ -15,7 +15,7 @@ use regex::Regex;
 
 use super::instruments::FOREIGN_NATIONALITY_STEMS;
 use super::is_unresolvable_instrument;
-use super::text::fold;
+use lj_fold::fold;
 
 /// Version du parse des signaux (colonne `citation_key.signal_version`).
 pub const SIGNAL_VERSION: i16 = 1;

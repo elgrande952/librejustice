@@ -19,7 +19,7 @@ mod opendata;
 mod sha256;
 
 pub use compact::compact_archives;
-pub use judilibre::sync_judilibre;
+pub use judilibre::{parse_decision_line, read_jsonl_gz_lines, sync_judilibre};
 pub use manifest::{Entry, JurState, Manifest, MonthState};
 pub use opendata::sync_opendata;
 

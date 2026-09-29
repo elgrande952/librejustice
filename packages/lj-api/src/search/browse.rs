@@ -13,11 +13,12 @@ use crate::error::{ApiError, Result};
 use crate::referential::{referential, Referential};
 use crate::state::AppState;
 
+use super::aggregate::{aggregate_facets, Aggs, Scope};
 use super::filters::{as_refs, Params};
 use super::hydrate::{facets_from_counters, FacetCounters};
 
-/// La requête porte-t-elle au moins un filtre ? Sans question ni filtre, la
-/// page est l'arrivée sur `/decisions` et non une recherche.
+/// Does the request carry at least one filter? With neither question nor filter,
+/// the page is the landing on `/decision-search`, not a search.
 pub(crate) fn has_filters(req: &SearchRequest) -> bool {
     fn some<T>(v: &Option<Vec<T>>) -> bool {
         v.as_deref().is_some_and(|s| !s.is_empty())
@@ -37,10 +38,10 @@ pub(crate) fn has_filters(req: &SearchRequest) -> bool {
 }
 
 /// Sans requête, la pertinence vaut la date décroissante.
-fn order_by(sort: SortOrder) -> &'static str {
+fn order_by(sort: SortOrder, date: &str, id: &str) -> String {
     match sort {
-        SortOrder::DateAsc => "d.date_lecture ASC NULLS LAST, d.id",
-        _ => "d.date_lecture DESC NULLS LAST, d.id",
+        SortOrder::DateAsc => format!("{date} ASC NULLS LAST, {id}"),
+        _ => format!("{date} DESC NULLS LAST, {id}"),
     }
 }
 
@@ -68,29 +69,42 @@ async fn window_ids(
     len: i64,
 ) -> Result<Vec<(i64, String)>> {
     let mut params: Params = Vec::new();
-    let predicate = if has_filters(req) {
+    let filtered = has_filters(req).then(|| {
         let mut idx = 1usize;
-        format!(
-            "d.id @@@ {}",
-            super::aggregate::build_predicate(req, &mut idx, &mut params)
-        )
-    } else {
-        "d.deleted_at IS NULL".to_string()
-    };
+        super::aggregate::build_predicate(req, &mut idx, &mut params)
+    });
     let (li, oi) = (params.len() + 1, params.len() + 2);
     let mut refs = as_refs(&params);
     refs.push(&len);
     refs.push(&start);
-    let sql = format!(
-        "SELECT d.id, d.public_id FROM decisions d WHERE {predicate} \
-         ORDER BY {} LIMIT ${li} OFFSET ${oi}",
-        order_by(req.sort)
-    );
+    let sql = match filtered {
+        Some(predicate) => format!(
+            "SELECT d.id, d.public_id, d.jurisdiction_type FROM ( \
+               SELECT t.decision_id, t.date_lecture FROM decision_text t WHERE t.id @@@ {predicate} \
+               ORDER BY {} LIMIT ${li} OFFSET ${oi} \
+             ) w JOIN decisions d ON d.id = w.decision_id \
+             ORDER BY {}",
+            order_by(req.sort, "t.date_lecture", "t.decision_id"),
+            order_by(req.sort, "w.date_lecture", "w.decision_id"),
+        ),
+        None => format!(
+            "SELECT d.id, d.public_id, d.jurisdiction_type FROM decisions d WHERE d.deleted_at IS NULL \
+             ORDER BY {} LIMIT ${li} OFFSET ${oi}",
+            order_by(req.sort, "d.date_lecture", "d.id"),
+        ),
+    };
     let rows = conn
         .query(&sql, &refs)
         .await
         .map_err(|e| ApiError::Internal(format!("browse page: {e}")))?;
-    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let jt = lj_dtos::JurisdictionType::from_code(r.get(2))
+                .expect("a stored jurisdiction_type is a known variant");
+            (r.get(0), lj_dtos::decision_path(jt, r.get(1)))
+        })
+        .collect())
 }
 
 /// Total et facettes du fonds filtré, comptés dans l'index par le même agrégat
@@ -102,7 +116,7 @@ async fn live_totals_and_facets(
     refs: &Referential,
 ) -> Result<(i64, SearchFacets)> {
     let conn = super::client(state).await?;
-    let (total, counters) = super::aggregate::aggregate_facets(&conn, req, &[])
+    let (total, counters) = aggregate_facets(&conn, req, Scope::Question(&[]), Aggs::All)
         .await
         .map_err(|e| ApiError::Internal(format!("browse facettes: {e}")))?;
     Ok((total, facets_from_counters(&counters, refs)))
@@ -241,7 +255,7 @@ pub(crate) async fn browse(state: &AppState, req: &SearchRequest) -> Result<Sear
         .into_iter()
         .map(|(_, hit)| hit)
         .collect();
-    let all_hit_ids: Vec<String> = window.into_iter().map(|(_, public_id)| public_id).collect();
+    let all_hit_paths: Vec<String> = window.into_iter().map(|(_, path)| path).collect();
 
     Ok(SearchResponse {
         query: String::new(),
@@ -249,9 +263,10 @@ pub(crate) async fn browse(state: &AppState, req: &SearchRequest) -> Result<Sear
         hits,
         query_mode: QueryMode::Browse,
         facets: Some(facets),
-        all_hit_ids,
+        all_hit_paths,
         reranked: false,
         pinned: Vec::new(),
+        pinned_more: false,
     })
 }
 

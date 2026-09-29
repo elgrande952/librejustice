@@ -1,8 +1,8 @@
 # LibreJustice
 
-**[librejustice.fr](https://librejustice.fr)**: a free search engine for French and European law, plus current public notices. It links case law from France's administrative and judicial courts to consolidated legal texts and makes them searchable in plain language on the web and through **MCP**.
+**[librejustice.fr](https://librejustice.fr)**: a free search engine for French-language and European law, plus current public notices. It links case law from France's administrative and judicial courts to consolidated legal texts and makes them searchable in plain language on the web and through **MCP**.
 
-Free and open source. **~3.7 million decisions and ~3.6 million legal articles** in one database, linked article by article, resynchronised daily. That is the whole point: texts and case law live together, so there is no second server to plug in for the codes and no third one for the citation graph.
+Free and open source. **~3.8 million decisions and ~3.9 million legal articles** in one database, linked article by article, resynchronised daily. That is the whole point: texts and case law live together, so there is no second server to plug in for the codes and no third one for the citation graph.
 
 ## What you search
 
@@ -25,7 +25,7 @@ Public databases are silos, each with a search engine bounded by its own fonds (
 
 ## Using LibreJustice from an AI assistant
 
-The public MCP server is `https://librejustice.fr/mcp` (OAuth 2.1 with dynamic client registration: no API key to configure). Five tools: `search_decisions`, `get_decision`, `search_legal_texts`, `get_legal_text`, `list_my_activity`.
+The public MCP server is `https://librejustice.fr/mcp` (OAuth 2.1 with dynamic client registration: no API key to configure). Four tools: `search_decisions`, `get_decision`, `search_norms`, `get_norm`.
 
 With Claude Code, the plugin installs the connector and the usage skills:
 
@@ -60,7 +60,9 @@ A single-server node, **Postgres + ParadeDB + VectorChord** (hybrid BM25 + vecto
 A **pure Rust** Cargo workspace, split in two roots:
 
 - `packages/` libraries:
-  - `lj-core` pure core: parsing, normalisation, extraction, summary, legal refs.
+  - `lj-core` pure core: the decision model and its normalisation.
+  - `lj-parse` source parsers into the decision model.
+  - `lj-norm` referential of the legal texts: article keys, aliases, applicability.
   - `lj-extract` field and citation extraction from decisions.
   - `lj-sources` source I/O (Judilibre JSON, opendata ZIP/XML).
   - `lj-store` Postgres access (tokio-postgres + deadpool) and migrations.

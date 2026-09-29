@@ -43,31 +43,14 @@ pub(crate) fn looks_like_caa_rg(rg: &str) -> bool {
         && b[4].is_ascii_digit()
 }
 
-/// Replie les diacritiques français usuels, sans dépendance Unicode native.
-/// Suffisant pour les noms de juridiction.
-fn fold_accents(c: char) -> char {
-    match c {
-        'à' | 'â' | 'ä' | 'á' | 'ã' => 'a',
-        'ç' => 'c',
-        'é' | 'è' | 'ê' | 'ë' => 'e',
-        'î' | 'ï' | 'í' | 'ì' => 'i',
-        'ô' | 'ö' | 'ó' | 'ò' | 'õ' => 'o',
-        'ù' | 'û' | 'ü' | 'ú' => 'u',
-        'ÿ' | 'ý' => 'y',
-        'œ' => 'o',
-        other => other,
-    }
-}
-
 /// Normalise un composant **textuel** de la clé (juridiction) : minuscules,
 /// accents repliés, tout caractère non alphanumérique réduit à une espace,
 /// espaces collapsés. `Tribunal administratif d'Amiens` → `tribunal
 /// administratif d amiens`.
 pub(crate) fn normalize_component(s: &str) -> String {
     let folded: String = s
-        .to_lowercase()
         .chars()
-        .map(fold_accents)
+        .flat_map(lj_fold::fold_char)
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     folded.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -164,65 +147,39 @@ pub fn decision_canonical_ref(d: &Decision) -> Option<String> {
     }
 }
 
-/// Pourvoi au format canonique stocké (`18-23.954`) — le seul que la
-/// résolution par famille CC sait reformater (clé 7 chiffres).
-fn is_canonical_pourvoi(docket: &str) -> bool {
-    let b = docket.as_bytes();
-    b.len() == 9
-        && b[2] == b'-'
-        && b[5] == b'.'
-        && [0usize, 1, 3, 4, 6, 7, 8]
-            .iter()
-            .all(|&i| b[i].is_ascii_digit())
-}
-
-/// Clés `target_ref` candidates qu'une citation pendante emploierait pour
-/// viser une décision d'identité `(jurisdiction_type, jurisdiction_code,
-/// docket_numbers)` — l'inverse exact des reformatages clé→docket des SQL
-/// de résolution par famille (`resolve_case_family_sqls`). À l'arrivée d'une
-/// cible, ces clés sondent l'index des pendantes. Une clé manquée n'est jamais
-/// une erreur (le pendant reste pendant, rattrapé par `reconcile`) ; une clé en
-/// trop est un miss de sonde. Par famille :
-/// - `CC` : `cc|<7 chiffres>` ssi le docket est au format canonique
-///   (`18-23.954` → `cc|1823954`) — les autres formes sont irrésolubles par
-///   le sweep aussi ;
-/// - `CE`/`CEDH`/`CONSTIT` : `<préfixe>|<docket>` tel quel ;
-/// - `TC` : `tc|<docket minuscule>` (le `C` des numéros modernes est plié) ;
-/// - `CJUE` : `cjue|<docket minuscule>` + variante sans préfixe `c-` (la clé
-///   nue « aff. 6/64 » résout en C-) ;
-/// - tout type à `jurisdiction_code` : `rg|<code>|<docket>` ET
-///   `af|<code>|<docket>` (le code discrimine déjà dans le SQL).
-pub fn pending_target_keys(
-    jurisdiction_type: &str,
+/// The dockets an arriving target answers to, the probe a batch of freshly
+/// written decisions runs against the pending addresses.
+///
+/// No per-court reformatting, unlike the family keys this replaces: both sides
+/// of the join fold through `lj_docket_keys`, so `18-23.954` already meets
+/// `1823954`. Two graphies folding does not merge are added here, the eras of a
+/// Tribunal des conflits number and the CJUE role a citation writes bare.
+pub fn pending_target_dockets(
     jurisdiction_code: Option<&str>,
     docket_numbers: &[String],
 ) -> Vec<String> {
-    let mut keys = Vec::new();
+    let mut out = Vec::new();
     for docket in docket_numbers {
-        match jurisdiction_type {
-            "CC" if is_canonical_pourvoi(docket) => {
-                let digits: String = docket.chars().filter(char::is_ascii_digit).collect();
-                keys.push(format!("cc|{digits}"));
-            }
-            "CE" => keys.push(format!("ce|{docket}")),
-            "CEDH" => keys.push(format!("cedh|{docket}")),
-            "CONSTIT" => keys.push(format!("constit|{docket}")),
-            "TC" => keys.push(format!("tc|{}", lj_core::docket_key::tc_ordinal(docket))),
-            "CJUE" => {
-                let lower = docket.to_lowercase();
-                if let Some(bare) = lower.strip_prefix("c-") {
-                    keys.push(format!("cjue|{bare}"));
-                }
-                keys.push(format!("cjue|{lower}"));
-            }
-            _ => {}
+        let docket = docket.trim();
+        if docket.is_empty() {
+            continue;
         }
-        if let Some(code) = jurisdiction_code.filter(|c| !c.is_empty()) {
-            keys.push(format!("rg|{code}|{docket}"));
-            keys.push(format!("af|{code}|{docket}"));
-        }
+        let other = match jurisdiction_code {
+            Some("tc") => Some(
+                docket
+                    .trim_start_matches(['c', 'C'])
+                    .trim_start_matches('0')
+                    .to_string(),
+            ),
+            Some("cjue") => docket.split_once('-').map(|(_, role)| role.to_string()),
+            _ => None,
+        };
+        out.push(docket.to_string());
+        out.extend(other.filter(|o| !o.is_empty() && o != docket));
     }
-    keys
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -287,38 +244,23 @@ mod tests {
         );
     }
 
+    /// The probe is the decision's own numbers, plus the two graphies folding
+    /// leaves apart.
     #[test]
-    fn pending_target_keys_invert_family_reformats() {
+    fn an_arriving_target_probes_by_its_dockets() {
         assert_eq!(
-            pending_target_keys("CC", None, &["18-23.954".into()]),
-            vec!["cc|1823954"]
-        );
-        assert!(pending_target_keys("CC", None, &["1823954".into()]).is_empty());
-        assert_eq!(
-            pending_target_keys("CJUE", None, &["C-561/19".into()]),
-            vec!["cjue|561/19", "cjue|c-561/19"]
+            pending_target_dockets(Some("cc"), &["18-23.954".into()]),
+            vec!["18-23.954"]
         );
         assert_eq!(
-            pending_target_keys("CJUE", None, &["T-123/20".into()]),
-            vec!["cjue|t-123/20"]
+            pending_target_dockets(Some("tc"), &["C4174".into()]),
+            vec!["4174", "C4174"]
         );
         assert_eq!(
-            pending_target_keys("CA", Some("ca_paris"), &["21/04532".into()]),
-            vec!["rg|ca_paris|21/04532", "af|ca_paris|21/04532"]
+            pending_target_dockets(Some("cjue"), &["C-561/19".into()]),
+            vec!["561/19", "C-561/19"]
         );
-        assert!(pending_target_keys("CA", None, &["21/04532".into()]).is_empty());
-        assert_eq!(
-            pending_target_keys("CE", None, &["498887".into()]),
-            vec!["ce|498887"]
-        );
-        assert_eq!(
-            pending_target_keys("TC", None, &["00012".into()]),
-            vec!["tc|12"]
-        );
-        assert_eq!(
-            pending_target_keys("TC", None, &["C4174".into()]),
-            vec!["tc|4174"]
-        );
+        assert!(pending_target_dockets(Some("cc"), &["  ".into()]).is_empty());
     }
 
     #[test]

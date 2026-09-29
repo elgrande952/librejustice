@@ -1,32 +1,29 @@
 //! Chronology steps the corpus does not hold. A `decision_links` row whose
 //! target stays pending (`target_decision_id IS NULL`) leaves nothing but its
-//! key, written by the ingest in the `canonical_ref` grammar: it is read back
-//! here into a named step, which the page renders without a link.
+//! address: it is read back here into a named step, which the page renders
+//! without a link.
 
 use crate::referential::Referential;
 
-/// One chronology step read back from a pending key.
+/// One chronology step read back from a pending address.
 pub struct PendingStep {
     pub label: String,
     pub date: String,
     pub docket: Option<String>,
 }
 
-/// `None` when the court component matches no referential unit, which is what
-/// a name the extraction mis-cut looks like ("tribunal administratif de nimes
-/// auquel la requete"), and when the key is `caa|<rg>|<date>`, whose court
-/// lives in the request-number prefix and nowhere else in the key.
-pub fn pending_step(target_ref: &str, refs: &Referential) -> Option<PendingStep> {
-    let (court, docket, date) = match *target_ref.split('|').collect::<Vec<_>>().as_slice() {
-        ["ca-parties", court, date] => (court, None, date),
-        ["caa", _, _] => return None,
-        [court, docket, date] => (court, Some(docket), date),
-        [_, court, docket, date] => (court, Some(docket), date),
-        _ => return None,
-    };
+/// `None` when the court matches no referential unit, which is what a court
+/// the gazetteer could not name looks like, and when the address carries no
+/// date, a step with nothing to place it on the chain.
+pub fn pending_step(
+    court: Option<&str>,
+    docket: Option<&str>,
+    date: Option<&str>,
+    refs: &Referential,
+) -> Option<PendingStep> {
     Some(PendingStep {
-        label: refs.court_by_key(court)?.to_string(),
-        date: date.to_string(),
+        label: refs.court_by_key(court?)?.to_string(),
+        date: date?.to_string(),
         docket: docket.map(str::to_string),
     })
 }
@@ -51,10 +48,10 @@ mod tests {
                 "Tribunal judiciaire du Havre",
             ),
             (
-                "tcom_paris",
-                "tcom7501",
-                "TCOM",
-                "Tribunal de commerce de Paris",
+                "caa_lyon",
+                "caa_lyon",
+                "CAA",
+                "Cour administrative d'appel de Lyon",
             ),
             ("ta_lyon", "ta_lyon", "TA", "Tribunal administratif de Lyon"),
             ("cc", "cc", "CC", "Cour de cassation"),
@@ -76,12 +73,17 @@ mod tests {
         )
     }
 
+    /// The court is named by its code, whatever the family the key grammar used
+    /// to sort it into, and an address without a docket is a step all the same.
     #[test]
-    fn every_key_family_names_its_court() {
+    fn a_court_of_the_referential_names_its_step() {
         let refs = refs();
-        let step = |key: &str| pending_step(key, &refs).map(|s| (s.label, s.date, s.docket));
+        let step = |court, docket, date| {
+            pending_step(Some(court), docket, Some(date), &refs)
+                .map(|s| (s.label, s.date, s.docket))
+        };
         assert_eq!(
-            step("tribunal administratif de lyon|0907255|2012-03-27"),
+            step("ta_lyon", Some("0907255"), "2012-03-27"),
             Some((
                 "Tribunal administratif de Lyon".to_string(),
                 "2012-03-27".to_string(),
@@ -89,7 +91,11 @@ mod tests {
             ))
         );
         assert_eq!(
-            step("ca-parties|ca_aix_provence|2021-03-03"),
+            step("caa_lyon", Some("02LY02109"), "2003-03-31").map(|s| s.0),
+            Some("Cour administrative d'appel de Lyon".to_string())
+        );
+        assert_eq!(
+            step("ca_aix_en_provence", None, "2021-03-03"),
             Some((
                 "Cour d'appel d'Aix-en-Provence".to_string(),
                 "2021-03-03".to_string(),
@@ -97,29 +103,16 @@ mod tests {
             ))
         );
         assert_eq!(
-            step("tj|tj76351|24 01880|2024-06-30").map(|s| s.0),
+            step("tj_le_havre", Some("24/01880"), "2024-06-30").map(|s| s.0),
             Some("Tribunal judiciaire du Havre".to_string())
-        );
-        assert_eq!(
-            step("tcom|7501|2023064061|2024-01-19").map(|s| s.0),
-            Some("Tribunal de commerce de Paris".to_string())
-        );
-        assert_eq!(
-            step("cc|04-15.329|2006-11-16").map(|s| s.0),
-            Some("Cour de cassation".to_string())
         );
     }
 
     #[test]
-    fn a_court_the_referential_does_not_hold_yields_no_step() {
+    fn an_address_without_court_or_date_yields_no_step() {
         let refs = refs();
-        let absent = [
-            "tribunal administratif de nimes auquel la requete|1900612|2021-05-04",
-            "caa|02ly02109|2003-03-31",
-            "tj|tj99999|24 01880|2024-06-30",
-        ];
-        for key in absent {
-            assert!(pending_step(key, &refs).is_none(), "{key}");
-        }
+        assert!(pending_step(Some("tj_nulle_part"), None, Some("2024-06-30"), &refs).is_none());
+        assert!(pending_step(None, Some("0907255"), Some("2012-03-27"), &refs).is_none());
+        assert!(pending_step(Some("cc"), Some("04-15.329"), None, &refs).is_none());
     }
 }

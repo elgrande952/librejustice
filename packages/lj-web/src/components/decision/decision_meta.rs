@@ -4,6 +4,7 @@ use lj_dtos::{DecisionDetail, FacetTag, LegalReference};
 
 use leptos_router::components::A;
 
+use crate::components::decision::selection::{SelState, SelectionToolbar};
 use crate::components::hover_preview::{HoverPreview, PreviewKind};
 use crate::helpers::{format_iso_date, format_juridiction};
 use crate::pages::decision_page::labels::publication_label;
@@ -119,9 +120,18 @@ pub fn DecisionMeta(
 
     // Résumé garanti en base et porté par le détail : rendu direct, aucun fetch.
     // Absent (cas résiduel) ⇒ bloc masqué.
+    let summary_ref = NodeRef::<leptos::html::P>::new();
+    let selection_state: RwSignal<Option<SelState>> = RwSignal::new(None);
+    #[cfg(feature = "hydrate")]
+    crate::components::decision::selection::watch_selection(summary_ref, selection_state);
     let summary_view = detail.summary.clone().map(|text| {
         view! {
-            <p class="mt-3 text-sm leading-relaxed text-[var(--color-ink-muted)]">{text}</p>
+            <p
+                node_ref=summary_ref
+                class="mt-3 text-sm leading-relaxed text-[var(--color-ink-muted)]"
+            >
+                {text}
+            </p>
         }
     });
 
@@ -154,9 +164,12 @@ pub fn DecisionMeta(
         // Date de lecture propagée aux hover cards d'articles : version en
         // vigueur à la date de la décision.
         let at_date = detail.date_lecture.clone();
+        let place = detail.court_place.clone();
         let rows = legal_references
             .into_iter()
-            .map(|r| view! { <LegalRefRow reference=r at_date=at_date.clone() /> })
+            .map(|r| {
+                view! { <LegalRefRow reference=r at_date=at_date.clone() place=place.clone() /> }
+            })
             .collect_view();
         view! {
             <div class="mt-5 border-t border-[var(--color-rule)] pt-4">
@@ -169,9 +182,10 @@ pub fn DecisionMeta(
     });
 
     view! {
+        // Never printed: the sheet goes into a case file, where only the court's own text counts.
         <section
             aria-label="Synthèse"
-            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6"
+            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6 print:hidden"
         >
             <div id=section_id class="relative -top-24" aria-hidden="true" />
             <h2 class="font-sans text-base text-[var(--color-ink)]">"Synthèse"</h2>
@@ -180,6 +194,14 @@ pub fn DecisionMeta(
             {themes_view}
             {refs_view}
         </section>
+        <Show when=move || selection_state.get().is_some()>
+            {move || {
+                let state = selection_state.get().expect("présence garantie par `when`");
+                view! {
+                    <SelectionToolbar state=state reference=None selection_state=selection_state />
+                }
+            }}
+        </Show>
     }
 }
 
@@ -206,15 +228,25 @@ fn LegalRefRow(
     /// Date de la décision hôte, transmise aux hover cards d'articles.
     #[prop(optional_no_strip)]
     at_date: Option<String>,
+    /// The court's place, which the links carry as the body's do.
+    #[prop(optional_no_strip)]
+    place: Option<String>,
 ) -> impl IntoView {
     let LegalReference {
         instrument,
         slug,
+        jurisdiction,
         articles,
     } = reference;
-    // Chaque article devient un lien `/texte/{slug}/{numKey}/{at_date}` quand la
-    // citation est **résolue** au catalogue : `slug` du `legal_text` + `numKey`
-    // canonique posés au DTO ; sinon texte brut. Articles séparés par « , ».
+    // Each article becomes a `/norm/{juris}/{slug}/{numKey}/{at_date}`
+    // link once the citation is **resolved** against the catalogue: the
+    // `legal_text` slug plus the canonical `numKey`, both set on the DTO.
+    // Otherwise plain text, separated by a comma.
+    let text = slug
+        .as_deref()
+        .map(|s| lj_vocab::norm_path(&jurisdiction, s));
+    let segment = lj_vocab::url_segment(&jurisdiction);
+    let suffix = crate::pages::law_page::data::reader_suffix(place.as_deref());
     let articles_view = (!articles.is_empty()).then(|| {
         let last = articles.len() - 1;
         let items = articles
@@ -222,22 +254,26 @@ fn LegalRefRow(
             .enumerate()
             .map(|(i, article)| {
                 let sep = (i < last).then_some(", ");
-                let target = slug.as_ref().filter(|_| !article.num_key.is_empty()).map(
-                    |s| {
+                let target = text
+                    .as_ref()
+                    .zip(slug.as_ref())
+                    .filter(|_| !article.num_key.is_empty())
+                    .map(|(path, s)| {
                         let href = match at_date.as_deref() {
-                            Some(d) => format!("/texte/{s}/{}/{d}", article.num_key),
-                            None => format!("/texte/{s}/{}", article.num_key),
+                            Some(d) => format!("{path}/{}/{d}{suffix}", article.num_key),
+                            None => format!("{path}/{}{suffix}", article.num_key),
                         };
                         (
                             href,
                             PreviewKind::Article {
+                                juris: segment.clone(),
                                 code: s.to_string(),
                                 num: article.num_key.clone(),
                                 date: at_date.clone(),
+                                place: place.clone(),
                             },
                         )
-                    },
-                );
+                    });
                 let num = article.num;
                 let body = match target {
                     // Hover card d'article sur le lien.
@@ -262,13 +298,13 @@ fn LegalRefRow(
             <span class="text-[var(--color-ink-muted)]">"art.\u{00A0}"{items}</span>
         }
     });
-    // Nom de l'instrument cliquable vers `/texte/{slug}` (le texte entier) dès que
-    // la citation est résolue au catalogue — même doctrine que le corps, où une
-    // mention nue mène à `/texte/{slug}`.
-    let instrument_view = match slug {
-        Some(s) => view! {
+    // The instrument name links to the whole text as soon as the citation
+    // resolves against the catalogue, the same doctrine as the body, where a
+    // bare mention leads to the summary.
+    let instrument_view = match text {
+        Some(path) => view! {
             <A
-                href=format!("/texte/{s}")
+                href=format!("{path}{suffix}")
                 attr:class="font-medium text-[var(--color-ink)] underline underline-offset-4 hover:text-[var(--color-accent)]"
             >
                 {instrument}

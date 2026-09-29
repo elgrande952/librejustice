@@ -1,5 +1,5 @@
-//! Rail gauche de `/decisions` : synthèse cliquable des résultats
-//! (histogramme des années, textes les plus cités, juridictions, solution).
+//! Rail gauche de `/decision-search` : synthèse cliquable des résultats
+//! (histogramme des années, articles les plus cités, juridictions, solution).
 //! Rendu dans tous les états, la requête vide comprise : le mode parcours sert
 //! les facettes du fonds. Desktop uniquement, le conteneur `aside` de la page
 //! étant `hidden lg:block` ;
@@ -148,23 +148,22 @@ pub fn SearchRail(
         let Some(f) = facets.get() else {
             return ().into_any();
         };
-        let picked = selected("legalInstrument");
-        let mut items = f.legal_instrument;
-        items.sort_by_key(|i| std::cmp::Reverse(i.count));
-        let rows: Vec<RailRow> = items
+        let picked = selected("legalArticle");
+        let rows: Vec<RailRow> = f
+            .legal_article_top
             .into_iter()
             .take(ROWS)
-            .map(|i| RailRow {
-                active: picked.contains(&i.value),
-                label: i.label,
-                count: i.count,
-                value: i.value,
+            .map(|a| RailRow {
+                active: picked.contains(&a.value),
+                label: a.label,
+                count: a.count,
+                value: a.value,
             })
             .collect();
         rail_list(
             stale,
-            "Textes les plus cités",
-            "legalInstrument",
+            "Articles les plus cités",
+            "legalArticle",
             rows,
             toggle,
         )
@@ -232,7 +231,7 @@ fn rail_skeleton() -> AnyView {
     view! {
         <div class=RAIL_COLUMN>
             {skeleton_block("Années", view! { <Skeleton class="h-10 w-full" /> }.into_any())}
-            {skeleton_block("Textes les plus cités", skeleton_rows(ROWS))}
+            {skeleton_block("Articles les plus cités", skeleton_rows(ROWS))}
             {skeleton_block("Juridictions", skeleton_rows(ROWS))}
             {skeleton_block("Solution", skeleton_rows(ROWS))}
         </div>

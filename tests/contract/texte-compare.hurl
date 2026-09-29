@@ -1,12 +1,12 @@
 # ============================================================================
 # CONTRACT TESTS — route group: loi / comparateur de versions
-#   GET /internal/texte/{code}/{num}/compare/{de}/{a}
+#   GET /internal/norm/{code}/{num}/compare/{de}/{a}
 # Bornes = dates ISO de fenêtre de version. Le 373-2-9 du Code civil gagne un
 # alinéa entre 2002-03-05 et 2007-03-06 ; le 16-13 a deux versions au texte
 # identique. Assertions STRUCTURELLES, pas de valeurs live.
 # ============================================================================
 
-GET {{base}}/internal/texte/code-civil/373-2-9/compare/2002-03-05/2007-03-06
+GET {{base}}/internal/norm/code-civil/373-2-9/compare/2002-03-05/2007-03-06
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
@@ -26,31 +26,31 @@ jsonpath "$.rows[*].left[?(@.op == 'insert')]" count == 0
 jsonpath "$.rows[*].right[?(@.op == 'delete')]" count == 0
 
 # Deux rédactions identiques : aucune ligne modifiée.
-GET {{base}}/internal/texte/code-civil/16-13/compare/2002-03-05/2004-08-07
+GET {{base}}/internal/norm/code-civil/16-13/compare/2002-03-05/2004-08-07
 HTTP 200
 [Asserts]
 jsonpath "$.rows[?(@.kind != 'equal')]" count == 0
 
 # borne non-date → 422
-GET {{base}}/internal/texte/code-civil/16-13/compare/pas-une-date/2004-08-07
+GET {{base}}/internal/norm/code-civil/16-13/compare/pas-une-date/2004-08-07
 HTTP 422
 
 # code inconnu → 404
-GET {{base}}/internal/texte/inconnu-xyz/16-13/compare/2002-03-05/2004-08-07
+GET {{base}}/internal/norm/inconnu-xyz/16-13/compare/2002-03-05/2004-08-07
 HTTP 404
 
 # ============================================================================
 # Chronolégi — sommaire et section à date (`?date=YYYY-MM-DD`)
 # ============================================================================
 
-GET {{base}}/internal/texte/code-civil/sommaire?date=1990-01-01
+GET {{base}}/internal/norm/code-civil/sommaire?date=1990-01-01
 HTTP 200
 [Asserts]
 header "Cache-Control" exists
 jsonpath "$.tree" count > 0
 
 # date invalide → 422
-GET {{base}}/internal/texte/code-civil/sommaire?date=pas-une-date
+GET {{base}}/internal/norm/code-civil/sommaire?date=pas-une-date
 HTTP 422
 
 # ============================================================================
@@ -59,7 +59,7 @@ HTTP 422
 # sert `tree` sans `reading`.
 # ============================================================================
 
-GET {{base}}/internal/texte/l-interpretation-par-la-jurisprudence-de-la-cjue-des-libertes-fondamentales/sommaire
+GET {{base}}/internal/norm/l-interpretation-par-la-jurisprudence-de-la-cjue-des-libertes-fondamentales/sommaire
 HTTP 200
 [Asserts]
 jsonpath "$.reading" count > 0
@@ -73,14 +73,14 @@ jsonpath "$.entries" count == 0
 # Art. L311-13 CESEDA : lois modificatrices → liens Légifrance composés.
 # ============================================================================
 
-GET {{base}}/internal/texte/convention-de-sauvegarde-des-droits-de-l-homme-et-des-libertes-fondamentales/8
+GET {{base}}/internal/norm/convention-de-sauvegarde-des-droits-de-l-homme-et-des-libertes-fondamentales/8
 HTTP 200
 [Asserts]
 jsonpath "$.commentaires" count > 0
 jsonpath "$.commentaires[0].kind" == "note"
 jsonpath "$.commentaires[0].url" isString
 
-GET {{base}}/internal/texte/code-de-l-entree-et-du-sejour-des-etrangers-et-du-droit-d-asile/l311-13
+GET {{base}}/internal/norm/code-de-l-entree-et-du-sejour-des-etrangers-et-du-droit-d-asile/l311-13
 HTTP 200
 [Asserts]
 jsonpath "$.travauxParlementaires" count > 0
@@ -90,12 +90,12 @@ jsonpath "$.travauxParlementaires[0].href" matches /^https:\/\/www\.legifrance\.
 # ============================================================================
 # Renvois hyperliés du corps. Art. 1242 du Code civil (version 2016,
 # stable) : renvoie aux art. 1733 et 1734 du même code — spans codepoints
-# demi-ouverts sur `texte`, hrefs internes /texte/{slug}/{numKey}.
+# demi-ouverts sur `texte`, hrefs internes /norm/{juris}/{slug}/{numKey}.
 # ============================================================================
 
-GET {{base}}/internal/texte/code-civil/1242
+GET {{base}}/internal/norm/code-civil/1242
 HTTP 200
 [Asserts]
 jsonpath "$.texteSpans" count > 0
-jsonpath "$.texteSpans[0].targets[0].href" matches /^\/texte\//
+jsonpath "$.texteSpans[0].targets[0].href" matches /^\/norm\//
 jsonpath "$.texteSpans[0].targets[0].label" isString

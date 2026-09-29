@@ -1,32 +1,3 @@
--- Migration 0063 — DROP des colonnes mono-source de `decisions`.
---
--- Clôt la frontière : `decisions` devient le **canonique pur**,
--- tout le per-source vit sur `decision_sources`. On DROP `source_uid`,
--- `content_checksum` et `source_fields` de `decisions` — descendus dans
--- `decision_sources` par le portage (passe 1). Le DROP emporte la
--- contrainte `UNIQUE`/`NOT NULL` de `source_uid` (0001) et l'index associé.
---
--- PRÉREQUIS — ordre staged : le **portage des
--- provenances doit être TERMINÉ** avant ce DROP. Sinon `source_fields` (payload
--- méta, présent seulement sur `decisions` pour les lignes non portées) serait
--- PERDU. Le portage se fait HORS-MIGRATION, batché par keyset (base low-IOPS) :
---
---     lj-ingest dedup-backfill          -- passe 1 = portage, puis identité + fusion
---   ou au minimum :
---     lj-ingest backfill-decision-sources
---
--- Ces commandes ne déclenchent PAS le migrator (seuls `migrate`, les ingests et
--- le démarrage `lj-server` le font) : on peut donc porter AVANT que ce DROP ne
--- s'applique, sans interblocage.
---
--- Cette migration NE FAIT PAS le portage elle-même : un INSERT...SELECT de ~3M
--- lignes jsonb en une seule transaction saturerait le WAL de la base low-IOPS
--- (raison d'être du portage batché hors-migration). À la place, elle pose un
--- GARDE-FOU : si une `decisions` n'a pas sa provenance dans `decision_sources`,
--- ou si un `source_fields` non-NULL n'a pas été porté, elle ÉCHOUE bruyamment
--- (et le déploiement avec) — AUCUNE donnée perdue. Relancer le portage, puis
--- redéployer.
-
 DO $$
 DECLARE
     missing_prov   bigint;

@@ -1,5 +1,5 @@
 //! Vue « Annonces » de la page `/annonces` — le pot des événements juridiques en
-//! cours, **même gabarit que `/decisions` et `/textes`** : rail de synthèse à
+//! cours, **même gabarit que `/decision-search` et `/norm-search`** : rail de synthèse à
 //! gauche, barre de dropdowns + chips actives au centre, colonne d'appoint à
 //! droite.
 //!
@@ -20,8 +20,9 @@ use leptos_router::hooks::use_query_map;
 use leptos_router::params::ParamsMap;
 use lj_dtos::{
     AnnonceFacetAxis, AnnonceFondGroup, AnnonceHit, AnnonceSearchRequest, AnnonceSearchResponse,
-    AnnonceSort, FacetChoice, ANNONCE_FOND_MARCHE,
+    AnnonceSort, FacetChoice,
 };
+use lj_vocab::ANNONCE_FOND_MARCHE;
 
 use crate::api::ApiClient;
 use crate::components::layout::{CONTENT_COL, GRID_3COL, SIDE_RAIL};
@@ -44,18 +45,19 @@ const LISTE_LONGUE: usize = 12;
 
 /// Clés d'URL portées par les filtres. `fond` en fait partie : c'est un axe
 /// comme les autres, pas un mode.
-const FILTER_KEYS: [&str; 6] = [
+const FILTER_KEYS: [&str; 7] = [
     "fond",
-    "departement",
+    "zone",
     "famille",
     "cpv",
+    "metier",
     "echeanceJours",
     "closes",
 ];
 
 /// Axes multi-valeurs : cocher une seconde valeur l'ajoute au lieu de remplacer
 /// la première (un candidat suit deux départements).
-const MULTI_KEYS: [&str; 4] = ["fond", "departement", "famille", "cpv"];
+const MULTI_KEYS: [&str; 5] = ["fond", "zone", "famille", "cpv", "metier"];
 
 /// État de recherche lu depuis l'URL — la même mécanique que les pages sœurs :
 /// l'URL est l'état, rien ne vit en mémoire.
@@ -63,9 +65,10 @@ const MULTI_KEYS: [&str; 4] = ["fond", "departement", "famille", "cpv"];
 pub struct AnnoncesQuery {
     pub q: String,
     pub fond: Vec<String>,
-    pub departement: Vec<String>,
+    pub zone: Vec<String>,
     pub famille: Vec<String>,
     pub cpv: Vec<String>,
+    pub metier: Vec<String>,
     pub echeance_jours: Option<u32>,
     pub closes: bool,
     pub sort: Option<String>,
@@ -90,9 +93,10 @@ impl AnnoncesQuery {
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
             fond: liste("fond"),
-            departement: liste("departement"),
+            zone: liste("zone"),
             famille: liste("famille"),
             cpv: liste("cpv"),
+            metier: liste("metier"),
             echeance_jours: map.get("echeanceJours").and_then(|j| j.parse().ok()),
             closes: map.get("closes").is_some_and(|v| v == "true" || v == "1"),
             sort: map.get("sort").filter(|s| !s.is_empty()),
@@ -119,9 +123,10 @@ impl AnnoncesQuery {
     fn valeurs(&self, key: &str) -> Vec<String> {
         match key {
             "fond" => self.fond.clone(),
-            "departement" => self.departement.clone(),
+            "zone" => self.zone.clone(),
             "famille" => self.famille.clone(),
             "cpv" => self.cpv.clone(),
+            "metier" => self.metier.clone(),
             "echeanceJours" => self
                 .echeance_jours
                 .map(|j| j.to_string())
@@ -135,9 +140,10 @@ impl AnnoncesQuery {
         AnnonceSearchRequest {
             q: (!self.q.is_empty()).then(|| self.q.clone()),
             fond: self.fond.clone(),
-            departement: self.departement.clone(),
+            zone: self.zone.clone(),
             famille: self.famille.clone(),
             cpv: self.cpv.clone(),
+            metier: self.metier.clone(),
             echeance_jours: self.echeance_jours,
             closes: self.closes,
             sort: match self.sort.as_deref() {
@@ -312,9 +318,9 @@ fn AnnoncesFlux(#[prop(into)] state: Signal<AnnoncesQuery>) -> impl IntoView {
     let href = move |ext: &str| {
         let qs = query_state::without_keys(&query_map.get(), &["page", "sort"]);
         if qs.is_empty() {
-            format!("/annonces.{ext}")
+            format!("/notice-search.{ext}")
         } else {
-            format!("/annonces.{ext}?{qs}")
+            format!("/notice-search.{ext}?{qs}")
         }
     };
     // L'agenda n'est offert que si un fond sélectionné porte des échéances : un
@@ -343,7 +349,7 @@ fn AnnoncesFlux(#[prop(into)] state: Signal<AnnoncesQuery>) -> impl IntoView {
                 </a>
             </Show>
             <p class="pt-1 text-[11px] leading-snug text-[var(--color-ink-subtle)]">
-                "Sans compte : l'URL est l'abonnement."
+                "Sans compte : l'adresse est l'abonnement."
             </p>
         </div>
     }
@@ -382,6 +388,18 @@ fn AnnoncesRail(
     }
 }
 
+/// The rail shows the level below a root, keeping a root that has none. The
+/// server interleaves each root with its leaves, hence the re-sort by weight.
+fn rail_choices(mut choices: Vec<FacetChoice>) -> Vec<FacetChoice> {
+    let parents: Vec<String> = choices.iter().filter_map(|c| c.parent.clone()).collect();
+    if parents.is_empty() {
+        return choices;
+    }
+    choices.retain(|c| !parents.contains(&c.value));
+    choices.sort_by_key(|c| std::cmp::Reverse(c.count));
+    choices
+}
+
 fn rail_block(axe: AnnonceFacetAxis, actives: &[String]) -> AnyView {
     if axe.choices.is_empty() {
         return ().into_any();
@@ -390,8 +408,7 @@ fn rail_block(axe: AnnonceFacetAxis, actives: &[String]) -> AnyView {
     let nav = Nav::new();
     let stale = stale_counts();
     let key = axe.key.clone();
-    let rows = axe
-        .choices
+    let rows = rail_choices(axe.choices)
         .into_iter()
         .take(RAIL_ROWS)
         .map(|c| {
@@ -529,25 +546,49 @@ fn FacetList(
                 hint: None,
             })
             .collect();
+        // A tree keeps the order the server posed, a root then its own leaves;
+        // sorting it by name would scatter the leaves away from their root.
+        let arbre = choices.iter().any(|c| c.parent.is_some());
         out.extend(choices);
-        if out.len() > LISTE_LONGUE {
+        if !arbre && out.len() > LISTE_LONGUE {
             out.sort_by_key(|c| cle_alpha(&c.label));
         }
         out
     });
     let cherchable = Signal::derive(move || rows.with(|r| r.len()) > LISTE_LONGUE);
+    let placeholder = match url_key.as_str() {
+        "zone" => "Filtrer (ex. Guyane…)",
+        "cpv" => "Filtrer (ex. travaux…)",
+        "metier" => "Filtrer (ex. menuiserie…)",
+        _ => "Filtrer…",
+    };
     // Les lignes montrées ; le compteur et le libellé de chacune se relisent
     // dans `rows`, qui suit les facettes de la dernière réponse.
     let visible = Memo::new(move |_| {
         let aiguille = cle_alpha(&saisie.get());
-        rows.get()
+        let toutes = rows.get();
+        let repond =
+            |c: &FacetChoice| aiguille.is_empty() || cle_alpha(&c.label).contains(&aiguille);
+        let racines: Vec<String> = toutes
+            .iter()
+            .filter(|c| c.parent.is_none() && repond(c))
+            .map(|c| c.value.clone())
+            .collect();
+        toutes
             .into_iter()
-            .filter(|c| aiguille.is_empty() || cle_alpha(&c.label).contains(&aiguille))
+            .filter(|c| {
+                repond(c)
+                    || c.parent
+                        .as_deref()
+                        .is_some_and(|p| racines.iter().any(|r| r == p))
+            })
+            .map(|c| (c.parent.is_some(), c))
             .collect::<Vec<_>>()
     });
+
     view! {
         <Show when=move || cherchable.get()>
-            <FilterSearchInput value=saisie placeholder="Filtrer (ex. Guyane…)" />
+            <FilterSearchInput value=saisie placeholder=placeholder />
         </Show>
         <div
             class="filter-scroll flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto overscroll-contain"
@@ -557,8 +598,8 @@ fn FacetList(
             </Show>
             <For
                 each=move || visible.get()
-                key=|c: &FacetChoice| c.value.clone()
-                children=move |c: FacetChoice| {
+                key=|(_, c): &(bool, FacetChoice)| c.value.clone()
+                children=move |(feuille, c): (bool, FacetChoice)| {
                     let key = url_key.clone();
                     let value = c.value.clone();
                     let pour_actif = c.value.clone();
@@ -576,7 +617,8 @@ fn FacetList(
                     let count = Signal::derive(move || row.get().map(|x| x.count).unwrap_or(0));
                     let row_class = move || {
                         crate::helpers::cn([
-                            "flex w-full items-center gap-2.5 rounded px-2 py-1 text-left text-sm transition-colors",
+                            "flex w-full items-center gap-2.5 rounded py-1 text-left text-sm transition-colors",
+                            if feuille { "pl-5 pr-2" } else { "px-2 font-medium" },
                             if is_active.get() {
                                 "bg-[var(--color-bordeaux-soft)] text-[var(--color-accent)]"
                             } else {
@@ -618,20 +660,7 @@ fn FacetList(
 /// « Ardèche » se range alors entre « Ardennes » et « Ariège », et se trouve en
 /// tapant « ardeche ».
 fn cle_alpha(label: &str) -> String {
-    label
-        .chars()
-        .flat_map(char::to_lowercase)
-        .map(|c| match c {
-            'à' | 'á' | 'â' | 'ä' => 'a',
-            'ç' => 'c',
-            'é' | 'è' | 'ê' | 'ë' => 'e',
-            'î' | 'ï' | 'í' => 'i',
-            'ô' | 'ö' | 'ó' => 'o',
-            'ù' | 'û' | 'ü' => 'u',
-            'ÿ' => 'y',
-            c => c,
-        })
-        .collect()
+    lj_fold::fold_chars(label)
 }
 
 /// Chips des filtres actifs + « Tout effacer ». Le libellé se résout dans
@@ -804,12 +833,13 @@ fn Groupe(groupe: AnnonceFondGroup, seul: bool) -> impl IntoView {
 fn Ligne(hit: AnnonceHit) -> impl IntoView {
     let interne = hit.fond == ANNONCE_FOND_MARCHE;
     let href = if interne {
-        format!("/marche/{}", hit.uid)
+        lj_vocab::notice_path(&hit.uid)
     } else {
         hit.url_action.clone()
     };
     let titre = hit.titre.clone();
     let acteur = Some(hit.acteur.trim().to_string()).filter(|a| !a.is_empty());
+    let description = description(&hit);
     let meta = ligne_meta(&hit);
     let lien = if interne {
         view! {
@@ -834,9 +864,29 @@ fn Ligne(hit: AnnonceHit) -> impl IntoView {
     view! {
         <li class="flex flex-col gap-1 border-t border-[var(--color-rule)] py-3">
             {lien} {acteur.map(|a| view! { <p class="text-sm text-[var(--color-ink-muted)]">{a}</p> })}
+            {description
+                .map(|d| {
+                    view! {
+                        <p class="line-clamp-2 text-sm leading-snug text-[var(--color-ink-muted)]">
+                            {d}
+                        </p>
+                    }
+                })}
             <p class="text-xs text-[var(--color-ink-subtle)]">{meta}</p>
         </li>
     }
+}
+
+/// Collapsed to one line: a scraped notice keeps the newlines and tabs of the
+/// HTML it came from, which a clamp would spend on whitespace.
+pub fn description(hit: &AnnonceHit) -> Option<String> {
+    let serre = hit
+        .description
+        .as_deref()?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!serre.is_empty()).then_some(serre)
 }
 
 /// Ligne de métadonnées : échéance ou parution, lieu, nature, canaux.
@@ -850,8 +900,8 @@ fn ligne_meta(hit: &AnnonceHit) -> String {
             }
         }
     }
-    if let Some(dep) = hit.departement_label.as_deref() {
-        bouts.push(dep.to_string());
+    if let Some(portee) = crate::helpers::portee_zones(&hit.zones) {
+        bouts.push(portee);
     }
     if let Some(f) = hit.famille.as_ref() {
         bouts.push(f.label.clone());
@@ -908,6 +958,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_rail_drops_a_subdivided_root_and_keeps_one_that_is_not() {
+        let choix = |value: &str, parent: Option<&str>, count: i64| FacetChoice {
+            value: value.to_string(),
+            label: value.to_string(),
+            count,
+            parent: parent.map(str::to_string),
+            hint: None,
+        };
+        let rows = rail_choices(vec![
+            choix("nature_marche:TRAVAUX", None, 5529),
+            choix("45", Some("nature_marche:TRAVAUX"), 5467),
+            choix("nature_marche:AUTRES", None, 51),
+            choix("nature_marche:SERVICES", None, 9483),
+            choix("71", Some("nature_marche:SERVICES"), 2357),
+        ]);
+        let vues: Vec<&str> = rows.iter().map(|c| c.value.as_str()).collect();
+        assert_eq!(vues, ["45", "71", "nature_marche:AUTRES"]);
+    }
+
+    #[test]
     fn la_date_iso_se_lit_en_francais() {
         assert_eq!(date_fr("2026-08-12").as_deref(), Some("12/08/2026"));
         assert_eq!(
@@ -936,7 +1006,7 @@ mod tests {
         assert_eq!(base.count_key(), ailleurs.count_key());
 
         let filtre = AnnoncesQuery {
-            departement: vec!["75".to_string()],
+            zone: vec!["75".to_string()],
             ..base.clone()
         };
         assert_ne!(base.count_key(), filtre.count_key());

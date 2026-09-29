@@ -29,6 +29,10 @@ use crate::error::ApiError;
 /// `ranked[:RERANK_K]`.
 pub const RERANK_K: usize = 50;
 /// Notes visées par document avant fusion — une par passe (`scs3`).
+///
+/// Measured on the 100-query ranking GT with no deadline: one pass scores
+/// +0.0813 NDCG@10 over base retrieval, two +0.0874, three +0.1111. The second
+/// pass buys nothing, the third is worth +0.0298 over one, CI95 [+0.0118, +0.0484].
 pub const TARGET_SCORES: usize = 3;
 /// Documents par appel listwise.
 const BATCH_SIZE: usize = 10;
@@ -51,6 +55,15 @@ const HEDGES_PER_PASS: usize = 1;
 /// Couvre toute la distribution mesurée. À 2 s, la coupe tombait dans le régime
 /// normal du modèle et une recherche sur dix sortait au classement dégradé.
 pub const RERANK_BUDGET: Duration = Duration::from_secs(3);
+
+/// Same deadline for an MCP caller, whose assistant turn already costs seconds.
+/// On 07/09/2026 a burst of 23 searches in two minutes took the model to a 4,66 s
+/// median, so 3 s served the retrieval order rather than the ranking.
+pub const RERANK_BUDGET_MCP: Duration = Duration::from_secs(5);
+
+/// Model the prompt below was written and measured against. Moving one without
+/// the other measures something else, so the pair is held here.
+pub const RERANK_MODEL: &str = "mistral-small-2603";
 
 /// Prompt système listwise-scoring (barème std).
 const LISTWISE_SCORE_SYS: &str = concat!(
@@ -98,8 +111,7 @@ fn parse_listwise_scores(content: &str, k: usize) -> Option<Vec<f64>> {
     Some((1..=k).map(|i| scores[&i]).collect())
 }
 
-/// Un appel Mistral chat-completions via le client partagé ([`lj_llm::mistral`]),
-/// température 0, `prompt_cache_key` stable.
+/// Un appel Mistral via le client partagé ([`lj_llm::mistral`]), température 0.
 ///
 /// Retry propre au rerank, sans sommeil : 401 (clé morte) et 429 / 5xx / erreur
 /// transport sont retentés immédiatement, l'admission par quota faisant l'attente
@@ -114,7 +126,7 @@ async fn mistral_chat(
     let mut last_err = String::new();
     let attempts = client.live_key_count();
     for attempt in 0..attempts {
-        match client.chat(system, user, None, Some("rr-lws-v1")).await {
+        match client.chat(system, user, None).await {
             Ok(content) => return Ok(content),
             Err(MistralError::Status(401)) => last_err = "401".into(),
             Err(MistralError::Status(code)) if !is_retryable_status(code) => {
@@ -316,7 +328,7 @@ async fn score_pass(
                         if hedges.fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1)).is_err() {
                             return (&mut primary).await;
                         }
-                        tracing::debug!(seed, n = b.len(), "relance d'un batch de rerank");
+                        tracing::debug!(seed, n = b.len(), "rerank batch retried");
                         let hedge = listwise_score_batch(&client, &query, &b);
                         tokio::pin!(hedge);
                         tokio::select! {
@@ -352,12 +364,12 @@ async fn score_pass(
             }
             Err(BatchPerdu::Echeance) => tracing::warn!(
                 seed,
-                "batch de rerank coupé sur l'échéance de latence — fusion sur les notes restantes"
+                "rerank batch cut on the latency deadline, merging on the remaining scores"
             ),
             Err(BatchPerdu::Amont(err)) => tracing::warn!(
                 error = %err,
                 seed,
-                "batch de rerank perdu sur erreur du reranker — fusion sur les notes restantes"
+                "rerank batch lost on a reranker error, merging on the remaining scores"
             ),
         }
     }
@@ -680,9 +692,10 @@ mod tests {
     fn a_document_is_in_exactly_as_many_passes_as_notes_it_lacks() {
         let it = items(&[1, 2, 3, 4]);
         let cached = cache(&[(2, &[50.0]), (3, &[50.0, 60.0]), (4, &[50.0, 60.0, 70.0])]);
-        assert_eq!(pool_ids(&it, &cached, 0), vec![1, 2, 3]);
-        assert_eq!(pool_ids(&it, &cached, 1), vec![1, 2]);
-        assert_eq!(pool_ids(&it, &cached, 2), vec![1]);
+        for pass in 0..TARGET_SCORES {
+            let expected: Vec<i64> = (1..=(TARGET_SCORES - pass) as i64).collect();
+            assert_eq!(pool_ids(&it, &cached, pass), expected);
+        }
     }
 
     #[test]
@@ -721,26 +734,25 @@ mod tests {
     #[test]
     fn a_fully_cached_shortlist_needs_no_call() {
         let it = items(&[1, 2, 3]);
-        let cached = cache(&[
-            (1, &[10.0, 10.0, 10.0]),
-            (2, &[90.0, 90.0, 90.0]),
-            (3, &[50.0, 50.0, 50.0]),
-        ]);
+        let full = |v: f64| vec![v; TARGET_SCORES];
+        let cached = cache(&[(1, &full(10.0)), (2, &full(90.0)), (3, &full(50.0))]);
         assert_eq!(cached_order(&it, &cached), Some(vec![2, 3, 1]));
         // Une seule note manquante suffit à redemander un tour.
-        let partial = cache(&[(1, &[10.0, 10.0]), (2, &[90.0; 3]), (3, &[50.0; 3])]);
+        let short = full(10.0)[1..].to_vec();
+        let partial = cache(&[(1, &short), (2, &full(90.0)), (3, &full(50.0))]);
         assert_eq!(cached_order(&it, &partial), None);
     }
 
     #[test]
-    fn merged_keeps_the_three_most_recent_notes() {
+    fn merged_keeps_the_most_recent_notes() {
         let t0 = Instant::now();
-        let d = DocScores::merged(None, &[10.0, 20.0], t0);
-        assert_eq!(d.scores, vec![10.0, 20.0]);
-        // La quatrième note chasse la première : la fenêtre glisse, un document
-        // souvent pris comme ancre ne pèse pas plus qu'un autre.
-        let d = DocScores::merged(Some(d), &[30.0, 40.0], t0);
-        assert_eq!(d.scores, vec![20.0, 30.0, 40.0]);
+        let first: Vec<f64> = (1..=TARGET_SCORES).map(|i| 10.0 * i as f64).collect();
+        let d = DocScores::merged(None, &first, t0);
+        assert_eq!(d.scores, first);
+        // The extra note evicts the oldest, so a document often taken as an
+        // anchor does not weigh more than another.
+        let d = DocScores::merged(Some(d), &[99.0], t0);
+        assert_eq!(d.scores, [&first[1..], &[99.0][..]].concat());
     }
 
     #[test]

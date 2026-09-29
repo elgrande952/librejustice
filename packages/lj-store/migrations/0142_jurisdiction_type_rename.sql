@@ -1,19 +1,3 @@
--- Migration 0142 — `jurisdiction_type` : un concept, un nom.
---
--- Renomme la colonne FR `juridiction_type` en `jurisdiction_type` sur ses
--- trois porteurs (`decisions`, `decision_chunks`, `jurisdiction`), aligné sur
--- le reste du schéma déjà anglais (`jurisdiction_name`, `jurisdiction_code`,
--- `jurisdiction_level`…).
---
--- `decisions_bm25` DOIT être recréé dans la même transaction : le schéma
--- Tantivy fige le nom de champ à la création de l'index — après le RENAME,
--- tout INSERT/UPDATE sur `decisions` échoue (« Error getting tokenizer for
--- field: juridiction_type », vérifié sur pg_search 0.23.5) et le pushdown du
--- filtre retombe en heap_filter. Pas de variante CONCURRENTLY possible ici :
--- le nom de champ suit la colonne au CREATE, donc l'index neuf ne peut pas
--- précéder le rename. Rebuild (~11 GB, 3 M décisions) sous lock
--- AccessExclusive sur `decisions` — même classe de fenêtre que 0081.
-
 SET LOCAL maintenance_work_mem = '2GB';
 SET LOCAL max_parallel_maintenance_workers = 4;
 

@@ -6,12 +6,11 @@ license.workspace = true
 
 # I/O sources : client Judilibre (reqwest), downloader ZIP opendata, lecteur ZIP.
 [dependencies]
-lj-core = { workspace = true }
+lj-parse = { workspace = true }
 anyhow = { workspace = true }
 # `blocking` requis pour `sync_opendata` (port synchrone de `requests`).
-# `cookies` requis par les moteurs de marchés à état de session (annonces/ :
-# dematis CSRF, achatpublic, atline, aws, safetender).
-reqwest = { workspace = true, features = ["blocking", "cookies"] }
+reqwest = { workspace = true, features = ["blocking"] }
+url = { workspace = true }
 # Middleware async (client Judilibre) ; downloader blocking reste hors middleware.
 reqwest-middleware = { workspace = true }
 reqwest-tracing = { workspace = true }
@@ -27,25 +26,14 @@ flate2 = { workspace = true }
 # Lecteur tar streaming pour les bulk DILA `.tar.gz` (tar_reader.rs).
 tar = { workspace = true }
 chrono = { workspace = true }
-# Modèle AnnonceBrute (lj-core annonces) : dates/échéances en jiff ; fenêtrage
-# dateparution du connecteur BOAMP.
-jiff = { workspace = true }
-# Fan-out des pages d'un moteur de marchés (buffer_unordered) : la découpe en
-# sessions parallèles est la recette d'accès des moteurs d'annonces.
-futures = { workspace = true }
 # Checksum xxh3-64 du payload source brut de chaque canal.
 thiserror = { workspace = true }
 tracing = { workspace = true }
 # Réparation mojibake DILA JADE : localiser les spans SCT/ANA/CITATION_JP (dila.rs).
 regex = { workspace = true }
-# Extraction texte PDF born-digital, crate pur Rust (pdf.rs).
-pdf-extract = { workspace = true }
 # Extraction texte DOCX born-digital (docx.rs) : parse word/document.xml.
 quick-xml = { workspace = true }
+lj-workspace-hack = { version = "0.1", path = "../lj-workspace-hack" }
 
 [dev-dependencies]
 tempfile = "3"
-# Génère un PDF born-digital valide (encodage police base-14) pour tester
-# l'extraction texte : un PDF cousu à la main n'embarque pas de quoi mapper les
-# glyphes, l'extracteur rend du vide.
-printpdf = { workspace = true }

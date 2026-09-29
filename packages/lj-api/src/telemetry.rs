@@ -1,6 +1,3 @@
-//! Adaptateur telemetrie du serveur API : construit les [`lj_telemetry::InitOpts`]
-//! depuis [`Settings`] et delegue l'installation a `lj-telemetry`.
-
 use crate::config::Settings;
 use anyhow::Result;
 use lj_telemetry::{InitOpts, OtlpCreds, TelemetryGuard};
@@ -9,12 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 pub use lj_telemetry::{meter, unattended_request_span};
 
-/// Initialise la telemetrie de l'API. Renvoie un guard de flush a garder vivant
-/// pour toute la duree du process.
 pub fn init_telemetry(settings: &Settings) -> Result<TelemetryGuard> {
-    // `otel::tracing` est la cible du span serveur d'`OtelAxumLayer`, emis au
-    // niveau TRACE : sous le plancher `info` il n'est jamais cree et la couche
-    // est inerte.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
         .add_directive(
@@ -48,14 +40,11 @@ pub fn init_telemetry(settings: &Settings) -> Result<TelemetryGuard> {
         deployment_environment: settings.deployment_environment.clone(),
         host_name: settings.host_name.clone(),
         container_name: settings.container_name.clone(),
-        // Une cible `INFO` absente de cette liste ne part pas en LogRecords : le
-        // plancher d'export est `WARN`, les signaux d'usage s'y inscrivent.
         otlp_log_filter: Targets::new()
             .with_default(LevelFilter::WARN)
             .with_target(crate::usage::LOG_TARGET, LevelFilter::INFO)
             .with_target(crate::ratelimit::LOG_TARGET, LevelFilter::INFO)
-            // La bascule du disjoncteur est WARN, le réarmement INFO : sous le
-            // plancher, Loki ne montre que les pannes et jamais les reprises.
+            .with_target(crate::mail::LOG_TARGET, LevelFilter::INFO)
             .with_target(lj_llm::backend::LOG_TARGET, LevelFilter::INFO),
         otlp,
     })

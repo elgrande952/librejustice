@@ -2,7 +2,7 @@
 //! backfills, fusion de clusters doublons, retrait par provenance (tombstone) +
 //! reconcile.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use super::support::{now, source_from_source_uid};
 use super::types::ExistingDecisionState;
@@ -61,17 +61,17 @@ impl DecisionRepository<'_> {
         Ok(row.get::<_, Option<i64>>(0))
     }
 
-    /// `source_uid` de la provenance **autoritaire** : rang max, puis rendition
-    /// FR-prioritaire (`lang = 'fra'` DESC), puis `source_uid` croissant, tombstonée
-    /// comprise. `None` si la décision n'a aucune provenance. Seule l'autorité écrit
-    /// `full_text` et les métadonnées.
+    /// `source_uid` of the authority provenance, tombstoned included: highest
+    /// rank, then French, then English, then smallest `source_uid`. `None` for a
+    /// decision without provenance. Only the authority writes the metadata and
+    /// the lead text.
     #[tracing::instrument(name = "db.authority_source_uid", skip(self), fields(db.system = "postgresql"))]
-    pub(super) async fn authority_source_uid(&self, decision_id: i64) -> Result<Option<String>> {
+    pub async fn authority_source_uid(&self, decision_id: i64) -> Result<Option<String>> {
         let row = self
             .conn
             .query_opt(
                 "SELECT source_uid FROM decision_sources WHERE decision_id = $1 \
-                 ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC LIMIT 1",
+                 ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, (lang = 'eng') IS TRUE DESC, source_uid ASC LIMIT 1",
                 &[&decision_id],
             )
             .await?;
@@ -85,11 +85,11 @@ impl DecisionRepository<'_> {
         let rows = self
             .conn
             .query(
-                "SELECT s.source_uid, d.full_text, s.source_fields \
+                "SELECT s.source_uid, (SELECT dt.full_text FROM decision_text dt WHERE dt.decision_id = d.id AND dt.lead), s.source_fields \
                  FROM decision_sources s JOIN decisions d ON d.id = s.decision_id \
                  WHERE s.source_uid LIKE 'cnda/%' \
                    AND s.deleted_at IS NULL \
-                   AND d.full_text IS NOT NULL",
+                   AND EXISTS (SELECT 1 FROM decision_text dt WHERE dt.decision_id = d.id)",
                 &[],
             )
             .await?;
@@ -139,6 +139,35 @@ impl DecisionRepository<'_> {
                 .await?
         };
         Ok((posees, retirees))
+    }
+
+    /// Poses `case-law_joins_case_court` on the CJUE provenances, `values`
+    /// carrying the JSON the CDM predicate takes in `source_fields`, what the
+    /// ingest writes today, over the corpus that predates it.
+    #[tracing::instrument(name = "db.set_source_fields_joined_cases", skip(self, source_uids, values), fields(db.system = "postgresql", n = source_uids.len()))]
+    pub async fn set_source_fields_joined_cases(
+        &self,
+        source_uids: &[String],
+        values: &[String],
+    ) -> Result<u64> {
+        if source_uids.is_empty() {
+            return Ok(0);
+        }
+        Ok(self
+            .conn
+            .execute(
+                "UPDATE decision_sources s \
+                 SET source_fields = jsonb_set(s.source_fields, \
+                                               ARRAY['case-law_joins_case_court'], \
+                                               v.joined::jsonb) \
+                 FROM UNNEST($1::text[], $2::text[]) AS v(source_uid, joined) \
+                 WHERE s.source_uid = v.source_uid \
+                   AND s.deleted_at IS NULL \
+                   AND s.source_fields->'case-law_joins_case_court' \
+                       IS DISTINCT FROM v.joined::jsonb",
+                &[&source_uids, &values],
+            )
+            .await?)
     }
 
     #[tracing::instrument(name = "db.upsert_decision_source", skip(self, source_fields), fields(db.system = "postgresql"))]
@@ -220,7 +249,7 @@ impl DecisionRepository<'_> {
                         WHERE s.decision_id = l.id
                           AND s.deleted_at IS NULL
                           AND s.source_fields ? 'ecli'
-                        ORDER BY s.source_rank DESC, (s.lang = 'fra') IS TRUE DESC, s.source_uid ASC
+                        ORDER BY s.source_rank DESC, (s.lang = 'fra') IS TRUE DESC, (s.lang = 'eng') IS TRUE DESC, s.source_uid ASC
                         LIMIT 1
                     ) ds ON true
                     WHERE d.id = l.id
@@ -257,7 +286,7 @@ impl DecisionRepository<'_> {
                 FROM decisions d
                 WHERE d.id > $1
                   AND d.canonical_ref IS NULL
-                  AND d.full_text IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM decision_text dt WHERE dt.decision_id = d.id)
                 ORDER BY d.id
                 LIMIT $2
                 ",
@@ -283,7 +312,7 @@ impl DecisionRepository<'_> {
                 SELECT d.id
                 FROM decisions d
                 WHERE d.id > $1
-                  AND d.full_text IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM decision_text dt WHERE dt.decision_id = d.id)
                 ORDER BY d.id
                 LIMIT $2
                 ",
@@ -368,28 +397,105 @@ impl DecisionRepository<'_> {
         Ok(out)
     }
 
-    /// Sous-ensemble des `source_uid` présents (provenances actives) dont la
-    /// rendition servie est le français (`lang = 'fra'`). Les syncs CEDH/CJUE s'en
-    /// servent pour ne re-fetcher que les nouveaux et les EN-only : un arrêt déjà en FR
-    /// est définitif.
-    #[tracing::instrument(name = "db.find_fr_source_uids", skip(self, source_uids), fields(db.system = "postgresql"))]
-    pub async fn find_fr_source_uids(&self, source_uids: &[String]) -> Result<HashSet<String>> {
-        if source_uids.is_empty() {
-            return Ok(HashSet::new());
-        }
+    /// The languages the base holds for each CELEX, tombstoned included, with the
+    /// source fields of one of them.
+    #[tracing::instrument(name = "db.cjue_languages", skip(self, celexes), fields(db.system = "postgresql"))]
+    pub async fn cjue_languages(
+        &self,
+        celexes: &[String],
+    ) -> Result<HashMap<String, (Vec<String>, Value)>> {
+        let uids: Vec<String> = celexes
+            .iter()
+            .flat_map(|c| {
+                lj_vocab::languages::EU_OFFICIAL_LANGUAGES
+                    .iter()
+                    .map(move |l| format!("cjue/{c}/{l}"))
+            })
+            .collect();
         let rows = self
             .conn
             .query(
-                "
-                SELECT ds.source_uid
-                FROM decision_sources ds
-                WHERE ds.source_uid = ANY($1) AND ds.deleted_at IS NULL
-                  AND ds.lang = 'fra'
-                ",
-                &[&source_uids],
+                "SELECT split_part(source_uid, '/', 2), split_part(source_uid, '/', 3), \
+                        CASE WHEN row_number() OVER (PARTITION BY split_part(source_uid, '/', 2) \
+                                                     ORDER BY (lang = 'fra') IS TRUE DESC, source_uid) = 1 \
+                             THEN source_fields END \
+                 FROM decision_sources WHERE source_uid = ANY($1)",
+                &[&uids],
             )
             .await?;
-        Ok(rows.into_iter().map(|r| r.get(0)).collect())
+        let mut out: HashMap<String, (Vec<String>, Value)> = HashMap::new();
+        for r in rows {
+            let entry = out.entry(r.get(0)).or_insert((Vec::new(), Value::Null));
+            entry.0.push(r.get(1));
+            if let Some(fields) = r.get::<_, Option<Value>>(2) {
+                entry.1 = fields;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The decision an other language of the same judgment already carries:
+    /// the CJUE by its CELEX, else by an ECLI naming a single decision, the CEDH
+    /// by its ECLI. `None` when none, or when the ECLI names several decisions
+    /// or, at the CEDH, one that already has `lang`.
+    #[tracing::instrument(name = "db.find_language_sibling", skip(self, decision), fields(db.system = "postgresql"))]
+    pub(super) async fn find_language_sibling(
+        &self,
+        decision: &lj_core::decision::Decision,
+        lang: Option<&str>,
+    ) -> Result<Option<i64>> {
+        if let Some(rest) = decision.source_uid.strip_prefix("cjue/") {
+            let celex = rest.split('/').next().unwrap_or(rest);
+            let uids: Vec<String> = lj_vocab::languages::EU_OFFICIAL_LANGUAGES
+                .iter()
+                .map(|l| format!("cjue/{celex}/{l}"))
+                .filter(|u| *u != decision.source_uid)
+                .collect();
+            let row = self
+                .conn
+                .query_one(
+                    "SELECT min(decision_id) FROM decision_sources WHERE source_uid = ANY($1)",
+                    &[&uids],
+                )
+                .await?;
+            if let Some(id) = row.get::<_, Option<i64>>(0) {
+                return Ok(Some(id));
+            }
+            // CELLAR lists some works twice under a suffixed CELEX (62021CO0121_1),
+            // same ECLI and same text.
+            let Some(ecli) = &decision.ecli else {
+                return Ok(None);
+            };
+            let rows = self
+                .conn
+                .query(
+                    "SELECT id FROM decisions \
+                     WHERE ecli = $1 AND jurisdiction_type = 'CJUE' AND deleted_at IS NULL LIMIT 2",
+                    &[ecli],
+                )
+                .await?;
+            return Ok(match rows.as_slice() {
+                [r] => Some(r.get(0)),
+                _ => None,
+            });
+        }
+        let (true, Some(ecli)) = (decision.source_uid.starts_with("cedh/"), &decision.ecli) else {
+            return Ok(None);
+        };
+        let rows = self
+            .conn
+            .query(
+                "SELECT d.id, EXISTS (SELECT 1 FROM decision_sources s \
+                   WHERE s.decision_id = d.id AND s.lang IS NOT DISTINCT FROM $2 AND s.deleted_at IS NULL) \
+                 FROM decisions d \
+                 WHERE d.ecli = $1 AND d.jurisdiction_type = 'CEDH' AND d.deleted_at IS NULL LIMIT 2",
+                &[ecli, &lang],
+            )
+            .await?;
+        Ok(match rows.as_slice() {
+            [r] if !r.get::<_, bool>(1) => Some(r.get(0)),
+            _ => None,
+        })
     }
 
     /// Résout une décision canonique EXISTANTE par identité : `canonical_ref`, seul
@@ -486,7 +592,7 @@ impl DecisionRepository<'_> {
             .query_opt(
                 "SELECT deleted_at IS NULL AS active \
                  FROM decision_sources WHERE decision_id = $1 \
-                 ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC LIMIT 1",
+                 ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, (lang = 'eng') IS TRUE DESC, source_uid ASC LIMIT 1",
                 &[&decision_id],
             )
             .await?;
@@ -517,14 +623,19 @@ impl DecisionRepository<'_> {
         // chunks+embeddings, payload brut, résumé).
         self.conn
             .execute(
-                "UPDATE decisions SET deleted_at = NOW(), full_text = NULL, summary = NULL \
-                 WHERE id = $1",
+                "UPDATE decisions SET deleted_at = NOW() WHERE id = $1",
                 &[&decision_id],
             )
             .await?;
         self.conn
             .execute(
                 "DELETE FROM decision_chunks WHERE decision_id = $1",
+                &[&decision_id],
+            )
+            .await?;
+        self.conn
+            .execute(
+                "DELETE FROM decision_text WHERE decision_id = $1",
                 &[&decision_id],
             )
             .await?;
@@ -542,7 +653,7 @@ impl DecisionRepository<'_> {
     /// provenance active la ressusciterait via [`reconcile`](Self::reconcile). Partagé
     /// par le comptage, l'échantillon et le DELETE, qui visent la même cible.
     const ORPHAN_TOMBSTONE_WHERE: &'static str = "d.deleted_at IS NOT NULL \
-         AND d.full_text IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM decision_text dt WHERE dt.decision_id = d.id) \
          AND NOT EXISTS ( \
            SELECT 1 FROM decision_sources s \
            WHERE s.decision_id = d.id AND s.deleted_at IS NULL)";
@@ -989,7 +1100,7 @@ impl DecisionRepository<'_> {
             .await?)
     }
 
-    /// Commentaires d'un article de norme (page `/texte/{code}/{num_key}`) : entrées
+    /// Commentaires d'un article de norme (page `/norm/{juris}/{code}/{num_key}`) : entrées
     /// `commentaires[]` ancrées sur cet article **et** celles du texte entier
     /// (`num_key IS NULL`, ex. débats de la loi). Agrégées en un tableau jsonb, `None`
     /// si aucune.
@@ -1016,6 +1127,45 @@ impl DecisionRepository<'_> {
         Ok(row.and_then(|r| r.get::<_, Option<Value>>(0)))
     }
 
+    /// Slug of the law bearing each of these numbers (`2014-873`), through the
+    /// slug that prefixes them. 366 of the 420 numbers cited in a HAL deposit's
+    /// title resolve there: the rest predates the corpus or is misspelt.
+    #[tracing::instrument(name = "db.law_slugs_by_numbers", skip(self, numbers), fields(db.system = "postgresql"))]
+    pub async fn law_slugs_by_numbers(&self, numbers: &[String]) -> Result<Vec<(String, String)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT n.num, lt.slug \
+                 FROM unnest($1::text[]) AS n(num) \
+                 JOIN legal_text lt ON lt.nature = 'LOI' \
+                   AND lt.slug LIKE 'loi-n-' || n.num || '-du-%'",
+                &[&numbers],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect())
+    }
+
+    /// Commentaries anchored on the whole text (`num_key IS NULL`), for a text's
+    /// page. An article reading adds its own to them.
+    #[tracing::instrument(name = "db.text_commentaires", skip(self), fields(db.system = "postgresql"))]
+    pub async fn text_commentaires(&self, text_slug: &str) -> Result<Option<Value>> {
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT jsonb_agg(c) FROM article_commentaire ac \
+                 CROSS JOIN LATERAL jsonb_array_elements(ac.source_fields->'commentaires') c \
+                 WHERE ac.text_slug = $1 AND ac.num_key IS NULL \
+                   AND ac.deleted_at IS NULL \
+                   AND jsonb_typeof(ac.source_fields->'commentaires') = 'array'",
+                &[&text_slug],
+            )
+            .await?;
+        Ok(row.and_then(|r| r.get::<_, Option<Value>>(0)))
+    }
+
     /// Résout une décision par (n° de dossier, date de lecture) — le n° seul n'est
     /// pas unique. Renvoie les `(id, public_id)` correspondants, plusieurs si des
     /// dossiers homonymes partagent la date.
@@ -1025,12 +1175,14 @@ impl DecisionRepository<'_> {
         docket: &str,
         date_iso: &str,
     ) -> Result<Vec<(i64, String)>> {
+        // pg_search refuses a predicate on bare `docket_numbers`, indexed by two BM25 expressions.
         let rows = self
             .conn
             .query(
                 "SELECT id, public_id FROM decisions \
-                 WHERE $1 = ANY(docket_numbers) AND date_lecture::text = $2 \
-                   AND deleted_at IS NULL",
+                 WHERE lj_docket_keys(docket_numbers) && lj_docket_keys(ARRAY[$1::text]) \
+                   AND EXISTS (SELECT 1 FROM unnest(docket_numbers) x(dk) WHERE x.dk = $1) \
+                   AND date_lecture::text = $2 AND deleted_at IS NULL",
                 &[&docket, &date_iso],
             )
             .await?;
@@ -1040,16 +1192,49 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Checksums des commentaires ADDE déjà en base (`source = 'adde'`), par
-    /// `source_uid` — skip d'idempotence avant upsert.
-    #[tracing::instrument(name = "db.adde_checksums", skip(self), fields(db.system = "postgresql"))]
-    pub async fn adde_checksums(&self) -> Result<HashMap<String, String>> {
+    /// Cassation decisions carrying one of these docket numbers, with the
+    /// number that matched.
+    ///
+    /// The number alone is not unique: 11 989 of the 598 148 borne by the
+    /// fonds are shared by several decisions, which all get the link.
+    #[tracing::instrument(name = "db.cassation_decisions_by_dockets", skip(self, dockets), fields(db.system = "postgresql"))]
+    pub async fn cassation_decisions_by_dockets(
+        &self,
+        dockets: &[String],
+    ) -> Result<Vec<(i64, String, String)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT d.id, d.public_id, x.dk \
+                 FROM decisions d, unnest(d.docket_numbers) x(dk) \
+                 WHERE lj_docket_keys(d.docket_numbers) && lj_docket_keys($1) \
+                   AND x.dk = ANY($1) \
+                   AND d.jurisdiction_type = 'CC' AND d.deleted_at IS NULL",
+                &[&dockets],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<_, i64>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                )
+            })
+            .collect())
+    }
+
+    /// Checksums of a `source`'s web commentary bundles, by `source_uid`:
+    /// idempotence skip before upsert.
+    #[tracing::instrument(name = "db.web_commentary_checksums", skip(self), fields(db.system = "postgresql"))]
+    pub async fn web_commentary_checksums(&self, source: &str) -> Result<HashMap<String, String>> {
         let rows = self
             .conn
             .query(
                 "SELECT source_uid, content_checksum FROM decision_sources \
-                 WHERE source = 'adde' AND deleted_at IS NULL",
-                &[],
+                 WHERE source = $1 AND deleted_at IS NULL",
+                &[&source],
             )
             .await?;
         Ok(rows

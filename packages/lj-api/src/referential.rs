@@ -35,6 +35,7 @@ pub struct FacetValueEntry {
 pub struct JurisdictionEntry {
     pub jurisdiction_type: String,
     pub source_code: String,
+    pub city: Option<String>,
     pub label: String,
 }
 
@@ -59,6 +60,7 @@ pub struct Referential {
     /// candidate keys and 96.4 % of them name nothing: asked in Postgres, that
     /// answer costs 133 ms of the search (measured 31/08/2026).
     case_names: std::collections::HashSet<String>,
+    seat_words: std::collections::HashSet<String>,
 }
 
 impl Referential {
@@ -71,6 +73,16 @@ impl Referential {
         seats.sort_unstable();
         Self {
             case_names: Default::default(),
+            seat_words: jurisdictions
+                .iter()
+                .flat_map(|j| {
+                    j.city
+                        .iter()
+                        .chain(std::iter::once(&j.label))
+                        .flat_map(|s| folded_words(s))
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
             courts: jurisdictions.iter().flat_map(court_keys).collect(),
             court_paths: jurisdictions
                 .iter()
@@ -106,6 +118,7 @@ impl Referential {
                         JurisdictionEntry {
                             jurisdiction_type: r.jurisdiction_type,
                             source_code: r.source_code,
+                            city: r.city,
                             label: r.label,
                         },
                     )
@@ -190,11 +203,50 @@ impl Referential {
         self.jurisdictions.get(code)
     }
 
+    pub fn seat_words(&self) -> &std::collections::HashSet<String> {
+        &self.seat_words
+    }
+
+    /// The court of type `kind` the folded `words` seat: the only court of its
+    /// type, or the one whose city they write, its first words at least
+    /// (« Saint-Denis » for « Saint-Denis de la Réunion »). `None` when two
+    /// courts of the type fit as well, or none.
+    pub fn court_code(&self, kind: &str, words: &[&str]) -> Option<String> {
+        let of_kind: Vec<(&String, &JurisdictionEntry)> = self
+            .jurisdictions
+            .iter()
+            .filter(|(_, e)| e.jurisdiction_type == kind)
+            .collect();
+        if let [(code, e)] = of_kind[..] {
+            if e.city.is_none() {
+                return Some(code.clone());
+            }
+        }
+        let article = |w: &&String| SEAT_ARTICLES.contains(&w.as_str());
+        let mut scored: Vec<(usize, &String)> = of_kind
+            .iter()
+            .filter_map(|(code, e)| {
+                let city = folded_words(e.city.as_deref()?);
+                let written = |w: &String| words.contains(&w.as_str());
+                let mut core = city.iter().skip_while(article).take_while(|w| !article(w));
+                let first = core.next()?;
+                (written(first) && core.all(written))
+                    .then(|| (city.iter().filter(|w| written(w)).count(), *code))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+        match scored[..] {
+            [(best, code), (second, _), ..] if best > second => Some(code.clone()),
+            [(_, code)] => Some(code.clone()),
+            _ => None,
+        }
+    }
+
     /// Court label under any writing of its unit: code (`tj_le_havre`), source
     /// location (`tj76351`, `7501`) or name (`tribunal judiciaire du havre`).
     pub fn court_by_key(&self, key: &str) -> Option<&str> {
         self.courts
-            .get(&lj_core::text::slug(key))
+            .get(&lj_fold::slug(key, '-'))
             .map(String::as_str)
     }
 
@@ -240,11 +292,11 @@ pub fn unknown_jurisdiction_code_msg(code: &str, refs: &Referential) -> String {
         .map(|(k, _)| format!("{k}_"))
         .filter(|k| refs.jurisdictions().any(|(c, _)| c.starts_with(k)));
     let place = kind.as_deref().map_or(code, |k| &code[k.len()..]);
-    let mut needles = vec![lj_core::text::slug(place)];
+    let mut needles = vec![lj_fold::slug(place, '-')];
     // Dernier segment : les codes devinés portent souvent la ville en queue
     // (« tribunal_paris », « conseil_etat »).
     if let Some(last) = place.rsplit(['_', '-']).next() {
-        needles.push(lj_core::text::slug(last));
+        needles.push(lj_fold::slug(last, '-'));
     }
     for n in needles.clone() {
         needles.extend(
@@ -259,7 +311,7 @@ pub fn unknown_jurisdiction_code_msg(code: &str, refs: &Referential) -> String {
     let mut scored: Vec<(bool, bool, usize, String, String)> = refs
         .jurisdictions()
         .filter_map(|(c, e)| {
-            let label = lj_core::text::slug(&e.label);
+            let label = lj_fold::slug(&e.label, '-');
             let distance = levenshtein(code, c);
             let place_hit = e.source_code == code || needles.iter().any(|n| segment_of(&label, n));
             let same_kind = kind.as_deref().is_some_and(|k| c.starts_with(k));
@@ -309,6 +361,34 @@ pub fn unknown_seat_msg(path: &str, nodes: &[String]) -> String {
     )
 }
 
+/// Folds the two spellings callers write into the one the fund carries: none of
+/// its 2 288 nodes holds a hyphen, and a comma means a list joined into one
+/// string. Half of the paths refused over 02 to 07/09/2026 were one of the two.
+/// The seat whose last segment the caller abbreviated, `CA.AIX` for
+/// `CA.AIX_EN_PROVENCE`: unique target or nothing, `TJ.SAINT` prefixing several.
+/// The bound is the underscore, a dot being the hierarchy a prefix already covers.
+pub fn seat_completion<'a>(path: &str, nodes: &'a [String]) -> Option<&'a str> {
+    let mut hit = None;
+    for n in nodes {
+        if n.len() > path.len() && n.starts_with(path) && n.as_bytes()[path.len()] == b'_' {
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(n.as_str());
+        }
+    }
+    hit
+}
+
+pub fn canonicalize_seats(paths: &mut Vec<String>) {
+    *paths = paths
+        .iter()
+        .flat_map(|p| p.split(','))
+        .map(|p| p.trim().replace('-', "_"))
+        .filter(|p| !p.is_empty())
+        .collect();
+}
+
 /// `needle` présent dans `hay` en segment entier (bornes `-` ou extrémités) —
 /// une sous-chaîne libre fait matcher « ta_basse_terre » sur Nanterre.
 fn segment_of(hay: &str, needle: &str) -> bool {
@@ -340,14 +420,26 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// (`tcom7501`), so both are indexed.
 fn court_keys(row: &JurisdictionRow) -> Vec<(String, String)> {
     let mut keys = vec![
-        lj_core::text::slug(&row.code),
-        lj_core::text::slug(&row.source_code),
-        lj_core::text::slug(&row.label),
+        lj_fold::slug(&row.code, '-'),
+        lj_fold::slug(&row.source_code, '-'),
+        lj_fold::slug(&row.label, '-'),
     ];
     if let Some(bare) = row.source_code.strip_prefix("tcom") {
-        keys.push(lj_core::text::slug(bare));
+        keys.push(lj_fold::slug(bare, '-'));
     }
     keys.into_iter().map(|k| (k, row.label.clone())).collect()
+}
+
+const SEAT_ARTICLES: &[&str] = &[
+    "de", "du", "des", "la", "le", "les", "l", "d", "sur", "en", "a", "et",
+];
+
+fn folded_words(s: &str) -> Vec<String> {
+    lj_fold::fold(s)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Suffixe d'un uid namespacé (`solution:REJET` → `REJET`).
@@ -359,7 +451,7 @@ pub fn uid_suffix(uid: &str) -> &str {
 pub async fn referential(state: &AppState) -> Result<Arc<Referential>> {
     state
         .referential_cache
-        .try_get_with((), load(state))
+        .try_get_with(String::new(), load(state))
         .await
         .map_err(|e: Arc<ApiError>| ApiError::Internal(format!("referential load: {e}")))
 }
@@ -412,6 +504,72 @@ mod tests {
         }
     }
 
+    fn jrv(code: &str, jurisdiction_type: &str, city: &str, label: &str) -> JurisdictionRow {
+        JurisdictionRow {
+            city: Some(city.to_string()),
+            ..jr(code, jurisdiction_type, label)
+        }
+    }
+
+    #[test]
+    fn la_cour_citee_se_lit_par_son_type_et_son_siege() {
+        let refs = Referential::new(
+            vec![],
+            vec![
+                jr("ce", "CE", "Conseil d'État"),
+                jrv(
+                    "caa_paris",
+                    "CAA",
+                    "Paris",
+                    "Cour administrative d'appel de Paris",
+                ),
+                jrv(
+                    "caa_lyon",
+                    "CAA",
+                    "Lyon",
+                    "Cour administrative d'appel de Lyon",
+                ),
+                jrv("tj_paris", "TJ", "Paris", "Tribunal judiciaire de Paris"),
+                jrv(
+                    "tj_le_havre",
+                    "TJ",
+                    "Le Havre",
+                    "Tribunal judiciaire du Havre",
+                ),
+                jrv(
+                    "tj_saint_denis_reunion",
+                    "TJ",
+                    "Saint-Denis de la Réunion",
+                    "Tribunal judiciaire de Saint-Denis de la Réunion",
+                ),
+                jrv(
+                    "tj_saint_malo",
+                    "TJ",
+                    "Saint-Malo",
+                    "Tribunal judiciaire de Saint-Malo",
+                ),
+            ],
+            Vec::new(),
+        );
+        let code = |kind: &str, q: &str| {
+            let folded = lj_core::case_names::case_name_key(q);
+            let words: Vec<&str> = folded.split(' ').collect();
+            refs.court_code(kind, &words)
+        };
+        assert_eq!(code("CE", "").as_deref(), Some("ce"));
+        assert_eq!(code("CAA", "paris").as_deref(), Some("caa_paris"));
+        assert_eq!(code("TJ", "de paris").as_deref(), Some("tj_paris"));
+        assert_eq!(code("TJ", "du havre").as_deref(), Some("tj_le_havre"));
+        assert_eq!(
+            code("TJ", "saint denis").as_deref(),
+            Some("tj_saint_denis_reunion")
+        );
+        assert_eq!(code("TJ", "saint").as_deref(), None);
+        assert_eq!(code("CAA", "23 avril 1998").as_deref(), None);
+        assert!(refs.seat_words().contains("havre"));
+        assert!(refs.seat_words().contains("reunion"));
+    }
+
     #[test]
     fn tag_resolves_label_and_falls_back_to_suffix() {
         let refs = Referential::new(
@@ -459,6 +617,46 @@ mod tests {
 
         let orphelin = unknown_seat_msg("CA.PARSI.C3", &noeuds);
         assert!(orphelin.contains("facets.seat"), "{orphelin}");
+    }
+
+    /// `CA.AIX` was passed for `CA.AIX_EN_PROVENCE` on 13/09/2026. The completion
+    /// holds only when it designates one seat, and never across the dot.
+    #[test]
+    fn le_segment_abrege_se_complete_s_il_designe_un_seul_siege() {
+        let noeuds = vec![
+            "CA".to_string(),
+            "CA.AIX_EN_PROVENCE".to_string(),
+            "CA.PARIS".to_string(),
+            "CA.PARIS.C3".to_string(),
+            "TJ.SAINT_DENIS".to_string(),
+            "TJ.SAINT_ETIENNE".to_string(),
+        ];
+        assert_eq!(
+            seat_completion("CA.AIX", &noeuds),
+            Some("CA.AIX_EN_PROVENCE")
+        );
+        // Two targets: the question stands.
+        assert_eq!(seat_completion("TJ.SAINT", &noeuds), None);
+        // The dot is the hierarchy, which a prefix already covers.
+        assert_eq!(seat_completion("CA.PARIS", &noeuds), None);
+        assert_eq!(seat_completion("CA.NULLE", &noeuds), None);
+    }
+
+    /// The two forms callers wrote instead of the fund's spelling: the city
+    /// hyphenated as French writes it, and two paths joined into one string.
+    #[test]
+    fn les_graphies_d_appelant_se_replient_sur_celle_du_fonds() {
+        let mut un = vec!["CA.AIX-EN-PROVENCE".to_string()];
+        canonicalize_seats(&mut un);
+        assert_eq!(un, vec!["CA.AIX_EN_PROVENCE"]);
+
+        let mut jointe = vec!["CC.SOCIALE, CC.COMMERCIALE".to_string()];
+        canonicalize_seats(&mut jointe);
+        assert_eq!(jointe, vec!["CC.SOCIALE", "CC.COMMERCIALE"]);
+
+        let mut vide = vec!["CC,".to_string(), String::new()];
+        canonicalize_seats(&mut vide);
+        assert_eq!(vide, vec!["CC"]);
     }
 
     #[test]

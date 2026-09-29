@@ -1,10 +1,10 @@
-//! Page de recherche de textes `/textes` (lois et règlements) — page distincte
-//! de `/decisions` : le corpus articles est servi par un moteur BM25 seul, avec
-//! ses propres filtres ; aucune recherche transverse.
+//! Text search page `/norm-search` (laws and regulations), a page separate from
+//! `/decision-search`: the article corpus is served by a BM25 only engine, with its
+//! own filters; no cross search.
 //!
-//! Rendue côté client comme `/decisions` : route non indexée, mêmes îlots
-//! interactifs (barre, dropdowns). `<Title>` dynamique reflétant la requête `q`
-//! de l'URL ; hérite de la description racine.
+//! Rendered client side like `/decision-search`: unindexed route, same interactive
+//! islands (bar, dropdowns). A dynamic `<Title>` reflecting the URL's `q` query;
+//! inherits the root description.
 
 use leptos::prelude::*;
 use leptos_meta::Title;
@@ -46,7 +46,7 @@ pub fn TextesPage() -> impl IntoView {
 }
 
 /// Squelette statique du fallback SSR/1er rendu : même grille que le corps
-/// (rail vide + colonne contenu, gabarit `/decisions`), barre inerte +
+/// (rail vide + colonne contenu, gabarit `/decision-search`), barre inerte +
 /// placeholder de liste. Aucun signal dépendant de `window`/`localStorage` →
 /// hydratation sans divergence.
 #[component]
@@ -77,7 +77,7 @@ fn TextesPageSkeleton() -> impl IntoView {
 fn TextesPageBody() -> impl IntoView {
     let query_map = use_query_map();
     // Texte de la barre partagé avec les filtres (même mécanique que
-    // `/decisions`) : une mutation de filtre applique le texte non soumis.
+    // `/decision-search`) : une mutation de filtre applique le texte non soumis.
     provide_context(DraftQuery(RwSignal::new(
         query_map.get_untracked().get("q").unwrap_or_default(),
     )));

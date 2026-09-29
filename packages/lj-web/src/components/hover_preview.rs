@@ -1,5 +1,6 @@
 //! Hover card de prévisualisation des références : au survol d'un lien
-//! d'article de code (`/texte/{code}/{num}`) ou de décision (`/decision/{id}`),
+//! d'article de code (`/norm/{juridiction}/{code}/{num}`) ou de décision
+//! (`/decision/{id}`),
 //! un panneau flottant montre le contenu pointé sans naviguer.
 //!
 //! PHRASING CONTENT uniquement (`<span>`) : les déclencheurs vivent dans des
@@ -24,46 +25,77 @@ use crate::pages::law_page::article_title;
 #[derive(Clone)]
 pub enum PreviewKind {
     Article {
+        juris: String,
         code: String,
         num: String,
         date: Option<String>,
+        place: Option<String>,
     },
     Decision {
         id: String,
     },
 }
 
-/// Cible de prévisualisation d'un `href` interne : `/texte/{code}/{num}` →
-/// article (version à `at_date` si fournie), `/texte/{code}/{num}/{date}` →
-/// article à la date portée par le lien, qui prime sur le contexte hôte ;
-/// `/decision/{id}` → décision. Les autres formes (`/texte/{code}` nu) n'ont pas
-/// de carte.
+/// What an internal `href` previews. `/norm/{jurisdiction}/{code}/{num}` is
+/// an article, at `at_date` when one is given; `…/{num}/{date}` is the article
+/// at the date the link carries, which wins over the host context;
+/// `/decision/{jurisdiction}/{id}` is a decision. Other shapes, a bare
+/// `/norm/{jurisdiction}/{code}` or a division among them, have no card.
 pub fn preview_kind(href: &str, at_date: Option<&str>) -> Option<PreviewKind> {
-    if let Some(id) = href.strip_prefix("/decision/") {
-        return (!id.is_empty() && !id.contains('/'))
+    if let Some(rest) = href.strip_prefix("/decision/") {
+        let (juris, id) = rest.split_once('/')?;
+        return (!juris.is_empty() && !id.is_empty() && !id.contains('/'))
             .then(|| PreviewKind::Decision { id: id.to_string() });
     }
-    let rest = href.strip_prefix("/texte/")?;
+    let (path, query) = href.split_once('?').unwrap_or((href, ""));
+    let place = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("place="))
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let rest = path.strip_prefix("/norm/")?;
     let mut parts = rest.split('/');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(code), Some(num), None, None) if !code.is_empty() && !num.is_empty() => {
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some(juris), Some(code), Some(num), None, None)
+            if !juris.is_empty() && !code.is_empty() && !num.is_empty() =>
+        {
             Some(PreviewKind::Article {
+                juris: juris.to_string(),
                 code: code.to_string(),
                 num: num.to_string(),
                 date: at_date.map(str::to_string),
+                place,
             })
         }
-        (Some(code), Some(num), Some(date), None)
-            if !code.is_empty() && !num.is_empty() && !date.is_empty() =>
+        (Some(juris), Some(code), Some(num), Some(date), None)
+            if !juris.is_empty() && !code.is_empty() && !num.is_empty() && is_iso_date(date) =>
         {
             Some(PreviewKind::Article {
+                juris: juris.to_string(),
                 code: code.to_string(),
                 num: num.to_string(),
                 date: Some(date.to_string()),
+                place,
             })
         }
         _ => None,
     }
+}
+
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
 /// Payload chargé (article boxé : le `LawArticleResponse` porte timeline et
@@ -118,8 +150,14 @@ pub fn HoverPreview(kind: PreviewKind, children: Children) -> impl IntoView {
             leptos::task::spawn_local(async move {
                 let client = crate::api::client::ApiClient::from_context();
                 let fetched = match &kind {
-                    PreviewKind::Article { code, num, date } => client
-                        .fetch_legi_article(code, num, date.as_deref())
+                    PreviewKind::Article {
+                        juris,
+                        code,
+                        num,
+                        date,
+                        place,
+                    } => client
+                        .fetch_legi_article(code, num, date.as_deref(), place.as_deref(), juris)
                         .await
                         .ok()
                         .map(|a| PreviewData::Article(Box::new(a))),
@@ -323,30 +361,37 @@ mod tests {
     #[test]
     fn preview_kind_parses_article_and_decision() {
         assert!(matches!(
-            preview_kind("/texte/code-civil/1728", Some("2015-06-04")),
-            Some(PreviewKind::Article { code, num, date })
-                if code == "code-civil" && num == "1728" && date.as_deref() == Some("2015-06-04")
+            preview_kind("/norm/fr/code-civil/1728", Some("2015-06-04")),
+            Some(PreviewKind::Article { juris, code, num, date, place: None })
+                if juris == "fr" && code == "code-civil" && num == "1728"
+                    && date.as_deref() == Some("2015-06-04")
         ));
         assert!(matches!(
-            preview_kind("/texte/code-civil/1728", None),
+            preview_kind("/norm/fr/code-civil/1728?place=NC", None),
+            Some(PreviewKind::Article { num, place: Some(p), .. }) if num == "1728" && p == "NC"
+        ));
+        assert!(matches!(
+            preview_kind("/norm/fr/code-civil/1728", None),
             Some(PreviewKind::Article { date: None, .. })
         ));
         assert!(matches!(
-            preview_kind("/texte/code-civil/1728/2016-10-01", Some("2015-06-04")),
+            preview_kind("/norm/fr/code-civil/1728/2016-10-01", Some("2015-06-04")),
             Some(PreviewKind::Article { date: Some(d), .. }) if d == "2016-10-01"
         ));
         assert!(matches!(
-            preview_kind("/decision/z-hk-uk5YqPg", None),
+            preview_kind("/decision/fr/z-hk-uk5YqPg", None),
             Some(PreviewKind::Decision { id }) if id == "z-hk-uk5YqPg"
         ));
     }
 
     #[test]
     fn preview_kind_rejects_other_shapes() {
-        assert!(preview_kind("/texte/code-civil", None).is_none());
-        assert!(preview_kind("/texte/code-civil/1728/2016-10-01/x", None).is_none());
+        assert!(preview_kind("/norm/fr/code-civil", None).is_none());
+        assert!(preview_kind("/norm/fr/code-civil/1728/2016-10-01/x", None).is_none());
         assert!(preview_kind("/decision/", None).is_none());
-        assert!(preview_kind("/decision/a/b", None).is_none());
-        assert!(preview_kind("/decisions", None).is_none());
+        assert!(preview_kind("/decision/z-hk-uk5YqPg", None).is_none());
+        assert!(preview_kind("/decision/fr/a/b", None).is_none());
+        assert!(preview_kind("/norm/fr/code-civil/livre-i/titre-v", None).is_none());
+        assert!(preview_kind("/decision-search", None).is_none());
     }
 }

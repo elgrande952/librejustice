@@ -3,7 +3,7 @@
 //! base, joint au hot path) : les deux vues sont instantanées, sans aucun fetch.
 //!
 //! Navigation : lien `/decision/{id}`. Au clic, on pose la graine de navigation
-//! (`ResultNavSeed` : `hit_ids` + origine recherche) consommée par
+//! (`ResultNavSeed` : `hit_paths` + origine recherche) consommée par
 //! la barre décision de la page cible (cf. `components::decision_bar`).
 
 use std::sync::Arc;
@@ -39,16 +39,16 @@ fn navigation_origin() -> (String, f64) {
     (String::new(), 0.0)
 }
 
-/// Pose la graine de navigation (origine recherche + position/total + `hit_ids`
-/// pour prev/next). `hit_ids` est passé par référence (refcompté en amont) et non
-/// via une valeur réactive : un `StoredValue` est lié à l'owner de `ResultList`,
-/// disposé au re-render (revalidation SWR) → `get_value()` paniquerait dans ce
-/// handler de clic différé, avortant la pose de graine.
-fn set_nav_seed(seed: ResultNavSignal, hit_ids: &[String]) {
+/// Sets the navigation seed (search origin + position/total + `hit_paths` for
+/// prev/next). `hit_paths` is passed by reference (refcounted upstream) and not
+/// through a reactive value: a `StoredValue` is tied to the owner of `ResultList`,
+/// disposed on re-render (SWR revalidation), so `get_value()` would panic in this
+/// deferred click handler, aborting the seed.
+fn set_nav_seed(seed: ResultNavSignal, hit_paths: &[String]) {
     let (search, scroll_y) = navigation_origin();
     seed.set(Some(ResultNavSeed {
         nav: Some(ResultNav {
-            hit_ids: hit_ids.to_vec(),
+            hit_paths: hit_paths.to_vec(),
         }),
         from_search: Some(FromSearch { search, scroll_y }),
     }));
@@ -60,7 +60,7 @@ pub fn ResultCard(
     index: usize,
     page: u32,
     page_size: u32,
-    hit_ids: Arc<Vec<String>>,
+    hit_paths: Arc<Vec<String>>,
     /// Vue voulue par la bascule d'en-tête. Une carte peut y déroger ; le
     /// prochain geste sur la bascule reprend la main sur toutes.
     #[prop(into)]
@@ -85,19 +85,19 @@ pub fn ResultCard(
 
     let position = (page as usize - 1) * page_size as usize + index + 1;
     let numeral = format!("{position:02}");
-    let decision_href = format!("/decision/{}", hit.id);
+    let decision_href = lj_dtos::decision_path(hit.jurisdiction_type, &hit.id);
 
     // Graine de navigation posée au clic : la barre décision de la page cible la
     // consomme (origine recherche + liste d'`id` pour prev/next).
     // Inerte en SSR (le clic ne s'y produit pas ; `navigation_origin` y est vide).
     let seed = use_result_nav();
     let on_navigate_title = {
-        let hit_ids = hit_ids.clone();
-        move |_| set_nav_seed(seed, &hit_ids)
+        let hit_paths = hit_paths.clone();
+        move |_| set_nav_seed(seed, &hit_paths)
     };
     let on_navigate_footer = {
-        let hit_ids = hit_ids.clone();
-        move |_| set_nav_seed(seed, &hit_ids)
+        let hit_paths = hit_paths.clone();
+        move |_| set_nav_seed(seed, &hit_paths)
     };
 
     // Titre : `title_html` sinon fallback construit (juridiction, date, n° rôle).
@@ -124,6 +124,7 @@ pub fn ResultCard(
     // Siège (chambre · formation/office) hors du titre — rendu à gauche de la
     // ligne méta, en regard des badges référentiels alignés à droite.
     let seat = hit.seat.clone().filter(|s| !s.trim().is_empty());
+    let matched_docket = hit.matched_docket.clone();
 
     // Extrait et résumé sont tous deux dans le payload : rendu direct.
     let embedded_summary = hit.summary.clone();
@@ -206,6 +207,15 @@ pub fn ResultCard(
                         .map(|s| {
                             view! {
                                 <p class="text-sm text-[var(--color-ink-subtle)]">{s}</p>
+                            }
+                        })}
+                    {matched_docket
+                        .map(|n| {
+                            view! {
+                                <p class="text-sm text-[var(--color-ink-subtle)]">
+                                    "aussi n° "
+                                    <span class="font-medium text-[var(--color-ink)]">{n}</span>
+                                </p>
                             }
                         })}
                     <div class="ml-auto flex flex-wrap justify-end gap-1.5">

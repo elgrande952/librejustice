@@ -8,7 +8,7 @@
 //!
 //! On lit `tombstones.jsonl`, on reconstruit le `source_uid` (`judilibre/{id}`,
 //! cf. `parse_judilibre`) et on hard-delete via `DecisionRepository::delete`
-//! (cascade chunks/texte/refs, même chemin que `reverses`). Idempotent : un id
+//! (cascade chunks/norm/refs, même chemin que `reverses`). Idempotent : un id
 //! déjà absent renvoie `false` — on re-traite le fichier entier à chaque ingest.
 
 use std::collections::BTreeSet;

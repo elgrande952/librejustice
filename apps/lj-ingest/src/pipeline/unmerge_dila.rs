@@ -57,7 +57,7 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -76,7 +76,7 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
     tracing::info!(
         losers = losers.len(),
         execute,
-        "unmerge-same-source-dila : perdantes dila-jade à re-créer"
+        "unmerge-same-source-dila: dila-jade losers to re-create"
     );
 
     // Index : ID DILA (sans préfixe `dila-jade/`) → Plan.
@@ -101,7 +101,7 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
     let mut tarballs = collect_tar_gz(&tarballs_dir)?;
     tarballs.sort();
     if tarballs.is_empty() {
-        tracing::warn!(dir = %tarballs_dir.display(), "unmerge-dila : aucun tarball jade — rien à re-matérialiser");
+        tracing::warn!(dir = %tarballs_dir.display(), "unmerge-dila: no jade tarball, nothing to rematerialise");
     }
 
     // Passe 1 (CPU, bloquant) : un seul passage streamé sur les tarballs jade ;
@@ -133,7 +133,7 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
                         // Non routé / électoral : laissé fusionné (non fatal).
                         Ok(None) => {}
                         Err(e) => {
-                            tracing::warn!(member = %name, error = %e, "unmerge-dila: parse échec");
+                            tracing::warn!(member = %name, error = %e, "unmerge-dila: parse failed");
                         }
                     }
                     Ok(())
@@ -178,7 +178,7 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
                 &mut counts,
             )
             .await?;
-            tracing::debug!(new_id, dila_id = %id, "unmerge-dila: décision scindée matérialisée");
+            tracing::debug!(new_id, dila_id = %id, "unmerge-dila: split decision materialised");
             Ok(())
         }
         .await;
@@ -191,7 +191,7 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
             Err(e) => {
                 let _ = conn.batch_execute("ROLLBACK").await;
                 stats.failed += 1;
-                tracing::warn!(dila_id = %id, error = %e, "unmerge-dila: split échoué, laissé fusionné");
+                tracing::warn!(dila_id = %id, error = %e, "unmerge-dila: split failed, left merged");
             }
         }
 
@@ -205,7 +205,7 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
             );
         }
         if limit.is_some_and(|n| processed >= n) {
-            tracing::info!(limit = ?limit, "unmerge-dila: borne --limit atteinte, arrêt");
+            tracing::info!(limit = ?limit, "unmerge-dila: --limit reached, stopping");
             break;
         }
     }
@@ -220,14 +220,14 @@ pub async fn unmerge_same_source_dila(execute: bool, limit: Option<usize>) -> Re
         "perdantes dila-jade (rn>1)            : {}",
         stats.losers_total
     );
-    println!("  re-matérialisables (tarball-hit)    : {}", stats.ready);
+    println!("  rematerialisable (tarball-hit)      : {}", stats.ready);
     println!(
-        "  absentes des tarballs (laissées)    : {}",
+        "  missing from the tarballs (left)    : {}",
         stats.cache_miss
     );
     if execute {
-        println!("  décisions scindées créées           : {}", stats.split);
-        println!("  échecs (laissées fusionnées)        : {}", stats.failed);
+        println!("  split decisions created             : {}", stats.split);
+        println!("  failures (left merged)              : {}", stats.failed);
     }
     Ok(())
 }

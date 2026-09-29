@@ -162,7 +162,7 @@ pub async fn garde(State(state): State<AppState>, mut requete: Request, next: Ne
             target: "lj_api::api_keys",
             motif = code,
             chemin = %chemin,
-            "porte publique refusée"
+            "public gate refused"
         );
         (
             StatusCode::UNAUTHORIZED,

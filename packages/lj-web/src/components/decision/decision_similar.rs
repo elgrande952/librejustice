@@ -124,7 +124,7 @@ fn SimilarCard(hit: SimilarDecisionHit) -> impl IntoView {
         title_parts.push(docket.clone());
     }
     let title = title_parts.join(", ");
-    let href = format!("/decision/{}", hit.id);
+    let href = lj_dtos::decision_path(hit.jurisdiction_type, &hit.id);
 
     // Saut vers une voisine : conserve l'origine recherche, abandonne la nav
     // inter-résultats.

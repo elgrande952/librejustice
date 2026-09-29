@@ -17,3 +17,4 @@ opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
+lj-workspace-hack = { version = "0.1", path = "../lj-workspace-hack" }

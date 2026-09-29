@@ -7,9 +7,8 @@
 //! possède l'appelant.
 
 use super::types::{
-    DecisionPartyReadRow, EntityContentieuxCounts, EntityCounselRow, EntityDecisionRow,
-    EntityDenominationReadRow, EntityDirectoryRow, EntityHeaderRow, EntityJurisdictionCountRow,
-    EntityYearCountRow,
+    DecisionPartyReadRow, EntityContentieuxCounts, EntityDecisionRow, EntityDenominationReadRow,
+    EntityDirectoryRow, EntityHeaderRow, EntityJurisdictionCountRow, EntityYearCountRow,
 };
 use super::DecisionRepository;
 use crate::error::Result;
@@ -698,38 +697,6 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Top conseils (avocats/cabinets) observés dans les décisions où l'entité
-    /// est **partie**, décroissant : co-occurrence `counsel_name`/`law_firm` sur
-    /// le même `decision_id`. `entity_uid` = uid registre du conseil s'il est
-    /// lui-même résolu.
-    pub async fn entity_top_counsel(&self, uid: &str, limit: i64) -> Result<Vec<EntityCounselRow>> {
-        let rows = self
-            .conn
-            .query(
-                "WITH anchor AS ( \
-                     SELECT DISTINCT decision_id FROM decision_party \
-                     WHERE entity_uid = $1 AND quality = 'party' \
-                 ) \
-                 SELECT p.value, \
-                        (array_agg(p.entity_uid) FILTER (WHERE p.entity_uid IS NOT NULL))[1] AS uid, \
-                        count(DISTINCT p.decision_id) AS n \
-                 FROM decision_party p \
-                 JOIN anchor a ON a.decision_id = p.decision_id \
-                 WHERE p.quality IN ('counsel_name', 'law_firm') \
-                 GROUP BY p.value ORDER BY n DESC, p.value LIMIT $2",
-                &[&uid, &limit],
-            )
-            .await?;
-        Ok(rows
-            .iter()
-            .map(|r| EntityCounselRow {
-                value: r.get(0),
-                entity_uid: r.get(1),
-                count: r.get(2),
-            })
-            .collect())
-    }
-
     /// Décisions citant l'entité (toutes qualités), plus récentes d'abord,
     /// paginées : ids internes destinés à l'hydratation `SearchHit` côté API
     /// (rendu unifié avec la recherche) + rôle représentatif de l'entité (pick
@@ -953,18 +920,16 @@ impl DecisionRepository<'_> {
         }
     }
 
-    /// Recherche d'entités par préfixe de dénomination pliée (`folded_prefix`
-    /// déjà plié côté appelant, du MÊME fold que `lj_fold`), filtre catégorie
-    /// optionnel — sur le registre COMPLET, en DEUX jambes : le top contentieux
-    /// d'abord (index partiel `decision_count > 0`, tri borné à ce sous-ensemble),
-    /// puis le complément alphabétique du registre servi par l'ordre
-    /// d'`entity_prefix_idx` sans tri (`USING ~<~` : l'ordre C de l'opclass
-    /// text_pattern_ops est le seul que cet index sait servir). Le préfixe est
-    /// échappé côté appelant (wildcards LIKE neutralisés) et déjà suffixé `%`.
+    /// Prefix search over the whole registry, restricted to `categories` when
+    /// given (`None` = every category). Caller owns the fold: `folded_like` is
+    /// folded like `lj_fold`, LIKE wildcards escaped, `%` appended.
+    ///
+    /// `USING ~<~` is the C ordering of the text_pattern_ops opclass, the only one
+    /// `entity_prefix_idx` can serve without a sort.
     pub async fn entity_search(
         &self,
         folded_like: &str,
-        category: Option<&str>,
+        categories: Option<&[&str]>,
         limit: i64,
     ) -> Result<Vec<EntityDirectoryRow>> {
         let rows = self
@@ -978,7 +943,7 @@ impl DecisionRepository<'_> {
                              lj_fold(denomination) AS df, 0 AS leg \
                       FROM entity \
                       WHERE lj_fold(denomination) LIKE $1 ESCAPE '\\' \
-                        AND ($2::text IS NULL OR category = $2) \
+                        AND ($2::text[] IS NULL OR category = ANY($2)) \
                         AND decision_count > 0 \
                       ORDER BY decision_count DESC, lj_fold(denomination) \
                       LIMIT $3) \
@@ -988,49 +953,37 @@ impl DecisionRepository<'_> {
                              lj_fold(denomination), 1 \
                       FROM entity \
                       WHERE lj_fold(denomination) LIKE $1 ESCAPE '\\' \
-                        AND ($2::text IS NULL OR category = $2) \
+                        AND ($2::text[] IS NULL OR category = ANY($2)) \
                         AND decision_count = 0 \
                       ORDER BY lj_fold(denomination) USING ~<~ \
                       LIMIT $3) \
                  ) t \
                  ORDER BY leg, decision_count DESC, df \
                  LIMIT $3",
-                &[&folded_like, &category, &limit],
+                &[&folded_like, &categories, &limit],
             )
             .await?;
         Ok(rows.iter().map(directory_row).collect())
     }
 
-    /// Listing paginé d'une catégorie de l'annuaire — registre COMPLET, tri
-    /// contentieux décroissant puis dénomination ; filtre barreau optionnel
-    /// (avocats). Renvoie `(total, contentieux, page)` — `total` = lignes
-    /// paginables du filtre courant (le registre entier de la catégorie, ou le
-    /// sous-ensemble barreau), `contentieux` = celles avec ≥ 1 décision. Sans
-    /// barreau les deux viennent d'`annuaire_registre` (O(1), rafraîchie au
-    /// relink) ; avec barreau ils se comptent en live (sous-ensemble petit, index
-    /// partiel).
+    /// Paginated listing of one directory category, contentious volume first, then
+    /// denomination. `total` (rows in the category) and `contentieux` (those with
+    /// at least one decision) are read from `annuaire_registre`, refreshed at
+    /// relink, so neither is counted live.
     pub async fn entity_directory(
         &self,
         category: &str,
-        barreau: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<(i64, i64, Vec<EntityDirectoryRow>)> {
         let counts = self
             .conn
             .query_one(
-                "SELECT CASE WHEN $2::text IS NULL THEN \
-                            coalesce((SELECT total FROM annuaire_registre \
-                                      WHERE category = $1), 0) \
-                        ELSE (SELECT count(*) FROM entity \
-                              WHERE category = $1 AND barreau = $2) END, \
-                        CASE WHEN $2::text IS NULL THEN \
-                            coalesce((SELECT contentieux FROM annuaire_registre \
-                                      WHERE category = $1), 0) \
-                        ELSE (SELECT count(*) FROM entity \
-                              WHERE category = $1 AND barreau = $2 \
-                                AND decision_count > 0) END",
-                &[&category, &barreau],
+                "SELECT coalesce((SELECT total FROM annuaire_registre \
+                                  WHERE category = $1), 0), \
+                        coalesce((SELECT contentieux FROM annuaire_registre \
+                                  WHERE category = $1), 0)",
+                &[&category],
             )
             .await?;
         let (total, contentieux): (i64, i64) = (counts.get(0), counts.get(1));
@@ -1040,10 +993,10 @@ impl DecisionRepository<'_> {
                 "SELECT uid, split_part(uid, ':', 1), denomination, nature, forme, \
                         active, barreau, decision_count \
                  FROM entity \
-                 WHERE category = $1 AND ($2::text IS NULL OR barreau = $2) \
+                 WHERE category = $1 \
                  ORDER BY decision_count DESC, lj_fold(denomination) \
-                 LIMIT $3 OFFSET $4",
-                &[&category, &barreau, &limit, &offset],
+                 LIMIT $2 OFFSET $3",
+                &[&category, &limit, &offset],
             )
             .await?;
         Ok((total, contentieux, rows.iter().map(directory_row).collect()))
@@ -1067,7 +1020,7 @@ impl DecisionRepository<'_> {
     }
 
     /// Itère `(namespace, local_id, lastmod)` pour les entités à publier au
-    /// sitemap (pages `/entite/{ns}/{id}`). Périmètre = entités avec ≥ 1 décision
+    /// sitemap (pages `/entity/{juris}/{ns}/{id}`). Périmètre = entités avec ≥ 1 décision
     /// liée (`entity.decision_count > 0`) **sauf les avocats**
     /// (`category = 'avocats'`) : ce sont des personnes physiques, exclues de la
     /// promotion SEO pour raison RGPD. `lastmod` = date de la décision liée la plus

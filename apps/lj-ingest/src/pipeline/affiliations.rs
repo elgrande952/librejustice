@@ -43,7 +43,7 @@ pub async fn derive_affiliations(apply: bool) -> Result<()> {
         derived.len()
     );
     if !apply {
-        println!("(dry-run — relancer avec --apply pour écrire)");
+        println!("(dry-run, re-run with --apply to write)");
         return Ok(());
     }
 
@@ -63,8 +63,8 @@ pub async fn derive_affiliations(apply: bool) -> Result<()> {
         dropped,
         avocats,
         structures,
-        "affiliations dérivées des décisions"
+        "affiliations derived from the decisions"
     );
-    println!("appliqué : {written} arêtes écrites, {dropped} remplacées");
+    println!("applied: {written} edges written, {dropped} replaced");
     Ok(())
 }

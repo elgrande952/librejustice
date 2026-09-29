@@ -312,7 +312,7 @@ pub fn parse_circulaire_xml(raw: &[u8]) -> Result<Circulaire> {
     // Lossy systématique : des fichiers 2009 portent un RESUME tronqué en pleine
     // séquence multi-octets.
     let cleaned = String::from_utf8_lossy(raw);
-    let root = lj_core::parsing::build_tree(cleaned.as_bytes())
+    let root = lj_parse::build_tree(cleaned.as_bytes())
         .ok_or_else(|| SourceError::Invalid("circulaire: XML illisible".into()))?;
 
     let text = |tag: &str| -> Option<String> {

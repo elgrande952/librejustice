@@ -104,13 +104,7 @@ async fn signup(
             }
         }
     };
-    locale::retenir(
-        &state,
-        &sub,
-        locale::du_navigateur(&entetes).as_deref(),
-        None,
-    )
-    .await?;
+    locale::retenir(&state, &sub, &locale::du_navigateur(&entetes), None).await?;
     let lien = lien_mail(&state, &sub, "confirmation", "/confirm", None).await?;
     let voie = mail::Voie::pour(usage::is_first_party(&entetes, &state.settings));
     mail::send_confirmation(&state, &email, &lien, voie).await?;
@@ -178,13 +172,7 @@ async fn login(
         )
         .await?;
     }
-    locale::retenir(
-        &state,
-        &sub,
-        locale::du_navigateur(&entetes).as_deref(),
-        None,
-    )
-    .await?;
+    locale::retenir(&state, &sub, &locale::du_navigateur(&entetes), None).await?;
     let token = session::open(&state, &sub).await?;
     let mut resp = Redirect::to(&destination_interne(next)).into_response();
     let (nom, valeur) = session::header(session::set_cookie(&token))?;
@@ -316,13 +304,7 @@ async fn link_request(
             .get("sub"),
     };
 
-    locale::retenir(
-        &state,
-        &sub,
-        locale::du_navigateur(&entetes).as_deref(),
-        None,
-    )
-    .await?;
+    locale::retenir(&state, &sub, &locale::du_navigateur(&entetes), None).await?;
     let lien = lien_mail(&state, &sub, "connexion", "/login-link", None).await?;
     let voie = mail::Voie::pour(usage::is_first_party(&entetes, &state.settings));
     mail::send_connexion(&state, &email, &lien, voie).await?;
@@ -434,7 +416,7 @@ async fn reset(
 
     let token = session::open(&state, &sub).await?;
     session::close_others(&state, &sub, &token).await?;
-    let mut resp = Redirect::to("/decisions").into_response();
+    let mut resp = Redirect::to("/decision-search").into_response();
     let (nom, valeur) = session::header(session::set_cookie(&token))?;
     resp.headers_mut().append(nom, valeur);
     Ok(resp)

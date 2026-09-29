@@ -32,9 +32,12 @@ pub fn official_url(src: &SourceRef<'_>) -> Option<String> {
         "dila-cnil" => Some(format!("https://www.legifrance.gouv.fr/cnil/id/{uid}")),
         "dila-constit" => src.published_url.map(str::to_string),
         "judilibre" => Some(format!("https://www.courdecassation.fr/decision/{uid}")),
-        "cjue" => Some(format!(
-            "https://eur-lex.europa.eu/legal-content/FR/TXT/?uri=CELEX:{uid}"
-        )),
+        "cjue" => uid.split_once('/').map(|(celex, lang)| {
+            format!(
+                "https://eur-lex.europa.eu/legal-content/{}/TXT/?uri=CELEX:{celex}",
+                lang.to_ascii_uppercase()
+            )
+        }),
         "cedh" => Some(format!("https://hudoc.echr.coe.int/fre?i={uid}")),
         "cnda" => src
             .published_url
@@ -96,8 +99,13 @@ mod tests {
             ),
             (
                 "cjue",
-                "cjue/62025TJ0762",
+                "cjue/62025TJ0762/fr",
                 "https://eur-lex.europa.eu/legal-content/FR/TXT/?uri=CELEX:62025TJ0762",
+            ),
+            (
+                "cjue",
+                "cjue/62025TJ0762/de",
+                "https://eur-lex.europa.eu/legal-content/DE/TXT/?uri=CELEX:62025TJ0762",
             ),
             (
                 "cedh",

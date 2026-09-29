@@ -33,7 +33,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
 use lj_core::decision::Decision;
-use lj_core::parsing::{
+use lj_parse::{
     analyse_body, build_ariane_source_fields, parse_ajce_html, parse_dce_html, AjceEntry,
 };
 use lj_sources::ariane::{self, ArianeFond, ArianeHit};
@@ -157,7 +157,7 @@ pub async fn sync_ariane(years: Vec<u16>, census_only: bool, limit: Option<usize
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
 
@@ -284,7 +284,7 @@ async fn sync_comments(
                         dossier,
                         date,
                         year,
-                        "bundle ariane orphelin : décision parente absente du stock, pas de DCE"
+                        "orphan ariane bundle: parent decision missing from the stock, no DCE"
                     );
                     orphans += 1;
                 }
@@ -326,7 +326,7 @@ async fn sync_comments(
             orphans,
             vides = stats.vides,
             erreurs = stats.erreurs,
-            "sync_ariane année"
+            "sync_ariane year"
         );
     }
 
@@ -350,7 +350,7 @@ async fn sync_comments(
         sans_cle = totals.sans_cle,
         vides = totals.vides,
         erreurs = totals.erreurs,
-        "sync_ariane terminé"
+        "sync_ariane done"
     );
     Ok(())
 }
@@ -372,7 +372,7 @@ fn gather_year(
 
     for hit in enumerate(client, ArianeFond::Crp, year)? {
         let Some(key) = bundle_key(&hit) else {
-            tracing::warn!(id = %hit.id, "hit CRP sans clé (dossier, date)");
+            tracing::warn!(id = %hit.id, "CRP hit without a key (dossier, date)");
             stats.sans_cle += 1;
             continue;
         };
@@ -425,7 +425,7 @@ enum HitFetch {
 
 fn fetch_hit(client: &reqwest::blocking::Client, dir: &Path, hit: &ArianeHit) -> HitFetch {
     let Ok(num) = hit.num() else {
-        tracing::warn!(id = %hit.id, "hit AJCE sans numéro");
+        tracing::warn!(id = %hit.id, "AJCE hit without a number");
         return HitFetch::Vide;
     };
     let html = match ariane::ajce_html_cached(client, dir, num) {
@@ -436,7 +436,7 @@ fn fetch_hit(client: &reqwest::blocking::Client, dir: &Path, hit: &ArianeHit) ->
             html
         }
         Err(e) => {
-            tracing::warn!(num, error = %e, "téléchargement AJCE échoué");
+            tracing::warn!(num, error = %e, "AJCE download failed");
             return HitFetch::Erreur;
         }
     };
@@ -446,7 +446,7 @@ fn fetch_hit(client: &reqwest::blocking::Client, dir: &Path, hit: &ArianeHit) ->
     // classement vaut d'être servi, l'entrée part avec un corps vide. Seule une
     // fiche sans rien est un vrai vide.
     if body.is_empty() && parsed.rubriques.is_empty() {
-        tracing::warn!(num, "analyse AJCE sans contenu, skippée");
+        tracing::warn!(num, "AJCE analysis without content, skipped");
         return HitFetch::Vide;
     }
     // Clé du hit, repli sur le n° de dossier de l'en-tête HTML (quelques
@@ -454,7 +454,7 @@ fn fetch_hit(client: &reqwest::blocking::Client, dir: &Path, hit: &ArianeHit) ->
     let Some(key) =
         bundle_key(hit).or_else(|| Some((parsed.dossier.clone()?, hit.date_iso()?.to_string())))
     else {
-        tracing::warn!(id = %hit.id, "hit AJCE sans clé (dossier, date)");
+        tracing::warn!(id = %hit.id, "AJCE hit without a key (dossier, date)");
         return HitFetch::SansCle;
     };
     let entry = AjceEntry {
@@ -615,7 +615,7 @@ fn enumerate(
             year,
             total = total_count,
             vus = out.len(),
-            "énumération incomplète ou dupliquée"
+            "enumeration incomplete or duplicated"
         );
     }
     Ok(out)
@@ -651,7 +651,7 @@ async fn deficits_de_decisions(
             fonds = notre,
             manque = i64::from(*aw) - notre,
             tranche,
-            "déficit"
+            "shortfall"
         );
     }
     Ok(deficits
@@ -697,7 +697,7 @@ async fn fill_decisions(
             .await
             .map_err(|e| anyhow!("tâche énumération DCE {year}: {e}"))??
         };
-        tracing::info!(year, absents = absents.len(), "énumération DCE");
+        tracing::info!(year, absents = absents.len(), "DCE enumeration");
         if absents.is_empty() {
             census.mark_decisions(manifest, year);
             write_manifest(dir, manifest)?;
@@ -718,7 +718,7 @@ async fn fill_decisions(
             .await
             .map_err(|e| anyhow!("tâche téléchargement DCE {year}: {e}"))??
         };
-        tracing::info!(year, candidats = candidates.len(), "documents DCE lus");
+        tracing::info!(year, candidats = candidates.len(), "DCE documents read");
         let tous_lus = candidates.len() == attendus;
         drain_batch(
             conn,
@@ -734,7 +734,7 @@ async fn fill_decisions(
             write_manifest(dir, manifest)?;
         }
     }
-    tracing::info!(created = counts.created, "décisions ArianeWeb créées");
+    tracing::info!(created = counts.created, "ArianeWeb decisions created");
     Ok(())
 }
 
@@ -770,13 +770,13 @@ fn dce_from_hit(
             html
         }
         Err(e) => {
-            tracing::warn!(num, error = %e, "téléchargement DCE échoué, skip");
+            tracing::warn!(num, error = %e, "DCE download failed, skip");
             return None;
         }
     };
     let parsed = parse_dce_html(&html);
     if parsed.body.len() < 200 {
-        tracing::warn!(num, "document DCE quasi vide, skip");
+        tracing::warn!(num, "DCE document nearly empty, skip");
         return None;
     }
     let dossiers = if parsed.dossiers.is_empty() {
@@ -812,7 +812,7 @@ fn dce_candidate(
         docket_numbers: dossiers.clone(),
         ..Default::default()
     };
-    let extracted = lj_ingest::extract::with_facet_uids(extracted, Some("CE"));
+    let extracted = lj_extract_rows::with_facet_uids(extracted, Some("CE"));
     let decision = Decision {
         source_uid: format!("ariane-dce/{num}"),
         member_name: num.to_string(),
@@ -853,6 +853,7 @@ fn dce_candidate(
         payload_format: "html".to_string(),
         write_mode: super::WriteMode::Full,
         dila_fond: None,
+        passages: true,
         // Forme payload-Judilibre minimale : le chemin linéaire
         // (`Decision::from_source_fields_json`) reconstruit la décision
         // canonique depuis ces clés.
@@ -888,7 +889,7 @@ async fn recover_dce_orphans(
 ) -> Result<(usize, usize, usize)> {
     let repo = DecisionRepository::new(conn);
     let total = recoverable.len();
-    tracing::info!(orphelins_avec_dce = total, "récupération DCE : démarrage");
+    tracing::info!(orphelins_avec_dce = total, "DCE fetch: start");
 
     // 1. Téléchargement + parse DCE → candidats à créer + clés de rattachement
     //    (bloquant, throttlé).
@@ -912,13 +913,13 @@ async fn recover_dce_orphans(
                         html
                     }
                     Err(e) => {
-                        tracing::warn!(num, error = %e, "téléchargement DCE échoué, skip");
+                        tracing::warn!(num, error = %e, "DCE download failed, skip");
                         continue;
                     }
                 };
                 let parsed = parse_dce_html(&html);
                 if parsed.body.len() < 200 {
-                    tracing::warn!(num, "document DCE quasi vide, skip");
+                    tracing::warn!(num, "DCE document nearly empty, skip");
                     continue;
                 }
                 let dossiers = if parsed.dossiers.is_empty() {
@@ -956,7 +957,7 @@ async fn recover_dce_orphans(
                         num,
                         dossier = %k.0,
                         date = %k.1,
-                        "orphelin déjà en base (lien raté), rattachement sans création"
+                        "orphan already in the database (link missed), attaching without creating"
                     );
                     liens_rates += 1;
                     attaches.push((key, bundle, lookup_keys));
@@ -981,7 +982,7 @@ async fn recover_dce_orphans(
     tracing::info!(
         candidats = candidates.len(),
         liens_rates,
-        "récupération DCE : parse ok"
+        "DCE fetch: parse ok"
     );
 
     // 2. Création (chunk + embed) via le drain standard.
@@ -1036,7 +1037,7 @@ async fn recover_dce_orphans(
         created = counts.created,
         attached,
         still_orphans,
-        "récupération DCE terminée"
+        "DCE fetch done"
     );
     Ok((counts.created, attached, still_orphans))
 }

@@ -25,7 +25,7 @@ HTTP 401
 [Asserts]
 jsonpath "$.detail" == "api_key_invalid"
 
-# ── The spec is readable without a key, and names the seven routes ───────────
+# ── The spec is readable without a key, and names the six routes ─────────────
 GET {{base}}/openapi.json
 HTTP 200
 [Asserts]
@@ -33,9 +33,8 @@ jsonpath "$.openapi" startsWith "3.1"
 jsonpath "$.paths['/api/search'].get.operationId" == "searchDecisions"
 jsonpath "$.paths['/api/search-textes'].get.operationId" == "searchLegalTexts"
 jsonpath "$.paths['/api/decision/{id}'].get.operationId" == "getDecision"
-jsonpath "$.paths['/api/texte/{code}'].get.operationId" == "getLegalTextRoot"
-jsonpath "$.paths['/api/texte/{code}/section/{cid}'].get.operationId" == "getLegalTextSection"
-jsonpath "$.paths['/api/texte/{code}/{article}'].get.operationId" == "getLegalArticle"
+jsonpath "$.paths['/api/norm/{juridiction}/{code}'].get.operationId" == "getLegalTextRoot"
+jsonpath "$.paths['/api/norm/{juridiction}/{code}/{article}'].get.operationId" == "getLegalArticle"
 jsonpath "$.paths['/api/article/{uid}'].get.operationId" == "getLegalArticleById"
 
 # ── Legacy mount closed: outside the parity, `/api` serves nothing ───────────

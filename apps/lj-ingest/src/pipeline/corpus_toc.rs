@@ -189,7 +189,7 @@ fn emit(
 /// Slug d'un segment de cid : slug du libellé, tronqué à [`SEGMENT_MAX`] sur
 /// une frontière de mot quand c'est possible.
 fn segment_slug(label: &str) -> String {
-    let slug = lj_extract::legi::slugify_code(label);
+    let slug = lj_fold::slug(label, '-');
     if slug.len() <= SEGMENT_MAX {
         return slug;
     }

@@ -13,8 +13,9 @@
 
 use lj_dtos::{
     annonce_acteur_role, annonce_fond_label, AnnonceFacetAxis, AnnonceHit, AnnonceSearchRequest,
-    FacetChoice, FacetTag, ANNONCE_FOND_JOAFE,
+    FacetChoice, FacetTag,
 };
+use lj_vocab::ANNONCE_FOND_JOAFE;
 use serde::Deserialize;
 
 use crate::error::{ApiError, Result};
@@ -28,7 +29,7 @@ const FACETS: &str =
 
 /// Champs projetés dans le hit commun — la même liste pour la recherche du pot
 /// et pour la chronologie d'une entité.
-const SELECT: &str = "id,dateparution,typeavis,titre,departement_code,url_pdf";
+const SELECT: &str = "id,dateparution,typeavis,titre,objet,departement_code,url_pdf";
 
 #[derive(Debug, Deserialize)]
 struct Record {
@@ -36,6 +37,7 @@ struct Record {
     dateparution: Option<String>,
     typeavis: Option<String>,
     titre: Option<String>,
+    objet: Option<String>,
     departement_code: Option<String>,
     url_pdf: Option<String>,
 }
@@ -73,7 +75,7 @@ fn where_clause(req: &AnnonceSearchRequest) -> Option<String> {
             .collect();
         (!liste.is_empty()).then(|| format!("({})", liste.join(" OR ")))
     };
-    clauses.extend(ou("departement_code", &req.departement));
+    clauses.extend(ou("departement_code", &req.zone));
     clauses.extend(ou("typeavis", &req.famille));
     (!clauses.is_empty()).then(|| clauses.join(" AND "))
 }
@@ -114,7 +116,7 @@ pub async fn page(
 
 /// La chronologie JOAFE d'un RNA. L'identifiant est déjà filtré en
 /// alphanumérique par l'appelant (frontière de validation du volet registre).
-pub async fn pour_entite(
+pub(crate) async fn pour_entite(
     state: &AppState,
     rna: &str,
     limit: usize,
@@ -145,13 +147,13 @@ pub async fn axes(state: &AppState, req: &AnnonceSearchRequest) -> Result<Vec<An
         famille: Vec::new(),
         ..req.clone()
     };
-    let sans_departement = AnnonceSearchRequest {
-        departement: Vec::new(),
+    let sans_zone = AnnonceSearchRequest {
+        zone: Vec::new(),
         ..req.clone()
     };
-    let (types, departements) = tokio::try_join!(
+    let (types, zones) = tokio::try_join!(
         facette(state, &sans_famille, "typeavis"),
-        facette(state, &sans_departement, "departement_code"),
+        facette(state, &sans_zone, "departement_code"),
     )?;
     Ok(vec![
         AnnonceFacetAxis {
@@ -160,9 +162,9 @@ pub async fn axes(state: &AppState, req: &AnnonceSearchRequest) -> Result<Vec<An
             choices: types,
         },
         AnnonceFacetAxis {
-            key: "departement".to_string(),
+            key: "zone".to_string(),
             label: "Département".to_string(),
-            choices: departements,
+            choices: zones,
         },
     ])
 }
@@ -208,11 +210,23 @@ async fn facette(
 /// que les autres fonds.
 fn libelle(champ: &str, valeur: &str) -> String {
     match champ {
-        "departement_code" => lj_core::referential_labels::departement_label(valeur)
+        "departement_code" => lj_norm::referential_labels::departement_label(valeur)
             .map(|n| format!("{valeur} — {n}"))
             .unwrap_or_else(|| valeur.to_string()),
         _ => valeur.to_string(),
     }
+}
+
+/// Official page, rebuilt from the parution id (`202600010183` → `20260001`,
+/// `0183`). Upstream `url_pdf` was null on the 100 latest parutions (11/09/2026).
+fn detail_url(id: &str) -> Option<String> {
+    (id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit())).then(|| {
+        format!(
+            "https://www.journal-officiel.gouv.fr/associations/detail-annonce/associations_b/{}/{}",
+            &id[..8],
+            &id[8..]
+        )
+    })
 }
 
 fn hit_from(r: &Record) -> AnnonceHit {
@@ -228,24 +242,36 @@ fn hit_from(r: &Record) -> AnnonceHit {
             .unwrap_or_default()
             .to_string(),
         titre,
+        description: r.objet.clone(),
         acteur: r.titre.clone().unwrap_or_default(),
         acteur_role: annonce_acteur_role(ANNONCE_FOND_JOAFE).to_string(),
-        departement: r.departement_code.clone(),
-        departement_label: r
+        zones: r
             .departement_code
-            .as_deref()
-            .and_then(lj_core::referential_labels::departement_label)
-            .map(str::to_string),
+            .iter()
+            .map(|c| FacetTag {
+                label: lj_norm::referential_labels::departement_label(c)
+                    .unwrap_or(c)
+                    .to_string(),
+                key: c.clone(),
+            })
+            .collect(),
         famille: r.typeavis.as_ref().map(|t| FacetTag {
             key: t.clone(),
             label: t.clone(),
         }),
         cpv: None,
+        cpv_deduit: false,
+        metiers: Vec::new(),
+        metiers_deduits: false,
         date_publication: r.dateparution.clone().unwrap_or_default(),
         echeance: None,
         closed: false,
         attribue: false,
-        url_action: r.url_pdf.clone().unwrap_or_default(),
+        url_action: r
+            .url_pdf
+            .clone()
+            .or_else(|| r.id.as_deref().and_then(detail_url))
+            .unwrap_or_default(),
         reference: r.id.clone(),
         procedure: r.typeavis.clone(),
         first_seen_at: None,
@@ -263,7 +289,7 @@ mod tests {
     fn la_clause_odsql_combine_les_axes() {
         let req = AnnonceSearchRequest {
             q: Some("pêche".into()),
-            departement: vec!["31".into()],
+            zone: vec!["31".into()],
             famille: vec!["Création".into(), "Dissolution".into()],
             ..Default::default()
         };
@@ -296,6 +322,7 @@ mod tests {
             dateparution: Some("2026-03-14".into()),
             typeavis: Some("Création".into()),
             titre: Some("LES AMIS DU CANAL".into()),
+            objet: Some("Promouvoir la navigation fluviale".into()),
             departement_code: Some("31".into()),
             url_pdf: Some(
                 "https://www.journal-officiel.gouv.fr/document/associations_b_1234".into(),
@@ -305,7 +332,13 @@ mod tests {
         assert_eq!(hit.uid, "joafe:associations_1234");
         assert_eq!(hit.titre, "Création — LES AMIS DU CANAL");
         assert_eq!(hit.acteur_role, "Association");
-        assert_eq!(hit.departement_label.as_deref(), Some("Haute-Garonne"));
+        assert_eq!(
+            hit.zones
+                .iter()
+                .map(|z| z.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Haute-Garonne"]
+        );
         assert_eq!(
             hit.famille.as_ref().map(|f| f.label.as_str()),
             Some("Création")

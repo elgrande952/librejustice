@@ -1,4 +1,4 @@
-//! Single pass over the whole-corpus counters. These three cannot be derived at
+//! Single pass over the whole-corpus counters. These cannot be derived at
 //! write time: a count of articles in force depends on `CURRENT_DATE`, which
 //! moves without a row moving. Invariant this file holds: nothing counts the
 //! corpus at read time, the home page reads `corpus_counts`.
@@ -22,10 +22,9 @@ async fn open() -> Result<(deadpool_postgres::Pool, deadpool_postgres::Object)> 
     Ok((pool, conn))
 }
 
-/// The `precompute` command: replays the three corpus snapshots. Idempotent.
+/// The `precompute` command: replays the two corpus snapshots. Idempotent.
 pub async fn precompute_all() -> Result<()> {
     resync_jurisdiction_counts().await?;
-    resync_chambers().await?;
     resync_corpus_counts().await
 }
 
@@ -34,7 +33,7 @@ pub async fn resync_jurisdiction_counts() -> Result<()> {
     let (_pool, conn) = open().await?;
     let repo = DecisionRepository::new(&conn);
     let couples = repo.rebuild_jurisdiction_year_counts().await?;
-    println!("jurisdiction_year_counts : {couples} couple(s) upserté(s).");
+    println!("jurisdiction_year_counts: {couples} pair(s) upserted.");
     Ok(())
 }
 
@@ -43,14 +42,6 @@ pub async fn resync_corpus_counts() -> Result<()> {
     let (_pool, conn) = open().await?;
     let repo = DecisionRepository::new(&conn);
     let rows = repo.rebuild_corpus_counts().await?;
-    println!("corpus_counts : {rows} ligne(s) upsertée(s).");
-    Ok(())
-}
-
-/// A pair gone from the corpus leaves the table.
-pub async fn resync_chambers() -> Result<()> {
-    let (_pool, conn) = open().await?;
-    let n = DecisionRepository::new(&conn).rebuild_chambers().await?;
-    println!("chamber : {n} chambre(s) ajoutée(s).");
+    println!("corpus_counts: {rows} row(s) upserted.");
     Ok(())
 }

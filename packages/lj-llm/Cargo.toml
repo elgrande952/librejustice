@@ -7,13 +7,15 @@ license.workspace = true
 # Backends embeddings : Cloudflare Workers AI, OpenAI-HTTP. Cache moka
 # in-process. Quantisation / L2-normalisation (ndarray). Client Mistral chat/OCR.
 [dependencies]
-lj-core = { workspace = true }
+lj-vocab = { workspace = true }
 # Compteur `embed.auto.served` : quel backend a servi. Le meter est un no-op
 # tant qu'aucun binaire n'a installé l'export.
 lj-telemetry = { workspace = true }
 anyhow = { workspace = true }
 # Encodage data-URI base64 du PDF pour l'OCR Mistral (`/v1/ocr`).
 base64 = { workspace = true }
+# Pacific midnight, where Gemini's free daily quota resets.
+jiff = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-tracing = { workspace = true }
@@ -27,3 +29,4 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 # Empreinte xxh3-64 des clés Mistral, stockée en table `mistral_key_status`.
 xxhash-rust = { workspace = true }
+lj-workspace-hack = { version = "0.1", path = "../lj-workspace-hack" }

@@ -21,8 +21,8 @@ pub struct Settings {
     pub vchord_probes: u32,
     // Embedding
     pub embed_backend: String,
-    pub embed_url: Option<String>,
-    pub embed_api_key: Option<String>,
+    /// Local hosts in priority order, never empty.
+    pub embed_hosts: Vec<lj_llm::hosts::EmbedHost>,
     pub embed_connect_timeout: f64,
     pub cloudflare_account_id: Option<String>,
     pub cloudflare_backend_token: Option<String>,
@@ -35,24 +35,22 @@ pub struct Settings {
     /// ChatGPT (servi en `text/plain` sur `/.well-known/openai-apps-challenge`).
     /// Valeur publique. Absent → 404.
     pub openai_apps_challenge_token: Option<String>,
-    /// Secret que présentent nos propres émetteurs dans
-    /// [`lj_dtos::INTERNAL_ORIGIN_HEADER`] pour que leur trafic soit compté
-    /// `internal`. Absent → tout est `external`.
     pub internal_origin_token: Option<String>,
-    /// Clé du MAC qui pseudonymise l'appelant en télémétrie. Absent → aucun
-    /// pseudonyme n'est posé, et rien ne nomme personne.
     pub usage_pseudonym_key: Option<String>,
     /// Mainteneur déclaré pour le claim du connecteur sur Glama (servi en JSON
     /// sur `/.well-known/glama.json` : `{"maintainers": [<valeur>]}` — email du
     /// compte Glama ou login GitHub). Valeur publique. Absent → 404.
     pub glama_maintainer: Option<String>,
+    /// P-256 private key signing the OIDC `id_token`, PKCS#8 DER in one line of
+    /// base64. Absent: no `id_token` is issued, `/.well-known/jwks.json` is a
+    /// 404, and discovery advertises `none` as its signing algorithm.
+    pub oidc_signing_key: Option<String>,
     /// Clé IndexNow, partagée avec le cron `lj-ingest indexnow` : le protocole
     /// exige qu'elle soit servie à `https://<host>/<clé>.txt`. Publique par
     /// protocole. Absent → pas de route.
     pub indexnow_key: Option<String>,
     pub gunicorn_workers: usize,
     pub version: String,
-    // Export OTel vers la gateway Grafana Cloud.
     pub grafana_otlp_endpoint: Option<String>,
     pub grafana_otlp_user: Option<String>,
     pub grafana_cloud_api_key: Option<String>,
@@ -88,8 +86,6 @@ pub struct Settings {
     /// Vides = tour désactivé, `/api/auth/microsoft/start` répond 503.
     pub microsoft_client_id: String,
     pub microsoft_client_secret: String,
-    pub mistral_api_keys: Vec<String>,
-    pub mistral_model: String,
     /// Dépenses de recherche par appelant et par minute (embedding + récupération
     /// hybride), comptées sur MISS du `search_cache` uniquement.
     pub search_budget_per_min: u32,
@@ -146,11 +142,6 @@ fn parse_bool(var: &str, default: bool) -> bool {
     }
 }
 
-/// The environments whose traffic is all ours. A listed set and not `!= "prod"`:
-/// `/.env` carries `dev`, and prod owes its `prod` to the deploy's `export`
-/// alone, so a hand-run `compose up` would come up `dev` and the negation would
-/// make prod silent on usage, without a sign. An unknown environment counts as
-/// external, which shows and gets fixed.
 fn environment_is_first_party(env: Option<&str>) -> bool {
     matches!(env, Some("beta" | "dev" | "staging"))
 }
@@ -189,8 +180,13 @@ impl Settings {
         let vchord_probes = parse_ranged::<u32>("LIBREJUSTICE_API_VCHORD_PROBES", 20, 1, 512)?;
 
         let embed_backend = or_default("LIBREJUSTICE_EMBED_BACKEND", "auto");
-        let embed_url = opt("LIBREJUSTICE_EMBED_URL");
-        let embed_api_key = opt("LIBREJUSTICE_EMBED_API_KEY");
+        let embed_hosts = lj_llm::hosts::parse_hosts(
+            opt("LIBREJUSTICE_EMBED_URL")
+                .as_deref()
+                .unwrap_or(lj_llm::hosts::DEFAULT_URL),
+            opt("LIBREJUSTICE_EMBED_API_KEY").as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
         let embed_connect_timeout =
             parse_ranged::<f64>("LIBREJUSTICE_EMBED_CONNECT_TIMEOUT", 0.2, 0.005, 5.0)?;
         let cloudflare_account_id = opt("LIBREJUSTICE_CLOUDFLARE_ACCOUNT_ID");
@@ -218,13 +214,12 @@ impl Settings {
         let internal_origin_token = opt("LIBREJUSTICE_API_INTERNAL_ORIGIN_TOKEN");
         let usage_pseudonym_key = opt("LIBREJUSTICE_API_USAGE_PSEUDONYM_KEY");
         let glama_maintainer = opt("LIBREJUSTICE_API_GLAMA_MAINTAINER");
+        let oidc_signing_key = opt("LIBREJUSTICE_API_OIDC_SIGNING_KEY");
         let indexnow_key = opt("LIBREJUSTICE_INDEXNOW_KEY");
 
         let gunicorn_workers =
             parse_ranged::<usize>("LIBREJUSTICE_API_GUNICORN_WORKERS", 4, 1, 32)?;
 
-        // Credentials gateway OTLP Grafana Cloud. L'export OTel s'active si les
-        // trois sont là.
         let grafana_otlp_endpoint = opt("LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT");
         let grafana_otlp_user = opt("LIBREJUSTICE_GRAFANA_OTLP_USER");
         let grafana_cloud_api_key = opt("LIBREJUSTICE_GRAFANA_CLOUD_API_KEY");
@@ -272,10 +267,10 @@ impl Settings {
             "LibreJustice <noreply@librejustice.fr>",
         );
 
-        let smtp_host = or_default("LIBREJUSTICE_COCKPIT_SMTP_HOST", "");
-        let smtp_port = parse_ranged("LIBREJUSTICE_COCKPIT_SMTP_PORT", 587, 1, 65_535)? as u16;
-        let smtp_user = or_default("LIBREJUSTICE_COCKPIT_SMTP_USER", "");
-        let smtp_password = or_default("LIBREJUSTICE_COCKPIT_SMTP_PASSWORD", "");
+        let smtp_host = or_default("LIBREJUSTICE_SMTP_HOST", "");
+        let smtp_port = parse_ranged("LIBREJUSTICE_SMTP_PORT", 587, 1, 65_535)? as u16;
+        let smtp_user = or_default("LIBREJUSTICE_SMTP_USER", "");
+        let smtp_password = or_default("LIBREJUSTICE_SMTP_PASSWORD", "");
         let support_mailbox = or_default(
             "LIBREJUSTICE_API_SUPPORT_MAILBOX",
             "contact@librejustice.fr",
@@ -287,9 +282,6 @@ impl Settings {
         let google_client_secret = or_default("LIBREJUSTICE_GOOGLE_OAUTH_CLIENT_SECRET", "");
         let microsoft_client_id = or_default("LIBREJUSTICE_MICROSOFT_OAUTH_CLIENT_ID", "");
         let microsoft_client_secret = or_default("LIBREJUSTICE_MICROSOFT_OAUTH_CLIENT_SECRET", "");
-
-        let mistral_api_keys = parse_csv("LIBREJUSTICE_MISTRAL_API_KEYS");
-        let mistral_model = or_default("LIBREJUSTICE_MISTRAL_MODEL", "mistral-small-2603");
 
         // 30/min: over seven days the busiest of 392 callers peaked at 23 searches
         // in a sliding minute, and none went above 25.
@@ -308,8 +300,7 @@ impl Settings {
             pool_max,
             vchord_probes,
             embed_backend,
-            embed_url,
-            embed_api_key,
+            embed_hosts,
             embed_connect_timeout,
             cloudflare_account_id,
             cloudflare_backend_token,
@@ -321,6 +312,7 @@ impl Settings {
             internal_origin_token,
             usage_pseudonym_key,
             glama_maintainer,
+            oidc_signing_key,
             indexnow_key,
             gunicorn_workers,
             version,
@@ -347,8 +339,6 @@ impl Settings {
             google_client_secret,
             microsoft_client_id,
             microsoft_client_secret,
-            mistral_api_keys,
-            mistral_model,
             search_budget_per_min,
             search_budget_enforce,
             rerank_budget_per_min,
@@ -368,11 +358,6 @@ impl Settings {
         }
     }
 
-    /// Les scrapers de ressources partagées — l'hôte, la base — ne tournent que
-    /// dans l'instance de prod : beta et dev lisent la même machine et la même
-    /// base, et n'en publiaient que des copies (1 254 séries pour 418 utiles).
-    /// Les métriques du processus restent par environnement, elles y décrivent
-    /// bien trois choses différentes.
     pub fn scrapes_shared_resources(&self) -> bool {
         self.grafana_otlp_endpoint.is_some()
             && self.grafana_otlp_user.is_some()
@@ -475,8 +460,6 @@ mod tests {
         for env in ["beta", "dev", "staging"] {
             assert!(environment_is_first_party(Some(env)), "{env}");
         }
-        // Le défaut prudent : ni la prod, ni l'absence de réglage, ni un nom
-        // inconnu ne rendent la mesure d'usage muette.
         for env in [None, Some("prod"), Some("preprod"), Some("")] {
             assert!(!environment_is_first_party(env), "{env:?}");
         }

@@ -8,12 +8,16 @@ use super::DecisionRepository;
 use crate::error::Result;
 
 impl DecisionRepository<'_> {
-    /// Vide la table des sacs (le job est un overwrite complet : une identité
-    /// passée sous le seuil de citations ne garde pas un sac périmé).
-    pub async fn usage_terms_reset(&self) -> Result<u64> {
+    /// Drops the bags of the identities out of `uids`/`nums`, the whole pool.
+    pub async fn usage_terms_prune(&self, uids: &[String], nums: &[String]) -> Result<u64> {
         let n = self
             .conn
-            .execute("DELETE FROM legal_article_usage", &[])
+            .execute(
+                "DELETE FROM legal_article_usage u
+                 WHERE (u.text_uid, u.num_key) NOT IN (
+                   SELECT p.uid, p.num FROM unnest($1::text[], $2::text[]) AS p(uid, num))",
+                &[&uids, &nums],
+            )
             .await?;
         Ok(n)
     }
@@ -83,6 +87,16 @@ impl DecisionRepository<'_> {
         self.conn
             .batch_execute("SET LOCAL statement_timeout = 0")
             .await?;
+        // Replaced in the batch's transaction: a run cut short keeps the previous
+        // bags of every batch it did not reach.
+        self.conn
+            .execute(
+                "DELETE FROM legal_article_usage u
+                 USING unnest($1::text[], $2::text[]) AS p(uid, num)
+                 WHERE u.text_uid = p.uid AND u.num_key = p.num",
+                &[&uids, &nums],
+            )
+            .await?;
         let (valid_a, norm_a) = (
             super::referential::article_valid_now("a"),
             super::referential::article_is_norm("a"),
@@ -95,20 +109,26 @@ impl DecisionRepository<'_> {
                 WITH ctx AS (
                   SELECT p.uid, p.num,
                          row_number() OVER (PARTITION BY p.uid, p.num) AS rn,
-                         lower(substr(d.full_text, greatest(1, (c.el->>0)::int - 200), 200) || ' ' ||
-                               substr(d.full_text, (c.el->>1)::int + 1, 200)) AS t
+                         lower(substr(dt.full_text, greatest(1, (c.el->>0)::int - 200), 200) || ' ' ||
+                               substr(dt.full_text, (c.el->>1)::int + 1, 200)) AS t
                   FROM unnest($1::text[], $2::text[]) AS p(uid, num)
                   CROSS JOIN LATERAL (
-                    SELECT lc.decision_id, el.el
-                    FROM legal_citation lc
+                    SELECT s.decision_id, el.el
+                    -- Each indexed decision holds a matching span, so its 300 first carry
+                    -- the 300 first contexts: 13.5 s to 1.6 s on CPC 700 (1.1 M decisions).
+                    FROM (SELECT lc.decision_id FROM legal_citation lc
+                          WHERE public.lj_cit_terms(lc.spans) @> ARRAY[p.uid || '|' || p.num]
+                          ORDER BY hashtext(lc.decision_id::text)
+                          LIMIT 300) s
+                    JOIN legal_citation lc ON lc.decision_id = s.decision_id
                     CROSS JOIN LATERAL jsonb_array_elements(lc.spans)
                       WITH ORDINALITY el(el, ord)
-                    WHERE public.lj_cit_terms(lc.spans) @> ARRAY[p.uid || '|' || p.num]
-                      AND el.el->>2 = p.uid AND el.el->>3 = p.num
-                    ORDER BY hashtext(lc.decision_id::text), el.ord
+                    WHERE el.el->>2 = p.uid AND el.el->>3 = p.num
+                    ORDER BY hashtext(s.decision_id::text), el.ord
                     LIMIT 300) c
                   JOIN decisions d ON d.id = c.decision_id
-                  WHERE d.full_text IS NOT NULL
+                  JOIN decision_text dt ON dt.decision_id = d.id AND dt.lead
+                  WHERE EXISTS (SELECT 1 FROM decision_text dt WHERE dt.decision_id = d.id)
                 ),
                 nctx AS (SELECT uid, num, count(*) AS n FROM ctx GROUP BY 1, 2),
                 words AS (

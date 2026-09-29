@@ -1,55 +1,31 @@
-//! Scraper de métriques Postgres → OTLP.
-//!
-//! Noms et unités du `postgresqlreceiver` OTel, pour que la conversion
-//! OTLP → Prometheus rende `postgresql_db_size_bytes` et ses voisins.
-//!
-//! Chaque famille se scrape dans sa propre transaction bornée par
-//! [`SCRAPE_STATEMENT_TIMEOUT`] : `pg_database_size` et `pg_relation_size`
-//! appellent `stat()` par segment de fichier, donc leur latence suit l'I/O et
-//! non le volume. Une famille lente n'aveugle pas les autres.
-//!
-//! `postgresql.{database,table,index}.name` sont des attributs de DATAPOINT :
-//! ils deviennent des labels Prometheus. En attributs de `Resource`, ils
-//! finiraient dans `target_info`, sans dimension par table.
-
 use deadpool_postgres::Pool;
 use opentelemetry::{global, KeyValue};
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Période de scrape (1 DPM, free tier).
 const SCRAPE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Borne d'une requête de scrape, très en dessous du `statement_timeout` du
-/// pool : la connexion est rendue vite quand l'I/O est saturé. La métrique
-/// perdue est un point ; la connexion retenue, une requête utilisateur en moins.
 const SCRAPE_STATEMENT_TIMEOUT: &str = "5s";
 
-/// Une mesure de taille (table ou index), portant ses labels de datapoint.
 struct Sized {
     database: String,
     table: String,
-    /// `Some` pour un index, `None` pour une table.
     index: Option<String>,
     bytes: i64,
 }
 
-/// Compteur de vacuum manuel par table.
 struct Vacuum {
     database: String,
     table: String,
     count: i64,
 }
 
-/// Snapshot des métriques Postgres, rafraîchi par la boucle async et lu par les
-/// callbacks des observable gauges.
 struct PgStatsSnapshot {
     db_size: Vec<(String, i64)>,
     tables: Vec<Sized>,
     indexes: Vec<Sized>,
     vacuums: Vec<Vacuum>,
-    /// Âge du WAL courant en secondes (un point par base, partagé instance-wide).
     wal_age_seconds: Option<f64>,
 }
 
@@ -63,39 +39,27 @@ impl PgStatsSnapshot {
     };
 }
 
-/// État global partagé entre la boucle de scrape et les callbacks OTel. Chaque
-/// champ vit sa propre vie : le scrape n'écrase que les familles qu'il a
-/// réussi à lire.
 static SNAPSHOT: Mutex<PgStatsSnapshot> = Mutex::new(PgStatsSnapshot::EMPTY);
 
-/// Démarre le scraper : enregistre les observable gauges OTel, puis boucle de
-/// rafraîchissement du snapshot toutes les 60 s. Conçu pour `tokio::spawn`.
-///
-/// Le `Meter` vient du `MeterProvider` global posé par
-/// `telemetry::init_telemetry` ; sans provider global, les instruments sont des
-/// no-op silencieux.
 pub async fn run(pool: Pool) {
     register_gauges();
     info!(
         interval_secs = SCRAPE_INTERVAL.as_secs(),
-        "pg_metrics : scraper démarré"
+        "pg_metrics: scraper started"
     );
 
     let mut ticker = tokio::time::interval(SCRAPE_INTERVAL);
     loop {
         ticker.tick().await;
         if let Err(err) = scrape(&pool).await {
-            warn!(error = %err, "pg_metrics : scrape échoué (retry au prochain tick)");
+            warn!(error = %err, "pg_metrics: scrape failed (retry at next tick)");
         }
     }
 }
 
-/// Enregistre les observable gauges. Chaque callback projette le dernier
-/// snapshot en mesures, une par couple (table/index/db) avec ses labels.
 fn register_gauges() {
     let meter = global::meter("librejustice-pg");
 
-    // postgresql.db_size (By) → postgresql_db_size_bytes
     let _db_size = meter
         .i64_observable_gauge("postgresql.db_size")
         .with_description("The database disk usage.")
@@ -111,7 +75,6 @@ fn register_gauges() {
         })
         .build();
 
-    // postgresql.table.size (By) → postgresql_table_size_bytes
     let _table_size = meter
         .i64_observable_gauge("postgresql.table.size")
         .with_description("Disk space used by a table.")
@@ -130,7 +93,6 @@ fn register_gauges() {
         })
         .build();
 
-    // postgresql.index.size (By) → postgresql_index_size_bytes
     let _index_size = meter
         .i64_observable_gauge("postgresql.index.size")
         .with_description("The size of the index on disk.")
@@ -151,7 +113,6 @@ fn register_gauges() {
         })
         .build();
 
-    // postgresql.table.vacuum.count → postgresql_table_vacuum_count
     let _vacuum = meter
         .i64_observable_gauge("postgresql.table.vacuum.count")
         .with_description("Number of times a table has manually been vacuumed.")
@@ -169,7 +130,6 @@ fn register_gauges() {
         })
         .build();
 
-    // postgresql.wal.age (s) → postgresql_wal_age_seconds
     let _wal_age = meter
         .f64_observable_gauge("postgresql.wal.age")
         .with_description("Age of the oldest WAL file.")
@@ -181,14 +141,9 @@ fn register_gauges() {
         })
         .build();
 }
-/// Rafraîchit le snapshot, une famille à la fois : un échec laisse la famille
-/// à sa valeur précédente sans empêcher les suivantes. L'erreur remontée est
-/// celle du checkout de connexion — les échecs par famille sont loggués sur
-/// place avec leur nom.
 async fn scrape(pool: &Pool) -> anyhow::Result<()> {
     let conn = pool.get().await?;
 
-    // Taille de chaque base non-template (parité `postgresql.db_size`).
     if let Some(rows) = read(
         &conn,
         "db_size",
@@ -203,7 +158,6 @@ async fn scrape(pool: &Pool) -> anyhow::Result<()> {
             .collect();
     }
 
-    // Taille des tables utilisateur (`pg_relation_size`, comme le receiver).
     if let Some(rows) = read(
         &conn,
         "table_size",
@@ -218,8 +172,6 @@ async fn scrape(pool: &Pool) -> anyhow::Result<()> {
         SNAPSHOT.lock().unwrap().tables = rows.iter().map(sized).collect();
     }
 
-    // Taille des index utilisateur (label `postgresql.table.name` sans schéma,
-    // comportement par défaut du receiver hors feature gate `separateSchemaAttr`).
     if let Some(rows) = read(
         &conn,
         "index_size",
@@ -232,7 +184,6 @@ async fn scrape(pool: &Pool) -> anyhow::Result<()> {
         SNAPSHOT.lock().unwrap().indexes = rows.iter().map(sized).collect();
     }
 
-    // Nombre de vacuum manuels par table (`postgresql.table.vacuum.count`).
     if let Some(rows) = read(
         &conn,
         "vacuum_count",
@@ -253,8 +204,6 @@ async fn scrape(pool: &Pool) -> anyhow::Result<()> {
             .collect();
     }
 
-    // Âge du WAL : secondes écoulées depuis le dernier checkpoint réussi
-    // (proxy de `postgresql.wal.age`, qui mesure l'âge du plus vieux segment).
     if let Some(rows) = read(
         &conn,
         "wal_age",
@@ -270,11 +219,6 @@ async fn scrape(pool: &Pool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Lit une famille dans sa propre transaction bornée par
-/// [`SCRAPE_STATEMENT_TIMEOUT`]. `None` = échec loggué, l'appelant garde la
-/// valeur précédente. Le `ROLLBACK` inconditionnel rend la connexion utilisable
-/// pour la famille suivante, y compris après une annulation par
-/// `statement_timeout` (qui rejette tout jusqu'à la fin de la transaction).
 async fn read(
     conn: &deadpool_postgres::Object,
     family: &'static str,
@@ -296,15 +240,13 @@ async fn read(
             warn!(
                 family,
                 error = %err,
-                "pg_metrics : famille non lue (valeur précédente conservée)"
+                "pg_metrics: family not read (previous value kept)"
             );
             None
         }
     }
 }
 
-/// Projette une ligne `(database, table, bytes, index)` en [`Sized`] — forme
-/// commune aux tailles de table (4ᵉ colonne `NULL`) et d'index.
 fn sized(r: &tokio_postgres::Row) -> Sized {
     Sized {
         database: r.get(0),

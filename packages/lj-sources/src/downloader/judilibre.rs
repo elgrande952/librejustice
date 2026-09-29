@@ -222,6 +222,44 @@ pub(super) fn append_decisions(path: &Path, decisions: &[Value]) -> Result<()> {
     Ok(())
 }
 
+/// Every line of a `.jsonl.gz`, without its `\n`.
+pub fn read_jsonl_gz_lines(path: &Path) -> Result<Vec<Vec<u8>>> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    let mut decoder = flate2::read::MultiGzDecoder::new(file);
+    let mut content = Vec::new();
+    decoder.read_to_end(&mut content)?;
+    Ok(split_jsonl_lines(&content))
+}
+
+/// Splits JSONL content into trimmed lines, **without the empty pseudo-line** of
+/// the final `\n`: `ingested_lines` stays a stable resume offset on an
+/// append-only file.
+fn split_jsonl_lines(content: &[u8]) -> Vec<Vec<u8>> {
+    let content = content.strip_suffix(b"\n").unwrap_or(content);
+    if content.is_empty() {
+        return Vec::new();
+    }
+    content
+        .split(|&b| b == b'\n')
+        .map(|line| {
+            let start = line.iter().position(|b| !b.is_ascii_whitespace());
+            match start {
+                None => Vec::new(),
+                Some(s) => {
+                    let end = line.iter().rposition(|b| !b.is_ascii_whitespace()).unwrap();
+                    line[s..=end].to_vec()
+                }
+            }
+        })
+        .collect()
+}
+
+/// Parses one `.jsonl.gz` line, a Judilibre decision.
+pub fn parse_decision_line(line: &[u8]) -> Result<Value> {
+    Ok(sonic_rs::from_slice(line)?)
+}
+
 /// Lit les ids présents dans `tombstones.jsonl` (set). Fichier absent = vide.
 fn read_tombstone_ids(path: &Path) -> Result<std::collections::HashSet<String>> {
     let mut ids = std::collections::HashSet::new();
@@ -635,6 +673,18 @@ fn is_valid_gzip(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_jsonl_lines_count_is_append_stable() {
+        assert_eq!(split_jsonl_lines(b"").len(), 0);
+        assert_eq!(split_jsonl_lines(b"a\nb\n").len(), 2);
+        assert_eq!(split_jsonl_lines(b"a\nb").len(), 2);
+        let after_append = split_jsonl_lines(b"a\nb\nc\n");
+        assert_eq!(after_append.len(), 3);
+        assert_eq!(after_append[2], b"c");
+        assert_eq!(split_jsonl_lines(b"a\n  \nb\n").len(), 3);
+        assert_eq!(split_jsonl_lines(b"a\n  \nb\n")[1], b"");
+    }
 
     #[test]
     fn yyyymm_of_decision() {

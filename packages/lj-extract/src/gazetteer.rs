@@ -82,32 +82,11 @@ const MONTHS: &[&str] = &[
     "decembre",
 ];
 
-/// Plie accents → ASCII, minuscule (port léger de la logique `fold` partagée).
-fn fold_ascii(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            let lc = c.to_lowercase().next().unwrap_or(c);
-            let folded = match lc {
-                'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' => 'a',
-                'ç' => 'c',
-                'è' | 'é' | 'ê' | 'ë' => 'e',
-                'ì' | 'í' | 'î' | 'ï' => 'i',
-                'ñ' => 'n',
-                'ò' | 'ó' | 'ô' | 'ö' | 'õ' => 'o',
-                'ù' | 'ú' | 'û' | 'ü' => 'u',
-                'ý' | 'ÿ' => 'y',
-                other => other,
-            };
-            Some(folded)
-        })
-        .collect()
-}
-
 /// Squelette : tokens distinctifs (≥2 chars, hors mots-outils, mois, années,
 /// numéros). « Convention collective nationale des services de l'automobile du
 /// 15 janvier 1981 » → {services, automobile}.
 fn skeleton(raw: &str) -> BTreeSet<String> {
-    let folded = fold_ascii(raw);
+    let folded = lj_fold::fold_chars(raw);
     folded
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|t| t.len() >= 2)
@@ -229,7 +208,7 @@ mod tests {
             assert!(snapped.is_some(), "devrait snapper: {cited}");
             let title = snapped.unwrap().title.to_lowercase();
             assert!(
-                fold_ascii(&title).contains(&fold_ascii(frag)),
+                lj_fold::fold_chars(&title).contains(&lj_fold::fold_chars(frag)),
                 "{cited} → {title} (attendu fragment {frag})"
             );
         }

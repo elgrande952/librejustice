@@ -3,5 +3,5 @@
 # version précise, pas le canal rolling "stable" — sinon clippy dérive à chaque
 # release et casse le gate sur du code inchangé. Rien dans le workspace n'exige
 # nightly (aucun `#![feature]`, pas de rustfmt.toml instable, édition 2021).
-channel = "1.96.0"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]

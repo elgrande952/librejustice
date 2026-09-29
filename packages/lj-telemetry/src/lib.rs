@@ -1,18 +1,3 @@
-//! Telemetrie partagee : subscriber tracing + export DIRECT vers la gateway
-//! OTLP Grafana Cloud (traces + logs + metriques), HTTP/protobuf + Basic Auth.
-//!
-//! Trois roles :
-//!
-//! - export OTLP/HTTP des 3 signaux vers un endpoint unique, en Basic Auth ;
-//! - scrub PII des spans avant export ([`ScrubbingSpanProcessor`]) : IP et
-//!   `db.statement` retires, query-strings tronquees ;
-//!   `librejustice.search.query` est conserve ;
-//! - echantillonnage par tete ([`RootSampler`]), qui abandonne la trace d'un
-//!   crawl non surveille des son span racine.
-//!
-//! Sans credentials Grafana, on reste sur un simple subscriber fmt. En
-//! court-vivant, [`init`] rend un [`TelemetryGuard`] dont le `Drop` flush.
-
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -36,54 +21,25 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-/// Nom de scope OTel commun (tracer + meter). Les instruments (ex. scraper
-/// Postgres cote `lj-api`) passent par [`meter`].
 const SCOPE: &str = "librejustice";
 
-/// Credentials de la gateway OTLP Grafana Cloud. Presents = export actif.
 pub struct OtlpCreds {
-    /// Base URL de la gateway (ex. `https://otlp-gateway-...grafana.net/otlp`).
-    /// On y ajoute soi-même `/v1/{traces,logs,metrics}` par signal (cf.
-    /// [`OtlpExport::signal_endpoint`]) : `with_endpoint` sur un builder par-signal
-    /// prend l'URL telle quelle.
     pub endpoint: String,
-    /// Utilisateur OTLP (numero d'instance Grafana Cloud).
     pub user: String,
-    /// Cle d'API Grafana Cloud.
     pub api_key: String,
 }
 
-/// Parametres d'initialisation de la telemetrie.
 pub struct InitOpts {
-    /// Filtre de niveaux du subscriber (chaque binaire le construit a sa facon :
-    /// `RUST_LOG` cote api, `LIBREJUSTICE_LOG_LEVEL` cote ingest).
     pub filter: EnvFilter,
-    /// Format du layer fmt stdout : `true` = JSON, `false` = texte.
     pub json: bool,
-    /// `service.name` du `Resource` (ex. `librejustice-api`, `librejustice-ingest`).
     pub service_name: String,
-    /// `deployment.environment` du `Resource` (ex. `prod`), si pose.
     pub deployment_environment: Option<String>,
-    /// `host.name` du `Resource` : la **machine**. A defaut, le hostname du
-    /// noyau, qui vaut l'identifiant du conteneur des qu'on tourne dedans — d'ou
-    /// l'override, pose par le compose.
     pub host_name: Option<String>,
-    /// `container.name` du `Resource`, pose par le compose et donc **absent**
-    /// d'un lancement sur l'hote : c'est ce qui distingue la chaine du cron d'un
-    /// tir a la main.
     pub container_name: Option<String>,
-    /// Plancher du bridge logs -> LogRecords OTLP (Loki), par cible. L'API reste
-    /// sur `WARN` par defaut et n'ouvre `INFO` que sur sa cible d'usage ; l'ingest
-    /// passe tout a `INFO` pour exporter les breadcrumbs de cycle de vie
-    /// (debut/fin de phase).
     pub otlp_log_filter: Targets,
-    /// Credentials OTLP. `None` = subscriber fmt seul (pas d'export).
     pub otlp: Option<OtlpCreds>,
 }
 
-/// Garde de vie de la telemetrie : flush des batch processors a la
-/// destruction. A lier dans `main`
-/// (`let _guard = lj_telemetry::init(...)?;`).
 #[must_use = "garder le guard vivant jusqu'a la fin du process, sinon les signaux bufferises ne partent pas"]
 #[derive(Default)]
 pub struct TelemetryGuard {
@@ -106,7 +62,6 @@ impl Drop for TelemetryGuard {
     }
 }
 
-/// Config OTLP resolue (endpoint normalise + en-tete d'auth + resource).
 struct OtlpExport {
     endpoint: String,
     auth: String,
@@ -139,17 +94,11 @@ impl OtlpExport {
         HashMap::from([("Authorization".to_string(), self.auth.clone())])
     }
 
-    /// URL complète d'un signal : `<endpoint>/v1/<signal>` (ex.
-    /// `.../otlp/v1/traces`). `with_endpoint` par-signal est utilisé verbatim, le
-    /// suffixe doit donc être ajouté ici.
     fn signal_endpoint(&self, signal: &str) -> String {
         format!("{}/v1/{signal}", self.endpoint)
     }
 }
 
-/// Installe le subscriber tracing global et, si [`InitOpts::otlp`] est fourni,
-/// branche l'export OTLP/HTTP des traces + logs + metriques. Renvoie un guard de
-/// flush a garder vivant jusqu'a la fin du process.
 pub fn init(mut opts: InitOpts) -> Result<TelemetryGuard> {
     let fmt_layer = if opts.json {
         tracing_subscriber::fmt::layer()
@@ -175,8 +124,6 @@ pub fn init(mut opts: InitOpts) -> Result<TelemetryGuard> {
     let logger_provider = build_logger_provider(&export)?;
 
     let traces_layer = tracing_opentelemetry::layer().with_tracer(tracer_provider.tracer(SCOPE));
-    // Bridge logs : ce que `otlp_log_filter` laisse passer part en LogRecords
-    // OTLP.
     let logs_layer =
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider)
             .with_filter(opts.otlp_log_filter);
@@ -191,7 +138,7 @@ pub fn init(mut opts: InitOpts) -> Result<TelemetryGuard> {
     tracing::info!(
         endpoint = %export.endpoint,
         service = %opts.service_name,
-        "opentelemetry : traces + logs + metriques -> Grafana Cloud OTLP"
+        "opentelemetry: traces + logs + metrics -> Grafana Cloud OTLP"
     );
 
     Ok(TelemetryGuard {
@@ -201,51 +148,18 @@ pub fn init(mut opts: InitOpts) -> Result<TelemetryGuard> {
     })
 }
 
-/// `Meter` du scope `librejustice` : point d'acces unique pour creer des
-/// instruments (ex. observables du scraper Postgres). No-op si l'export OTel
-/// n'est pas actif (provider global par defaut).
 pub fn meter() -> opentelemetry::metrics::Meter {
     global::meter(SCOPE)
 }
 
-/// Attribut qui marque le span racine d'une requete servie a un crawl non
-/// surveille. Ecrit par [`unattended_request_span`], lu par
-/// [`RootSampler`] — les deux doivent nommer la meme cle.
 const UNATTENDED_KEY: &str = "librejustice.unattended";
 
-/// Span racine d'une requete servie a un crawl non surveille.
-///
-/// C'est ici, et une seule fois par requete, que se prend la decision de ne pas
-/// tracer : [`RootSampler`] y lit [`UNATTENDED_KEY`] et repond `Drop`.
-/// Le `SpanContext` non echantillonne qui en resulte porte la decision a toute
-/// la descendance via `ParentBased` — les `db.*` du rendu SSR compris.
-///
-/// Ce que l'appelant doit garantir : que les spans a couper naissent bien
-/// **sous** ce span. Le lien parent-enfant passe par le contexte de tache de
-/// `tracing`, donc chaque frontiere de tache doit le reporter explicitement
-/// (`Instrument` sur le handler, sur le corps de reponse et sur les taches de
-/// l'executeur Leptos, cote `lj-server`).
 pub fn unattended_request_span() -> tracing::Span {
     tracing::info_span!("http.request", librejustice.unattended = true)
 }
 
-/// Prefixe des spans d'acces base. Un tel span qui se retrouve RACINE n'a aucun
-/// contexte : ni requete, ni etape de chaine. Voir [`RootSampler`].
 const DB_SPAN_PREFIX: &str = "db.";
 
-/// Delegue racine du `ParentBased`. Deux regles, toutes deux sur le span racine :
-/// abandon si le span porte [`UNATTENDED_KEY`], abandon si son nom commence par
-/// [`DB_SPAN_PREFIX`]. Tout le reste est echantillonne.
-///
-/// La seconde vise l'ingest, qui appelle le depot ligne par ligne sans envelopper
-/// ses commandes dans un span : chaque acces y forme une trace d'un seul span,
-/// que rien ne rattache a une execution, et 500/s saturent l'export. Cote serveur
-/// ces memes spans ont toujours le span de requete pour parent, donc ils ne
-/// passent pas ici — mesure : 16 traces racines `db.*` par heure contre 30 979
-/// pour l'ingest.
-///
-/// Un span qui a deja un parent ne passe pas ici — `ParentBased` suit alors le
-/// bit `sampled` du parent.
 #[derive(Debug, Clone)]
 struct RootSampler;
 
@@ -274,14 +188,10 @@ impl ShouldSample for RootSampler {
     }
 }
 
-/// Sampler du provider de traces.
 fn sampler() -> Sampler {
     Sampler::ParentBased(Box::new(RootSampler))
 }
 
-/// Construit le `TracerProvider` OTLP/HTTP et le pose en global. Le
-/// [`ScrubbingSpanProcessor`] nettoie la PII avant de deleguer au
-/// `BatchSpanProcessor` (serialisation + transmission sur thread dedie).
 fn build_tracer_provider(export: &OtlpExport) -> Result<SdkTracerProvider> {
     let exporter = SpanExporter::builder()
         .with_http()
@@ -303,8 +213,6 @@ fn build_tracer_provider(export: &OtlpExport) -> Result<SdkTracerProvider> {
     Ok(provider)
 }
 
-/// Construit le `MeterProvider` OTLP/HTTP (PeriodicReader, export ~60s) et le
-/// pose en global.
 fn build_meter_provider(export: &OtlpExport) -> Result<SdkMeterProvider> {
     let exporter = MetricExporter::builder()
         .with_http()
@@ -323,8 +231,6 @@ fn build_meter_provider(export: &OtlpExport) -> Result<SdkMeterProvider> {
     Ok(provider)
 }
 
-/// Construit le `LoggerProvider` OTLP/HTTP (BatchLogProcessor) consomme par le
-/// bridge `tracing`.
 fn build_logger_provider(export: &OtlpExport) -> Result<SdkLoggerProvider> {
     let exporter = LogExporter::builder()
         .with_http()
@@ -339,7 +245,6 @@ fn build_logger_provider(export: &OtlpExport) -> Result<SdkLoggerProvider> {
     Ok(provider)
 }
 
-/// Cles d'attributs supprimees avant export (PII directe).
 const PII_DROP_KEYS: &[&str] = &[
     "client.address",
     "client.socket.address",
@@ -349,14 +254,8 @@ const PII_DROP_KEYS: &[&str] = &[
     "db.statement",
 ];
 
-/// Cles d'URL dont on tronque la query-string (`?...` retire).
 const URL_TRUNCATE_KEYS: &[&str] = &["url.full", "http.url", "http.target"];
 
-/// `SpanProcessor` qui scrub la PII puis delegue au `BatchSpanProcessor`.
-///
-/// C'est le seul endroit ou la PII est retiree avant qu'elle ne quitte le
-/// process. `librejustice.search.query` n'est pas dans les listes : il part
-/// intact.
 #[derive(Debug)]
 struct ScrubbingSpanProcessor {
     inner: BatchSpanProcessor,
@@ -396,9 +295,6 @@ impl SpanProcessor for ScrubbingSpanProcessor {
     }
 }
 
-/// Nom d'hote, lu du noyau : un shell non interactif et une unite systemd
-/// n'exportent pas `HOSTNAME`, si bien que tout ce qui tourne hors conteneur
-/// s'etiquetait « unknown » — 6 488 lignes sur 24 h, mesure du 12/08/2026.
 fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|nom| nom.trim().to_string())
@@ -410,8 +306,6 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// `SpanProcessor` qui note le nom de chaque span parvenu jusqu'a l'export.
-    /// Un span abandonne par le sampler n'atteint jamais `on_end`.
     #[derive(Debug, Clone, Default)]
     struct Recorder(Arc<Mutex<Vec<String>>>);
 
@@ -433,8 +327,6 @@ mod tests {
         fn set_resource(&mut self, _resource: &Resource) {}
     }
 
-    /// Joue `f` sous un subscriber branche sur [`sampler`] et rend les noms des
-    /// spans effectivement exportes, dans l'ordre de fermeture.
     fn exported_spans(f: impl FnOnce()) -> Vec<String> {
         let recorder = Recorder::default();
         let provider = SdkTracerProvider::builder()

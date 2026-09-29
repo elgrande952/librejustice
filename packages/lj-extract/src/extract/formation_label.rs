@@ -148,7 +148,7 @@ fn chamber_line_label(tail: &str) -> Option<String> {
         out.push(toks[0]);
         i += 1;
     }
-    if toks.get(i).map(|t| fold_ascii(t)) != Some("chambre".to_string()) {
+    if toks.get(i).map(|t| lj_fold::fold_chars(t)) != Some("chambre".to_string()) {
         return None;
     }
     out.push(toks[i]);
@@ -208,21 +208,6 @@ fn chamber_line_label(tail: &str) -> Option<String> {
         return None;
     }
     Some(out.join(" ").trim_end_matches([',', '-', ' ']).to_string())
-}
-
-/// Repli casse+accents ASCII d'un token (comparaison de mot-clé).
-fn fold_ascii(tok: &str) -> String {
-    tok.to_lowercase()
-        .chars()
-        .map(|c| match c {
-            'à' | 'â' | 'ä' => 'a',
-            'é' | 'è' | 'ê' | 'ë' => 'e',
-            'î' | 'ï' => 'i',
-            'ô' | 'ö' => 'o',
-            'ù' | 'û' | 'ü' => 'u',
-            _ => c,
-        })
-        .collect()
 }
 
 /// Chambre lue dans le BANDEAU d'en-tête : regex sur petit span positionné. La

@@ -3,17 +3,17 @@
 use leptos::prelude::*;
 use leptos_meta::{provide_meta_context, Title};
 use leptos_router::components::{Route, Router, Routes};
-use leptos_router::{ParamSegment, SsrMode, StaticSegment};
+use leptos_router::{ParamSegment, SsrMode, StaticSegment, WildcardSegment};
 
 use crate::components::AppShell;
 use crate::pages::{
-    ActivityPage, AnnoncesCataloguePage, AnnoncesDepartementPage, AnnoncesPage,
-    AnnuaireDirectoryPage, AnnuairePage, ApiGuide, AuthorizeMcpPage, CodeCataloguePage,
-    ConfirmPage, DecisionPage, EmailChangePage, EntityPage, FeedbackPage, JuridictionHubPage,
-    JuridictionYearPage, JuridictionsPage, Landing, LawArticlePage, LawCodePage, LawComparePage,
-    LawSectionPage, LegalNotice, LoginLinkPage, LoginPage, MarchePage, McpGuide, NormFondPage,
-    NormYearPage, NormesPage, NotFound, Privacy, ProfilePage, ResetPasswordPage, SearchPage,
-    SourcesPage, TextesPage,
+    AnnoncesCataloguePage, AnnoncesDepartementPage, AnnoncesPage, AnnuaireDirectoryPage,
+    AnnuairePage, ApiGuide, AuthorizeMcpPage, BookmarksPage, CodeCataloguePage, ConfirmPage,
+    CorpusPage, DecisionPage, EmailChangePage, EntityPage, FeedbackPage, JuridictionHubPage,
+    JuridictionYearPage, JuridictionsPage, Landing, LawCodePage, LegalNotice, LoginLinkPage,
+    LoginPage, MarchePage, McpGuide, NormFondPage, NormNodePage, NormYearPage, NormesPage,
+    NotFound, Privacy, ProfilePage, RedactPage, ResetPasswordPage, SearchPage, SourcesPage,
+    TextesPage, ToolsPage,
 };
 use crate::seo::site_default;
 
@@ -87,24 +87,6 @@ const BANDEAU: &str = r#"(() => {
   };
 })();"#;
 
-/// Balise d'incident client, et veille d'hydratation qui en est le premier
-/// usage.
-///
-/// `__ljIncident(motif, détail)` poste vers `/internal/client/incident` la seule
-/// classe de panne que le serveur ne peut pas voir : il a répondu, et
-/// l'utilisateur n'a pourtant pas sa page. Aucune identité transmise (chemin,
-/// assets en échec, temps écoulé) ; la page 404 l'appelle aussi.
-///
-/// La veille : tout le contenu interactif du site dépend du bundle wasm, et
-/// quand il ne charge pas, le bootstrap Leptos — un `import().then()` sans
-/// `catch` — meurt sans un mot, laissant un rendu SSR inerte. Si `__LJ_HYDRATED`
-/// (posé par `hydrate()`) n'apparaît pas, ce script affiche un recours et
-/// signale la panne, sur la première des deux conditions : un asset `/pkg`
-/// répondu en erreur, ou 30 s écoulées.
-///
-/// Une hydratation qui aboutit après un premier sondage sort en
-/// `hydration_lente`, au grain du sondage (5 s) : une page hydratée avant le
-/// premier ne signale rien.
 #[cfg(feature = "ssr")]
 const SONDE_CLIENT: &str = r#"(() => {
   window.__ljIncident = (motif, detail) => {
@@ -121,33 +103,63 @@ const SONDE_CLIENT: &str = r#"(() => {
     } catch {}
   };
 
-  const failedAssets = () =>
-    performance
-      .getEntriesByType("resource")
-      .filter((r) => r.name.includes("/pkg/") && r.responseStatus >= 400)
-      .map((r) => r.name.split("/").pop() + ":" + r.responseStatus);
+  const broken = new Map();
+  document.addEventListener(
+    "error",
+    (e) => {
+      const target = e.target;
+      const url = target && target.tagName ? String(target.href || target.src || "") : "";
+      if (url.includes("/pkg/")) broken.set(url.split("/").pop(), 0);
+    },
+    true,
+  );
 
-  let attendu = false;
+  const failedAssets = () => {
+    const seen = new Map(broken);
+    for (const r of performance.getEntriesByType("resource")) {
+      if (r.name.includes("/pkg/") && r.responseStatus >= 400) {
+        seen.set(r.name.split("/").pop(), r.responseStatus);
+      }
+    }
+    return Array.from(seen, ([name, status]) => name + ":" + status);
+  };
+
+  const styleAbsent = () => {
+    const lien = document.getElementById("leptos");
+    if (!lien) return false;
+    try {
+      return !lien.sheet || lien.sheet.cssRules.length === 0;
+    } catch {
+      return false;
+    }
+  };
+
+  let masque = document.visibilityState === "hidden";
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) masque = true;
+  });
 
   const check = (elapsed) => {
     if (window.__LJ_HYDRATED) {
-      if (attendu) {
-        window.__ljIncident("hydration_lente", {
-          elapsed_ms: Math.round(performance.now()),
-        });
-      }
+      const nu = styleAbsent();
+      window.__ljIncident(nu ? "stylesheet_missing" : "hydration_ok", {
+        assets: nu ? failedAssets() : [],
+        elapsed_ms: Math.round(window.__LJ_HYDRATED_AT ?? performance.now()),
+      });
       return;
     }
-    attendu = true;
     const assets = failedAssets();
     if (assets.length === 0 && elapsed < 30000) {
       setTimeout(() => check(elapsed + 5000), 5000);
       return;
     }
-    window.__ljIncident("hydration", {
-      assets,
-      elapsed_ms: Math.round(performance.now()),
-    });
+    if (!masque) {
+      window.__ljIncident("hydration", {
+        assets,
+        stylesheet_missing: styleAbsent(),
+        elapsed_ms: Math.round(performance.now()),
+      });
+    }
     window.__ljBar("Cette page n'a pas pu charger entièrement.", false);
   };
 
@@ -290,32 +302,35 @@ pub fn App() -> impl IntoView {
                 <Routes fallback=NotFound>
                     // ── Pages publiques (SSR streaming par defaut, OutOfOrder) ──
                     <Route path=StaticSegment("") view=Landing />
-                    // ── Recherche : `/decisions` (hybride BM25+ANN) et `/textes` (BM25
-                    // seul), moteurs et filtres propres, aucune recherche transverse. ──
-                    <Route path=StaticSegment("decisions") view=SearchPage />
-                    <Route path=StaticSegment("textes") view=TextesPage />
+                    // Search: `/decision-search` (hybrid BM25+ANN) and `/norm-search`
+                    // (BM25 only), their own engines and filters, no cross search.
+                    <Route path=StaticSegment("decision-search") view=SearchPage />
+                    <Route path=StaticSegment("norm-search") view=TextesPage />
                     <Route path=StaticSegment("sources") view=SourcesPage />
                     // ── Annonces : la publicité légale en cours, plusieurs fonds derrière
                     // un même DTO (marchés publics en base, BODACC en proxy) ; les pages
-                    // `departement` restent du SSR bloquant, pour le crawl. ──
-                    <Route path=StaticSegment("annonces") view=AnnoncesPage />
+                    // d'index restent du SSR bloquant, pour le crawl. ──
+                    <Route path=StaticSegment("notice-search") view=AnnoncesPage />
                     <Route
-                        path=(StaticSegment("annonces"), StaticSegment("departement"))
+                        path=(StaticSegment("notice-index"), ParamSegment("juris"))
                         view=AnnoncesCataloguePage
                     />
                     <Route
                         path=(
-                            StaticSegment("annonces"),
-                            StaticSegment("departement"),
+                            StaticSegment("notice-index"),
+                            ParamSegment("juris"),
                             ParamSegment("code"),
                         )
                         view=AnnoncesDepartementPage
                     />
-                    <Route path=(StaticSegment("marche"), ParamSegment("uid")) view=MarchePage />
+                    <Route
+                        path=(StaticSegment("notice"), ParamSegment("juris"), ParamSegment("uid"))
+                        view=MarchePage
+                    />
                     // ── Decision : similaires en streaming (PartiallyBlocked :
                     // le bloc bloquant est rendu cote serveur, sans JS). ──
                     <Route
-                        path=(StaticSegment("decision"), ParamSegment("id"))
+                        path=(StaticSegment("decision"), ParamSegment("juris"), ParamSegment("id"))
                         view=DecisionPage
                         ssr=SsrMode::PartiallyBlocked
                     />
@@ -323,33 +338,42 @@ pub fn App() -> impl IntoView {
                     // décisions citantes streamée et paginée par `?page=`. Rendu adapté au
                     // namespace (`siren`/`rna`/`cnb`/`oacc`). ──
                     <Route
-                        path=(StaticSegment("entite"), ParamSegment("ns"), ParamSegment("id"))
+                        path=(
+                            StaticSegment("entity"),
+                            ParamSegment("juris"),
+                            ParamSegment("ns"),
+                            ParamSegment("id"),
+                        )
                         view=EntityPage
                         ssr=SsrMode::PartiallyBlocked
                     />
                     // ── Annuaire des entités : accueil et listing paginé par catégorie,
                     // bloquants SSR ; compteurs des cartes streamés. ──
                     <Route
-                        path=StaticSegment("annuaire")
+                        path=StaticSegment("entity-search")
                         view=AnnuairePage
                         ssr=SsrMode::PartiallyBlocked
                     />
                     <Route
-                        path=(StaticSegment("annuaire"), ParamSegment("kind"))
+                        path=(StaticSegment("entity-index"), ParamSegment("juris"), ParamSegment("kind"))
                         view=AnnuaireDirectoryPage
                         ssr=SsrMode::PartiallyBlocked
                     />
                     // ── Hubs juridiction : catalogue par famille, hub d'une juridiction
                     // (années), liste paginée d'une année. SSR bloquant — le contenu est
                     // fait de liens crawlables. ──
-                    <Route path=StaticSegment("juridictions") view=JuridictionsPage />
                     <Route
-                        path=(StaticSegment("juridiction"), ParamSegment("code"))
+                        path=(StaticSegment("decision-index"), ParamSegment("juris"))
+                        view=JuridictionsPage
+                    />
+                    <Route
+                        path=(StaticSegment("decision-index"), ParamSegment("juris"), ParamSegment("code"))
                         view=JuridictionHubPage
                     />
                     <Route
                         path=(
-                            StaticSegment("juridiction"),
+                            StaticSegment("decision-index"),
+                            ParamSegment("juris"),
                             ParamSegment("code"),
                             ParamSegment("annee"),
                         )
@@ -357,68 +381,64 @@ pub fn App() -> impl IntoView {
                     />
                     // ── Hubs normes : même arborescence vers les textes, l'année pouvant
                     // être `sans-date`. ──
-                    <Route path=StaticSegment("normes") view=NormesPage />
+                    // What applies in a place: the date is a segment, the place
+                    // a setting, as on the article page.
+                    <Route
+                        path=(StaticSegment("norm-index"), ParamSegment("juris"), StaticSegment("in-force"))
+                        view=CorpusPage
+                    />
+                    <Route
+                        path=(
+                            StaticSegment("norm-index"),
+                            ParamSegment("juris"),
+                            StaticSegment("in-force"),
+                            ParamSegment("date"),
+                        )
+                        view=CorpusPage
+                    />
+                    <Route
+                        path=(StaticSegment("norm-index"), ParamSegment("juris"))
+                        view=NormesPage
+                    />
                     // Le fond `codes` a son propre catalogue (sommaire par
                     // code, pas un hub année) — segment statique prioritaire
                     // sur la capture `{fond}`.
                     <Route
-                        path=(StaticSegment("normes"), StaticSegment("codes"))
+                        path=(StaticSegment("norm-index"), ParamSegment("juris"), StaticSegment("codes"))
                         view=CodeCataloguePage
                     />
                     <Route
-                        path=(StaticSegment("normes"), ParamSegment("fond"))
+                        path=(StaticSegment("norm-index"), ParamSegment("juris"), ParamSegment("fond"))
                         view=NormFondPage
                     />
                     <Route
                         path=(
-                            StaticSegment("normes"),
+                            StaticSegment("norm-index"),
+                            ParamSegment("juris"),
                             ParamSegment("fond"),
                             ParamSegment("annee"),
                         )
                         view=NormYearPage
                     />
-                    // ── Référentiel LEGI : sommaire de code, article en vigueur, article
-                    // à une date (route séparée, pas un segment optionnel). L'article est
-                    // bloquant SSR, les décisions citantes sont streamées. ──
-                    <Route path=(StaticSegment("texte"), ParamSegment("code")) view=LawCodePage />
-                    // Vue-lecture d'une section : segment littéral `section`, déclaré
-                    // avant la capture `{num}`.
+                    // ── LEGI referential: code summary, article in force, article at a
+                    // date (a route of its own, not an optional segment). The article
+                    // blocks SSR, the citing decisions stream. The first segment names
+                    // the enacting jurisdiction; the older shape without it is
+                    // redirected by the server, never routed here. ──
+                    <Route
+                        path=(StaticSegment("norm"), ParamSegment("juris"), ParamSegment("code"))
+                        view=LawCodePage
+                    />
+                    // Every node of a text: an article, at a date or compared, a
+                    // section path; `NormNodePage` reads the segments.
                     <Route
                         path=(
-                            StaticSegment("texte"),
+                            StaticSegment("norm"),
+                            ParamSegment("juris"),
                             ParamSegment("code"),
-                            StaticSegment("section"),
-                            ParamSegment("cid"),
+                            WildcardSegment("rest"),
                         )
-                        view=LawSectionPage
-                    />
-                    <Route
-                        path=(StaticSegment("texte"), ParamSegment("code"), ParamSegment("num"))
-                        view=LawArticlePage
-                        ssr=SsrMode::PartiallyBlocked
-                    />
-                    <Route
-                        path=(
-                            StaticSegment("texte"),
-                            ParamSegment("code"),
-                            ParamSegment("num"),
-                            ParamSegment("date"),
-                        )
-                        view=LawArticlePage
-                        ssr=SsrMode::PartiallyBlocked
-                    />
-                    // Comparateur de versions : diff serveur entre deux rédactions,
-                    // bornes = dates de fenêtre de version.
-                    <Route
-                        path=(
-                            StaticSegment("texte"),
-                            ParamSegment("code"),
-                            ParamSegment("num"),
-                            StaticSegment("comparer"),
-                            ParamSegment("de"),
-                            ParamSegment("a"),
-                        )
-                        view=LawComparePage
+                        view=NormNodePage
                         ssr=SsrMode::PartiallyBlocked
                     />
                     // ── Pages auth et compte : formulaires rendus serveur, sans JS.
@@ -436,23 +456,11 @@ pub fn App() -> impl IntoView {
                         view=ProfilePage
                         ssr=SsrMode::PartiallyBlocked
                     />
-                    // ── Activite : meme composant, une route explicite par onglet sous
-                    // `/activity/`, defaut compris. `/activity` nu = 308 vers l'onglet
-                    // recherches. ──
-                    <Route
-                        path=(StaticSegment("activity"), StaticSegment("searches"))
-                        view=ActivityPage
-                    />
-                    <Route
-                        path=(StaticSegment("activity"), StaticSegment("bookmarks"))
-                        view=ActivityPage
-                    />
-                    <Route
-                        path=(StaticSegment("activity"), StaticSegment("readings"))
-                        view=ActivityPage
-                    />
+                    <Route path=StaticSegment("bookmarks") view=BookmarksPage />
                     // ── Pages statiques publiques ──
                     <Route path=StaticSegment("feedback") view=FeedbackPage />
+                    <Route path=StaticSegment("tools") view=ToolsPage />
+                    <Route path=StaticSegment("redact") view=RedactPage />
                     <Route path=StaticSegment("api-guide") view=ApiGuide />
                     <Route path=StaticSegment("mcp-guide") view=McpGuide />
                     <Route path=StaticSegment("legal-notice") view=LegalNotice />
@@ -491,10 +499,7 @@ fn provide_auth_runtime() {
     let known: StoredValue<Option<Option<String>>> = StoredValue::new(None);
 
     // Applique l'etat de session courant, et ne vide le cache que sur un vrai
-    // changement d'identite (connexion, deconnexion, bascule de compte). Le contenu
-    // cache (recherche) ne depend pas de l'identite ; ce qui en depend est
-    // l'enregistrement serveur dans `user_search_history`, d'ou l'eviction pour que
-    // la recherche suivante reparte authentifiee.
+    // changement d'identite (connexion, deconnexion, bascule de compte).
     let apply = move || {
         leptos::task::spawn_local(async move {
             let mail = crate::auth::current_email().await;

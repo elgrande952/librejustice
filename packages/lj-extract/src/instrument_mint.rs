@@ -11,8 +11,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use lj_core::text::{fold, slug};
 use lj_core::truecase::{is_caps_lock, truecase};
+use lj_fold::{fold, slug};
 
 /// Verdict de dérivation pour une fiche INTL héritée.
 #[derive(Debug, Clone, PartialEq)]
@@ -356,7 +356,7 @@ fn uid_core(folded_seg: &str, nature: &str) -> String {
         .map(str::to_string)
         .collect();
     let stem = if tokens.is_empty() {
-        slug(folded_seg)
+        slug(folded_seg, '-')
     } else {
         tokens.join("-")
     };

@@ -1,34 +1,7 @@
--- Migration 0052 — Arrays légaux dénormalisés au grain décision.
---
--- ``legal_instruments`` / ``legal_article_composite`` (données par-décision,
--- aujourd'hui répliquées sur chaque chunk pour le filtre ``chunks_bm25``)
--- montent sur ``decisions`` : elles alimentent les fast fields de
--- ``decisions_bm25`` (jambes BM25 body + titre au grain décision, migration
--- 0053). Les colonnes chunk homonymes restent en place — la jambe ANN filtre
--- toujours au scan chunk (VectorChord exige le filtre local, pas de join).
--- Résolution canonique COALESCE identique à la sync chunk (0049).
---
--- Le backfill est set-based et tourne AVANT le build de ``decisions_bm25``
--- (0053) : l'UPDATE massif n'a aucune maintenance d'index BM25 à porter
--- (leçon 0047/0048). N'appliquer qu'une fois le backfill ``full_text``
--- terminé (étape 1) : l'UPDATE touche ``decisions`` et entrerait
--- sinon en concurrence de verrous avec la boucle de backfill.
-
--- =====================================================================
--- 1. Colonnes arrays légaux au grain décision
--- =====================================================================
-
 ALTER TABLE decisions
     ADD COLUMN IF NOT EXISTS legal_instruments       TEXT[],
     ADD COLUMN IF NOT EXISTS legal_article_composite TEXT[];
 
--- =====================================================================
--- 2. Sync incrémentale au grain décision (réutilisée par
---    consolidate-legal-refs / reextract-fields)
--- =====================================================================
-
--- Même agrégation que ``_sync_chunks_legal_instruments_for`` (0048/0049),
--- mais une seule ligne par décision (pas de fanout chunk). COALESCE canonique.
 CREATE OR REPLACE FUNCTION _sync_decisions_legal_instruments_for(p_ids bigint[])
 RETURNS void AS $$
     WITH agg AS (
@@ -58,17 +31,6 @@ RETURNS void AS $$
       );
 $$ LANGUAGE sql;
 
--- =====================================================================
--- 3. Backfill par lots d'id (mémoire bornée par lot, ~3 M lignes)
--- =====================================================================
-
--- Un backfill set-based d'un seul tenant (CTE agrégeant les ~3 M décisions
--- jointes à decision_legal_references) matérialise un hash-agg + tri par groupe
--- qui dépasse la RAM du serveur (24 Go) → OOM/swap saturé. On borne la mémoire
--- en appelant la sync par fenêtres d'id : chaque appel n'agrège que les refs de
--- sa fenêtre. Même pattern « keyset par lot » que les backfills lj-ingest
--- (backfill_text_fields). Le tout reste dans la transaction de migration
--- (atomique) — seule la mémoire PAR STATEMENT est bornée, pas la transaction.
 DO $$
 DECLARE
     b     bigint := 0;

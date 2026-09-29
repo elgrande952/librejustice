@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
 
 use lj_core::case_names::case_name_key;
-use lj_core::parsing::{
+use lj_parse::{
     ce_list_names, is_pseudonymised, parse_ce_list_anchors, parse_ce_list_page, split_joint_name,
     CeListAnchor, CeListEntry,
 };
@@ -69,7 +69,7 @@ pub async fn sync_ce_list() -> Result<()> {
                 date = anchor.date,
                 numero = anchor.docket,
                 nom = name,
-                "ancre sans décision au fonds"
+                "anchor without a decision in the corpus"
             );
             orphelines += 1;
             continue;
@@ -174,7 +174,7 @@ async fn harvest(
                         titre = entry.title,
                         date = a.date,
                         numero = a.docket,
-                        "ancre sans nom à sa date"
+                        "anchor without a name at its date"
                     );
                 }
                 sans_nom += lot.len();

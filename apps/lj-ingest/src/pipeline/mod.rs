@@ -17,8 +17,10 @@ mod adde;
 mod affiliations;
 mod annonces;
 mod annonces_couverture;
+mod applicability_events;
 mod ariane;
 mod article_commentaires;
+mod assertions;
 mod attract;
 mod backfill;
 mod batch;
@@ -40,6 +42,7 @@ mod eu_rproc;
 mod europe;
 mod false_merges;
 mod files;
+mod hal;
 mod jorf;
 mod juricaf;
 mod kali;
@@ -49,7 +52,7 @@ mod opendata;
 mod parties;
 mod precompute;
 mod prepare;
-mod quantum_gold;
+mod quantum;
 mod reconcile;
 mod reextract;
 mod registries;
@@ -63,19 +66,23 @@ mod slugs;
 mod suggest_build;
 mod text_refs;
 mod text_rename;
+mod toc_paths;
 mod treaty_bodies;
+mod union_filing;
 mod unmerge;
 mod unmerge_dila;
 
 pub use adde::sync_adde;
 pub use affiliations::derive_affiliations;
 pub use annonces::{
-    annonces, annonces_backfill, annonces_discover, annonces_enrichir, annonces_jumeler,
-    annonces_regulariser, annonces_resoudre,
+    annonces, annonces_backfill, annonces_contenu, annonces_decp, annonces_discover,
+    annonces_enrichir, annonces_jumeler, annonces_regulariser, annonces_resoudre,
+    annonces_sonder_liens,
 };
 pub use annonces_couverture::annonces_couverture;
 pub use ariane::sync_ariane;
 pub use article_commentaires::{reconcile_article_commentaires, seed_article_commentaires};
+pub use assertions::{assertions_compile, assertions_control, assertions_coverage, CompileOptions};
 pub use backfill::{backfill_canonical_ref, backfill_ecli, merge_cross_source_duplicates};
 pub use bofip::{ingest_bofip, sync_bofip};
 pub use ce_list::sync_ce_list;
@@ -91,22 +98,25 @@ pub(crate) use eu_catalog::{canonical_of, datasets_a_retirer};
 pub use eu_catalog::{ingest_eu_catalog, merge_eu_swapped_uids, sync_eu_catalog, sync_eu_jorf};
 pub use eu_law::sync_eu_law;
 pub use eu_rproc::ingest_eu_rproc;
-pub use europe::{cache_cedh, ingest_cedh, ingest_cjue, sync_cedh, sync_cjue};
+pub use europe::{
+    backfill_cjue_joined_cases, cache_cedh, ingest_cedh, ingest_cjue, sync_cedh, sync_cjue,
+};
 pub use false_merges::analyze_false_merges;
-pub use jorf::{ingest_jorf, sync_jorf};
+pub use hal::{sync_hal, HalScan};
+pub use jorf::{backfill_jorf_bodies, ingest_jorf, sync_jorf};
 pub use juricaf::juricaf_probe;
 pub use kali::{ingest_kali, requalifier_kali, sync_kali};
 pub use legal_corpus::{
     canonicalize_source_labels, load_legal_corpus, reading_ranks, relabel_sources, stamp_freshness,
 };
-pub use legi::{backfill_links, backfill_textes, backfill_toc, ingest_legi, sync_legi};
+pub use legi::{
+    audit_legi_versions, backfill_links, backfill_textes, backfill_toc, ingest_legi, sync_legi,
+};
 pub use opendata::{ingest_judilibre, ingest_opendata, refetch_judilibre, reingest_stale_opendata};
 pub use parties::{reconcile_parties, relink_parties};
-pub use precompute::{
-    precompute_all, resync_chambers, resync_corpus_counts, resync_jurisdiction_counts,
-};
-pub use quantum_gold::load_quantum_gold;
-pub use reconcile::reconcile_all;
+pub use precompute::{precompute_all, resync_corpus_counts, resync_jurisdiction_counts};
+pub use quantum::{extract_quantum, load_quantum_gold, load_quantum_readings};
+pub use reconcile::{reconcile_all, resolve_pending_citations};
 pub use reextract::reextract_fields;
 pub use registries::{load_registries, RegistrySource};
 pub use rekey::{destar_article_keys, rekey_article_keys, rekey_identity_keys};
@@ -115,21 +125,23 @@ pub use roles::backfill_text_roles;
 pub use scope_alsace::scope_backfill_alsace;
 pub use scope_compteurs::scope_backfill_compteurs;
 pub use seats::resolve_seats;
-pub use slugs::assign_slugs;
+pub use slugs::{assign_slugs, drop_country_suffix, remint_text_slugs};
 pub use suggest_build::build_suggest;
 pub use text_refs::extract_text_refs;
 pub use text_rename::rename_texts;
+pub use toc_paths::audit_toc_paths;
 pub use treaty_bodies::backfill_treaty_bodies;
+pub use union_filing::refile_union_texts;
 pub use unmerge::unmerge_same_source;
 pub use unmerge_dila::unmerge_same_source_dila;
 
 use lj_core::decision::Decision;
-use lj_core::parsing::DilaFond;
 use lj_extract::link::{CatalogText, LinkSnapshot};
+use lj_parse::DilaFond;
 use lj_store::db::Connection;
 use lj_store::repository::{DecisionRepository, ExtractedFields};
 
-use crate::chunking::Chunk;
+use lj_chunk::Chunk;
 
 pub const BATCH_SIZE: usize = 128;
 
@@ -163,12 +175,11 @@ pub(crate) struct ExtractCtx {
 }
 
 impl ExtractCtx {
-    pub fn snapshots(&self) -> lj_ingest::extract::Snapshots<'_> {
-        lj_ingest::extract::Snapshots {
+    pub fn snapshots(&self) -> lj_extract_rows::Snapshots<'_> {
+        lj_extract_rows::Snapshots {
             link: &self.link,
             vocab: &self.vocab,
             chrono: &self.chrono,
-            jur_labels: &self.jur_labels,
             jur_codes: &self.jur_codes,
             case_names: &self.case_names,
             seats: &self.seats,
@@ -194,9 +205,10 @@ pub(crate) async fn extract_ctx(conn: &Connection) -> anyhow::Result<&'static Ex
             let link = LinkSnapshot::build(texts.clone(), articles);
             let vocab = lj_extract::compiled::CompiledVocab::build(&texts, &link);
             let jurisdictions = repo.load_jurisdictions().await?;
-            // Snapshots keyés par `source_code` : l'extraction travaille en codes
-            // source (location Judilibre), le code canonique n'apparaît qu'à l'écriture
-            // (`ensure_jurisdictions`).
+            // `jur_labels` and `jur_codes` are keyed by `source_code`, the key
+            // the extraction holds; the gazetteer returns the canonical code,
+            // the one `decisions.jurisdiction_code` carries and every address
+            // joins on.
             let jur_labels = jurisdictions
                 .iter()
                 .map(|j| (j.source_code.clone(), j.label.clone()))
@@ -208,17 +220,19 @@ pub(crate) async fn extract_ctx(conn: &Connection) -> anyhow::Result<&'static Ex
             let chrono = lj_extract::chrono::ChronoSnapshot::new(
                 jurisdictions
                     .into_iter()
-                    .filter_map(|j| Some((j.source_code, j.jurisdiction_type, j.city?))),
+                    .filter_map(|j| Some((j.code, j.jurisdiction_type, j.city?))),
             );
             let case_names = lj_extract::case_link::CaseNameSnapshot::new(
                 repo.unambiguous_case_names().await?.into_iter().filter_map(
-                    |(cle, jt, code, dockets, date)| {
-                        let target = lj_extract::identity::pending_target_keys(
-                            &jt,
-                            code.as_deref(),
-                            &dockets,
-                        );
-                        Some((cle, target.into_iter().next()?, date))
+                    |(cle, code, dockets, date)| {
+                        Some((
+                            cle,
+                            lj_core::address::CaseAddress::new(
+                                code.as_deref()?,
+                                dockets.first()?,
+                                date.as_deref().unwrap_or_default(),
+                            ),
+                        ))
                     },
                 ),
             );
@@ -233,7 +247,7 @@ pub(crate) async fn extract_ctx(conn: &Connection) -> anyhow::Result<&'static Ex
                         span: s.span,
                     }),
             );
-            tracing::info!(n_texts, n_articles, "contexte d'extraction hydraté");
+            tracing::info!(n_texts, n_articles, "extraction context hydrated");
             Ok(ExtractCtx {
                 link,
                 vocab,
@@ -344,6 +358,9 @@ struct Candidate {
     /// `META_JURI_*` pour reconstruire `source_fields`. `None` pour les autres
     /// formats (XML opendata, JSON Judilibre).
     dila_fond: Option<DilaFond>,
+    /// `false` for a text that is not its decision's lead: it is neither cut
+    /// nor embedded.
+    passages: bool,
     /// `source_fields` déjà construits (`payload_format == "html"`, CEDH/CJUE) :
     /// les métadonnées HUDOC/CDM verbatim (colonnes/prédicats) plus les sections
     /// rebasées sur `full_text`. `None` pour les formats dont `prepare_write`

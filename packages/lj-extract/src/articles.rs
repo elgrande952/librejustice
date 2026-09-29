@@ -67,28 +67,11 @@ fn art_re() -> &'static Regex {
     })
 }
 
-/// Supprime les diacritiques (NFKD + drop combining). Implémentation minimale
-/// couvrant les accents français rencontrés dans les libellés de codes.
-fn strip_accents(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'à' | 'â' | 'ä' | 'á' | 'ã' => 'a',
-            'é' | 'è' | 'ê' | 'ë' => 'e',
-            'î' | 'ï' | 'í' | 'ì' => 'i',
-            'ô' | 'ö' | 'ó' | 'ò' | 'õ' => 'o',
-            'û' | 'ü' | 'ù' | 'ú' => 'u',
-            'ÿ' | 'ý' => 'y',
-            'ç' => 'c',
-            other => other,
-        })
-        .collect()
-}
-
 /// Associe un libellé libre (« code de la santé publique ») à un sigle
 /// canonique. Normalise casse/accents/apostrophes/espaces puis cherche le
 /// préfixe le plus long de la table.
 fn norm_suffix(raw_suffix: &str) -> Option<&'static str> {
-    let lowered = strip_accents(&raw_suffix.to_lowercase());
+    let lowered = lj_fold::fold_chars(raw_suffix);
     let replaced: String = lowered
         .chars()
         .map(|c| {

@@ -4,8 +4,8 @@ use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
 use std::collections::HashSet;
 
-use lj_core::parsing::{clean_ocr_markdown, parse_cnda, reflow_cnda_pdf_text, CndaParsed};
 use lj_llm::mistral::{ocr_with_retry, MistralClient};
+use lj_parse::{clean_ocr_markdown, parse_cnda, reflow_cnda_pdf_text, CndaParsed};
 use lj_store::repository::ExtractedFields;
 
 use crate::config::Settings;
@@ -52,7 +52,7 @@ fn cnda_candidate(parsed: CndaParsed, raw_source: &[u8], payload_format: &str) -
         solution_uid: parsed.solution_uid.clone(),
         ..Default::default()
     };
-    let extracted = lj_ingest::extract::with_facet_uids(extracted, Some("CNDA"));
+    let extracted = lj_extract_rows::with_facet_uids(extracted, Some("CNDA"));
     Candidate {
         decision_id: None,
         public_id: generate_public_id(),
@@ -64,6 +64,7 @@ fn cnda_candidate(parsed: CndaParsed, raw_source: &[u8], payload_format: &str) -
         payload_format: payload_format.to_string(),
         write_mode: super::WriteMode::Full,
         dila_fond: None,
+        passages: true,
     }
 }
 
@@ -98,7 +99,7 @@ async fn scanned_ocr_fallback(
             Some(markdown)
         }
         Err(e) => {
-            tracing::warn!(numero = %numero, error = %e, "cnda OCR repli scanné échouée");
+            tracing::warn!(numero = %numero, error = %e, "cnda scanned OCR fallback failed");
             None
         }
     }
@@ -138,11 +139,14 @@ async fn run_cnda(
     // repli pour les rares PDF scannés (cache-first). Client dédié sur le pool
     // standard, donc registre de quota dédié : le seau de `mistral-ocr` n'est pas
     // celui du chat.
-    let ocr_client = if settings.mistral_api_keys.is_empty() {
+    let ocr_keys = lj_store::repository::DecisionRepository::new(&conn)
+        .pool_api_keys("mistral")
+        .await?;
+    let ocr_client = if ocr_keys.is_empty() {
         None
     } else {
         Some(MistralClient::new(
-            settings.mistral_api_keys.clone(),
+            ocr_keys,
             "mistral-ocr-latest".to_string(),
         )?)
     };
@@ -203,7 +207,7 @@ async fn run_cnda(
                 .or_else(|| numero_from_slug(fiche_url))
                 .or_else(|| fiche.numero.clone())
             else {
-                tracing::warn!(fiche = %fiche_url, "cnda fiche sans numéro de décision lisible, skip");
+                tracing::warn!(fiche = %fiche_url, "cnda record without a readable decision number, skip");
                 counts.skipped += 1;
                 continue;
             };
@@ -261,7 +265,7 @@ async fn run_cnda(
                         Ok(text) => (clean_ocr_markdown(&text), "docx", bytes.clone()),
                         Err(e) => {
                             tracing::warn!(numero = %numero, fiche = %fiche_url, error = %e,
-                                "cnda DOCX illisible — décision skippée");
+                                "cnda DOCX unreadable, decision skipped");
                             counts.skipped += 1;
                             continue;
                         }
@@ -291,7 +295,7 @@ async fn run_cnda(
                                 tracing::warn!(
                                     numero = %numero,
                                     fiche = %fiche_url,
-                                    "cnda PDF scanné/illisible sans OCR disponible — décision skippée (retry ultérieur)"
+                                    "cnda PDF scanned/unreadable with no OCR available, decision skipped (retry later)"
                                 );
                                 counts.skipped += 1;
                                 continue;
@@ -319,7 +323,7 @@ async fn run_cnda(
                         numero = %numero,
                         fiche = %fiche_url,
                         error = %e,
-                        "cnda parse impossible — skip (re-fetch ciblé ultérieur)"
+                        "cnda parse impossible, skip (targeted re-fetch later)"
                     );
                     counts.skipped += 1;
                     continue;
@@ -396,7 +400,7 @@ async fn run_cnda(
     // (retirés du corpus, ou numéro erroné).
     if let Some(rem) = &remaining {
         if !rem.is_empty() {
-            tracing::warn!(introuvables = ?rem, "cnda --only : numéros non trouvés dans la liste");
+            tracing::warn!(introuvables = ?rem, "cnda --only: numbers not found in the list");
         }
     }
 

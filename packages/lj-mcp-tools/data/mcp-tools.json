@@ -1,0 +1,1429 @@
+{
+  "instructions": "Search French and European case law: all French courts plus, among others, the CNDA, the Conseil constitutionnel, CNIL sanctions, the CEDH and the CJUE. The engine understands meaning, not just keywords: phrase the query as a natural question or a list of descriptive terms; synonyms and reformulations are handled. Typical workflow: search_decisions for a shortlist, then get_decision to read candidates in full. Previews only orient: never judge relevance, quote, or state what a decision holds from one, as the matched passage may be a party's argument, not the court's ruling. Iterate by refining the query or filters. Open any `url` with the matching tool: /decision/ links with get_decision, /norm/ links with get_norm. When mentioning a decision, hyperlink its `title` (or a conventional citation) to its `url`.",
+  "protocolVersions": [
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05"
+  ],
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Search decisions by meaning and keywords combined. Returns a shortlist: `title`, `url`, an overview (`aiSummary`: AI-written summary of what the decision is about, a machine paraphrase never quotable as the court's words; or `snippet`: the verbatim passage where your keywords matched) and metadata; get_decision reads the full text. Put constraints in the structured filters (jurisdiction, dates, articles, codes), keep the query for the legal issue. Values within one filter are OR'd; different filters are AND'd. The response carries a `facets` block: per filter name, a map of filter value to decision count under the current query. Reuse those keys verbatim to refine. Hit metadata fields carry the same tokens under the same names: a hit's `seat`, `legalDomain` or `solution` passes back verbatim into the matching filter.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ai_rerank": {
+            "default": true,
+            "description": "When enabled (default), reorders results by actual relevance to the query using an LLM reranker. Keep on for agentic use, shortlist quality is significantly higher. Cost: a few seconds of extra latency. Disable only for high-rate exploratory searches where latency matters more than ranking quality.",
+            "type": "boolean"
+          },
+          "date_from": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Earliest decision date, inclusive (YYYY-MM-DD)."
+          },
+          "date_to": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Latest decision date, inclusive (YYYY-MM-DD)."
+          },
+          "legal_article": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 140,
+                  "type": "string"
+                },
+                "maxItems": 20,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Restrict to decisions citing a specific article of a specific code, as a composite key \"<instrument>|<article>\" where <instrument> is a slug or an exact text name, resolved like legal_instrument (e.g. \"code-civil|1240\", \"code-de-justice-administrative|L761-1\"). The instrument prefix is required: the same article number exists in several codes."
+          },
+          "legal_domain": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "CIVIL",
+                    "COMMERCIAL",
+                    "PUBLIC",
+                    "SOCIAL",
+                    "FISCAL",
+                    "PROPRIETE_INTELLECTUELLE",
+                    "EUROPEEN",
+                    "CRIMINEL",
+                    "CONSTITUTIONNEL",
+                    "CIVIL_PROCEDURES_CIVILES_EXECUTION",
+                    "CIVIL_DROIT_IMMOBILIER_CONSTRUCTION",
+                    "CIVIL_DROIT_LOCATIF",
+                    "CIVIL_DROIT_PERSONNES_FAMILLE",
+                    "CIVIL_DROIT_COPROPRIETE_PROPRIETE_IMMOBILIERE",
+                    "CIVIL_DROIT_ASSURANCES",
+                    "CIVIL_DROIT_RESPONSABILITE",
+                    "CIVIL_DROIT_BANCAIRE_BOURSIER",
+                    "CIVIL_DROIT_SUCCESSIONS",
+                    "CIVIL_DROIT_EXPROPRIATION_PREEMPTION",
+                    "CIVIL_DIVORCE_SEPARATION_CORPS",
+                    "CIVIL_DROIT_RURAL",
+                    "CIVIL_DROIT_RESPONSABILITE_CONTRATS",
+                    "CIVIL_DROIT_SAISIE_IMMOBILIERE",
+                    "CIVIL_DROIT_MINEURS",
+                    "COMMERCIAL_DROIT_ENTREPRISES_DIFFICULTE",
+                    "COMMERCIAL_DROIT_BANCAIRE_BOURSIER",
+                    "COMMERCIAL_DROIT_CONTRATS",
+                    "COMMERCIAL_DROIT_SOCIETES",
+                    "COMMERCIAL_DROIT_NUMERIQUE",
+                    "COMMERCIAL_DROIT_TRANSPORT",
+                    "COMMERCIAL_DROIT_ASSURANCES",
+                    "COMMERCIAL_DROIT_CONCURRENCE",
+                    "COMMERCIAL_DROIT_CONSOMMATION",
+                    "COMMERCIAL_DROIT_ARBITRAGE",
+                    "PUBLIC_DROIT_ETRANGERS_NATIONALITE",
+                    "PUBLIC_DROIT_URBANISME_IMMOBILIER_PUBLIC",
+                    "PUBLIC_DROIT_TRAVAIL",
+                    "PUBLIC_DROIT_PENAL_PUBLIC",
+                    "PUBLIC_DROIT_AIDE_ACTION_SOCIALE",
+                    "PUBLIC_DROIT_ENVIRONNEMENT",
+                    "SOCIAL_DROIT_TRAVAIL",
+                    "SOCIAL_DROIT_AIDE_ACTION_SOCIALE",
+                    "SOCIAL_DROIT_PENAL_SOCIAL",
+                    "PROPRIETE_INTELLECTUELLE_INDUSTRIELLE",
+                    "PROPRIETE_INTELLECTUELLE_LITTERAIRE_ARTISTIQUE"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by legal domain (curated domain tree): 9 roots and their leaves (e.g. CIVIL_DROIT_LOCATIF). Selecting a root also matches all its leaves."
+          },
+          "legal_instrument": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                "maxItems": 10,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Restrict to decisions citing one or more given codes or statutes. Accepts a slug from facets.legal_instrument (e.g. \"code-civil\") or an exact text name resolved server-side (e.g. \"Code civil\")."
+          },
+          "limit": {
+            "default": 10,
+            "description": "Maximum number of results (default 10).",
+            "maximum": 20,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "mode": {
+            "default": "auto",
+            "description": "'auto' is the right choice in almost all cases, it picks the regime from the query shape. auto: combines meaning and keyword matching on plain queries; switches to keyword-only when the query contains ET / OU / SAUF or quoted phrases. lexical: force keyword-only matching. Every term becomes required and nothing recovers a miss, so it fits a string you expect word for word (a consecrated formula, the direction of a holding, a party named in the text) and an empty answer is then an answer. reference: force the lookup by identity, on the docket number, the case name, or the court and the date. semantic: force the meaning+keyword hybrid even on quoted or operator queries (where auto would fall back to keyword-only).",
+            "enum": [
+              "auto",
+              "lexical",
+              "semantic",
+              "reference"
+            ],
+            "type": "string"
+          },
+          "office": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "JLD",
+                    "JAF",
+                    "JCP",
+                    "JEX",
+                    "JUGE_ENFANTS",
+                    "PREMIER_PRESIDENT",
+                    "MAGISTRAT_DESIGNE",
+                    "PRESIDENT_SECTION_CONTENTIEUX",
+                    "JUGE_EXPROPRIATION"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by specialised judge/office (JLD, JAF, JCP, JEX, juge des enfants, premier président, magistrat désigné). Absent value = ordinary bench."
+          },
+          "procedure": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "REFERE_SUSPENSION",
+                    "REFERE_LIBERTE",
+                    "REFERE_MESURES_UTILES",
+                    "REFERE_PRECONTRACTUEL",
+                    "REFERE_PROVISION",
+                    "REFERE_CIVIL",
+                    "FILTRAGE_R222_1",
+                    "PAPC",
+                    "QPC",
+                    "QUESTION_PREJUDICIELLE_CJUE",
+                    "RECOURS_REVISION",
+                    "TIERCE_OPPOSITION",
+                    "RECTIFICATION_INTERPRETATION"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by procedural track (référés, QPC, EU referral, révision, tierce opposition…). Absent value = ordinary contentious procedure."
+          },
+          "publication": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "PUBLIE_RAPPORT",
+                    "PUBLIE_BULLETIN",
+                    "LETTRE_CHAMBRE",
+                    "COMMUNIQUE",
+                    "INEDIT_BULLETIN",
+                    "PUBLIE_LEBON",
+                    "MENTIONNE_LEBON",
+                    "INEDIT_LEBON"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by publication, at the grain the Cour de cassation itself uses (any-of, membership is multiple: a decision matches every value whose code it carries). Judicial order: PUBLIE_RAPPORT (annual report, the strongest signal), PUBLIE_BULLETIN, LETTRE_CHAMBRE, COMMUNIQUE, INEDIT_BULLETIN. Administrative order: PUBLIE_LEBON, MENTIONNE_LEBON, INEDIT_LEBON. Lower courts carry no publication statement and match no value."
+          },
+          "query": {
+            "description": "French query, the primary input. Two regimes, pick the right tool for the job: (a) Natural language or descriptive keywords for legal-issue searches; the engine handles synonyms and reformulations. Examples: « responsabilité hôpital infection nosocomiale » ; « étranger malade soins inaccessibles dans son pays d'origine » ; « licenciement discrimination syndicale charge de la preuve ». (b) Quoted exact phrases and ET / OU / SAUF operators for a named entity (company, municipality, person), a precise legal formula, or the direction of a holding: semantic matching ignores negations (« n'est pas X » ranks like « est X »), and only an exact phrase targets which way the court ruled. Examples: « \"Société Générale\" » ; « \"commune de Saint-Denis\" SAUF Réunion » ; « \"force majeure\" ET épidémie ». Using operators or quotes switches the engine to keyword-only matching for the whole query (no synonyms), so do not mix the two regimes.",
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "seat": {
+            "anyOf": [
+              {
+                "items": {
+                  "maxLength": 60,
+                  "type": "string"
+                },
+                "maxItems": 10,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Restrict to one or more seats, as a dotted path from the court type down to the room: \"CA\" (a whole type), \"CA.PARIS\" and \"TJ.BORDEAUX\" (one court), \"CC.C1_CIVILE\", \"CA.PARIS.P5.C3\", \"TJ.LYON.SOCIALE\", \"TJ.PARIS.REFERES\", \"TA.MARSEILLE.C5\" (one room). A path matches itself and everything below it, so start at the type and go deeper. Types: TJ (tribunal judiciaire), CA (cour d'appel), CC (Cour de cassation), TCOM (tribunal des activités économiques), TA (tribunal administratif), CAA (cour administrative d'appel), CE (Conseil d'État), CNDA (asylum), CONSTIT (Conseil constitutionnel), TC (Tribunal des conflits), CNIL (sanctions), CEDH and CJUE (European courts). Take the paths from facets.seat."
+          },
+          "solution": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "REJET",
+                    "IRRECEVABILITE",
+                    "DESISTEMENT",
+                    "NON_LIEU_A_STATUER",
+                    "CONFIRMATION",
+                    "INFIRMATION",
+                    "INFIRMATION_PARTIELLE",
+                    "REFORMATION",
+                    "CASSATION",
+                    "CASSATION_PARTIELLE",
+                    "ANNULATION",
+                    "CONFORMITE",
+                    "NON_CONFORMITE",
+                    "INELIGIBILITE",
+                    "SATISFACTION_TOTALE",
+                    "SATISFACTION_PARTIELLE",
+                    "AUTRE"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by the ruling of the operative part (référentiel solution). REJET / IRRECEVABILITE / DESISTEMENT / NON_LIEU_A_STATUER are procedural or negative endings; CONFIRMATION / INFIRMATION* / REFORMATION are appeal outcomes; CASSATION* is cassation-specific; ANNULATION covers administrative annulment; SATISFACTION_TOTALE / SATISFACTION_PARTIELLE cover first-instance civil rulings granting the claim."
+          },
+          "sort": {
+            "default": "relevance",
+            "description": "Result ordering. Use 'relevance' (default) unless the user wants chronological order.",
+            "enum": [
+              "relevance",
+              "date_desc",
+              "date_asc"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_decisions",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "facets": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "hits": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "aiSummary": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "chars": {
+                  "type": "integer"
+                },
+                "citedArticles": {
+                  "additionalProperties": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "type": "object"
+                },
+                "dateLecture": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "format": "date"
+                },
+                "docketNumbers": {
+                  "anyOf": [
+                    {
+                      "items": {
+                        "type": "string"
+                      },
+                      "type": "array"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "legalDomain": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "office": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "officialUrl": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "procedure": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "publication": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "seat": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "snippet": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "solution": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "title",
+                "url",
+                "chars"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pinned": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "title",
+                "url"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "query": {
+            "type": "string"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query",
+          "total",
+          "hits"
+        ],
+        "type": "object"
+      },
+      "title": "Search Decisions"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Fetch the full text and metadata of a decision by its `url`. The text carries inline markdown links to cited articles (/norm/, open with get_norm) and cited decisions (/decision/, open with get_decision); a citation spanning several articles (« articles 3 à 6 », « et suivants ») links its first article and appends the others as labelled links right after the span. `appellateFate` states in one line what became of THIS decision on review (INFIRMATION = reversed, it no longer stands; CONFIRMATION = upheld): read it before citing the decision as authority. `caseChronology` lists the prior AND subsequent decisions of the same case (appeal, pourvoi, renvoi). An absent fate or chronology never proves no recourse exists, only that none is linked in the corpus. `commentaires` links out to the rapporteur public's conclusions and the court's related documents: context, never the ruling, so quote the decision text and not a commentaire.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "url": {
+            "description": "A librejustice.fr decision URL, from a search_decisions hit or an inline citation link; search_decisions first if you have neither.",
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "type": "object"
+      },
+      "name": "get_decision",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "appellateFate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "caseChronology": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "current": {
+                  "type": "boolean"
+                },
+                "linkToNext": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "solution": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
+              },
+              "required": [
+                "title",
+                "current"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "commentaires": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "access": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "libre",
+                        "abonnes"
+                      ],
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "author": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "date": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "format": "date"
+                },
+                "issue": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "kind": {
+                  "enum": [
+                    "conclusions",
+                    "note"
+                  ],
+                  "type": "string"
+                },
+                "pages": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "publisher": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "title": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "url": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "volume": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dateLecture": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "format": "date"
+          },
+          "docketNumbers": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "jurisdictionCode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "jurisdictionType": {
+            "type": "string"
+          },
+          "legalDomain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "office": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "officialUrl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "procedure": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "publication": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "seat": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "solution": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "text": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "url",
+          "jurisdictionType",
+          "text"
+        ],
+        "type": "object"
+      },
+      "title": "Get Decision"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Fetch a legal text, or one of its articles, as it stood on a given date. Returns the version in force at `date` (omit for today): full text, status, validity dates, and the timeline of all versions: say which version you quote. The text carries inline markdown links to cross-referenced articles (/norm/, open with get_norm; when served at a date, the links point to the same date). `commentaires` links out to commentary anchored on the article. `num` absent means you hold the whole text; the `url` of an article's `section`, or of a `section` entry of `articles`, returns all its articles at once.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "article": {
+            "description": "Lowercase article key, alongside `code` (\"l761-1\" for L. 761-1, \"1240\" for 1240).",
+            "type": "string"
+          },
+          "code": {
+            "description": "Code slug, when you hold the code and the article apart rather than as a url (\"code-civil\"). Alone, addresses the text itself.",
+            "type": "string"
+          },
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Consultation date (YYYY-MM-DD): returns the version in force at that date. Omit for the version currently in force."
+          },
+          "textId": {
+            "description": "Légifrance id: an article (LEGIARTI, JORFARTI, KALIARTI), a text (LEGITEXT, JORFTEXT) or a section (LEGISCTA).",
+            "type": "string"
+          },
+          "url": {
+            "description": "A librejustice.fr article URL `/norm/{juridiction}/{code}/{article}`: take it from a search_norms hit or an inline citation link, or compose it: {juridiction} is the enacting state as ISO 3166-1 alpha-2 lowercase (\"fr\", \"be\"), \"eu\" for the Union, its treaties included, \"intl\" for a treaty signed outside it (the ECHR, a bilateral accord), {code} is the code slug (\"code-civil\", as in facets.legal_instrument), {article} the lowercase article key (\"l761-1\" for L. 761-1, \"1240\" for 1240). `/norm/{juridiction}/{code}` alone addresses the text itself, which is how a text with no articles (circulaire, publication decree) is read.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "get_norm",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "articleCount": {
+            "type": "integer"
+          },
+          "articles": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "article",
+                    "section"
+                  ],
+                  "type": "string"
+                },
+                "num": {
+                  "type": "string"
+                },
+                "section": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "num",
+                "url"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "code": {
+            "type": "string"
+          },
+          "commentaires": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "access": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "libre",
+                        "abonnes"
+                      ],
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "author": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "date": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "format": "date"
+                },
+                "issue": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "kind": {
+                  "enum": [
+                    "conclusions",
+                    "note"
+                  ],
+                  "type": "string"
+                },
+                "pages": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "publisher": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "title": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "url": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "volume": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "dateDebut": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "format": "date"
+          },
+          "dateFin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "format": "date"
+          },
+          "etat": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "modifiedBy": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "date": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "format": "date"
+                },
+                "href": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "label"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "nota": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "num": {
+            "type": "string"
+          },
+          "omitted": {
+            "type": "integer"
+          },
+          "section": {
+            "additionalProperties": false,
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "label",
+              "url"
+            ],
+            "type": "object"
+          },
+          "sourceUrl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "title": {
+            "type": "string"
+          },
+          "travauxParlementaires": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "date": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "format": "date"
+                },
+                "href": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "label": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "label"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "url": {
+            "type": "string"
+          },
+          "versions": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "dateDebut": {
+                  "format": "date",
+                  "type": "string"
+                },
+                "dateFin": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "format": "date"
+                },
+                "etat": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "etat",
+                "dateDebut"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "code",
+          "title",
+          "url",
+          "versions"
+        ],
+        "type": "object"
+      },
+      "title": "Get Norm"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Find legal articles from their subject, their wording, or an article number with no code named; returns a shortlist with highlighted snippets and the exact `total`. Query in French, descriptive terms (« délai de recours contentieux refus implicite »); put the code in the `code` filter (slug or exact name), keep the query for the subject. The response carries a `facets` block (`code`, `jurisdiction`): per filter name, a map of filter value to article count, reuse those keys verbatim to refine. Chain a hit into get_norm with its `url`, plus `date` when the dispute is governed by an earlier version.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Restrict to one code/text by its URL slug (\"code-civil\", as in facets.code) or exact name. Omit to search the whole navigable referential."
+          },
+          "date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Consultation date (YYYY-MM-DD): searches the versions valid at that date (point-in-time, same semantics as get_norm). Omit to search the versions currently in force."
+          },
+          "jurisdiction": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Filter by country/legal order, as an ISO 3166 alpha-2 country code: \"FR\" (France, the bulk of the corpus) or a foreign code (\"SN\", \"DZ\", \"MA\", \"VN\", \"PE\", …); plus \"UE\" for EU law and \"INTL\" for treaties/international law."
+          },
+          "limit": {
+            "default": 10,
+            "description": "Maximum number of results (default 10).",
+            "maximum": 20,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "query": {
+            "description": "French query over legal articles. Matches article titles (boosted) and bodies; alias expansion handles acronyms and usual names.",
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "search_norms",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "facets": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "hits": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "snippet": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "titlePath": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "title",
+                "url",
+                "snippet",
+                "source"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "pinned": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "title": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "title",
+                "url"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "query": {
+            "type": "string"
+          },
+          "total": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query",
+          "total",
+          "hits",
+          "facets"
+        ],
+        "type": "object"
+      },
+      "title": "Search Norms"
+    }
+  ]
+}

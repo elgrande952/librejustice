@@ -29,10 +29,6 @@ impl FromRequestParts<AppState> for OptionalUser {
             return Ok(OptionalUser(None));
         };
         use crate::session::Verdict;
-        // Troisième état : le cookie existe et ne vaut rien. Journalisé ICI, sur
-        // toutes les routes — y compris celles qui se contentent de dégrader en
-        // anonyme, où le refus serait sinon muet. Le motif est dans le corps du
-        // message : un filtre de ligne Loki ne voit que lui.
         match crate::session::resolve(state, &cookie).await {
             Verdict::Porteur { sub, refresh } => {
                 // Réémission : quand l'échéance a glissé en base, pour que le
@@ -46,7 +42,7 @@ impl FromRequestParts<AppState> for OptionalUser {
                 Ok(OptionalUser(Some(sub)))
             }
             Verdict::Indisponible => {
-                tracing::warn!("session indéterminée : la base n'a pas répondu");
+                tracing::warn!("session undetermined: the database did not answer");
                 Ok(OptionalUser(None))
             }
             refus => {
@@ -54,7 +50,7 @@ impl FromRequestParts<AppState> for OptionalUser {
                     Verdict::FormeInvalide => "forme_invalide",
                     _ => "inconnue",
                 };
-                tracing::warn!("session refusée : {motif}");
+                tracing::warn!("session refused: {motif}");
                 parts.extensions.insert(SessionRejected);
                 Ok(OptionalUser(None))
             }

@@ -1,0 +1,1 @@
+ALTER TABLE decisions ALTER COLUMN search_title DROP EXPRESSION;

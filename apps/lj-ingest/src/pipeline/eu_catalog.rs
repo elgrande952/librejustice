@@ -6,8 +6,9 @@
 //! - BY DEMAND ([`ingest_eu_catalog`]): the slashnums our decisions actually
 //!   cite and the corpus lacks (unlinked `legal_citation` spans, cut out of
 //!   `full_text`). Catches the old or repealed acts a decision still invokes.
-//! - BY THE REGISTRY ([`sync_eu_catalog`]): base acts published since a date,
-//!   cited or not. The only door for an act nobody has cited yet.
+//! - BY THE REGISTRY ([`sync_eu_catalog`]): the whole registry of the six
+//!   secondary-law types, cited or not, then its daily delta. The only door for
+//!   an act nobody has cited yet.
 //! - BY THE FRENCH JO ([`sync_eu_jorf`]): the DILA fiches of European nature,
 //!   which name an act and never carry its body. Each is paired with its
 //!   EUR-Lex act, then collapses into it, leaving one identity per act.
@@ -183,7 +184,7 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
         slashnums = missing.len(),
         target_edges,
         total_edges,
-        "ingestion EUR-Lex : slashnums cités-absents à récupérer"
+        "EUR-Lex ingest: cited-but-missing slashnums to fetch"
     );
 
     let client = CjueClient::new();
@@ -215,7 +216,7 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
                 "DIRECTIVE_EURO"
             };
             ecrire_dataset(&path, &text_uid, &title, date.as_deref(), nature_db, celex)?;
-            tracing::debug!(celex, %text_uid, edges, "acte UE récupéré");
+            tracing::debug!(celex, %text_uid, edges, "EU act fetched");
             written += 1;
             done = true;
             break;
@@ -234,7 +235,7 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
         skipped_existing,
         not_found,
         mismatch,
-        "ingestion EUR-Lex terminée : datasets générés (charger via load-legal-corpus)"
+        "EUR-Lex ingest done: datasets generated (load them with load-legal-corpus)"
     );
     println!(
         "ingest-eu-catalog : {written} écrits, {skipped_existing} déjà présents, \
@@ -244,46 +245,86 @@ pub async fn ingest_eu_catalog(limit: Option<usize>) -> Result<()> {
     Ok(())
 }
 
-/// Sweeps the EUR-Lex registry from `depuis` and brings in every act the corpus
-/// lacks. The only door through which an uncited act arrives, since
-/// [`ingest_eu_catalog`] sees only what our decisions name. Loads right away, one
-/// file per transaction, otherwise nothing exists in the database.
-pub async fn sync_eu_catalog(
-    depuis: NaiveDate,
-    jusqu_a: NaiveDate,
-    limit: Option<usize>,
-) -> Result<()> {
+/// First year of the registry: the ECSC acts of 1952.
+pub(crate) const PREMIERE_ANNEE: i32 = 1952;
+
+/// Days the registry delta reaches back before its watermark. CELLAR can register
+/// an act after the day it dates the registration with; the overlap costs a few
+/// hundred rows, the weekly full sweep catches what it still misses.
+const RECOUVREMENT_JOURS: i64 = 30;
+
+/// What a registry pass did: whether it swept the whole registry, and the acts
+/// it brought in.
+pub struct CatalogPass {
+    pub full: bool,
+    pub entered: Vec<String>,
+}
+
+/// Brings in every act of the EUR-Lex registry the corpus lacks. The only door
+/// through which an uncited act arrives, since [`ingest_eu_catalog`] sees only
+/// what our decisions name. Two cadences: the delta asks the acts CELLAR
+/// registered since the watermark of the eu-law manifest, the full pass sweeps
+/// the registry year by year, and is the bootstrap when the watermark is absent.
+/// Loads right away, one file per transaction, otherwise nothing exists in the
+/// database.
+pub async fn sync_eu_catalog(full: bool, limit: Option<usize>) -> Result<CatalogPass> {
     let settings = Settings::from_env()?;
     let dir = settings.legal_corpus_dir();
     std::fs::create_dir_all(&dir).map_err(|e| anyhow!("mkdir {}: {e}", dir.display()))?;
+    let manifest_path = lj_sources::cjue::eu_law_manifest_path(&settings.cache_dir());
+    let mut manifest = lj_sources::cjue::EuLawManifest::load(&manifest_path)
+        .map_err(|e| anyhow!("manifest eu-law: {e}"))?;
+    let aujourdhui = chrono::Utc::now().date_naive();
+    let since = match (&manifest.catalog_since, full) {
+        (Some(watermark), false) => {
+            let watermark = NaiveDate::parse_from_str(watermark, "%Y-%m-%d")
+                .map_err(|e| anyhow!("catalog_since {watermark:?}: {e}"))?;
+            Some(watermark - chrono::Duration::days(RECOUVREMENT_JOURS))
+        }
+        _ => None,
+    };
 
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
     let repo = DecisionRepository::new(&conn);
     // Disk alone would lie: an act loaded from another machine has no dataset
-    // here, and would be rewritten then reloaded on every pass.
-    let en_base: std::collections::HashSet<String> = repo
+    // here, and would be rewritten then reloaded on every pass. The CELEX
+    // counts as much as the uid: `EU/REG/1408-71` holds 31971R1408, and
+    // `EU/REG/1408-1971` would open it a second time.
+    let registre = repo
         .eu_law_registry()
         .await
-        .map_err(|e| anyhow!("eu_law_registry: {e}"))?
-        .into_iter()
-        .map(|(uid, ..)| uid)
-        .collect();
+        .map_err(|e| anyhow!("eu_law_registry: {e}"))?;
+    let mut en_base: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (uid, celex, ..) in registre {
+        en_base.insert(uid);
+        if let Some(canonical) = canonical_uid_from_notice(&celex) {
+            en_base.insert(canonical);
+        }
+    }
 
     let client = CjueClient::new();
-    let (plancher, plafond) = (depuis.to_string(), jusqu_a.to_string());
     let (mut vus, mut deja) = (0usize, 0usize);
-    let mut ecrits: Vec<std::path::PathBuf> = Vec::new();
-    'balayage: for annee in depuis.year()..=jusqu_a.year() {
+    let mut ecrits: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let partitions: Vec<Option<i32>> = match since {
+        Some(_) => vec![None],
+        None => (PREMIERE_ANNEE..=aujourdhui.year()).map(Some).collect(),
+    };
+    'balayage: for annee in partitions {
         let mut offset = 0usize;
         loop {
-            let page = client.legislation_page(annee, offset).await?;
+            let page = match (annee, since) {
+                (Some(annee), _) => client.legislation_page(annee, offset).await?,
+                (None, Some(since)) => {
+                    client
+                        .legislation_since_page(&since.to_string(), offset)
+                        .await?
+                }
+                (None, None) => unreachable!("a delta pass always has its bound"),
+            };
             let pleine = page.len() >= lj_sources::cjue::PAGE_SIZE;
             for (celex, date, title) in &page {
-                if date.as_str() < plancher.as_str() || date.as_str() > plafond.as_str() {
-                    continue;
-                }
                 let Some(text_uid) = text_uid_from_celex(celex) else {
                     continue; // corrigendum, unnumbered act: not a corpus text
                 };
@@ -299,8 +340,8 @@ pub async fn sync_eu_catalog(
                     "DIRECTIVE_EURO"
                 };
                 ecrire_dataset(&path, &text_uid, title, Some(date), nature_db, celex)?;
-                tracing::debug!(celex, %text_uid, "acte UE découvert au registre");
-                ecrits.push(path);
+                tracing::debug!(celex, %text_uid, "EU act discovered in the registry");
+                ecrits.push((path, text_uid));
                 if limit.is_some_and(|n| ecrits.len() >= n) {
                     break 'balayage;
                 }
@@ -313,7 +354,7 @@ pub async fn sync_eu_catalog(
     }
 
     let mut publie_targets = std::collections::HashSet::new();
-    for path in &ecrits {
+    for (path, _) in &ecrits {
         conn.batch_execute("BEGIN")
             .await
             .map_err(|e| anyhow!("BEGIN: {e}"))?;
@@ -331,21 +372,35 @@ pub async fn sync_eu_catalog(
     if !ecrits.is_empty() {
         super::legal_corpus::run_corpus_finishers(&repo, publie_targets).await?;
     }
+    // A pass cut by `--limit` has not seen the whole window.
+    if limit.is_none() {
+        manifest.catalog_since = Some(aujourdhui.to_string());
+        manifest
+            .save(&manifest_path)
+            .map_err(|e| anyhow!("manifest save: {e}"))?;
+    }
 
+    let full = since.is_none();
     tracing::info!(
-        depuis = %depuis,
-        jusqu_a = %jusqu_a,
+        full,
+        since = ?since,
         vus,
         deja,
         ecrits = ecrits.len(),
-        "sync-eu-catalog : registre EUR-Lex balayé"
+        "sync-eu-catalog: EUR-Lex registry swept"
     );
     println!(
-        "sync-eu-catalog : {vus} actes au registre du {depuis} au {jusqu_a}, {deja} déjà au fonds, \
-         {n} entrés et chargés.",
+        "sync-eu-catalog ({}) : {vus} actes au registre, {deja} déjà au fonds, {n} entrés et chargés.",
+        match since {
+            Some(since) => format!("delta depuis le {since}"),
+            None => "registre entier".to_string(),
+        },
         n = ecrits.len()
     );
-    Ok(())
+    Ok(CatalogPass {
+        full,
+        entered: ecrits.into_iter().map(|(_, uid)| uid).collect(),
+    })
 }
 
 /// Nature the DILA title announces, in the vocabulary [`celex_candidates`]
@@ -442,7 +497,7 @@ pub async fn sync_eu_jorf(limit: Option<usize>) -> Result<()> {
         };
         if repo.collapse_legal_text(jorf_uid, &uid).await?.is_some() {
             fusionnees += 1;
-            tracing::debug!(from = jorf_uid, to = uid, "coquille JO fusionnée");
+            tracing::debug!(from = jorf_uid, to = uid, "OJ typo merged");
         }
     }
     // On `frappees`, not on `publie_targets`: a catalogue entry has no article,
@@ -451,7 +506,7 @@ pub async fn sync_eu_jorf(limit: Option<usize>) -> Result<()> {
     if frappees > 0 {
         super::legal_corpus::run_corpus_finishers(&repo, publie_targets).await?;
     }
-    let denorm = repo.refresh_article_denorm().await?;
+    let denorm = repo.refresh_article_denorm(None).await?;
     let (ranked_texts, _) = repo.refresh_reading_ranks().await?;
 
     tracing::info!(
@@ -461,7 +516,7 @@ pub async fn sync_eu_jorf(limit: Option<usize>) -> Result<()> {
         sans_acte,
         denorm,
         ranked_texts,
-        "sync-eu-jorf : coquilles du JO appariées à EUR-Lex"
+        "sync-eu-jorf: OJ typos matched to EUR-Lex"
     );
     println!(
         "sync-eu-jorf : {total} coquilles du JO, {fusionnees} fusionnées dans leur acte EUR-Lex \
@@ -568,7 +623,7 @@ pub async fn merge_eu_swapped_uids(apply: bool) -> Result<()> {
                 gauche_celex = ?pair.0.celex,
                 droite = %pair.1.text_uid,
                 droite_celex = ?pair.1.celex,
-                "uid permutés non prouvés doublons, laissés en place"
+                "swapped uids not proven duplicates, left in place"
             );
             continue;
         };
@@ -593,7 +648,7 @@ pub async fn merge_eu_swapped_uids(apply: bool) -> Result<()> {
                 meurt.text_uid,
                 meurt.articles,
                 if *corps_a_deplacer {
-                    ", corps à déplacer"
+                    ", body to move"
                 } else {
                     ""
                 }
@@ -611,7 +666,7 @@ pub async fn merge_eu_swapped_uids(apply: bool) -> Result<()> {
                 .await?;
             fusionnees += 1;
         }
-        tracing::info!(garde = %garde.text_uid, meurt = %meurt.text_uid, corps_a_deplacer, "uid permuté fusionné");
+        tracing::info!(garde = %garde.text_uid, meurt = %meurt.text_uid, corps_a_deplacer, "swapped uid merged");
     }
 
     // Read after the merges, so the disk pass sees the state a regeneration
@@ -629,7 +684,7 @@ pub async fn merge_eu_swapped_uids(apply: bool) -> Result<()> {
         if apply {
             std::fs::remove_file(path).map_err(|e| anyhow!("rm {}: {e}", path.display()))?;
         }
-        tracing::info!(dataset = %path.display(), uid, nomme, apply, "dataset ressemant un uid fermé");
+        tracing::info!(dataset = %path.display(), uid, nomme, apply, "dataset reseeding a closed uid");
     }
 
     let (n, s) = (orphelins.len(), if orphelins.len() > 1 { "s" } else { "" });

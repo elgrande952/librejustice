@@ -63,7 +63,9 @@ pub fn decision_title(
         seat,
         date_lecture,
         nom_usage,
-        docket_numbers.and_then(|d| d.first()).map(String::as_str),
+        docket_numbers
+            .and_then(lj_core::titles::docket_display)
+            .as_deref(),
     )
 }
 
@@ -117,8 +119,12 @@ mod tests {
 
     #[test]
     fn seat_office_depuis_les_axes() {
-        // Chambre que rien ne qualifie : le libellé tombe sur la clé seule.
-        let label = lj_core::chamber::seat_label(Some("C7"));
+        // A room nothing qualifies: the label is the number alone.
+        let label = lj_core::chamber::Seat {
+            chamber: Some(lj_core::chamber::ChamberId::Number(7)),
+            ..Default::default()
+        }
+        .label();
         let seat = decision_seat(
             "Tribunal judiciaire de Nanterre",
             label.as_deref(),

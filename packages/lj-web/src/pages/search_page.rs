@@ -1,6 +1,6 @@
-//! Page de recherche de décisions `/decisions` (gabarit du secteur) :
+//! Page de recherche de décisions `/decision-search` (gabarit du secteur) :
 //! CompactSearch + barre de filtres horizontale + résultats. La recherche de
-//! textes vit sur sa propre page `/textes` (moteurs et filtres distincts,
+//! textes vit sur sa propre page `/norm-search` (moteurs et filtres distincts,
 //! aucune recherche transverse). État dans les query params ; données via
 //! `leptos-fetch` (SWR) ; DTO `lj-dtos`.
 //!
@@ -29,13 +29,14 @@ use crate::components::search::compact_search::search_state::{key_from_map, Sear
 use crate::components::search::compact_search::DraftQuery;
 use crate::components::search::view_prefs::CardView;
 use crate::components::search::{
-    corpus_stats, effective_card_view, ActiveFilterChips, CompactSearch, DecisionsFilterBar,
-    Pagination, ResultEmpty, ResultError, ResultList, ResultSkeleton, SearchRail, SortSelect,
-    StaleCounts, SyntaxHint, TextesCorpusTeaser, TextesTeaser, ViewControls,
+    answered, corpus_stats, effective_card_view, is_stale, ActiveFilterChips, CompactSearch,
+    DecisionsFilterBar, ModeSelect, Pagination, ResultEmpty, ResultError, ResultList,
+    ResultSkeleton, SearchRail, SortSelect, StaleCounts, SyntaxHint, TextesCorpusTeaser,
+    TextesTeaser, ViewControls, DECISION_MODES,
 };
 use crate::helpers::{format_results_count, total_pages, SEARCH_PAGE_SIZE};
 
-/// `/decisions` est **rendue côté client** : route non indexée, la plus coûteuse
+/// `/decision-search` est **rendue côté client** : route non indexée, la plus coûteuse
 /// en SSR (elle rend CompactSearch + cartes + facettes côté serveur) et la seule
 /// porteuse des mismatches d'hydratation (date-picker, nav). `ClientOnly` rend
 /// un squelette statique au SSR et au 1er rendu, puis
@@ -136,12 +137,16 @@ fn DecisionsView() -> impl IntoView {
     // filtres. Question changée, le rail passe en attente ; filtre changé, il
     // reste cliquable mais ses nombres comptent l'ensemble d'avant le clic.
     let counted = RwSignal::new(None::<SearchKey>);
+    // Full key, not `count_key`: the resolved mode and the rerank verdict depend
+    // on the sort and the AI mode, which `count_key` drops.
+    let answered_key = RwSignal::new(None::<SearchKey>);
     Effect::new(move |_| {
         if let Some(Ok(resp)) = resource.get() {
             volume.set(Some(Volume {
                 mode: resp.query_mode,
                 reranked: resp.reranked,
             }));
+            answered_key.set(Some(key.get_untracked()));
             if let Some(compte) = resp.total {
                 total.set(Some(compte));
             }
@@ -161,11 +166,10 @@ fn DecisionsView() -> impl IntoView {
     });
     // `Memo` : lu par le compteur de chaque ligne de facette, plusieurs centaines
     // sous une branche juridiction dépliée.
-    let stale = Memo::new(move |_| counted.get() != Some(key.get().count_key()));
+    let count_key = Signal::derive(move || key.get().count_key());
+    let stale = Memo::new(move |_| is_stale(counted.into(), count_key).get());
     provide_context(StaleCounts(stale.into()));
-    // Le total suit la même règle que les compteurs de facettes : absent le temps
-    // qu'il compte les filtres de l'URL, la volumétrie rendant sa place d'attente.
-    let shown_total = Signal::derive(move || total.get().filter(|_| !stale.get()));
+    let shown_total = answered(total.into(), counted.into(), count_key);
     // Skeleton : clé en premier chargement (`is_loading` leptos-fetch) ET rien en
     // cache pour elle. La lecture SYNCHRONE du cache donne les deux comportements :
     // pas de flash au retour depuis `/decision` (cache présent → rendu direct), et
@@ -184,10 +188,14 @@ fn DecisionsView() -> impl IntoView {
     });
     let has_query = Signal::derive(move || !query.get().is_empty());
     let stats = corpus_stats();
-    // Mode RÉSOLU par le serveur, pas le mode demandé : c'est lui qui décide de
-    // la vue automatique des cartes et du grisage du tri IA.
-    let mode = Signal::derive(move || volume.get().map(|v| v.mode));
-    let default_view = effective_card_view(query, mode);
+    // `servi` asserts, so it goes silent in flight; the card view holds the
+    // page's shape and keeps the last known mode, a toggle flipping on every
+    // refetch being worse than a default one round-trip behind.
+    let servi: Signal<Option<Volume>> = answered(volume.into(), answered_key.into(), key);
+    let mode = Signal::derive(move || servi.get().map(|v| v.mode));
+    let reranked = Signal::derive(move || servi.get().map(|v| v.reranked));
+    let dernier_mode = Signal::derive(move || volume.get().map(|v| v.mode));
+    let default_view = effective_card_view(query, dernier_mode);
     let (ai_mode, set_ai_mode) = crate::components::search::compact_search::ai_mode::use_ai_mode();
 
     view! {
@@ -220,7 +228,15 @@ fn DecisionsView() -> impl IntoView {
                     </div>
                     <ActiveFilterChips facets=facets />
                     <div class="lg:hidden">
-                        <ViewControls query=query mode=mode rerank=ai_mode on_rerank=set_ai_mode>
+                        <ViewControls
+                            query=query
+                            mode=dernier_mode
+                            served=mode
+                            rerank=ai_mode
+                            on_rerank=set_ai_mode
+                            reranked=reranked
+                        >
+                            <ModeSelect resolved=mode modes=DECISION_MODES />
                             <div class="ml-auto">
                                 <SortSelect />
                             </div>
@@ -247,11 +263,14 @@ fn DecisionsView() -> impl IntoView {
                         total=shown_total
                         loading=show_skeleton
                     />
+                    <ModeSelect resolved=mode modes=DECISION_MODES class="w-full" />
                     <ViewControls
                         query=query
-                        mode=mode
+                        mode=dernier_mode
+                        served=mode
                         rerank=ai_mode
                         on_rerank=set_ai_mode
+                        reranked=reranked
                         spread=true
                     />
                     <div class="flex self-start">
@@ -269,9 +288,9 @@ fn DecisionsView() -> impl IntoView {
     }
 }
 
-/// Volumétrie desktop, en tête de la colonne droite : « N résultats / pour
-/// « q » / Recherche <mode> », ou l'état d'attente pendant un chargement à
-/// cache froid. En parcours il n'y a pas de question, donc pas de ligne « pour ».
+/// Desktop volumetry, heading the right column: the count, or the waiting state
+/// on a cold cache. The question is in the bar and the mode is on the pills, so
+/// only browse adds a line, having neither.
 #[component]
 fn SearchSummary(
     #[prop(into)] query: Signal<String>,
@@ -283,9 +302,9 @@ fn SearchSummary(
         if loading.get() {
             return waiting_summary(query.get()).into_any();
         }
-        let Some(volume) = volume.get() else {
+        if volume.get().is_none() {
             return ().into_any();
-        };
+        }
         let compte = move || match total.get() {
             Some(total) => view! {
                 <h2 class="font-sans text-xl text-[var(--color-ink)]">
@@ -295,27 +314,7 @@ fn SearchSummary(
             .into_any(),
             None => view! { <CountPlaceholder /> }.into_any(),
         };
-        if volume.mode == QueryMode::Browse {
-            return view! {
-                <div class="flex flex-col gap-1">
-                    {compte}
-                    <p class="text-xs text-[var(--color-ink-subtle)]">{MODE_BROWSE}</p>
-                </div>
-            }
-            .into_any();
-        }
-        let mode_label = mode_label(volume);
-        view! {
-            <div class="flex flex-col gap-1">
-                {compte}
-                <p class="text-sm leading-snug text-[var(--color-ink-subtle)]">
-                    "pour "
-                    <em class="text-[var(--color-ink)]">"«\u{00A0}"{move || query.get()}"\u{00A0}»"</em>
-                </p>
-                <p class="text-xs text-[var(--color-ink-subtle)]">{mode_label}</p>
-            </div>
-        }
-        .into_any()
+        compte().into_any()
     }
 }
 
@@ -331,43 +330,22 @@ fn CountPlaceholder() -> impl IntoView {
     }
 }
 
-/// Ce que la volumétrie annonce sous le compte : le mode qui a produit la liste.
-const MODE_BROWSE: &str = "Parcours par date";
-
-/// `reranked` vient du serveur : le tri IA renonce en silence (tri par date,
-/// budget épuisé), il ne s'annonce donc que s'il a réordonné.
+/// `reranked` is the server's answer, not the caller's request: it gives up
+/// silently on an exhausted budget or under three results, and nothing else on
+/// the page knows.
 #[derive(Clone, Copy, PartialEq)]
 struct Volume {
     mode: QueryMode,
     reranked: bool,
 }
 
-fn mode_label(volume: Volume) -> &'static str {
-    match (volume.mode, volume.reranked) {
-        (QueryMode::Lexical, _) => "Recherche lexicale",
-        (QueryMode::Hybrid, false) => "Recherche sémantique",
-        (QueryMode::Hybrid, true) => "Recherche sémantique, triée par IA",
-        (QueryMode::Reference, _) => "Recherche par référence",
-        (QueryMode::Browse, _) => MODE_BROWSE,
-    }
-}
-
-/// Attente à cache froid : la question si elle existe, le fonds sinon.
 fn waiting_summary(query: String) -> AnyView {
-    if query.is_empty() {
-        return view! {
-            <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">"Chargement du fonds…"</h2>
-        }
-        .into_any();
-    }
-    view! {
-        <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">
-            "Recherche en cours pour "
-            <em class="not-italic">"«\u{00A0}"{query}"\u{00A0}»"</em>
-            "…"
-        </h2>
-    }
-    .into_any()
+    let label = if query.is_empty() {
+        "Chargement du fonds…"
+    } else {
+        "Recherche en cours…"
+    };
+    view! { <h2 class="font-sans text-xl text-[var(--color-ink-subtle)]">{label}</h2> }.into_any()
 }
 
 /// Volumétrie compacte, rendue dans la ligne mobile qui porte aussi l'aide à la
@@ -385,9 +363,9 @@ fn MobileSummary(
             }
             .into_any();
         }
-        let Some(volume) = volume.get() else {
+        if volume.get().is_none() {
             return ().into_any();
-        };
+        }
         view! {
             <p class="text-sm text-[var(--color-ink-subtle)]">
                 {move || {
@@ -398,12 +376,9 @@ fn MobileSummary(
                                 <span class="font-medium text-[var(--color-ink)]">
                                     {format_results_count(total)}
                                 </span>
-                                " · "
                             }
-                                .into_any()
                         })
                 }}
-                {mode_label(volume)}
             </p>
         }
         .into_any()
@@ -517,10 +492,11 @@ fn ResultsBody(
     #[prop(into)] default_view: Signal<CardView>,
 ) -> impl IntoView {
     let pinned = result.pinned.clone();
+    let pinned_more = result.pinned_more;
     if result.hits.is_empty() {
         return view! {
             <div class="flex min-w-0 flex-col gap-6">
-                <PinnedCard pinned=pinned />
+                <PinnedCard pinned=pinned more=pinned_more />
                 <ResultEmpty query=query />
             </div>
         }
@@ -558,21 +534,21 @@ fn ResultsBody(
     // La pagination est bornée par la liste servie, pas par le décompte, qui
     // arrive par son propre appel. En parcours la liste n'est qu'une fenêtre sur
     // le fonds, et le total la borne.
-    let servis = result.all_hit_ids.len() as i64;
+    let servis = result.all_hit_paths.len() as i64;
     let total = match result.query_mode {
         QueryMode::Browse => result.total.unwrap_or(servis),
         _ => servis,
     };
     let pages = total_pages(total) as u32;
     let hits = result.hits;
-    let all_hit_ids = result.all_hit_ids;
+    let all_hit_paths = result.all_hit_paths;
     let page = key.get_untracked().page;
     view! {
         <div class="flex min-w-0 flex-col gap-6">
-            <PinnedCard pinned=pinned />
+            <PinnedCard pinned=pinned more=pinned_more />
             <ResultList
                 hits=hits
-                all_hit_ids=all_hit_ids
+                all_hit_paths=all_hit_paths
                 page=page
                 page_size=SEARCH_PAGE_SIZE
                 default_view=default_view
@@ -594,26 +570,29 @@ fn ResultsBody(
 
 /// The top of the reference retrieval, served apart from the content list.
 #[component]
-fn PinnedCard(pinned: Vec<PinnedDecision>) -> impl IntoView {
+fn PinnedCard(pinned: Vec<PinnedDecision>, more: bool) -> impl IntoView {
     if pinned.is_empty() {
         return ().into_any();
     }
     let label = match pinned.len() {
-        1 => "Référence",
-        _ => "Références",
+        1 => "Cherchez-vous cette décision ?",
+        _ => "Cherchez-vous ces décisions ?",
     };
     view! {
         <section
             aria-label=label
             class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 px-4 py-3"
         >
-            <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">{label}</p>
-            <ul class="mt-2 flex flex-col gap-1.5">
+            <p class="font-sans text-sm text-[var(--color-ink-subtle)]">{label}</p>
+            <ul class="mt-2 flex flex-col gap-2">
                 {pinned
                     .into_iter()
                     .map(|d| view! { <PinnedRow decision=d /> })
                     .collect::<Vec<_>>()}
             </ul>
+            <Show when=move || more>
+                <PinnedMore />
+            </Show>
         </section>
     }
     .into_any()
@@ -621,14 +600,53 @@ fn PinnedCard(pinned: Vec<PinnedDecision>) -> impl IntoView {
 
 #[component]
 fn PinnedRow(decision: PinnedDecision) -> impl IntoView {
+    use crate::components::ui::{Badge, BadgeTone};
+
+    let seat = decision.seat.filter(|s| !s.trim().is_empty());
+    let solution = decision
+        .solution
+        .filter(|t| t.key != "AUTRE")
+        .map(|t| t.label);
+    let procedure = decision.procedure.map(|t| t.label);
     view! {
-        <li>
+        <li class="flex flex-col gap-0.5">
             <A
-                href=format!("/decision/{}", decision.id)
+                href=lj_dtos::decision_path(decision.jurisdiction_type, &decision.id)
                 attr:class="font-sans text-base leading-snug text-[var(--color-ink)] no-underline transition-colors hover:text-[var(--color-accent)]"
             >
                 {decision.title}
             </A>
+            <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                {seat
+                    .map(|s| {
+                        view! { <span class="text-xs text-[var(--color-ink-subtle)]">{s}</span> }
+                    })}
+                <div class="ml-auto flex flex-wrap justify-end gap-1.5">
+                    {solution.map(|label| view! { <Badge tone=BadgeTone::Outline>{label}</Badge> })}
+                    {procedure.map(|label| view! { <Badge tone=BadgeTone::Accent>{label}</Badge> })}
+                </div>
+            </div>
         </li>
+    }
+}
+
+/// The card is a sample: `reference` on the same query is the whole list of the
+/// decisions carrying the designation.
+#[component]
+fn PinnedMore() -> impl IntoView {
+    use crate::components::search::compact_search::query_state;
+
+    let query_map = leptos_router::hooks::use_query_map();
+    let href = move || {
+        let qs = query_state::with_param(&query_map.get(), "mode", Some("reference"), true);
+        query_state::search_href(&qs)
+    };
+    view! {
+        <A
+            href=href
+            attr:class="mt-3 inline-block text-xs text-[var(--color-ink-subtle)] underline decoration-dotted underline-offset-4 transition-colors hover:text-[var(--color-accent)]"
+        >
+            "D'autres décisions répondent à cette référence"
+        </A>
     }
 }

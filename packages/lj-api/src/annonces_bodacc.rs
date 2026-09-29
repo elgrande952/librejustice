@@ -11,8 +11,9 @@
 
 use lj_dtos::{
     annonce_acteur_role, annonce_fond_label, AnnonceFacetAxis, AnnonceHit, AnnonceSearchRequest,
-    FacetChoice, FacetTag, ANNONCE_FOND_BODACC,
+    FacetChoice, FacetTag,
 };
+use lj_vocab::ANNONCE_FOND_BODACC;
 use serde::Deserialize;
 
 use crate::error::{ApiError, Result};
@@ -82,7 +83,7 @@ fn where_clause(req: &AnnonceSearchRequest) -> Option<String> {
             .collect();
         (!liste.is_empty()).then(|| format!("({})", liste.join(" OR ")))
     };
-    clauses.extend(ou("numerodepartement", &req.departement));
+    clauses.extend(ou("numerodepartement", &req.zone));
     clauses.extend(ou("familleavis", &req.famille));
     (!clauses.is_empty()).then(|| clauses.join(" AND "))
 }
@@ -131,7 +132,7 @@ const SELECT: &str = "id,publicationavis,parution,numeroannonce,dateparution,fam
 /// La chronologie BODACC d'un SIREN pour la fiche entité : le même fond, la même
 /// projection, une clause de rattachement au lieu d'un état de filtres. Le champ
 /// `registre` est composite (`siren,greffe`) → `like`.
-pub async fn pour_entite(
+pub(crate) async fn pour_entite(
     state: &AppState,
     siren: &str,
     limit: usize,
@@ -164,7 +165,7 @@ pub async fn axes(state: &AppState, req: &AnnonceSearchRequest) -> Result<Vec<An
         ..req.clone()
     };
     let sans_departement = AnnonceSearchRequest {
-        departement: Vec::new(),
+        zone: Vec::new(),
         ..req.clone()
     };
     let (familles, departements) = tokio::try_join!(
@@ -178,7 +179,7 @@ pub async fn axes(state: &AppState, req: &AnnonceSearchRequest) -> Result<Vec<An
             choices: familles,
         },
         AnnonceFacetAxis {
-            key: "departement".to_string(),
+            key: "zone".to_string(),
             label: "Département".to_string(),
             choices: departements,
         },
@@ -227,7 +228,7 @@ async fn facette(
 /// que le fond `marche` — un code de département est un code de département.
 fn libelle(champ: &str, valeur: &str) -> String {
     match champ {
-        "numerodepartement" => lj_core::referential_labels::departement_label(valeur)
+        "numerodepartement" => lj_norm::referential_labels::departement_label(valeur)
             .map(|n| format!("{valeur} — {n}"))
             .unwrap_or_else(|| valeur.to_string()),
         _ => famille_label(valeur).to_string(),
@@ -271,15 +272,28 @@ fn hit_from(r: &Record) -> AnnonceHit {
             .unwrap_or_default()
             .to_string(),
         titre,
+        description: None,
         acteur,
         acteur_role: annonce_acteur_role(ANNONCE_FOND_BODACC).to_string(),
-        departement: r.numerodepartement.clone(),
-        departement_label: r.departement_nom_officiel.clone(),
+        zones: r
+            .numerodepartement
+            .iter()
+            .map(|c| FacetTag {
+                label: r
+                    .departement_nom_officiel
+                    .clone()
+                    .unwrap_or_else(|| c.clone()),
+                key: c.clone(),
+            })
+            .collect(),
         famille: r.familleavis.as_ref().map(|f| FacetTag {
             key: f.clone(),
             label: famille_label(f).to_string(),
         }),
         cpv: None,
+        cpv_deduit: false,
+        metiers: Vec::new(),
+        metiers_deduits: false,
         date_publication: r.dateparution.clone().unwrap_or_default(),
         // Une annonce constate un fait déjà survenu : aucune échéance, donc
         // aucun `VEVENT` dans un agenda et aucune fenêtre « ferme sous N jours ».
@@ -302,7 +316,7 @@ mod tests {
     fn la_clause_odsql_combine_les_axes() {
         let req = AnnonceSearchRequest {
             q: Some("boulangerie".into()),
-            departement: vec!["31".into(), "75".into()],
+            zone: vec!["31".into(), "75".into()],
             famille: vec!["collective".into()],
             ..Default::default()
         };
@@ -350,7 +364,10 @@ mod tests {
         assert_eq!(hit.acteur, "TULU, Stéphanie");
         assert_eq!(hit.acteur_role, "Entreprise");
         assert_eq!(hit.titre, "Créations — Avis initial (Toulouse)");
-        assert_eq!(hit.departement.as_deref(), Some("31"));
+        assert_eq!(
+            hit.zones.iter().map(|z| z.key.as_str()).collect::<Vec<_>>(),
+            ["31"]
+        );
         assert!(hit.echeance.is_none() && hit.cpv.is_none());
         assert_eq!(
             hit.url_action,

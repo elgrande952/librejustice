@@ -46,10 +46,10 @@ impl DecisionRepository<'_> {
         let rows = self
             .conn
             .query(
-                "SELECT id, full_text FROM decisions
-                 WHERE id > $1 AND id % $2 = 0
-                   AND deleted_at IS NULL AND full_text IS NOT NULL
-                 ORDER BY id LIMIT $3",
+                "SELECT decision_id, full_text FROM decision_text
+                 WHERE decision_id > $1 AND decision_id % $2 = 0
+                   AND deleted_at IS NULL AND lead
+                 ORDER BY decision_id LIMIT $3",
                 &[&after_id, &modulo, &limit],
             )
             .await?;

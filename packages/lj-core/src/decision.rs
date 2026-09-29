@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const VISA_TRIM_TARGET_TOKENS: usize = 500;
 /// `VISA_TRIM_MAX_CHARS` ≈ 1705 (= 500 × 3.41 tronqué).
 pub const VISA_TRIM_MAX_CHARS: usize =
-    (VISA_TRIM_TARGET_TOKENS as f64 * crate::tokens::CHARS_PER_TOKEN_MEDIAN) as usize;
+    (VISA_TRIM_TARGET_TOKENS as f64 * lj_vocab::tokens::CHARS_PER_TOKEN_MEDIAN) as usize;
 
 /// Décision attaquée telle que la source la déclare (champ `contested`
 /// Judilibre) : matière brute du lien de chronologie — les clés canoniques se

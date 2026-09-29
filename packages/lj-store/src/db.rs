@@ -100,8 +100,8 @@ pub async fn get_timed(pool: &Pool) -> Result<(Connection, Duration)> {
     if attente >= POOL_WAIT_LOG {
         let ms = attente.as_millis();
         tracing::warn!(
-            attente_pool_ms = ms as u64,
-            "attente de connexion au pool : {ms} ms"
+            pool_wait_ms = ms as u64,
+            "waited {ms} ms for a pool connection"
         );
     }
     Ok((conn, attente))

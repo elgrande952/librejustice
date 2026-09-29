@@ -14,9 +14,9 @@
 //!   ne porte que les titres analytiques tronqués à 1 544 car. ; les sommaires
 //!   complets ne sont que dans l'HTML). L'`Id` garde son pipe non URL-encodé.
 //!
-//! Frontière d'encodage : HTML décodé ici en latin-1 (le header HTTP dit vrai
-//! pour l'HTML) + nettoyage du `0x19` (apostrophe Windows-1252 mal mappée). Le
-//! PDF CRP n'est jamais téléchargé : seule son existence est stockée.
+//! Encoding boundary: the HTML is decoded here, latin-1 or UTF-8 depending on
+//! what the bytes carry, plus the `0x19` cleanup (mis-mapped Windows-1252
+//! apostrophe). The CRP PDF is never downloaded: only its existence is stored.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -354,15 +354,23 @@ pub fn dce_html_cached(
     Ok((decode_ariane_html(&bytes), true))
 }
 
-/// Décodage latin-1 + réparation du `0x19` (apostrophe typographique
-/// Windows-1252 mal mappée par Sinequa sur les documents récents).
+/// Sinequa serves its recent documents in UTF-8 and the older ones in latin-1,
+/// under the same `Content-Type`, so the encoding is read off the bytes and not
+/// off the header: accented French latin-1 is not valid UTF-8. Measured
+/// 10/09/2026 over the whole cache, 166 AJCE sheets out of 107 828 are UTF-8,
+/// all of them past number 170 000. The `0x19` is a typographic apostrophe
+/// Sinequa mis-maps, in both encodings.
 pub fn decode_ariane_html(raw: &[u8]) -> String {
-    raw.iter()
-        .map(|&b| match b {
-            0x19 => '\u{2019}',
-            b => b as char,
-        })
-        .collect()
+    match std::str::from_utf8(raw) {
+        Ok(text) => text.replace('\u{19}', "\u{2019}"),
+        Err(_) => raw
+            .iter()
+            .map(|&b| match b {
+                0x19 => '\u{2019}',
+                b => b as char,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -394,5 +402,14 @@ mod tests {
     fn decode_latin1_et_0x19() {
         let raw = b"Conseil d\x19\xc9tat"; // 0x19 + É latin-1
         assert_eq!(decode_ariane_html(raw), "Conseil d\u{2019}État");
+    }
+
+    #[test]
+    fn decode_utf8_et_0x19() {
+        let raw = "Expulsion prononc\u{e9}e \u{e0} l\u{19}encontre".as_bytes();
+        assert_eq!(
+            decode_ariane_html(raw),
+            "Expulsion prononcée à l\u{2019}encontre"
+        );
     }
 }

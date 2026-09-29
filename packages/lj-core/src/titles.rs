@@ -1,14 +1,14 @@
-//! Composition canonique du titre de décision — partagée par l'API (affichage à
-//! la lecture) et l'ingest (écriture de `search_title`) : une seule fonction, un
-//! seul format.
+//! Canonical composition of a decision title, shared by the API (display on
+//! read) and the ingest (writing `search_title`): one function, one format. The
+//! seat is not part of the second: `compose_search_title` passes `None`, so
+//! recomposing it stales no indexed title.
 //!
-//! Format : `<juridiction>[, <siège>], <date FR>[, <nom d'usage>],
-//! <premier numéro>`, p. ex.
+//! Format: `<juridiction>[, <siège>], <date FR>[, <nom d'usage>],
+//! <premier numéro>`, e.g.
 //! « Cour d'appel de Paris, pôle 5, 3e chambre · formation à trois,
-//! 25 février 2026, 21/04532 ». Le siège est recomposé depuis les axes
-//! structurés (`chamber_key` + `matiere_uid` + labels `formation:*` /
-//! `office:*`), jamais
-//! depuis une chaîne source.
+//! 25 février 2026, 21/04532 ». The seat is recomposed from the structured
+//! seat (`seat`) and the `formation:*` / `office:*` labels, never from a
+//! source string.
 
 const FR_MONTHS: [&str; 12] = [
     "janvier",
@@ -122,90 +122,93 @@ fn mid_title(s: &str) -> String {
     }
 }
 
-/// Comparaison de redondance : minuscules + accents aplatis (sous-ensemble du
-/// pliage lj-extract, suffisant pour des labels référentiels).
-fn fold(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            'À' | 'Â' | 'Ä' | 'à' | 'â' | 'ä' => vec!['a'],
-            'É' | 'È' | 'Ê' | 'Ë' | 'é' | 'è' | 'ê' | 'ë' => vec!['e'],
-            'Î' | 'Ï' | 'î' | 'ï' => vec!['i'],
-            'Ô' | 'Ö' | 'ô' | 'ö' => vec!['o'],
-            'Ù' | 'Û' | 'Ü' | 'ù' | 'û' | 'ü' => vec!['u'],
-            'Ç' | 'ç' => vec!['c'],
-            _ => c.to_lowercase().collect(),
-        })
-        .collect()
-}
-
 /// Le type de formation est-il déjà dit par la position ? Sous-ensemble de
 /// tokens pliés, mots génériques exclus — « Sous-sections réunies » ⊆
 /// « Sous-sections 2/6 réunies », « Formation plénière » ⊆ « Assemblée
 /// plénière », mais « Formation à trois » ⊄ « 3e chambre ».
 fn formation_redundant(base: &str, formation: &str) -> bool {
-    let base_folded = fold(base);
+    let base_folded = lj_fold::fold_chars(base);
     let base_tokens: Vec<&str> = base_folded
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .collect();
-    fold(formation)
+    lj_fold::fold_chars(formation)
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty() && !matches!(*t, "formation" | "de" | "a" | "en" | "du"))
         .all(|t| base_tokens.contains(&t))
 }
 
-/// Siège recomposé depuis les axes structurés : la chambre, qualifiée
-/// après un point médian par le type de formation ou à défaut l'office
-/// (« 7e chambre · juge des libertés et de la détention ») — le « · » évite les
-/// parenthèses imbriquées quand le titre est lui-même cité entre parenthèses ;
-/// sans position, formation puis office. Les redondances tombent par comparaison
-/// pliée : la chambre déjà portée par le label de juridiction (« Cour de
-/// cassation, deuxième chambre civile ») n'est pas répétée, une position
-/// « Sous-sections 2/6 réunies » n'est pas suffixée « (sous-sections réunies) ».
+/// Chamber, then formation, then office, joined by a middle dot; a missing axis
+/// leaves no hole. Folding drops what would be said twice, and « Juge unique »
+/// beside an office is the corpus rather than an edge case: 411,807 of the
+/// 413,947 decisions carrying both axes have it, so uniformity without that
+/// filter reads « juge unique · magistrat désigné » (08/09/2026).
 pub fn seat_display(
     jurisdiction: &str,
     chamber_label: Option<&str>,
     formation_label: Option<&str>,
     office_label: Option<&str>,
 ) -> Option<String> {
-    let jur_folded = fold(jurisdiction);
+    let jur_folded = lj_fold::fold_chars(jurisdiction);
     let base = chamber_label
         .map(str::trim)
-        .filter(|p| !p.is_empty() && !jur_folded.contains(&fold(p)));
-    let formation = formation_label.map(str::trim).filter(|f| {
-        !f.is_empty()
-            && !jur_folded.contains(&fold(f))
-            && !base.is_some_and(|b| formation_redundant(b, f))
-    });
+        .filter(|p| !p.is_empty() && !jur_folded.contains(&lj_fold::fold_chars(p)));
     let office = office_label
         .map(str::trim)
-        .filter(|o| !o.is_empty() && !jur_folded.contains(&fold(o)));
-    match base {
-        Some(b) => match formation.or(office) {
-            // « 5e chambre » + « Chambre jugeant seule » → « 5e chambre
-            // jugeant seule » (idem « 3e sous-section jugeant seule ») : le
-            // qualificatif en « chambre … » se greffe à une position qui
-            // finit déjà par la chambre / sous-section qu'il qualifie.
-            Some(q)
-                if (fold(b).ends_with("chambre") || fold(b).ends_with("sous-section"))
-                    && q.get(..8)
-                        .is_some_and(|p| p.eq_ignore_ascii_case("chambre ")) =>
-            {
-                Some(format!("{} {}", mid_title(b), &q[8..]))
-            }
-            Some(q) => Some(format!("{} · {}", mid_title(b), mid_title(q))),
-            None => Some(mid_title(b)),
-        },
-        // Sans position, le rôle est plus parlant que le type de formation :
-        // « juge des référés », pas « juge unique ».
-        None => office.or(formation).map(mid_title),
+        .filter(|o| !o.is_empty() && !jur_folded.contains(&lj_fold::fold_chars(o)));
+    let dit_par_l_office = |f: &str| office.is_some() && lj_fold::fold_chars(f) == "juge unique";
+    let formation = formation_label.map(str::trim).filter(|f| {
+        !f.is_empty()
+            && !jur_folded.contains(&lj_fold::fold_chars(f))
+            && !base.is_some_and(|b| formation_redundant(b, f))
+            && !dit_par_l_office(f)
+    });
+    let qualifiers: Vec<&str> = formation.into_iter().chain(office).collect();
+    let Some(b) = base else {
+        return match qualifiers.is_empty() {
+            true => None,
+            false => Some(
+                qualifiers
+                    .into_iter()
+                    .map(mid_title)
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            ),
+        };
+    };
+    // « Chambre jugeant seule » grafts onto a position already ending in the
+    // chamber it qualifies, so it is never a segment of its own.
+    if let [q] = qualifiers[..] {
+        if (lj_fold::fold_chars(b).ends_with("chambre")
+            || lj_fold::fold_chars(b).ends_with("sous-section"))
+            && q.get(..8)
+                .is_some_and(|p| p.eq_ignore_ascii_case("chambre "))
+        {
+            return Some(format!("{} {}", mid_title(b), &q[8..]));
+        }
     }
+    let mut segments = vec![mid_title(b)];
+    segments.extend(qualifiers.into_iter().map(mid_title));
+    Some(segments.join(" · "))
 }
 
-/// Titre canonique « <juridiction>[, <siège>], <date FR>[, <nom d'usage>],
-/// <numéro> ». La juridiction est le label référentiel déjà résolu par
-/// l'appelant, le siège sort de [`seat_display`], et le nom d'usage précède le
-/// numéro comme le Conseil d'État cite ses propres arrêts.
+/// The number the title names the decision by, which is the head one: it is
+/// under that number that a decision is cited. The others are what reaches it,
+/// not what names it, and no title holds them anyway, a Cour de cassation
+/// judgment of 24/04/2013 carrying 1 244 pourvois. The number a search bit on is
+/// said by the result, next to the title, never inside it.
+pub fn docket_display(numbers: &[String]) -> Option<String> {
+    numbers
+        .iter()
+        .map(|n| n.trim())
+        .find(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+/// Canonical title `<court>[, <seat>], <FR date>[, <case name>], <numbers>`.
+/// The court is the referential label the caller already resolved, the seat
+/// comes from [`seat_display`], and the case name precedes the numbers the way
+/// the Conseil d'Etat cites its own decisions.
 pub fn decision_title(
     jurisdiction: &str,
     seat: Option<&str>,
@@ -315,15 +318,56 @@ mod tests {
         );
     }
 
+    /// « Juge unique » does not survive an office, which already says the
+    /// magistrate sits alone. Dominant case of the corpus, chamber or not.
     #[test]
-    fn seat_office_prime_sans_position() {
-        let seat = seat_display(
-            "Tribunal judiciaire de Lyon",
-            None,
-            Some("Juge unique"),
-            Some("Juge des référés"),
+    fn juge_unique_tombe_devant_un_office() {
+        assert_eq!(
+            seat_display(
+                "Tribunal judiciaire de Lyon",
+                None,
+                Some("Juge unique"),
+                Some("Juge des référés"),
+            )
+            .as_deref(),
+            Some("juge des référés")
         );
-        assert_eq!(seat.as_deref(), Some("juge des référés"));
+        assert_eq!(
+            seat_display(
+                "Tribunal administratif de Melun",
+                Some("3e chambre"),
+                Some("Juge unique"),
+                Some("Magistrat désigné"),
+            )
+            .as_deref(),
+            Some("3e chambre · magistrat désigné")
+        );
+    }
+
+    /// The three axes hold the line when none repeats another: 1,792 decisions,
+    /// against 411,807 for the « juge unique » case above.
+    #[test]
+    fn les_trois_axes_se_suivent_dans_l_ordre() {
+        assert_eq!(
+            seat_display(
+                "Cour administrative d'appel de Nantes",
+                Some("5e chambre"),
+                Some("Formation à trois"),
+                Some("Magistrat désigné"),
+            )
+            .as_deref(),
+            Some("5e chambre · formation à trois · magistrat désigné")
+        );
+        assert_eq!(
+            seat_display(
+                "Cour de cassation",
+                None,
+                Some("Formation restreinte"),
+                Some("Premier président"),
+            )
+            .as_deref(),
+            Some("formation restreinte · premier président")
+        );
     }
 
     #[test]
@@ -361,6 +405,28 @@ mod tests {
         assert_eq!(
             title,
             "Cour d'appel de Paris, pôle 5, 3e chambre · formation à trois, 25 février 2026, 21/04532"
+        );
+    }
+
+    #[test]
+    fn le_titre_ne_porte_que_le_numero_de_tete() {
+        let n = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        assert_eq!(docket_display(&[]), None);
+        assert_eq!(docket_display(&n(&["  ", ""])), None);
+        assert_eq!(docket_display(&n(&["490357"])).as_deref(), Some("490357"));
+        assert_eq!(
+            docket_display(&n(&["  ", "490595", "490625"])).as_deref(),
+            Some("490595")
+        );
+        assert_eq!(
+            decision_title(
+                "Conseil d'État",
+                None,
+                Some("2024-10-01"),
+                None,
+                docket_display(&n(&["490357", "490595", "490625"])).as_deref(),
+            ),
+            "Conseil d'État, 1 octobre 2024, 490357"
         );
     }
 

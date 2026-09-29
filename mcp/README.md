@@ -39,6 +39,4 @@ uv run --with pytest pytest mcp -q
 
 ## What it serves
 
-Four tools: `search_decisions`, `search_legal_texts`, `get_decision`, `get_legal_text`. Their names, descriptions and schemas are read from `packages/lj-dtos/data/mcp-tools.json`, which the hosted server serialises from its own definitions, so a client, or a directory, enumerates the tools without presenting a key. A call needs one, and lands on `/api`: the budget is attached to the account the key names, shared with searches made on the site.
-
-The connector's fifth tool, `list_my_activity`, is not served here. It reports the searches, bookmarks and readings the site and the connector recorded for the account, which this process neither writes nor reads.
+Four tools: `search_decisions`, `search_norms`, `get_decision`, `get_norm`. Their names, descriptions and schemas are read from `packages/lj-mcp-tools/data/mcp-tools.json`, which the hosted server serialises from its own definitions, so a client, or a directory, enumerates the tools without presenting a key. A call needs one, and lands on `/api`: the budget is attached to the account the key names, shared with searches made on the site.

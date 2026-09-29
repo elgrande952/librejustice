@@ -1,24 +1,23 @@
-//! Mutation de l'état URL de recherche. Toutes les mutations partent du
-//! `ParamsMap` courant (lu
-//! via `use_query_map`), appliquent un changement, et renvoient la *query
-//! string sans le `?` initial* prête pour `navigate("/decisions?{qs}")`.
+//! Mutation of the search URL state. Every mutation starts from the current
+//! `ParamsMap` (read through `use_query_map`), applies one change, and returns the
+//! *query string without the leading `?`* ready for `navigate("/decision-search?{qs}")`.
 //!
-//! Invariants :
-//! - toute mutation de filtre/tri supprime `page` (retour page 1) ;
-//! - `relevance` ⇒ `sort` supprimé ; `aiMode=false` ⇒ `aiMode` supprimé ;
-//! - les autres clés sont conservées telles quelles (multi-valeurs incluses).
+//! Invariants:
+//! - every filter/sort mutation removes `page` (back to page 1);
+//! - `relevance` ⇒ `sort` removed; `aiMode=false` ⇒ `aiMode` removed;
+//! - the other keys are kept as is (multi-values included).
 //!
-//! Module privé de la tranche, rattaché via `#[path]` depuis un composant (le
-//! `mod.rs` figé de `search/` n'expose que les composants).
+//! Private module of the slice, attached through `#[path]` from a component (the
+//! frozen `mod.rs` of `search/` only exposes the components).
 
 use leptos_router::params::ParamsMap;
 
-pub const SEARCH_PATH: &str = "/decisions";
+pub const SEARCH_PATH: &str = "/decision-search";
 /// Route de la recherche de textes (page distincte : moteurs et filtres
 /// propres, aucune recherche transverse).
-pub const TEXTES_PATH: &str = "/textes";
+pub const TEXTES_PATH: &str = "/norm-search";
 /// Route du moteur d'annonces (pot des événements en cours).
-pub const ANNONCES_PATH: &str = "/annonces";
+pub const ANNONCES_PATH: &str = "/notice-search";
 
 /// Le corpus que la route interroge. Trois pages de recherche, trois corpus
 /// disjoints : la barre, le mode IA et l'autocomplétion en dépendent.
@@ -58,9 +57,9 @@ pub fn corpus() -> Corpus {
     }
 }
 
-/// Chemin de recherche courant : `/textes` si on y est déjà (les mutations et
-/// soumissions y restent), sinon `/decisions`. Lu sur `window.location` — les
-/// appels ne surviennent que dans des handlers client (clic, submit).
+/// Current search path: `/norm-search` if already there (mutations and submissions
+/// stay there), else `/decision-search`. Read from `window.location`, the calls
+/// only happen in client handlers (click, submit).
 #[cfg(feature = "hydrate")]
 fn current_search_path() -> &'static str {
     let path = web_sys::window().and_then(|w| w.location().pathname().ok());
@@ -109,6 +108,16 @@ pub fn with_param(map: &ParamsMap, key: &str, value: Option<&str>, drop_page: bo
         next.remove(key);
         if let Some(v) = value {
             next.insert(key.to_string(), v.to_string());
+        }
+    })
+}
+
+/// Rewrites a multi-valued key with `values`, none removing it. Drops `page`.
+pub fn with_values(map: &ParamsMap, key: &str, values: &[String]) -> String {
+    mutate(map, true, |next| {
+        next.remove(key);
+        for v in values {
+            next.insert(key.to_string(), v.clone());
         }
     })
 }

@@ -13,7 +13,7 @@ use lj_store::repository::{
     BulkDecisionWrite, DecisionRepository, ExistingDecisionState, UpsertStatus,
 };
 
-use crate::chunking::DEFAULT_CHUNK_TOKENS;
+use lj_chunk::DEFAULT_CHUNK_TOKENS;
 
 use super::embed::{embed_prepared, to_bulk_write, EmbeddedDecision};
 use super::prepare::{chunk_write, extract_write, triage_candidates};
@@ -103,9 +103,14 @@ async fn write_writes_inner(
                 id
             }
         };
-        counts.chunks_created += repo
-            .replace_chunks(decision_id, &write.decision, &write.chunks)
-            .await?;
+        if !write.chunks.is_empty()
+            && repo.authority_source_uid(decision_id).await?.as_deref()
+                == Some(write.decision.source_uid.as_str())
+        {
+            counts.chunks_created += repo
+                .replace_chunks(decision_id, &write.decision, &write.chunks)
+                .await?;
+        }
         repo.set_payload_format(decision_id, &write.payload_format)
             .await?;
         fresh_ids.push(decision_id);

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use lj_core::normalizer::extract_refs;
-use lj_core::parsing::parse_xml;
+use lj_parse::parse_xml;
 use lj_sources::zip_reader::iter_decisions;
 use serde_json::{json, Map, Value};
 

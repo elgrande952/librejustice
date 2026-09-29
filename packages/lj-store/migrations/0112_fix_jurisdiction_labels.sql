@@ -1,18 +1,3 @@
--- 0112 : guérison des labels de juridiction (review exhaustive des titres).
---
--- 1. tj35238 : « Tribunal judiciaire de Redon » était un mislabel de la table
---    location Judilibre — 35238 est le code INSEE de Rennes (vérifié sur
---    pièces : 1 269 des 2 000 décisions sondées mentionnent le barreau de
---    Rennes, 27 celui de Redon).
--- 2. tj97209 : label source sans ville (97209 = Fort-de-France).
--- 3. Fusion des codes doublons issus d'extractions anciennes :
---    ta_d_amiens → ta_amiens (« de d Amiens »), caa_versailless →
---    caa_versailles (typo source), ta_la_reunion → ta_reunion.
--- 4. Accents manquants (labels dérivés de sources en capitales).
---
--- `decisions.search_title` (colonne générée) se recalcule seul ; les colonnes
--- dénormalisées de `decision_chunks` sont resynchronisées en fin de script.
-
 UPDATE jurisdiction SET label = 'Tribunal judiciaire de Rennes', city = 'Rennes'
 WHERE code = 'tj35238';
 UPDATE jurisdiction SET label = 'Tribunal judiciaire de Fort-de-France', city = 'Fort-de-France'
@@ -32,14 +17,11 @@ WHERE code = 'tcom5101';
 UPDATE jurisdiction SET label = 'Tribunal administratif de Nouvelle-Calédonie', city = 'Nouvelle-Calédonie'
 WHERE code = 'ta_nouvelle_caledonie';
 
--- Fusions : rebrancher les décisions sur le code canonique, puis supprimer
--- les entrées orphelines du référentiel.
 UPDATE decisions SET jurisdiction_code = 'ta_amiens' WHERE jurisdiction_code = 'ta_d_amiens';
 UPDATE decisions SET jurisdiction_code = 'caa_versailles' WHERE jurisdiction_code = 'caa_versailless';
 UPDATE decisions SET jurisdiction_code = 'ta_reunion' WHERE jurisdiction_code = 'ta_la_reunion';
 DELETE FROM jurisdiction WHERE code IN ('ta_d_amiens', 'caa_versailless', 'ta_la_reunion');
 
--- Réalignement de decisions.jurisdiction_name (alimente search_title / BM25).
 UPDATE decisions d SET jurisdiction_name = j.label
 FROM jurisdiction j
 WHERE j.code = d.jurisdiction_code
@@ -50,7 +32,6 @@ WHERE j.code = d.jurisdiction_code
   )
   AND d.jurisdiction_name IS DISTINCT FROM j.label;
 
--- Resync des colonnes dénormalisées des chunks (BM25 chunks).
 UPDATE decision_chunks c
 SET jurisdiction_name = d.jurisdiction_name, search_title = d.search_title
 FROM decisions d

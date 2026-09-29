@@ -1,0 +1,441 @@
+# Métier du descripteur BOAMP : l'axe « qui répond », indépendant du CPV qui dit « ce qui est acheté ».
+# Bloc @ : un code de métier et son libellé. Corps : un descripteur BOAMP, le code de son métier.
+# Un descripteur qui ne nomme aucun corps d'état ni aucune profession n'est pas dans la table
+# (Prestations de services, Délégation de service public, Abonnement) : il dit la forme du contrat.
+@	agriculture	Agriculture, forêt et espaces naturels
+@	amiante	Désamiantage et dépollution
+@	ascenseur	Ascenseurs et levage
+@	assurance	Assurance
+@	audiovisuel	Culture, événementiel et audiovisuel
+@	batiment-tce	Bâtiment tous corps d'état
+@	charpente-couverture	Charpente et couverture
+@	communication	Communication, impression et édition
+@	conseil	Conseil, audit et finance
+@	dechets	Déchets et propreté urbaine
+@	eau	Eau et assainissement
+@	electricite	Électricité et courants faibles
+@	energie	Énergie et fluides
+@	espaces-verts	Espaces verts et paysage
+@	etudes	Maîtrise d'oeuvre, études et ingénierie
+@	finitions	Second oeuvre et finitions
+@	formation	Formation et ressources humaines
+@	genie-civil	Génie civil et ouvrages d'art
+@	genie-climatique	Génie climatique et plomberie
+@	gros-oeuvre	Gros oeuvre, maçonnerie et patrimoine
+@	habillement	Textile et habillement
+@	industrie	Industrie, matières et matériaux
+@	informatique	Informatique et télécommunications
+@	maintenance	Exploitation et maintenance
+@	menuiserie	Menuiserie et fermetures
+@	metallerie	Métallerie et serrurerie
+@	mobilier-equipement	Mobilier et équipement
+@	nettoyage	Nettoyage et hygiène
+@	restauration	Restauration et alimentation
+@	sante	Santé, médical et laboratoire
+@	securite	Sécurité, gardiennage et incendie
+@	sport-loisirs	Sport, loisirs et jeux
+@	terrassement	Terrassement et démolition
+@	transport	Transport et véhicules
+@	vrd	Voirie et réseaux divers
+Abris	mobilier-equipement
+Acier	industrie
+Aire d'accueil	vrd
+Aire de jeux	sport-loisirs
+Alarme	securite
+Alimentation en eau potable	eau
+Aliments pour animaux	agriculture
+Amiante	amiante
+Amiante (diagnostic)	amiante
+Amiante (désamiantage)	amiante
+Amiante, diagnostic	amiante
+Amiante, désamiantage	amiante
+Analyses médicales	sante
+Analyses médicales, biologiques	sante
+Animaux	agriculture
+Antenne	informatique
+Antipollution (équipement)	amiante
+Appareil élévateur	ascenseur
+Armement	securite
+Arrosage	espaces-verts
+Articles de bureau et articles scolaires	communication
+Articles funéraires	mobilier-equipement
+Articles funéraires, cercueil	mobilier-equipement
+Articles à usage unique	sante
+Ascenseur	ascenseur
+Assainissement	eau
+Assistance juridique	conseil
+Assistance technique	etudes
+Assistance à maîtrise d'ouvrage	etudes
+Assurance	assurance
+Audiovisuel	audiovisuel
+Audit	conseil
+Autocommutateur	informatique
+Automate	electricite
+Automatisation	electricite
+Aéronautique	transport
+Banc d'essais	industrie
+Bardage	charpente-couverture
+Barquettes alimentaires	restauration
+Barrage	genie-civil
+Bassin, étang	genie-civil
+Benne	dechets
+Berge	genie-civil
+Blanchissage	nettoyage
+Blanchisserie (matériel)	nettoyage
+Bois	charpente-couverture
+Boisson	restauration
+Boîtes aux lettres	communication
+Busage	eau
+Bâche	mobilier-equipement
+Bâtiment	batiment-tce
+Bâtiments modulaires	mobilier-equipement
+Cabine de peinture	transport
+Canalisations	eau
+Candélabre	electricite
+Caoutchouc	industrie
+Captage	eau
+Carburant et combustible	transport
+Carburant, hydrocarbure	transport
+Carrelage	finitions
+Carte magnétique	informatique
+Carte magnétique, carte à puce	informatique
+Carton	industrie
+Cd, DVD	audiovisuel
+Cercueils	mobilier-equipement
+Chambre froide	restauration
+Charpente	charpente-couverture
+Chaudronnerie	metallerie
+Chauffage (exploitation)	genie-climatique
+Chauffage (exploitation, entretien)	genie-climatique
+Chauffage (fourniture)	genie-climatique
+Chauffage (matériel)	genie-climatique
+Chauffage (travaux)	genie-climatique
+Chaussures ou articles chaussants	habillement
+Chèque cadeau	formation
+Cimetière	espaces-verts
+Climatisation	genie-climatique
+Clocher	charpente-couverture
+Cloison, faux plafond	finitions
+Clôture	espaces-verts
+Colis	transport
+Collecte sélective	dechets
+Combustible	energie
+Composteur	espaces-verts
+Compteur d'eau	eau
+Concession (services restauration)	restauration
+Conditionnement	industrie
+Consommable informatique	informatique
+Consommables informatiques	informatique
+Consommables médicaux	sante
+Construction navale	transport
+Conteneur	dechets
+Conteneur, poubelles	dechets
+Contrôle d'accès	securite
+Contrôle technique	etudes
+Couches	sante
+Couverture	charpente-couverture
+Crédit-bail	conseil
+Cuir	habillement
+Cuisine (équipement)	restauration
+Curage	eau
+Câblage	electricite
+Denrées alimentaires	restauration
+Digue	genie-civil
+Disque, disquette	informatique
+Diététique	restauration
+Dragage	genie-civil
+Drainage	eau
+Droguerie	nettoyage
+Décharge	dechets
+Déchets	dechets
+Déchets non ménagers (prestations)	dechets
+Déchetterie	dechets
+Déchetterie (exploitation)	dechets
+Déchetterie (travaux)	dechets
+Déclencheur d'avalanche	genie-civil
+Déclencheur d'avalanche/explosif	genie-civil
+Décoration (travaux)	finitions
+Dématérialisation	informatique
+Démolition	terrassement
+Déménagement	transport
+Déneigement	vrd
+Dépollution	amiante
+Dératisation, désinsectisation	nettoyage
+Détection incendie	securite
+Echafaudage	gros-oeuvre
+Eclairage public	electricite
+Ecluse	genie-civil
+Edition	communication
+Electricité	electricite
+Electricité (travaux)	electricite
+Electricité, gaz (fourniture)	energie
+Electrification rurale	electricite
+Electromécanique	electricite
+Electroménager	mobilier-equipement
+Enneigement artificiel	sport-loisirs
+Enrochements	genie-civil
+Eolienne	energie
+Equarrissage	agriculture
+Equipement de piscine	sport-loisirs
+Equipement hydraulique	genie-civil
+Equipement industriel	industrie
+Equipement muséographique	audiovisuel
+Equipement sportif	sport-loisirs
+Equipement thermique	genie-climatique
+Equipements spécialisés	mobilier-equipement
+Espaces verts	espaces-verts
+Etanchéité	charpente-couverture
+Etude	etudes
+Evénementiel	audiovisuel
+Expertise comptable	conseil
+explosif	industrie
+Extincteur	securite
+Falaise	genie-civil
+Ferronnerie	metallerie
+Feu d'artifice	audiovisuel
+Fibre optique	informatique
+Film	audiovisuel
+Film plastique	industrie
+Fluides médicaux	sante
+Fondations spéciales	gros-oeuvre
+Fonderie	industrie
+Fontaine	espaces-verts
+Fontainerie	eau
+Forage	eau
+Formation	formation
+Fouille archéologique	terrassement
+Fourniture d'électricité / gaz	energie
+Fourrière	securite
+Gardiennage	securite
+Gaz divers	energie
+Gaz médicaux	sante
+Glissières de sécurité	vrd
+Gouttières	charpente-couverture
+Gros oeuvre	gros-oeuvre
+Groupe électrogène	electricite
+Génie civil	genie-civil
+Géothermie	energie
+Habillement	habillement
+Horodateur	vrd
+Houille, lignite et tourbe	energie
+Hydraulique agricole	agriculture
+Hydrocarbures naturels	energie
+Hygiène (articles)	nettoyage
+Illumination	electricite
+Implants	sante
+Impression	communication
+Imprimés	communication
+Informatique (assistance)	informatique
+Informatique (maintenance serveurs et réseaux)	informatique
+Informatique (matériel)	informatique
+Informatique (prestations de services)	informatique
+Ingénierie	etudes
+Insignes	habillement
+Installation portuaire	genie-civil
+Instruments de musique	audiovisuel
+Internet	informatique
+Interphone	securite
+Irrigation	agriculture
+Isolation	finitions
+Jeux, jouets	sport-loisirs
+Laboratoire (fourniture)	sante
+Laboratoire (matériel)	sante
+Lagunage	eau
+Literie	habillement
+Livres	communication
+Location	mobilier-equipement
+Location (matériels)	mobilier-equipement
+Logiciel	informatique
+Lubrifiant	transport
+Lubrifiants	transport
+Machines-outils	industrie
+Maintenance	maintenance
+Manutention	ascenseur
+Matériaux de construction	gros-oeuvre
+Matériaux routiers	vrd
+Matériel agricole	agriculture
+Matériel agricole / matériel horticole	agriculture
+Matériel agricole, horticole	agriculture
+Matériel d'imprimerie	communication
+Matériel de bureau	mobilier-equipement
+Matériel de manutention	ascenseur
+Matériel de précision	mobilier-equipement
+Matériel de puériculture	sante
+Matériel de secours et d'incendie	securite
+Matériel de stérilisation	sante
+Matériel de sécurité	securite
+Matériel de transmission	informatique
+Matériel de travaux publics	industrie
+Matériel de téléphonie	informatique
+Matériel dentaire	sante
+Matériel didactique	mobilier-equipement
+Matériel ferroviaire	transport
+Matériel médical	sante
+Matériel phonique	audiovisuel
+Matériel photographique et cinématographique	audiovisuel
+Matériel robinetterie	genie-climatique
+Matériel scénique	audiovisuel
+Matériel électrique	electricite
+Matériel électronique	informatique
+Matériel électronique médical	sante
+Maçonnerie	gros-oeuvre
+Maîtrise d'oeuvre	etudes
+Menuiserie	menuiserie
+Microfiches	communication
+Microfilmage	communication
+Minerais métalliques	industrie
+Minéraux divers	industrie
+Miroiterie	menuiserie
+Mise à disposition de personnel	formation
+Mission d'ordonnancement, pilotage, coordination (OPC)	etudes
+Mission de coordination	etudes
+Mobilier	mobilier-equipement
+Mobilier extérieur	vrd
+Mobilier urbain	vrd
+Monuments historiques	gros-oeuvre
+Mur antibruit	vrd
+Mur de soutènement	genie-civil
+Mécanique	transport
+Métallerie	metallerie
+Métallurgie	industrie
+Métaux précieux	industrie
+Nettoyage de locaux	nettoyage
+Nettoyage urbain	dechets
+Non-tissés	habillement
+Numérisation	informatique
+Objet publicitaire	communication
+Occultation	menuiserie
+Oeuvre d'art	audiovisuel
+Onduleur	electricite
+Optique	sante
+Ordures ménagères (prestations)	dechets
+Orgue	audiovisuel
+Outillage	industrie
+Ouvrage d'art	genie-civil
+Ouvrage d'infrastructure	genie-civil
+Ouvrage hydraulique	genie-civil
+Ouvrage métallique	metallerie
+Palplanches	genie-civil
+Panneaux	communication
+Papeterie	communication
+Paratonnerre	electricite
+Passe à poissons	genie-civil
+Passerelle	genie-civil
+Peinture (fourniture)	finitions
+Peinture (travaux)	finitions
+Photovoltaïque	energie
+Piscine	sport-loisirs
+Pièces détachées	transport
+Plage	genie-civil
+Plancher technique	finitions
+Plastique	industrie
+Plomberie	genie-climatique
+Plomberie (travaux)	genie-climatique
+Plâtrerie	finitions
+Pneumatiques	transport
+Pompes	eau
+Porte automatique	menuiserie
+Porte automatique, portail	menuiserie
+Poteaux d'incendie	securite
+Prestation hotelière	restauration
+Produits chimiques	industrie
+Produits d'entretien	nettoyage
+Produits de l'agriculture	agriculture
+Produits de récupération	industrie
+Produits des industries diverses	industrie
+Produits pharmaceutiques	sante
+Produits radioactifs	amiante
+Produits travail des métaux	industrie
+Progiciel	informatique
+Protection, chutes de pierres	genie-civil
+Prothèses	sante
+Publicité	communication
+Publicité, Communication	communication
+Quincaillerie (articles)	menuiserie
+Radar	informatique
+Radiologie (matériel)	sante
+Radiologie (produits)	sante
+Ramonage	genie-climatique
+Ravalement	gros-oeuvre
+Rayonnage	mobilier-equipement
+Reliure	communication
+Remembrement (travaux connexes)	agriculture
+Repas	restauration
+Repas, traiteur	restauration
+Reprographie	communication
+Restauration collective	restauration
+Revêtements de sols	finitions
+Revêtements muraux	finitions
+Rivières, ruisseaux	genie-civil
+Rivières/ruisseaux	genie-civil
+Robinetterie (matériel)	genie-climatique
+Routage	communication
+Réactifs	sante
+Réseaux divers	vrd
+Réservoir	eau
+Sacs	dechets
+Sanitaire	genie-climatique
+Sel de déneigement	vrd
+Serre	agriculture
+Serrurerie	metallerie
+Signalisation	vrd
+Signalétique	communication
+Site internet	informatique
+Sondage	genie-civil
+Sondage (enquête)	conseil
+Sondage (travaux)	genie-civil
+Sondage, enquête	conseil
+Sonorisation	audiovisuel
+Spectacle	audiovisuel
+Stand	mobilier-equipement
+Station d'épuration	eau
+Station d'épuration (exploitation)	eau
+Station d'épuration (travaux)	eau
+Station de pompage	eau
+Station de refoulement	eau
+Station de relevage	eau
+Stimulateurs cardiaques	sante
+Surgelés	restauration
+Surveillance	securite
+Sécurité incendie	securite
+Tabac	restauration
+Tente	mobilier-equipement
+Terrain de sport	sport-loisirs
+Terrasse	finitions
+Terrassement	terrassement
+Textile	habillement
+Titres de transport	transport
+Titres restaurant	restauration
+Topographie	etudes
+Tous corps d'état	batiment-tce
+Transformateur	electricite
+Transport	transport
+Travaux agricoles	agriculture
+Travaux d'électricité	electricite
+Travaux dans l'eau	genie-civil
+Travaux de sondage	genie-civil
+Travaux de viabilité	vrd
+Travaux forestiers	agriculture
+Travaux sous-marins	genie-civil
+Télécabines, télésièges, téléskis	sport-loisirs
+Télécommunications	informatique
+Télégestion	informatique
+Téléphone	informatique
+Télésurveillance	securite
+Télévision	audiovisuel
+Vaisselle	restauration
+Ventilation	genie-climatique
+Verre	industrie
+Vidéo	audiovisuel
+Vidéo, cinéma	audiovisuel
+Vitraux	audiovisuel
+Vitrerie	menuiserie
+Voies ferrées	vrd
+Voirie	vrd
+Voirie et réseaux divers	vrd
+Voyage	transport
+Végétaux	espaces-verts
+Véhicules	transport
+Véhicules (acquisition)	transport
+Véhicules (location)	transport
+Zinguerie	charpente-couverture

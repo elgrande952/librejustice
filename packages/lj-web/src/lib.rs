@@ -20,6 +20,7 @@ pub mod helpers;
 pub mod incident;
 pub mod pages;
 pub mod query;
+pub mod reads;
 pub mod seo;
 
 /// Point d'entree wasm : cargo-leptos appelle `hydrate()` cote client pour
@@ -28,11 +29,22 @@ pub mod seo;
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn hydrate() {
     console_error_panic_hook::set_once();
+    crate::reads::note_document();
     leptos::mount::hydrate_body(crate::app::App);
     // Témoin lu par la sonde d'hydratation du shell.
     let _ = js_sys::Reflect::set(
         &js_sys::global(),
         &wasm_bindgen::JsValue::from_str("__LJ_HYDRATED"),
         &wasm_bindgen::JsValue::TRUE,
+    );
+    // Stamped here, never read when the probe fires: a clamped poll wakes minutes late.
+    let instant = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or_default();
+    let _ = js_sys::Reflect::set(
+        &js_sys::global(),
+        &wasm_bindgen::JsValue::from_str("__LJ_HYDRATED_AT"),
+        &wasm_bindgen::JsValue::from_f64(instant),
     );
 }

@@ -1,9 +1,3 @@
--- Migration 0205 — Appartenances communautaires datées + défaut de domaine au
--- grain du texte.
-
--- L'appartenance d'un État à une communauté de droit uniforme est datée et
--- multiple (le Sénégal est à la fois OHADA, UEMOA, CIMA) ; l'arbre
--- facet_value.parent_uid reste l'inclusion géographique pure.
 CREATE TABLE scope_membership (
     member_scope    text NOT NULL REFERENCES facet_value(uid),
     community_scope text NOT NULL REFERENCES facet_value(uid),
@@ -15,20 +9,14 @@ CREATE TABLE scope_membership (
     CHECK (split_part(community_scope, ':', 1) = 'communaute')
 );
 
--- Non nul, remplace le défaut de juridiction pour tous les articles du texte ;
--- article_scope prime dessus, article par article.
 ALTER TABLE legal_text ADD COLUMN default_scope text REFERENCES facet_value(uid);
 
--- Vocabulaire : communautés de droit uniforme.
 INSERT INTO facet_value (uid, facet, label, abbr, parent_uid, sort) VALUES
     ('communaute:OHADA', 'communaute', 'OHADA (droit uniforme des affaires)', 'OHADA', NULL, 0),
     ('communaute:UEMOA', 'communaute', 'Union économique et monétaire ouest-africaine', 'UEMOA', NULL, 1),
     ('communaute:CIMA',  'communaute', 'Conférence interafricaine des marchés d''assurances', 'CIMA', NULL, 2),
     ('communaute:CEMAC', 'communaute', 'Communauté économique et monétaire de l''Afrique centrale', 'CEMAC', NULL, 3);
 
--- Vocabulaire : racines géographiques des ordres juridiques présents en base
--- (chaque juridiction étrangère est racine de son propre ordre — parent NULL,
--- comme geo:FR). NC/PF vivent déjà sous geo:FR (migration 0203).
 INSERT INTO facet_value (uid, facet, label, abbr, parent_uid, sort) VALUES
     ('geo:AM', 'geo', 'Arménie',                 NULL, NULL, 100),
     ('geo:AO', 'geo', 'Angola',                  NULL, NULL, 101),
@@ -88,17 +76,12 @@ INSERT INTO facet_value (uid, facet, label, abbr, parent_uid, sort) VALUES
     ('geo:VE', 'geo', 'Venezuela',               NULL, NULL, 155),
     ('geo:VN', 'geo', 'Viêt Nam',                NULL, NULL, 156);
 
--- Adhésions VÉRIFIÉES uniquement (une date d'adhésion fausse
--- fabrique du droit applicable qui n'existait pas). Les autres États
--- OHADA/UEMOA/CIMA arrivent par backfill, l'état officiel des ratifications
--- en source.
 INSERT INTO scope_membership (member_scope, community_scope, m_debut, m_fin, source) VALUES
     ('geo:SN', 'communaute:OHADA', '1995-09-18', NULL,
      'Traité de Port-Louis du 17 octobre 1993, entré en vigueur le 18 septembre 1995 ; Sénégal ratifié le 14 juin 1994'),
     ('geo:CD', 'communaute:OHADA', '2012-09-12', NULL,
      'Adhésion de la RDC, entrée en vigueur le 12 septembre 2012');
 
--- Défauts de domaine au grain du texte, curation vérifiée.
 UPDATE legal_text SET default_scope = 'geo:FR-ALS'
 WHERE text_uid IN ('JORFTEXT000000869866', 'JORFTEXT000000869867');
 UPDATE legal_text SET default_scope = 'geo:PF'

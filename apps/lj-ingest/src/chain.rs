@@ -1,19 +1,9 @@
-//! Chaînes cron : listes ordonnées d'étapes exécutées indépendamment.
-//!
-//! L'ordre est conservé, l'abandon ne l'est pas : chaque étape tourne sous son
-//! propre watchdog, les échecs sont collectés, et la chaîne sort non-zéro après
-//! un `error!` récapitulatif (clé d'alerte Grafana : `chain_failed`).
-//!
-//! Le délai du watchdog est **porté par l'étape**, pas par la chaîne : un
-//! plafond unique se cale sur la plus lente, et laisse les autres pendues des
-//! heures sur un amont muet.
-
 use std::time::Instant;
 
 use anyhow::{bail, Result};
 use clap::ValueEnum;
 
-use crate::{pipeline, Command, DbCommand};
+use crate::{pipeline, AssertionsCommand, Command, DbCommand};
 
 /// Plancher du délai d'une étape. En dessous, une journée simplement lente
 /// (amont chargé, file plus grosse que d'habitude) se ferait couper.
@@ -36,22 +26,25 @@ fn step(command: Command, watchdog_secs: u64) -> Step {
     }
 }
 
-/// Chaîne planifiée. `Hebdo` = la quotidienne suivie de la maintenance
-/// hebdomadaire, dans un seul processus.
+/// Scheduled chain. `Weekly` = the daily one followed by the weekly
+/// maintenance, in a single process.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub(crate) enum ChainKind {
-    /// Lundi → samedi : sources du jour, fraîcheur, résumés, publication.
-    Quotidienne,
-    /// Dimanche : la quotidienne puis la maintenance hebdomadaire.
-    Hebdo,
+    /// Monday to Saturday: the day's sources, freshness, summaries, publication.
+    Daily,
+    /// Sunday: the daily one, then the weekly maintenance.
+    Weekly,
+    /// Before the quotas reset: what the day has not spent.
+    Drain,
 }
 
 impl ChainKind {
-    /// Libellé stable pour les breadcrumbs / l'alerte (`chain="quotidienne"`).
+    /// Stable label for the breadcrumbs and the alert (`chain="daily"`).
     fn label(self) -> &'static str {
         match self {
-            ChainKind::Quotidienne => "quotidienne",
-            ChainKind::Hebdo => "hebdo",
+            ChainKind::Daily => "daily",
+            ChainKind::Weekly => "weekly",
+            ChainKind::Drain => "drain",
         }
     }
 }
@@ -60,7 +53,7 @@ impl ChainKind {
 /// précédente : l'ordre porte une fraîcheur (les résumés couvrent ce que
 /// l'ingest vient d'écrire, IndexNow soumet ce que `generate-summaries` vient
 /// de bumper), pas une précondition.
-fn quotidienne() -> Vec<Step> {
+fn daily() -> Vec<Step> {
     vec![
         step(Command::Sync, 1_800),
         step(
@@ -99,9 +92,21 @@ fn quotidienne() -> Vec<Step> {
             },
             PLANCHER_SECS,
         ),
-        step(Command::SyncCedh, 3_600),
+        // 75 s on the passes that worked, 12 to 14/09/2026. The 3 600 it carried
+        // dated from the pooled connection that froze for a full hour, fixed on
+        // 31/08/2026 and never recalibrated since.
+        step(Command::SyncCedh, PLANCHER_SECS),
         step(Command::SyncCjue, PLANCHER_SECS),
         step(Command::SyncCnda, PLANCHER_SECS),
+        // Web doctrine, after the decision sources: a note attaches to a
+        // decision already in the stock, which the day's harvest just wrote.
+        step(Command::SyncAdde, PLANCHER_SECS),
+        step(
+            Command::SyncHal {
+                scan: pipeline::HalScan::Daily,
+            },
+            PLANCHER_SECS,
+        ),
         step(Command::SyncLegi, PLANCHER_SECS),
         step(Command::SyncKali, PLANCHER_SECS),
         step(Command::SyncJorf, PLANCHER_SECS),
@@ -111,55 +116,35 @@ fn quotidienne() -> Vec<Step> {
                 only: None,
                 force: false,
                 full: false,
+                backlog: false,
+                concurrency: 4,
             },
             1_800,
         ),
         step(Command::SyncCirculaires, PLANCHER_SECS),
         step(Command::SyncCirculairesBodies, PLANCHER_SECS),
-        // Fond marchés du pot Annonces : ré-énumération complète des canaux puis
-        // cycle de vie. Indépendant du reste de la chaîne.
-        step(Command::Annonces, 1_800),
-        // Cycle de vie du re-groupage du jour : orphelines résolues en
-        // redirections. La forme, elle, s'applique à l'écriture ; son filet rétroactif
-        // est hebdomadaire (`--formes`). Idempotent.
+        // Fond marchés du pot Annonces, en une étape : énumération des canaux,
+        // cycle de vie, fiches des lignes neuves, attributions. Indépendant du
+        // reste de la chaîne, et seul à écrire dans ce fonds.
         step(
-            Command::AnnoncesRegulariser { formes: false },
-            PLANCHER_SECS,
-        ),
-        // Dépôts à racine nue, sans clé de jointure : la jumelle — par
-        // référence, par titre + date d'échéance, ou par titre + acheteur dans
-        // l'instance déclarée — rattrape ce que la moisson ne peut pas voir.
-        // Avant l'enrichissement : la ligne fusionnée hérite du CPV BOAMP et sort de
-        // la file.
-        step(Command::AnnoncesJumeler { applique: true }, PLANCHER_SECS),
-        // Le résidu sans jumelle en stock : la recherche de la plateforme, par
-        // la référence que l'avis publie, atteint les consultations que la
-        // liste énumérable de l'instance ne montre pas (strate hors API chez
-        // Atexo et Atline). Après le jumelage, qui vient de vider le stock
-        // appariable — il ne reste que ce qu'aucune clé ne peut voir.
-        step(
-            Command::AnnoncesResoudre {
-                applique: true,
-                limite: 500,
+            Command::Annonces {
+                centrale_jours: lj_sources_annonces::centraledesmarches::FENETRE_JOURS,
+                relancer_muets: false,
             },
-            2_400,
-        ),
-        // Ce que les listings ne portent pas, tiré page à page. Après la moisson,
-        // qui vient de renouveler la file.
-        step(
-            Command::AnnoncesEnrichir {
-                limite: 2_000,
-                budget_min: 15,
-                sans_acheteur: false,
-            },
-            PLANCHER_SECS,
+            // The internal budgets bound the phases, not this: 1 200 per engine
+            // for the harvest, 1 800 for the notice pull. Measured 1 694 s.
+            4_500,
         ),
         step(Command::StampFreshness, PLANCHER_SECS),
         step(
             Command::GenerateSummaries {
                 limit: None,
-                concurrency: None,
                 refresh_stale: false,
+                cited_min: None,
+                by_jurisdiction: false,
+                reverse: false,
+                models: Vec::new(),
+                accounts: Vec::new(),
             },
             5_400,
         ),
@@ -182,17 +167,16 @@ fn quotidienne() -> Vec<Step> {
     ]
 }
 
-/// Maintenance hebdomadaire, après la quotidienne du dimanche.
-fn hebdomadaire() -> Vec<Step> {
+/// Weekly maintenance, after Sunday's daily chain.
+fn weekly() -> Vec<Step> {
     vec![
         step(Command::Db(DbCommand::ReindexSearch), 9_000),
-        // The only door an EU act that no decision cites comes through. Before
-        // sync-eu-law, which gives the catalogue entries it opens their body in
-        // the same run.
+        // The net of the registry delta the daily sync-eu-law opens with: the
+        // whole registry, a few minutes of SPARQL. Before sync-eu-law, which
+        // gives the catalogue entries it opens their body in the same run.
         step(
             Command::SyncEuCatalog {
-                depuis: None,
-                jusqu_a: None,
+                full: true,
                 limit: None,
             },
             PLANCHER_SECS,
@@ -210,12 +194,15 @@ fn hebdomadaire() -> Vec<Step> {
                 only: None,
                 force: false,
                 full: true,
+                backlog: false,
+                concurrency: 4,
             },
             5_400,
         ),
-        // Le parc de profils d'acheteurs bouge en mois : un recensement
-        // hebdomadaire suffit, la moisson quotidienne lit le recensement en base.
-        step(Command::AnnoncesDiscover, PLANCHER_SECS),
+        // 376 s on 13/09/2026, 913 s on 22/09 for 6 % more hosts: what weighs is
+        // the share that does not answer, four probes in series each. The floor
+        // cut the 20/09 pass 13 s from the end, and nothing is written before it.
+        step(Command::AnnoncesDiscover, 2_700),
         // Filet de forme du pot Annonces : l'ingest écrit propre à la
         // construction, ce passage porte une règle nouvelle au stock clos que
         // la moisson ne revisite jamais (titres, acheteurs, lots).
@@ -228,20 +215,22 @@ fn hebdomadaire() -> Vec<Step> {
             PLANCHER_SECS,
         ),
         step(Command::PartiesRelink { full: false }, PLANCHER_SECS),
-        // 1 450 s mesurés le 23/08/2026, donc un facteur 4 de garde : c'est le
-        // délai le plus large au regard de sa mesure, et la somme des watchdogs
-        // de la chaîne doit tenir sous la période du cron.
+        // 1 450 s mesurés le 23/08/2026, et le facteur de garde tombe de 4 à 3
+        // le 16/09/2026 : la somme des watchdogs de l'hebdo tenait à 300 s sous
+        // la période du cron, et c'est ici qu'il y avait de quoi rendre.
         step(
             Command::ReextractFields {
                 dry_run: false,
                 full: true,
                 jurisdiction_type: Vec::new(),
+                jurisdiction_code: Vec::new(),
                 field: Vec::new(),
                 citing_ref_uid: None,
                 text_query: None,
-                workers: None,
+                // Runs at 3am, and the watchdog below was measured at 8 workers.
+                workers: Some(8),
             },
-            6_300,
+            4_350,
         ),
         step(
             Command::UsageTerms {
@@ -262,26 +251,103 @@ fn hebdomadaire() -> Vec<Step> {
         step(Command::Renvois, PLANCHER_SECS),
         step(Command::AliasCandidats { revue: None }, PLANCHER_SECS),
         step(Command::ExtractTextRefs, 2_400),
-        // Filet de dérive des acteurs, après la ré-extraction qui est l'écrivain
-        // incrémental de `decision_party` : son compteur de réécritures mesure ce que
-        // le régime at-write a laissé fuir. Un compteur non nul dans Grafana = fuite à
-        // diagnostiquer.
         step(Command::PartiesReconcile { workers: None }, 3_600),
         // Affiliations tirées des appositions : une fonction du corpus, donc à
         // recalculer quand le corpus a bougé. Après la ré-extraction (qui rafraîchit
         // `firm_ord`) et le relink (qui résout les deux bouts).
         step(Command::DeriveAffiliations { apply: true }, PLANCHER_SECS),
+        // Reads what the week's harvest failed to reach, so it runs after
+        // `annonces-discover`, whose census is what tells an unconnected engine
+        // from an unlisted tenant. Writes nothing.
+        step(Command::AnnoncesCouverture { limite: 40 }, PLANCHER_SECS),
+        // What the daily chain could not write as a collage, its court having
+        // published nothing yet: ArianeWeb lands months after the decision, so the
+        // summary exists before the words that beat it. ~35 rows a week, a queue
+        // built in 3,4 s.
+        step(
+            Command::UpgradeSummariesCommentaries { limit: None },
+            PLANCHER_SECS,
+        ),
+        // Net under the daily scan: 180 days instead of 30, ~10 requests, and
+        // a `warn!` on what it repairs. A week repairing nothing says the daily
+        // pass holds.
+        step(
+            Command::SyncHal {
+                scan: pipeline::HalScan::Repair,
+            },
+            PLANCHER_SECS,
+        ),
         // Filet de dérive du régime « dérivé à l'écriture » : ferme la marche, il
         // doit voir l'état final du run.
         step(Command::Reconcile, 3_600),
     ]
 }
 
+/// What the day's quotas still hold, spent before they reset.
+///
+/// Gemini's admitted rate is learnt by steps from a cold start, 8 requests a minute
+/// over the first four, measured 20/09/2026, where its day holds 16 000 and expires
+/// at 07:00 UTC. A run cut at two hours never leaves slow start and each restart pays
+/// it again, hence the rest of the day for the rewrite.
+///
+/// It serves the cited decisions first: the doors together turn over thousands a day
+/// against 3,6 million stale rows, and a cited one is read 3,8 times as often.
+fn night_tail() -> Vec<Step> {
+    vec![step(
+        Command::GenerateSummaries {
+            limit: None,
+            refresh_stale: true,
+            cited_min: Some(1),
+            by_jurisdiction: false,
+            reverse: false,
+            models: Vec::new(),
+            accounts: Vec::new(),
+        },
+        64_800,
+    )]
+}
+
 /// Étapes de la chaîne, dans l'ordre.
 fn steps(kind: ChainKind) -> Vec<Step> {
-    let mut steps = quotidienne();
-    if matches!(kind, ChainKind::Hebdo) {
-        steps.extend(hebdomadaire());
+    if matches!(kind, ChainKind::Drain) {
+        return night_tail();
+    }
+    let mut steps = daily();
+    match kind {
+        // After every writer of the referential: the states of the texts the
+        // day touched, and of those never compiled. Not on Sunday, whose
+        // budget is spent to the last 450 s; Monday's three-day window covers it.
+        ChainKind::Daily => {
+            let after = steps
+                .iter()
+                .position(|s| s.command.label() == "sync-circulaires-bodies")
+                .expect("the referential writers precede the compiler")
+                + 1;
+            steps.insert(
+                after,
+                step(
+                    Command::Assertions(AssertionsCommand::Compile {
+                        full: false,
+                        days: 3,
+                        text_uid: None,
+                        dry_run: false,
+                    }),
+                    PLANCHER_SECS,
+                ),
+            );
+        }
+        ChainKind::Weekly => {
+            // The only pass that pays for the tenants silent seven nights: a
+            // platform given back is found within a week, the other six do not
+            // probe it.
+            for s in &mut steps {
+                if let Command::Annonces { relancer_muets, .. } = &mut s.command {
+                    *relancer_muets = true;
+                }
+            }
+            steps.extend(weekly());
+        }
+        ChainKind::Drain => unreachable!("rendue plus haut"),
     }
     steps
 }
@@ -298,7 +364,7 @@ pub(crate) async fn run(kind: ChainKind) -> Result<()> {
     let steps = steps(kind);
     let total = steps.len();
     let started = Instant::now();
-    tracing::info!(chain, total, "chain : début");
+    tracing::info!(chain, total, "chain: start");
 
     let mut failed: Vec<&'static str> = Vec::new();
     for Step {
@@ -307,21 +373,30 @@ pub(crate) async fn run(kind: ChainKind) -> Result<()> {
     } in steps
     {
         let step = command.label();
-        if crate::run_with_watchdog(command, watchdog_secs)
+        let depart = Instant::now();
+        let ok = crate::run_with_watchdog(command, watchdog_secs)
             .await
-            .is_err()
-        {
+            .is_ok();
+        if !ok {
             failed.push(step);
         }
+        // A step cut by the watchdog logs nothing of its own, and the delay to
+        // compare a duration against is here rather than in the command.
+        tracing::info!(
+            chain,
+            step,
+            ok,
+            watchdog_secs,
+            elapsed_s = depart.elapsed().as_secs(),
+            "chain: step"
+        );
     }
 
     let elapsed_s = started.elapsed().as_secs();
     if failed.is_empty() {
-        tracing::info!(chain, total, elapsed_s, "chain : succès");
+        tracing::info!(chain, total, elapsed_s, "chain: success");
         return Ok(());
     }
-    // Signal d'alarme : un seul événement à interroger côté Grafana
-    // (`chain_failed > 0`), qui porte la liste des étapes tombées.
     let steps_failed = failed.join(",");
     tracing::error!(
         chain,
@@ -329,7 +404,7 @@ pub(crate) async fn run(kind: ChainKind) -> Result<()> {
         chain_failed = failed.len(),
         steps_failed,
         elapsed_s,
-        "chain : étapes en échec"
+        "chain: steps failed"
     );
     bail!(
         "chain {chain} : {}/{total} étapes en échec ({steps_failed})",
@@ -349,7 +424,7 @@ mod tests {
     /// borne qu'un plafond unique ne donne pas : 39 étapes à 4 h valent 156 h.
     #[test]
     fn le_pire_cas_tient_sous_la_periode_du_cron() {
-        for kind in [ChainKind::Quotidienne, ChainKind::Hebdo] {
+        for kind in [ChainKind::Daily, ChainKind::Weekly, ChainKind::Drain] {
             let pire: u64 = steps(kind).iter().map(|s| s.watchdog_secs).sum();
             assert!(
                 pire < PERIODE_CRON_SECS,
@@ -363,7 +438,7 @@ mod tests {
     /// suffire à faire couper une étape.
     #[test]
     fn aucun_delai_sous_le_plancher() {
-        for kind in [ChainKind::Quotidienne, ChainKind::Hebdo] {
+        for kind in [ChainKind::Daily, ChainKind::Weekly, ChainKind::Drain] {
             for s in steps(kind) {
                 assert!(
                     s.watchdog_secs >= PLANCHER_SECS,

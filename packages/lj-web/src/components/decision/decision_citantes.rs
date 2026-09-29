@@ -29,7 +29,7 @@ pub fn DecisionCitantes(citantes: Vec<CitingDecisionHit>, total: Option<i64>) ->
     view! {
         <section
             aria-label=title
-            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6"
+            class="rounded-lg border border-[var(--color-rule)] bg-[var(--color-vellum)]/40 p-6 print:hidden"
         >
             <h2 class="font-sans text-base text-[var(--color-ink)]">{title}</h2>
             <ul class="mt-4 flex flex-col">{lignes}</ul>

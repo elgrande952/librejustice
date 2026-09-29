@@ -1,7 +1,6 @@
 //! Composants partages (shell, kit UI) + sous-modules de tranche (decision,
-//! search, activity, profile).
+//! search, profile).
 
-pub mod activity;
 pub mod app_shell;
 pub mod client_only;
 pub mod decision;
@@ -14,6 +13,6 @@ pub mod search;
 pub mod top_bar;
 pub mod ui;
 
-pub use app_shell::{own_page_description, AppShell};
+pub use app_shell::{own_page_description, AppShell, FillViewport};
 pub use footer::Footer;
 pub use top_bar::{TopBar, Wordmark};

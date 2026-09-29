@@ -1,0 +1,28 @@
+[package]
+name = "lj-htr"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Loaded on demand by the redaction workshop, in as many workers as the page
+# splits into, for a page written by hand.
+[package.metadata.cargo-machete]
+ignored = ["getrandom"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lj-fold = { workspace = true }
+serde = { workspace = true }
+serde-wasm-bindgen = "0.6"
+tract-onnx = "0.21"
+wasm-bindgen = { workspace = true }
+
+# tract's random operators reach getrandom 0.2 through rand_core, and on
+# wasm32 it has no backend unless `js` names the browser CSPRNG.
+getrandom = { version = "0.2", features = ["js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lj-workspace-hack = { version = "0.1", path = "../../packages/lj-workspace-hack" }

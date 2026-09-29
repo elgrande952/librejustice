@@ -22,7 +22,7 @@ pub fn LegalNotice() -> impl IntoView {
                     <br />
                     "également directeur de la publication"
                     <br />
-                    "SIRET : 922 108 600 00011"
+                    "SIRET : 922 108 600 00029"
                     <br />
                     "Courriel : "
                     <a
@@ -86,7 +86,24 @@ pub fn LegalNotice() -> impl IntoView {
 
             <Section title="Propriété intellectuelle">
                 <p>
-                    "L'infrastructure logicielle, le design et les composants du site sont la propriété de l'éditeur. Les décisions de justice reproduites sont des documents publics soumis à la Licence Ouverte Etalab 2.0."
+                    "Le "
+                    <a
+                        class="text-[var(--color-accent)] underline-offset-4 hover:underline"
+                        href="https://github.com/librejustice/librejustice"
+                        rel="noreferrer"
+                        target="_blank"
+                    >
+                        "code du site"
+                    </a>
+                    " est publié sous licence Apache 2.0. Certains éléments, comme les polices de caractères et les outils qui lisent les documents scannés ou manuscrits, proviennent de tiers et restent sous "
+                    <a
+                        class="text-[var(--color-accent)] underline-offset-4 hover:underline"
+                        href="/third-party-licenses.txt"
+                        rel="external"
+                    >
+                        "leurs propres licences"
+                    </a>
+                    ". Les décisions de justice reproduites sont des documents publics soumis à la Licence Ouverte Etalab 2.0."
                 </p>
             </Section>
 

@@ -5,8 +5,8 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
-use lj_core::parsing::{build_source_fields_dila, parse_dila_doc, DilaDoc, DilaFond};
 use lj_llm::backend::AnyEmbedder;
+use lj_parse::{build_source_fields_dila, parse_dila_doc, DilaDoc, DilaFond};
 use lj_store::db::Connection;
 use lj_store::repository::DecisionRepository;
 
@@ -131,7 +131,7 @@ pub(super) fn classify_dila(
     };
 
     if decision.jurisdiction_type.is_none() {
-        tracing::warn!(uid = %decision.source_uid, "UID DILA non routé, skip");
+        tracing::warn!(uid = %decision.source_uid, "DILA UID not routed, skip");
         return Ok(None);
     }
 
@@ -144,6 +144,7 @@ pub(super) fn classify_dila(
         payload_format: "dila-xml".to_string(),
         write_mode: super::WriteMode::Full,
         dila_fond: Some(fond.core()),
+        passages: true,
         prebuilt_source_fields: None,
         prebuilt_extracted: None,
     };
@@ -206,7 +207,7 @@ async fn apply_dila_analyses(
             None => match repo
                 .resolve_identity(
                     &cand.decision,
-                    lj_ingest::extract::canonical_ref(&cand.decision).as_deref(),
+                    lj_extract_rows::canonical_ref(&cand.decision).as_deref(),
                 )
                 .await?
             {
@@ -270,7 +271,7 @@ pub async fn ingest_dila(fond: Fond) -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
 
@@ -278,7 +279,7 @@ pub async fn ingest_dila(fond: Fond) -> Result<()> {
     let mut tarballs = collect_tar_gz(&tarballs_dir)?;
     tarballs.sort();
     if tarballs.is_empty() {
-        tracing::info!(dir = %tarballs_dir.display(), fond = ?fond, "aucun tar.gz DILA trouvé");
+        tracing::info!(dir = %tarballs_dir.display(), fond = ?fond, "no DILA tar.gz found");
         return Ok(());
     }
 
@@ -411,7 +412,7 @@ async fn ingest_dila_tarball(
                     // JADE non routé : skip non fatal.
                     Ok(None) => DilaMsg::Skip,
                     Err(e) => {
-                        tracing::error!(member = %name, error = %e, "parse DILA échec");
+                        tracing::error!(member = %name, error = %e, "DILA parse failed");
                         DilaMsg::ParseErr
                     }
                 }
@@ -542,18 +543,18 @@ pub async fn sync_dila(fond: Fond) -> Result<()> {
             .map_err(|e| anyhow!("sync_dila join {:?}: {e}", fond))?
             .map_err(|e| anyhow!("sync_dila {:?}: {e}", fond))?;
     if batch.archives.is_empty() {
-        tracing::info!(fond = ?fond, "sync_dila : rien de neuf (≤ watermark)");
+        tracing::info!(fond = ?fond, "sync_dila: nothing new (<= watermark)");
         return Ok(());
     }
 
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
 
-    tracing::info!(fond = ?fond, downloaded = batch.archives.len(), "sync_dila : ingestion des archives fraîches");
+    tracing::info!(fond = ?fond, downloaded = batch.archives.len(), "sync_dila: ingesting the fresh archives");
     let (embedder, require_embeddings) = build_embedder_opt(&settings).await?;
     let mut total = IngestCounts::default();
     let mut deleted_total: u64 = 0;

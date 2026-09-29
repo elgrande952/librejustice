@@ -14,7 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 lj-api = { workspace = true }
-lj-core = { workspace = true }
+lj-dtos = { workspace = true }
+lj-norm = { workspace = true }
+lj-crawlers = { workspace = true }
+lj-vocab = { workspace = true }
 lj-web = { workspace = true, features = ["ssr"] }
 lj-store = { workspace = true }
 
@@ -32,7 +35,9 @@ http-body = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
+lj-workspace-hack = { version = "0.1", path = "../../packages/lj-workspace-hack" }
 
 [dev-dependencies]
 futures = { workspace = true }

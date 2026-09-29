@@ -1,11 +1,12 @@
-//! Assignation des slugs de textes : unique écrivain de `legal_text.slug`.
-//! Tout texte reçoit un slug déterministe, immuable et **lisible** — jamais
-//! d'uid dedans. Cascade en collision : slug complet du titre, puis date du
-//! texte, puis NOR, puis ordinal. Les textes hors juridiction FR/UE/INTL portent
-//! le pays en suffixe ISO 3166-1 alpha-3, radical débarrassé de ses marqueurs
-//! pays (`code-civil-bel`). La passe tourne en fin de chaque ingest référentiel
-//! et s'expose en commande `assign-slugs` (backfill). Idempotente : elle ne
-//! remplit que les `slug NULL`.
+//! Text slug assignment: the only writer of `legal_text.slug`. Every text
+//! gets a deterministic, immutable and **readable** slug, never a uid inside.
+//! Cascade on collision: a wider cut of the title, then the date of the text,
+//! then the NOR, then an ordinal, inside the jurisdiction, uniqueness bearing on the
+//! pair since the URL names the jurisdiction in its first segment. The stem of
+//! a foreign text is stripped of its country markers, which the segment says
+//! again (`/norm/be/nouveau-code-civil`). The pass runs at the end of every
+//! referential ingest and is exposed as the `assign-slugs` command (backfill).
+//! Idempotent: it fills `slug NULL` and nothing else.
 
 use anyhow::{anyhow, bail, Result};
 use lj_store::repository::{DecisionRepository, SlugSourceRow};
@@ -17,22 +18,28 @@ use crate::config::Settings;
 /// font couramment 150-250 chars, l'URL n'a pas à porter tout l'intitulé.
 const MAX_SLUG_LEN: usize = 80;
 
-/// Tronque un slug déjà formé à [`MAX_SLUG_LEN`], sur une frontière de tiret.
-fn truncate_slug(full: &str) -> String {
-    if full.len() <= MAX_SLUG_LEN {
+/// The cut tried when the first is taken. The whole title instead gave slugs
+/// of up to 1 382 chars; this cut keeps them under 150 for 21 k more ordinals
+/// out of 1.35 M texts.
+const WIDE_SLUG_LEN: usize = 120;
+
+/// Cuts an already formed slug at `max`, on a dash boundary.
+fn truncate_slug(full: &str, max: usize) -> String {
+    if full.len() <= max {
         return full.to_string();
     }
-    match full[..=MAX_SLUG_LEN].rfind('-') {
+    match full[..=max].rfind('-') {
         Some(cut) if cut > 0 => full[..cut].to_string(),
-        _ => full[..MAX_SLUG_LEN].to_string(),
+        _ => full[..max].to_string(),
     }
 }
 
-/// Pays d'une juridiction hors corpus propre (FR/UE/INTL) : suffixe ISO
-/// 3166-1 alpha-3 minuscule, et tokens de radical à stripper (gentilés, nom
-/// du pays) — l'identité pays vit dans le seul suffixe, jamais dans le
-/// radical (`code-civil-syr`, pas `code-civil-syrien-syr`). Code inconnu =
-/// erreur franche : étendre la table à la curation du texte.
+/// The country of a jurisdiction outside the home corpora (FR/UE/INTL): its
+/// lowercase ISO 3166-1 alpha-3 code, as the old suffix carried it, and the
+/// stem tokens to strip (demonyms, country name). The country identity lives
+/// in the URL segment, never in the slug (`code-civil`, not
+/// `code-civil-syrien`). An unknown code is a hard error: extend the table
+/// when the text is curated.
 fn country(a2: &str) -> Result<(&'static str, &'static [&'static str])> {
     Ok(match a2 {
         "AM" => ("arm", &["armenien", "armenienne", "armenie"]),
@@ -136,18 +143,39 @@ fn strip_country_tokens(slug: &str, tokens: &[&str], a2: &str) -> String {
     toks.join("-")
 }
 
-/// Slug d'un texte face aux slugs déjà pris : premier candidat libre de la
-/// cascade tronqué → complet → complet+date → complet+date+NOR → ordinal.
-/// Hors FR/UE/INTL, le radical est débarrassé de ses marqueurs pays et chaque
-/// candidat porte le suffixe alpha-3.
-fn pick_slug(src: &SlugSourceRow, taken: &HashSet<String>) -> Result<String> {
+/// The slug of a text against the `(jurisdiction, slug)` pairs already taken:
+/// the first free candidate of the cascade truncated, truncated wider, plus
+/// date, plus date plus NOR, then an ordinal. Outside FR/UE/INTL the stem is
+/// stripped of its country markers, which the URL segment carries.
+fn pick_slug(src: &SlugSourceRow, taken: &HashSet<(String, String)>) -> Result<String> {
+    let (candidates, stem) = cascade(src, |s| lj_fold::slug(s, '-'))?;
+    let libre = |cand: &str| !taken.contains(&(src.jurisdiction.clone(), cand.to_string()));
+    if let Some(cand) = candidates.into_iter().find(|c| libre(c)) {
+        return Ok(cand);
+    }
+    Ok((2..)
+        .map(|i| format!("{stem}-{i}"))
+        .find(|cand| libre(cand))
+        .expect("les ordinaux finissent par trouver un slug libre"))
+}
+
+/// The date a slug may carry: the date of the text, else its publication
+/// date, the DILA setting the 2999-01-01 sentinel on some JORF texts.
+fn slug_date(src: &SlugSourceRow) -> Option<&str> {
+    [&src.date_texte, &src.date_publi]
+        .into_iter()
+        .filter_map(|d| d.as_deref())
+        .find(|d| ("1500-01-01".."2100-01-01").contains(d))
+}
+
+/// The candidates of the cascade in order, and the stem its ordinals extend.
+fn cascade(src: &SlugSourceRow, slugify: impl Fn(&str) -> String) -> Result<(Vec<String>, String)> {
     if src.title.trim().is_empty() {
         bail!("texte {} sans titre : aucun slug dérivable", src.text_uid);
     }
-    let mut full_raw = lj_extract::legi::slugify_code(&src.title);
-    let mut suffix = String::new();
+    let mut full_raw = slugify(&src.title);
     if !matches!(src.jurisdiction.as_str(), "FR" | "UE" | "INTL") {
-        let (a3, tokens) = country(&src.jurisdiction)?;
+        let (_, tokens) = country(&src.jurisdiction)?;
         full_raw = strip_country_tokens(&full_raw, tokens, &src.jurisdiction);
         if full_raw.is_empty() {
             bail!(
@@ -155,29 +183,19 @@ fn pick_slug(src: &SlugSourceRow, taken: &HashSet<String>) -> Result<String> {
                 src.text_uid
             );
         }
-        suffix = format!("-{a3}");
     }
-    let base = format!("{}{suffix}", truncate_slug(&full_raw));
-    let full = format!("{full_raw}{suffix}");
-    let mut candidates = vec![base, full.clone()];
-    let mut stem = full;
-    if let Some(date) = &src.date_texte {
+    let wide = truncate_slug(&full_raw, WIDE_SLUG_LEN);
+    let mut candidates = vec![truncate_slug(&full_raw, MAX_SLUG_LEN), wide.clone()];
+    let mut stem = wide;
+    if let Some(date) = slug_date(src) {
         stem = format!("{stem}-{date}");
         candidates.push(stem.clone());
     }
     if let Some(nor) = &src.nor {
-        stem = format!("{stem}-{}", lj_extract::legi::slugify_code(nor));
+        stem = format!("{stem}-{}", slugify(nor));
         candidates.push(stem.clone());
     }
-    for cand in candidates {
-        if !taken.contains(&cand) {
-            return Ok(cand);
-        }
-    }
-    Ok((2..)
-        .map(|i| format!("{stem}-{i}"))
-        .find(|cand| !taken.contains(cand))
-        .expect("les ordinaux finissent par trouver un slug libre"))
+    Ok((candidates, stem))
 }
 
 /// Remplit les `slug NULL` : candidats triés par `text_uid` (déterminisme),
@@ -191,7 +209,7 @@ pub async fn assign_text_slugs(repo: &DecisionRepository<'_>) -> Result<u64> {
     if pending.is_empty() {
         return Ok(0);
     }
-    let mut taken: HashSet<String> = repo
+    let mut taken: HashSet<(String, String)> = repo
         .existing_text_slugs()
         .await
         .map_err(|e| anyhow!("existing_text_slugs: {e}"))?
@@ -201,7 +219,7 @@ pub async fn assign_text_slugs(repo: &DecisionRepository<'_>) -> Result<u64> {
     let mut assign: Vec<(String, String)> = Vec::with_capacity(pending.len());
     for src in pending {
         let slug = pick_slug(&src, &taken)?;
-        taken.insert(slug.clone());
+        taken.insert((src.jurisdiction.clone(), slug.clone()));
         assign.push((src.text_uid, slug));
     }
 
@@ -215,18 +233,185 @@ pub async fn assign_text_slugs(repo: &DecisionRepository<'_>) -> Result<u64> {
     Ok(written)
 }
 
+/// Command `drop-country-suffix`: a single pass that strips from the 247
+/// foreign slugs the alpha-3 suffix the URL segment now carries, and bequeaths
+/// every old address as a redirect. Replays as a no-op, a bare slug having no
+/// suffix left to strip. Refuses a collision rather than cascading: a name
+/// twice under one jurisdiction is curated by hand.
+pub async fn drop_country_suffix() -> Result<()> {
+    let settings = Settings::from_env()?;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+    let mut taken: HashSet<(String, String)> = repo
+        .existing_text_slugs()
+        .await
+        .map_err(|e| anyhow!("existing_text_slugs: {e}"))?
+        .into_iter()
+        .collect();
+    let mut renamed = 0u64;
+    let mut kept = 0u64;
+    for (text_uid, jurisdiction, ancien) in repo
+        .foreign_text_slugs()
+        .await
+        .map_err(|e| anyhow!("foreign_text_slugs: {e}"))?
+    {
+        let (a3, _) = country(&jurisdiction)?;
+        let Some(neuf) = ancien.strip_suffix(&format!("-{a3}")) else {
+            kept += 1;
+            continue;
+        };
+        if neuf.is_empty() {
+            bail!("texte {text_uid} : slug réduit à son suffixe pays, rien à garder");
+        }
+        let cle = (jurisdiction.clone(), neuf.to_string());
+        if taken.contains(&cle) {
+            bail!("texte {text_uid} : « {neuf} » est déjà pris sous {jurisdiction}");
+        }
+        repo.rename_text_slug(&text_uid, &ancien, neuf)
+            .await
+            .map_err(|e| anyhow!("rename_text_slug({text_uid}): {e}"))?;
+        taken.remove(&(jurisdiction, ancien));
+        taken.insert(cle);
+        renamed += 1;
+    }
+    tracing::info!(
+        renamed,
+        kept,
+        "country suffix removed from the foreign slugs"
+    );
+    Ok(())
+}
+
+/// Whether the cascade can have produced `slug`: one of its candidates, or an
+/// ordinal of its stem.
+fn minted_by(slug: &str, candidates: &[String], stem: &str) -> bool {
+    candidates.iter().any(|c| c == slug)
+        || slug
+            .strip_prefix(stem)
+            .and_then(|t| t.strip_prefix('-'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether every word of `slug` comes from the title, the date or the NOR of
+/// the text: a name chosen by hand, as opposed to a slug minted from a title
+/// the text no longer bears, or from a badly decoded one. A hand name is no
+/// longer than the widest cut.
+fn named_from(slug: &str, src: &SlugSourceRow) -> bool {
+    if slug.len() > WIDE_SLUG_LEN {
+        return false;
+    }
+    let words: HashSet<String> = [Some(src.title.as_str()), slug_date(src), src.nor.as_deref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|s| {
+            lj_fold::slug(s, '-')
+                .split('-')
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    slug.split('-').all(|w| words.contains(w))
+}
+
+/// Command `remint-text-slugs`: renames every slug the cascade no longer
+/// mints from its text, each old address kept as a redirect. A slug whose words
+/// all come from the text was named by hand and stays. **Dry-run by default.**
+/// Replays as a no-op.
+pub async fn remint_text_slugs(applique: bool) -> Result<()> {
+    let settings = Settings::from_env()?;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    let repo = DecisionRepository::new(&conn);
+    let texts = repo
+        .texts_with_slug()
+        .await
+        .map_err(|e| anyhow!("texts_with_slug: {e}"))?;
+    let mut taken: HashSet<(String, String)> = repo
+        .existing_text_slugs()
+        .await
+        .map_err(|e| anyhow!("existing_text_slugs: {e}"))?
+        .into_iter()
+        .collect();
+    let redirects: std::collections::HashMap<String, String> = repo
+        .text_slug_redirects()
+        .await
+        .map_err(|e| anyhow!("text_slug_redirects: {e}"))?
+        .into_iter()
+        .collect();
+
+    let mut bequeathed: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    for (ancien, uid) in &redirects {
+        bequeathed.entry(uid).or_default().push(ancien);
+    }
+
+    let mut plan: Vec<(String, String, String)> = Vec::new();
+    let mut by_hand = 0u64;
+    for (src, stored) in &texts {
+        let (candidates, stem) = cascade(src, |s| lj_fold::slug(s, '-'))?;
+        if minted_by(stored, &candidates, &stem) {
+            continue;
+        }
+        if named_from(stored, src) {
+            by_hand += 1;
+            continue;
+        }
+        // A text may take back one of its own old addresses.
+        let own: Vec<(String, String)> = bequeathed
+            .get(src.text_uid.as_str())
+            .into_iter()
+            .flatten()
+            .map(|ancien| (src.jurisdiction.clone(), ancien.to_string()))
+            .collect();
+        for key in &own {
+            taken.remove(key);
+        }
+        let neuf = pick_slug(src, &taken)?;
+        taken.extend(own);
+        taken.insert((src.jurisdiction.clone(), neuf.clone()));
+        plan.push((src.text_uid.clone(), stored.clone(), neuf));
+    }
+
+    for (text_uid, ancien, _) in &plan {
+        if redirects.get(ancien).is_some_and(|uid| uid != text_uid) {
+            bail!("texte {text_uid} : la redirection « {ancien} » répond déjà à un autre texte");
+        }
+    }
+    for (text_uid, ancien, neuf) in plan.iter().take(20) {
+        tracing::info!(text_uid, ancien, neuf, "remint slug");
+    }
+    tracing::info!(
+        renamed = plan.len(),
+        by_hand,
+        applique,
+        "text slugs reminted"
+    );
+    if !applique {
+        return Ok(());
+    }
+    for (text_uid, ancien, neuf) in &plan {
+        repo.rename_text_slug(text_uid, ancien, neuf)
+            .await
+            .map_err(|e| anyhow!("rename_text_slug({text_uid}): {e}"))?;
+    }
+    Ok(())
+}
+
 /// Commande `assign-slugs` : backfill autonome (pool + migrations + passe).
 pub async fn assign_slugs() -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
     let n = assign_text_slugs(&repo).await?;
-    tracing::info!(written = n, "slugs de textes assignés");
+    tracing::info!(written = n, "text slugs assigned");
     Ok(())
 }
 
@@ -245,8 +430,46 @@ mod tests {
             title: title.into(),
             jurisdiction: jurisdiction.into(),
             date_texte: date.map(str::to_string),
+            date_publi: None,
             nor: nor.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn un_slug_que_la_cascade_ne_frappe_plus_se_renomme_sauf_le_nom_a_la_main() {
+        let texte = src("Aide médicale de l'État", "FR", Some("2005-09-27"), None);
+        let (candidates, stem) = cascade(&texte, |s| lj_fold::slug(s, '-')).unwrap();
+        assert!(minted_by("aide-medicale-de-l-etat", &candidates, &stem));
+        assert!(minted_by(
+            "aide-medicale-de-l-etat-2005-09-27-3",
+            &candidates,
+            &stem
+        ));
+        assert!(!minted_by("aide-medicale-de-l-tat", &candidates, &stem));
+        assert!(!named_from("aide-medicale-de-l-tat", &texte));
+        assert!(!minted_by("aide-medicale-etat", &candidates, &stem));
+        assert!(named_from("aide-medicale-etat", &texte));
+    }
+
+    #[test]
+    fn la_date_sentinelle_cede_a_la_date_de_publication() {
+        let mut texte = src(
+            "Avis de vacance",
+            "FR",
+            Some("2999-01-01"),
+            Some("ECOX9900001V"),
+        );
+        let taken = HashSet::from([("FR".to_string(), "avis-de-vacance".to_string())]);
+        assert_eq!(
+            pick_slug(&texte, &taken).unwrap(),
+            "avis-de-vacance-ecox9900001v"
+        );
+        assert!(!named_from("avis-de-vacance-2999-01-01", &texte));
+        texte.date_publi = Some("2024-03-15".into());
+        assert_eq!(
+            pick_slug(&texte, &taken).unwrap(),
+            "avis-de-vacance-2024-03-15"
+        );
     }
 
     #[test]
@@ -277,18 +500,18 @@ mod tests {
         // Base libre → tronqué.
         let s1 = pick_slug(&src(long_title, "FR", Some("2014-06-12"), None), &taken).unwrap();
         assert!(s1.len() <= MAX_SLUG_LEN);
-        taken.insert(s1.clone());
+        taken.insert(("FR".to_string(), s1.clone()));
 
-        // Base prise → slug complet non tronqué.
+        // Base prise → coupe plus large.
         let s2 = pick_slug(&src(long_title, "FR", Some("2014-06-12"), None), &taken).unwrap();
         assert!(s2.starts_with(&s1));
-        assert!(s2.len() > MAX_SLUG_LEN);
-        taken.insert(s2.clone());
+        assert!(s2.len() > MAX_SLUG_LEN && s2.len() <= WIDE_SLUG_LEN);
+        taken.insert(("FR".to_string(), s2.clone()));
 
-        // Complet pris → date.
+        // Coupe large prise → date.
         let s3 = pick_slug(&src(long_title, "FR", Some("2014-06-12"), None), &taken).unwrap();
         assert_eq!(s3, format!("{s2}-2014-06-12"));
-        taken.insert(s3.clone());
+        taken.insert(("FR".to_string(), s3.clone()));
 
         // Date prise → NOR.
         let s4 = pick_slug(
@@ -297,7 +520,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s4, format!("{s3}-agrs1413134a"));
-        taken.insert(s4.clone());
+        taken.insert(("FR".to_string(), s4.clone()));
 
         // Tout pris → ordinal sur le radical le plus riche.
         let s5 = pick_slug(&src(long_title, "FR", Some("2014-06-12"), None), &taken).unwrap();
@@ -305,11 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn juridiction_etrangere_suffixe_alpha3() {
+    fn juridiction_etrangere_perd_ses_marqueurs_pays() {
         let taken = HashSet::new();
         assert_eq!(
             pick_slug(&src("Code civil syrien", "SY", None, None), &taken).unwrap(),
-            "code-civil-syr"
+            "code-civil"
         );
         assert_eq!(
             pick_slug(
@@ -317,16 +540,30 @@ mod tests {
                 &taken
             )
             .unwrap(),
-            "code-civil-obligations-civ"
+            "code-civil-obligations"
         );
         assert_eq!(
             pick_slug(&src("Constitution belge", "BE", None, None), &taken).unwrap(),
-            "constitution-bel"
+            "constitution"
         );
         assert!(pick_slug(&src("Code civil", "ZZ", None, None), &taken).is_err());
         assert!(
             pick_slug(&src("Syrie", "SY", None, None), &taken).is_err(),
             "titre réduit au pays : erreur franche"
         );
+    }
+
+    /// Le même nom sous deux juridictions ne se départage plus : la paire porte
+    /// l'identité, et 27 pays ont un code civil.
+    #[test]
+    fn le_meme_nom_vit_sous_deux_juridictions() {
+        let mut taken = HashSet::new();
+        let be = pick_slug(&src("Code civil belge", "BE", None, None), &taken).unwrap();
+        taken.insert(("BE".to_string(), be.clone()));
+        let ch = pick_slug(&src("Code civil suisse", "CH", None, None), &taken).unwrap();
+        assert_eq!((be.as_str(), ch.as_str()), ("code-civil", "code-civil"));
+        taken.insert(("CH".to_string(), ch));
+        let deuxieme = pick_slug(&src("Code civil belge", "BE", None, None), &taken).unwrap();
+        assert_eq!(deuxieme, "code-civil-2");
     }
 }

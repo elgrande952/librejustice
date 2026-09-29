@@ -1,63 +1,24 @@
--- Migration 0041 — Publication : codes bruts multi-valeur par ordre.
---
--- Remplace les colonnes générées cassées ``is_recueil`` / ``is_tables_lebon``
--- (migration 0009, ``LIKE '%A%'`` sensible à la casse → 117 852 arrêts judiciaires
--- « Publié au bulletin » classés à tort « Inédit ») par un ``publication_codes
--- TEXT[]`` fidèle. La facette/portée se dérivent des codes en requête
--- (``= ANY`` / ``term_set``), plus aucune dérivation en base.
---
--- Harmonise aussi ``docket_numbers`` en ``NOT NULL DEFAULT '{}'`` (un array de
--- facette n'a pas de raison d'être NULL ; un NULL casse ``= ANY`` / overlap).
---
--- Fenêtre de maintenance OBLIGATOIRE : ce script DROP + CREATE ``chunks_bm25``
--- (≈ plusieurs minutes sur le corpus). Pendant le build, /search en mode lexical
--- ou hybrid échoue. À programmer off-peak. Rollback : recréer ``chunks_bm25`` avec
--- ``is_recueil`` / ``is_tables_lebon`` (état migration 0038).
-
 SET LOCAL maintenance_work_mem = '2GB';
 SET LOCAL max_parallel_maintenance_workers = 4;
-
--- =====================================================================
--- 1. decisions : publication_codes TEXT[] (fidèle) + backfill
--- =====================================================================
 
 ALTER TABLE decisions
     ADD COLUMN publication_codes TEXT[] NOT NULL DEFAULT '{}';
 
--- Backfill depuis le scalaire historique (déjà tronqué au 1er code à l'ingestion ;
--- le multi-valeur ne se récupère qu'au ré-ingest, hors scope de cette migration).
 UPDATE decisions
 SET publication_codes = ARRAY[publication_code]
 WHERE publication_code IS NOT NULL AND publication_code <> '';
 
--- =====================================================================
--- 2. Drop trigger + colonnes générées cassées + scalaire
--- =====================================================================
---
--- Le trigger ``decisions_sync_chunks_meta`` référence is_recueil/is_tables_lebon
--- (corps + clause WHEN) : on le DROP avant de retirer les colonnes, on le recrée
--- en §5 sur publication_codes.
-
 DROP TRIGGER IF EXISTS decisions_sync_chunks_meta ON decisions;
 
--- DROP des colonnes générées (l'index idx_decisions_is_recueil tombe en cascade).
 ALTER TABLE decisions
     DROP COLUMN is_recueil,
     DROP COLUMN is_tables_lebon,
     DROP COLUMN publication_code;
 
--- =====================================================================
--- 3. docket_numbers : NOT NULL DEFAULT '{}'
--- =====================================================================
-
 UPDATE decisions SET docket_numbers = '{}' WHERE docket_numbers IS NULL;
 ALTER TABLE decisions
     ALTER COLUMN docket_numbers SET DEFAULT '{}',
     ALTER COLUMN docket_numbers SET NOT NULL;
-
--- =====================================================================
--- 4. decision_chunks : publication_codes dénormalisé + drop booléens
--- =====================================================================
 
 ALTER TABLE decision_chunks
     ADD COLUMN publication_codes TEXT[] NOT NULL DEFAULT '{}';
@@ -68,14 +29,9 @@ FROM decisions d
 WHERE c.decision_id = d.id
   AND c.publication_codes IS DISTINCT FROM d.publication_codes;
 
--- Index booléens + colonnes (cascade des index idx_chunks_is_*).
 ALTER TABLE decision_chunks
     DROP COLUMN is_recueil,
     DROP COLUMN is_tables_lebon;
-
--- =====================================================================
--- 5. Trigger de propagation decisions → decision_chunks (sur publication_codes)
--- =====================================================================
 
 CREATE OR REPLACE FUNCTION sync_chunks_decision_meta() RETURNS TRIGGER AS $$
 BEGIN
@@ -105,13 +61,6 @@ CREATE TRIGGER decisions_sync_chunks_meta
      OR OLD.date_lecture       IS DISTINCT FROM NEW.date_lecture
     )
     EXECUTE FUNCTION sync_chunks_decision_meta();
-
--- =====================================================================
--- 6. Rebuild chunks_bm25 : publication_codes en fast field (remplace booléens)
--- =====================================================================
---
--- ParadeDB ne permet pas d'altérer les fast fields d'un index BM25 existant.
--- Rebuild complet requis. ``chunks_vec`` n'est pas concerné.
 
 DROP INDEX IF EXISTS chunks_bm25;
 

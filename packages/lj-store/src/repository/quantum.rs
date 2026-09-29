@@ -22,6 +22,11 @@ use crate::error::Result;
 pub struct QuantumObservationRow {
     pub victime_ord: i16,
     pub poste_ord: i16,
+    /// -1 on the poste's own row, the only one carrying `montant_cents`: a
+    /// finer row observes a price alone, so summing the amounts still sums the
+    /// postes.
+    pub composante_ord: i16,
+    pub tranche_ord: i16,
     pub poste: String,
     pub axe: Option<String>,
     pub hors_table: Option<String>,
@@ -29,6 +34,10 @@ pub struct QuantumObservationRow {
     pub valeur_unitaire_cents: Option<i64>,
     pub quantite: Option<f64>,
     pub unite: Option<String>,
+    pub nature_aide: Option<String>,
+    pub mode_emploi: Option<String>,
+    pub specialisee: Option<bool>,
+    pub nuit: Option<bool>,
     pub taux_pct: Option<f64>,
     pub cotation: Option<f64>,
     pub categorie: Option<String>,
@@ -60,13 +69,16 @@ pub struct QuantumWriteItem {
 }
 
 const COPY_SQL: &str = "COPY quantum_observation (decision_id, pc_extract_version, victime_ord, \
-     poste_ord, poste, axe, hors_table, montant_cents, valeur_unitaire_cents, quantite, unite, \
+     poste_ord, composante_ord, tranche_ord, poste, axe, hors_table, montant_cents, \
+     valeur_unitaire_cents, quantite, unite, nature_aide, mode_emploi, specialisee, nuit, \
      taux_pct, cotation, categorie, categorie_manque, deces, comparabilite, taux_dfp_pct, \
      age, sexe, role, lien, preuve, equations, origine, cite, indemnites_acquises_cents, \
      juridiction, annee) \
      FROM STDIN (FORMAT binary)";
 const COPY_TYPES: &[Type] = &[
     Type::INT8,
+    Type::INT2,
+    Type::INT2,
     Type::INT2,
     Type::INT2,
     Type::INT2,
@@ -77,6 +89,10 @@ const COPY_TYPES: &[Type] = &[
     Type::INT8,
     Type::FLOAT8,
     Type::TEXT,
+    Type::TEXT,
+    Type::TEXT,
+    Type::BOOL,
+    Type::BOOL,
     Type::FLOAT8,
     Type::FLOAT8,
     Type::TEXT,
@@ -98,6 +114,68 @@ const COPY_TYPES: &[Type] = &[
 ];
 
 impl DecisionRepository<'_> {
+    /// The decisions naming a poste of the corporel, by id: the fonds the
+    /// deterministic pass reads. 75 563 on 2026-09-10, 2 s.
+    #[tracing::instrument(name = "db.quantum_fonds_ids", skip(self), fields(db.system = "postgresql"))]
+    pub async fn quantum_fonds_ids(&self) -> Result<Vec<i64>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT d.decision_id FROM decision_text d
+                 WHERE d.deleted_at IS NULL AND d.lang = 'fr'
+                   AND d.id @@@ paradedb.boolean(should => ARRAY[
+                     paradedb.phrase('full_text', ARRAY['déficit','fonctionnel','permanent']),
+                     paradedb.phrase('full_text', ARRAY['déficit','fonctionnel','temporaire']),
+                     paradedb.phrase('full_text', ARRAY['souffrances','endurées']),
+                     paradedb.phrase('full_text', ARRAY['tierce','personne']),
+                     paradedb.phrase('full_text', ARRAY['préjudice','d','affection'])])
+                 ORDER BY d.decision_id",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<_, i64>(0)).collect())
+    }
+
+    /// `(id, full_text)` of the given decisions, the deleted ones left out.
+    #[tracing::instrument(name = "db.decision_texts", skip(self, ids), fields(db.system = "postgresql", ids = ids.len()))]
+    pub async fn decision_texts(&self, ids: &[i64]) -> Result<Vec<(i64, String)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT decision_id, full_text FROM decision_text
+                 WHERE decision_id = ANY($1) AND lang = 'fr' AND deleted_at IS NULL
+                 ORDER BY decision_id",
+                &[&ids],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1)))
+            .collect())
+    }
+
+    /// Drops the readings of these decisions tagged at most `pc_extract_version`,
+    /// observations with them: what a pass wrote and no longer finds. A manual
+    /// revision stays.
+    #[tracing::instrument(name = "db.delete_quantum_at_most", skip(self, ids), fields(db.system = "postgresql", ids = ids.len()))]
+    pub async fn delete_quantum_at_most(
+        &self,
+        ids: &[i64],
+        pc_extract_version: i16,
+    ) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        Ok(self
+            .conn
+            .execute(
+                "DELETE FROM decision_quantum
+                 WHERE decision_id = ANY($1) AND pc_extract_version <= $2",
+                &[&ids, &pc_extract_version],
+            )
+            .await?)
+    }
+
     /// Writes a batch of records tagged with a version, and replaces their
     /// observations.
     ///
@@ -188,6 +266,8 @@ impl DecisionRepository<'_> {
                         &pc_extract_version,
                         &o.victime_ord,
                         &o.poste_ord,
+                        &o.composante_ord,
+                        &o.tranche_ord,
                         &o.poste,
                         &o.axe,
                         &o.hors_table,
@@ -195,6 +275,10 @@ impl DecisionRepository<'_> {
                         &o.valeur_unitaire_cents,
                         &o.quantite,
                         &o.unite,
+                        &o.nature_aide,
+                        &o.mode_emploi,
+                        &o.specialisee,
+                        &o.nuit,
                         &o.taux_pct,
                         &o.cotation,
                         &o.categorie,

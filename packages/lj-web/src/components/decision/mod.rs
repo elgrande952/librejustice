@@ -12,6 +12,7 @@ pub mod decision_renvoyants;
 pub mod decision_similar;
 pub mod decision_skeleton;
 pub mod decision_toc;
+pub mod selection;
 pub mod toc_spy_dom;
 
 pub use decision_body::DecisionBody;

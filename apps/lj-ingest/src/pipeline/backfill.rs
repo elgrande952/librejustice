@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 
 use lj_core::decision::Decision;
+use lj_parse::FromSourceFields;
 use lj_store::repository::DecisionRepository;
 
 use crate::config::Settings;
@@ -87,7 +88,7 @@ pub async fn backfill_canonical_ref(force: bool) -> Result<()> {
                 }
                 Ok((_, None)) => {}
                 Err(e) => {
-                    tracing::error!(error = %e, "canonical-ref échec");
+                    tracing::error!(error = %e, "canonical-ref failed");
                     errors += 1;
                 }
             }
@@ -105,7 +106,7 @@ pub async fn backfill_canonical_ref(force: bool) -> Result<()> {
         );
     }
 
-    tracing::info!(updated_total, errors, "Backfill canonical_ref terminé");
+    tracing::info!(updated_total, errors, "canonical_ref backfill done");
     Ok(())
 }
 
@@ -147,7 +148,7 @@ pub async fn merge_cross_source_duplicates() -> Result<()> {
     let groups = repo.fetch_cross_source_merge_groups().await?;
     tracing::info!(
         clusters = groups.len(),
-        "merge-cross-source : clusters à fusionner"
+        "merge-cross-source: clusters to merge"
     );
 
     let mut merged_clusters = 0usize;
@@ -168,7 +169,7 @@ pub async fn merge_cross_source_duplicates() -> Result<()> {
         }
     }
 
-    tracing::info!(merged_clusters, merged_losers, "merge-cross-source terminé");
+    tracing::info!(merged_clusters, merged_losers, "merge-cross-source done");
     Ok(())
 }
 
@@ -200,6 +201,6 @@ pub async fn backfill_ecli() -> Result<()> {
         tracing::info!(updated_total, last_id, "backfill-ecli progress");
     }
 
-    tracing::info!(updated_total, "Backfill ECLI terminé");
+    tracing::info!(updated_total, "ECLI backfill done");
     Ok(())
 }

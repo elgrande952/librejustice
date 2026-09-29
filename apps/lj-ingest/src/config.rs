@@ -21,21 +21,6 @@ fn env_or(key: &str, default: &str) -> String {
     env_opt(key).unwrap_or_else(|| default.to_string())
 }
 
-/// Découpe une liste séparée par des virgules en éléments non vides, trimés.
-///
-/// `None`/vide → `[]`.
-fn split_csv(value: Option<String>) -> Vec<String> {
-    value
-        .into_iter()
-        .flat_map(|raw| {
-            raw.split(',')
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
 /// Parse un budget neurons (`LIBREJUSTICE_INGEST_NEURON_BUDGET`).
 ///
 /// Accepte un entier brut ou un suffixe d'échelle `k`/`m` (`"9k"` → 9000,
@@ -85,15 +70,13 @@ pub struct Settings {
     pub piste_client_id: Option<String>,
     pub piste_client_secret: Option<String>,
     pub embed_backend: String,
-    pub embed_url: String,
-    pub embed_api_key: Option<String>,
+    /// Local hosts in priority order, never empty.
+    pub embed_hosts: Vec<lj_llm::hosts::EmbedHost>,
     pub cloudflare_account_id: Option<String>,
     pub cloudflare_backend_token: Option<String>,
     /// Budget neurons Workers AI par run (cap dur côté embedder Cloudflare).
     /// Accepte les suffixes `k`/`m` (ex. `"9k"` → 9000). `None` = pas de cap.
     pub ingest_neuron_budget: Option<usize>,
-    pub mistral_api_keys: Vec<String>,
-    pub mistral_model: String,
     pub indexnow_key: Option<String>,
     pub grafana_otlp_endpoint: Option<String>,
     pub grafana_otlp_user: Option<String>,
@@ -107,11 +90,8 @@ pub struct Settings {
     /// `0` = watchdog désactivé. Une chaîne cron n'en dépend pas : chaque étape
     /// porte son propre délai (`chain.rs`).
     pub watchdog_secs: u64,
-    /// URL de base du pont d'egress, seul chemin du connecteur klekoon (TLS 1.2
-    /// legacy que rustls refuse). Défaut = pont local `http://127.0.0.1:8090`
-    /// (hôte/dev) ; en prod, le conteneur `cron` reçoit l'adresse interne par
-    /// son environnement.
-    pub egress_url: String,
+    /// `http://`, `socks5://`, or empty for the host's own address.
+    pub egress_proxy: String,
 }
 
 impl Settings {
@@ -132,18 +112,16 @@ impl Settings {
             piste_client_id: env_opt("LIBREJUSTICE_PISTE_CLIENT_ID"),
             piste_client_secret: env_opt("LIBREJUSTICE_PISTE_CLIENT_SECRET"),
             embed_backend: env_or("LIBREJUSTICE_EMBED_BACKEND", "auto"),
-            embed_url: env_or(
-                "LIBREJUSTICE_EMBED_URL",
-                "http://127.0.0.1:8400/v1/embeddings",
-            ),
-            embed_api_key: env_opt("LIBREJUSTICE_EMBED_API_KEY"),
+            embed_hosts: lj_llm::hosts::parse_hosts(
+                &env_or("LIBREJUSTICE_EMBED_URL", lj_llm::hosts::DEFAULT_URL),
+                env_opt("LIBREJUSTICE_EMBED_API_KEY").as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?,
             cloudflare_account_id: env_opt("LIBREJUSTICE_CLOUDFLARE_ACCOUNT_ID"),
             cloudflare_backend_token: env_opt("LIBREJUSTICE_CLOUDFLARE_BACKEND_TOKEN"),
             ingest_neuron_budget: parse_neuron_budget(env_opt(
                 "LIBREJUSTICE_INGEST_NEURON_BUDGET",
             ))?,
-            mistral_api_keys: split_csv(env_opt("LIBREJUSTICE_MISTRAL_API_KEYS")),
-            mistral_model: env_or("LIBREJUSTICE_MISTRAL_MODEL", "mistral-small-2603"),
             indexnow_key: env_opt("LIBREJUSTICE_INDEXNOW_KEY"),
             grafana_otlp_endpoint: env_opt("LIBREJUSTICE_GRAFANA_OTLP_ENDPOINT"),
             grafana_otlp_user: env_opt("LIBREJUSTICE_GRAFANA_OTLP_USER"),
@@ -153,7 +131,7 @@ impl Settings {
             host_name: env_opt("LIBREJUSTICE_HOST_NAME"),
             container_name: env_opt("LIBREJUSTICE_CONTAINER_NAME"),
             watchdog_secs: parse_watchdog_secs(env_opt("LIBREJUSTICE_INGEST_WATCHDOG_SECS"))?,
-            egress_url: env_or("LIBREJUSTICE_EGRESS_URL", "http://127.0.0.1:8090"),
+            egress_proxy: env_or("LIBREJUSTICE_EGRESS_PROXY", ""),
         })
     }
 
@@ -249,16 +227,6 @@ mod tests {
     }
 
     #[test]
-    fn split_csv_trims_and_filters() {
-        assert_eq!(
-            split_csv(Some(" a , b ,, c ".to_string())),
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
-        assert!(split_csv(None).is_empty());
-        assert!(split_csv(Some("   ".to_string())).is_empty());
-    }
-
-    #[test]
     fn parse_neuron_budget_scales_and_validates() {
         assert_eq!(parse_neuron_budget(None).unwrap(), None);
         assert_eq!(parse_neuron_budget(Some("  ".into())).unwrap(), None);
@@ -282,13 +250,10 @@ mod tests {
             piste_client_id: None,
             piste_client_secret: None,
             embed_backend: "openai-http".into(),
-            embed_url: "http://x".into(),
-            embed_api_key: None,
+            embed_hosts: lj_llm::hosts::parse_hosts("http://x", None).unwrap(),
             cloudflare_account_id: None,
             cloudflare_backend_token: None,
             ingest_neuron_budget: None,
-            mistral_api_keys: vec![],
-            mistral_model: "m".into(),
             indexnow_key: None,
             grafana_otlp_endpoint: None,
             grafana_otlp_user: None,
@@ -298,7 +263,7 @@ mod tests {
             host_name: None,
             container_name: None,
             watchdog_secs: 14_400,
-            egress_url: "http://127.0.0.1:8090".into(),
+            egress_proxy: String::new(),
         };
         assert_eq!(settings.cache_dir(), PathBuf::from("/data/lj/ingest/cache"));
     }

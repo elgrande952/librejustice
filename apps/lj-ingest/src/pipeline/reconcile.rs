@@ -8,6 +8,9 @@
 //! Le volet parties (relink + annuaire) vit dans `parties-relink`, collé au reload
 //! hebdo du registre CNB dont il dépend. Tout nouveau filet de dérive DOIT
 //! s'enregistrer ici.
+//!
+//! One exception to the weekly cadence: the two citation nets also run at the
+//! tail of every ingest pass, through `resolve_pending_citations`.
 
 use std::future::Future;
 use std::time::Instant;
@@ -21,16 +24,47 @@ use crate::config::Settings;
 /// compte final, et plusieurs tiennent des minutes sur une seule requête : sans
 /// ces bornes, leur silence ne se distingue pas d'un blocage.
 async fn filet<T, E>(nom: &'static str, f: impl Future<Output = Result<T, E>>) -> Result<T, E> {
-    tracing::info!(filet = nom, "filet de dérive : début");
+    tracing::info!(filet = nom, "drift net: start");
     let started = Instant::now();
     let out = f.await;
     tracing::info!(
         filet = nom,
         elapsed_s = started.elapsed().as_secs(),
         ok = out.is_ok(),
-        "filet de dérive : fin"
+        "drift net: end"
     );
     out
+}
+
+async fn pending_citations(repo: &DecisionRepository<'_>) -> Result<()> {
+    let resolved = filet(
+        "citations jurisprudence",
+        repo.resolve_pending_case_citations(),
+    )
+    .await?;
+    tracing::info!(resolved, "pending case-law citations resolved");
+    let resolved = filet(
+        "citations texte→jurisprudence",
+        repo.resolve_pending_text_case_citations(),
+    )
+    .await?;
+    tracing::info!(resolved, "pending text-to-case-law citations resolved");
+    Ok(())
+}
+
+/// The two citation nets alone, which the ingest pass runs at its tail: a pass
+/// that dies mid-way leaves its citations pending and the Sunday `reconcile` is
+/// seven days off. Measured 10/09: 24 s per large family, 47 citations recovered
+/// over 514 611 pending keys.
+pub async fn resolve_pending_citations() -> Result<()> {
+    let settings = Settings::from_env()?;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    conn.batch_execute("SET statement_timeout = 0")
+        .await
+        .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
+    pending_citations(&DecisionRepository::new(&conn)).await
 }
 
 /// Commande `reconcile` : rejoue tous les filets de dérive. Idempotent.
@@ -60,19 +94,8 @@ pub async fn reconcile_all() -> Result<()> {
         repo.resolve_pending_decision_links(),
     )
     .await?;
-    tracing::info!(resolved, "liens de chronologie pendants résolus");
-    let resolved = filet(
-        "citations jurisprudence",
-        repo.resolve_pending_case_citations(),
-    )
-    .await?;
-    tracing::info!(resolved, "citations de jurisprudence pendantes résolues");
-    let resolved = filet(
-        "citations texte→jurisprudence",
-        repo.resolve_pending_text_case_citations(),
-    )
-    .await?;
-    tracing::info!(resolved, "citations texte→jurisprudence pendantes résolues");
+    tracing::info!(resolved, "pending chronology links resolved");
+    pending_citations(&repo).await?;
 
     // Liens conseils devenus ambigus à date : le delta du reload CNB ne voit que le
     // voisinage des identités ajoutées, ce filet plein rattrape l'ambiguïté de stock.
@@ -88,7 +111,7 @@ pub async fn reconcile_all() -> Result<()> {
     tracing::info!(
         keys = freed.len(),
         relinked,
-        "liens conseils ambigus à date dé-liés puis re-résolus"
+        "ambiguous dated council links unlinked then re-resolved"
     );
 
     // Commentaires de norme curés : le dataset sous `state_dir` est la source de
@@ -105,7 +128,7 @@ pub async fn reconcile_all() -> Result<()> {
         upserted = report.upserted,
         tombstoned = report.tombstoned,
         dangling = report.dangling,
-        "commentaires de norme curés réconciliés"
+        "curated norm comments reconciled"
     );
 
     // Versions d'article mal situées : sentinelle doublonnée, version qu'aucune
@@ -125,6 +148,6 @@ pub async fn reconcile_all() -> Result<()> {
              l'écriture aurait dû s'en charger, un écrivain a fui"
         ));
     }
-    tracing::info!("versions d'article : rien à situer");
+    tracing::info!("article versions: nothing to place");
     Ok(())
 }

@@ -1,6 +1,6 @@
 //! Parser PUR du fond LEGI (bulk DILA) — `payload XML → LegiArticle / LegiCode`.
 //! Aucun I/O : les octets sont fournis par `lj-ingest`. Réutilise l'arbre XML
-//! minimal de [`lj_core::parsing`] (`build_tree`/`XmlNode`), donc le même tolérant
+//! minimal de [`lj_parse`] (`build_tree`/`XmlNode`), donc le même tolérant
 //! `quick-xml` que le parser opendata.
 //!
 //! Les sentinelles de date (`2999-01-01` = pas de fin, `2222-02-22` = version
@@ -9,7 +9,7 @@
 
 use lj_core::error::CoreError;
 use lj_core::normalizer::clean_texte;
-use lj_core::parsing::{build_tree, node_text, XmlNode};
+use lj_parse::{build_tree, node_text, XmlNode};
 
 /// Sentinelles `DATE_FIN` LEGI → « pas de date » : `2999-01-01` (pas de fin /
 /// en vigueur) et `2222-02-22` (version future programmée, date inconnue).
@@ -34,6 +34,21 @@ pub struct LegiArticle {
     pub texte: Option<String>,
     pub nota: Option<String>,
     pub liens: Vec<LegiLien>,
+    /// The chronicle DILA declares for this article (`VERSIONS/VERSION/LIEN_ART`),
+    /// every version of the number and not only the one this file carries: the
+    /// only completeness test the bulk offers, what we hold against what the
+    /// source announces.
+    pub versions: Vec<LegiVersionRef>,
+}
+
+/// One version announced by an article's chronicle. `date_fin` absorbs the
+/// sentinels like [`LegiArticle`], `None` meaning no end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegiVersionRef {
+    pub legiarti: String,
+    pub etat: String,
+    pub date_debut: Option<String>,
+    pub date_fin: Option<String>,
 }
 
 /// Un texte/code du fond LEGI (`LEGITEXT*.xml`, racine `<TEXTE_VERSION>`).
@@ -363,7 +378,7 @@ pub fn parse_legi_article(raw: &[u8]) -> Result<LegiArticle, CoreError> {
     let etat = node_text(find_anywhere(&root, "META_ARTICLE/ETAT")).unwrap_or_default();
     let date_fin = date_or_none(node_text(find_anywhere(&root, "META_ARTICLE/DATE_FIN")));
     let titre_text = find_anywhere(&root, "CONTEXTE").and_then(collect_titre_tm);
-    let num_key = lj_core::article_key::identity_key(&num);
+    let num_key = lj_norm::article_key::identity_key(&num);
 
     Ok(LegiArticle {
         legiarti,
@@ -377,7 +392,33 @@ pub fn parse_legi_article(raw: &[u8]) -> Result<LegiArticle, CoreError> {
         texte: clean_contenu(find_anywhere(&root, "BLOC_TEXTUEL/CONTENU")),
         nota: clean_contenu(find_anywhere(&root, "NOTA/CONTENU")),
         liens: collect_liens(&root)?,
+        versions: collect_versions(&root),
     })
+}
+
+/// The `VERSIONS` block, flattened: one entry per `LIEN_ART`, in document order.
+/// An entry without `id` is skipped, having nothing to compare a held row to.
+fn collect_versions(root: &XmlNode) -> Vec<LegiVersionRef> {
+    let Some(bloc) = find_anywhere(root, "VERSIONS") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for version in &bloc.children {
+        for lien in &version.children {
+            if lien.tag != "LIEN_ART" {
+                continue;
+            }
+            let attr = |k: &str| lien.attr(k).filter(|v| !v.is_empty()).map(str::to_string);
+            let Some(legiarti) = attr("id") else { continue };
+            out.push(LegiVersionRef {
+                legiarti,
+                etat: lien.attr("etat").unwrap_or_default().to_string(),
+                date_debut: attr("debut"),
+                date_fin: date_or_none(attr("fin")),
+            });
+        }
+    }
+    out
 }
 
 /// Collecte les enfants directs d'un conteneur `STRUCT`/`STRUCTURE_TA` en
@@ -401,7 +442,7 @@ fn collect_toc_edges(container: &XmlNode) -> Result<Vec<LegiTocEdge>, CoreError>
                     child_kind: TocChildKind::Article,
                     child_uid: id,
                     child_cid: None,
-                    child_num_key: Some(lj_core::article_key::identity_key(&num)),
+                    child_num_key: Some(lj_norm::article_key::identity_key(&num)),
                     label: num,
                     etat,
                     date_debut,
@@ -531,42 +572,6 @@ pub fn parse_legi_texte(raw: &[u8]) -> Result<LegiCode, CoreError> {
     })
 }
 
-/// Slug déterministe d'un titre de code : minuscules, accents retirés, ` ` / `'`
-/// → `-`, ne garde que `[a-z0-9-]`, collapse les `-` consécutifs, trim les `-` de
-/// bord. Ex. `Code civil` → `code-civil`.
-pub fn slugify_code(titre: &str) -> String {
-    let mut out = String::with_capacity(titre.len());
-    let mut prev_dash = false;
-    for ch in titre.chars() {
-        let lowered = strip_accent(ch).to_ascii_lowercase();
-        if lowered.is_ascii_alphanumeric() {
-            out.push(lowered);
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-/// Replie un caractère latin accentué sur sa base ASCII ; les autres caractères
-/// sont rendus tels quels (et seront écartés par le filtre `[a-z0-9-]`).
-fn strip_accent(ch: char) -> char {
-    match ch {
-        'à' | 'á' | 'â' | 'ä' | 'ã' | 'å' => 'a',
-        'ç' => 'c',
-        'è' | 'é' | 'ê' | 'ë' => 'e',
-        'ì' | 'í' | 'î' | 'ï' => 'i',
-        'ñ' => 'n',
-        'ò' | 'ó' | 'ô' | 'ö' | 'õ' => 'o',
-        'ù' | 'ú' | 'û' | 'ü' => 'u',
-        'ý' | 'ÿ' => 'y',
-        'œ' => 'o',
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +617,40 @@ mod tests {
             Some("Le premier alinéa.\nLe second alinéa.")
         );
         assert_eq!(a.nota, None);
+    }
+
+    /// The chronicle is what the source announces, so the sentinel end is absorbed
+    /// like everywhere else and an entry without `id` is dropped: it could not be
+    /// compared to a held row.
+    #[test]
+    fn parse_article_collects_the_declared_chronicle() {
+        let xml = br#"<ARTICLE>
+  <META_COMMUN><ID>LEGIARTI000006746513</ID></META_COMMUN>
+  <META_ARTICLE><NUM>R142-9</NUM><ETAT>MODIFIE</ETAT>
+    <DATE_DEBUT>1996-09-11</DATE_DEBUT><DATE_FIN>2005-10-01</DATE_FIN></META_ARTICLE>
+  <CONTEXTE><TEXTE cid="LEGITEXT000006073189"/></CONTEXTE>
+  <VERSIONS>
+    <VERSION etat="MODIFIE">
+      <LIEN_ART debut="1985-12-21" etat="MODIFIE" fin="1996-09-11" id="LEGIARTI000006746512" num="R142-9"/>
+    </VERSION>
+    <VERSION etat="MODIFIE">
+      <LIEN_ART debut="1996-09-11" etat="MODIFIE" fin="2005-10-01" id="LEGIARTI000006746513" num="R142-9"/>
+    </VERSION>
+    <VERSION etat="VIGUEUR">
+      <LIEN_ART debut="2020-01-01" etat="VIGUEUR" fin="2999-01-01" id="LEGIARTI000041404184" num="R142-9"/>
+    </VERSION>
+    <VERSION etat="MODIFIE"><LIEN_ART debut="2019-01-01" etat="MODIFIE" num="R142-9"/></VERSION>
+  </VERSIONS>
+</ARTICLE>"#;
+        let a = parse_legi_article(xml).expect("article");
+        assert_eq!(a.versions.len(), 3);
+        assert_eq!(a.versions[0].legiarti, "LEGIARTI000006746512");
+        assert_eq!(a.versions[0].date_fin.as_deref(), Some("1996-09-11"));
+        assert_eq!(a.versions[2].etat, "VIGUEUR");
+        assert_eq!(a.versions[2].date_fin, None);
+
+        let sans_bloc = parse_legi_article(ARTICLE_MODIFIE.as_bytes()).expect("article");
+        assert!(sans_bloc.versions.is_empty());
     }
 
     #[test]
@@ -1121,20 +1160,5 @@ mod tests {
     fn textelr_missing_cid_is_hard_error() {
         let xml = br#"<TEXTELR><META><META_COMMUN><ID>LEGITEXT000005620686</ID></META_COMMUN></META></TEXTELR>"#;
         assert!(matches!(parse_legi_textelr(xml), Err(CoreError::Xml(_))));
-    }
-
-    #[test]
-    fn slugify_strips_accents_punct_and_collapses() {
-        assert_eq!(slugify_code("Code civil"), "code-civil");
-        assert_eq!(slugify_code("Code pénal"), "code-penal");
-        assert_eq!(
-            slugify_code("Code de l'environnement"),
-            "code-de-l-environnement"
-        );
-        assert_eq!(
-            slugify_code("Code de commerce (ancien)"),
-            "code-de-commerce-ancien"
-        );
-        assert_eq!(slugify_code("  Code   civil  "), "code-civil");
     }
 }

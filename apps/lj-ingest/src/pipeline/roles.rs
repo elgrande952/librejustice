@@ -14,7 +14,7 @@ pub async fn backfill_text_roles() -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     // Passes pleine-table sur l'ensemble des titres : au-delà du
@@ -27,7 +27,7 @@ pub async fn backfill_text_roles() -> Result<()> {
     let verbs = repo.normalize_link_verbs().await?;
     // `legal_article.searchable` dépend du rôle : un rôle reclassé doit
     // re-dénormaliser les articles du texte.
-    let denorm = repo.refresh_article_denorm().await?;
+    let denorm = repo.refresh_article_denorm(None).await?;
     tracing::info!(
         individuel,
         habilitation,
@@ -35,7 +35,7 @@ pub async fn backfill_text_roles() -> Result<()> {
         modificatif,
         verbs_alignes = verbs,
         denorm,
-        "rôles des textes backfillés"
+        "text roles backfilled"
     );
     Ok(())
 }

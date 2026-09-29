@@ -102,19 +102,7 @@ fn to_iso(c: Civil) -> String {
 /// Sans accent ni point final, minuscules : « Févr. » et « fevrier » se
 /// comparent au même mois.
 fn fold_month(s: &str) -> String {
-    s.trim()
-        .trim_end_matches('.')
-        .to_lowercase()
-        .chars()
-        .map(|c| match c {
-            'é' | 'è' | 'ê' => 'e',
-            'û' | 'ù' => 'u',
-            'à' | 'â' => 'a',
-            'ô' => 'o',
-            'ç' => 'c',
-            other => other,
-        })
-        .collect()
+    lj_fold::fold(s.trim().trim_end_matches('.'))
 }
 
 /// Mois nommé, sur les seules formes que nous affichons. Un préfixe partiel ne

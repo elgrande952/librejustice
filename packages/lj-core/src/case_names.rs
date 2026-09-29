@@ -9,7 +9,8 @@ use std::sync::LazyLock;
 
 use serde::Deserialize;
 
-use crate::text::{fold, normalize_spaces};
+use crate::text::normalize_spaces;
+use lj_fold::fold;
 
 const CASE_NAMES_JSON: &str = include_str!("../data/case_names.json");
 
@@ -83,117 +84,6 @@ pub fn short_case_name_key(key: &str) -> Option<String> {
     (short.chars().count() >= 3).then_some(short)
 }
 
-/// Courts and formations, folded. One of them beside a name or a number makes
-/// the query a citation: « Béziers conseil d'État » asks for the decision.
-const COURT_WORDS: &[&str] = &[
-    "ce",
-    "conseil",
-    "etat",
-    "cass",
-    "cassation",
-    "cour",
-    "caa",
-    "ta",
-    "tribunal",
-    "administratif",
-    "administrative",
-    "appel",
-    "cjue",
-    "cjce",
-    "tue",
-    "cedh",
-    "cnda",
-    "constitutionnel",
-    "commerce",
-    "judiciaire",
-    "assemblee",
-    "ass",
-    "section",
-    "sect",
-    "pleniere",
-    "plen",
-    "chambre",
-    "ch",
-    "civ",
-    "com",
-    "soc",
-    "crim",
-    "mixte",
-];
-
-/// What a citation carries besides its court: the words of the reference, the
-/// months, the articles.
-const CITATION_WORDS: &[&str] = &[
-    "arret",
-    "decision",
-    "jurisprudence",
-    "affaire",
-    "req",
-    "n",
-    "no",
-    "numero",
-    "c",
-    "contre",
-    "v",
-    "vs",
-    "de",
-    "du",
-    "des",
-    "d",
-    "l",
-    "la",
-    "le",
-    "les",
-    "et",
-    "en",
-    "janvier",
-    "fevrier",
-    "mars",
-    "avril",
-    "mai",
-    "juin",
-    "juillet",
-    "aout",
-    "septembre",
-    "octobre",
-    "novembre",
-    "decembre",
-];
-
-fn is_citation_word(word: &str) -> bool {
-    let digits = word.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-    let ordinal = !digits.is_empty()
-        && digits.chars().all(|c| c.is_ascii_digit())
-        && matches!(
-            &word[digits.len()..],
-            "" | "e" | "er" | "re" | "eme" | "ere"
-        );
-    let roman = word.chars().all(|c| matches!(c, 'i' | 'v' | 'x'));
-    ordinal || roman || COURT_WORDS.contains(&word) || CITATION_WORDS.contains(&word)
-}
-
-/// The words around a designation cite it and ask nothing else: each is a
-/// citation word, a number, an ordinal or a roman numeral, one names a court.
-pub fn remainder_cites(words: &[&str]) -> bool {
-    words.iter().any(|w| COURT_WORDS.contains(w)) && words.iter().all(|w| is_citation_word(w))
-}
-
-/// The words of a folded query outside `key`, one of its contiguous n-grams.
-/// Every word when the key is not there.
-pub fn words_around<'a>(words: &[&'a str], key: &str) -> Vec<&'a str> {
-    let cle: Vec<&str> = key.split(' ').collect();
-    let debut = (0..words.len().saturating_sub(cle.len() - 1))
-        .find(|&i| words[i..i + cle.len()] == cle[..]);
-    match debut {
-        Some(i) => words[..i]
-            .iter()
-            .chain(&words[i + cle.len()..])
-            .copied()
-            .collect(),
-        None => words.to_vec(),
-    }
-}
-
 /// Contexte qu'un nom supporte autour de lui, en mots. Mesuré sur le trafic
 /// externe : une requête qui nomme son arrêt va jusqu'à quinze mots de contexte,
 /// au-delà de vingt ce sont des paragraphes collés. Le budget de la référence
@@ -260,37 +150,6 @@ mod tests {
             ("commune", None),
         ] {
             assert_eq!(short_case_name_key(cle).as_deref(), court, "clé {cle:?}");
-        }
-    }
-
-    #[test]
-    fn la_juridiction_autour_du_nom_en_fait_une_citation() {
-        let autour = |q: &str, cle: &str| -> bool {
-            let plie = case_name_key(q);
-            let mots: Vec<&str> = plie.split(' ').collect();
-            remainder_cites(&words_around(&mots, cle))
-        };
-        for (q, cle, cite) in [
-            ("Béziers conseil d'État", "beziers", true),
-            ("Béziers CE 2001", "beziers", true),
-            (
-                "CE, Sect., 28 décembre 2009, Commune de Béziers",
-                "commune de beziers",
-                true,
-            ),
-            ("Cass. civ. 1re, 12 mai 2021, Marzouk", "marzouk", true),
-            ("Béziers II", "beziers", false),
-            ("Béziers 2001", "beziers", false),
-            ("arrêt Béziers", "beziers", false),
-            ("Béziers", "beziers", false),
-            ("Béziers conseil municipal", "beziers", false),
-            (
-                "Béziers conseil d'État loyauté contractuelle",
-                "beziers",
-                false,
-            ),
-        ] {
-            assert_eq!(autour(q, cle), cite, "requête {q:?}");
         }
     }
 

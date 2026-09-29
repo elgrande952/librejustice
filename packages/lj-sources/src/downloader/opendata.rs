@@ -108,7 +108,7 @@ pub fn sync_opendata(data_dir: &Path, force: bool) -> Result<Manifest> {
             // retries de download_one marque ce mois `error` et passe au suivant — il sera
             // re-tenté au prochain sync (status != ok).
             if let Err(e) = download_one(&client, &mut entry, &abs_path, force) {
-                tracing::warn!(url = %entry.url, error = %e, "download ZIP échoué, on continue");
+                tracing::warn!(url = %entry.url, error = %e, "ZIP download failed, moving on");
                 entry.status = "error_download".to_string();
             }
             if entry.status == "ok" {
@@ -254,9 +254,9 @@ fn download_reverses_csv(
         200 => {
             let bytes = body.expect("statut 200 → corps lu par get_with_body_retrying");
             fs::write(&dst, &bytes)?;
-            tracing::info!(jur, octets = bytes.len(), "manifeste reverses sauvé");
+            tracing::info!(jur, octets = bytes.len(), "reverses manifest saved");
         }
-        404 => tracing::info!(jur, "pas de manifeste reverses"),
+        404 => tracing::info!(jur, "no reverses manifest"),
         s => tracing::warn!(jur, status = s, "manifeste reverses HTTP error"),
     }
     Ok(())

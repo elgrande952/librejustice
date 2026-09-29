@@ -2,7 +2,7 @@
 experimental = true
 
 [env]
-_.file = [".env", ".env.admin", ".env.local"]
+_.file = [".env", ".env.admin", ".env.local", ".env.mistral"]
 
 # L'environnement de déploiement est décidé par le lanceur : `deploy-from-tree`
 # exporte prod, le conteneur cron impose prod, `beta.sh` impose beta. Ici, le
@@ -26,23 +26,28 @@ uv = "latest"
 prek = "latest"
 usage = "latest"
 age = "1"
+"cargo:cargo-hakari" = "0.9.39"
+
+[tasks.clippy]
+description = "clippy -D warnings sur le workspace, seul, sans le format."
+run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.lint]
 description = "Linters Rust (rustfmt --check + clippy -D warnings)"
 run = """
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+mise run clippy
 """
 
 [tasks.test-only]
 description = "Tous les tests du workspace SANS le lint (cargo test, sans DB) : query/RRF/signals/rerank, extraction (oracle_parity), chunking, legal-refs, DTOs, SSR SEO."
-run = "cargo test --workspace"
+run = "cargo test --workspace --tests"
 
 [tasks.test]
 description = "Lint Rust + tous les tests du workspace + le serveur MCP local"
 depends = ["lint"]
 run = """
-cargo test --workspace
+cargo test --workspace --tests
 uv run pytest mcp -q
 """
 
@@ -72,10 +77,12 @@ podman compose -f infra/docker-compose.yml up -d --no-recreate postgres
 # cargo-leptos à chaque changement (hot-reload :3001). La base est celle de
 # `LIBREJUSTICE_DB_URL` : aucun Postgres local requis.
 [tasks.dev]
-description = "lj-server fusionné (API + MCP + SSR Leptos, :3000) via cargo-leptos watch ; DB = LIBREJUSTICE_DB_URL (.env → prod)"
+description = "lj-server fusionné (API + MCP + SSR Leptos, :3000), compilé une fois et arrêté au bout de 2 h ; DB = LIBREJUSTICE_DB_URL (.env → prod)"
 env = { LIBREJUSTICE_API_DEPLOYMENT_ENVIRONMENT = "dev", LIBREJUSTICE_API_PUBLIC_BASE_URL = "http://localhost:3000" }
 depends = ["build-skill-zips"]
-run = "cargo leptos watch --project librejustice-dev"
+# No watch, and a lifetime: two watchers left behind ran 2 and 4 days on the
+# prod host, rebuilding on every neighbour's edit.
+run = "timeout 2h cargo leptos serve --project librejustice-dev"
 
 # Zips des skills du plugin servis par /mcp-guide (upload claude.ai :
 # le zip contient le dossier de la skill à sa racine). Générés au build,
@@ -108,17 +115,37 @@ podman compose -f infra/docker-compose.yml --profile staging up -d --build --for
 [tasks.precompress]
 description = "Précompresse /pkg (wasm/js/css) en brotli q11 + gzip -9 ; ServeDir.precompressed_* les sert tels quels (zéro recompression par requête, cf. lj-server). À lancer après `cargo leptos build --release`."
 run = """
-pkg="${LEPTOS_SITE_ROOT:-target/site}/pkg"
+site="${LEPTOS_SITE_ROOT:-target/site}"
+# Keyed on content: the redaction modules, OCR data and fonts rarely change,
+# and brotli -q 11 costs ~3 s per MB on this host.
+cache="${LIBREJUSTICE_STATE_DIR:-$HOME/.local/share/librejustice}/cache/precompress"
+mkdir -p "$cache"
 # Noms content-hashés (`hash-files = true`) : lj-web.<sha256>.{wasm,js,css}.
-for f in "$pkg"/lj-web.*.wasm "$pkg"/lj-web.*.js "$pkg"/lj-web.*.css; do
+# The redaction module and its viewer are compressed HERE rather than where they
+# are built: they travel through `public/`, whose copy by cargo-leptos truncated
+# a `.gz` at 256 KB on 21/09, which the browser read as an amputated module.
+for f in "$site"/pkg/lj-web.*.wasm "$site"/pkg/lj-web.*.js "$site"/pkg/lj-web.*.css \
+         "$site"/redactor/*.wasm "$site"/redactor/*.js \
+         "$site"/redactor/fonts/*.ttf "$site"/redactor/fonts/*.otf "$site"/redactor/cmaps/*.cmap \
+         "$site"/ocr/*.wasm "$site"/ocr/*.js "$site"/ocr/*.traineddata; do
   [ -f "$f" ] || continue
-  gzip -9 -kf "$f"
-  if command -v brotli >/dev/null 2>&1; then
-    brotli -q 11 -kf "$f"
-  else
-    python3 -c "import brotli,sys; p=sys.argv[1]; open(p+'.br','wb').write(brotli.compress(open(p,'rb').read(),quality=11))" "$f"
+  key="$cache/$(sha256sum "$f" | cut -c1-64)"
+  if [ ! -f "$key.gz" ]; then
+    gzip -9 -c "$f" > "$key.gz.tmp" && mv "$key.gz.tmp" "$key.gz"
   fi
+  if [ ! -f "$key.br" ]; then
+    if command -v brotli >/dev/null 2>&1; then
+      brotli -q 11 -c "$f" > "$key.br.tmp"
+    else
+      python3 -c "import brotli,sys; sys.stdout.buffer.write(brotli.compress(open(sys.argv[1],'rb').read(),quality=11))" "$f" > "$key.br.tmp"
+    fi
+    mv "$key.br.tmp" "$key.br"
+  fi
+  touch "$key.gz" "$key.br"
+  cp "$key.gz" "$f.gz"
+  cp "$key.br" "$f.br"
 done
+find "$cache" -type f -mtime +14 -delete
 """
 
 [tasks.clean]
@@ -126,6 +153,446 @@ description = "Récupère du disque côté user (rapide, sans sudo) : caches de 
 run = """
 rm -rf target/*/incremental
 podman image prune -f
+"""
+
+# The `/redact` module, outside the hydration bundle, which must not grow for
+# one page: fetched only when a document is opened, it reads a PDF, a scan and
+# a Word document, and draws their pages as SVG.
+[tasks.redact-wasm]
+description = "Builds the browser redaction module into lj-web/public, whence cargo-leptos copies it into the bundle (served under /redactor)."
+
+run = """
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+site="packages/lj-web/public"
+rm -f "$site"/redactor/*.js "$site"/redactor/*.wasm
+rustup target add wasm32-unknown-unknown
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=+simd128" \
+  cargo build -p lj-redact --target wasm32-unknown-unknown --profile redact-release --locked \
+    --target-dir target/redact
+# Bound once per content of the module: 3 s of CPU per run otherwise. Files only:
+# a cached directory in 0700 carried its mode onto public/redactor, unreadable.
+wasm=target/redact/wasm32-unknown-unknown/redact-release/lj_redact.wasm
+bound="${LIBREJUSTICE_STATE_DIR:-$HOME/.local/share/librejustice}/cache/bindgen/$({ sha256sum < "$wasm"; echo lj_redact; wasm-bindgen --version; } | sha256sum | cut -c1-64)"
+if [ ! -d "$bound" ]; then
+  wasm-bindgen --target web --no-typescript --out-dir "$bound.tmp" --out-name lj_redact "$wasm"
+  mv "$bound.tmp" "$bound"
+fi
+touch "$bound"
+cp -a "$bound"/* "$site/redactor"/
+{ cat packages/lj-pdf/NOTICE; echo; cat packages/lj-office/NOTICE; } > "$site/redactor/NOTICE.txt"
+find "${bound%/*}" -mindepth 1 -maxdepth 1 -mtime +14 -exec rm -rf {} +
+"""
+
+[tasks.htr-wasm]
+description = "Builds the slow reader's module into lj-web/public/redactor/htr, whence cargo-leptos copies it into the bundle (served under /redactor/htr)."
+run = """
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+site="packages/lj-web/public/redactor/htr"
+# public/redactor is ignored by git, and htr-assets, which also creates this
+# directory, runs after this task in build-app: a fresh tree has no htr/ yet.
+mkdir -p "$site"
+rm -f "$site"/*.js "$site"/*.wasm
+rustup target add wasm32-unknown-unknown
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=+simd128" \
+  cargo build -p lj-htr --target wasm32-unknown-unknown --profile htr-release --locked \
+    --target-dir target/htr
+# Bound once per content of the module: 7 s of CPU per run otherwise.
+wasm=target/htr/wasm32-unknown-unknown/htr-release/lj_htr.wasm
+bound="${LIBREJUSTICE_STATE_DIR:-$HOME/.local/share/librejustice}/cache/bindgen/$({ sha256sum < "$wasm"; echo lj_htr; wasm-bindgen --version; } | sha256sum | cut -c1-64)"
+if [ ! -d "$bound" ]; then
+  wasm-bindgen --target web --no-typescript --out-dir "$bound.tmp" --out-name lj_htr "$wasm"
+  mv "$bound.tmp" "$bound"
+fi
+touch "$bound"
+cp -a "$bound"/* "$site"/
+find "${bound%/*}" -mindepth 1 -maxdepth 1 -mtime +14 -exec rm -rf {} +
+"""
+
+# The slow reader's networks, converted once per pin: the handwriting reader
+# ships as a PyTorch checkpoint, exported here, which wants PyLaia and Torch.
+# Each file vendored here is listed, with its licence, in
+# packages/lj-web/public/third-party-licenses.txt.
+[tasks.htr-assets]
+description = "Vendors the slow reader's networks and lexicon into lj-web/public/redactor/htr/models (served under /redactor/htr/models, fetched only when the pages are read as handwriting)."
+run = """
+det="e6f4fa85f00e168c862bc462aebca69eef9b3d3d"
+paddle="7b02d0a30a07ba2b92ad1ff5a8941ae2c633de65"
+laia="270d9e1d4ccfa1047a4e617f2af3df40f3074fed"
+words="525f9b560de45753a5ea01069454e72e9aa541c6"
+key=$(echo "$det $paddle $laia $words" | cat - apps/lj-htr/models.py | sha256sum | cut -c1-16)
+vendor="$LIBREJUSTICE_STATE_DIR/vendor/htr-$key"
+site="packages/lj-web/public/redactor/htr/models"
+licenses="
+3840c5c0c61c294264d2dd77b8777be6ddd90121ef4e0e64abcd22edea581d6e PaddleOCR-LICENSE.txt https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/b03f46425e8ff4442b268ce449e3eef758146cd4/LICENSE
+1378695bd756232909fd2668310ad6d8c3ee314e05698c15b747660623ab2ba4 pylaia-rimes-README.md https://huggingface.co/Teklia/pylaia-rimes/raw/270d9e1d4ccfa1047a4e617f2af3df40f3074fed/README.md
+a92fcc50e27f7b2d5860ec1c1ce794dc4c892d945bfa4c8c3136cdfd213ee710 FrequencyWords-README.md https://raw.githubusercontent.com/hermitdave/FrequencyWords/525f9b560de45753a5ea01069454e72e9aa541c6/README.md
+b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5 MIT.txt https://raw.githubusercontent.com/spdx/license-list-data/31ba1a50e5397e00a304dbadc76531740e89ee48/text/MIT.txt
+"
+held="$LIBREJUSTICE_STATE_DIR/vendor/htr-licenses-$(printf '%s' "$licenses" | sha256sum | cut -c1-12)"
+if [ ! -f "$held/.complete" ]; then
+  rm -rf "$held"
+  mkdir -p "$held"
+  printf '%s' "$licenses" | while read -r sum name url; do
+    [ -n "$sum" ] || continue
+    curl -fsSL -o "$held/$name" "$url"
+    echo "$sum  $held/$name" | sha256sum -c --quiet
+  done
+  touch "$held/.complete"
+fi
+if [ ! -f "$vendor/.complete" ]; then
+  rm -rf "$vendor"
+  # Torch, its environment and the interpreter live here and leave with it.
+  scratch=$(mktemp -d)
+  trap 'rm -rf "$scratch"' EXIT
+  mkdir -p "$scratch/downloads"
+  fetch() {
+    curl -fsSL -o "$scratch/downloads/$1" "$2"
+    echo "$3  $scratch/downloads/$1" | sha256sum -c --quiet
+  }
+  hf="https://huggingface.co"
+  fetch det.onnx "$hf/PaddlePaddle/PP-OCRv5_mobile_det_onnx/resolve/$det/inference.onnx" \
+    a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d
+  fetch rec.onnx "$hf/monkt/paddleocr-onnx/resolve/$paddle/languages/latin/rec.onnx" \
+    614ffc2d6d3902d360fad7f1b0dd455ee45e877069d14c4e51a99dc4ef144409
+  fetch dict.txt "$hf/monkt/paddleocr-onnx/resolve/$paddle/languages/latin/dict.txt" \
+    3c0a8a79b612653c25f765271714f71281e4e955962c153e272b7b8c1d2b13ff
+  fetch model "$hf/Teklia/pylaia-rimes/resolve/$laia/model" \
+    e50c1ec3ff00c86c448634987e05f135cbd8017b39f2389ec032fc8f0f99ff6f
+  fetch weights.ckpt "$hf/Teklia/pylaia-rimes/resolve/$laia/weights.ckpt" \
+    b24aa78625c3c5cfbd07926aee3d5890dec2d7aab931a1c55bdbe6770236a8aa
+  fetch syms.txt "$hf/Teklia/pylaia-rimes/resolve/$laia/syms.txt" \
+    ad1f4574e53658cc972ee0ce9f664fefd1061624c9664ff9a9ec371aaa0d9e66
+  for pair in fr:f81f7c570b6433764da99aa30f4dfb08d81c5926301377b709af23a13b1f9596 \
+      en:5351ff405b1126ef555791dd4d9798a48e3e9a501a9fc481a9da957752cfb458 \
+      de:d9e50546fd7e8b6fe6542a2b33c51d1331092b2a3916ec09f80d97856068705b \
+      es:dcff3ad4316192f4dc4ff7d26e637c6ff314ef1ca0f3f720c5649018a71056c0 \
+      it:bb96cdcb56d28342c1e909db6b2525448b7767136b7e86a2ccc649a1be66fc19 \
+      pt:f97704382f97273ff59488b1885e7ac90d20f81fd92e5fbad3e3ce43633f495c \
+      nl:099bd0c27b514d54284360ad9ce2b4ef7b6903b22e848b67ab10f6aa2adb4baa; do
+    lang="${pair%%:*}"
+    fetch "lexicon-$lang.txt" \
+      "https://raw.githubusercontent.com/hermitdave/FrequencyWords/$words/content/2018/$lang/${lang}_50k.txt" "${pair#*:}"
+  done
+  UV_CACHE_DIR="$scratch/uv" UV_PYTHON_INSTALL_DIR="$scratch/python" \
+    uv run --quiet --no-config --managed-python \
+    --index https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match \
+    apps/lj-htr/models.py "$scratch/downloads" "$vendor/site"
+  touch "$vendor/.complete"
+fi
+rm -rf "$site"
+mkdir -p "$site/licenses"
+cp "$vendor"/site/* "$site/"
+cp "$held"/* "$site/licenses/"
+"""
+
+# The Adobe CMaps the module parses as text, fetched only for a PDF whose text
+# names one: the set hayro-cmap embeds natively, read from the repository it is
+# built from, with the CID to Unicode tables that repository adds.
+# Each file vendored here is listed, with its licence, in
+# packages/lj-web/public/third-party-licenses.txt.
+[tasks.pdf-cmaps]
+description = "Vendors the predefined Adobe CMaps into lj-web/public/redactor/cmaps (served under /redactor/cmaps, fetched only for a PDF that names one)."
+run = """
+rev="5d490e4b9af819322500d8409ac61eecdb6e8d93"
+sum="1c6d86862fc85be0fa452d4ed8d6955be33607b1b26990022c7bfa478aa4980d"
+vendor="$LIBREJUSTICE_STATE_DIR/vendor/cmap-resources-$rev"
+site="packages/lj-web/public/redactor/cmaps"
+if [ ! -f "$vendor/.complete" ]; then
+  rm -rf "$vendor"
+  mkdir -p "$vendor"
+  curl -fsSL -o "$vendor/src.tar.gz" "https://github.com/LaurenzV/cmap-resources/archive/$rev.tar.gz"
+  echo "$sum  $vendor/src.tar.gz" | sha256sum -c --quiet
+  tar -xzf "$vendor/src.tar.gz" -C "$vendor" --strip-components 1
+  rm "$vendor/src.tar.gz"
+  touch "$vendor/.complete"
+fi
+rm -rf "$site"
+mkdir -p "$site"
+for name in 83pv-RKSJ-H 90ms-RKSJ-H 90ms-RKSJ-V 90msp-RKSJ-H 90msp-RKSJ-V 90pv-RKSJ-H \
+    Add-RKSJ-H Add-RKSJ-V Adobe-CNS1-UCS2 Adobe-GB1-UCS2 Adobe-Japan1-UCS2 Adobe-Korea1-UCS2 \
+    B5pc-H B5pc-V CNS-EUC-H CNS-EUC-V ETen-B5-H ETen-B5-V ETenms-B5-H ETenms-B5-V EUC-H EUC-V \
+    Ext-RKSJ-H Ext-RKSJ-V GB-EUC-H GB-EUC-V GBK-EUC-H GBK-EUC-V GBK2K-H GBK2K-V GBKp-EUC-H \
+    GBKp-EUC-V GBpc-EUC-H GBpc-EUC-V H HKscs-B5-H HKscs-B5-V KSC-EUC-H KSC-EUC-V KSCms-UHC-H \
+    KSCms-UHC-HW-H KSCms-UHC-HW-V KSCms-UHC-V KSCpc-EUC-H UniCNS-UCS2-H UniCNS-UCS2-V \
+    UniCNS-UTF16-H UniCNS-UTF16-V UniGB-UCS2-H UniGB-UCS2-V UniGB-UTF16-H UniGB-UTF16-V \
+    UniJIS-UCS2-H UniJIS-UCS2-HW-H UniJIS-UCS2-HW-V UniJIS-UCS2-V UniJIS-UTF16-H UniJIS-UTF16-V \
+    UniKS-UCS2-H UniKS-UCS2-V UniKS-UTF16-H UniKS-UTF16-V V; do
+  found=$(ls "$vendor"/Adobe-*/CMap/"$name" "$vendor/pdf2unicode/$name" 2>/dev/null | head -1)
+  [ -n "$found" ] || { echo "pdf-cmaps: $name absent de cmap-resources $rev" >&2; exit 1; }
+  cp "$found" "$site/$name.cmap"
+done
+cp "$vendor/LICENSE.md" "$site/LICENSE.md"
+"""
+
+# One of the five tesseract builds is vendored, LSTM and SIMD: the loader has to
+# name that file, or tesseract.js probes for names this folder does not carry.
+# Each file vendored here is listed, with its licence, in
+# packages/lj-web/public/third-party-licenses.txt.
+[tasks.ocr-assets]
+description = "Vendors tesseract wasm + the fra data into lj-web/public/ocr (served under /ocr, 1.5 MB brotli fetched only for a document with no text layer)."
+run = """
+tesseract="7.0.0"
+core="7.0.0"
+tessdata="4.1.0"
+vendor="$LIBREJUSTICE_STATE_DIR/vendor/tesseract-$tesseract-core-$core-data-$tessdata"
+site="packages/lj-web/public/ocr"
+licenses="
+cdf963ced7d25a0f98901a547647b4d6e2dbe0197fd78c87a059a87b0e542fe2 tesseract.min.js.LICENSE.txt https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/tesseract.min.js.LICENSE.txt
+45f54171aeaa1d10c0c1a66f374b7bba1f02472b1487fbe892eec04f840002ac worker.min.js.LICENSE.txt https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/worker.min.js.LICENSE.txt
+b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1 tesseract.js-LICENSE.md https://raw.githubusercontent.com/naptha/tesseract.js/42eae669e4b3a66429d8516f078912cc747a89df/LICENSE.md
+c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08 tesseract.js-core-LICENSE.txt https://raw.githubusercontent.com/naptha/tesseract.js-core/acffef2b66eb44a31df297e11d905f4b39001068/LICENSE
+cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 tessdata_fast-LICENSE.txt https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/65727574dfcd264acbb0c3e07860e4e9e9b22185/LICENSE
+cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 tesseract-LICENSE.txt https://raw.githubusercontent.com/Balearica/tesseract/2a9c1c49c360462733c386d2a44fcd22c4e21411/LICENSE
+87829abb5bbb00b55a107365da89e9a33f86c4250169e5a1e5588505be7d5806 leptonica-license.txt https://raw.githubusercontent.com/DanBloomberg/leptonica/4af068b56a9674da915debea4ed7e1b9885b17e8/leptonica-license.txt
+c791da525733040e622ed257c7b096b8f5191b332604ead0c6bc2b54cbd8e0d1 libjpeg-README.txt https://raw.githubusercontent.com/LuaDist/libjpeg/6c0fcb8ddee365e7abc4d332662b06900612e923/README
+fbd6fed7938541d2c809c0826225fc85e551fdbfa8732b10f0c87e0847acafd7 libtiff-COPYRIGHT.txt https://gitlab.com/libtiff/libtiff/-/raw/b51bb157123264e26d34c09cc673d213aea61fc7/COPYRIGHT
+5aec868f669e384a22372a4e8a1a6cd7d44c64cd451f960ca69cc170d1e13acf libwebp-COPYING.txt https://raw.githubusercontent.com/webmproject/libwebp/20ef03ee351d4ff03fc5ff3ec4804a879d1b9d5c/COPYING
+0c9b7990ecdca88b676db232c226548ac408b279f550d424d996f0d83591dd8e giflib-COPYING.txt https://raw.githubusercontent.com/mirrorer/giflib/fa37672085ce4b3d62c51627ab3c8cf2dda8009a/COPYING
+33ba4e187d8b0c8d7ab2bc2e522bb095219e03089e9aa0122b4fb9eb2b7de82b libpng-LICENSE.txt https://raw.githubusercontent.com/glennrp/libpng/a37d4836519517bdce6cb9d956092321eca3e73b/LICENSE
+fc2c3368901700f0acdeb1d8afeaca5923296768ec6824ecdf627aac396001fd zlib-README.txt https://raw.githubusercontent.com/madler/zlib/21767c654d31d2dccdde4330529775c6c5fd5389/README
+b1843fbf5b03f519a5f0a44fce751bdd1022ae7148614923f9d6293e17a18b17 openlibm-LICENSE.md https://raw.githubusercontent.com/JuliaMath/openlibm/ae2d91698508701c83cab83714d42a1146dccf85/LICENSE.md
+9f165f5bd2b462122cacb8c6dc32028be1abb4d8ad0322e9a332f30b2ebdb833 bmp-js-LICENSE.txt https://cdn.jsdelivr.net/npm/bmp-js@0.1.0/LICENSE
+80957b522b0ea4ce24290953d74d818220c804d1f42cad02b8d7da1c12ce1fc1 is-url-LICENSE-MIT.txt https://cdn.jsdelivr.net/npm/is-url@1.2.4/LICENSE-MIT
+20c27d6339619eeb3113cb865d4e98a3f559e52964fc75caea9cb5fa72674565 idb-keyval-LICENCE.txt https://cdn.jsdelivr.net/npm/idb-keyval@6.2.1/LICENCE
+bcf29b4fd3ec2cb5f9d40a0866da446f6da62170d2ccedf4aeca9cf9406dd20c wasm-feature-detect-LICENSE.txt https://cdn.jsdelivr.net/npm/wasm-feature-detect@1.8.0/LICENSE
+51887a3d47051ac2fce1210562e5b9fe0830a8a8fabeb272c2d586eeb18a05fd regenerator-runtime-LICENSE.txt https://cdn.jsdelivr.net/npm/regenerator-runtime@0.13.11/LICENSE
+06bafa45fdad2579ba0e43b0c9b2c6290287c99c4203c300254a462b38a307f6 buffer-LICENSE.txt https://cdn.jsdelivr.net/npm/buffer@6.0.3/LICENSE
+18d45466ba3253deae04667e267a91ea8de8548f18c1125264d1c9db28194cc1 ieee754-LICENSE.txt https://cdn.jsdelivr.net/npm/ieee754@1.2.1/LICENSE
+5b37224c080cdcc97c871ada971c224e9926370fe74f11b539aa1cf9f3b1aca1 base64-js-LICENSE.txt https://cdn.jsdelivr.net/npm/base64-js@1.5.1/LICENSE
+131afe3f7bdce1698beb292fb8de1a968de01bce876122a60ef5db230471c866 zlibjs-LICENSE.txt https://cdn.jsdelivr.net/npm/zlibjs@0.3.1/LICENSE
+"
+held="$LIBREJUSTICE_STATE_DIR/vendor/ocr-licenses-$(printf '%s' "$licenses" | sha256sum | cut -c1-12)"
+if [ ! -f "$held/.complete" ]; then
+  rm -rf "$held"
+  mkdir -p "$held"
+  printf '%s' "$licenses" | while read -r sum name url; do
+    [ -n "$sum" ] || continue
+    curl -fsSL -o "$held/$name" "$url"
+    echo "$sum  $held/$name" | sha256sum -c --quiet
+  done
+  touch "$held/.complete"
+fi
+
+if [ ! -f "$vendor/.complete" ]; then
+  rm -rf "$vendor"
+  mkdir -p "$vendor"
+  for f in tesseract.esm.min.js worker.min.js; do
+    curl -fsSL -o "$vendor/$f" "https://cdn.jsdelivr.net/npm/tesseract.js@$tesseract/dist/$f"
+  done
+  for f in tesseract-core-simd-lstm.js tesseract-core-simd-lstm.wasm; do
+    curl -fsSL -o "$vendor/$f" "https://cdn.jsdelivr.net/npm/tesseract.js-core@$core/$f"
+  done
+  curl -fsSL -o "$vendor/fra.traineddata" \
+    "https://github.com/tesseract-ocr/tessdata_fast/raw/$tessdata/fra.traineddata"
+  touch "$vendor/.complete"
+fi
+
+rm -rf "$site"
+mkdir -p "$site"
+cp "$vendor"/tesseract.esm.min.js "$vendor"/worker.min.js "$vendor"/tesseract-core-simd-lstm.js \
+   "$vendor"/tesseract-core-simd-lstm.wasm "$vendor"/fra.traineddata "$site/"
+mkdir -p "$site/licenses"
+cp "$held"/*.min.js.LICENSE.txt "$site/"
+for f in "$held"/*; do
+  case "$f" in *.min.js.LICENSE.txt) ;; *) cp "$f" "$site/licenses/" ;; esac
+done
+"""
+
+# LibreOffice renders the reference pages: it must resolve each Office name to the
+# file the renderer measures, hence the user-level fontconfig install and aliases.
+# Caladea stays on the LibreOffice pin, the later one changed its widths
+# (huertatipografica/Caladea#4); URW ships as OTF, the files LibreOffice reads.
+# Each file vendored here is listed, with its licence, in
+# packages/lj-web/public/third-party-licenses.txt.
+[tasks.office-fonts]
+description = "Vendors the free substitutes of the Office fonts into lj-web/public/redactor/fonts (served under /redactor/fonts) and installs them with their aliases into the user's fontconfig, for LibreOffice."
+run = """
+lo="https://dev-www.libreoffice.org"
+gh="https://raw.githubusercontent.com"
+urw="$gh/ArtifexSoftware/urw-base35-fonts/c15105598aa7eb256b1ebfcecd3d078801521e73"
+noto="$gh/notofonts/notofonts.github.io/28b15b4b43b7bed62b5cf6e6b0b5ff5846270535/fonts"
+wine="$gh/wine-mirror/wine/db11d0fe6a169c457e23d007e20404643d067aa8"
+gelasio="$gh/SorkinType/Gelasio/7ab20e7e5c42791e603b9ee3201a0b49849cfdb2/fonts/ttf"
+garamond="$gh/octaviopardo/EBGaramond12/106a4a6d377987459ae5e68673a4570f13b957fb/fonts/otf"
+ptsans="$gh/google/fonts/8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5/ofl/ptsans"
+manifest="
+4bd12b6cbc321c1cf16da76e2c585c925ce956a08067ae6f6c64eff6ccfdaf5a carlito.tar.gz $lo/src/c74b7223abe75949b4af367942d96c7a-crosextrafonts-carlito-20130920.tar.gz
+c48d1c2fd613c9c06c959c34da7b8388059e2408d2bb19845dc3ed35f76e4d09 caladea.tar.gz $lo/src/368f114c078f94214a308a74c7e991bc-crosextrafonts-20130214.tar.gz
+7191c669bf38899f73a2094ed00f7b800553364f90e2637010a69c0e268f25d0 liberation.tar.gz $lo/src/liberation-fonts-ttf-2.1.5.tar.gz
+8879d89b5ff7b506c9fc28efc31a5c0b954bbe9333e66e5283d27d20a8519ea3 liberation-narrow.tar.gz $lo/src/liberation-narrow-fonts-ttf-1.07.6.tar.gz
+7576310b219e04159d35ff61dd4a4ec4cdba4f35c00e002a136f00e96a908b0a dejavu.zip $lo/src/33e1e61fab06a547851ed308b4ffef42-dejavu-fonts-ttf-2.37.zip
+3f62c51e05e3b5a1e6241cf92a371f0be2ea1183aa87b30718bbd40832a8d423 selawik.zip https://github.com/microsoft/Selawik/releases/download/1.01/Selawik_Release.zip
+f543e6e2d7275557a839a164941c0a86e5f2c3f2a0042bfc434c88c6dde9e140 OpenSymbol.ttf $lo/extern/f543e6e2d7275557a839a164941c0a86e5f2c3f2a0042bfc434c88c6dde9e140-opens___.ttf
+90f1abad4da0ce03da5d2277ee75a9600ce812d37c90eab76e0838ffa7937e55 tahoma.ttf $wine/fonts/tahoma.ttf
+508a2acc88cd6abdd399ae79c9965db43fba75a46bb115117b55d2be2272d889 tahomabd.ttf $wine/fonts/tahomabd.ttf
+48c797fbe0e07c48a18cb962e7bdfa23f19618327dddf54093265328dc9eb39d Gelasio-Regular.ttf $gelasio/Gelasio-Regular.ttf
+e0ef3addf1acf35f5c6aef2be00d0a2c01363bf70a5950e16650976051a0c462 Gelasio-Bold.ttf $gelasio/Gelasio-Bold.ttf
+1d8bda4ff258bb8251eae4f7d7500c8d97d084136192bb264bc2305168765d1b Gelasio-Italic.ttf $gelasio/Gelasio-Italic.ttf
+aa87e21b46aef3dcb50a68dc6e1946f0c0a9819d067e4be6a98a6daa8f5b3c16 Gelasio-BoldItalic.ttf $gelasio/Gelasio-BoldItalic.ttf
+8d618a6bc6e1f4444e1990c39770a62ccbc29394e57afcc58acd530c16489275 EBGaramond-Regular.otf $garamond/EBGaramond-Regular.otf
+2832055876314e4932c46809e919a45fd726a53faa6bfae53be9628723bde90f EBGaramond-Bold.otf $garamond/EBGaramond-Bold.otf
+296feee09f6fa157f913cf3d75460b5e282b3c43dff4ddffbcc5c1a924f4fd14 EBGaramond-Italic.otf $garamond/EBGaramond-Italic.otf
+c010c63d6924e0dec2fedc1b0cb57e86ae9047bb0e9651ea603b0967d6e3072e EBGaramond-BoldItalic.otf $garamond/EBGaramond-BoldItalic.otf
+9cc831490532009bae2b3ce0d39c62adfc889060beb421593bfd9d2396d0f10a PT_Sans-Web-Regular.ttf $ptsans/PT_Sans-Web-Regular.ttf
+3128bd5ecf01816e59a23d54c57a7a6b14615b07db53ff277c77376010265b05 PT_Sans-Web-Bold.ttf $ptsans/PT_Sans-Web-Bold.ttf
+5a90fe2d0cd798700935240580bdcc12c0ffc9102c0c7163b3418e13bc21debd PT_Sans-Web-Italic.ttf $ptsans/PT_Sans-Web-Italic.ttf
+81ac221cdd02bccfa679c74adb122478e9d092e65a722e31ca11469961483785 PT_Sans-Web-BoldItalic.ttf $ptsans/PT_Sans-Web-BoldItalic.ttf
+f3961a9cde016d41a4879aecda1474d3a36d6bf54fa0e4643de029cc2248b0e8 NotoSans-Regular.ttf $noto/NotoSans/unhinted/ttf/NotoSans-Regular.ttf
+87cb2d84472a7d66da659ee47b6cdb9552326e8c128245231f191b6ac72529d9 NotoSans-Bold.ttf $noto/NotoSans/unhinted/ttf/NotoSans-Bold.ttf
+678288f868807d4d64a6f3b51466871d117d915780381ce9d0ed4b3bcbd06d37 NotoSans-Italic.ttf $noto/NotoSans/unhinted/ttf/NotoSans-Italic.ttf
+3d367743f371f28671d2764e911a53d7c20ec9b6aa8791d059e7090389fc52a5 NotoSans-BoldItalic.ttf $noto/NotoSans/unhinted/ttf/NotoSans-BoldItalic.ttf
+a15cfbbc1539d707115111d672d590a3d70d4f74b4c0a315956da20ae19a14e1 NotoSerif-Regular.ttf $noto/NotoSerif/unhinted/ttf/NotoSerif-Regular.ttf
+24ad531e6b05ddad8c3d89572d2c93eb86a6b74e652ce7ee3c3e171de68e84c3 NotoSerif-Bold.ttf $noto/NotoSerif/unhinted/ttf/NotoSerif-Bold.ttf
+c4b3c971741ecdb40f5a443bce754e8fe91efe761b6ea10c92be7c3597cdadc4 NotoSerif-Italic.ttf $noto/NotoSerif/unhinted/ttf/NotoSerif-Italic.ttf
+1bc4f86502eaa368718f6192bee022ea9a703d5af1c18b7d291212657b63074a NotoSerif-BoldItalic.ttf $noto/NotoSerif/unhinted/ttf/NotoSerif-BoldItalic.ttf
+f054a7389d8d0e9f4c5f7b4c21feb7e2b14bec8004a1e92778a78d149524eea9 P052-Roman.otf $urw/fonts/P052-Roman.otf
+ba6503baaf0f9e4e40a69cc4c0e57049fbde313fe183aba8fe823208337a94af P052-Bold.otf $urw/fonts/P052-Bold.otf
+1feac6055211cf5c6c812c026e398195070f174064cc4d390f0db01647443b0e P052-Italic.otf $urw/fonts/P052-Italic.otf
+63e15828175e55559ae09c9bdcd09fc0354537657d43109edb6e2a5509f8299f P052-BoldItalic.otf $urw/fonts/P052-BoldItalic.otf
+04318316cee29950805110c9c8949eea189ef5575132881f4d4d7e03e5299903 URWGothic-Book.otf $urw/fonts/URWGothic-Book.otf
+ec4e947734950fd344918e560bc8ad0c5d8b17d0ab4853988824f13b9f77e53f URWGothic-BookOblique.otf $urw/fonts/URWGothic-BookOblique.otf
+5b009410cf5231dcb1e45b155c1afedcfc63d82042fd8c414d0dd7705c9fbbae URWGothic-Demi.otf $urw/fonts/URWGothic-Demi.otf
+d57abaa6d40718cfbf735ad50080d0b095e7194e451992e02786a7c0113db35c URWGothic-DemiOblique.otf $urw/fonts/URWGothic-DemiOblique.otf
+7b1bc8e6a16cef53785ce03d4848f8971f3ba38cd9e266e4786a50e08bd9235b URWBookman-Light.otf $urw/fonts/URWBookman-Light.otf
+ed722e6c2996b08e8516d27a7c017972cfabf5d1736b496b6526da78fd17691a URWBookman-LightItalic.otf $urw/fonts/URWBookman-LightItalic.otf
+ab8b2fe57cbea9783c6179188dc013c76cfc5717c22cf59bbf3016ef2d7d93ee URWBookman-Demi.otf $urw/fonts/URWBookman-Demi.otf
+4d9dbaae8178ffa2f5d557245d09dc968eeac9eed7e453cc2db4cc6a9aacb44d URWBookman-DemiItalic.otf $urw/fonts/URWBookman-DemiItalic.otf
+e00cc7b88f0cf25ae43f0e48de39d0043fe042b55719a3ac32669ab3369542ec C059-Roman.otf $urw/fonts/C059-Roman.otf
+75dea10068264324522e7b96612083582eee0158eb728fa9c219279890f33e26 C059-Bold.otf $urw/fonts/C059-Bold.otf
+77852deabd3a84f7d0213932239de522410309374c2255ccbd510f01dc7c6e80 C059-Italic.otf $urw/fonts/C059-Italic.otf
+60d0ab6a22e4018b1232806d98f4015e04f9a0a569db7a169c40d55e2a9f6252 C059-BdIta.otf $urw/fonts/C059-BdIta.otf
+7c25be4d78155523080ab85b10277150657ff7dabbcad7037bdd536c9b6d0d08 NimbusSans-Regular.otf $urw/fonts/NimbusSans-Regular.otf
+7f33328e6b4d4cd21b45fa625791928c9407dc702db6780e56b09ca9a3ecaa67 NimbusSans-Bold.otf $urw/fonts/NimbusSans-Bold.otf
+7b0bef5686aa58c0fd0f0d01beeae56664208490e30ca6a25431281c9a0c6402 NimbusSans-Italic.otf $urw/fonts/NimbusSans-Italic.otf
+3f47fb34fcb7de09f8cbc9f305191340ddebf7a068419f4bb5f49287dea59b87 NimbusSans-BoldItalic.otf $urw/fonts/NimbusSans-BoldItalic.otf
+fd41669443616a7ae890c42e53a58f47fa24a940fd1e367acaff665cf5b6e9d8 NimbusRoman-Regular.otf $urw/fonts/NimbusRoman-Regular.otf
+e0ad81923bc6d85d5426f796217c87963ca1ae3c65e22c87a25b6c6353de299e NimbusRoman-Bold.otf $urw/fonts/NimbusRoman-Bold.otf
+b7c424e6cb79baddfcdcd9a9d87f9fc4fdd06f0e5160066e2b2e47bcd647c7b9 NimbusRoman-Italic.otf $urw/fonts/NimbusRoman-Italic.otf
+c84bcb17ab4ee54f16dadad6a3b0b2df37a24f9fc812897c4a59eeca785a5dec NimbusRoman-BoldItalic.otf $urw/fonts/NimbusRoman-BoldItalic.otf
+4f225ca8e13acb16f733ce741693105e527d5f7a5443901b9ecc190fca4e149b NimbusMonoPS-Regular.otf $urw/fonts/NimbusMonoPS-Regular.otf
+f036d05d2168c7f71cb11d31e81d11133f3d09711e24ebde19d08a24842384d5 NimbusMonoPS-Bold.otf $urw/fonts/NimbusMonoPS-Bold.otf
+7f1f85498027e07befadd3c7592518909b9e8c7f96ee5615e0b21be0c399c4b4 NimbusMonoPS-Italic.otf $urw/fonts/NimbusMonoPS-Italic.otf
+a67ed9e364c933c79fc3ce88e17a0265334697c184b065407e754d43cbbf6d0a NimbusMonoPS-BoldItalic.otf $urw/fonts/NimbusMonoPS-BoldItalic.otf
+57c8ff33c9c0cfc3ef00e650a1cc910d7ee479a8bc509f6c9209a7c2a11399d6 URW-base35-COPYING.txt $urw/COPYING
+772b1b47eead8722156abaed483154e1dd1137e7035290550cea6444192a2e3f URW-base35-LICENSE.txt $urw/LICENSE
+e237fa56668030e928551ddd60f05df5fe957f75eab874bbd017e085ed722e7c WineTahoma-COPYING.LIB.txt $wine/COPYING.LIB
+1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5 OpenSymbol-COPYING.MPL.txt $gh/LibreOffice/core/59197dea293677b55a6f79a6bcfaaa7ce7c8f97b/COPYING.MPL
+cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30 Caladea-LICENSE.txt $gh/google/fonts/8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5/apache/tinos/LICENSE.txt
+f114a5b4b274c72b625e88c690a27f2ac097cec53071cf1e605bdca7ebc08fcc LiberationSansNarrow-Regular.sfd $gh/liberationfonts/liberation-sans-narrow/5462920fee502b688604472e65af49af951bdd56/src/LiberationSansNarrow-Regular.sfd
+3b0c24ae42f33ab911eb187d3c2888715777e6d8fe8d13176bd72917bd763fe4 LiberationSansNarrow-Bold.sfd $gh/liberationfonts/liberation-sans-narrow/5462920fee502b688604472e65af49af951bdd56/src/LiberationSansNarrow-Bold.sfd
+98311e966a72639c1a7e1c46ec454fb34d432dd487aefd168b13fba07991c4e4 LiberationSansNarrow-Italic.sfd $gh/liberationfonts/liberation-sans-narrow/5462920fee502b688604472e65af49af951bdd56/src/LiberationSansNarrow-Italic.sfd
+344a3fe5272e3e5ff6005628ce83a7167d5845e7428f471947280c68f62f3923 LiberationSansNarrow-BoldItalic.sfd $gh/liberationfonts/liberation-sans-narrow/5462920fee502b688604472e65af49af951bdd56/src/LiberationSansNarrow-BoldItalic.sfd
+0c1a3182a3a6b3d444113421121cbacf87322111aff245ee616109bd47479710 tahoma.sfd $wine/fonts/tahoma.sfd
+90e42b98fc092034e6485a7f8f811195ca2ca148b6704e5d2df56a4c97dfca49 tahomabd.sfd $wine/fonts/tahomabd.sfd
+aca99a3aacca8e0c6e204a3b332bc3c766c880e81c3322cf511cc8553392f1e0 OpenSymbol.sfd $gh/LibreOffice/core/52f1115571469f210192cbce6b52e8b7d1d85dc0/extras/source/truetype/symbol/OpenSymbol.sfd
+cc3d3bf735b45aa5f1fdd983de140a7d54c4508281b19fc589afb5d9446f7ad5 LiberationSansNarrow-fontexport.pe $gh/liberationfonts/liberation-sans-narrow/5462920fee502b688604472e65af49af951bdd56/scripts/fontexport.pe
+47718754812f1b9ce5393a82382603796236ac610e56c6409e6342a469b18902 LiberationSansNarrow-Makefile $gh/liberationfonts/liberation-sans-narrow/5462920fee502b688604472e65af49af951bdd56/Makefile
+9c5b09bf5d92f3e5b36d82707fd127125ab441901cd858f9518753e75067a2da WineTahoma-genttf.ff $wine/fonts/genttf.ff
+058611bd968817d532cedeab6acaa055e882d365a88523df00e7917ad7a0f704 EBGaramond-OFL.txt $gh/octaviopardo/EBGaramond12/106a4a6d377987459ae5e68673a4570f13b957fb/OFL.txt
+b393cb01867c919b44381512120dc3e4c954c7b47e2035c405f3a324799a4d29 Gelasio-OFL.txt $gh/SorkinType/Gelasio/7ab20e7e5c42791e603b9ee3201a0b49849cfdb2/OFL.txt
+f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8 Noto-OFL.txt $noto/LICENSE
+77b7c2506d4efb22e09c8ccf10159f4956eab3ef7c007fef95de136bcf45300c Selawik-OFL.txt $gh/microsoft/Selawik/b65ff9ce7c4673e75ec5c622924a6b6f61f2f876/LICENSE.txt
+"
+vendor="$LIBREJUSTICE_STATE_DIR/vendor/office-fonts-$(printf '%s' "$manifest" | sha256sum | cut -c1-12)"
+site="packages/lj-web/public/redactor/fonts"
+fonts_dir="${XDG_DATA_HOME:-$HOME/.local/share}/fonts/librejustice-office"
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/fontconfig/conf.d/50-librejustice-office.conf"
+
+if [ ! -f "$vendor/.complete" ]; then
+  rm -rf "$vendor"
+  mkdir -p "$vendor/dl" "$vendor/stage/selawik" "$vendor/fonts/licenses"
+  printf '%s' "$manifest" | while read -r sum name url; do
+    [ -n "$sum" ] || continue
+    curl -fsSL -o "$vendor/dl/$name" "$url"
+    echo "$sum  $vendor/dl/$name" | sha256sum -c --quiet
+  done
+  for t in carlito caladea liberation liberation-narrow; do
+    tar -xzf "$vendor/dl/$t.tar.gz" -C "$vendor/stage"
+  done
+  python3 -m zipfile -e "$vendor/dl/dejavu.zip" "$vendor/stage"
+  python3 -m zipfile -e "$vendor/dl/selawik.zip" "$vendor/stage/selawik"
+  out="$vendor/fonts"
+  cp "$vendor"/stage/crosextrafonts-*/*.ttf "$vendor"/stage/liberation-*/*.ttf \
+     "$vendor"/stage/selawik/*.ttf "$vendor"/dl/*.ttf "$vendor"/dl/*.otf "$out/"
+  for f in Sans Sans-Bold Sans-Oblique Sans-BoldOblique \
+           SansCondensed SansCondensed-Bold SansCondensed-Oblique SansCondensed-BoldOblique \
+           Serif Serif-Bold Serif-Italic Serif-BoldItalic \
+           SansMono SansMono-Bold SansMono-Oblique SansMono-BoldOblique; do
+    cp "$vendor/stage/dejavu-fonts-ttf-2.37/ttf/DejaVu$f.ttf" "$out/"
+  done
+  cp "$vendor"/dl/*.txt "$out/licenses/"
+  mkdir -p "$out/sources"
+  cp "$vendor"/dl/*.sfd "$vendor"/dl/*.pe "$vendor"/dl/*.ff "$vendor"/dl/*-Makefile "$out/sources/"
+  cp "$vendor/stage/crosextrafonts-carlito-20130920/LICENSE" "$out/licenses/Carlito-LICENSE.txt"
+  cp "$vendor/stage/liberation-fonts-ttf-2.1.5/LICENSE" "$out/licenses/Liberation-LICENSE.txt"
+  cp "$vendor/stage/liberation-narrow-fonts-ttf-1.07.6/COPYING" "$out/licenses/LiberationSansNarrow-COPYING.txt"
+  cp "$vendor/stage/liberation-narrow-fonts-ttf-1.07.6/License.txt" "$out/licenses/LiberationSansNarrow-License.txt"
+  cp "$vendor/stage/dejavu-fonts-ttf-2.37/LICENSE" "$out/licenses/DejaVu-LICENSE.txt"
+  rm -rf "$vendor/dl" "$vendor/stage"
+  touch "$vendor/.complete"
+fi
+
+rm -rf "$site"
+mkdir -p "$site"
+cp -R "$vendor/fonts/." "$site/"
+
+# LibreOffice may be converting while this runs: a file is only rewritten when it changed.
+mkdir -p "$fonts_dir" "${conf%/*}"
+changed=""
+for f in "$vendor"/fonts/*.ttf "$vendor"/fonts/*.otf; do
+  cmp -s "$f" "$fonts_dir/${f##*/}" || { cp "$f" "$fonts_dir/"; changed=1; }
+done
+for f in "$fonts_dir"/*; do
+  [ -e "$f" ] || continue
+  [ -e "$vendor/fonts/${f##*/}" ] || { rm "$f"; changed=1; }
+done
+cat > "$conf.new" <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <alias binding="same"><family>Calibri</family><prefer><family>Carlito</family></prefer></alias>
+  <alias binding="same"><family>Calibri Light</family><prefer><family>Carlito</family></prefer></alias>
+  <alias binding="same"><family>Cambria</family><prefer><family>Caladea</family></prefer></alias>
+  <alias binding="same"><family>Cambria Math</family><prefer><family>Caladea</family></prefer></alias>
+  <alias binding="same"><family>Arial</family><prefer><family>Liberation Sans</family></prefer></alias>
+  <alias binding="same"><family>Helvetica</family><prefer><family>Liberation Sans</family></prefer></alias>
+  <alias binding="same"><family>Arial Narrow</family><prefer><family>Liberation Sans Narrow</family></prefer></alias>
+  <alias binding="same"><family>Times New Roman</family><prefer><family>Liberation Serif</family></prefer></alias>
+  <alias binding="same"><family>Times</family><prefer><family>Liberation Serif</family></prefer></alias>
+  <alias binding="same"><family>Courier New</family><prefer><family>Liberation Mono</family></prefer></alias>
+  <alias binding="same"><family>Courier</family><prefer><family>Liberation Mono</family></prefer></alias>
+  <alias binding="same"><family>Consolas</family><prefer><family>Liberation Mono</family></prefer></alias>
+  <alias binding="same"><family>Georgia</family><prefer><family>Gelasio</family></prefer></alias>
+  <alias binding="same"><family>Segoe UI</family><prefer><family>Selawik</family></prefer></alias>
+  <alias binding="same"><family>Segoe UI Light</family><prefer><family>Selawik Light</family></prefer></alias>
+  <alias binding="same"><family>Segoe UI Semilight</family><prefer><family>Selawik Semilight</family></prefer></alias>
+  <alias binding="same"><family>Segoe UI Semibold</family><prefer><family>Selawik Semibold</family></prefer></alias>
+  <alias binding="same"><family>Verdana</family><prefer><family>DejaVu Sans</family></prefer></alias>
+  <alias binding="same"><family>Trebuchet MS</family><prefer><family>DejaVu Sans Condensed</family></prefer></alias>
+  <alias binding="same"><family>Candara</family><prefer><family>Carlito</family></prefer></alias>
+  <alias binding="same"><family>Corbel</family><prefer><family>Carlito</family></prefer></alias>
+  <alias binding="same"><family>Constantia</family><prefer><family>Caladea</family></prefer></alias>
+  <alias binding="same"><family>Garamond</family><prefer><family>EB Garamond</family></prefer></alias>
+  <alias binding="same"><family>Century Gothic</family><prefer><family>URW Gothic</family></prefer></alias>
+  <alias binding="same"><family>Book Antiqua</family><prefer><family>P052</family></prefer></alias>
+  <alias binding="same"><family>Palatino Linotype</family><prefer><family>P052</family></prefer></alias>
+  <alias binding="same"><family>Palatino</family><prefer><family>P052</family></prefer></alias>
+  <alias binding="same"><family>Bookman Old Style</family><prefer><family>URW Bookman</family></prefer></alias>
+  <alias binding="same"><family>Century Schoolbook</family><prefer><family>C059</family></prefer></alias>
+  <alias binding="same"><family>Aptos</family><prefer><family>PT Sans</family></prefer></alias>
+  <alias binding="same"><family>Aptos Display</family><prefer><family>Carlito</family></prefer></alias>
+  <alias binding="same"><family>Aptos Light</family><prefer><family>Selawik Light</family></prefer></alias>
+  <alias binding="same"><family>Aptos Narrow</family><prefer><family>Carlito</family></prefer></alias>
+  <alias binding="same"><family>Aptos Serif</family><prefer><family>Gelasio</family></prefer></alias>
+  <alias binding="same"><family>Aptos Mono</family><prefer><family>Liberation Mono</family></prefer></alias>
+  <alias binding="same"><family>Marianne</family><prefer><family>Noto Sans</family></prefer></alias>
+  <alias binding="same"><family>sans-serif</family><prefer><family>Noto Sans</family><family>DejaVu Sans</family></prefer></alias>
+  <alias binding="same"><family>serif</family><prefer><family>Noto Serif</family><family>DejaVu Serif</family></prefer></alias>
+  <alias binding="same"><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
+</fontconfig>
+EOF
+if cmp -s "$conf.new" "$conf"; then rm "$conf.new"; else mv "$conf.new" "$conf"; fi
+[ -z "$changed" ] || fc-cache "$fonts_dir"
 """
 
 # Les artefacts sont compilés sur l'hôte, contre sa glibc, puis précompressés :
@@ -141,13 +608,58 @@ rustup target add wasm32-unknown-unknown
 # Bundle reconstruit depuis un répertoire vide : l'image fait `COPY target/site
 # /app/site`, donc tout fichier étranger qui traîne là part en prod.
 rm -rf target/site
+mise run redact-wasm
+mise run htr-wasm
+mise run htr-assets
+mise run ocr-assets
+mise run office-fonts
+mise run pdf-cmaps
 # Les deux binaires dans une seule invocation : deux sélections de paquets font
 # deux exemplaires compilés de chaque crate partagé, recompilés à chaque build.
 # Un argument par occurrence du flag, qui ne découpe pas les espaces.
-cargo leptos build --release --project librejustice \
-  --bin-cargo-args="-p" --bin-cargo-args="lj-ingest" \
-  --bin-cargo-args="--bin" --bin-cargo-args="lj-ingest" \
-  --bin-cargo-args="--locked"
+# The front (wasm, wasm-bindgen, wasm-opt, Tailwind, precompress) only reads the
+# hydrate crates and public/: on an unchanged key it is restored, not rebuilt.
+# public/redactor stays out of the key: the redaction modules change with every
+# lj-office or lj-pdf commit, and are copied over the restored site instead.
+# The manifests enter by what the front reads of them: its resolved graph, the profiles, its leptos metadata, this task.
+front_cache="${LIBREJUSTICE_STATE_DIR:-$HOME/.local/share/librejustice}/cache/front"
+front_graph=$(cargo tree --locked -p lj-web --target wasm32-unknown-unknown \
+  --no-default-features -F hydrate -e normal,build --prefix none -f '{p} {f}' \
+  | sed -e 's/ ([*])$//' -e "s|$PWD/||g" | sort -u)
+front_crates=$(printf '%s\n' "$front_graph" | grep -o '([^)]*/[^)]*)' | tr -d '()' | grep -v :// | sort -u)
+front_inputs="$front_crates Cargo.toml Cargo.lock rust-toolchain.toml .mise.toml .cargo"
+front_key=""
+if [ -z "$(git status --porcelain -- $front_inputs)" ]; then
+  front_key=$({
+    for path in $front_crates rust-toolchain.toml .cargo; do echo "$path $(git rev-parse "HEAD:$path" 2>/dev/null)"; done
+    printf '%s\n' "$front_graph"
+    python3 -c 'import json, tomllib; c = tomllib.load(open("Cargo.toml", "rb")); m = tomllib.load(open(".mise.toml", "rb")); print(json.dumps([c["profile"], c["workspace"].get("package"), c["workspace"]["metadata"]["leptos"], m["tasks"]["build-app"]], sort_keys=True))'
+    find packages/lj-web/public -path packages/lj-web/public/redactor -prune \
+      -o -type f -print0 | sort -z | xargs -0 sha256sum
+    cargo leptos --version
+    env | grep -E '^(LEPTOS_|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)' | sort
+  } | sha256sum | cut -c1-64)
+fi
+front_hit=""
+if [ -n "$front_key" ] && [ -f "$front_cache/$front_key/hash.txt" ]; then
+  front_hit=1
+  echo "build-app: front restored from cache $front_key"
+  cargo leptos build --release --project librejustice --server-only \
+    --bin-cargo-args="-p" --bin-cargo-args="lj-ingest" \
+    --bin-cargo-args="--bin" --bin-cargo-args="lj-ingest" \
+    --bin-cargo-args="--locked"
+  rm -rf target/site
+  cp -a "$front_cache/$front_key/site" target/site
+  rm -rf target/site/redactor
+  cp -a packages/lj-web/public/redactor target/site/redactor
+  cp "$front_cache/$front_key/hash.txt" target/release/hash.txt
+  touch "$front_cache/$front_key"
+else
+  cargo leptos build --release --project librejustice \
+    --bin-cargo-args="-p" --bin-cargo-args="lj-ingest" \
+    --bin-cargo-args="--bin" --bin-cargo-args="lj-ingest" \
+    --bin-cargo-args="--locked"
+fi
 # Un snippet wasm-bindgen n'est pas renommable — son chemin est la clé d'import
 # que le binaire wasm déclare, et cargo-leptos l'exclut de son hachage —, alors
 # que `/pkg` est servi `immutable` un an. On refuse plutôt que de figer l'URL
@@ -156,7 +668,22 @@ if [ -d target/site/pkg/snippets ]; then
   echo "build-app: le bundle porte des snippets wasm-bindgen — ils seraient servis immutable sous une URL figée, à versionner avant de livrer" >&2
   exit 1
 fi
+# On a hit, only the modules copied over the site are new to its cache.
 mise run precompress
+if [ -z "$front_hit" ] && [ -n "$front_key" ]; then
+  rm -rf "$front_cache/$front_key.tmp"
+  mkdir -p "$front_cache/$front_key.tmp"
+  cp -a target/site "$front_cache/$front_key.tmp/site"
+  cp target/release/hash.txt "$front_cache/$front_key.tmp/hash.txt"
+  rm -rf "$front_cache/$front_key"
+  mv "$front_cache/$front_key.tmp" "$front_cache/$front_key"
+  ls -1dt "$front_cache"/*/ | tail -n +4 | xargs -r rm -rf
+fi
+# Without its module, /redact shows an empty page and says nothing.
+if [ ! -f target/site/redactor/lj_redact_bg.wasm ]; then
+  echo "build-app: target/site/redactor/lj_redact_bg.wasm absent du bundle, /redact n'aurait rien a charger" >&2
+  exit 1
+fi
 # Le HTML SSR référence les noms de `hash.txt` : s'ils ne sont pas dans le
 # bundle, `/pkg` répond 404 et l'hydratation meurt en silence sur tout le site.
 # On refuse de livrer plutôt que de le découvrir en prod.
@@ -240,17 +767,24 @@ run = "hurl --variable api_url=$LIBREJUSTICE_STAGING_API_BASE_URL tests/smoke/*.
 #
 # `mcp.hurl` est à part : il encode le contrat MCP non authentifié, donc il ne
 # se joue que contre un serveur local — la prod exige OAuth et répond 401.
+#
+# `--jobs 1 --delay 500`: hurl plays the files in parallel by default, which the
+# edge rate-limits; one job with a delay passes, 2 min in all.
 [tasks.contract]
 description = "Contrats HTTP publics contre une cible (défaut prod), sans secret"
 run = """
 hurl --variable base=${LIBREJUSTICE_CONTRACT_BASE_URL:-https://librejustice.fr} \
   -H "x-lj-origin: ${LIBREJUSTICE_API_INTERNAL_ORIGIN_TOKEN:-}" \
+  --jobs 1 --delay 500 \
   tests/contract/health.hurl \
   tests/contract/decisions.hurl \
   tests/contract/search.hurl \
   tests/contract/search-textes.hurl \
   tests/contract/texte-compare.hurl \
   tests/contract/texte-contexte.hurl \
+  tests/contract/texte-commentaires.hurl \
+  tests/contract/texte-lieu.hurl \
+  tests/contract/texte-juridiction.hurl \
   tests/contract/resolution.hurl \
   tests/contract/entities.hurl \
   tests/contract/annonces.hurl \
@@ -260,6 +794,7 @@ hurl --variable base=${LIBREJUSTICE_CONTRACT_BASE_URL:-https://librejustice.fr} 
   tests/contract/api-publique.hurl \
   tests/contract/security-headers.hurl \
   tests/contract/front-build.hurl \
+  tests/contract/redactor.hurl \
   --test
 """
 
@@ -276,6 +811,7 @@ hurl --variable base=${LIBREJUSTICE_CONTRACT_BASE_URL:-https://librejustice.fr} 
   tests/contract/health.hurl \
   tests/contract/front-build.hurl \
   tests/contract/resolution.hurl \
+  tests/contract/redactor.hurl \
   --test
 mise run contract-authed
 """

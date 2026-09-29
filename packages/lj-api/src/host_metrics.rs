@@ -1,35 +1,12 @@
-//! Scraper de métriques hôte → OTLP, sept séries.
-//!
-//! Elles distinguent un gel du runtime d'une stalle disque, ce qu'aucune
-//! métrique applicative ne sait faire.
-//!
-//! Noms alignés sur le `hostmetricsreceiver` OTel là où il en a un, pour que la
-//! conversion OTLP → Prometheus rende des noms prévisibles
-//! (`system_cpu_utilization_ratio`, `system_cpu_load_average_1m_ratio`,
-//! `system_memory_utilization_ratio`). Le PSI Linux n'est pas dans la semconv :
-//! il sort en `system.linux.pressure`, une métrique portant un attribut
-//! `resource` = `cpu` | `io` | `memory`, soit trois séries sous un nom.
-//!
-//! `/proc/{loadavg,stat,meminfo,pressure/*}` ne sont pas masqués par podman :
-//! aucun privilège ni montage à ajouter. L'occupation du disque sort de
-//! `statvfs(3)`, que `/proc` ne publie pas, et porte sur `/` — la racine overlay
-//! rapporte le système de fichiers sous-jacent.
-
 use opentelemetry::{global, KeyValue};
 use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Période de scrape (1 DPM, free tier).
 const SCRAPE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Le PSI est lu sur sa fenêtre **avg60**, pas avg10 : à un scrape par minute,
-/// avg10 ne couvre que le dernier sixième de l'intervalle et laisse passer un
-/// gel de 30 s — exactement l'épisode qui a motivé ce module.
 const PSI_WINDOW: &str = "avg60";
 
-/// Snapshot lu par les callbacks OTel. `None` = jamais lu avec succès, la
-/// métrique n'est alors pas observée du tout (mieux qu'un zéro qui mentirait).
 struct HostSnapshot {
     cpu_utilization: Option<f64>,
     load1: Option<f64>,
@@ -54,18 +31,14 @@ impl HostSnapshot {
 
 static SNAPSHOT: Mutex<HostSnapshot> = Mutex::new(HostSnapshot::EMPTY);
 
-/// Compteurs cumulés de `/proc/stat` du tick précédent : l'utilisation CPU est
-/// un delta, pas un instantané.
 static CPU_PREV: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 
-/// Démarre le scraper : enregistre les gauges, puis rafraîchit le snapshot
-/// toutes les 60 s. Conçu pour `tokio::spawn`.
 pub async fn run() {
     register_gauges();
     info!(
         interval_secs = SCRAPE_INTERVAL.as_secs(),
         psi_window = PSI_WINDOW,
-        "host_metrics : scraper démarré"
+        "host_metrics: scraper started"
     );
 
     let mut ticker = tokio::time::interval(SCRAPE_INTERVAL);
@@ -144,9 +117,6 @@ fn register_gauges() {
         .build();
 }
 
-/// Lit `/proc` puis remplace le snapshot. Chaque famille garde sa valeur
-/// précédente si sa lecture échoue. Les lectures se font **avant** le verrou :
-/// un callback d'export n'attend pas un accès disque.
 fn scrape() {
     let cpu = read_cpu_utilization();
     let load1 = read_load1();
@@ -166,14 +136,11 @@ fn scrape() {
     snap.pressure_memory = pressure_memory.or(snap.pressure_memory);
 }
 
-/// `/proc/loadavg` : premier champ.
 fn read_load1() -> Option<f64> {
     let raw = read_proc("/proc/loadavg")?;
     raw.split_whitespace().next()?.parse().ok()
 }
 
-/// `/proc/stat`, ligne `cpu` : delta occupé / delta total depuis le tick
-/// précédent. Rend `None` au premier passage, faute de point de comparaison.
 fn read_cpu_utilization() -> Option<f64> {
     let raw = read_proc("/proc/stat")?;
     let line = raw.lines().find(|l| l.starts_with("cpu "))?;
@@ -187,7 +154,6 @@ fn read_cpu_utilization() -> Option<f64> {
         return None;
     }
     let total: u64 = f.iter().sum();
-    // idle + iowait : les deux formes d'inoccupation du receiver OTel.
     let busy = total.saturating_sub(f[3] + f[4]);
 
     let mut prev = CPU_PREV.lock().unwrap();
@@ -200,7 +166,6 @@ fn read_cpu_utilization() -> Option<f64> {
     out
 }
 
-/// `/proc/meminfo` : 1 - MemAvailable / MemTotal.
 fn read_memory_utilization() -> Option<f64> {
     let raw = read_proc("/proc/meminfo")?;
     let kb = |key: &str| -> Option<f64> {
@@ -216,10 +181,6 @@ fn read_memory_utilization() -> Option<f64> {
     (total > 0.0).then(|| 1.0 - available / total)
 }
 
-/// `statvfs("/")` : occupation au sens de `df`, soit `occupé / (occupé +
-/// disponible)`. Les blocs réservés au superutilisateur (`f_bfree - f_bavail`,
-/// 5 % par défaut en ext4) comptent donc comme occupés — les compter libres
-/// annoncerait une place que le service, non privilégié, ne peut pas prendre.
 fn read_filesystem_utilization() -> Option<f64> {
     let path = std::ffi::CString::new("/").ok()?;
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -228,7 +189,7 @@ fn read_filesystem_utilization() -> Option<f64> {
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
         warn!(
             error = %std::io::Error::last_os_error(),
-            "host_metrics : statvfs / échoué"
+            "host_metrics: statvfs / failed"
         );
         return None;
     }
@@ -237,8 +198,6 @@ fn read_filesystem_utilization() -> Option<f64> {
     (utilisable > 0.0).then(|| occupe / utilisable)
 }
 
-/// `/proc/pressure/<resource>`, ligne `some`, champ [`PSI_WINDOW`]. Le PSI est
-/// en pourcentage : on rend une fraction, comme les autres gauges.
 fn read_pressure(resource: &str) -> Option<f64> {
     let raw = read_proc(&format!("/proc/pressure/{resource}"))?;
     let line = raw.lines().find(|l| l.starts_with("some "))?;
@@ -253,7 +212,7 @@ fn read_proc(path: &str) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(raw) => Some(raw),
         Err(err) => {
-            warn!(path, error = %err, "host_metrics : lecture /proc échouée");
+            warn!(path, error = %err, "host_metrics: /proc read failed");
             None
         }
     }

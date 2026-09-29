@@ -1,8 +1,3 @@
--- Liens de chronologie entre décisions : de la décision qui
--- attaque vers la décision attaquée. `target_ref` = canonical_ref
--- de la cible, clé PENDANTE tant qu'aucune décision unique et active ne la
--- porte ; `target_decision_id` posé à l'écriture ou par le relink.
-
 CREATE TABLE decision_links (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     decision_id BIGINT NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
@@ -15,9 +10,8 @@ CREATE TABLE decision_links (
     UNIQUE (decision_id, link_type, target_ref)
 );
 
--- Relink : résoudre les pendants qui visent une décision nouvellement arrivée.
 CREATE INDEX decision_links_pending_target_idx
     ON decision_links (target_ref) WHERE target_decision_id IS NULL;
--- Descente de chronologie (qui attaque cette décision ?).
+
 CREATE INDEX decision_links_target_decision_idx
     ON decision_links (target_decision_id) WHERE target_decision_id IS NOT NULL;

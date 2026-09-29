@@ -16,7 +16,7 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 
-use lj_core::parsing::{build_adde_source_fields, parse_adde_title};
+use lj_parse::{build_adde_source_fields, parse_adde_title};
 use lj_sources::adde;
 use lj_store::repository::DecisionRepository;
 
@@ -39,18 +39,18 @@ pub async fn sync_adde() -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
-    let existing = repo.adde_checksums().await?;
+    let existing = repo.web_commentary_checksums("adde").await?;
 
     let client = adde::http_client();
     let posts = adde::fetch_jurisprudence_posts(&client).await?;
     tracing::info!(
         posts = posts.len(),
         bundles_en_base = existing.len(),
-        "sync_adde démarré"
+        "sync_adde started"
     );
 
     let mut stats = Stats::default();
@@ -59,7 +59,7 @@ pub async fn sync_adde() -> Result<()> {
         let Some(citation) = parse_adde_title(&post.title) else {
             // Post de la catégorie sans titre-citation exploitable — hors périmètre.
             stats.hors_perimetre += 1;
-            tracing::debug!(title = %post.title, "post ADDE sans citation, ignoré");
+            tracing::debug!(title = %post.title, "ADDE post without a citation, ignored");
             continue;
         };
 
@@ -96,7 +96,7 @@ pub async fn sync_adde() -> Result<()> {
             // Décision commentée absente du stock (récente/juridiction non
             // ingérée) — durable, se rattachera quand la décision arrivera.
             stats.orphans += 1;
-            tracing::warn!(title = %post.title, "analyse ADDE sans décision en base");
+            tracing::warn!(title = %post.title, "ADDE analysis without a decision in the database");
         }
     }
 
@@ -106,7 +106,7 @@ pub async fn sync_adde() -> Result<()> {
         upserted = stats.upserted,
         unchanged = stats.unchanged,
         orphans = stats.orphans,
-        "sync_adde terminé"
+        "sync_adde done"
     );
     Ok(())
 }

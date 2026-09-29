@@ -15,6 +15,18 @@ const CARTE: &str =
 const ACTION_RETRAIT: &str =
     "text-sm text-[var(--color-ink-muted)] underline hover:text-[var(--color-ink)]";
 
+/// Fallback label: the API rejects an empty one.
+#[cfg(feature = "hydrate")]
+fn default_label() -> String {
+    let d = js_sys::Date::new_0();
+    format!(
+        "Clé du {:02}/{:02}/{}",
+        d.get_date(),
+        d.get_month() + 1,
+        d.get_full_year()
+    )
+}
+
 #[component]
 pub fn ApiKeysSettings() -> impl IntoView {
     let cles = RwSignal::new(Vec::<ApiKeySummary>::new());
@@ -37,27 +49,34 @@ pub fn ApiKeysSettings() -> impl IntoView {
     });
 
     let creer = move |_| {
-        let nom = libelle.get().trim().to_string();
-        if nom.is_empty() || en_cours.get() {
+        if en_cours.get() {
             return;
         }
         en_cours.set(true);
         erreur.set(None);
         #[cfg(feature = "hydrate")]
-        leptos::task::spawn_local(async move {
-            match crate::api::client::ApiClient::from_context()
-                .create_api_key(&nom)
-                .await
-            {
-                Ok(cree) => {
-                    secret.set(Some(cree.secret));
-                    cles.update(|c| c.insert(0, cree.key));
-                    libelle.set(String::new());
+        {
+            let saisi = libelle.get().trim().to_string();
+            let nom = if saisi.is_empty() {
+                default_label()
+            } else {
+                saisi
+            };
+            leptos::task::spawn_local(async move {
+                match crate::api::client::ApiClient::from_context()
+                    .create_api_key(&nom)
+                    .await
+                {
+                    Ok(cree) => {
+                        secret.set(Some(cree.secret));
+                        cles.update(|c| c.insert(0, cree.key));
+                        libelle.set(String::new());
+                    }
+                    Err(e) => erreur.set(Some(e.message)),
                 }
-                Err(e) => erreur.set(Some(e.message)),
-            }
-            en_cours.set(false);
-        });
+                en_cours.set(false);
+            });
+        }
         #[cfg(not(feature = "hydrate"))]
         en_cours.set(false);
     };
@@ -90,7 +109,7 @@ pub fn ApiKeysSettings() -> impl IntoView {
                 <input
                     type="text"
                     class=CHAMP
-                    placeholder="À quoi sert cette clé ? (ex. script de veille)"
+                    placeholder="Nom de la clé (facultatif)"
                     maxlength="64"
                     prop:value=move || libelle.get()
                     on:input:target=move |ev| libelle.set(ev.target().value())

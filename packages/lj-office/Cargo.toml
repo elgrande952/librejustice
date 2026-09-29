@@ -1,0 +1,31 @@
+[package]
+name = "lj-office"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+encoding_rs = "0.8"
+# The backend `deflate-flate2` leaves to the caller: miniz_oxide, pure Rust.
+flate2 = { workspace = true }
+harfrust = "0.12"
+lj-draw = { workspace = true }
+lj-image = { workspace = true }
+memchr = { workspace = true }
+quick-xml = { workspace = true }
+read-fonts = "0.41"
+unicode-linebreak = "0.1.5"
+# Store or Deflate only: the default features pull C codecs with no wasm target.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+
+# The `office` example, which a bench spawns once per file.
+[dev-dependencies]
+png = "0.18"
+resvg = "0.48"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lj-workspace-hack = { version = "0.1", path = "../lj-workspace-hack" }

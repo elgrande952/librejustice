@@ -7,11 +7,12 @@ use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use chrono::NaiveDate;
+use lj_core::address::CaseAddress;
 use lj_core::case_names::case_name_key;
 use lj_extract::eponyme::parse_renvoi;
 use lj_store::repository::{DecisionRepository, ElectedCaseName, Renvoi, TitleInputs};
 
-use crate::case_names::{add_short_keys, NOM_TROP_COURANT};
+use crate::case_names::{add_ordinal_keys, add_short_keys, NOM_TROP_COURANT};
 use crate::config::Settings;
 
 const LOT: i64 = 2_000;
@@ -38,7 +39,6 @@ pub async fn run() -> Result<()> {
             for brut in renvois {
                 lus += 1;
                 for c in parse_renvoi(brut) {
-                    let target_date = c.date_iso.parse::<NaiveDate>().ok();
                     let numeros = if c.dockets.is_empty() {
                         vec![String::new()]
                     } else {
@@ -48,8 +48,7 @@ pub async fn run() -> Result<()> {
                         rows.push(Renvoi {
                             decision_id: *id,
                             renvoi_no,
-                            target_ref: format!("{}|{num}", c.juridiction),
-                            target_date,
+                            address: CaseAddress::new(&c.juridiction, &num, &c.date_iso),
                             nom: c.nom.clone(),
                         });
                     }
@@ -60,7 +59,7 @@ pub async fn run() -> Result<()> {
         ecrits += repo.replace_renvois(&ids, &rows).await?;
     }
     let resolus = repo.resolve_pending_renvois().await?;
-    let (elected, unanchored, ferraille, courts) = case_names(&repo).await?;
+    let (elected, unanchored, ferraille, courts, ordinals) = case_names(&repo).await?;
     let poses = repo.put_case_names(&elected).await?;
     let kept: Vec<i64> = elected.iter().map(|e| e.decision_id).collect();
     let effaces = repo
@@ -72,7 +71,8 @@ pub async fn run() -> Result<()> {
         "renvois : {sources} décisions commentées, {lus} renvois lus, {ecrits} cibles écrites, \
          {resolus} résolues au fonds, {} noms d'usage dont {poses} changés et {} effacés, \
          {ferraille} mots trop courants écartés, {courts} clés courtes trop courantes écartées, \
-         {unanchored} du canon sans décision, {retitled} titres réécrits",
+         {ordinals} noms ordinaux appris des citations, {unanchored} du canon sans décision, \
+         {retitled} titres réécrits",
         elected.len(),
         effaces.len()
     );
@@ -84,7 +84,7 @@ pub async fn run() -> Result<()> {
 /// would not hold, and derives no short key.
 async fn case_names(
     repo: &DecisionRepository<'_>,
-) -> Result<(Vec<ElectedCaseName>, usize, usize, usize)> {
+) -> Result<(Vec<ElectedCaseName>, usize, usize, usize, usize)> {
     let mut by_decision: BTreeMap<i64, ElectedCaseName> = BTreeMap::new();
     for (decision_id, name) in repo.elected_case_names().await? {
         let key = case_name_key(&name);
@@ -139,7 +139,7 @@ async fn case_names(
     let mut unanchored = 0;
     for (a, target) in canon.iter().zip(targets) {
         let Some(decision_id) = target else {
-            tracing::warn!(nom = a.nom, "nom du canon sans décision au fonds");
+            tracing::warn!(nom = a.nom, "canon name without a decision in the corpus");
             unanchored += 1;
             continue;
         };
@@ -158,11 +158,13 @@ async fn case_names(
             entry.keys.push(key);
         }
     }
+    let ordinals = add_ordinal_keys(repo, &mut by_decision).await?;
     Ok((
         by_decision.into_values().collect(),
         unanchored,
         ferraille,
         courts,
+        ordinals,
     ))
 }
 
@@ -185,7 +187,7 @@ fn recomposed_titles(inputs: &[TitleInputs]) -> Vec<(i64, String)> {
             None,
             i.date_lecture.as_deref(),
             i.case_name.as_deref(),
-            i.docket_numbers.first().map(String::as_str),
+            t::docket_display(&i.docket_numbers).as_deref(),
         );
         if i.search_title.as_deref() != Some(named.as_str()) {
             titles.push((i.decision_id, named));
@@ -197,6 +199,7 @@ fn recomposed_titles(inputs: &[TitleInputs]) -> Vec<(i64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lj_core::chamber::{ChamberId, Container, Seat};
     use lj_store::repository::{ExtractedFields, JurisdictionRow};
 
     /// The two composers of `search_title` must agree to the character. They do
@@ -208,7 +211,15 @@ mod tests {
     fn the_two_title_composers_agree() {
         let court = "Cour d'appel de Paris";
         let dockets = vec!["21/01234".to_string()];
-        for chamber_key in [None, Some("CA.ca_paris.P5.C6.CIVILE".to_string())] {
+        let civile = Seat {
+            jurisdiction_type: "CA".to_string(),
+            jurisdiction_code: Some("ca_paris".to_string()),
+            container: Some(Container::Pole(5)),
+            chamber: Some(ChamberId::Number(6)),
+            specialty: vec!["matiere:CIVILE"],
+            ..Default::default()
+        };
+        for seat in [None, Some(civile)] {
             for case_name in [None, Some("Danthony")] {
                 let extracted = ExtractedFields {
                     jurisdiction: Some(JurisdictionRow {
@@ -220,7 +231,7 @@ mod tests {
                     }),
                     date_lecture: NaiveDate::from_ymd_opt(2026, 1, 15),
                     docket_numbers: dockets.clone(),
-                    chamber_key: chamber_key.clone(),
+                    seat: seat.clone(),
                     formation_uid: Some("formation:A_TROIS".to_string()),
                     office_uid: Some("office:JEX".to_string()),
                     ..Default::default()
@@ -235,7 +246,7 @@ mod tests {
                     // Never equal to the composition, so the pass always returns it.
                     search_title: None,
                 };
-                let a = lj_ingest::extract::compose_search_title(
+                let a = lj_extract_rows::compose_search_title(
                     &extracted,
                     Some("CA"),
                     &std::collections::HashMap::new(),
@@ -244,10 +255,7 @@ mod tests {
                 .expect("a court names a title");
                 let b = recomposed_titles(std::slice::from_ref(&inputs));
                 assert_eq!(b.len(), 1, "the pass returns the recomposed title");
-                assert_eq!(
-                    a, b[0].1,
-                    "chamber_key={chamber_key:?} case_name={case_name:?}"
-                );
+                assert_eq!(a, b[0].1, "seat={seat:?} case_name={case_name:?}");
                 assert!(!a.contains("chambre"), "the seat left the title: {a}");
             }
         }

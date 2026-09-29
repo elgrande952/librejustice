@@ -231,13 +231,6 @@ fn list_tarballs(client: &reqwest::blocking::Client, fond: DilaFond) -> Result<V
     Ok(classify_listing(&html, fond))
 }
 
-/// Exécute une opération réseau bloquante sous watchdog : si elle dépasse
-/// `threshold` sans rendre la main, un thread SÉPARÉ émet un `ERROR` exporté vers
-/// Grafana. Le client blocking reqwest peut se figer en spin CPU 100 % sans
-/// logger ni timeouter, son runtime tokio bloqué ne traitant plus son propre
-/// timer. Le watchdog ne PEUT pas interrompre le spin : il rend l'incident
-/// visible et alertable (`message=~"dila_network_stall"`). `drop(tx)` au retour
-/// le réveille immédiatement.
 pub(crate) fn with_stall_watchdog<T>(what: &str, threshold: Duration, op: impl FnOnce() -> T) -> T {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let label = what.to_string();
@@ -277,7 +270,11 @@ fn download_tarball(
 ) -> Result<()> {
     let url = format!("{DILA_BASE_URL}/{}/{name}", fond.segment());
     if dst.exists() {
-        tracing::info!(fond = fond.segment(), name, "dila_tarball présent, skip");
+        tracing::info!(
+            fond = fond.segment(),
+            name,
+            "dila_tarball already there, skip"
+        );
         return Ok(());
     }
     if let Some(parent) = dst.parent() {

@@ -1,0 +1,9 @@
+lj-office
+Copyright LibreJustice contributors. Licensed under the Apache License, Version 2.0.
+
+Parts of the Word 97-2003 reader (FIB, piece table and SPRM handling in
+src/doc) follow the reading of office_oxide 0.1.12
+(https://crates.io/crates/office_oxide), dual-licensed MIT OR Apache-2.0 by
+its author and taken here under the Apache License 2.0:
+
+  Copyright (c) Yury Fedoseev

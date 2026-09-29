@@ -16,13 +16,12 @@ use lj_dtos::{
     AnnonceCatalogueResponse, AnnonceDetailResponse, AnnonceSearchRequest, AnnonceSearchResponse,
     AnnuaireStatsResponse, ArticleSearchResponse, CitingDecisionHit, CoCitedArticle,
     CodeCatalogueResponse, CodeTocResponse, CorpusStatsResponse, DecisionDetail,
-    DecisionPartiesResponse, DecisionViewsResponse, EntityDecisionsResponse,
-    EntityDirectoryResponse, EntityPageResponse, EntityRegistreResponse, EntitySearchResponse,
-    JurisdictionCatalogueResponse, JurisdictionHubResponse, JurisdictionYearResponse,
-    LawArticleResponse, LawCodeSummary, LawCompareResponse, LawSectionResponse,
-    NormCatalogueResponse, NormFondResponse, NormYearResponse, SearchContext,
-    SearchHistoryResponse, SearchRequest, SearchResponse, SimilarDecisionsResponse,
-    SuggestResponse,
+    DecisionPartiesResponse, EntityDecisionsResponse, EntityDirectoryResponse, EntityPageResponse,
+    EntityRegistreResponse, EntitySearchResponse, JurisdictionCatalogueResponse,
+    JurisdictionHubResponse, JurisdictionYearResponse, LawArticleResponse, LawCodeSummary,
+    LawCompareResponse, LawSectionResponse, NormCatalogueResponse, NormFondResponse,
+    NormYearResponse, PlaceCorpusResponse, PlacesResponse, SearchContext, SearchRequest,
+    SearchResponse, SimilarDecisionsResponse, SuggestResponse,
 };
 // Types portés uniquement par les routes client (`/me`, signets, hover cards).
 #[cfg(feature = "hydrate")]
@@ -41,6 +40,9 @@ pub struct PageParams {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TextesFilters<'a> {
     pub code: Option<&'a str>,
+    /// The places read from: what applies in any of them is served, the default
+    /// reader's when there is none.
+    pub places: &'a [String],
     pub jurisdiction: Option<&'a str>,
     pub nature: Option<&'a str>,
     pub source: Option<&'a str>,
@@ -100,450 +102,262 @@ impl SearchFailure {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub type ApiResult<T> = Result<T, ApiError>;
 
 // ════════════════════════════ SSR : services in-process ════════════════════════════
 
-/// Client SSR : appelle la couche service `lj-api` sur l'[`AppState`] partagé,
-/// sans HTTP. Seules les routes rendues côté serveur (recherche amorcée,
-/// détail décision + voisins) sont portées ici ; le reste de l'API (`/me`,
-/// signets, historique…) est client-only (`hydrate`).
+/// What the SSR render asks of the service layer. `lj-server` implements it over
+/// `lj-api`, so a change in the backend crates does not rebuild the front.
 #[cfg(feature = "ssr")]
-#[derive(Clone)]
-pub struct ApiClient {
-    state: lj_api::state::AppState,
-}
-
-#[cfg(feature = "ssr")]
-impl ApiClient {
-    /// Récupère l'[`AppState`] fourni au contexte Leptos par `lj-server`.
-    pub fn from_context() -> Self {
-        let state = leptos::prelude::use_context::<lj_api::state::AppState>()
-            .expect("AppState fourni au contexte SSR par lj-server (leptos_routes_with_context)");
-        Self { state }
-    }
-
+#[async_trait::async_trait]
+pub trait Backend: Send + Sync {
     /// Jamais atteinte au rendu de `/decisions` : la page y peint son squelette
     /// (`search_is_loading` vrai côté serveur, la ressource n'est donc pas lue) et
     /// la recherche part du client à l'hydratation.
-    pub async fn search(
+    async fn search(
         &self,
         request: &SearchRequest,
         context: SearchContext,
-    ) -> ApiResult<SearchResponse> {
-        // Rendu SSR = client in-process sans session (auth côté hydrate) → anonyme.
-        // Pas de budget non plus : l'appel n'a pas de socket client à nommer, et la
-        // recherche de l'utilisateur part du wasm sur `/internal/search`, où elle est
-        // comptée.
-        lj_api::search::search(
-            &self.state,
-            request,
-            lj_api::usage::Caller::web_anonymous(context),
-            None,
-        )
-        .await
-        .map_err(map_service_error)
-    }
+    ) -> ApiResult<SearchResponse>;
 
     /// Décompte et facettes de la même recherche, second appel de la page.
-    pub async fn search_count(
+    async fn search_count(
         &self,
         request: &SearchRequest,
-    ) -> ApiResult<lj_dtos::SearchCountResponse> {
-        lj_api::search::count(&self.state, request, None)
-            .await
-            .map_err(map_service_error)
-    }
+    ) -> ApiResult<lj_dtos::SearchCountResponse>;
+
+    /// What the « Textes cités » panel input names in the catalogue. Never
+    /// reached at SSR: the input starts empty, and the fetch leaves the wasm.
+    async fn search_instruments(
+        &self,
+        request: &SearchRequest,
+        needle: &str,
+    ) -> ApiResult<lj_dtos::LegalInstrumentSuggestions>;
 
     /// Suggestions multi-mots de la barre de recherche (in-process, jamais appelée
     /// au rendu SSR : le fetch part d'un Effect client).
-    pub async fn suggest(&self, q: &str, mode: &str) -> ApiResult<SuggestResponse> {
-        lj_api::search::suggest::suggest(&self.state, q, mode)
-            .await
-            .map_err(map_service_error)
-    }
+    async fn suggest(&self, q: &str, mode: &str) -> ApiResult<SuggestResponse>;
 
-    pub async fn fetch_decision(&self, id: &str) -> ApiResult<DecisionDetail> {
-        lj_api::decisions::get_decision(&self.state, id)
-            .await
-            .map_err(|e| map_not_found(e, "Décision introuvable"))
-    }
+    async fn fetch_decision(&self, id: &str) -> ApiResult<DecisionDetail>;
 
-    pub async fn fetch_similar_decisions(&self, id: &str) -> ApiResult<SimilarDecisionsResponse> {
-        lj_api::decisions::similar_decisions(&self.state, id, 4)
-            .await
-            .map_err(|e| map_not_found(e, "Décision introuvable"))
-    }
-
-    // ── Référentiel LEGI (`/texte`) ───────────────────────────────────────────
+    async fn fetch_similar_decisions(&self, id: &str) -> ApiResult<SimilarDecisionsResponse>;
 
     /// Article LEGI à une date (`date = Some`) ou en vigueur (`date = None`),
     /// avec sa timeline. Slug inconnu / article absent ⇒ 404.
-    pub async fn fetch_legi_article(
+    async fn fetch_legi_article(
         &self,
         code: &str,
         num: &str,
         date: Option<&str>,
-    ) -> ApiResult<LawArticleResponse> {
-        let result = match date {
-            Some(date) => lj_api::legi::article_at_date_str(&self.state, code, num, date).await,
-            None => lj_api::legi::article_in_force(&self.state, code, num).await,
-        };
-        result.map_err(|e| map_not_found(e, "Article introuvable"))
-    }
+        place: Option<&str>,
+        juris: &str,
+    ) -> ApiResult<LawArticleResponse>;
+
+    /// The place vocabulary a reader picks from.
+    async fn fetch_places(&self) -> ApiResult<PlacesResponse>;
+
+    /// What applies in a place at a date, grouped by journal.
+    async fn fetch_place_corpus(
+        &self,
+        place: Option<&str>,
+        date: Option<&str>,
+    ) -> ApiResult<PlaceCorpusResponse>;
 
     /// Comparaison de deux versions d'un article. Bornes = dates ISO de fenêtre de
     /// version (`initiale` = borne ouverte).
-    pub async fn fetch_legi_compare(
+    async fn fetch_legi_compare(
         &self,
         code: &str,
         num: &str,
         de: &str,
         a: &str,
-    ) -> ApiResult<LawCompareResponse> {
-        lj_api::legi::article_compare(&self.state, code, num, de, a)
-            .await
-            .map_err(|e| map_not_found(e, "Version introuvable"))
-    }
+        juris: &str,
+    ) -> ApiResult<LawCompareResponse>;
 
-    pub async fn fetch_legi_citing(
+    async fn fetch_legi_citing(
         &self,
         code: &str,
         num: &str,
         date: Option<&str>,
+        place: Option<&str>,
+        juris: &str,
         page: PageParams,
-    ) -> ApiResult<Vec<CitingDecisionHit>> {
-        lj_api::legi::article_citing(
-            &self.state,
-            code,
-            num,
-            date,
-            i64::from(page.limit),
-            i64::from(page.offset),
-        )
-        .await
-        .map_err(|e| map_not_found(e, "Article introuvable"))
-    }
+    ) -> ApiResult<Vec<CitingDecisionHit>>;
 
     /// Articles co-cités avec l'article (« souvent cité avec »).
-    pub async fn fetch_legi_related(
+    async fn fetch_legi_related(
         &self,
         code: &str,
         num: &str,
-    ) -> ApiResult<Vec<CoCitedArticle>> {
-        lj_api::legi::article_co_cited(&self.state, code, num)
-            .await
-            .map_err(|e| map_not_found(e, "Article introuvable"))
-    }
+        juris: &str,
+    ) -> ApiResult<Vec<CoCitedArticle>>;
 
-    pub async fn fetch_legi_code_summary(&self, code: &str) -> ApiResult<LawCodeSummary> {
-        lj_api::legi::code_summary(&self.state, code)
-            .await
-            .map_err(|e| map_not_found(e, "Code introuvable"))
-    }
+    async fn fetch_legi_code_summary(&self, code: &str, juris: &str) -> ApiResult<LawCodeSummary>;
 
     /// Recherche plein-texte d'articles (page `/textes`). `code` borne la recherche
     /// à un texte ; `jurisdiction`/`nature`/`source` filtrent le corpus. Chaque
-    /// filtre `None`/vide est ignoré côté service. Le `context` ne pilote pas
-    /// l'historique ici (le service in-process n'enregistre rien, seul le transport
-    /// HTTP le fait) mais il qualifie le signal d'usage : un `teaser` reste un fetch
-    /// machine.
-    pub async fn search_textes(
+    /// filtre `None`/vide est ignoré côté service. Le `context` qualifie le signal
+    /// d'usage : un `teaser` reste un fetch machine.
+    async fn search_textes(
         &self,
         q: &str,
         filters: TextesFilters<'_>,
         page: PageParams,
+        mode: lj_dtos::SearchMode,
         context: SearchContext,
-    ) -> ApiResult<ArticleSearchResponse> {
-        lj_api::legi::search_textes(
-            &self.state,
-            q,
-            filters.code,
-            filters.jurisdiction,
-            filters.nature,
-            filters.source,
-            filters.scope,
-            None,
-            i64::from(page.limit),
-            i64::from(page.offset),
-            lj_api::usage::Caller::web_anonymous(context),
-            // SSR in-process : pas de socket, donc pas d'appelant à nommer.
-            None,
-        )
-        .await
-        .map_err(map_service_error)
-    }
+    ) -> ApiResult<ArticleSearchResponse>;
 
     /// Catalogue du fond codes (`/normes/codes`) : codes et constitutions
     /// (`scope=head` de l'API). Servi depuis le cache process-local 12 h.
-    pub async fn fetch_codes_catalogue(&self) -> ApiResult<CodeCatalogueResponse> {
-        lj_api::legi::code_catalogue(&self.state, true)
-            .await
-            .map(|r| (*r).clone())
-            .map_err(map_service_error)
-    }
+    async fn fetch_codes_catalogue(&self) -> ApiResult<CodeCatalogueResponse>;
 
     /// Catalogue des juridictions groupé par famille. Servi depuis le cache
     /// process-local 12 h.
-    pub async fn fetch_juridictions(&self) -> ApiResult<JurisdictionCatalogueResponse> {
-        lj_api::jurisdiction_hubs::catalogue(&self.state)
-            .await
-            .map(|r| (*r).clone())
-            .map_err(map_service_error)
-    }
+    async fn fetch_juridictions(&self) -> ApiResult<JurisdictionCatalogueResponse>;
 
     /// Hub d'une juridiction : années couvertes + volume.
-    pub async fn fetch_juridiction_hub(&self, code: &str) -> ApiResult<JurisdictionHubResponse> {
-        lj_api::jurisdiction_hubs::hub(&self.state, code)
-            .await
-            .map_err(map_service_error)
-    }
+    async fn fetch_juridiction_hub(&self, code: &str) -> ApiResult<JurisdictionHubResponse>;
 
     /// Page paginée des décisions d'une juridiction×année.
-    pub async fn fetch_juridiction_year(
+    async fn fetch_juridiction_year(
         &self,
         code: &str,
         year: i32,
         page: u32,
-    ) -> ApiResult<JurisdictionYearResponse> {
-        lj_api::jurisdiction_hubs::year_page(&self.state, code, year, page)
-            .await
-            .map_err(map_service_error)
-    }
+    ) -> ApiResult<JurisdictionYearResponse>;
 
     /// Catalogue des normes par fond. Servi depuis le cache process-local 12 h.
-    pub async fn fetch_normes(&self) -> ApiResult<NormCatalogueResponse> {
-        lj_api::norm_hubs::catalogue(&self.state)
-            .await
-            .map(|r| (*r).clone())
-            .map_err(map_service_error)
-    }
+    async fn fetch_normes(&self) -> ApiResult<NormCatalogueResponse>;
 
     /// Hub d'un fond de normes : années couvertes + volume.
-    pub async fn fetch_norm_fond(&self, fond: &str) -> ApiResult<NormFondResponse> {
-        lj_api::norm_hubs::hub(&self.state, fond)
-            .await
-            .map_err(map_service_error)
-    }
+    async fn fetch_norm_fond(&self, juris: &str, fond: &str) -> ApiResult<NormFondResponse>;
 
     /// Page paginée des textes d'un fond×année (`year = None` = bucket sans date).
-    pub async fn fetch_norm_year(
+    async fn fetch_norm_year(
         &self,
+        juris: &str,
         fond: &str,
         year: Option<i32>,
         page: u32,
-    ) -> ApiResult<NormYearResponse> {
-        lj_api::norm_hubs::year_page(&self.state, fond, year, page)
-            .await
-            .map_err(map_service_error)
-    }
+    ) -> ApiResult<NormYearResponse>;
 
     /// Page du moteur d'annonces (fond `marche`).
-    pub async fn search_annonces(
+    async fn search_annonces(
         &self,
         request: &AnnonceSearchRequest,
-    ) -> ApiResult<AnnonceSearchResponse> {
-        lj_api::annonces::search(&self.state, request)
-            .await
-            .map_err(map_service_error)
-    }
+    ) -> ApiResult<AnnonceSearchResponse>;
 
     /// Fiche d'une consultation (`/marche/{uid}`). Uid inconnu ⇒ 404.
-    pub async fn fetch_annonce(&self, uid: &str) -> ApiResult<AnnonceDetailResponse> {
-        lj_api::annonces::detail(&self.state, uid)
-            .await
-            .map_err(|e| map_not_found(e, "Consultation introuvable"))
-    }
+    async fn fetch_annonce(&self, uid: &str) -> ApiResult<AnnonceDetailResponse>;
 
     /// Catalogue du fond annonces (stock ouvert par département et nature).
-    pub async fn fetch_annonces_catalogue(&self) -> ApiResult<AnnonceCatalogueResponse> {
-        lj_api::annonces::catalogue(&self.state)
-            .await
-            .map(|c| (*c).clone())
-            .map_err(map_service_error)
-    }
+    async fn fetch_annonces_catalogue(&self) -> ApiResult<AnnonceCatalogueResponse>;
 
     /// Compteurs globaux du corpus (page d'accueil), lus dans l'instantané
     /// `corpus_counts` : trois lignes indexées par rendu.
-    pub async fn fetch_corpus_stats(&self) -> ApiResult<CorpusStatsResponse> {
-        lj_api::stats::corpus_stats(&self.state)
-            .await
-            .map_err(map_service_error)
-    }
+    async fn fetch_corpus_stats(&self) -> ApiResult<CorpusStatsResponse>;
 
-    /// Table des matières d'un code (`/texte/{code}/sommaire`). Slug inconnu ⇒ 404.
-    pub async fn fetch_code_toc(
+    /// Table des matières d'un code (`/norm/{code}/sommaire`). Slug inconnu ⇒ 404.
+    async fn fetch_code_toc(
         &self,
         code: &str,
         date: Option<&str>,
-    ) -> ApiResult<CodeTocResponse> {
-        lj_api::legi::code_toc_str(&self.state, code, date)
-            .await
-            .map_err(|e| map_not_found(e, "Code introuvable"))
-    }
+        juris: &str,
+    ) -> ApiResult<CodeTocResponse>;
 
-    /// Vue-lecture d'une section (`/texte/{code}/section/{cid}`).
-    pub async fn fetch_law_section(
+    /// Vue-lecture d'une section (`/norm/{code}/section/{path}`).
+    async fn fetch_law_section(
         &self,
         code: &str,
-        cid: &str,
+        path: &str,
         date: Option<&str>,
-    ) -> ApiResult<LawSectionResponse> {
-        lj_api::legi::law_section_str(&self.state, code, cid, date)
-            .await
-            .map_err(|e| map_not_found(e, "Section introuvable"))
-    }
+        juris: &str,
+    ) -> ApiResult<LawSectionResponse>;
 
-    /// Décisions citant une division (`…/section/{cid}/citing`) : union des
+    /// Décisions citant une division (`…/section-citing/{path}`) : union des
     /// citantes de son sous-arbre à la date demandée.
-    pub async fn fetch_law_section_citing(
+    async fn fetch_law_section_citing(
         &self,
         code: &str,
-        cid: &str,
+        path: &str,
         date: Option<&str>,
+        juris: &str,
         page: PageParams,
-    ) -> ApiResult<Vec<CitingDecisionHit>> {
-        lj_api::legi::section_citing(
-            &self.state,
-            code,
-            cid,
-            date,
-            i64::from(page.limit),
-            i64::from(page.offset),
-        )
-        .await
-        .map_err(|e| map_not_found(e, "Section introuvable"))
-    }
+    ) -> ApiResult<Vec<CitingDecisionHit>>;
 
     // ── Fiche entité (`/entite`) ────────────────────────────────────────────
-
     /// Identité registre + agrégats contentieux d'une entité. Uid inconnu ⇒ 404.
-    pub async fn fetch_entity(&self, ns: &str, id: &str) -> ApiResult<EntityPageResponse> {
-        lj_api::entities::entity_page(&self.state, ns, id)
-            .await
-            .map_err(|e| map_not_found(e, "Entité introuvable"))
-    }
+    async fn fetch_entity(&self, ns: &str, id: &str) -> ApiResult<EntityPageResponse>;
 
     /// Décisions citant l'entité, paginées (plus récentes d'abord).
-    pub async fn fetch_entity_decisions(
+    async fn fetch_entity_decisions(
         &self,
         ns: &str,
         id: &str,
         page: i64,
         page_size: i64,
-    ) -> ApiResult<EntityDecisionsResponse> {
-        lj_api::entities::entity_decisions(&self.state, ns, id, page, page_size)
-            .await
-            .map_err(|e| map_not_found(e, "Entité introuvable"))
-    }
+    ) -> ApiResult<EntityDecisionsResponse>;
 
     /// Volet registre de l'entité (APIs publiques à l'affichage).
-    pub async fn fetch_entity_registre(
-        &self,
-        ns: &str,
-        id: &str,
-    ) -> ApiResult<EntityRegistreResponse> {
-        lj_api::registre::entity_registre(&self.state, ns, id)
-            .await
-            .map_err(map_service_error)
-    }
+    async fn fetch_entity_registre(&self, ns: &str, id: &str) -> ApiResult<EntityRegistreResponse>;
 
     /// Acteurs (parties + conseils) extraits d'une décision (encart « Parties »).
-    pub async fn fetch_decision_parties(&self, id: &str) -> ApiResult<DecisionPartiesResponse> {
-        lj_api::entities::decision_parties(&self.state, id)
-            .await
-            .map_err(|e| map_not_found(e, "Décision introuvable"))
-    }
+    async fn fetch_decision_parties(&self, id: &str) -> ApiResult<DecisionPartiesResponse>;
 
     // ── Annuaire des entités (`/annuaire`) ───────────────────────────────────
-
     /// Compteurs d'entités avec contentieux par catégorie (accueil annuaire).
-    pub async fn fetch_annuaire_stats(&self) -> ApiResult<AnnuaireStatsResponse> {
-        lj_api::entities::annuaire_stats(&self.state)
-            .await
-            .map_err(map_service_error)
-    }
+    async fn fetch_annuaire_stats(&self) -> ApiResult<AnnuaireStatsResponse>;
 
     /// Recherche d'entités (annuaire). `kind` (slug de catégorie) borne si fourni.
-    pub async fn search_entities(
+    async fn search_entities(
         &self,
         q: &str,
         kind: Option<&str>,
         limit: u32,
-    ) -> ApiResult<EntitySearchResponse> {
-        let category = kind.map(resolve_kind).transpose()?;
-        lj_api::entities::entity_search(&self.state, q, category, i64::from(limit))
-            .await
-            .map_err(map_service_error)
-    }
+    ) -> ApiResult<EntitySearchResponse>;
 
     /// Listing paginé d'une catégorie (tri contentieux décroissant côté API).
-    /// `barreau` filtre les avocats `cnb:`.
-    pub async fn fetch_entities_directory(
+    async fn fetch_entities_directory(
         &self,
         kind: &str,
-        barreau: Option<&str>,
         page: i64,
         page_size: i64,
-    ) -> ApiResult<EntityDirectoryResponse> {
-        let category = resolve_kind(kind)?;
-        lj_api::entities::entity_directory(&self.state, category, barreau, page, page_size)
-            .await
-            .map_err(map_service_error)
+    ) -> ApiResult<EntityDirectoryResponse>;
+
+    /// The bearer's account summary, read from the session cookie of the request.
+    async fn account_summary(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Option<lj_dtos::AccountSummary>;
+
+    /// The registered name of an OAuth client.
+    async fn oauth_client_name(&self, client_id: &str) -> Option<String>;
+}
+
+/// The SSR client, provided to the Leptos context of every request by `lj-server`.
+#[cfg(feature = "ssr")]
+#[derive(Clone)]
+pub struct ApiClient(std::sync::Arc<dyn Backend>);
+
+#[cfg(feature = "ssr")]
+impl ApiClient {
+    pub fn new(backend: impl Backend + 'static) -> Self {
+        Self(std::sync::Arc::new(backend))
     }
 
-    // Listes « Mon activité » : portées par les fetchers infinite-scroll, qui ne
-    // s'exécutent que côté client (Effect `hydrate`) — le SSR est anonyme, sans
-    // session in-process. Présentes pour que les closures compilent en `ssr`.
-    pub async fn list_search_history(&self, _page: PageParams) -> ApiResult<SearchHistoryResponse> {
-        Err(anonymous())
-    }
-
-    pub async fn list_decision_views(&self, _page: PageParams) -> ApiResult<DecisionViewsResponse> {
-        Err(anonymous())
+    pub fn from_context() -> Self {
+        leptos::prelude::use_context::<Self>()
+            .expect("ApiClient provided to the SSR context by lj-server")
     }
 }
 
-/// Slug de catégorie annuaire → catégorie stockée (mapping `lj_api`). Slug
-/// inconnu ⇒ 422, parité de la route HTTP (le front valide en amont via
-/// `pages::annuaire::common::Kind`).
 #[cfg(feature = "ssr")]
-fn resolve_kind(kind: &str) -> ApiResult<&'static str> {
-    lj_api::entities::kind_to_category(kind).ok_or_else(|| ApiError {
-        message: format!("Catégorie inconnue : {kind}"),
-        status: 422,
-    })
-}
+impl std::ops::Deref for ApiClient {
+    type Target = dyn Backend;
 
-/// Erreur « pas de session » du client SSR (anonyme in-process).
-#[cfg(feature = "ssr")]
-fn anonymous() -> ApiError {
-    ApiError {
-        message: "auth_required".to_string(),
-        status: 401,
+    fn deref(&self) -> &Self::Target {
+        &*self.0
     }
-}
-
-/// Mappe une erreur service `lj-api` en [`ApiError`] (status + message).
-#[cfg(feature = "ssr")]
-fn map_service_error(err: lj_api::error::ApiError) -> ApiError {
-    ApiError {
-        status: err.status(),
-        message: err.to_string(),
-    }
-}
-
-/// Comme [`map_service_error`], mais remplace le message d'un 404 par `not_found`
-/// (parité du message spécifique des routes décision).
-#[cfg(feature = "ssr")]
-fn map_not_found(err: lj_api::error::ApiError, not_found: &str) -> ApiError {
-    let status = err.status();
-    let message = if status == 404 {
-        not_found.to_string()
-    } else {
-        err.to_string()
-    };
-    ApiError { message, status }
 }
 
 // ════════════════════════════ Hydrate : reqwest /internal same-origin ════════════════════
@@ -683,6 +497,23 @@ impl ApiClient {
         self.send_json(builder, "search count failed", None).await
     }
 
+    /// What the « Textes cités » panel input names in the catalogue, counted on
+    /// the same search: the facet only serves the head of its vocabulary.
+    pub async fn search_instruments(
+        &self,
+        request: &SearchRequest,
+        needle: &str,
+    ) -> ApiResult<lj_dtos::LegalInstrumentSuggestions> {
+        let query = build_search_query(request);
+        let needle = encode_pairs(&[("needle".to_string(), needle.to_string())]);
+        let builder = self.request(
+            Method::GET,
+            &format!("/search/instruments?{query}&{needle}"),
+        );
+        self.send_json(builder, "instrument suggest failed", None)
+            .await
+    }
+
     // ── Decision ───────────────────────────────────────────────────────────
 
     pub async fn fetch_decision(&self, id: &str) -> ApiResult<DecisionDetail> {
@@ -724,11 +555,17 @@ impl ApiClient {
         code: &str,
         num: &str,
         date: Option<&str>,
+        place: Option<&str>,
+        juris: &str,
     ) -> ApiResult<LawArticleResponse> {
-        let path = match date {
-            Some(date) => format!("/texte/{code}/{num}/{date}"),
-            None => format!("/texte/{code}/{num}"),
+        let text = lj_vocab::norm_path(juris, code);
+        let mut path = match date {
+            Some(date) => format!("{text}/{num}/{date}"),
+            None => format!("{text}/{num}"),
         };
+        if let Some(place) = place {
+            path.push_str(&format!("?place={place}"));
+        }
         let builder = self.request(Method::GET, &path);
         self.send_json(
             builder,
@@ -738,6 +575,29 @@ impl ApiClient {
         .await
     }
 
+    pub async fn fetch_places(&self) -> ApiResult<PlacesResponse> {
+        let builder = self.request(Method::GET, "/places");
+        self.send_json(builder, "places fetch failed", Some("Lieux introuvables"))
+            .await
+    }
+
+    pub async fn fetch_place_corpus(
+        &self,
+        place: Option<&str>,
+        date: Option<&str>,
+    ) -> ApiResult<PlaceCorpusResponse> {
+        let mut path = match date {
+            Some(d) => format!("/corpus/{d}"),
+            None => "/corpus".to_string(),
+        };
+        if let Some(place) = place {
+            path.push_str(&format!("?place={place}"));
+        }
+        let builder = self.request(Method::GET, &path);
+        self.send_json(builder, "corpus fetch failed", Some("Corpus introuvable"))
+            .await
+    }
+
     /// Comparaison de deux versions d'un article.
     pub async fn fetch_legi_compare(
         &self,
@@ -745,11 +605,10 @@ impl ApiClient {
         num: &str,
         de: &str,
         a: &str,
+        juris: &str,
     ) -> ApiResult<LawCompareResponse> {
-        let builder = self.request(
-            Method::GET,
-            &format!("/texte/{code}/{num}/compare/{de}/{a}"),
-        );
+        let text = lj_vocab::norm_path(juris, code);
+        let builder = self.request(Method::GET, &format!("{text}/{num}/compare/{de}/{a}"));
         self.send_json(
             builder,
             "legi compare fetch failed",
@@ -763,12 +622,16 @@ impl ApiClient {
         code: &str,
         num: &str,
         date: Option<&str>,
+        place: Option<&str>,
+        juris: &str,
         page: PageParams,
     ) -> ApiResult<Vec<CitingDecisionHit>> {
         let date_q = date.map(|d| format!("&date={d}")).unwrap_or_default();
+        let place_q = place.map(|p| format!("&place={p}")).unwrap_or_default();
+        let text = lj_vocab::norm_path(juris, code);
         let builder = self.request(
             Method::GET,
-            &format!("/texte/{code}/{num}/citing{}{date_q}", page_query(page)),
+            &format!("{text}/{num}/citing{}{date_q}{place_q}", page_query(page)),
         );
         self.send_json(
             builder,
@@ -783,8 +646,10 @@ impl ApiClient {
         &self,
         code: &str,
         num: &str,
+        juris: &str,
     ) -> ApiResult<Vec<CoCitedArticle>> {
-        let builder = self.request(Method::GET, &format!("/texte/{code}/{num}/related"));
+        let text = lj_vocab::norm_path(juris, code);
+        let builder = self.request(Method::GET, &format!("{text}/{num}/related"));
         self.send_json(
             builder,
             "legi related fetch failed",
@@ -793,8 +658,12 @@ impl ApiClient {
         .await
     }
 
-    pub async fn fetch_legi_code_summary(&self, code: &str) -> ApiResult<LawCodeSummary> {
-        let builder = self.request(Method::GET, &format!("/texte/{code}"));
+    pub async fn fetch_legi_code_summary(
+        &self,
+        code: &str,
+        juris: &str,
+    ) -> ApiResult<LawCodeSummary> {
+        let builder = self.request(Method::GET, &lj_vocab::norm_path(juris, code));
         self.send_json(builder, "legi code fetch failed", Some("Code introuvable"))
             .await
     }
@@ -805,16 +674,21 @@ impl ApiClient {
         q: &str,
         filters: TextesFilters<'_>,
         page: PageParams,
+        mode: lj_dtos::SearchMode,
         context: SearchContext,
     ) -> ApiResult<ArticleSearchResponse> {
         let mut path = format!(
-            "/search-textes?q={}&limit={}&offset={}",
+            "/search-textes?q={}&limit={}&offset={}&mode={}",
             url_encode(q),
             page.limit,
-            page.offset
+            page.offset,
+            enum_value(&mode)
         );
         if context == SearchContext::Teaser {
             path.push_str("&context=teaser");
+        }
+        for place in filters.places {
+            path.push_str(&format!("&place={}", url_encode(place)));
         }
         for (key, value) in [
             ("code", filters.code),
@@ -875,8 +749,8 @@ impl ApiClient {
     }
 
     /// Hub d'un fond de normes : années couvertes + volume.
-    pub async fn fetch_norm_fond(&self, fond: &str) -> ApiResult<NormFondResponse> {
-        let path = format!("/normes/{fond}");
+    pub async fn fetch_norm_fond(&self, juris: &str, fond: &str) -> ApiResult<NormFondResponse> {
+        let path = format!("/normes/{juris}/{fond}");
         let builder = self.request(Method::GET, &path);
         self.send_json(builder, "norm fond fetch failed", None)
             .await
@@ -885,6 +759,7 @@ impl ApiClient {
     /// Page paginée des textes d'un fond×année (`year = None` = bucket sans date).
     pub async fn fetch_norm_year(
         &self,
+        juris: &str,
         fond: &str,
         year: Option<i32>,
         page: u32,
@@ -893,7 +768,7 @@ impl ApiClient {
             Some(y) => y.to_string(),
             None => "sans-date".to_string(),
         };
-        let path = format!("/normes/{fond}/{annee}?page={page}");
+        let path = format!("/normes/{juris}/{fond}/{annee}?page={page}");
         let builder = self.request(Method::GET, &path);
         self.send_json(builder, "norm year fetch failed", None)
             .await
@@ -936,27 +811,31 @@ impl ApiClient {
             .await
     }
 
-    /// Table des matières d'un code (`/texte/{code}/sommaire`). Slug inconnu ⇒ 404.
+    /// Table des matières d'un code (`…/sommaire`). Slug inconnu ⇒ 404.
     pub async fn fetch_code_toc(
         &self,
         code: &str,
         date: Option<&str>,
+        juris: &str,
     ) -> ApiResult<CodeTocResponse> {
         let date_q = date.map(|d| format!("?date={d}")).unwrap_or_default();
-        let builder = self.request(Method::GET, &format!("/texte/{code}/sommaire{date_q}"));
+        let text = lj_vocab::norm_path(juris, code);
+        let builder = self.request(Method::GET, &format!("{text}/sommaire{date_q}"));
         self.send_json(builder, "code toc fetch failed", Some("Code introuvable"))
             .await
     }
 
-    /// Vue-lecture d'une section (`/texte/{code}/section/{cid}`).
+    /// Vue-lecture d'une section (`…/section/{path}`).
     pub async fn fetch_law_section(
         &self,
         code: &str,
-        cid: &str,
+        path: &str,
         date: Option<&str>,
+        juris: &str,
     ) -> ApiResult<LawSectionResponse> {
         let date_q = date.map(|d| format!("?date={d}")).unwrap_or_default();
-        let builder = self.request(Method::GET, &format!("/texte/{code}/section/{cid}{date_q}"));
+        let text = lj_vocab::norm_path(juris, code);
+        let builder = self.request(Method::GET, &format!("{text}/section/{path}{date_q}"));
         self.send_json(
             builder,
             "law section fetch failed",
@@ -965,21 +844,20 @@ impl ApiClient {
         .await
     }
 
-    /// Décisions citant une division (`…/section/{cid}/citing`).
+    /// Décisions citant une division (`…/section-citing/{path}`).
     pub async fn fetch_law_section_citing(
         &self,
         code: &str,
-        cid: &str,
+        path: &str,
         date: Option<&str>,
+        juris: &str,
         page: PageParams,
     ) -> ApiResult<Vec<CitingDecisionHit>> {
         let date_q = date.map(|d| format!("&date={d}")).unwrap_or_default();
+        let text = lj_vocab::norm_path(juris, code);
         let builder = self.request(
             Method::GET,
-            &format!(
-                "/texte/{code}/section/{cid}/citing{}{date_q}",
-                page_query(page)
-            ),
+            &format!("{text}/section-citing/{path}{}{date_q}", page_query(page)),
         );
         self.send_json(
             builder,
@@ -1073,21 +951,16 @@ impl ApiClient {
     }
 
     /// Listing paginé d'une catégorie (tri contentieux décroissant côté API).
-    /// `barreau` filtre les avocats `cnb:`.
     pub async fn fetch_entities_directory(
         &self,
         kind: &str,
-        barreau: Option<&str>,
         page: i64,
         page_size: i64,
     ) -> ApiResult<EntityDirectoryResponse> {
-        let mut path = format!(
+        let path = format!(
             "/entities/directory?kind={}&page={page}&page_size={page_size}",
             url_encode(kind)
         );
-        if let Some(barreau) = barreau.filter(|b| !b.is_empty()) {
-            path.push_str(&format!("&barreau={}", url_encode(barreau)));
-        }
         let builder = self.request(Method::GET, &path);
         self.send_json(builder, "entities directory fetch failed", None)
             .await
@@ -1113,14 +986,6 @@ impl ApiClient {
     pub async fn fetch_account(&self) -> ApiResult<AccountSummary> {
         let builder = self.request(Method::GET, "/account");
         self.send_json(builder, "account fetch failed", None).await
-    }
-
-    pub async fn set_activity_tracking(&self, enabled: bool) -> ApiResult<UserProfile> {
-        let builder = self
-            .request(Method::PUT, "/me/activity-tracking")
-            .json(&lj_dtos::ActivityTrackingUpdate { enabled });
-        self.send_json(builder, "activity tracking update failed", None)
-            .await
     }
 
     // ── Clés de la surface publique ──────────────────────────────────────────
@@ -1165,64 +1030,34 @@ impl ApiClient {
             .await
     }
 
-    // ── Historique de recherche ────────────────────────────────────────────────
-
-    pub async fn list_search_history(&self, page: PageParams) -> ApiResult<SearchHistoryResponse> {
-        let builder = self.request(
-            Method::GET,
-            &format!("/me/search-history{}", page_query(page)),
-        );
-        self.send_json(builder, "history fetch failed", None).await
+    pub async fn report_read(&self, report: &lj_dtos::ReadReport) -> ApiResult<()> {
+        let builder = self.request(Method::POST, "/reads").json(report);
+        self.send_unit(builder, "read report failed", None).await
     }
 
-    pub async fn delete_search_history_entry(&self, entry_id: i64) -> ApiResult<()> {
-        let builder = self.request(Method::DELETE, &format!("/me/search-history/{entry_id}"));
-        self.send_unit(builder, "history delete failed", None).await
-    }
-
-    pub async fn clear_search_history(&self) -> ApiResult<()> {
-        let builder = self.request(Method::DELETE, "/me/search-history");
-        self.send_unit(builder, "history clear failed", None).await
-    }
-
-    // ── Decisions consultees ───────────────────────────────────────────────────
-
-    pub async fn list_decision_views(&self, page: PageParams) -> ApiResult<DecisionViewsResponse> {
-        let builder = self.request(
-            Method::GET,
-            &format!("/me/decision-views{}", page_query(page)),
-        );
-        self.send_json(builder, "decision views fetch failed", None)
-            .await
-    }
-
-    pub async fn record_decision_view(&self, decision_id: &str) -> ApiResult<()> {
-        let builder = self.request(Method::POST, &format!("/me/decision-views/{decision_id}"));
-        self.send_unit(builder, "decision view record failed", None)
-            .await
-    }
-
-    pub async fn delete_decision_view(&self, decision_id: &str) -> ApiResult<()> {
-        let builder = self.request(Method::DELETE, &format!("/me/decision-views/{decision_id}"));
-        self.send_unit(builder, "decision view delete failed", None)
-            .await
-    }
-
-    pub async fn clear_decision_views(&self) -> ApiResult<()> {
-        let builder = self.request(Method::DELETE, "/me/decision-views");
-        self.send_unit(builder, "decision views clear failed", None)
+    pub async fn report_entity_search(
+        &self,
+        report: &lj_dtos::EntitySearchReport,
+    ) -> ApiResult<()> {
+        let builder = self.request(Method::POST, "/entity-searches").json(report);
+        self.send_unit(builder, "entity search report failed", None)
             .await
     }
 }
 
-/// Key of the one-shot marker of a reload already spent in this tab.
+/// Key holding the date of the last reload spent in this tab.
 #[cfg(feature = "hydrate")]
 const CHALLENGE_RELOAD: &str = "lj-defi-recharge";
 
+/// Separates the two populations rather than capping a count: a client the edge
+/// never lets through comes back within seconds, where a clearance that expires
+/// honestly is a `challenge_ttl` away, 24 h. Any value between the two holds.
+#[cfg(feature = "hydrate")]
+const CHALLENGE_RELOAD_COOLDOWN_MS: f64 = 60_000.0;
+
 /// A 403 here can only come from the edge: the API returns none, on any route. An
 /// edge challenge needs a **document** response to be solved, which a `fetch`
-/// cannot show, so one reload per tab hands the browser one. One, never two: a
-/// client the edge always challenges would otherwise reload forever.
+/// cannot show, so a reload hands the browser one.
 #[cfg(feature = "hydrate")]
 fn recover_from_challenge(resp: &reqwest::Response) {
     if resp.status() != StatusCode::FORBIDDEN {
@@ -1234,10 +1069,16 @@ fn recover_from_challenge(resp: &reqwest::Response) {
     let Ok(Some(storage)) = window.session_storage() else {
         return;
     };
-    if storage.get_item(CHALLENGE_RELOAD).ok().flatten().is_some() {
+    let now = js_sys::Date::now();
+    let last = storage
+        .get_item(CHALLENGE_RELOAD)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<f64>().ok());
+    if last.is_some_and(|last| now - last < CHALLENGE_RELOAD_COOLDOWN_MS) {
         return;
     }
-    let _ = storage.set_item(CHALLENGE_RELOAD, "1");
+    let _ = storage.set_item(CHALLENGE_RELOAD, &now.to_string());
     let _ = window.location().reload();
 }
 
@@ -1342,7 +1183,7 @@ fn build_annonces_query(request: &AnnonceSearchRequest) -> String {
     }
     for (key, values) in [
         ("fond", &request.fond),
-        ("departement", &request.departement),
+        ("zone", &request.zone),
         ("famille", &request.famille),
         ("cpv", &request.cpv),
     ] {

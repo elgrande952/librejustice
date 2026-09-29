@@ -2,9 +2,19 @@
 # `apps/lj-ingest/src/chain.rs` : chacune a son watchdog, un échec n'interrompt
 # pas les suivantes, et la chaîne sort non-zéro sur `chain_failed`.
 
+# Ce que les portes d'une annonce servent, échantillonné. Hors chaîne, dont le
+# pire cas sature déjà la période du cron : la sonde tient son propre budget de
+# 120 s et lit les liens que la chaîne de la veille a écrits.
+30 2 * * * cd /app && lj-ingest annonces-sonder-liens --par-moteur 8
+
 # Du lundi au samedi.
-0 3 * * 1-6 cd /app && lj-ingest chain quotidienne
+0 3 * * 1-6 cd /app && lj-ingest chain daily
 
 # Le dimanche, la quotidienne et l'hebdomadaire s'enchaînent dans un seul
 # processus : aucun chevauchement, aucun verrou.
-0 3 * * 0 cd /app && lj-ingest chain hebdo
+0 3 * * 0 cd /app && lj-ingest chain weekly
+
+# `lj-ingest chain drain` n'est plus planifié depuis le 21/09/2026 : la vidange
+# réécrivait le stock des anciennes générations sur luna autant que sur gemini,
+# et la stratégie de réécriture n'est pas arrêtée. La commande reste, la ligne
+# de cron revient avec la décision.

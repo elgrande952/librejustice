@@ -1,79 +1,10 @@
-//! Primitives de chaînes pures partagées (folding, recasse, collapse d'espaces,
-//! lookahead manuel). Noyau `lj-core` : consommé côté serve par `aliases` (fold
-//! des requêtes) et côté ingest par le recognizer de `lj-extract`, d'où leur
-//! résidence dans l'ancêtre commun.
+//! Primitives de chaînes pures partagées (recasse, collapse d'espaces,
+//! lookahead manuel), consommées côté serve et côté ingest. Le pliage vit dans
+//! `lj-fold`.
 
 use std::sync::LazyLock;
 
 use regex::Regex;
-
-/// Minuscule, accents supprimés (NFD + drop Mn), apostrophes typo
-/// normalisées, espaces collapsés. Clé de comparaison uniquement.
-pub fn fold(text: &str) -> String {
-    let lower = text.to_lowercase();
-    let decomposed = nfd::decompose(&lower);
-    let stripped: String = decomposed
-        .chars()
-        .filter(|c| !nfd::is_combining_mark(*c))
-        .collect();
-    let stripped = stripped.replace('\u{2019}', "'");
-    static RE_WS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
-    RE_WS.replace_all(&stripped, " ").trim().to_string()
-}
-
-/// Slug de comparaison : `fold` puis toute séquence non-alphanumérique
-/// réduite à un `-`, sans tiret de bord. Rend comparables les graphies d'un
-/// même lieu à travers les conventions de séparateur — code de juridiction
-/// (`ca_basse_terre`), libellé (« Cour d'appel de Basse-Terre »), slug de
-/// barreau (`bergerac-sarlat`).
-pub fn slug(s: &str) -> String {
-    let mut out = String::new();
-    for c in fold(s).chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-// ── pliage longueur-stable ──────────────────────────────────────────────────
-//
-// 1 char → 1 char, offsets préservés — le pliage général (`fold` ci-dessus)
-// normalise l'espace et casse les positions. Couvre le français des titres et
-// décisions ; tout char inconnu passe en minuscule simple. C'est le fold
-// canonique des dénominations : recognizer `lj-extract`, chargeur de
-// registres (`denomination_folded`), recherche annuaire.
-
-/// Pliage 1:1 d'un char (voie ASCII rapide — l'écrasante majorité des chars
-/// d'une décision : la casse ASCII évite la table Unicode de `to_lowercase`).
-pub fn fold_char(c: char) -> char {
-    if c.is_ascii() {
-        return match c {
-            '\n' | '\r' | '\t' => ' ',
-            _ => c.to_ascii_lowercase(),
-        };
-    }
-    match c {
-        'À' | 'Â' | 'Ä' | 'à' | 'â' | 'ä' => 'a',
-        'É' | 'È' | 'Ê' | 'Ë' | 'é' | 'è' | 'ê' | 'ë' => 'e',
-        'Î' | 'Ï' | 'î' | 'ï' => 'i',
-        'Ô' | 'Ö' | 'ô' | 'ö' => 'o',
-        'Ù' | 'Û' | 'Ü' | 'ù' | 'û' | 'ü' => 'u',
-        'Ç' | 'ç' => 'c',
-        'Œ' | 'œ' => 'o', // « œ » 1:1 (≠ NFKD « oe ») : la stabilité prime
-        '’' => '\'',
-        // Blancs → espace simple : les motifs portent des espaces, le texte
-        // des sauts de ligne (« accord franco-tunisien du\n17 mars 1988 »).
-        '\n' | '\r' | '\t' | '\u{a0}' | '\u{2007}' | '\u{2009}' | '\u{202f}' => ' ',
-        _ => c.to_lowercase().next().unwrap_or(c),
-    }
-}
-
-pub fn fold_stable(s: &str) -> String {
-    s.chars().map(fold_char).collect()
-}
 
 pub fn uppercase_first(s: &str) -> String {
     let mut chars = s.chars();
@@ -133,67 +64,4 @@ pub fn normalize_spaces(value: &str) -> String {
         .replace_all(value.trim(), " ")
         .trim()
         .to_string()
-}
-
-/// Mini-décomposition NFD ciblée (le crate `unicode-normalization` n'est pas
-/// au manifest de `lj-core`). Suffisant pour `fold` sur le corpus juridique
-/// FR : retire les diacritiques latins courants.
-mod nfd {
-    pub fn decompose(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for c in s.chars() {
-            match c {
-                'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => {
-                    out.push('a');
-                    out.push('\u{0301}');
-                }
-                'è' | 'é' | 'ê' | 'ë' => {
-                    out.push('e');
-                    out.push('\u{0301}');
-                }
-                'ì' | 'í' | 'î' | 'ï' => {
-                    out.push('i');
-                    out.push('\u{0301}');
-                }
-                'ò' | 'ó' | 'ô' | 'õ' | 'ö' => {
-                    out.push('o');
-                    out.push('\u{0301}');
-                }
-                'ù' | 'ú' | 'û' | 'ü' => {
-                    out.push('u');
-                    out.push('\u{0301}');
-                }
-                'ý' | 'ÿ' => {
-                    out.push('y');
-                    out.push('\u{0301}');
-                }
-                'ç' => {
-                    out.push('c');
-                    out.push('\u{0327}');
-                }
-                'ñ' => {
-                    out.push('n');
-                    out.push('\u{0303}');
-                }
-                other => out.push(other),
-            }
-        }
-        out
-    }
-
-    pub fn is_combining_mark(c: char) -> bool {
-        ('\u{0300}'..='\u{036f}').contains(&c)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fold_strips_accents_case_and_apostrophes() {
-        assert_eq!(fold("CODE CIVIL"), "code civil");
-        assert_eq!(fold("Code de l\u{2019}entrée"), "code de l'entree");
-        assert_eq!(fold("  Décret   du  "), "decret du");
-    }
 }

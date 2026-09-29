@@ -2,6 +2,7 @@
 //! `upsert`/`update_existing`, application de provenance, écriture canonique,
 //! création, et mise à jour batchée des champs ré-extractibles.
 
+use super::decision_text::text_lang;
 use super::support::{
     as_param_refs, extracted_column_type, extracted_field_value, is_routed_field, now,
     CASE_CITATIONS_FIELD, CASE_NAME_FIELD, DECISION_LINKS_FIELD, LEGAL_REFS_FIELD, PARTIES_FIELD,
@@ -11,7 +12,7 @@ use super::types::{ExtractedFields, JurisdictionRow, UpsertResult, UpsertStatus}
 use super::{DecisionRepository, ElectedCaseName};
 use crate::error::{Result, StoreError};
 use lj_core::decision::Decision;
-use lj_core::EXTRACT_VERSION;
+use lj_versions::EXTRACT_VERSION;
 use serde_json::Value;
 use tokio_postgres::types::{Json, ToSql};
 
@@ -26,27 +27,21 @@ impl DecisionRepository<'_> {
     }
 
     /// Identité de cible d'un lot de décisions actives — l'entrée de la sonde
-    /// inversée (`attract_pending_citations`) : de quoi générer les clés
-    /// candidates (`lj_extract::identity::pending_target_keys`) depuis les
-    /// valeurs STOCKÉES (code juridiction canonicalisé, dockets écrits).
-    /// Renvoie `(jurisdiction_type, jurisdiction_code, docket_numbers,
-    /// canonical_ref)`.
+    /// inversée (`attract_pending_citations`), lue aux valeurs STOCKÉES :
+    /// `(jurisdiction_code, docket_numbers)`.
     pub async fn decision_target_identities(
         &self,
         ids: &[i64],
-    ) -> Result<Vec<(String, Option<String>, Vec<String>, Option<String>)>> {
+    ) -> Result<Vec<(Option<String>, Vec<String>)>> {
         let rows = self
             .conn
             .query(
-                "SELECT jurisdiction_type, jurisdiction_code, docket_numbers, canonical_ref \
+                "SELECT jurisdiction_code, docket_numbers \
                  FROM decisions WHERE id = ANY($1) AND deleted_at IS NULL",
                 &[&ids],
             )
             .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
-            .collect())
+        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
     #[tracing::instrument(name = "db.upsert", skip(self, decision, extracted), fields(db.system = "postgresql"))]
@@ -101,9 +96,14 @@ impl DecisionRepository<'_> {
             });
         }
 
-        // `source_uid` inconnu → résolution d'identité par `canonical_ref`. Match →
-        // on attache la provenance à la décision trouvée ; sinon → création.
-        if let Some(existing_id) = self.resolve_identity(decision, canonical_ref).await? {
+        // Unknown `source_uid`: another language of the same judgment, then the
+        // `canonical_ref` identity. A match takes the provenance, otherwise create.
+        let lang = source_fields.get("lang").and_then(Value::as_str);
+        let existing = match self.find_language_sibling(decision, lang).await? {
+            Some(id) => Some(id),
+            None => self.resolve_identity(decision, canonical_ref).await?,
+        };
+        if let Some(existing_id) = existing {
             self.apply_provenance(
                 existing_id,
                 decision,
@@ -186,6 +186,7 @@ impl DecisionRepository<'_> {
                 public_id,
                 extracted,
                 canonical_ref,
+                source_fields,
                 embed_version,
             )
             .await?;
@@ -201,6 +202,14 @@ impl DecisionRepository<'_> {
                 self.replace_decision_parties(decision_id, e.parties.as_deref())
                     .await?;
             }
+        } else {
+            self.put_text(
+                decision_id,
+                &decision.source_uid,
+                source_fields,
+                &decision.texte_integral_clean,
+            )
+            .await?;
         }
         // 3) Reconcile : `deleted_at` / vide RGPD (no-op si autorité active).
         self.reconcile(decision_id).await?;
@@ -214,6 +223,7 @@ impl DecisionRepository<'_> {
     /// `decision_sources`). No-op sur une décision à `extract_version` >
     /// `EXTRACT_VERSION` : un écrivain à version V ne remplace jamais des données à
     /// version > V.
+    #[allow(clippy::too_many_arguments)]
     async fn write_canonical_content(
         &self,
         decision_id: i64,
@@ -221,6 +231,7 @@ impl DecisionRepository<'_> {
         public_id: &str,
         extracted: Option<&ExtractedFields>,
         canonical_ref: Option<&str>,
+        source_fields: &Value,
         embed_version: Option<i16>,
     ) -> Result<()> {
         let e = extracted;
@@ -231,7 +242,8 @@ impl DecisionRepository<'_> {
                 .remove(&j.source_code),
             None => None,
         };
-        self.conn
+        let written = self
+            .conn
             .execute(
                 "
                 UPDATE decisions SET
@@ -240,17 +252,17 @@ impl DecisionRepository<'_> {
                   date_lecture = $4, date_audience = $5, docket_numbers = $6,
                   publication_codes = $7,
                   extract_version = $9,
-                  full_text = $10, embed_version = $11, ecli = $12, canonical_ref = $13,
-                  solution_uid = $14, procedure_uid = $15, office_uid = $16,
-                  legal_domain_uid = $17,
-                  jurisdiction_code = $18,
-                  applicant_counsel_names = $19, applicant_law_firms = $20,
-                  applicant_companies = $21, defendant_counsel_names = $22,
-                  defendant_law_firms = $23, defendant_companies = $24,
-                  intervenors = $25, themes = $26,
-                  chamber_key = $27, formation_uid = $28,
-                  search_title = $29,
-                  seat = $30, seat_paths = $31
+                  embed_version = $10, ecli = $11, canonical_ref = $12,
+                  solution_uid = $13, procedure_uid = $14, office_uid = $15,
+                  legal_domain_uid = $16,
+                  jurisdiction_code = $17,
+                  applicant_counsel_names = $18, applicant_law_firms = $19,
+                  applicant_companies = $20, defendant_counsel_names = $21,
+                  defendant_law_firms = $22, defendant_companies = $23,
+                  intervenors = $24, themes = $25,
+                  formation_uid = $26,
+                  search_title = $27,
+                  seat = $28, seat_paths = $29
                 WHERE id = $8
                   AND (extract_version IS NULL OR extract_version <= $9)
                 ",
@@ -264,7 +276,6 @@ impl DecisionRepository<'_> {
                     &e.map(|e| e.publication_codes.clone()).unwrap_or_default(),
                     &decision_id,
                     &EXTRACT_VERSION,
-                    &decision.texte_integral_clean,
                     &embed_version,
                     &decision.ecli,
                     &canonical_ref,
@@ -283,7 +294,6 @@ impl DecisionRepository<'_> {
                     &e.map(|e| e.defendant_companies.clone()).unwrap_or_default(),
                     &e.map(|e| e.intervenors.clone()).unwrap_or_default(),
                     &e.map(|e| e.themes.clone()).unwrap_or_default(),
-                    &e.and_then(|e| e.chamber_key.clone()),
                     &e.and_then(|e| e.formation_uid.clone()),
                     &e.and_then(|e| e.search_title.clone()),
                     &e.and_then(|e| e.seat.clone()).map(Json),
@@ -291,6 +301,15 @@ impl DecisionRepository<'_> {
                 ],
             )
             .await?;
+        if written == 1 {
+            self.put_text(
+                decision_id,
+                &decision.source_uid,
+                source_fields,
+                &decision.texte_integral_clean,
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -431,6 +450,20 @@ impl DecisionRepository<'_> {
             )
             .await?;
         Ok(resolved)
+    }
+
+    /// `jurisdiction_type` of a live decision, by its public id.
+    #[tracing::instrument(name = "db.decision_jurisdiction_type", skip(self), fields(db.system = "postgresql"))]
+    pub async fn decision_jurisdiction_type(&self, public_id: &str) -> Result<Option<String>> {
+        let row = self
+            .conn
+            .query_opt(
+                "SELECT jurisdiction_type FROM decisions \
+                 WHERE public_id = $1 AND deleted_at IS NULL",
+                &[&public_id],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
     }
 
     #[tracing::instrument(name = "db.set_public_id", skip(self), fields(db.system = "postgresql"))]
@@ -821,6 +854,10 @@ impl DecisionRepository<'_> {
             .as_deref()
             .map(|n| vec![lj_core::case_names::case_name_key(n)]);
         let case_name_source = case_name.as_ref().map(|_| "source");
+        let lang = match text_lang(source_fields, "original_lang")? {
+            Some(l) => l,
+            None => text_lang(source_fields, "lang")?.unwrap_or("fr"),
+        };
         let row = self
             .conn
             .query_one(
@@ -829,18 +866,18 @@ impl DecisionRepository<'_> {
                   jurisdiction_type, public_id, updated_at,
                   date_lecture, date_audience, docket_numbers,
                   publication_codes, extract_version,
-                  full_text, embed_version, ecli, canonical_ref,
+                  embed_version, ecli, canonical_ref,
                   solution_uid, procedure_uid, office_uid, legal_domain_uid,
                   jurisdiction_code,
                   applicant_counsel_names, applicant_law_firms, applicant_companies,
                   defendant_counsel_names, defendant_law_firms, defendant_companies,
-                  intervenors, themes, chamber_key, formation_uid,
+                  intervenors, themes, formation_uid,
                   search_title, case_name, case_name_keys, case_name_source,
-                  seat, seat_paths
+                  seat, seat_paths, lang
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28,
-                        $29, $30, $31, $32, $33)
+                        $29, $30, $31, $32)
                 RETURNING id
                 ",
                 &[
@@ -852,7 +889,6 @@ impl DecisionRepository<'_> {
                     &e.map(|e| e.docket_numbers.clone()).unwrap_or_default(),
                     &e.map(|e| e.publication_codes.clone()).unwrap_or_default(),
                     &EXTRACT_VERSION,
-                    &decision.texte_integral_clean,
                     &embed_version,
                     &decision.ecli,
                     &canonical_ref,
@@ -871,7 +907,6 @@ impl DecisionRepository<'_> {
                     &e.map(|e| e.defendant_companies.clone()).unwrap_or_default(),
                     &e.map(|e| e.intervenors.clone()).unwrap_or_default(),
                     &e.map(|e| e.themes.clone()).unwrap_or_default(),
-                    &e.and_then(|e| e.chamber_key.clone()),
                     &e.and_then(|e| e.formation_uid.clone()),
                     &e.and_then(|e| e.search_title.clone()),
                     &case_name,
@@ -879,6 +914,7 @@ impl DecisionRepository<'_> {
                     &case_name_source,
                     &e.and_then(|e| e.seat.clone()).map(Json),
                     &e.map(|e| e.seat_paths.clone()).unwrap_or_default(),
+                    &lang,
                 ],
             )
             .await?;
@@ -901,6 +937,13 @@ impl DecisionRepository<'_> {
             source_fields,
         )
         .await?;
+        self.put_text(
+            decision_id,
+            &decision.source_uid,
+            source_fields,
+            &decision.texte_integral_clean,
+        )
+        .await?;
         Ok(decision_id)
     }
 
@@ -917,9 +960,9 @@ impl DecisionRepository<'_> {
         let rows = self
             .conn
             .query(
-                "SELECT id, full_text FROM decisions \
-                 WHERE id > $1 AND id % $2 = 0 AND full_text IS NOT NULL \
-                 ORDER BY id LIMIT $3",
+                "SELECT decision_id, full_text FROM decision_text \
+                 WHERE decision_id > $1 AND decision_id % $2 = 0 AND lead \
+                 ORDER BY decision_id LIMIT $3",
                 &[&after_id, &sample_mod, &limit],
             )
             .await?;
@@ -942,40 +985,13 @@ pub fn canonical_jurisdiction_code(
     if !matches!(jurisdiction_type, "TJ" | "TCOM") {
         return source_code.to_string();
     }
-    match city.map(slugify_city).filter(|s| !s.is_empty()) {
+    match city
+        .map(|c| lj_fold::slug(c, '_'))
+        .filter(|s| !s.is_empty())
+    {
         Some(slug) => format!("{}_{slug}", jurisdiction_type.to_lowercase()),
         None => source_code.to_string(),
     }
-}
-
-/// Slug ASCII d'un nom de ville — miroir exact de l'expression SQL de la
-/// migration 0137 (accents français pliés, toute séquence non alphanumérique
-/// réduite à un `_`, bornes nettoyées).
-fn slugify_city(city: &str) -> String {
-    let mut out = String::with_capacity(city.len());
-    for c in city.to_lowercase().chars() {
-        let folded = match c {
-            'à' | 'â' | 'ä' | 'á' => 'a',
-            'é' | 'è' | 'ê' | 'ë' => 'e',
-            'í' | 'î' | 'ï' => 'i',
-            'ó' | 'ô' | 'ö' => 'o',
-            'ú' | 'ù' | 'û' | 'ü' => 'u',
-            'ç' => 'c',
-            'ÿ' => 'y',
-            'ñ' => 'n',
-            'œ' => {
-                out.push('o');
-                'e'
-            }
-            c => c,
-        };
-        if folded.is_ascii_alphanumeric() {
-            out.push(folded);
-        } else if !out.is_empty() && !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    out.trim_end_matches('_').to_string()
 }
 
 #[cfg(test)]

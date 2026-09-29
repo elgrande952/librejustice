@@ -8,9 +8,15 @@
 //! - Token Revocation (RFC 7009) — `POST /oauth/revoke`
 //! - Authorization Server Metadata (RFC 8414) — `/.well-known/oauth-authorization-server`
 //! - Protected Resource Metadata (RFC 9728) — `/.well-known/oauth-protected-resource`
+//! - OpenID Connect Discovery : `/.well-known/openid-configuration`
+//! - UserInfo (OIDC Core §5.3) : `GET|POST /oauth/userinfo`
 //!
 //! Clients publics uniquement : pas de `client_secret`, la sécurité repose sur
 //! PKCE.
+//!
+//! The ES256 `id_token` and its JWKS only exist when a signing key is
+//! configured; without one the server issues no token and discovery advertises
+//! `none`, rather than promising a signature it cannot produce.
 
 use crate::auth::OptionalUser;
 use crate::error::{validation, ApiError, Result};
@@ -28,9 +34,12 @@ use serde_json::json;
 
 // ── DTOs ────────────────────────────────────────────────────────────────────
 
-/// Unique scope de la surface MCP : annoncé par la discovery, et rendu par le
-/// endpoint jeton (RFC 6749 §5.1).
-const SCOPE_MCP: &str = "mcp";
+/// An access token carries the same authority whatever the client asked for:
+/// the MCP tools, and the identity of the account that issued it. So the token
+/// endpoint returns these three and UserInfo serves any valid token, which is
+/// what spares a scope column on `mcp_auth_codes` and `mcp_tokens`. Every
+/// discovery document announces the same list, the resource one included.
+const SCOPES: [&str; 3] = ["mcp", "openid", "email"];
 
 /// RFC 7591 §2 — métadonnées client envoyées par Claude.ai / ChatGPT.
 #[derive(Debug, Deserialize)]
@@ -120,6 +129,8 @@ pub struct TokenResponse {
     pub expires_in: i64,
     pub refresh_token: String,
     pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
 }
 
 /// RFC 7009 §2.1 — corps de `POST /oauth/revoke`. Seul `token` est lu ;
@@ -133,7 +144,7 @@ pub struct RevokeForm {
 
 // ── Routeur OAuth (préfixe `/oauth`) ────────────────────────────────────────
 
-/// Routes `/oauth/{register,authorize,approve,token,revoke}`.
+/// Routes `/oauth/{register,authorize,approve,token,revoke,userinfo}`.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/oauth/register", post(register))
@@ -141,20 +152,10 @@ pub fn router() -> Router<AppState> {
         .route("/oauth/approve", post(approve))
         .route("/oauth/token", post(token))
         .route("/oauth/revoke", post(revoke))
+        .route("/oauth/userinfo", get(userinfo).post(userinfo))
         .layer(axum::middleware::from_fn(step_span))
 }
 
-/// Pose un span **et une ligne de log** par étape OAuth franchie.
-///
-/// Ni `client_id` ni jeton : l'étape se compte, elle ne se relie à personne.
-/// L'agent nomme le moteur, pas la personne, et c'est lui qui tranche la classe
-/// de panne où l'installation casse chez un visiteur et passe chez le suivant —
-/// le 15/08/2026, une CSP `form-action` coupait Chrome et laissait passer
-/// WebKit, invisible faute de cette colonne.
-///
-/// La ligne double le span parce que les deux ne se lisent pas au même endroit :
-/// le span part dans Tempo, où l'on fouille après coup, la ligne dans Loki, où
-/// les règles d'alerte savent compter.
 async fn step_span(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -183,21 +184,24 @@ async fn step_span(
         librejustice.oauth.agent = %agent,
     )
     .entered();
-    tracing::info!(agent = %agent, "étape oauth : {step} → {status}");
+    tracing::info!(agent = %agent, "oauth step: {step} -> {status}");
     response
 }
 
 /// Routes de discovery `/.well-known/*` (RFC 8414 + RFC 9728 + MCP 2025-03-26).
 ///
-/// Servies à la racine car publiées dans la discovery / consommées par les
-/// clients externes. Trois chemins servent le **même** document
-/// `oauth-protected-resource` : la forme RFC 9728 nue, la forme à composant de
-/// path (`/.well-known/…/mcp`) exigée par Claude.ai, et la forme préfixée par
-/// la ressource (`/mcp/.well-known/…`) que d'autres clients tentent d'abord.
+/// Each of the three documents answers all **three** path forms: the bare one,
+/// the path-component one (`/.well-known/…/mcp`) Claude.ai requires, and the
+/// resource-prefixed one (`/mcp/.well-known/…`) other clients try first. A
+/// scanner starting with the wrong form must not read a 404 as an absence.
 pub fn well_known_router() -> Router<AppState> {
     Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
+            get(oauth_as_metadata),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
             get(oauth_as_metadata),
         )
         .route(
@@ -216,6 +220,19 @@ pub fn well_known_router() -> Router<AppState> {
             "/mcp/.well-known/oauth-protected-resource",
             get(oauth_protected_resource_metadata),
         )
+        .route(
+            "/.well-known/openid-configuration",
+            get(openid_configuration),
+        )
+        .route(
+            "/.well-known/openid-configuration/mcp",
+            get(openid_configuration),
+        )
+        .route(
+            "/mcp/.well-known/openid-configuration",
+            get(openid_configuration),
+        )
+        .route("/.well-known/jwks.json", get(jwks))
         .route(
             "/.well-known/openai-apps-challenge",
             get(openai_apps_challenge),
@@ -383,6 +400,7 @@ async fn authorize(
 async fn approve(
     State(state): State<AppState>,
     OptionalUser(user): OptionalUser,
+    entetes: HeaderMap,
     Form(body): Form<ApproveForm>,
 ) -> Result<Response> {
     let missing = |f: &'static str| ApiError::Unprocessable(validation::missing(&["body", f]));
@@ -419,6 +437,13 @@ async fn approve(
         return Ok(Redirect::to(&format!("/login?next={next}")).into_response());
     };
 
+    crate::locale::retenir(
+        &state,
+        &user_id,
+        &crate::locale::du_navigateur(&entetes),
+        None,
+    )
+    .await?;
     let conn = pool_conn(&state).await?;
     let rejeu = conn
         .query_opt(
@@ -436,7 +461,7 @@ async fn approve(
         tracing::warn!(
             librejustice.oauth.rejeu = true,
             age_ms = (Utc::now() - emis).num_milliseconds(),
-            "consentement rejoué : même défi, le code déjà émis repart"
+            "consent replayed: same challenge, the already issued code goes out again"
         );
         return retour_client(&redirect_uri, ("code", &code), etat);
     }
@@ -562,7 +587,7 @@ async fn token_authorization_code(state: &AppState, body: TokenForm) -> Result<R
         .await
         .map_err(store_err)?;
 
-    let resp = issue_token_pair(&conn, &db_user_id, &db_client_id).await?;
+    let resp = issue_token_pair(state, &conn, &db_user_id, &db_client_id).await?;
     Ok(Json(resp).into_response())
 }
 
@@ -595,13 +620,14 @@ async fn token_refresh(state: &AppState, body: TokenForm) -> Result<Response> {
     let db_user_id: String = row.get(0);
     let db_client_id: String = row.get(1);
 
-    let resp = issue_token_pair(&conn, &db_user_id, &db_client_id).await?;
+    let resp = issue_token_pair(state, &conn, &db_user_id, &db_client_id).await?;
     Ok(Json(resp).into_response())
 }
 
 /// Émet et persiste une paire access token (30 j) + refresh token (90 j) pour un
 /// couple (utilisateur, client). Partagé par les deux grants.
 async fn issue_token_pair(
+    state: &AppState,
     conn: &deadpool_postgres::Object,
     user_id: &str,
     client_id: &str,
@@ -632,13 +658,45 @@ async fn issue_token_pair(
     )
     .await
     .map_err(store_err)?;
+    // Both token tables expire and are purged, so nothing else in the schema
+    // still knows that an account once connected.
+    conn.execute(
+        "UPDATE users SET mcp_connected_at = now() \
+         WHERE sub = $1 AND mcp_connected_at IS NULL",
+        &[&user_id],
+    )
+    .await
+    .map_err(store_err)?;
+
+    let id_token = match state.oidc_signer.as_deref() {
+        Some(signer) => {
+            let row = conn
+                .query_opt(
+                    "SELECT email, email_confirmed_at IS NOT NULL FROM users WHERE sub = $1",
+                    &[&user_id],
+                )
+                .await
+                .map_err(store_err)?;
+            let email: Option<String> = row.as_ref().and_then(|r| r.get(0));
+            let verified: bool = row.as_ref().is_some_and(|r| r.get(1));
+            signer.id_token(
+                &public_base(state),
+                user_id,
+                client_id,
+                email.as_deref(),
+                verified,
+            )
+        }
+        None => None,
+    };
 
     Ok(TokenResponse {
         access_token,
         token_type: "Bearer".to_string(),
         expires_in: 2_592_000, // 30 jours
         refresh_token,
-        scope: SCOPE_MCP.to_string(),
+        scope: SCOPES.join(" "),
+        id_token,
     })
 }
 
@@ -679,23 +737,123 @@ async fn revoke(State(state): State<AppState>, Form(body): Form<RevokeForm>) -> 
     Ok(StatusCode::OK.into_response())
 }
 
+/// RFC 8414 and OpenID Discovery serve the **same** document under two names.
+/// Measured on 09/09/2026: over a full day the OpenAI scanner read
+/// `oauth-authorization-server` 41 times and `openid-configuration` zero, so a
+/// provider that only carries its OIDC fields under the second name is, to that
+/// reader, not a provider at all. The union is legal on both paths.
 async fn oauth_as_metadata(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let base = public_base(&state);
-    Json(json!({
+    openid_configuration(State(state)).await
+}
+
+async fn openid_configuration(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(openid_configuration_doc(
+        &public_base(&state),
+        state.oidc_signer.is_some(),
+    ))
+}
+
+/// JWKS of the `id_token` signature. No key configured, no document: a `keys`
+/// array served empty would let a client believe a signature is verifiable.
+async fn jwks(State(state): State<AppState>) -> Response {
+    match state.oidc_signer.as_deref() {
+        Some(signer) => Json(signer.jwks()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The single discovery document, RFC 8414 and OpenID Discovery 1.0 at once:
+/// where to send the user, how to exchange codes, and who the user is.
+fn openid_configuration_doc(base: &str, signed: bool) -> serde_json::Value {
+    let mut doc = json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
+        "userinfo_endpoint": format!("{base}/oauth/userinfo"),
         "registration_endpoint": format!("{base}/oauth/register"),
         "revocation_endpoint": format!("{base}/oauth/revoke"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
-        // Annoncé explicitement : le défaut de la RFC 8414 en l'absence du champ est
-        // `client_secret_basic`, que nos clients publics ne peuvent pas produire.
+        // Announced: absent the field, the RFC 8414 default is
+        // `client_secret_basic`, which our public clients cannot produce.
         "revocation_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": [SCOPE_MCP],
-    }))
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["none"],
+        "scopes_supported": SCOPES,
+        "claims_supported": ["sub", "email", "email_verified"],
+    });
+    // The algorithm follows the key actually loaded, never the intention: a
+    // discovery promising ES256 with no JWKS behind it fails every validator.
+    if signed {
+        doc["id_token_signing_alg_values_supported"] = json!(["ES256"]);
+        doc["jwks_uri"] = json!(format!("{base}/.well-known/jwks.json"));
+    }
+    doc
+}
+
+/// OIDC Core §5.3. The bearer of an MCP access token reads the identity of the
+/// account that issued it. ChatGPT Enterprise workspaces need it to compare the
+/// email domain with the ones they have verified.
+async fn userinfo(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(token) = token else {
+        return userinfo_challenge("invalid_request");
+    };
+
+    let digest = sha256(token.as_bytes());
+    let digest: &[u8] = &digest;
+    let conn = match pool_conn(&state).await {
+        Ok(conn) => conn,
+        Err(e) => return e.into_response(),
+    };
+    let row = conn
+        .query_opt(
+            "SELECT u.sub, u.email, u.email_confirmed_at IS NOT NULL \
+             FROM mcp_tokens t JOIN users u ON u.sub = t.user_id \
+             WHERE t.access_token_sha256 = $1 AND t.expires_at > now()",
+            &[&digest],
+        )
+        .await;
+    let row = match row {
+        Ok(row) => row,
+        Err(e) => return store_err(e).into_response(),
+    };
+    let Some(row) = row else {
+        return userinfo_challenge("invalid_token");
+    };
+
+    let sub: String = row.get(0);
+    let email: Option<String> = row.get(1);
+    let verified: bool = row.get(2);
+    Json(userinfo_claims(&sub, email.as_deref(), verified)).into_response()
+}
+
+/// RFC 6750 §3: a refusal names its cause in the challenge, and the body stays
+/// empty.
+fn userinfo_challenge(error: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            format!("Bearer realm=\"mcp\", error=\"{error}\""),
+        )],
+    )
+        .into_response()
+}
+
+/// `sub` always, the address and its verified state only when the account
+/// carries one: OIDC requires `sub` alone, and a missing address is not an
+/// empty string.
+fn userinfo_claims(sub: &str, email: Option<&str>, verified: bool) -> serde_json::Value {
+    match email {
+        Some(email) => json!({ "sub": sub, "email": email, "email_verified": verified }),
+        None => json!({ "sub": sub }),
+    }
 }
 
 async fn oauth_protected_resource_metadata(
@@ -705,7 +863,7 @@ async fn oauth_protected_resource_metadata(
     Json(json!({
         "resource": format!("{base}/mcp"),
         "authorization_servers": [base],
-        "scopes_supported": [SCOPE_MCP],
+        "scopes_supported": SCOPES,
         "bearer_methods_supported": ["header"],
     }))
 }
@@ -779,7 +937,7 @@ pub(crate) async fn redirect_uri_allowed(
 // ── Crypto / encodage (sans dépendance externe) ─────────────────────────────
 
 /// Encode des octets en base64url **sans padding** (RFC 4648 §5).
-fn base64_url_no_pad(data: &[u8]) -> String {
+pub(crate) fn base64_url_no_pad(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
@@ -842,7 +1000,7 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes([
@@ -1060,6 +1218,75 @@ mod tests {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert_ne!(t, token_urlsafe(32));
+    }
+
+    #[test]
+    fn openid_configuration_porte_ce_qu_exige_la_restriction_de_domaine() {
+        let doc = openid_configuration_doc("https://librejustice.fr", true);
+        assert_eq!(doc["issuer"], "https://librejustice.fr");
+        assert_eq!(
+            doc["userinfo_endpoint"],
+            "https://librejustice.fr/oauth/userinfo"
+        );
+        for scope in ["mcp", "openid", "email"] {
+            assert!(
+                doc["scopes_supported"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s == scope),
+                "scope {scope} absent de la découverte"
+            );
+        }
+        for claim in ["sub", "email", "email_verified"] {
+            assert!(doc["claims_supported"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == claim));
+        }
+        assert_eq!(doc["code_challenge_methods_supported"][0], "S256");
+        assert_eq!(doc["subject_types_supported"][0], "public");
+        assert_eq!(doc["id_token_signing_alg_values_supported"][0], "ES256");
+        assert_eq!(
+            doc["jwks_uri"],
+            "https://librejustice.fr/.well-known/jwks.json"
+        );
+
+        // The same document is served under the RFC 8414 name, so nothing that
+        // one carried may have been lost in the merge.
+        for field in [
+            "registration_endpoint",
+            "revocation_endpoint",
+            "revocation_endpoint_auth_methods_supported",
+            "token_endpoint_auth_methods_supported",
+            "response_types_supported",
+            "grant_types_supported",
+        ] {
+            assert!(!doc[field].is_null(), "{field} absent du document unique");
+        }
+
+        let sans_cle = openid_configuration_doc("https://librejustice.fr", false);
+        assert_eq!(sans_cle["id_token_signing_alg_values_supported"][0], "none");
+        assert!(sans_cle["jwks_uri"].is_null());
+    }
+
+    #[test]
+    fn userinfo_rend_sub_seul_quand_le_compte_n_a_pas_d_adresse() {
+        assert_eq!(
+            userinfo_claims("u-1", Some("a@b.fr"), true),
+            json!({"sub": "u-1", "email": "a@b.fr", "email_verified": true})
+        );
+        assert_eq!(
+            userinfo_claims("u-1", Some("a@b.fr"), false),
+            json!({"sub": "u-1", "email": "a@b.fr", "email_verified": false})
+        );
+        assert_eq!(userinfo_claims("u-1", None, false), json!({"sub": "u-1"}));
+    }
+
+    #[test]
+    fn le_jeton_annonce_les_trois_scopes() {
+        assert_eq!(SCOPES.join(" "), "mcp openid email");
     }
 
     fn hex(bytes: &[u8]) -> String {

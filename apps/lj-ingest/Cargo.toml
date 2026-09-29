@@ -10,29 +10,38 @@ path = "src/main.rs"
 
 # CLI ingest (clap). Settings prefix LIBREJUSTICE_. Pipelines offline.
 [dependencies]
+lj-annonces = { workspace = true }
+lj-chunk = { workspace = true }
 lj-core = { workspace = true }
+lj-parse = { workspace = true }
+lj-norm = { workspace = true }
+lj-versions = { workspace = true }
 lj-dtos = { workspace = true }
+lj-fold = { workspace = true }
+lj-vocab = { workspace = true }
 lj-extract = { workspace = true }
+lj-quantum = { workspace = true }
+lj-extract-rows = { workspace = true }
 lj-store = { workspace = true }
 lj-sources = { workspace = true }
+lj-sources-annonces = { workspace = true }
 lj-llm = { workspace = true }
+lj-summary = { workspace = true }
+lj-suggest = { workspace = true }
 lj-telemetry = { workspace = true }
-tokenizers = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# sonic-rs : parse JSON SIMD sur le hot-path ingest (Judilibre). serde_json ailleurs.
-sonic-rs = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-tracing = { workspace = true }
 rayon = { workspace = true }
-fst = { workspace = true }
 futures = { workspace = true }
 flate2 = { workspace = true }
 csv = { workspace = true }
 xxhash-rust = { workspace = true }
+regex = { workspace = true }
 chrono = { workspace = true }
 # Jour courant en Europe/Paris pour la moisson d'annonces.
 jiff = { workspace = true }
@@ -43,3 +52,4 @@ tracing-subscriber = { workspace = true }
 # OTLP et le subscriber sont dans lj-telemetry.
 opentelemetry = { workspace = true }
 deadpool-postgres = { workspace = true }
+lj-workspace-hack = { version = "0.1", path = "../../packages/lj-workspace-hack" }

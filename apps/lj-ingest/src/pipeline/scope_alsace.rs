@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{anyhow, Result};
 
-use lj_core::compteurs::{parse_compteur, self_scope, SelfGrain};
+use lj_norm::compteurs::{parse_compteur, self_scope, SelfGrain};
 use lj_store::repository::{ArticleScopeRow, DecisionRepository};
 
 use crate::config::Settings;
@@ -253,9 +253,9 @@ pub async fn scope_backfill_alsace(apply: bool) -> Result<()> {
         let (deleted, inserted) = repo
             .replace_article_scopes(&format!("alsace:{SCOPE} "), &rows)
             .await?;
-        println!("article_scope : {deleted} supprimées, {inserted} insérées");
+        println!("article_scope: {deleted} deleted, {inserted} inserted");
     } else {
-        println!("dry-run — relancer avec --apply pour écrire");
+        println!("dry-run, re-run with --apply to write");
     }
     Ok(())
 }

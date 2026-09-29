@@ -31,7 +31,7 @@ pub async fn resync_arrays() -> Result<()> {
     let repo = DecisionRepository::new(&conn);
 
     let Some((lo, hi)) = repo.decision_id_bounds().await? else {
-        println!("resync-legal-arrays : aucune décision.");
+        println!("resync-legal-arrays: no decision.");
         return Ok(());
     };
     let (mut drift_decisions, mut drift_chunks) = (0i64, 0i64);
@@ -70,6 +70,6 @@ pub async fn resync_arrays() -> Result<()> {
     // décisions citantes (plan des pages citantes + IDF co-citations) se recomptent
     // dans la même passe hebdomadaire.
     let terms = repo.rebuild_citing_decision_counts().await?;
-    println!("citing_decision_counts : {terms} terme(s) upserté(s).");
+    println!("citing_decision_counts: {terms} term(s) upserted.");
     Ok(())
 }

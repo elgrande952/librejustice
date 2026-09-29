@@ -26,7 +26,7 @@ pub(super) fn from_location(decision: &Decision, header: Option<&str>) -> Option
     if let Some(loc) = &decision.jurisdiction_location {
         if let Some(name) = location_to_name(loc) {
             let tae = header.is_some_and(|b| {
-                crate::compiled::fold_stable(b).contains("tribunal des activites economiques")
+                lj_fold::fold_chars(b).contains("tribunal des activites economiques")
             });
             if name.starts_with("Tribunal de commerce") && tae {
                 return Some(name.replacen(

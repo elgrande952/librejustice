@@ -1,10 +1,10 @@
-//! Sonde inversée des pendants : à l'arrivée (ou réécriture des dockets) d'un
-//! lot de décisions CIBLES, générer les clés candidates
-//! (`lj_extract::identity::pending_target_keys`, inverse des reformatages des
-//! SQL de famille) et attirer les citations/liens pendants qui les visaient —
-//! le sens que la résolution at-write côté source ne couvre pas (la décision
-//! citée qui arrive après ses citantes). Une clé manquée reste pendante,
-//! rattrapée par `reconcile`.
+//! Reverse probe of the pending rows: when a batch of TARGET decisions
+//! arrives (or has its dockets rewritten), probe the pending addresses with
+//! the numbers those decisions carry
+//! (`lj_extract::identity::pending_target_dockets`) and attract the citations
+//! and links that aimed at them, the direction the at-write resolution on the
+//! source side does not cover (a cited decision arriving after the ones that
+//! cite it). A missed address stays pending, caught up by `reconcile`.
 
 use anyhow::Result;
 use lj_store::repository::DecisionRepository;
@@ -16,22 +16,21 @@ pub(super) async fn attract_pending_for(repo: &DecisionRepository<'_>, ids: &[i6
     if ids.is_empty() {
         return Ok(0);
     }
-    let mut keys = Vec::new();
-    let mut refs = Vec::new();
-    for (jt, code, dockets, canonical_ref) in repo.decision_target_identities(ids).await? {
-        keys.extend(lj_extract::identity::pending_target_keys(
-            &jt,
+    let mut dockets = Vec::new();
+    for (code, numeros) in repo.decision_target_identities(ids).await? {
+        dockets.extend(lj_extract::identity::pending_target_dockets(
             code.as_deref(),
-            &dockets,
+            &numeros,
         ));
-        refs.extend(canonical_ref);
     }
-    let resolved = repo.attract_pending_citations(&keys, &refs).await?;
+    dockets.sort();
+    dockets.dedup();
+    let resolved = repo.attract_pending_citations(&dockets).await?;
     if resolved > 0 {
         tracing::info!(
             resolved,
             targets = ids.len(),
-            "sonde inversée : pendants attirés"
+            "reverse probe: pendings attracted"
         );
     }
     Ok(resolved)

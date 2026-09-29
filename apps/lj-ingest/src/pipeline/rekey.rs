@@ -1,5 +1,5 @@
 //! Rebasage one-shot des clés d'article vers la clé publique slug
-//! (`lj_core::article_key`) : mapping Rust, fusion des doublons PK, rebasage
+//! (`lj_norm::article_key`) : mapping Rust, fusion des doublons PK, rebasage
 //! colonne par colonne, dédup TOC, resync des composites décision/chunks depuis
 //! `legal_citation`. Idempotent : `article_key` est un point fixe.
 
@@ -22,10 +22,10 @@ const KEY_COLUMNS: [(&str, &str); 10] = [
     ("text_case_citation", "owner_num_key"),
 ];
 
-/// Retire l'astérisque Légifrance des clés d'article en base, colonnes
-/// porteuses et blobs de citation compris ; la clé cible vient de
-/// `lj_core::article_key`. **Dry-run par défaut** : sans `--applique`, la passe
-/// rend son plan de fusion sans rien écrire. Idempotent.
+/// Strips the Légifrance asterisk from the article keys in the database,
+/// carrying columns and citation blobs included; the target key comes from
+/// `lj_norm::article_key`. **Dry run by default**: without `--applique`, the
+/// pass returns its merge plan and writes nothing. Idempotent.
 pub async fn destar_article_keys(applique: bool) -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -41,7 +41,7 @@ pub async fn destar_article_keys(applique: bool) -> Result<()> {
         .await?
         .into_iter()
         .filter_map(|old| {
-            let new = lj_core::article_key::article_key(&old);
+            let new = lj_norm::article_key::article_key(&old);
             (new != old).then_some((old, new))
         })
         .collect();
@@ -49,19 +49,19 @@ pub async fn destar_article_keys(applique: bool) -> Result<()> {
         anyhow::bail!("la clé `{old}` ne laisse rien une fois désétoilée");
     }
     if pairs.is_empty() {
-        println!("destar : aucune clé étoilée en base.");
+        println!("destar: no starred key in the database.");
         return Ok(());
     }
     repo.create_rekey_map(&pairs).await?;
-    println!("destar : {} clés à désétoiler.", pairs.len());
+    println!("destar: {} keys to unstar.", pairs.len());
     for (table, column) in KEY_COLUMNS {
         let n = repo.count_rekey_column(table, column).await?;
         if n > 0 {
-            println!("  {table}.{column} : {n} lignes");
+            println!("  {table}.{column}: {n} rows");
         }
     }
     println!(
-        "  legal_citation.spans : {} décisions",
+        "  legal_citation.spans: {} decisions",
         repo.count_rekey_citation_spans().await?
     );
 
@@ -79,12 +79,12 @@ pub async fn destar_article_keys(applique: bool) -> Result<()> {
             c.date_debut,
             c.date_fin.as_deref().unwrap_or("ouvert"),
             c.status,
-            if perdante { "SUPPRIMÉE" } else { "gardée" }
+            if perdante { "DELETED" } else { "kept" }
         );
     }
 
     if !applique {
-        println!("destar : dry-run, rien écrit. `--applique` pour exécuter.");
+        println!("destar: dry-run, nothing written. `--applique` to run it.");
         return Ok(());
     }
 
@@ -93,17 +93,17 @@ pub async fn destar_article_keys(applique: bool) -> Result<()> {
         .map_err(|e| anyhow!("begin: {e}"))?;
     let ecriture = async {
         for (table, n) in repo.drop_article_versions(&losers).await? {
-            tracing::info!(table, lignes = n, "lignes de la version perdante");
+            tracing::info!(table, lignes = n, "rows of the losing version");
         }
         let ranks = repo.invalidate_rekeyed_reading_ranks().await?;
         for (table, column) in KEY_COLUMNS {
             let n = repo.rekey_column(table, column).await?;
-            tracing::info!(table, column, lignes = n, "colonne désétoilée");
+            tracing::info!(table, column, lignes = n, "column unstarred");
         }
         let decisions = repo.rekey_citation_spans().await?;
-        tracing::info!(decisions, "spans de citation désétoilés");
+        tracing::info!(decisions, "citation spans unstarred");
         let toc = repo.rekey_dedup_toc_edges().await?;
-        tracing::info!(toc, ranks, "arêtes TOC dédupliquées, ordres salis");
+        tracing::info!(toc, ranks, "TOC edges deduplicated, orders dirtied");
         Ok::<u64, anyhow::Error>(decisions)
     }
     .await;
@@ -121,7 +121,7 @@ pub async fn destar_article_keys(applique: bool) -> Result<()> {
     };
 
     let (textes, _) = repo.refresh_reading_ranks().await?;
-    tracing::info!(textes, "ordres de lecture recalculés");
+    tracing::info!(textes, "reading orders recomputed");
 
     let Some((_, max_id)) = repo.decision_id_bounds().await? else {
         return Ok(());
@@ -195,12 +195,12 @@ fn versions_a_supprimer(conflicts: &[StarConflict]) -> Result<Vec<(String, Strin
     Ok(losers)
 }
 
-/// Rebasage one-shot des `num_key` vers la clé d'IDENTITÉ :
-/// `legal_article.num_key` (+ `legal_link.owner_num_key` qui la suit) et
-/// `legal_toc_edge.child_num_key`, recalculés depuis le `num`/`label` source
-/// par `lj_core::article_key::identity_key`. Une ligne dont la cible PK est
-/// déjà occupée est sautée et loggée — elle garde son ancienne clé.
-/// Idempotent : `identity_key` est un point fixe.
+/// One-shot rebase of the `num_key`s onto the IDENTITY key:
+/// `legal_article.num_key` (+ `legal_link.owner_num_key`, which follows it) and
+/// `legal_toc_edge.child_num_key`, recomputed from the source `num`/`label` by
+/// `lj_norm::article_key::identity_key`. A row whose target PK is already taken
+/// is skipped and logged, and keeps its old key.
+/// Idempotent: `identity_key` is a fixed point.
 pub async fn rekey_identity_keys() -> Result<()> {
     let settings = Settings::from_env()?;
     let pool =
@@ -224,7 +224,7 @@ pub async fn rekey_identity_keys() -> Result<()> {
         let mut targets = std::collections::HashSet::new();
         let (mut rows, mut new_keys) = (Vec::new(), Vec::new());
         for row in page {
-            let new_key = lj_core::article_key::identity_key(&row.2);
+            let new_key = lj_norm::article_key::identity_key(&row.2);
             if new_key == row.3 {
                 continue;
             }
@@ -236,7 +236,7 @@ pub async fn rekey_identity_keys() -> Result<()> {
                 tracing::warn!(
                     id = row.0,
                     num = %row.2,
-                    "doublon de cible dans le lot — clé conservée"
+                    "duplicate target in the batch, key kept"
                 );
             }
         }
@@ -252,7 +252,7 @@ pub async fn rekey_identity_keys() -> Result<()> {
                 updated,
                 skipped,
                 links,
-                "rekey identité (articles)"
+                "identity rekey (articles)"
             );
         }
     }
@@ -261,7 +261,7 @@ pub async fn rekey_identity_keys() -> Result<()> {
         updated,
         skipped,
         links,
-        "rekey identité : articles terminés"
+        "identity rekey: articles done"
     );
 
     let (mut toc_scanned, mut toc_updated) = (0u64, 0u64);
@@ -275,7 +275,7 @@ pub async fn rekey_identity_keys() -> Result<()> {
         toc_scanned += page.len() as u64;
         let (mut owners, mut seqs, mut keys) = (Vec::new(), Vec::new(), Vec::new());
         for (owner, seq, label, old_key) in &page {
-            let new_key = lj_core::article_key::identity_key(label);
+            let new_key = lj_norm::article_key::identity_key(label);
             if new_key != *old_key {
                 owners.push(owner.as_str());
                 seqs.push(*seq);
@@ -286,11 +286,7 @@ pub async fn rekey_identity_keys() -> Result<()> {
             toc_updated += repo.apply_toc_identity_keys(&owners, &seqs, &keys).await?;
         }
     }
-    tracing::info!(
-        toc_scanned,
-        toc_updated,
-        "rekey identité : arêtes TOC terminées"
-    );
+    tracing::info!(toc_scanned, toc_updated, "identity rekey: TOC edges done");
     println!(
         "rekey-identity : {updated} articles rebasés ({skipped} sautés, {links} liens suivis), \
          {toc_updated} arêtes TOC."
@@ -312,19 +308,19 @@ pub async fn rekey_article_keys() -> Result<()> {
     let pairs: Vec<(String, String)> = keys
         .into_iter()
         .filter_map(|old| {
-            let new = lj_core::article_key::article_key(&old);
+            let new = lj_norm::article_key::article_key(&old);
             (new != old).then_some((old, new))
         })
         .collect();
-    tracing::info!(a_rebaser = pairs.len(), "mapping des clés d'article");
+    tracing::info!(a_rebaser = pairs.len(), "article key mapping");
     if pairs.is_empty() {
-        tracing::info!("clés déjà en alphabet public — rien à faire");
+        tracing::info!("keys already in the public alphabet, nothing to do");
         return Ok(());
     }
     repo.create_rekey_map(&pairs).await?;
 
     let (articles_fusionnes, liens_fusionnes) = repo.rekey_merge_duplicate_articles().await?;
-    tracing::info!(articles_fusionnes, liens_fusionnes, "doublons PK fusionnés");
+    tracing::info!(articles_fusionnes, liens_fusionnes, "PK duplicates merged");
 
     for (table, column) in [
         ("legal_article", "num_key"),
@@ -334,13 +330,13 @@ pub async fn rekey_article_keys() -> Result<()> {
         ("text_case_citation", "owner_num_key"),
     ] {
         let n = repo.rekey_column(table, column).await?;
-        tracing::info!(table, column, lignes = n, "colonne rebasée");
+        tracing::info!(table, column, lignes = n, "column rebased");
     }
     let n = repo.rekey_citation_spans().await?;
-    tracing::info!(decisions = n, "spans legal_citation rebasés");
+    tracing::info!(decisions = n, "legal_citation spans rebased");
 
     let toc_dedup = repo.rekey_dedup_toc_edges().await?;
-    tracing::info!(toc_dedup, "arêtes TOC dédupliquées");
+    tracing::info!(toc_dedup, "TOC edges deduplicated");
 
     let Some((_, max_id)) = repo.decision_id_bounds().await? else {
         return Ok(());
@@ -357,7 +353,7 @@ pub async fn rekey_article_keys() -> Result<()> {
             tracing::info!(lo, max_id, d_total, c_total, "resync composites");
         }
     }
-    tracing::info!(d_total, c_total, "composites resynchronisés");
+    tracing::info!(d_total, c_total, "composites resynchronised");
     Ok(())
 }
 

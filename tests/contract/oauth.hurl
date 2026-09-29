@@ -34,8 +34,90 @@ jsonpath "$.code_challenge_methods_supported" count == 1
 jsonpath "$.code_challenge_methods_supported[0]" == "S256"
 jsonpath "$.token_endpoint_auth_methods_supported" count == 1
 jsonpath "$.token_endpoint_auth_methods_supported[0]" == "none"
-jsonpath "$.scopes_supported" count == 1
+jsonpath "$.scopes_supported" count == 3
 jsonpath "$.scopes_supported[0]" == "mcp"
+jsonpath "$.scopes_supported[1]" == "openid"
+jsonpath "$.scopes_supported[2]" == "email"
+jsonpath "$.userinfo_endpoint" endsWith "/oauth/userinfo"
+# The RFC 8414 name serves the OIDC document itself, whole: the OpenAI scanner
+# reads this path and never `openid-configuration`, so the OIDC fields have to
+# be here or they are nowhere for it.
+jsonpath "$.subject_types_supported[0]" == "public"
+jsonpath "$.id_token_signing_alg_values_supported[0]" == "ES256"
+jsonpath "$.jwks_uri" endsWith "/.well-known/jwks.json"
+jsonpath "$.claims_supported" includes "email_verified"
+
+GET {{base}}/.well-known/oauth-authorization-server/mcp
+HTTP 200
+[Asserts]
+jsonpath "$.userinfo_endpoint" endsWith "/oauth/userinfo"
+jsonpath "$.jwks_uri" endsWith "/.well-known/jwks.json"
+
+# -----------------------------------------------------------------------------
+# 1bis. OpenID Connect Discovery. What a ChatGPT Enterprise workspace domain
+#       restriction requires: the document, the scopes, and UserInfo.
+# -----------------------------------------------------------------------------
+GET {{base}}/.well-known/openid-configuration
+HTTP 200
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.issuer" isString
+jsonpath "$.authorization_endpoint" endsWith "/oauth/authorize"
+jsonpath "$.token_endpoint" endsWith "/oauth/token"
+jsonpath "$.userinfo_endpoint" endsWith "/oauth/userinfo"
+jsonpath "$.registration_endpoint" endsWith "/oauth/register"
+jsonpath "$.scopes_supported" count == 3
+jsonpath "$.scopes_supported[1]" == "openid"
+jsonpath "$.scopes_supported[2]" == "email"
+jsonpath "$.claims_supported" includes "email"
+jsonpath "$.claims_supported" includes "email_verified"
+jsonpath "$.subject_types_supported[0]" == "public"
+jsonpath "$.id_token_signing_alg_values_supported[0]" == "ES256"
+jsonpath "$.jwks_uri" endsWith "/.well-known/jwks.json"
+jsonpath "$.code_challenge_methods_supported[0]" == "S256"
+
+# A scanner trying the resource-prefixed shape first reads the same document,
+# never a 404.
+GET {{base}}/mcp/.well-known/openid-configuration
+HTTP 200
+[Asserts]
+jsonpath "$.userinfo_endpoint" endsWith "/oauth/userinfo"
+jsonpath "$.jwks_uri" endsWith "/.well-known/jwks.json"
+
+GET {{base}}/.well-known/openid-configuration/mcp
+HTTP 200
+[Asserts]
+jsonpath "$.userinfo_endpoint" endsWith "/oauth/userinfo"
+
+# JWKS: one signing key, public material only.
+GET {{base}}/.well-known/jwks.json
+HTTP 200
+[Asserts]
+header "Content-Type" contains "application/json"
+jsonpath "$.keys" count == 1
+jsonpath "$.keys[0].kty" == "EC"
+jsonpath "$.keys[0].crv" == "P-256"
+jsonpath "$.keys[0].alg" == "ES256"
+jsonpath "$.keys[0].use" == "sig"
+jsonpath "$.keys[0].kid" isString
+jsonpath "$.keys[0].x" isString
+jsonpath "$.keys[0].y" isString
+jsonpath "$.keys[0].d" not exists
+
+# -----------------------------------------------------------------------------
+# 1ter. UserInfo with no usable token: 401, cause in the challenge (RFC 6750 §3).
+# -----------------------------------------------------------------------------
+GET {{base}}/oauth/userinfo
+HTTP 401
+[Asserts]
+header "WWW-Authenticate" contains "Bearer"
+header "WWW-Authenticate" contains "error=\"invalid_request\""
+
+GET {{base}}/oauth/userinfo
+Authorization: Bearer no-such-token
+HTTP 401
+[Asserts]
+header "WWW-Authenticate" contains "error=\"invalid_token\""
 
 # -----------------------------------------------------------------------------
 # 2. Protected Resource metadata (RFC 9728) — root path
@@ -49,8 +131,12 @@ jsonpath "$.resource" endsWith "/mcp"
 jsonpath "$.authorization_servers" isCollection
 jsonpath "$.authorization_servers" count == 1
 jsonpath "$.authorization_servers[0]" isString
-jsonpath "$.scopes_supported" count == 1
+# The three scopes here too: this is the document ChatGPT reads most often, and
+# a resource that lists `mcp` alone reads as a provider without identity.
+jsonpath "$.scopes_supported" count == 3
 jsonpath "$.scopes_supported[0]" == "mcp"
+jsonpath "$.scopes_supported[1]" == "openid"
+jsonpath "$.scopes_supported[2]" == "email"
 jsonpath "$.bearer_methods_supported" count == 1
 jsonpath "$.bearer_methods_supported[0]" == "header"
 

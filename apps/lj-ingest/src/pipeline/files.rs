@@ -1,6 +1,5 @@
-//! Helpers I/O fichiers : listing récursif par extension, lecture `.jsonl.gz`.
+//! Helpers I/O fichiers : listing récursif par extension.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -78,53 +77,4 @@ fn collect_jsonl_gz_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
         }
     }
     Ok(())
-}
-
-/// Lit toutes les lignes (sans `\n`) d'un `.jsonl.gz`.
-pub(super) fn read_jsonl_gz_lines(path: &Path) -> Result<Vec<Vec<u8>>> {
-    let file = std::fs::File::open(path)?;
-    let mut decoder = flate2::read::MultiGzDecoder::new(file);
-    let mut content = Vec::new();
-    decoder.read_to_end(&mut content)?;
-    Ok(split_jsonl_lines(&content))
-}
-
-/// Découpe un contenu JSONL en lignes trimées, **sans la pseudo-ligne vide**
-/// induite par le `\n` final : `ingested_lines` reste ainsi un offset de resume
-/// stable sur un fichier append-only.
-fn split_jsonl_lines(content: &[u8]) -> Vec<Vec<u8>> {
-    let content = content.strip_suffix(b"\n").unwrap_or(content);
-    if content.is_empty() {
-        return Vec::new();
-    }
-    content
-        .split(|&b| b == b'\n')
-        .map(|line| {
-            let start = line.iter().position(|b| !b.is_ascii_whitespace());
-            match start {
-                None => Vec::new(),
-                Some(s) => {
-                    let end = line.iter().rposition(|b| !b.is_ascii_whitespace()).unwrap();
-                    line[s..=end].to_vec()
-                }
-            }
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_jsonl_lines_count_is_append_stable() {
-        assert_eq!(split_jsonl_lines(b"").len(), 0);
-        assert_eq!(split_jsonl_lines(b"a\nb\n").len(), 2);
-        assert_eq!(split_jsonl_lines(b"a\nb").len(), 2);
-        let after_append = split_jsonl_lines(b"a\nb\nc\n");
-        assert_eq!(after_append.len(), 3);
-        assert_eq!(after_append[2], b"c");
-        assert_eq!(split_jsonl_lines(b"a\n  \nb\n").len(), 3);
-        assert_eq!(split_jsonl_lines(b"a\n  \nb\n")[1], b"");
-    }
 }

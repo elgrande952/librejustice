@@ -1,4 +1,5 @@
-//! Page `/texte/{code}/{num}[/{date}]` (LawArticlePage, SEO-critique).
+//! Page `/norm/{juris}/{code}/{num}[/{date}]` (LawArticlePage, SEO-critique), et
+//! l'aiguillage des segments qui suivent le slug d'un texte (NormNodePage).
 //!
 //! - Article (en-tête, méta, corps, timeline) : `Resource::new_blocking` ⇒ le SSR
 //!   attend la résolution avant d'émettre le HTML (`<Title>`/`<Meta>`/JSON-LD
@@ -18,8 +19,9 @@ use leptos::prelude::*;
 use leptos_meta::{Link, Meta, Script, Title};
 use leptos_router::components::A;
 use lj_dtos::{
-    ArticleModification, ArticleNeighbor, CoCitedArticle, LawArticleResponse, LawArticleVersion,
-    LinkedTextRef, ModificationItem,
+    Applicability, ApplicabilityStatus, ArticleModification, ArticleNeighbor, CoCitedArticle,
+    LawArticleResponse, LawArticleVersion, LinkedTextRef, ModificationItem, PlaceGroup, PlaceNode,
+    PlaceRef, ReadablePlace, StateElsewhere, UndeterminedReason, DEFAULT_READER_PLACE,
 };
 
 use actions::ArticleActions;
@@ -28,17 +30,49 @@ use cited_by::CitedBySection;
 use crate::components::decision::DecisionLayout;
 use crate::components::own_page_description;
 use crate::components::search::compact_search::highlight::CitedBlock;
-use crate::components::ui::ProvenanceBlock;
+use crate::components::ui::{GroupedSelect, ProvenanceBlock, SelectGroup, SelectOption};
 use crate::helpers::{format_article_num, format_iso_date};
 use crate::seo::law::{article_canonical_url, article_meta_description, build_article_json_ld};
 use crate::seo::OG_IMAGE;
 
+use crate::pages::law_compare_page::LawComparePage;
+use crate::pages::law_section_page::{LawSectionLoaded, LawSectionPage};
 use data::{
-    article_key, fetch_article, fetch_citing, fetch_related, sendable, CitingResult, PageError,
-    RelatedResult,
+    article_key, chrono_date, fetch_article, fetch_article_or_section, fetch_citing, fetch_related,
+    fetch_section_citing, reader_place, reader_suffix, sendable, ArticleKey, ArticleOrSection,
+    CitingResult, NormNode, PageError, RelatedResult,
 };
 
 const RELATED_LIMIT: usize = 5;
+
+/// `/norm/{juris}/{code}/{*rest}`: the page the segments after the slug name.
+#[component]
+pub fn NormNodePage() -> impl IntoView {
+    let node = data::norm_node();
+    let kind = Memo::new(move |_| NodeKind::of(&node.get()));
+    move || match kind.get() {
+        NodeKind::Article => view! { <LawArticlePage /> }.into_any(),
+        NodeKind::Compare => view! { <LawComparePage /> }.into_any(),
+        NodeKind::Section => view! { <LawSectionPage /> }.into_any(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeKind {
+    Article,
+    Compare,
+    Section,
+}
+
+impl NodeKind {
+    fn of(node: &NormNode) -> Self {
+        match node {
+            NormNode::Article { .. } => NodeKind::Article,
+            NormNode::Compare { .. } => NodeKind::Compare,
+            NormNode::Section(_) => NodeKind::Section,
+        }
+    }
+}
 
 #[component]
 pub fn LawArticlePage() -> impl IntoView {
@@ -46,38 +80,68 @@ pub fn LawArticlePage() -> impl IntoView {
 
     let key = article_key();
 
-    let article = Resource::new_blocking(move || key.get(), |key| sendable(fetch_article(key)));
+    let section_date = chrono_date();
+    let node = Resource::new_blocking(
+        move || (key.get(), section_date.get()),
+        |(key, date)| sendable(fetch_article_or_section(key, date)),
+    );
+    // Awaits the node, so an article page never asks for a section's citing decisions.
+    let section_citing = Resource::new(
+        move || (key.get(), section_date.get()),
+        move |(key, date)| {
+            sendable(async move {
+                match node.await {
+                    Ok(ArticleOrSection::Section(_)) => {
+                        fetch_section_citing(key.juris, key.code, key.num, date).await
+                    }
+                    _ => CitingResult {
+                        hits: Vec::new(),
+                        error: None,
+                    },
+                }
+            })
+        },
+    );
     // Décisions citantes bornées à la fenêtre de validité de la version servie
     // (clé = code + num + date).
     let citing = Resource::new(
         move || {
             let k = key.get();
-            (k.code, k.num, k.date)
+            (k.juris, k.code, k.num, k.date, k.place)
         },
-        |(code, num, date)| sendable(fetch_citing(code, num, date)),
+        |(juris, code, num, date, place)| sendable(fetch_citing(juris, code, num, date, place)),
     );
     // Articles co-cités (« souvent cité avec ») — indépendants de la version
     // servie (co-citation au grain `num_key`).
     let related = Resource::new(
         move || {
             let k = key.get();
-            (k.code, k.num)
+            (k.juris, k.code, k.num)
         },
-        |(code, num)| sendable(fetch_related(code, num)),
+        |(juris, code, num)| sendable(fetch_related(juris, code, num)),
     );
 
     view! {
         <Suspense fallback=LawSkeleton>
             {move || Suspend::new(async move {
-                match article.await {
-                    Ok(article) => {
+                match node.await {
+                    Ok(ArticleOrSection::Article(article)) => {
                         // L'API résout par clé d'identité : le slug renommé et la
                         // forme non canonique du numéro rendent le même article,
                         // sous une seule URL indexable.
                         let k = key.get_untracked();
-                        if k.code != article.code || k.num != article.num_key {
+                        let segment = lj_vocab::url_segment(&article.jurisdiction);
+                        if k.code != article.code || k.num != article.num_key
+                            || k.juris != segment
+                        {
                             redirection_permanente(
-                                &article_url(&article.code, &article.num_key, k.date.as_deref()),
+                                &article_url(
+                                    &article.jurisdiction,
+                                    &article.code,
+                                    &article.num_key,
+                                    k.date.as_deref(),
+                                    k.place.as_deref(),
+                                ),
                             );
                         }
                         set_cache_control(200);
@@ -85,9 +149,43 @@ pub fn LawArticlePage() -> impl IntoView {
                             view! { <LawArticleLoaded article=article citing=citing related=related /> },
                         )
                     }
+                    Ok(ArticleOrSection::Section(section)) => {
+                        set_cache_control(200);
+                        Either::Right(Either::Left(
+                            view! {
+                                <LawSectionLoaded
+                                    section=section
+                                    citing=section_citing
+                                    date=section_date.get()
+                                />
+                            },
+                        ))
+                    }
                     Err(err) => {
                         set_cache_control(err.status);
-                        Either::Right(view! { <LawError err=err /> })
+                        let k = key.get_untracked();
+                        // Why a dated read finds nothing is in the timeline the
+                        // undated read carries: one extra fetch, on the 404 leg only.
+                        let frise = if err.status == 404 && k.date.is_some() {
+                            sendable(fetch_article(ArticleKey { date: None, ..k.clone() }))
+                                .await
+                                .ok()
+                        } else {
+                            None
+                        };
+                        Either::Right(Either::Right(
+                            view! {
+                                <LawError
+                                    err=err
+                                    juris=k.juris
+                                    code=k.code
+                                    num=k.num
+                                    date=k.date
+                                    place=k.place
+                                    frise=frise
+                                />
+                            },
+                        ))
                     }
                 }
             })}
@@ -96,11 +194,19 @@ pub fn LawArticlePage() -> impl IntoView {
 }
 
 /// URL d'article, `num` et date de la route préservés — seul le slug bouge.
-fn article_url(code: &str, num: &str, date: Option<&str>) -> String {
-    match date {
-        Some(d) => format!("/texte/{code}/{num}/{d}"),
-        None => format!("/texte/{code}/{num}"),
-    }
+fn article_url(
+    juris: &str,
+    code: &str,
+    num: &str,
+    date: Option<&str>,
+    place: Option<&str>,
+) -> String {
+    let text = lj_vocab::norm_path(juris, code);
+    let path = match date {
+        Some(d) => format!("{text}/{num}/{d}"),
+        None => format!("{text}/{num}"),
+    };
+    format!("{path}{}", reader_suffix(place))
 }
 
 /// Pose un 301 vers l'URL canonique : un slug retiré par un renommage lègue son
@@ -145,14 +251,46 @@ pub(crate) fn set_cache_control(status: u16) {
 pub(crate) fn set_cache_control(_status: u16) {}
 
 /// Page d'erreur (référence invalide / 404 / autre). Pose `robots noindex`.
+///
+/// A dated read that finds nothing has found the article and missed the version,
+/// and 26 % of the dated reads served on 08/09/2026 landed here: « article
+/// introuvable » sends the reader away from a page that exists.
 #[component]
-fn LawError(err: PageError) -> impl IntoView {
+fn LawError(
+    err: PageError,
+    juris: String,
+    code: String,
+    num: String,
+    date: Option<String>,
+    place: Option<String>,
+    frise: Option<LawArticleResponse>,
+) -> impl IntoView {
+    let suffix = reader_suffix(place.as_deref());
+    let text = lj_vocab::norm_path(&juris, &code);
     let eyebrow = if err.status == 404 {
         "Introuvable"
     } else {
         "Erreur"
     };
     let title = "Article introuvable - LibreJustice";
+    let (titre, recours) = match (err.status, date.as_deref()) {
+        (404, Some(d)) => (
+            format!(
+                "Aucune version de cet article au {}",
+                lj_dtos::format_date_fr(d)
+            ),
+            Some(format!("{text}/{num}{suffix}")),
+        ),
+        (422, _) => (
+            "Cette adresse ne désigne ni un lieu ni une date que nous connaissons".to_string(),
+            Some(format!("{text}/{num}")),
+        ),
+        _ => (err.message, None),
+    };
+    let raison = date
+        .as_deref()
+        .zip(frise.as_ref())
+        .and_then(|(d, article)| raison_du_trou(&article.versions, d));
     view! {
         <Title text=title />
         <Meta name="robots" content="noindex" />
@@ -160,9 +298,88 @@ fn LawError(err: PageError) -> impl IntoView {
             <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
                 {eyebrow}
             </p>
-            <h1 class="mt-2 font-sans text-3xl text-[var(--color-ink)]">{err.message}</h1>
+            <h1 class="mt-2 font-sans text-3xl text-[var(--color-ink)]">{titre}</h1>
+            {raison
+                .map(|(phrase, bornes)| {
+                    view! {
+                        <p class="mt-4 text-sm leading-relaxed text-[var(--color-ink-muted)]">
+                            {phrase}
+                        </p>
+                        <ul class="mt-4 flex flex-col gap-1">
+                            {bornes
+                                .into_iter()
+                                .map(|(libelle, jour)| {
+                                    view! {
+                                        <li>
+                                            <a
+                                                href=format!("{text}/{num}/{jour}{suffix}")
+                                                class="text-sm text-[var(--color-accent)] underline-offset-4 hover:underline"
+                                            >
+                                                {libelle}
+                                            </a>
+                                        </li>
+                                    }
+                                })
+                                .collect_view()}
+                        </ul>
+                    }
+                })}
+            {recours
+                .map(|href| {
+                    view! {
+                        <a
+                            href=href
+                            class="mt-6 self-start text-sm text-[var(--color-accent)] underline-offset-4 hover:underline"
+                        >
+                            "Voir la version en vigueur"
+                        </a>
+                    }
+                })}
         </div>
     }
+}
+
+/// French wording of the gap a dated read fell into, and the two versions that
+/// bound it. `lj_dtos::gap_explique` decides whether the status says why, the
+/// unexplained case being ours to hold and named as such.
+fn raison_du_trou(
+    versions: &[lj_dtos::LawArticleVersion],
+    date: &str,
+) -> Option<(String, Vec<(String, String)>)> {
+    let bornes: Vec<_> = versions
+        .iter()
+        .map(|v| (Some(v.date_debut.as_str()), v.date_fin.as_deref()))
+        .collect();
+    let (i, j) = lj_dtos::version_gap(&bornes, date)?;
+    let (avant, apres) = (versions.get(i)?, versions.get(j)?);
+    let ferme = lj_dtos::format_date_fr(avant.date_fin.as_deref()?);
+    let reprise = lj_dtos::format_date_fr(&apres.date_debut);
+    let phrase = if lj_dtos::gap_explique(&avant.etat) {
+        format!(
+            "{} le {ferme}, l'article est à nouveau présent le {reprise} : il n'existait pas sous ce numéro à la date demandée.",
+            status_label(&avant.etat)
+        )
+    } else {
+        format!(
+            "L'article court de part et d'autre de cette date, mais nous ne détenons aucune version entre le {ferme} et le {reprise}."
+        )
+    };
+    Some((
+        phrase,
+        vec![
+            (
+                format!(
+                    "Version qui précède, du {}",
+                    lj_dtos::format_date_fr(avant.date_debut.as_str())
+                ),
+                avant.date_debut.clone(),
+            ),
+            (
+                format!("Version qui suit, du {reprise}"),
+                apres.date_debut.clone(),
+            ),
+        ],
+    ))
 }
 
 /// Squelette de chargement (en-tête + corps + colonnes).
@@ -212,9 +429,11 @@ fn LawArticleLoaded(
     citing: Resource<CitingResult>,
     related: Resource<RelatedResult>,
 ) -> impl IntoView {
+    #[cfg(feature = "hydrate")]
+    Effect::new(|_| crate::reads::report(lj_dtos::ReadKind::Article));
     let title = article_title(&article);
     let description = article_meta_description(&article, &title);
-    let url = article_canonical_url(&article.code, &article.num_key);
+    let url = article_canonical_url(&article.jurisdiction, &article.code, &article.num_key);
     let jsonld = serde_json::to_string(&build_article_json_ld(&article, &title, &description))
         .unwrap_or_else(|_| "{}".to_string());
     let page_title = format!("{title} - LibreJustice");
@@ -224,35 +443,78 @@ fn LawArticleLoaded(
     // « entrera en vigueur » la porte.
     let served_is_upcoming = !article.date_debut.is_empty()
         && article.upcoming_version_date.as_deref() == Some(article.date_debut.as_str());
-    let validity = (!article.date_debut.is_empty() && !served_is_upcoming).then(|| {
-        let label = validity_label(
-            &article.date_debut,
-            article.date_fin.as_deref(),
-            article.expired,
-        );
-        view! { <p class="text-sm text-[var(--color-ink-muted)]">{label}</p> }
-    });
+    // `expired` and the version window are read on the article's own timeline,
+    // which is the metropolitan one. A place that keeps a wording the metropole
+    // has replaced makes that timeline speak of somewhere else: the wording is
+    // then named by its date, and the window is the reader's.
+    // A matter passed to the reader's place keeps the wording in force on the
+    // day of the transfer, which is the version served.
+    let frozen_on = article
+        .applicability
+        .as_ref()
+        .filter(|a| a.status == ApplicabilityStatus::Undetermined(UndeterminedReason::Frozen))
+        .and_then(|a| a.frozen_on.clone());
+    // An article is not shown from a place the reader picked where it does not
+    // apply; from the default place it stays, under its banner.
+    let withheld = article
+        .applicability
+        .as_ref()
+        .is_some_and(|a| a.status == ApplicabilityStatus::NotApplicable)
+        && reader_place()
+            .get_untracked()
+            .is_some_and(|p| p != DEFAULT_READER_PLACE);
+    let reader_holds = frozen_on.is_some()
+        || article.expired
+            && article.applicability.as_ref().is_some_and(|a| {
+                a.status == ApplicabilityStatus::Applicable && a.ends_on.is_none()
+            });
+    let validity =
+        (!withheld && !article.date_debut.is_empty() && !served_is_upcoming).then(|| {
+            let label = if let Some(d) = frozen_on.as_deref() {
+                format!("Rédaction en vigueur le {}", format_iso_date(Some(d)))
+            } else if reader_holds {
+                format!(
+                    "Rédaction du {}",
+                    format_iso_date(Some(&article.date_debut))
+                )
+            } else {
+                validity_label(
+                    &article.date_debut,
+                    article.date_fin.as_deref(),
+                    article.expired,
+                )
+            };
+            view! { <p class="text-sm text-[var(--color-ink-muted)]">{label}</p> }
+        });
     // L'API sert la version en vigueur quand la route ne porte pas de date : une
     // version close en réponse dit alors qu'aucune ne s'applique plus.
-    let expired_notice = (article.expired && !article.date_debut.is_empty()).then(|| {
-        expired_banner(match article_key().get_untracked().date {
-            None => "Cet article n'est plus en vigueur",
-            Some(_) => "Cette version n'est plus en vigueur",
-        })
-    });
-    let code_href = format!("/texte/{}", article.code);
+    let expired_notice =
+        (!withheld && article.expired && !reader_holds && !article.date_debut.is_empty()).then(
+            || {
+                expired_banner(match article_key().get_untracked().date {
+                    None => "Cet article n'est plus en vigueur",
+                    Some(_) => "Cette version n'est plus en vigueur",
+                })
+            },
+        );
+    let applicability = applicability_view(&article, article_key().get_untracked().date.is_some());
+    let code_href = lj_vocab::norm_path(&article.jurisdiction, &article.code);
     let code_name = code_display_name(&article);
     // Bandeau temporel : une version future de l'article existe. Si la version
     // SERVIE est cette version future, le bandeau dit l'entrée en vigueur, pas une
     // modification.
-    let upcoming = article.upcoming_version_date.as_deref().map(|d| {
-        let subject = if article.date_debut == d {
-            "Cet article entrera en vigueur"
-        } else {
-            "Cet article sera modifié"
-        };
-        upcoming_banner(subject, d)
-    });
+    let upcoming = article
+        .upcoming_version_date
+        .as_deref()
+        .filter(|_| !withheld && frozen_on.is_none())
+        .map(|d| {
+            let subject = if article.date_debut == d {
+                "Cet article entrera en vigueur"
+            } else {
+                "Cet article sera modifié"
+            };
+            upcoming_banner(subject, d)
+        });
 
     let nav_view = view! { <ArticleSideNav article=article.clone() /> }.into_any();
     let neighbor_nav = neighbor_nav(&article);
@@ -278,11 +540,12 @@ fn LawArticleLoaded(
                 </A>
                 <h1 class="font-sans text-3xl text-[var(--color-ink)]">{title.clone()}</h1>
                 {validity}
+                {applicability}
                 {expired_notice}
                 {upcoming}
                 {neighbor_nav}
             </header>
-            <ArticleBody article=article.clone() />
+            {(!withheld).then(|| view! { <ArticleBody article=article.clone() /> })}
             {travaux_section(article.travaux_parlementaires.clone())}
             {cited_by_view}
             <crate::components::decision::DecisionCommentaires commentaires=article
@@ -307,6 +570,7 @@ fn LawArticleLoaded(
         <Meta property="og:locale" content="fr_FR" />
         <Meta property="og:image" content=OG_IMAGE />
         <Meta name="twitter:card" content="summary_large_image" />
+        {withheld.then(|| view! { <Meta name="robots" content="noindex" /> })}
         <Link rel="canonical" href=url />
         <Script type_="application/ld+json">{jsonld}</Script>
         <DecisionLayout toc=nav_view main=main_view similar=neighbors_view />
@@ -319,8 +583,10 @@ fn LawArticleLoaded(
 fn neighbor_nav(article: &LawArticleResponse) -> Option<impl IntoView> {
     let ctx = &article.context;
     let idx = ctx.iter().position(|n| n.current)?;
+    let suffix = reader_suffix(reader_place().get_untracked().as_deref());
+    let text = lj_vocab::norm_path(&article.jurisdiction, &article.code);
     let link = |n: &ArticleNeighbor, arrow_left: bool| {
-        let href = format!("/texte/{}/{}", article.code, n.num_key);
+        let href = format!("{text}/{}{suffix}", n.num_key);
         let label = format!("Article {}", format_article_num(&n.num));
         view! {
             <A
@@ -359,16 +625,26 @@ fn neighbor_nav(article: &LawArticleResponse) -> Option<impl IntoView> {
 #[component]
 fn ArticleSideNav(article: LawArticleResponse) -> impl IntoView {
     // Chronolégi : la date demandée vient de la route
-    // (`/texte/{code}/{num}/{date}`), le picker navigue en segment de path.
-    let base = format!("/texte/{}/{}", article.code, article.num_key);
+    // (`/norm/{juris}/{code}/{num}/{date}`), le picker navigue en segment de path.
+    let base = format!(
+        "{}/{}",
+        lj_vocab::norm_path(&article.jurisdiction, &article.code),
+        article.num_key
+    );
     let key = article_key();
     let reference = article_title(&article);
     let requested_date = Signal::derive(move || key.get().date);
+    let places = article
+        .applicability
+        .as_ref()
+        .map(|a| readable_groups(&a.readable))
+        .unwrap_or_default();
     view! {
         <div class="flex flex-col gap-6 lg:sticky lg:top-20 lg:max-h-[calc(100vh-6rem)] lg:self-start lg:overflow-y-auto">
             <ArticleActions reference=reference />
             <nav aria-label="Versions de l'article" class="flex flex-col gap-8">
-                <ChronoDatePicker base=base date=requested_date path_segment=true />
+                <ChronoDatePicker base=base.clone() date=requested_date path_segment=true />
+                <PlacePicker base=base groups=places date=requested_date />
                 <Timeline article=article />
             </nav>
         </div>
@@ -387,14 +663,20 @@ pub(crate) fn ChronoDatePicker(
 ) -> impl IntoView {
     use leptos_router::hooks::use_navigate;
     let navigate = use_navigate();
+    let place = reader_place().get_untracked();
     let href_for = StoredValue::new(move |picked: &str| {
-        if picked.is_empty() {
+        let mut href = if picked.is_empty() {
             base.clone()
         } else if path_segment {
             format!("{base}/{picked}")
         } else {
             format!("{base}?date={picked}")
+        };
+        if let Some(l) = &place {
+            href.push(if href.contains('?') { '&' } else { '?' });
+            href.push_str(&format!("place={l}"));
         }
+        href
     });
     let reset = move || {
         date.get().map(|_| {
@@ -538,7 +820,7 @@ fn article_provenance_rows(article: &LawArticleResponse) -> Vec<(&'static str, S
     }
     rows.push((
         "Permalien",
-        article_canonical_url(&article.code, &article.num_key),
+        article_canonical_url(&article.jurisdiction, &article.code, &article.num_key),
     ));
     rows
 }
@@ -633,15 +915,16 @@ fn ArticleContext(article: LawArticleResponse) -> impl IntoView {
     if context.len() <= 1 {
         return ().into_any();
     }
-    let code = article.code.clone();
+    let text = lj_vocab::norm_path(&article.jurisdiction, &article.code);
+    let suffix = reader_suffix(reader_place().get_untracked().as_deref());
     let items = context
         .into_iter()
-        .map(|n| context_item(n, &code))
+        .map(|n| context_item(n, &text, &suffix))
         .collect();
     rail_block("Dans le même chapitre", items)
 }
 
-fn context_item(neighbor: ArticleNeighbor, code: &str) -> AnyView {
+fn context_item(neighbor: ArticleNeighbor, text: &str, suffix: &str) -> AnyView {
     let label = format!("Article {}", format_article_num(&neighbor.num));
     let abrogated = neighbor.etat != "VIGUEUR";
     if neighbor.current {
@@ -653,7 +936,7 @@ fn context_item(neighbor: ArticleNeighbor, code: &str) -> AnyView {
         .into_any();
         return rail_item(true, body);
     }
-    let href = format!("/texte/{code}/{}", neighbor.num_key);
+    let href = format!("{text}/{}{suffix}", neighbor.num_key);
     let cls = if abrogated {
         "block text-sm leading-snug text-[var(--color-ink-subtle)] line-through no-underline hover:text-[var(--color-accent)]"
     } else {
@@ -831,7 +1114,7 @@ fn ArticleBody(article: LawArticleResponse) -> impl IntoView {
 
 /// Liste des dispositions d'un article modificatif : un bloc par (action, code),
 /// en-tête action + code lié, puis les cibles — articles en chips cliquables vers
-/// `/texte/{code}/{num}`, sections en libellés.
+/// `/norm/{juris}/{code}/{num}`, sections en libellés.
 #[component]
 fn ModificationsList(groups: Vec<ArticleModification>) -> impl IntoView {
     let blocks = groups
@@ -956,6 +1239,333 @@ fn travaux_section(refs: Vec<LinkedTextRef>) -> Option<AnyView> {
     )
 }
 
+fn place_labels(places: &[PlaceRef]) -> String {
+    places
+        .iter()
+        .map(|p| p.label.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The first three places by name, the rest counted.
+fn place_summary(places: &[PlaceRef]) -> String {
+    if places.len() <= 3 {
+        return place_labels(places);
+    }
+    format!(
+        "{} et {} autres lieux",
+        place_labels(&places[..3]),
+        places.len() - 3
+    )
+}
+
+/// A clause cut on a word, an ellipsis saying so.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max).collect();
+    let cut = head.rfind(' ').unwrap_or(head.len());
+    format!("{}…", head[..cut].trim_end())
+}
+
+fn state_links(states: &[StateElsewhere], path: &str, with_version: bool) -> AnyView {
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for e in states {
+        for p in &e.places {
+            let href = if with_version {
+                format!("{path}/{}?place={}", e.version, p.uid)
+            } else {
+                format!("{path}?place={}", p.uid)
+            };
+            targets.push((href, p.label.clone()));
+        }
+    }
+    targets
+        .into_iter()
+        .map(|(href, label)| {
+            view! {
+                <A href=href attr:class="underline underline-offset-4">
+                    {label}
+                </A>
+            }
+        })
+        .collect_view()
+        .into_any()
+}
+
+/// The line under the title that says where the served version applies, or the
+/// banner that says what the reader's place makes of the article. Nothing while
+/// the text has no compiled state.
+fn applicability_view(article: &LawArticleResponse, dated: bool) -> Option<AnyView> {
+    let a: &Applicability = article.applicability.as_ref()?;
+    let when = if dated {
+        "à cette date"
+    } else {
+        "aujourd'hui"
+    };
+    let key = article_key().get_untracked();
+    let path = format!(
+        "{}/{}",
+        lj_vocab::norm_path(&article.jurisdiction, &article.code),
+        article.num_key
+    );
+    let dated_path = match key.date.as_deref() {
+        Some(d) => format!("{path}/{d}"),
+        None => path.clone(),
+    };
+    let banner_class = "mt-1 w-fit rounded-md border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-3 py-1.5 text-sm text-[var(--color-ink)]";
+    let from_reader = format!("Lu depuis {} : ", a.reader.label);
+    let lead = match a.status {
+        ApplicabilityStatus::Applicable => return Some(applicable_view(a, &path, when)),
+        ApplicabilityStatus::NotApplicable => match a.frozen_on.as_deref() {
+            Some(d) => format!(
+                "{from_reader}cet article ne s'y applique pas : il n'était pas en vigueur le {}, jour où la matière est passée à la collectivité.",
+                format_iso_date(Some(d))
+            ),
+            None => format!("{from_reader}cet article ne s'y applique pas {when}."),
+        },
+        ApplicabilityStatus::Undetermined(UndeterminedReason::NoMention) => format!(
+            "{from_reader}une loi ne s'y applique que si un texte le dit, et aucune mention qui étende cet article n'a été relevée."
+        ),
+        ApplicabilityStatus::Undetermined(UndeterminedReason::Frozen) => format!(
+            "{from_reader}la matière relève de la collectivité depuis le {}. Le texte national y reste dans sa rédaction de cette date tant que la collectivité ne l'a pas remplacé : voici cette rédaction.",
+            format_iso_date(a.frozen_on.as_deref())
+        ),
+        ApplicabilityStatus::OutsideWindow => format!(
+            "Aucun état connu de cet article ne couvre {} {when}.",
+            a.reader.label
+        ),
+    };
+    let lists_elsewhere = matches!(
+        a.status,
+        ApplicabilityStatus::NotApplicable
+            | ApplicabilityStatus::Undetermined(UndeterminedReason::NoMention)
+    );
+    let elsewhere = (lists_elsewhere && !a.elsewhere.is_empty()).then(|| {
+        let links = state_links(&a.elsewhere, &dated_path, false);
+        view! {
+            " Il s'applique en : "
+            <span class="inline-flex flex-wrap gap-x-2">{links}</span>
+        }
+    });
+    let rule = a.rule_source.as_deref().map(|s| {
+        let short = shorten(s, 240);
+        view! {
+            <p class="text-xs text-[var(--color-ink-subtle)]">
+                {format!("Selon la règle : « {short} »")}
+            </p>
+        }
+    });
+    Some(
+        view! {
+            <p class=banner_class>
+                <span aria-hidden="true" class="mr-1.5">"⚠"</span>
+                {lead}
+                {elsewhere}
+            </p>
+            {rule}
+        }
+        .into_any(),
+    )
+}
+
+/// The line of an article a state covers where the reader stands, the clause
+/// that dates it, and the other states the source left covering them.
+fn applicable_view(a: &Applicability, path: &str, when: &str) -> AnyView {
+    let banner_class = "mt-1 w-fit rounded-md border border-[var(--color-accent)] bg-[var(--color-accent-soft)] px-3 py-1.5 text-sm text-[var(--color-ink)]";
+    let from_reader = if a.reader.uid == DEFAULT_READER_PLACE {
+        String::new()
+    } else {
+        format!("Lu depuis {} : ", a.reader.label)
+    };
+    let mut line = format!("{from_reader}S'applique en {}", place_summary(&a.places));
+    match a.starts_on.as_deref() {
+        Some(d) => line.push_str(&format!(" depuis le {}", format_iso_date(Some(d)))),
+        None => line.push_str(" (début non daté par la source)"),
+    }
+    if let Some(f) = a.ends_on.as_deref() {
+        line.push_str(&format!(
+            ", cesse de s'appliquer le {}",
+            format_iso_date(Some(f))
+        ));
+        if a.ends_on_origin.as_deref() == Some("computed") {
+            line.push_str(" (fin déduite de l'état suivant)");
+        }
+    }
+    let all_places = place_labels(&a.places);
+    let clause = a
+        .starts_on_source
+        .as_deref()
+        .or(a.ends_on_source.as_deref())
+        .map(|c| {
+            let short = shorten(c, 240);
+            view! {
+                <p class="text-xs text-[var(--color-ink-subtle)]">
+                    {format!("Selon la source : « {short} »")}
+                </p>
+            }
+        });
+    let competing = (!a.competing.is_empty()).then(|| {
+        let links = state_links(&a.competing, path, true);
+        view! {
+            <p class=banner_class>
+                <span aria-hidden="true" class="mr-1.5">"⚠"</span>
+                {format!("Plusieurs états couvrent {} {when} et la source ne les départage pas. S'applique aussi, dans une autre version : ", a.reader.label)}
+                <span class="inline-flex flex-wrap gap-x-2">{links}</span>
+            </p>
+        }
+    });
+    view! {
+        <p class="text-sm text-[var(--color-ink-muted)]" title=all_places>{line}</p>
+        {clause}
+        {competing}
+    }
+    .into_any()
+}
+
+/// The heading a place is listed under in « Lu depuis ».
+pub(crate) fn place_group_label(group: PlaceGroup) -> &'static str {
+    match group {
+        PlaceGroup::Metropole => "Métropole",
+        PlaceGroup::OverseasIdentity => "Outre-mer, identité législative",
+        PlaceGroup::OverseasSpecialty => "Outre-mer, spécialité législative",
+        PlaceGroup::OtherStates => "Autres États",
+    }
+}
+
+/// The places the article can be read from, under their headings, in the
+/// order the API sorts them.
+fn readable_groups(readable: &[ReadablePlace]) -> Vec<(String, Vec<PlaceRef>)> {
+    let mut groups: Vec<(PlaceGroup, Vec<PlaceRef>)> = Vec::new();
+    for p in readable {
+        match groups.last_mut() {
+            Some((group, members)) if *group == p.group => members.push(p.place.clone()),
+            _ => groups.push((p.group, vec![p.place.clone()])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(group, members)| (place_group_label(group).to_string(), members))
+        .collect()
+}
+
+/// « Lu depuis » : a place picked under its heading, navigated as `?place=`
+/// on `base` at the date. Nothing when no place is listed.
+#[component]
+pub fn PlacePicker(
+    base: String,
+    groups: Vec<(String, Vec<PlaceRef>)>,
+    #[prop(into)] date: Signal<Option<String>>,
+) -> impl IntoView {
+    use leptos_router::hooks::use_navigate;
+    if groups.is_empty() {
+        return ().into_any();
+    }
+    let place = reader_place();
+    let current = Signal::derive(move || {
+        place
+            .get()
+            .unwrap_or_else(|| DEFAULT_READER_PLACE.to_string())
+    });
+    let groups = groups
+        .into_iter()
+        .map(|(label, members)| SelectGroup {
+            label,
+            options: members
+                .into_iter()
+                .map(|p| SelectOption {
+                    value: p.uid,
+                    label: p.label,
+                })
+                .collect(),
+        })
+        .collect();
+    let navigate = use_navigate();
+    let on_change = Callback::new(move |picked: String| {
+        let path = match date.get_untracked() {
+            Some(d) => format!("{base}/{d}"),
+            None => base.clone(),
+        };
+        let href = if picked == DEFAULT_READER_PLACE {
+            path
+        } else {
+            format!("{path}?place={picked}")
+        };
+        navigate(&href, Default::default());
+    });
+    view! {
+        <div class="flex flex-col gap-1">
+            <span class="text-xs uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
+                "Lu depuis"
+            </span>
+            <GroupedSelect
+                value=current
+                on_change=on_change
+                groups=groups
+                aria_label="Lu depuis"
+                filter_placeholder="Filtrer (ex. Mayotte…)"
+                empty_text="Aucun lieu ne correspond."
+            />
+        </div>
+    }
+    .into_any()
+}
+
+/// The vocabulary as a select shows it: the French places under their
+/// headings, a State with subdivisions as its own group, the other States
+/// together. France itself is left out, its places splitting it whole.
+pub(crate) fn place_groups(places: &[PlaceNode]) -> Vec<(String, Vec<PlaceRef>)> {
+    let place_ref = |p: &PlaceNode| PlaceRef {
+        uid: p.uid.clone(),
+        label: p.label.clone(),
+    };
+    let mut headed: std::collections::BTreeMap<PlaceGroup, Vec<PlaceRef>> = Default::default();
+    for p in places.iter().filter(|p| p.group != PlaceGroup::OtherStates) {
+        headed.entry(p.group).or_default().push(place_ref(p));
+    }
+    let mut groups: Vec<(String, Vec<PlaceRef>)> = headed
+        .into_iter()
+        .map(|(group, members)| (place_group_label(group).to_string(), members))
+        .collect();
+    let mut states: Vec<PlaceRef> = Vec::new();
+    for root in places
+        .iter()
+        .filter(|p| p.parent.is_none() && p.group == PlaceGroup::OtherStates)
+    {
+        let mut below: Vec<&PlaceNode> = Vec::new();
+        let mut stack = vec![root.uid.as_str()];
+        while let Some(parent) = stack.pop() {
+            for child in places
+                .iter()
+                .filter(|p| p.parent.as_deref() == Some(parent))
+            {
+                below.push(child);
+                stack.push(&child.uid);
+            }
+        }
+        let own: Vec<PlaceRef> = below
+            .iter()
+            .filter(|p| p.group == PlaceGroup::OtherStates)
+            .map(|p| place_ref(p))
+            .collect();
+        if below.is_empty() {
+            states.push(place_ref(root));
+        } else if !own.is_empty() {
+            let mut members = vec![place_ref(root)];
+            members.extend(own);
+            groups.push((root.label.clone(), members));
+        }
+    }
+    if !states.is_empty() {
+        groups.push((
+            place_group_label(PlaceGroup::OtherStates).to_string(),
+            states,
+        ));
+    }
+    groups
+}
+
 /// Bandeau temporel : « {sujet} sera modifié le … » — la sentinelle
 /// `2222-02-22` (date inconnue DILA) devient « à une date à déterminer ».
 pub(crate) fn upcoming_banner(subject: &str, date: &str) -> AnyView {
@@ -1008,12 +1618,13 @@ fn Timeline(article: LawArticleResponse) -> impl IntoView {
     if article.versions.is_empty() {
         return ().into_any();
     }
-    let code = article.code.clone();
+    let text = lj_vocab::norm_path(&article.jurisdiction, &article.code);
     let num = article.num_key.clone();
     let current = article.legiarti.clone();
+    let suffix = reader_suffix(reader_place().get_untracked().as_deref());
     // Comparateur : version courante vs sa précédente (ou la suivante si la
     // courante ouvre la timeline), dès 2 versions.
-    let compare = compare_href(&article.versions, &code, &num, &current).map(|href| {
+    let compare = compare_href(&article.versions, &text, &num, &current).map(|href| {
         view! {
             <A
                 href=href
@@ -1027,7 +1638,7 @@ fn Timeline(article: LawArticleResponse) -> impl IntoView {
     let rows = article
         .versions
         .into_iter()
-        .map(|v| timeline_item(v, &code, &num, &current, &modified_by))
+        .map(|v| timeline_item(v, &text, &num, &current, &modified_by, &suffix))
         .collect();
     view! {
         <div class="flex flex-col gap-1">
@@ -1043,7 +1654,7 @@ fn Timeline(article: LawArticleResponse) -> impl IntoView {
 /// qu'une version.
 fn compare_href(
     versions: &[LawArticleVersion],
-    code: &str,
+    text: &str,
     num: &str,
     current: &str,
 ) -> Option<String> {
@@ -1059,7 +1670,7 @@ fn compare_href(
         (&versions[idx], other)
     };
     Some(format!(
-        "/texte/{code}/{num}/comparer/{}/{}",
+        "{text}/{num}/compare/{}/{}",
         crate::pages::law_compare_page::version_url_key(from),
         crate::pages::law_compare_page::version_url_key(to),
     ))
@@ -1067,10 +1678,11 @@ fn compare_href(
 
 fn timeline_item(
     version: LawArticleVersion,
-    code: &str,
+    text: &str,
     num: &str,
     current: &str,
     modified_by: &[LinkedTextRef],
+    suffix: &str,
 ) -> AnyView {
     let is_current = version.legiarti == current;
     // `date_debut` vide = sentinelle absorbée (article modificatif) : pas de
@@ -1138,7 +1750,7 @@ fn timeline_item(
         .into_any();
         return rail_item(true, body);
     }
-    let href = format!("/texte/{code}/{num}/{}", version.date_debut);
+    let href = format!("{text}/{num}/{}{suffix}", version.date_debut);
     let body = view! {
         <A href=href attr:class="group block no-underline">
             <span class="block text-sm leading-snug text-[var(--color-accent)] group-hover:underline">
@@ -1193,7 +1805,7 @@ fn related_view(resolved: RelatedResult) -> AnyView {
 }
 
 fn related_item(item: CoCitedArticle) -> AnyView {
-    use crate::components::hover_preview::{HoverPreview, PreviewKind};
+    use crate::components::hover_preview::{preview_kind, HoverPreview, PreviewKind};
     let label = format!("Article {}", format_article_num(&item.num_key));
     let count = view! {
         <span class="shrink-0 text-xs tabular-nums text-[var(--color-ink-subtle)]">
@@ -1214,29 +1826,27 @@ fn related_item(item: CoCitedArticle) -> AnyView {
         }
         .into_any();
     };
-    let kind = PreviewKind::Article {
-        code: href
-            .trim_start_matches("/texte/")
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        num: item.num_key.clone(),
-        date: None,
+    let place = reader_place().get_untracked();
+    let mut kind = preview_kind(&href, None);
+    if let Some(PreviewKind::Article { place: p, .. }) = kind.as_mut() {
+        *p = place.clone();
+    }
+    let href = format!("{href}{}", reader_suffix(place.as_deref()));
+    let lien = view! {
+        <A
+            href=href
+            attr:class="text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
+        >
+            {label}
+        </A>
+        {title}
+    };
+    let corps = match kind {
+        Some(kind) => view! { <HoverPreview kind=kind>{lien}</HoverPreview> }.into_any(),
+        None => lien.into_any(),
     };
     view! {
-        <li class="flex items-baseline justify-between gap-2">
-            <HoverPreview kind=kind>
-                <A
-                    href=href
-                    attr:class="text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
-                >
-                    {label}
-                </A>
-                {title}
-            </HoverPreview>
-            {count}
-        </li>
+        <li class="flex items-baseline justify-between gap-2">{corps}{count}</li>
     }
     .into_any()
 }

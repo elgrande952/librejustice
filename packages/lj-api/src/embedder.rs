@@ -2,10 +2,9 @@
 //! response to a request.
 
 use crate::config::Settings;
-use lj_llm::backend::{AnyEmbedder, DummyEmbedder};
+use lj_llm::backend::{AnyEmbedder, DummyEmbedder, LocalHost};
 use lj_llm::cloudflare::CloudflareWorkersAIEmbedder;
 use lj_llm::openai_http::OpenAIHttpEmbedder;
-use std::sync::atomic::AtomicBool;
 
 /// Construit l'embedder de requête selon `settings.embed_backend`
 /// (`dummy` / `openai-http` / `cloudflare` / `auto`).
@@ -14,24 +13,19 @@ use std::sync::atomic::AtomicBool;
 /// signature est infaillible et l'embedder est construit une fois au démarrage,
 /// une config invalide doit faire échouer le boot, pas une requête.
 ///
-/// Mode `auto` : le local (OpenAI-HTTP) à l'URL résolue (`embed_url` ou
-/// `http://localhost:8400/v1/embeddings`) primaire, repli Cloudflare Workers AI
-/// en disjoncteur binaire (`degraded`). Les creds Cloudflare sont requises car
-/// elles servent au repli.
+/// `auto` mode: the local hosts of `embed_hosts` in priority order, each behind
+/// its own breaker, then Cloudflare Workers AI once every host is down. The
+/// Cloudflare credentials are required because they back the fallback.
 pub fn build_query_embedder(settings: &Settings) -> AnyEmbedder {
     match settings.embed_backend.as_str() {
         "dummy" => AnyEmbedder::Dummy(DummyEmbedder::default()),
         "openai-http" => {
-            let url = settings
-                .embed_url
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    panic!("embed_backend=openai-http nécessite LIBREJUSTICE_EMBED_URL.")
-                });
+            let [host] = settings.embed_hosts.as_slice() else {
+                panic!("embed_backend=openai-http takes one LIBREJUSTICE_EMBED_URL, a list needs auto.")
+            };
             AnyEmbedder::OpenAiHttp(OpenAIHttpEmbedder::new(
-                url,
-                settings.embed_api_key.clone(),
+                host.url.clone(),
+                host.api_key.clone(),
                 "",
             ))
         }
@@ -57,21 +51,14 @@ pub fn build_query_embedder(settings: &Settings) -> AnyEmbedder {
                  LIBREJUSTICE_CLOUDFLARE_ACCOUNT_ID + \
                  LIBREJUSTICE_CLOUDFLARE_BACKEND_TOKEN pour le fallback cloudflare.",
             );
-            let local_url = settings
-                .embed_url
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("http://localhost:8400/v1/embeddings");
-            let local = OpenAIHttpEmbedder::new(local_url, settings.embed_api_key.clone(), "");
             let cloudflare = CloudflareWorkersAIEmbedder::new(
                 account_id,
                 token,
                 CloudflareWorkersAIEmbedder::DEFAULT_MODEL,
             );
             AnyEmbedder::Auto {
-                local,
+                locals: settings.embed_hosts.iter().map(LocalHost::new).collect(),
                 cloudflare,
-                degraded: AtomicBool::new(false),
             }
         }
         other => panic!("embed_backend inconnu : {other:?}"),

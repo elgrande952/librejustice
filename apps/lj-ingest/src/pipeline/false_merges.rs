@@ -16,6 +16,7 @@ use anyhow::{anyhow, Result};
 use std::collections::BTreeSet;
 
 use lj_core::decision::Decision;
+use lj_parse::FromSourceFields;
 use lj_store::repository::DecisionRepository;
 use serde_json::Value;
 
@@ -141,26 +142,26 @@ pub async fn analyze_false_merges() -> Result<()> {
 
     println!("\n=== analyze-false-merges (read-only) ===");
     println!(
-        "décisions multi-provenances tout-judilibre : {}",
+        "all-judilibre multi-provenance decisions   : {}",
         stats.decisions
     );
     println!(
-        "  fusion légitime (canonical_ref unique)   : {}",
+        "  legitimate merge (unique canonical_ref)  : {}",
         stats.legit
     );
     println!(
-        "  ambiguë (≥1 provenance sans clé, gardée) : {}",
+        "  ambiguous (>=1 provenance without a key, kept): {}",
         stats.ambiguous
     );
     println!(
-        "  FAUX MERGE (clés divergentes, à scinder) : {}",
+        "  FALSE MERGE (diverging keys, to split)   : {}",
         stats.false_merges
     );
     println!(
-        "  → décisions à reconstituer (Σ groupes−1) : {}",
+        "  -> decisions to rebuild (sum of groups - 1): {}",
         stats.extra_decisions
     );
-    println!("\nÉchantillon de faux merges (decision_id | canonical_ref distincts) :");
+    println!("\nFalse-merge sample (decision_id | distinct canonical_ref):");
     for (id, refs) in &examples {
         println!("  {id} | {}", refs.join("  ¦  "));
     }

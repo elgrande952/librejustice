@@ -8,7 +8,8 @@ use regex::Regex;
 
 use crate::data::{instrument_aliases, legifrance_codes};
 
-use super::text::{capitalize_only, fold, uppercase_first};
+use super::text::{capitalize_only, uppercase_first};
+use lj_fold::fold;
 
 const CGI_LPF: &str = "Code général des impôts et le livre des procédures fiscales";
 
@@ -297,6 +298,31 @@ pub(crate) const FOREIGN_NATIONALITY_STEMS: &[&str] = &[
     "tongien",
 ];
 
+/// A territory named right after a code's title, as its complement or its
+/// adjective. « Applicable en Polynésie française » is not one: it reads the
+/// national code where it applies.
+static RE_TERRITORY_QUALIFIER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^ +(?:(?:de la |de |des iles |des )(?:polynesie(?: francaise)?|nouvelle[- ]caledonie|province (?:sud|nord|des iles(?: loyaute)?)|saint[- ]barthelemy|saint[- ]martin|saint[- ]pierre[- ]et[- ]miquelon|mayotte|wallis[- ]et[- ]futuna)|polynesien(?:ne)?|(?:neo-?)?caledonien(?:ne)?|mahorais)\b",
+    )
+    .unwrap()
+});
+
+/// Byte length of the territorial qualifier that opens the folded `tail`
+/// (« de la polynesie francaise » after « code de procedure civile »): the
+/// code it names is the territory's own, never the national one.
+pub(crate) fn territory_qualifier_len(tail: &str) -> Option<usize> {
+    RE_TERRITORY_QUALIFIER.find(tail).map(|m| m.end())
+}
+
+/// Does a folded instrument key carry a territorial qualifier after one of its
+/// words?
+pub(crate) fn names_territory(folded: &str) -> bool {
+    folded
+        .match_indices(' ')
+        .any(|(i, _)| territory_qualifier_len(&folded[i..]).is_some())
+}
+
 /// Titre officiel dont `raw` (plié) est un préfixe à la frontière de mot, et
 /// seulement si un seul convient. Borné aux noms commençant par « code ».
 pub(crate) fn snap_code_name(raw: &str) -> Option<String> {
@@ -317,6 +343,9 @@ pub(crate) fn snap_code_name(raw: &str) -> Option<String> {
             return Some(title.clone());
         }
         if folded.starts_with(canon_folded.as_str()) {
+            if territory_qualifier_len(&folded[canon_folded.len()..]).is_some() {
+                return None;
+            }
             if let Some(next) = folded[canon_folded.len()..].chars().next() {
                 if !next.is_alphanumeric() {
                     return Some(title.clone());
@@ -670,13 +699,7 @@ pub fn normalize_instrument(raw: &str) -> String {
         .replace_all(&raw, |c: &regex::Captures| {
             let month: usize = c[3].parse().unwrap_or(0);
             match MONTHS_FR.get(month.wrapping_sub(1)) {
-                Some(m) => format!(
-                    "{} {} {} {}",
-                    &c[1],
-                    &c[2].trim_start_matches('0'),
-                    m,
-                    &c[4]
-                ),
+                Some(m) => format!("{} {} {} {}", &c[1], c[2].trim_start_matches('0'), m, &c[4]),
                 None => c[0].to_string(),
             }
         })

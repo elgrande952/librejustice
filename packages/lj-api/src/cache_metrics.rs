@@ -1,13 +1,3 @@
-//! Scraper des caches moka in-process : occupation et taux de succès.
-//!
-//! Un plafond se règle sur l'occupation observée. Celui du cache parcours a valu
-//! 5 000 entrées de 421 Kio, soit 2 Gio, sans que rien ne le montre.
-//!
-//! `entry_count` et `weighted_size` ne sont exacts qu'après `run_pending_tasks`,
-//! d'où l'instantané asynchrone : les callbacks OTel sont synchrones. Et les
-//! caches étant par processus, ce scraper tourne dans tous les environnements,
-//! à l'inverse de `host_metrics` et `pg_metrics`.
-
 use opentelemetry::{global, KeyValue};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -15,10 +5,8 @@ use tracing::info;
 
 use crate::state::AppState;
 
-/// Période de scrape (1 DPM, free tier).
 const SCRAPE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Occupation d'un cache au dernier tour.
 struct Usage {
     cache: &'static str,
     entries: u64,
@@ -28,8 +16,6 @@ struct Usage {
 
 static SNAPSHOT: Mutex<Vec<Usage>> = Mutex::new(Vec::new());
 
-/// Un accès au cache vu de l'appelant : `hit` = il n'a pas payé le calcul. Un
-/// suiveur de single-flight compte donc comme un succès.
 pub(crate) fn record_access(cache: &'static str, hit: bool) {
     let counter = global::meter("librejustice-cache")
         .u64_counter("librejustice.cache.requests")
@@ -44,12 +30,11 @@ pub(crate) fn record_access(cache: &'static str, hit: bool) {
     );
 }
 
-/// Démarre le scraper. Conçu pour `tokio::spawn`.
 pub async fn run(state: AppState) {
     register_gauges();
     info!(
         interval_secs = SCRAPE_INTERVAL.as_secs(),
-        "cache_metrics : scraper démarré"
+        "cache_metrics: scraper started"
     );
 
     let mut ticker = tokio::time::interval(SCRAPE_INTERVAL);
@@ -93,8 +78,6 @@ fn register_gauges() {
         .build();
 }
 
-/// Un tour de mesure. Les caches à clé unique (`Cache<(), _>`) sont dehors :
-/// leur plafond vaut une entrée, il n'y a rien à régler.
 async fn scrape(state: &AppState) {
     macro_rules! usage {
         ($name:literal, $cache:expr) => {{
@@ -104,7 +87,7 @@ async fn scrape(state: &AppState) {
                 cache: $name,
                 entries: c.entry_count(),
                 weight: c.weighted_size(),
-                capacity: c.policy().max_capacity(),
+                capacity: c.max_capacity(),
             }
         }};
     }
@@ -118,6 +101,7 @@ async fn scrape(state: &AppState) {
         usage!("annonces", state.annonces_cache),
         usage!("registre", state.registre_cache),
         usage!("texte_identite", state.text_ref_cache),
+        usage!("sommaire_adresses", state.toc_address_cache),
     ];
     let (entries, weight, capacity) = state.embedding_cache.usage().await;
     out.push(Usage {

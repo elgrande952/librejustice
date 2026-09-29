@@ -3,11 +3,13 @@
 //! par CTE récursive filtrée à une date (sommaire réel, vue-lecture d'une
 //! section), purge des orphelins après backfill.
 
+use std::collections::HashMap;
+
 use chrono::NaiveDate;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
 
-use super::types::{TocEdgeRow, TocOwner, TocReadingRow, TocTreeRow};
+use super::types::{TocEdgeRow, TocOwner, TocTreeRow};
 use super::DecisionRepository;
 use crate::error::Result;
 
@@ -32,6 +34,9 @@ macro_rules! window {
         )
     };
 }
+
+/// An article version's `texte` and `nota`.
+pub type ArticleBody = (Option<String>, Option<String>);
 
 impl DecisionRepository<'_> {
     /// Remplace les arêtes de chaque propriétaire du batch : DELETE par clés
@@ -174,144 +179,48 @@ impl DecisionRepository<'_> {
             .collect())
     }
 
-    /// Vue-lecture d'une section : résout le `cid` stable vers sa version
-    /// couvrant `at`, puis renvoie `(titre de section, sous-arbre en ordre de
-    /// lecture)` — corps des articles joints par `source_uid`. `None` si le `cid`
-    /// est inconnu du texte à cette date (404 côté API).
-    #[tracing::instrument(name = "db.toc_section_reading", skip(self), fields(db.system = "postgresql"))]
-    pub async fn toc_section_reading(
+    /// The body and note of the article versions `source_uids`, by uid.
+    #[tracing::instrument(name = "db.article_bodies", skip(self, source_uids), fields(db.system = "postgresql", n = source_uids.len()))]
+    pub async fn article_bodies(
         &self,
         text_uid: &str,
-        cid: &str,
-        at: NaiveDate,
-    ) -> Result<Option<(String, Vec<TocReadingRow>)>> {
-        let Some((section_uid, section_label)) = self.section_head(text_uid, cid, at).await? else {
-            return Ok(None);
-        };
-        let items = self.reading_subtree(&section_uid, text_uid, at).await?;
-        Ok(Some((section_label, items)))
-    }
-
-    /// `(num_key, numéro affichable)` des articles du sous-arbre d'une section
-    /// **à une date** — l'ensemble de clés qu'agrège une division (citantes et
-    /// palmarès des plus cités). Même résolution du `cid` et même fenêtre datée
-    /// que [`Self::toc_section_reading`] ; `None` si le `cid` est inconnu du texte
-    /// à cette date (404 côté API). Le numéro affichable est le libellé de
-    /// l'arête, celui que rend la vue-lecture.
-    ///
-    /// Lecture **sans les corps**, là où `toc_section_reading` joint `texte` et
-    /// `nota` : la jointure détoasterait les corps pour n'en garder que les clés.
-    /// `DISTINCT ON` : une arête par version d'article, et une section LEGI
-    /// ré-écrite peut en présenter deux couvrantes — une clé sort une fois.
-    #[tracing::instrument(name = "db.toc_section_article_keys", skip(self), fields(db.system = "postgresql"))]
-    pub async fn toc_section_article_keys(
-        &self,
-        text_uid: &str,
-        cid: &str,
-        at: NaiveDate,
-    ) -> Result<Option<Vec<(String, String)>>> {
-        let Some((section_uid, _)) = self.section_head(text_uid, cid, at).await? else {
-            return Ok(None);
-        };
-        let sql = concat!(
-            "WITH RECURSIVE tree AS ( \
-                 SELECT e.child_kind, e.child_uid, e.child_num_key, e.label, \
-                        1 AS depth, ARRAY[e.seq] AS path \
-                 FROM legal_toc_edge e \
-                 WHERE e.owner_uid = $1 AND ",
-            window!("e", "$2"),
-            "    UNION ALL \
-                 SELECT c.child_kind, c.child_uid, c.child_num_key, c.label, \
-                        t.depth + 1, t.path || c.seq \
-                 FROM tree t \
-                 JOIN legal_toc_edge c ON c.owner_uid = t.child_uid \
-                 WHERE t.child_kind = 'section' AND t.depth < 32 AND ",
-            window!("c", "$2"),
-            ") SELECT DISTINCT ON (child_num_key) child_num_key, label FROM tree \
-              WHERE child_kind = 'article' AND child_num_key IS NOT NULL \
-              ORDER BY child_num_key, path",
-        );
-        let rows = self.conn.query(sql, &[&section_uid, &at]).await?;
-        Ok(Some(rows.iter().map(|r| (r.get(0), r.get(1))).collect()))
-    }
-
-    /// Résout le `cid` stable d'une section vers l'uid de sa version couvrant
-    /// `at`, et son libellé. `None` si le texte n'a pas cette section à cette date.
-    async fn section_head(
-        &self,
-        text_uid: &str,
-        cid: &str,
-        at: NaiveDate,
-    ) -> Result<Option<(String, String)>> {
-        let sql = concat!(
-            "SELECT e.child_uid, e.label FROM legal_toc_edge e \
-             WHERE e.text_uid = $1 AND e.child_cid = $2 AND e.child_kind = 'section' AND ",
-            window!("e", "$3"),
-            " LIMIT 1",
-        );
-        Ok(self
+        source_uids: &[&str],
+    ) -> Result<HashMap<String, ArticleBody>> {
+        let rows = self
             .conn
-            .query_opt(sql, &[&text_uid, &cid, &at])
-            .await?
-            .map(|r| (r.get("child_uid"), r.get("label"))))
-    }
-
-    /// Vue-lecture d'un texte entier : le sous-arbre ancré à la racine
-    /// (`owner_uid = text_uid`), corps des articles joints. Vide si le texte
-    /// n'a pas de structure ingérée (l'appelant replie sur la lecture à plat).
-    #[tracing::instrument(name = "db.toc_text_reading", skip(self), fields(db.system = "postgresql"))]
-    pub async fn toc_text_reading(
-        &self,
-        text_uid: &str,
-        at: NaiveDate,
-    ) -> Result<Vec<TocReadingRow>> {
-        self.reading_subtree(text_uid, text_uid, at).await
-    }
-
-    /// Sous-arbre en ordre de lecture ancré à `anchor_uid` (section ou racine
-    /// du texte), corps des articles joints par `source_uid`.
-    async fn reading_subtree(
-        &self,
-        anchor_uid: &str,
-        text_uid: &str,
-        at: NaiveDate,
-    ) -> Result<Vec<TocReadingRow>> {
-        let sql = concat!(
-            "WITH RECURSIVE tree AS ( \
-                 SELECT e.child_kind, e.child_uid, e.child_cid, e.child_num_key, \
-                        e.label, e.etat, 1 AS depth, ARRAY[e.seq] AS path \
-                 FROM legal_toc_edge e \
-                 WHERE e.owner_uid = $1 AND ",
-            window!("e", "$3"),
-            "    UNION ALL \
-                 SELECT c.child_kind, c.child_uid, c.child_cid, c.child_num_key, \
-                        c.label, c.etat, t.depth + 1, t.path || c.seq \
-                 FROM tree t \
-                 JOIN legal_toc_edge c ON c.owner_uid = t.child_uid \
-                 WHERE t.child_kind = 'section' AND t.depth < 32 AND ",
-            window!("c", "$3"),
-            ") SELECT t.child_kind, t.child_cid, t.child_num_key, t.label, t.etat, t.depth, \
-                     a.texte, a.nota \
-              FROM tree t \
-              LEFT JOIN legal_article a \
-                     ON t.child_kind = 'article' AND a.source_uid = t.child_uid \
-                        AND a.text_uid = $2 \
-              ORDER BY t.path",
-        );
-        let rows = self.conn.query(sql, &[&anchor_uid, &text_uid, &at]).await?;
+            .query(
+                "SELECT source_uid, texte, nota FROM legal_article \
+                 WHERE text_uid = $1 AND source_uid = ANY($2)",
+                &[&text_uid, &source_uids],
+            )
+            .await?;
         Ok(rows
             .iter()
-            .map(|r| TocReadingRow {
-                child_kind: r.get("child_kind"),
-                child_cid: r.get("child_cid"),
-                child_num_key: r.get("child_num_key"),
-                label: r.get("label"),
-                etat: r.get("etat"),
-                depth: r.get("depth"),
-                texte: r.get("texte"),
-                nota: r.get("nota"),
-            })
+            .map(|r| (r.get(0), (r.get(1), r.get(2))))
             .collect())
+    }
+
+    /// The key of every article the text ever had, all versions.
+    #[tracing::instrument(name = "db.text_article_keys", skip(self), fields(db.system = "postgresql"))]
+    pub async fn text_article_keys(&self, text_uid: &str) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT num_key FROM legal_article WHERE text_uid = $1",
+                &[&text_uid],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Every text with a structure.
+    #[tracing::instrument(name = "db.toc_text_uids", skip(self), fields(db.system = "postgresql"))]
+    pub async fn toc_text_uids(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query("SELECT DISTINCT text_uid FROM legal_toc_edge", &[])
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     /// Purge les arêtes des textes qui n'ont plus aucun article en base

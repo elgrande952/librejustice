@@ -14,7 +14,7 @@ use chrono::NaiveDate;
 use lj_store::repository::DecisionRepository;
 
 use crate::config::Settings;
-use lj_ingest::extract::{build_declared, owner_rows, Declared, OwnerRows};
+use lj_extract_rows::{build_declared, owner_rows, Declared, OwnerRows};
 
 /// Versions d'articles par page keyset. Le CPU d'une page part en rayon.
 const PAGE: i64 = 2_000;
@@ -36,7 +36,7 @@ pub async fn extract_text_refs() -> Result<()> {
     )
     .await
     .map_err(|e| anyhow!("session setup: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -49,7 +49,7 @@ pub async fn extract_text_refs() -> Result<()> {
     tracing::info!(
         aretes = n_declared,
         cles = declared.len(),
-        "oracle des renvois déclarés chargé"
+        "declared cross-reference oracle loaded"
     );
 
     // 1. Corps monolithiques, bufferisés par texte : un texte peut émettre
@@ -139,7 +139,7 @@ pub async fn extract_text_refs() -> Result<()> {
             }
         }
         if versions % 100_000 < PAGE as usize {
-            tracing::info!(versions, texts, "extract_text_refs en cours");
+            tracing::info!(versions, texts, "extract_text_refs running");
         }
     }
     if let Some((uid, acc)) = current.take() {

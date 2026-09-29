@@ -24,8 +24,8 @@ pub fn docket_key(num: &str) -> String {
 
 /// A decision number inside a query, every jurisdiction: `07-11.687`,
 /// `19-23664`, `23/01001`, `31399/23`, `2202166`, `2022021570`, `21PA01295`,
-/// `2005J00072`, `C-369/90`, `SAN-2022-019`. Sole source of what the exact key
-/// leg looks up.
+/// `2005J00072`, `C-369/90`, `SAN-2022-019`, `2010-104 QPC`, an ECLI. Each
+/// branch is named after the courts its graphy belongs to ([`courts_of`]).
 ///
 /// Bare digits run from five to ten: five carry 50,163 decisions (29/08/2026).
 /// The floor held at six as long as a postcode could empty a search; it no
@@ -37,18 +37,41 @@ pub fn docket_key(num: &str) -> String {
 /// two is a written date, `12/03` inside `12/03/2024`, for the 86 numbers left.
 pub(crate) static QUERY_DOCKET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
-        r"(?i)\b\d{2}-\d{2}\.\d{3,4}\b",
-        r"|\b\d{2}-\d{4,5}\b",
-        r"|\b\d{2}/\d{5}\b",
+        r"(?i)(?P<pourvoi>\b\d{2}-\d{2}\.\d{3,4}\b|\b\d{2}-\d{4,5}\b)",
+        r"|(?P<rg>\b\d{2}/\d{5}\b)",
+        r"|(?P<constit>\b\d{2,4}-\d{1,4})\s*(?:qpc|dc|lp|l|an|elec|ord|orga|fnr)\b",
         // Before the bare-digit branch, which would match `31399` alone.
-        r"|\b\d{3,5}/\d{2}\b",
-        r"|\b\d{2,4}[a-z]{1,3}\d{3,6}\b",
-        r"|\b[ctf]-\d{1,4}/\d{2}\b",
-        r"|\b[a-z]{2,4}-\d{4}-\d{3}\b",
-        r"|\b\d{5,10}\b",
+        r"|(?P<cedh>\b\d{3,5}/\d{2}\b)",
+        r"|(?P<lettres>\b\d{2,4}[a-z]{1,3}\d{3,6}\b)",
+        r"|(?P<cjue>\b[ctf]-\d{1,4}/\d{2}\b)",
+        r"|(?P<cnil>\b[a-z]{2,4}-\d{4}-\d{3}\b)",
+        r"|(?P<ecli>\becli:[a-z]{2}:[a-z0-9]+:\d{4}:[a-z0-9.]+)",
+        r"|(?P<nu>\b\d{5,10}\b)",
     ))
     .unwrap()
 });
+
+/// The branch a match came from and the courts its graphy can belong to, as
+/// `jurisdiction_type` codes; empty when the graphy says nothing.
+fn courts_of(caps: &regex::Captures) -> (&'static str, &'static [&'static str]) {
+    for (group, courts) in [
+        ("pourvoi", &["CC"][..]),
+        ("rg", &["CA", "TJ", "TCOM"][..]),
+        ("constit", &["CONSTIT"][..]),
+        // `106/77` is Simmenthal as often as a Strasbourg application.
+        ("cedh", &["CEDH", "CJUE"][..]),
+        ("lettres", &[][..]),
+        ("cjue", &["CJUE"][..]),
+        ("cnil", &["CNIL"][..]),
+        ("ecli", &[][..]),
+        ("nu", &[][..]),
+    ] {
+        if caps.name(group).is_some() {
+            return (group, courts);
+        }
+    }
+    unreachable!("every branch of QUERY_DOCKET_RE is named")
+}
 
 /// L'ordinal nu d'un numéro du Tribunal des conflits. Le fonds l'écrit selon
 /// l'époque (`00012` avant 2000, `3220` jusqu'en 2004, `C4174` ensuite) et les
@@ -105,6 +128,21 @@ static NUMERO_PRECEDENT_RE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// What, just before a number, makes it the number of a text or of one of its
+/// articles: `directive 2008/48`, `règlement 2016/679`, `article 1384`.
+/// `ordonnance` is not there, a judge's order carries a docket number.
+static TEXTE_PRECEDENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)\b(?:articles?|art\.?|alin[ée]as?|directives?|r[èe]glements?",
+        r"|d[ée]crets?|lois?|codes?)\s*(?:n°|no|n\.)?\s*(?:\(?(?:ue|ce|cee)\)?\s*)?$",
+    ))
+    .unwrap()
+});
+
+fn est_un_texte(query: &str, debut: usize) -> bool {
+    TEXTE_PRECEDENT_RE.is_match(&query[..debut])
+}
+
 /// Le nombre trouvé en `[debut, fin[` est-il une quantité et non un rôle ?
 ///
 /// Trois signaux par ordre de force : l'unité qui suit tranche seule, sinon la
@@ -123,19 +161,77 @@ fn est_une_quantite(query: &str, debut: usize, fin: usize) -> bool {
     !NUMERO_PRECEDENT_RE.is_match(avant) && MONTANT_PRECEDENT_RE.is_match(avant)
 }
 
-/// Clés canoniques des numéros portés par une requête, dédupliquées, dans
-/// l'ordre d'apparition. Les quantités sont écartées ([`est_une_quantite`]).
-pub fn query_docket_keys(query: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for m in QUERY_DOCKET_RE.find_iter(query) {
+/// Four digits standing alone: the shape of a year, and of the Conseil d'État
+/// numbers before the eighties (`5911`, written `05911` by the fonds).
+static QUATRE_CHIFFRES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d{4}\b").unwrap());
+
+/// A number the query carries: its canonical key, the courts its graphy can
+/// belong to (empty: any), and whether it is weak, four digits beside a court
+/// name, a shape a year shares, so it designates without ever declaring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryNumber {
+    pub key: String,
+    pub courts: &'static [&'static str],
+    pub weak: bool,
+}
+
+/// The numbers a query carries, deduplicated, in order of appearance. Amounts
+/// and the numbers of a text are left out, ECLIs go to [`query_eclis`].
+pub fn query_numbers(query: &str) -> Vec<QueryNumber> {
+    let mut out: Vec<QueryNumber> = Vec::new();
+    let mut push = |key: String, courts: &'static [&'static str], weak: bool| {
+        if !key.is_empty() && !out.iter().any(|n| n.key == key) {
+            out.push(QueryNumber { key, courts, weak });
+        }
+    };
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for caps in QUERY_DOCKET_RE.captures_iter(query) {
+        let m = caps.get(0).unwrap();
+        spans.push((m.start(), m.end()));
+        let (group, courts) = courts_of(&caps);
+        if group == "ecli" || est_un_texte(query, m.start()) {
+            continue;
+        }
         if m.as_str().bytes().all(|b| b.is_ascii_digit())
             && est_une_quantite(query, m.start(), m.end())
         {
             continue;
         }
-        let key = docket_key(m.as_str());
-        if !key.is_empty() && !out.contains(&key) {
-            out.push(key);
+        let number = match group {
+            "constit" => &caps["constit"],
+            _ => m.as_str(),
+        };
+        push(docket_key(number), courts, false);
+    }
+    let folded = crate::case_names::case_name_key(query);
+    let words: Vec<&str> = folded.split(' ').collect();
+    if !crate::citation::names_a_court(&words) {
+        return out;
+    }
+    for m in QUATRE_CHIFFRES_RE.find_iter(query) {
+        let year: u32 = m.as_str().parse().unwrap();
+        if (1800..=2100).contains(&year)
+            || spans.iter().any(|(s, e)| m.start() < *e && m.end() > *s)
+            || est_une_quantite(query, m.start(), m.end())
+            || est_un_texte(query, m.start())
+        {
+            continue;
+        }
+        push(m.as_str().to_string(), &[], true);
+        push(format!("0{}", m.as_str()), &[], true);
+    }
+    out
+}
+
+/// The ECLIs a query carries, upper-cased as the fonds stores them.
+pub fn query_eclis(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for caps in QUERY_DOCKET_RE.captures_iter(query) {
+        if let Some(m) = caps.name("ecli") {
+            let ecli = m.as_str().to_uppercase();
+            if !out.contains(&ecli) {
+                out.push(ecli);
+            }
         }
     }
     out
@@ -150,7 +246,16 @@ pub fn query_docket_keys(query: &str) -> Vec<String> {
 pub fn declares_reference_explicitly(query: &str) -> bool {
     QUERY_DOCKET_RE
         .find_iter(query)
-        .any(|m| marque_explicite(query, &m))
+        .any(|m| marque_explicite(query, &m) && !est_un_texte(query, m.start()))
+}
+
+/// The whole query is a run of six digits or more, a length no postcode and no
+/// year reach. Of the 164 distinct such numbers in 60 days of history, 155 name
+/// a decision of the fonds, against 12 of the 17 five-digit ones, which stay
+/// bare (03/09/2026).
+pub fn bare_number_declares(query: &str) -> bool {
+    let seule = query.trim();
+    seule.len() >= 6 && seule.bytes().all(|b| b.is_ascii_digit()) && is_bare_number(seule)
 }
 
 /// The number is the whole query. Too weak to pick a search mode on its own:
@@ -172,6 +277,10 @@ fn marque_explicite(query: &str, m: &regex::Match) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keys(query: &str) -> Vec<String> {
+        query_numbers(query).into_iter().map(|n| n.key).collect()
+    }
 
     #[test]
     fn les_trois_epoques_du_tribunal_des_conflits_donnent_le_meme_ordinal() {
@@ -208,10 +317,10 @@ mod tests {
 
     #[test]
     fn extraction_depuis_la_requete() {
-        assert_eq!(query_docket_keys("pourvoi 19-20.682"), ["1920682"]);
-        assert_eq!(query_docket_keys("Douai 22/01772 sociale"), ["2201772"]);
-        assert_eq!(query_docket_keys("CE 427345"), ["427345"]);
-        assert!(query_docket_keys("congés payés").is_empty());
+        assert_eq!(keys("pourvoi 19-20.682"), ["1920682"]);
+        assert_eq!(keys("Douai 22/01772 sociale"), ["2201772"]);
+        assert_eq!(keys("CE 427345"), ["427345"]);
+        assert!(keys("congés payés").is_empty());
     }
 
     /// Le rôle des tribunaux de commerce et des activités économiques compte dix
@@ -220,13 +329,10 @@ mod tests {
     /// numéro faisait descendre la cible au lieu de la remonter.
     #[test]
     fn le_role_a_dix_chiffres_des_tribunaux_de_commerce() {
-        assert_eq!(query_docket_keys("2022021570"), ["2022021570"]);
+        assert_eq!(keys("2022021570"), ["2022021570"]);
+        assert_eq!(keys("TAE Paris RG n° 2022021570"), ["2022021570"]);
         assert_eq!(
-            query_docket_keys("TAE Paris RG n° 2022021570"),
-            ["2022021570"]
-        );
-        assert_eq!(
-            query_docket_keys("tribunal de commerce de Lille 2026015202"),
+            keys("tribunal de commerce de Lille 2026015202"),
             ["2026015202"]
         );
     }
@@ -236,25 +342,22 @@ mod tests {
     #[test]
     fn les_numeros_du_trafic_reel() {
         assert_eq!(
-            query_docket_keys("2302081 Montreuil marocain passeport talent carte bleue européenne"),
+            keys("2302081 Montreuil marocain passeport talent carte bleue européenne"),
             ["2302081"]
         );
         assert_eq!(
-            query_docket_keys(
+            keys(
                 "\"402006\" Croë Suisse cession à un prix significativement inférieur à la valeur vénale"
             ),
             ["402006"]
         );
         assert_eq!(
-            query_docket_keys("\"412010\" prescription quadriennale créance indemnitaire"),
+            keys("\"412010\" prescription quadriennale créance indemnitaire"),
             ["412010"]
         );
-        assert_eq!(
-            query_docket_keys("requête n° 36760/06 Stanev c. Bulgarie"),
-            ["3676006"]
-        );
-        assert_eq!(query_docket_keys("CEDH 31399/23"), ["3139923"]);
-        assert!(query_docket_keys("décision du 12/03/2024 sur le permis").is_empty());
+        assert_eq!(keys("requête n° 36760/06 Stanev c. Bulgarie"), ["3676006"]);
+        assert_eq!(keys("CEDH 31399/23"), ["3139923"]);
+        assert!(keys("décision du 12/03/2024 sur le permis").is_empty());
     }
 
     /// Les trois montants qui coûtaient la recherche entière : rôles du Conseil
@@ -269,7 +372,7 @@ mod tests {
             "chiffre d'affaires de 850000 €",
             "commune de 120000 habitants",
         ] {
-            assert!(query_docket_keys(q).is_empty(), "requête {q:?}");
+            assert!(keys(q).is_empty(), "requête {q:?}");
         }
     }
 
@@ -277,15 +380,13 @@ mod tests {
     /// un rôle structuré n'est jamais concerné.
     #[test]
     fn le_garde_fou_epargne_les_vrais_roles() {
-        assert_eq!(query_docket_keys("dommages n° 250000"), ["250000"]);
+        assert_eq!(keys("dommages n° 250000"), ["250000"]);
         assert_eq!(
-            query_docket_keys("indemnité de 150000 euros pourvoi 19-20.682"),
+            keys("indemnité de 150000 euros pourvoi 19-20.682"),
             ["1920682"]
         );
         assert_eq!(
-            query_docket_keys(
-                "\"402006\" Croë Suisse cession à un prix inférieur à la valeur vénale"
-            ),
+            keys("\"402006\" Croë Suisse cession à un prix inférieur à la valeur vénale"),
             ["402006"]
         );
     }
@@ -297,9 +398,9 @@ mod tests {
     /// remplacer ; quatre chiffres restent dehors, l'année y tomberait.
     #[test]
     fn les_bornes_des_chiffres_nus() {
-        assert_eq!(query_docket_keys("11552"), ["11552"]);
+        assert_eq!(keys("11552"), ["11552"]);
         assert_eq!(
-            query_docket_keys("bail commercial 75001 Paris"),
+            keys("bail commercial 75001 Paris"),
             ["75001"],
             "le code postal entre en clé"
         );
@@ -308,22 +409,19 @@ mod tests {
                 && !is_bare_number("bail commercial 75001 Paris"),
             "mais il ne fait pas loi"
         );
-        assert!(query_docket_keys("arrêt de 1965").is_empty());
-        assert!(query_docket_keys("12345678901").is_empty());
+        assert!(keys("arrêt de 1965").is_empty());
+        assert!(keys("12345678901").is_empty());
     }
 
     #[test]
     fn extraction_des_graphies_a_lettres() {
-        assert_eq!(query_docket_keys("CAA Paris 21PA01295"), ["21pa01295"]);
-        assert_eq!(query_docket_keys("caa douai n° 22da00744"), ["22da00744"]);
-        assert_eq!(query_docket_keys("99PA2653"), ["99pa2653"]);
-        assert_eq!(query_docket_keys("TCOM Paris 2005J00072"), ["2005j00072"]);
-        assert_eq!(query_docket_keys("CJUE C-369/90 Micheletti"), ["c36990"]);
-        assert_eq!(query_docket_keys("T-99/98"), ["t9998"]);
-        assert_eq!(
-            query_docket_keys("délibération SAN-2022-019"),
-            ["san2022019"]
-        );
+        assert_eq!(keys("CAA Paris 21PA01295"), ["21pa01295"]);
+        assert_eq!(keys("caa douai n° 22da00744"), ["22da00744"]);
+        assert_eq!(keys("99PA2653"), ["99pa2653"]);
+        assert_eq!(keys("TCOM Paris 2005J00072"), ["2005j00072"]);
+        assert_eq!(keys("CJUE C-369/90 Micheletti"), ["c36990"]);
+        assert_eq!(keys("T-99/98"), ["t9998"]);
+        assert_eq!(keys("délibération SAN-2022-019"), ["san2022019"]);
     }
 
     /// Ce qu'une requête juridique écrit couramment et qui n'est pas un numéro de
@@ -339,13 +437,29 @@ mod tests {
             "2024-02-13",
             "arrêt du 13 février 2024",
         ] {
-            assert!(query_docket_keys(q).is_empty(), "requête {q:?}");
+            assert!(keys(q).is_empty(), "requête {q:?}");
         }
+    }
+
+    /// The number of a text or of an article designates no decision, whatever
+    /// its graphy: `2008/48` has the Strasbourg shape.
+    #[test]
+    fn le_numero_d_un_texte_n_est_pas_celui_d_une_decision() {
+        for q in [
+            "déchéance du droit aux intérêts article 23 directive 2008/48",
+            "règlement (UE) 2016/679 données personnelles",
+            "directive n° 2008/48",
+            "conseil d'état article 1384",
+        ] {
+            assert!(keys(q).is_empty(), "requête {q:?}");
+            assert!(!declares_reference_explicitly(q), "requête {q:?}");
+        }
+        assert_eq!(keys("ordonnance n° 2403127"), ["2403127"]);
     }
 
     #[test]
     fn deux_graphies_du_meme_numero_dans_une_requete_donnent_une_cle() {
-        assert_eq!(query_docket_keys("19-20312 ou 1920312"), ["1920312"]);
+        assert_eq!(keys("19-20312 ou 1920312"), ["1920312"]);
     }
 
     /// Les quatre façons de désigner un numéro comme un numéro, contre le chiffre
@@ -376,6 +490,94 @@ mod tests {
                 "chiffre nu ou prose {q:?}"
             );
         }
+    }
+
+    /// Six digits standing alone are a docket number and nothing else ; five are
+    /// still a postcode, and a number inside a question is a clue, not the request.
+    #[test]
+    fn le_chiffre_nu_declare_a_partir_de_six() {
+        for q in ["2503146", " 1702092 ", "335033", "2022021570"] {
+            assert!(bare_number_declares(q), "numéro nu {q:?}");
+        }
+        for q in [
+            "75013",
+            "33260",
+            "5911",
+            "387763 Czabaj délai raisonnable",
+            "licenciement sans cause réelle",
+        ] {
+            assert!(!bare_number_declares(q), "ni numéro nu ni assez long {q:?}");
+        }
+    }
+
+    /// Four digits beside a court name are a number the fonds may write with a
+    /// leading zero, weak because a year has the same shape: they buy a card,
+    /// never a mode. Alone, or beside a year, they stay a year.
+    #[test]
+    fn quatre_chiffres_pres_d_une_cour_sont_un_numero_faible() {
+        let faibles = query_numbers("5911 conseil d'etat 1978");
+        assert_eq!(
+            faibles.iter().map(|n| n.key.as_str()).collect::<Vec<_>>(),
+            ["5911", "05911"]
+        );
+        assert!(faibles.iter().all(|n| n.weak));
+        assert!(!is_bare_number("5911"));
+        assert!(!declares_reference_explicitly("5911 conseil d'etat 1978"));
+        for q in [
+            "5911",
+            "conseil d'état 1920",
+            "conseil d'état 2024 expulsion",
+            "CE 3000 euros",
+        ] {
+            assert!(keys(q).is_empty(), "requête {q:?}");
+        }
+        assert!(query_numbers("CE 427345 1978").iter().all(|n| !n.weak));
+    }
+
+    /// The graphy names the order: a pourvoi is the Cour de cassation, an RG a
+    /// judicial court, `2010-104 QPC` the Conseil constitutionnel, whose key
+    /// `2010104` two tribunaux administratifs and a CNIL deliberation share.
+    #[test]
+    fn la_graphie_dit_a_quelles_cours_le_numero_appartient() {
+        let un = |q: &str| {
+            let mut n = query_numbers(q);
+            assert_eq!(n.len(), 1, "requête {q:?}");
+            n.pop().unwrap()
+        };
+        assert_eq!(un("23-14.835").courts, ["CC"]);
+        assert!(un("2314835").courts.is_empty());
+        assert_eq!(un("19/06545").courts, ["CA", "TJ", "TCOM"]);
+        assert_eq!(un("44759/98").courts, ["CEDH", "CJUE"]);
+        assert_eq!(un("C-369/90").courts, ["CJUE"]);
+        assert!(un("21PA01295").courts.is_empty());
+        let qpc = un("2010-104 QPC 17 mars 2011");
+        assert_eq!(
+            (qpc.key.as_str(), qpc.courts),
+            ("2010104", &["CONSTIT"][..])
+        );
+        assert_eq!(
+            un("86-215 dc conseil constitutionnel 3 septembre 1986").key,
+            "86215"
+        );
+        assert_eq!(un("\"2026-915 DC\"").key, "2026915");
+        assert!(is_bare_number("2010-104 QPC"));
+        assert!(declares_reference_explicitly("2010-104 QPC"));
+    }
+
+    #[test]
+    fn l_ecli_est_une_reference_a_part() {
+        assert_eq!(
+            query_eclis("ecli:fr:ccass:2007:c200527"),
+            ["ECLI:FR:CCASS:2007:C200527"]
+        );
+        assert_eq!(
+            query_eclis("ECLI:EU:T:2026:513 rejet"),
+            ["ECLI:EU:T:2026:513"]
+        );
+        assert!(keys("ecli:fr:ccass:2007:c200527").is_empty());
+        assert!(is_bare_number("ECLI:FR:CCASS:2007:C200527"));
+        assert!(declares_reference_explicitly("ecli:fr:ccass:2007:c200527"));
+        assert!(query_eclis("congés payés").is_empty());
     }
 
     #[derive(serde::Deserialize)]

@@ -12,19 +12,28 @@ directory can enumerate the tools without one; a call needs it.
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "librejustice"
 VERSION = "0.1.0"
 
-SURFACE = Path(__file__).resolve().parent.parent / "packages/lj-dtos/data/mcp-tools.json"
+SURFACE = Path(__file__).resolve().parent.parent / "packages/lj-mcp-tools/data/mcp-tools.json"
 
 _surface = json.loads(SURFACE.read_text(encoding="utf-8"))
+PROTOCOL_VERSIONS = _surface["protocolVersions"]
+
+
+class MethodNotFound(Exception):
+    """JSON-RPC -32601, where a bad argument is -32602 and a failed call -32603."""
+
+
+class UnknownTool(Exception):
+    pass
 
 # Repeatable filters of `search_decisions`, whose query keys are camelCase.
 SEARCH_LISTS = {
@@ -81,62 +90,72 @@ def search_decisions(args):
     return "/api/search", params
 
 
-def search_legal_texts(args):
+def search_norms(args):
     return "/api/search-textes", scalars(args, TEXTS_SCALARS)
 
 
 def get_decision(args):
     url = args.get("url") or ""
     _, sep, tail = url.rpartition("/decision/")
-    if not sep or not tail:
-        raise ValueError(f"not a decision url (expected …/decision/{{id}}): {url or '(missing)'}")
-    return f"/api/decision/{urllib.parse.quote(tail.strip('/'), safe='')}", []
+    key = tail.strip("/").rpartition("/")[2]
+    if not sep or not key:
+        raise ValueError(
+            f"not a decision url (expected …/decision/{{juridiction}}/{{id}}): {url or '(missing)'}"
+        )
+    return f"/api/decision/{urllib.parse.quote(key, safe='')}", []
 
 
-def get_legal_text(args):
+def get_norm(args):
     date = [("date", args["date"])] if args.get("date") else []
     return legal_text_path(args), date
 
 
+# Today's prefix first; the two older ones still name a text.
+LEGAL_TEXT_PREFIXES = ("/norm/", "/texte/", "/loi/")
+
+LEGIFRANCE_ID = re.compile(r"(LEGIARTI|JORFARTI|KALIARTI|LEGITEXT|JORFTEXT|LEGISCTA)[0-9]+$")
+
+
 def legal_text_path(args):
-    """The four doors of `get_legal_text`, in the order it reads them."""
+    """The four doors of `get_norm`, in the order it reads them."""
     url = args.get("url") or ""
     ident = args.get("textId") or ""
-    if url.startswith("LEGIARTI") or ident:
+    if LEGIFRANCE_ID.match(url) or ident:
         return f"/api/article/{urllib.parse.quote(ident or url, safe='')}"
     if url:
-        _, sep, tail = url.rpartition("/texte/")
-        if not sep or not tail:
+        tail = next((url.rpartition(p)[2] for p in LEGAL_TEXT_PREFIXES if p in url), "")
+        if not tail.strip("/"):
             raise ValueError(
-                f"not a legal text url (expected …/texte/{{code}}[/{{article}}]): {url}"
+                f"not a legal text url (expected …/norm/{{juridiction}}/{{code}}[/{{article}}]): {url}"
             )
-        return "/api/texte/" + tail.strip("/")
+        return "/api/norm/" + tail.strip("/")
     code = args.get("code")
     if not code:
         raise ValueError(
             "missing tool argument: url. Address the text by url "
-            "(/texte/{code}/{article}), by the pair {code, article}, or by a LEGIARTI id."
+            "(/norm/{juridiction}/{code}/{article}), by the pair {code, article}, or by a "
+            "Légifrance id."
         )
-    path = "/api/texte/" + urllib.parse.quote(code, safe="")
+    path = "/api/norm/" + urllib.parse.quote(code, safe="")
     article = args.get("article")
     return f"{path}/{urllib.parse.quote(article, safe='')}" if article else path
 
 
-# A tool absent here is absent from `tools/list`: `list_my_activity` reports what
-# the site and the hosted connector recorded, which this process cannot read.
+# A tool absent here is absent from `tools/list`.
 ROUTES = {
     "search_decisions": search_decisions,
-    "search_legal_texts": search_legal_texts,
+    "search_norms": search_norms,
     "get_decision": get_decision,
-    "get_legal_text": get_legal_text,
+    "get_norm": get_norm,
 }
 
 
 def dispatch(request, settings):
     method = request.get("method", "")
     if method == "initialize":
+        asked = (request.get("params") or {}).get("protocolVersion")
         return {
-            "protocolVersion": PROTOCOL_VERSION,
+            "protocolVersion": asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": VERSION},
             "instructions": _surface["instructions"],
@@ -147,14 +166,14 @@ def dispatch(request, settings):
         return {"tools": [t for t in _surface["tools"] if t["name"] in ROUTES]}
     if method == "tools/call":
         return call(request.get("params") or {}, settings)
-    raise ValueError(f"unknown method: {method}")
+    raise MethodNotFound(f"method not found: {method}")
 
 
 def call(params, settings):
     name = params.get("name", "")
     route = ROUTES.get(name)
     if route is None:
-        raise ValueError(f"unknown tool: {name}")
+        raise UnknownTool(f"Unknown tool: {name}")
     path, query = route(params.get("arguments") or {})
     payload = fetch(path, query, settings)
     return {
@@ -219,10 +238,11 @@ def main():
         try:
             body = {"jsonrpc": "2.0", "id": request["id"], "result": dispatch(request, settings)}
         except Exception as error:
+            code = {MethodNotFound: -32601, UnknownTool: -32602}.get(type(error), -32603)
             body = {
                 "jsonrpc": "2.0",
                 "id": request["id"],
-                "error": {"code": -32603, "message": str(error)},
+                "error": {"code": code, "message": str(error)},
             }
         print(json.dumps(body, ensure_ascii=False), flush=True)
 

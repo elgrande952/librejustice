@@ -15,12 +15,12 @@ pub fn Privacy() -> impl IntoView {
                 "Politique de confidentialité"
             </h1>
             <p class="mt-2 text-xs uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
-                "En vigueur au 20 juillet 2026"
+                "En vigueur au 28 septembre 2026"
             </p>
 
             <Section title="Responsable de traitement">
                 <p>
-                    "Iris Sainte Fare Garnot (entrepreneur individuel, SIRET 922 108 600 00011), éditeur de "
+                    "Iris Sainte Fare Garnot (entrepreneur individuel, SIRET 922 108 600 00029), éditeur de "
                     <strong>"librejustice.fr"</strong>
                     ". Contact : "
                     <a
@@ -36,34 +36,30 @@ pub fn Privacy() -> impl IntoView {
             <Section title="Données collectées">
                 <p>
                     <strong>"Compte utilisateur."</strong>
-                    " Adresse email, identifiant interne, nom affiché si renseigné, et identifiant du fournisseur OAuth si vous vous connectez via Google. Effacé à la suppression du compte."
+                    " Votre adresse e-mail, votre nom si vous l'avez indiqué, et votre identifiant Google ou Microsoft si vous vous connectez par l'un d'eux. Nous notons aussi la langue de votre navigateur, votre pays, la date de votre inscription et celle de votre dernière visite. Si vous connectez un assistant IA à votre compte, nous lui transmettons votre adresse e-mail. Tout est effacé quand vous supprimez votre compte. Nous gardons aussi la trace des e-mails que nous vous envoyons et de votre éventuel désabonnement."
                 </p>
                 <p class="mt-3">
-                    <strong>"Signets et historique de recherche."</strong>
-                    " Identifiants des décisions sauvegardées, termes saisis, filtres appliqués. Attachés à votre compte, lus uniquement pour vous afficher vos propres listes. Supprimables à tout moment, entrée par entrée ou en bloc."
+                    <strong>"Signets."</strong>
+                    " Les décisions que vous avez mises de côté. Vous seul les voyez, et vous pouvez les retirer à tout moment."
                 </p>
                 <p class="mt-3">
-                    <strong>"Traces applicatives."</strong>
-                    " Latences, erreurs, chemins d'URL et termes recherchés. Ni adresse IP, ni identité en clair. Conservation : 14 jours."
+                    <strong>"Journaux techniques."</strong>
+                    " Le fonctionnement du service repose sur des journaux applicatifs et des traces de performance, qui servent à mesurer les temps de réponse et à diagnostiquer les erreurs. Ils peuvent contenir les paramètres des requêtes, dont les termes de recherche, ainsi que le type de client utilisé (navigateur, API ou assistant IA). Ces données sont pseudonymisées : aucun nom ni adresse e-mail n'y figure, l'utilisateur n'y apparaît que sous un identifiant technique dérivé. Elles sont supprimées automatiquement au bout de 30 jours."
+                </p>
+                <p class="mt-3">
+                    <strong>"Mesure d'audience."</strong>
+                    " Pour suivre l'utilisation du service et orienter ses évolutions, nous produisons des indicateurs de fréquentation consolidés à la journée : le volume des recherches et des consultations, et leur répartition par canal d'accès. Ces indicateurs agrégés reposent sur de simples décomptes, sans conserver les paramètres ou le contenu des requêtes individuelles. Ils ne font appel à aucun cookie ni traceur, et aucune adresse IP n'est enregistrée."
                 </p>
                 <p class="mt-3">
                     <strong>"Signalement d'un problème."</strong>
-                    " Le texte de votre message, l'adresse de la page concernée (y compris les termes de recherche lorsqu'elle en porte), le fait que vous étiez connecté ou non, et votre adresse email si vous la donnez ou si vous êtes connecté. Envoyés par courrier à notre boîte de support, où ils sont conservés le temps de traiter la demande. Rien n'est stocké en base."
+                    " Le texte de votre message, l'adresse de la page concernée (y compris les termes de recherche lorsqu'elle en porte), le fait que vous étiez connecté ou non, et votre adresse e-mail si vous la donnez ou si vous êtes connecté. Ces éléments arrivent dans notre boîte de support, où ils sont conservés pour le suivi de votre demande."
                 </p>
             </Section>
 
             <Section title="Cookies et stockage local">
                 <p>
-                    "Aucun cookie publicitaire, aucun traceur soumis à consentement. Seulement :"
+                    "Nous n'utilisons aucun cookie publicitaire ni aucun traceur soumis à consentement. Si vous êtes connecté, votre navigateur garde seulement un jeton de session, qui s'efface à la déconnexion."
                 </p>
-                <ul class="mt-3 list-disc space-y-2 pl-5">
-                    <li>
-                        "Un jeton de session stocké dans votre navigateur si vous êtes connecté, effacé à la déconnexion."
-                    </li>
-                    <li>
-                        "Une mesure d'audience anonyme côté Cloudflare, sans cookie ni identifiant persistant."
-                    </li>
-                </ul>
             </Section>
 
             <Section title="Sous-traitants">
@@ -78,7 +74,7 @@ pub fn Privacy() -> impl IntoView {
                     </li>
                     <li>
                         <strong>"Grafana Cloud"</strong>
-                        " (New York, données à Francfort) : logs et traces."
+                        " (New York, données à Francfort) : logs, traces et mesure d'audience."
                     </li>
                     <li>
                         <strong>"Mistral AI"</strong>
@@ -86,11 +82,7 @@ pub fn Privacy() -> impl IntoView {
                     </li>
                     <li>
                         <strong>"Resend"</strong>
-                        " (San Francisco, envoi via AWS Dublin) : emails de service (confirmation, réinitialisation)."
-                    </li>
-                    <li>
-                        <strong>"Brevo"</strong>
-                        " (Paris) : emails d'information et séquences de bienvenue."
+                        " (San Francisco, envoi via AWS Dublin) : e-mails de service (confirmation, réinitialisation) et e-mails d'information."
                     </li>
                 </ul>
             </Section>
@@ -107,7 +99,7 @@ pub fn Privacy() -> impl IntoView {
                     >
                         "contact@librejustice.fr"
                     </a>
-                    ", en indiquant l'URL de la page concernée. Réponse sous un mois au plus."
+                    ", en indiquant l'adresse de la page concernée. Réponse sous un mois au plus."
                 </p>
             </Section>
 
@@ -123,7 +115,7 @@ pub fn Privacy() -> impl IntoView {
                     >
                         "page profil"
                     </A>
-                    " efface immédiatement votre compte, vos signets et votre historique."
+                    " efface immédiatement votre compte et vos signets."
                 </p>
                 <p class="mt-3">
                     "Pour toute autre demande, écrivez à "

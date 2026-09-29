@@ -1,13 +1,12 @@
-//! Barre de décision sticky : contexte partagé + passage d'état
-//! recherche→décision.
+//! Sticky decision bar: shared context and search-to-decision state handoff.
 //!
-//! `leptos_router` n'a pas d'équivalent riche à `location.state`. On le
-//! remplace par deux contextes réactifs fournis au shell :
-//! - `DecisionBarSignal` : ce que la `TopBar` affiche (titre, nav, retour).
-//! - `ResultNavSignal` : « graine » posée au clic par une carte résultat / une
-//!   voisine / le widget prev-next, lue UNE fois par `DecisionHeader` au montage
-//!   pour construire la barre. One-shot (consommée au montage) : un lien décision
-//!   sans graine (activité, lien direct) ne réutilise pas une nav obsolète.
+//! `leptos_router` has no rich equivalent of `location.state`, so two reactive
+//! contexts provided to the shell stand in for it:
+//! - `DecisionBarSignal`: what the `TopBar` shows (title, nav, back).
+//! - `ResultNavSignal`: a seed set on click by a result card, a neighbour or the
+//!   prev-next widget, read ONCE by `DecisionHeader` on mount to build the bar.
+//!   One-shot: a decision link without a seed (bookmarks, direct link) never
+//!   reuses a stale nav.
 
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -23,17 +22,17 @@ pub struct FromSearch {
 }
 
 /// Navigation inter-résultats : la liste servie, dont se dérivent le rang, le
-/// compte et précédent/suivant à l'`id` courant.
+/// compte et précédent/suivant au chemin courant.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResultNav {
-    pub hit_ids: Vec<String>,
+    pub hit_paths: Vec<String>,
 }
 
 /// État affiché par la barre sticky.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecisionBarState {
     pub title: String,
-    pub id: String,
+    pub path: String,
     pub nav: Option<ResultNav>,
     pub from_search: Option<FromSearch>,
 }
@@ -60,12 +59,17 @@ pub type SeedMemorySignal = StoredValue<std::collections::HashMap<String, Result
 /// directement à la bonne position, sans saut.
 pub type RestoreScrollSignal = RwSignal<Option<f64>>;
 
+/// The anonymisation workbench on screen, whose controls the `TopBar` carries
+/// while a document is open.
+pub type WorkbenchSignal = RwSignal<Option<crate::pages::redact::Session>>;
+
 /// Fournit les signaux au contexte (appelé par `AppShell`, ancêtre de la
 /// `TopBar` et des pages routées — donc persistant à travers les navigations).
 pub fn provide_decision_bar_contexts() {
     provide_context::<DecisionBarSignal>(RwSignal::new(None));
     provide_context::<ResultNavSignal>(RwSignal::new(None));
     provide_context::<RestoreScrollSignal>(RwSignal::new(None));
+    provide_context::<WorkbenchSignal>(RwSignal::new(None));
     provide_context::<SeedMemorySignal>(StoredValue::new(std::collections::HashMap::new()));
 }
 

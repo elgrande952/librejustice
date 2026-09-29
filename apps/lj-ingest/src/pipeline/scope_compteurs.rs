@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, bail, Result};
 use chrono::NaiveDate;
 
-use lj_core::article_order::num_key_sort_key;
-use lj_core::compteurs::{compteur_has_table, parse_compteur, parse_compteur_table, TargetRef};
+use lj_norm::article_order::num_key_sort_key;
+use lj_norm::compteurs::{compteur_has_table, parse_compteur, parse_compteur_table, TargetRef};
 use lj_store::repository::{ArticleScopeRow, DecisionRepository};
 
 use crate::config::Settings;
@@ -54,7 +54,7 @@ pub(super) struct ResolvedTargets {
 /// d'article entier, choix de version — ancre de rédaction (`min date_debut
 /// >= D`) ou gel à la date `at` du porteur.
 pub(super) fn resolve_event_targets(
-    event: &lj_core::compteurs::CounterEvent,
+    event: &lj_norm::compteurs::CounterEvent,
     versions: &VersionsByKey,
     at: NaiveDate,
 ) -> ResolvedTargets {
@@ -139,7 +139,7 @@ pub(super) fn resolve_event_targets(
 }
 
 /// La cible venait-elle d'une ancre de rédaction explicite ?
-pub(super) fn event_anchored(event: &lj_core::compteurs::CounterEvent) -> bool {
+pub(super) fn event_anchored(event: &lj_norm::compteurs::CounterEvent) -> bool {
     event.redaction_date.is_some()
 }
 
@@ -205,7 +205,7 @@ pub async fn scope_backfill_compteurs(
                             text_uid = %compteur.text_uid,
                             num = %compteur.num,
                             lignes = ?table.unrecognized,
-                            "lignes de tableau non reconnues"
+                            "table rows not recognised"
                         );
                     }
                     events.extend(table.events);
@@ -366,9 +366,9 @@ pub async fn scope_backfill_compteurs(
     if apply {
         let tag = format!("compteur:{scope_uid} ");
         let (deleted, inserted) = repo.replace_article_scopes(&tag, &rows).await?;
-        println!("article_scope : {deleted} supprimées, {inserted} insérées");
+        println!("article_scope: {deleted} deleted, {inserted} inserted");
     } else {
-        println!("dry-run — relancer avec --apply pour écrire");
+        println!("dry-run, re-run with --apply to write");
     }
     Ok(())
 }

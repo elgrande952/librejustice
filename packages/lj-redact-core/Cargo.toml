@@ -1,0 +1,41 @@
+[package]
+name = "lj-redact-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+lj-fold = { workspace = true }
+memchr = { workspace = true }
+
+lj-office = { workspace = true, optional = true }
+lj-draw = { workspace = true, optional = true }
+lj-pdf = { workspace = true, optional = true }
+
+[features]
+default = ["pdf", "office", "embed-cmaps"]
+pdf = ["dep:lj-pdf", "dep:lj-draw"]
+office = ["dep:lj-office"]
+# Compiled in natively; the browser module fetches the CMaps a document asks for.
+embed-cmaps = ["pdf", "lj-pdf/embed-cmaps"]
+
+# The `redact` example, which a bench spawns once per file or per batch.
+[dev-dependencies]
+libc = { workspace = true }
+quick-xml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+
+[[example]]
+name = "redact"
+required-features = ["office", "pdf"]
+
+[[example]]
+name = "image_timing"
+required-features = ["pdf"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lj-workspace-hack = { version = "0.1", path = "../lj-workspace-hack" }

@@ -2,9 +2,9 @@
 //! statiques, dans un seul process axum partageant un `AppState` construit **une
 //! fois**. Écoute en HTTP clair : le TLS d'origine est terminé par le front `caddy`.
 //!
-//! Le rendu SSR appelle la couche service `lj-api` **in-process** (l'`AppState` est
-//! fourni au contexte Leptos par `leptos_routes_with_context`, lu par
-//! `lj_web::api::ApiClient`) ; le navigateur tape `/api` en HTTP same-origin.
+//! The SSR render calls the `lj-api` service layer in-process: the
+//! `lj_web::api::ApiClient` provided to the Leptos context delegates to
+//! `web_backend`. The browser calls `/internal` over same-origin HTTP.
 
 use anyhow::Result;
 use axum::body::{Body, Bytes, HttpBody};
@@ -24,6 +24,7 @@ use tower_http::set_header::SetResponseHeader;
 use tracing::Instrument as _;
 
 mod tracing_executor;
+mod web_backend;
 
 // Runtime **mono-thread** : le SSR Leptos crée des valeurs `_local` (!Send)
 // stockées dans l'Owner réactif ; sur un runtime multi-thread leur drop peut
@@ -46,11 +47,8 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let settings = Settings::from_env()?;
-    // Guard à garder vivant : son `Drop` flush les batch processors OTLP.
     let _telemetry_guard = telemetry::init_telemetry(&settings)?;
     install_panic_hook();
-    // À poser avant la première requête : sinon `leptos_axum` installe l'exécuteur
-    // tokio nu, qui perd le span courant à chaque resource.
     tracing_executor::install()?;
 
     let pool = db::build_pool(&settings.db_url, settings.pool_max)?;
@@ -66,7 +64,7 @@ async fn run() -> Result<()> {
                 .deployment_environment
                 .as_deref()
                 .unwrap_or("(absent)"),
-            "scrapers de ressources partagées inactifs"
+            "shared-resource scrapers off"
         );
     }
 
@@ -74,10 +72,10 @@ async fn run() -> Result<()> {
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = lj_api::jurisdiction_hubs::catalogue(&state).await {
-                tracing::warn!("warm-up catalogue juridictions: {e}");
+                tracing::warn!("jurisdiction catalogue warm-up failed: {e}");
             }
             if let Err(e) = lj_api::norm_hubs::catalogue(&state).await {
-                tracing::warn!("warm-up catalogue normes: {e}");
+                tracing::warn!("norm catalogue warm-up failed: {e}");
             }
         });
     }
@@ -131,16 +129,33 @@ async fn run() -> Result<()> {
         axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
 
-    // Routeur SSR Leptos : l'`AppState` est fourni au contexte de chaque requête (le
-    // client SSR `lj-web` l'y lit pour appeler la couche service in-process). Le
-    // fallback reçoit le même contexte : le Router Leptos matche les chemins à slash
-    // final (`/codes/`) sur leurs routes (`/codes`) alors qu'axum ne les route pas,
-    // donc son rendu traverse de vraies pages, qui lisent l'`AppState`. On redirige
-    // d'abord ces chemins vers la forme canonique sans slash.
+    // These names carry no fingerprint: they revalidate on every load, and an
+    // unchanged module answers 304.
+    let site_root = std::path::PathBuf::from(leptos_options.site_root.to_string());
+    let redactor_service = SetResponseHeader::overriding(
+        SetResponseHeader::overriding(
+            ServeDir::new(site_root.join("redactor"))
+                .precompressed_br()
+                .precompressed_gzip(),
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("public, no-cache"),
+        ),
+        axum::http::header::VARY,
+        axum::http::HeaderValue::from_static("accept-encoding"),
+    );
+
+    // The front's SSR client is provided to the context of every request. The
+    // fallback gets the same context: the Leptos router matches trailing-slash
+    // paths (`/codes/`) to their routes (`/codes`) where axum does not, so its
+    // render goes through real pages, which read that client. Those paths are
+    // first redirected to their canonical form without the slash.
+    let web_client = lj_web::api::ApiClient::new(web_backend::ServiceBackend {
+        state: state.clone(),
+    });
     let leptos_fallback = leptos_axum::file_and_error_handler_with_context(
         {
-            let state = state.clone();
-            move || provide_context(state.clone())
+            let web_client = web_client.clone();
+            move || provide_context(web_client.clone())
         },
         shell,
     );
@@ -149,8 +164,8 @@ async fn run() -> Result<()> {
             &leptos_options,
             routes,
             {
-                let state = state.clone();
-                move || provide_context(state.clone())
+                let web_client = web_client.clone();
+                move || provide_context(web_client.clone())
             },
             {
                 let leptos_options = leptos_options.clone();
@@ -179,12 +194,13 @@ async fn run() -> Result<()> {
             },
         )
         .with_state(leptos_options)
-        // Racine de trace des pages SSR ; dans l'ordre `.layer`, le dernier est le plus
-        // externe. `OtelAxumLayer` ouvre le span serveur semconv (`{method} {route}`,
-        // `http.response.status_code`), `body_in_request_span` l'étend au rendu du corps.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             lj_api::page_gates::session_gates,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ancienne_adresse,
         ))
         .layer(axum::middleware::from_fn(body_in_request_span))
         .layer(OtelAxumLayer::default());
@@ -223,22 +239,13 @@ async fn run() -> Result<()> {
             "/mcp",
             axum::routing::get(|| async { axum::response::Redirect::temporary("/mcp/") }),
         )
-        // Anciennes routes → pages actuelles, query préservée, en 308 : un alias est une
-        // redirection HTTP, pas une page rendue.
-        .route("/recherche", redirect_preserving_query("/decisions"))
-        .route(
-            "/recherche-decisions",
-            redirect_preserving_query("/decisions"),
-        )
-        .route("/recherche-textes", redirect_preserving_query("/textes"))
         .route(
             "/mentions-legales",
             redirect_preserving_query("/legal-notice"),
         )
         .route("/confidentialite", redirect_preserving_query("/privacy"))
-        // Routes d'auth renommées en anglais : les liens français dorment encore
-        // dans des boîtes mail et des favoris, la query (jeton, next) doit
-        // survivre au 308.
+        // French auth links still sit in mailboxes and bookmarks: their query
+        // (token, next) survives the redirect.
         .route("/confirmer", redirect_preserving_query("/confirm"))
         .route(
             "/reinitialiser-mot-de-passe",
@@ -246,68 +253,23 @@ async fn run() -> Result<()> {
         )
         .route("/profil", redirect_preserving_query("/profile"))
         .route("/connexion", redirect_preserving_query("/login-link"))
-        // Activité : une route explicite par onglet sous `/activity/` ; `/activity` nu
-        // redirige vers l'onglet recherches.
-        .route("/activity", redirect_preserving_query("/activity/searches"))
-        .route("/activite", redirect_preserving_query("/activity/searches"))
-        .route(
-            "/activite/recherches",
-            redirect_preserving_query("/activity/searches"),
-        )
-        .route(
-            "/activite/signets",
-            redirect_preserving_query("/activity/bookmarks"),
-        )
-        .route(
-            "/activite/lectures",
-            redirect_preserving_query("/activity/readings"),
-        )
-        .route(
-            "/recherches",
-            redirect_preserving_query("/activity/searches"),
-        )
-        .route("/signets", redirect_preserving_query("/activity/bookmarks"))
-        .route("/lectures", redirect_preserving_query("/activity/readings"))
-        .route(
-            "/codes",
-            axum::routing::get(|| async { axum::response::Redirect::permanent("/normes/codes") }),
-        )
-        // Wildcard `/loi/*` → `/texte/*` : `uri.path()` reste percent-encodé tel quel,
-        // aucune réécriture des segments.
-        .route(
-            "/loi/{*rest}",
-            axum::routing::get(|uri: axum::http::Uri| async move {
-                let path = uri.path().strip_prefix("/loi").unwrap_or(uri.path());
-                let dest = match uri.query() {
-                    Some(q) => format!("/texte{path}?{q}"),
-                    None => format!("/texte{path}"),
-                };
-                axum::response::Redirect::permanent(&dest)
-            }),
-        )
         .nest_service("/pkg", pkg_service)
         .nest_service("/fonts", fonts_service)
+        .nest_service("/redactor", redactor_service)
+        .layer(axum::middleware::from_fn(place_prefix_moved))
         .layer(CompressionLayer::new())
         .layer(axum::middleware::from_fn(html_cache_policy))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(axum::middleware::from_fn(pageview_span))
         .layer(axum::middleware::from_fn(crawler_trace_policy));
 
-    // Un seul chemin d'écoute : HTTP en clair sur l'adresse cargo-leptos, le TLS étant
-    // terminé par le front `caddy`. En prod le compose pose
-    // `LEPTOS_SITE_ADDR=0.0.0.0:8300` ; en dev c'est l'adresse qu'attend `cargo leptos
-    // watch`.
-    //
-    // `axum_server` est là pour son `Handle`, qui borne le drainage : une requête en
-    // vol ne peut pas retenir le process au-delà du `StopTimeout` de podman, qui
-    // l'achèverait au SIGKILL — donc sans flush des spans en file.
     let handle = axum_server::Handle::new();
     let arret = handle.clone();
     tokio::spawn(async move {
         signal_arret().await;
         arret.graceful_shutdown(Some(DRAINAGE));
     });
-    tracing::info!("lj-server écoute sur {leptos_addr}");
+    tracing::info!("lj-server listening on {leptos_addr}");
     axum_server::bind(leptos_addr)
         .handle(handle)
         .serve(app.into_make_service())
@@ -315,11 +277,6 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Hook de panique : logge la panique en `error!` — donc shippée vers Loki par le
-/// bridge — avant de déléguer au hook par défaut. Sans lui, une panique n'écrit que
-/// sur stderr, qui ne quitte jamais le serveur : le `podman logs` de la prod est le
-/// seul endroit où elle existe. Le backtrace part dans le `LogRecord` plutôt que sur
-/// stderr seul, et ne nomme ses frames que tant que le binaire garde ses symboles.
 fn install_panic_hook() {
     let defaut = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -332,9 +289,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Fenêtre laissée aux requêtes en vol après le signal d'arrêt. Tenue **sous** le
-/// `StopTimeout` de podman (10 s) : le process doit sortir de lui-même pour que le
-/// `Drop` de `TelemetryGuard` flushe les spans encore en file.
 const DRAINAGE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Attend SIGTERM (`podman stop`) ou Ctrl-C (dev).
@@ -349,21 +303,9 @@ async fn signal_arret() {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
     }
-    tracing::info!("signal d'arrêt reçu — drainage des connexions en vol");
+    tracing::info!("shutdown signal received, draining in-flight connections");
 }
 
-/// Span `pageview` d'attribution d'acquisition : émis pour les requêtes de
-/// **document** (GET, `Accept` contenant `text/html`) portant un `Referer`
-/// **externe**. Les navigations internes et les crawlers (pas de Referer) sont
-/// exclus ; aucune identité, seulement chemin d'atterrissage et origine.
-///
-/// **Une arrivée = un span** : posé après la réponse et jamais sur une
-/// redirection — le navigateur conserve le `Referer` en suivant un 301, donc la
-/// cible émet le sien.
-///
-/// **Le referer est déclaratif** : un client qui écrit `https://www.google.com/`
-/// dans l'en-tête se range dans l'organique sans avoir vu Google. D'où `client` et
-/// `country`, qui qualifient l'arrivée sans dire qui elle est.
 async fn pageview_span(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -422,16 +364,6 @@ async fn pageview_span(
     response
 }
 
-/// Soustrait à l'export de traces le crawl que personne n'attend.
-///
-/// Couche la plus externe : elle voit chaque requête, y compris celles que
-/// [`pageview_span`] laisse passer sans rien poser. La ligne est celle de
-/// [`lj_core::crawlers::Category::is_unattended`].
-///
-/// La requête part sous un span racine marqué que le sampler abandonne
-/// ([`telemetry::unattended_request_span`]) ; toute la descendance suit par
-/// `ParentBased`, y compris les spans nés après le retour d'ici. La décision se
-/// prend donc une fois, à la création du span racine.
 async fn crawler_trace_policy(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -440,8 +372,8 @@ async fn crawler_trace_policy(
         .headers()
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
-        .and_then(lj_core::crawlers::category_of)
-        .is_some_and(lj_core::crawlers::Category::is_unattended);
+        .and_then(lj_crawlers::category_of)
+        .is_some_and(lj_crawlers::Category::is_unattended);
     if unattended {
         next.run(req)
             .instrument(telemetry::unattended_request_span())
@@ -451,17 +383,6 @@ async fn crawler_trace_policy(
     }
 }
 
-/// Étend le span de la requête au **rendu du corps** de la réponse.
-///
-/// `leptos_axum` répond par un `Body::from_stream(to_html_stream_out_of_order())` :
-/// le future du handler se termine dès que l'en-tête est prêt, et tout le rendu —
-/// donc les appels service et leurs spans `db.*` — s'exécute quand hyper poll le
-/// corps.
-///
-/// On capture donc le span courant — celui qu'ouvre [`OtelAxumLayer`], monté juste
-/// au-dessus — et on le rend courant à chaque `poll_frame`. Le corps en garde un
-/// clone : le span se ferme à la fin du flux, ou plus tôt si le client raccroche et
-/// que hyper droppe le corps.
 async fn body_in_request_span(
     req: axum::extract::Request,
     next: axum::middleware::Next,
@@ -471,11 +392,6 @@ async fn body_in_request_span(
     axum::response::Response::from_parts(parts, Body::new(SpannedBody { inner: body, span }))
 }
 
-/// Corps de réponse dont chaque `poll_frame` s'exécute dans `span`.
-///
-/// Passe-plat strict par ailleurs : la frame remontée est celle du corps enveloppé,
-/// données comme trailers. `size_hint` et `is_end_stream` sont délégués — c'est ce
-/// dont hyper se sert pour poser un `Content-Length` plutôt que du chunked.
 struct SpannedBody {
     inner: Body,
     span: tracing::Span,
@@ -489,8 +405,6 @@ impl HttpBody for SpannedBody {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        // `SpannedBody` est `Unpin` (ses deux champs le sont) : pas de projection à faire,
-        // et le garde de span ne traverse aucun `await`.
         let corps = self.get_mut();
         let _entree = corps.span.enter();
         Pin::new(&mut corps.inner).poll_frame(cx)
@@ -511,7 +425,7 @@ impl HttpBody for SpannedBody {
 ///
 /// 1. le UA **quand il se déclare**. Ne remontent ici que les déplieurs de lien
 ///    (Slack, Facebook, Discord), qui posent un `Referer` ; la table complète de la
-///    politique d'accès est [`lj_core::crawlers::CRAWLERS`].
+///    politique d'accès est [`lj_crawlers::CRAWLERS`].
 /// 2. la cohérence de `Sec-Fetch-*`, qu'un moteur de rendu seul produit : une
 ///    navigation vers un document pose `Dest: document`, un client HTTP n'en pose
 ///    aucun, et un `fetch()` d'une autre origine en pose un autre.
@@ -676,7 +590,182 @@ fn build_id(hash_txt: &str) -> Option<String> {
     Some(format!("{}.{}", champ("wasm")?, champ("css")?))
 }
 
-/// Route GET répondant un 308 vers `target`, query string préservée telle quelle.
+/// Today's address of a path in an older shape or under a wrong jurisdiction, for
+/// the shapes that need no lookup. The caller drops a result equal to the path;
+/// `None` for an entity namespace no page serves.
+fn renamed_path(path: &str) -> Option<String> {
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    Some(match segs.as_slice() {
+        ["recherche" | "recherche-decisions" | "decisions"] => "/decision-search".to_string(),
+        ["recherche-textes" | "textes"] => "/norm-search".to_string(),
+        ["annonces"] => "/notice-search".to_string(),
+        ["annonces.rss"] => "/notice-search.rss".to_string(),
+        ["annonces.ics"] => "/notice-search.ics".to_string(),
+        ["annonces", "departement"] | ["notice-index"] => "/notice-index/fr".to_string(),
+        ["annonces", "departement", code] => format!("/notice-index/fr/{code}"),
+        ["marche", uid] => lj_vocab::notice_path(uid),
+        ["entite", ns, id] => {
+            lj_vocab::entity_segment(ns)?;
+            lj_vocab::entity_path(ns, id)
+        }
+        ["annuaire"] => "/entity-search".to_string(),
+        ["annuaire", kind] => format!("/entity-index/fr/{kind}"),
+        ["juridictions"] | ["decision-index"] => "/decision-index/fr".to_string(),
+        ["corpus"] => "/norm-index/fr/in-force".to_string(),
+        ["corpus", date] => format!("/norm-index/fr/in-force/{date}"),
+        ["normes"] | ["norm-index"] => "/norm-index/fr".to_string(),
+        ["normes", "codes"] | ["codes"] => "/norm-index/fr/codes".to_string(),
+        ["normes", fond] => format!("/norm-index/{}/{fond}", fond_jurisdiction(fond)),
+        ["normes", fond, year] => {
+            format!("/norm-index/{}/{fond}/{year}", fond_jurisdiction(fond))
+        }
+        ["entity", _, ns, id] => {
+            lj_vocab::entity_segment(ns)?;
+            lj_vocab::entity_path(ns, id)
+        }
+        ["notice", _, uid] => lj_vocab::notice_path(uid),
+        ["notice-index", _, rest @ ..] if rest.len() <= 1 => prefixed_fr("/notice-index/fr", rest),
+        ["entity-index", _, kind] => format!("/entity-index/fr/{kind}"),
+        ["norm-index", _, "in-force", rest @ ..] if rest.len() <= 1 => {
+            prefixed_fr("/norm-index/fr/in-force", rest)
+        }
+        _ => return None,
+    })
+}
+
+fn prefixed_fr(base: &str, rest: &[&str]) -> String {
+    match rest.first() {
+        Some(seg) => format!("{base}/{seg}"),
+        None => base.to_string(),
+    }
+}
+
+/// The jurisdiction an old catalogue fond, which mixed them, is now browsed under.
+fn fond_jurisdiction(fond: &str) -> &'static str {
+    match fond {
+        "textes-ue" => "eu",
+        "traites" => "intl",
+        _ => "fr",
+    }
+}
+
+/// Every older address answers with a permanent redirect to today's: the renamed
+/// prefixes, a decision, a court, an entity or a notice without its jurisdiction
+/// or under another one, and a text under
+/// `/texte/`, `/loi/` or without its jurisdiction segment. No text slug is two
+/// letters nor equals `intl`, so a recognised first segment is already the new
+/// shape.
+async fn ancienne_adresse(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let uri = req.uri().clone();
+    let segs: Vec<&str> = uri.path().trim_matches('/').split('/').collect();
+    let cible = match segs.as_slice() {
+        ["decision", id] | ["decision", _, id] => {
+            lj_api::decisions::decision_address(&state, id).await
+        }
+        ["juridiction" | "decision-index", code, rest @ ..] if rest.len() <= 1 => {
+            juridiction_address(&state, code, rest.first().copied()).await
+        }
+        ["decision-index", _, code, rest @ ..] if rest.len() <= 1 => {
+            juridiction_address(&state, code, rest.first().copied()).await
+        }
+        [prefix @ ("texte" | "loi" | "norm"), premier, suite @ ..] => {
+            text_address(&state, prefix, premier, suite).await
+        }
+        _ => renamed_path(uri.path()),
+    };
+    let Some(mut cible) = cible.filter(|c| c != uri.path()) else {
+        return next.run(req).await;
+    };
+    if let Some(q) = uri.query() {
+        cible.push('?');
+        cible.push_str(q);
+    }
+    axum::response::Redirect::permanent(&cible).into_response()
+}
+
+/// A place written with its vocabulary prefix (`?place=geo:PF`), as old links
+/// carry it, moves to the bare code, pages and API alike.
+async fn place_prefix_moved(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let Some(query) = req.uri().query().and_then(place_without_prefix) else {
+        return next.run(req).await;
+    };
+    axum::response::Redirect::permanent(&format!("{}?{query}", req.uri().path())).into_response()
+}
+
+fn place_without_prefix(query: &str) -> Option<String> {
+    let mut moved = false;
+    let pairs: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            let bare = ["place=geo:", "place=geo%3A", "place=geo%3a"]
+                .iter()
+                .find_map(|prefix| pair.strip_prefix(prefix));
+            match bare {
+                Some(code) => {
+                    moved = true;
+                    format!("place={code}")
+                }
+                None => pair.to_string(),
+            }
+        })
+        .collect();
+    moved.then(|| pairs.join("&"))
+}
+
+async fn juridiction_address(state: &AppState, code: &str, year: Option<&str>) -> Option<String> {
+    let referential = lj_api::referential::referential(state).await.ok()?;
+    let entry = referential.jurisdiction(code)?;
+    let jt = lj_dtos::JurisdictionType::from_code(&entry.jurisdiction_type)?;
+    let hub = format!("/decision-index/{}/{code}", jt.url_segment());
+    Some(match year {
+        Some(y) => format!("{hub}/{y}"),
+        None => hub,
+    })
+}
+
+async fn text_address(
+    state: &AppState,
+    prefix: &str,
+    premier: &str,
+    suite: &[&str],
+) -> Option<String> {
+    let juris = lj_norm::jurisdictions::from_url_segment(premier);
+    let current = juris.is_some();
+    let (code, rest) = match juris {
+        Some(_) => (*suite.first()?, &suite[1..]),
+        None => (premier, suite),
+    };
+    if let ["section", cid] = rest {
+        let found = lj_api::legi::section_address(state, code, juris, cid).await;
+        if let Ok(Some(address)) = found {
+            return Some(address);
+        }
+    }
+    if prefix == "norm" && current {
+        return None;
+    }
+    let mut cible = if current {
+        format!("/norm/{premier}")
+    } else {
+        lj_api::legi::text_address(state, premier).await?
+    };
+    for seg in suite {
+        cible.push('/');
+        cible.push_str(if *seg == "comparer" { "compare" } else { seg });
+    }
+    Some(cible)
+}
+
+/// Route GET answering a 308 to `target`, query string kept as is.
 fn redirect_preserving_query(target: &'static str) -> axum::routing::MethodRouter {
     axum::routing::get(move |raw: axum::extract::RawQuery| async move {
         let dest = match raw.0.filter(|q| !q.is_empty()) {
@@ -691,7 +780,7 @@ fn redirect_preserving_query(target: &'static str) -> axum::routing::MethodRoute
 mod tests {
     use super::{
         body_in_request_span, browser_family, build_id, client_kind, referer_is_external,
-        SpannedBody,
+        renamed_path, SpannedBody,
     };
     use axum::body::{Body, Bytes, HttpBody};
     use axum::http::HeaderMap;
@@ -805,8 +894,6 @@ mod tests {
         assert_eq!(build_id("js: GGGG"), None);
     }
 
-    /// Couche `tracing` d'observation : enregistre les fermetures de spans, dans
-    /// l'ordre.
     struct Fermetures(Arc<Mutex<Vec<tracing::Id>>>);
 
     impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fermetures {
@@ -815,12 +902,8 @@ mod tests {
         }
     }
 
-    /// Ce que chaque `poll_frame` du corps relève : le span courant, et le
-    /// nombre de spans déjà refermés à cet instant.
     type Observations = Arc<Mutex<Vec<(Option<tracing::Id>, usize)>>>;
 
-    /// Spec du rendu SSR : le corps streamé est poll DANS le span de sa requête, et ce
-    /// span reste ouvert jusqu'à la fin du flux.
     #[tokio::test]
     async fn le_corps_streame_est_poll_dans_le_span_de_requete() {
         use axum::extract::Request;
@@ -859,8 +942,6 @@ mod tests {
             }
         };
 
-        // Tient la place d'`OtelAxumLayer`, qui ouvre le span serveur puis l'abandonne dès
-        // la réponse rendue.
         let racine = {
             let span_requete = span_requete.clone();
             axum::middleware::from_fn(move |req: Request, next: axum::middleware::Next| {
@@ -950,5 +1031,50 @@ mod tests {
         };
         assert_eq!(fixe.size_hint().exact(), Some(3));
         assert!(!fixe.is_end_stream());
+    }
+
+    #[test]
+    fn une_ancienne_adresse_nomme_la_nouvelle() {
+        let cases = [
+            ("/decisions", Some("/decision-search")),
+            ("/recherche-textes", Some("/norm-search")),
+            ("/annonces.rss", Some("/notice-search.rss")),
+            ("/annonces/departement/2A", Some("/notice-index/fr/2A")),
+            ("/marche/boamp-25-1", Some("/notice/fr/boamp-25-1")),
+            (
+                "/entite/siren/552081317",
+                Some("/entity/fr/siren/552081317"),
+            ),
+            ("/entite/xx/1", None),
+            ("/annuaire/cabinets", Some("/entity-index/fr/cabinets")),
+            ("/juridictions", Some("/decision-index/fr")),
+            (
+                "/corpus/2020-01-01",
+                Some("/norm-index/fr/in-force/2020-01-01"),
+            ),
+            ("/codes", Some("/norm-index/fr/codes")),
+            (
+                "/normes/textes-ue/2019",
+                Some("/norm-index/eu/textes-ue/2019"),
+            ),
+            ("/normes/lois", Some("/norm-index/fr/lois")),
+            ("/norm-index", Some("/norm-index/fr")),
+            ("/decision-search", None),
+            ("/norm-index/fr", None),
+            (
+                "/entity/de/siren/552081317",
+                Some("/entity/fr/siren/552081317"),
+            ),
+            (
+                "/entity/fr/siren/552081317",
+                Some("/entity/fr/siren/552081317"),
+            ),
+            ("/notice/eu/boamp-25-1", Some("/notice/fr/boamp-25-1")),
+            ("/notice-index/be/75", Some("/notice-index/fr/75")),
+            ("/norm-index/de/in-force", Some("/norm-index/fr/in-force")),
+        ];
+        for (old, new) in cases {
+            assert_eq!(renamed_path(old).as_deref(), new, "{old}");
+        }
     }
 }

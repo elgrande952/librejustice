@@ -31,9 +31,42 @@ const SOURCES_SUIVIES: &[(&str, i64)] = &[
     ("dila-jade", 10),
     ("cjue", 14),
     ("dila-cnil", 25),
-    ("cnda", 30),
     ("cedh", 30),
     ("dila-constit", 55),
+    // cnda publishes in bursts: its catalogue shows a 47-day hole (26/02 → 14/04
+    // 2026) that the calibration window started just after, so the 30 it yielded
+    // alerted on 08/09/2026 against a source already fully ingested.
+    ("cnda", 95),
+];
+
+/// Channels of the Annonces pot, and the days without a new row past which the
+/// channel is taken for broken. The pot is 44 days old on 16/09/2026, a third
+/// of the window the decision sources were calibrated on, so the floor is a
+/// week rather than twice the widest gap seen: at that date the widest was 8
+/// days on atline, 4 on achatpublic and klekoon, 2 or 3 everywhere else.
+///
+/// `nicematin` and `provincenord` are watched by nothing: 65 and 11 rows since
+/// they opened, a press dump and a territorial portal publishing in bursts,
+/// where a silent week is the normal state.
+const CANAUX_SUIVIS: &[(&str, i64)] = &[
+    ("boamp", 7),
+    ("ted", 7),
+    ("aws", 7),
+    ("atexo", 7),
+    ("dematis", 7),
+    ("aji", 7),
+    ("modula", 7),
+    ("xmarches", 7),
+    ("safetender", 7),
+    ("synapse", 7),
+    ("centraledesmarches", 7),
+    ("achatpublic", 8),
+    ("klekoon", 8),
+    ("atline", 16),
+    // The only channel the chain computes instead of harvesting: it posts when
+    // data.economie.gouv.fr republishes, most days, and a wedged quick exit
+    // would otherwise stop it in silence.
+    ("decp", 7),
 ];
 
 /// Joue tous les invariants. Rend toujours `Ok` : un contrôle qui échoue est un
@@ -50,13 +83,101 @@ pub async fn run() -> Result<()> {
     mesurer("decision_sans_charge", decision_sans_charge()).await;
     mesurer("uid_ue_permute", uid_ue_permute()).await;
     mesurer("dataset_ue_uid_ferme", dataset_ue_uid_ferme()).await;
+    mesurer("base_reinitialisee", base_reinitialisee()).await;
+    mesurer("denorm_derive", denorm_derive()).await;
+    mesurer("fraicheur_canal_annonce", fraicheur_des_canaux()).await;
+    mesurer("marche_decp_sans_resultat", marche_decp_sans_resultat()).await;
     Ok(())
+}
+
+/// Counts the watched channels whose last posted row is past their threshold.
+/// The Annonces counterpart of [`fraicheur_des_sources`], where a broken
+/// connector shows up nowhere else: the harvest re-enumerates everything every
+/// night, and an engine yielding zero row exits as successfully as a live one.
+async fn fraicheur_des_canaux() -> Result<u64> {
+    let conn = repo_conn().await?;
+    let vues: std::collections::HashMap<String, chrono::NaiveDate> = DecisionRepository::new(&conn)
+        .derniere_moisson_par_canal()
+        .await
+        .map_err(|e| anyhow!("derniere_moisson_par_canal: {e}"))?
+        .into_iter()
+        .collect();
+
+    let aujourdhui = chrono::Utc::now().date_naive();
+    let mut fautifs = 0;
+    for (canal, seuil) in CANAUX_SUIVIS {
+        let jours = match vues.get(*canal) {
+            Some(dernier) => (aujourdhui - *dernier).num_days(),
+            None => i64::MAX,
+        };
+        if jours > *seuil {
+            fautifs += 1;
+            tracing::warn!(canal, jours, seuil, "canal d'annonces muet");
+        }
+    }
+    Ok(fautifs)
+}
+
+/// Counts the markets a `decp:` channel calls awarded with no `resultat` block
+/// to show it. The pose writes both together; the channel alone takes the
+/// market out of the matching queue for good, and its page stays empty.
+async fn marche_decp_sans_resultat() -> Result<u64> {
+    let conn = repo_conn().await?;
+    let fautifs = DecisionRepository::new(&conn)
+        .marches_decp_sans_resultat()
+        .await
+        .map_err(|e| anyhow!("marches_decp_sans_resultat: {e}"))?;
+    for uid in &fautifs {
+        tracing::warn!(uid, "marché on the DECP channel without a result block");
+    }
+    Ok(fautifs.len() as u64)
+}
+
+/// Counts 1 while a crash recovery younger than the chain's own period is
+/// visible. On 09/09/2026 the cluster killed and re-initialised every backend
+/// for one to two minutes and nothing said so: the postmaster survives the
+/// death of a child it does not track, so its start time never moves. The
+/// window is the chain's period, so the alert fires once and clears itself.
+async fn base_reinitialisee() -> Result<u64> {
+    let conn = repo_conn().await?;
+    let quand = DecisionRepository::new(&conn)
+        .derniere_recovery_a_chaud()
+        .await
+        .map_err(|e| anyhow!("derniere_recovery_a_chaud: {e}"))?;
+    match quand.filter(|t| chrono::Utc::now() - *t < chrono::Duration::hours(25)) {
+        Some(t) => {
+            tracing::warn!(quand = %t, "database: hot recovery, every connection killed");
+            Ok(1)
+        }
+        None => Ok(0),
+    }
+}
+
+/// Counts the articles whose denormalised copies disagree with their parent
+/// text. The end-of-pass refresh is bounded to the texts a pass touched, so a
+/// drift it never saw is invisible to it and visible only here.
+async fn denorm_derive() -> Result<u64> {
+    let conn = repo_conn().await?;
+    let n = DecisionRepository::new(&conn)
+        .denorm_derive()
+        .await
+        .map_err(|e| anyhow!("denorm_derive: {e}"))?;
+    if n > 0 {
+        tracing::warn!(articles = n, "articles: denormalised copy drifting");
+    }
+    Ok(n as u64)
 }
 
 async fn mesurer(invariant: &'static str, mesure: impl Future<Output = Result<u64>>) {
     match mesure.await {
-        Ok(fautifs) => publier(invariant, fautifs),
-        Err(e) => tracing::error!(invariant, error = %e, "invariant illisible"),
+        Ok(fautifs) => {
+            publier(invariant, fautifs);
+            publier_lisibilite(invariant, 0);
+        }
+        Err(e) => {
+            tracing::error!(invariant, error = %e, "invariant unreadable");
+            publier_lisibilite(invariant, 1);
+        }
     }
 }
 
@@ -75,7 +196,15 @@ fn publier(invariant: &'static str, fautifs: u64) {
         .with_description("Lignes fautives relevées par un invariant de fin de chaîne.")
         .build()
         .record(fautifs, &[KeyValue::new("invariant", invariant)]);
-    tracing::info!(invariant, fautifs, "invariant mesuré");
+    tracing::info!(invariant, fautifs, "invariant measured");
+}
+
+fn publier_lisibilite(invariant: &'static str, illisible: u64) {
+    lj_telemetry::meter()
+        .u64_gauge("ingest.invariant.unreadable")
+        .with_description("1 quand un invariant de fin de chaîne n'a pas pu se mesurer.")
+        .build()
+        .record(illisible, &[KeyValue::new("invariant", invariant)]);
 }
 
 /// Compte les décisions qu'aucune provenance ne peut ré-extraire. Le rang 0 dit
@@ -91,7 +220,7 @@ async fn decision_sans_charge() -> Result<u64> {
         .await
         .map_err(|e| anyhow!("decisions_sans_charge: {e}"))?;
     for public_id in &fautives {
-        tracing::warn!(public_id, "décision sans provenance de charge");
+        tracing::warn!(public_id, "decision without a load provenance");
     }
     Ok(fautives.len() as u64)
 }
@@ -107,7 +236,7 @@ async fn jurisdiction_code_tire() -> Result<u64> {
         .await
         .map_err(|e| anyhow!("jurisdictions_au_code_tire: {e}"))?;
     for code in &fautifs {
-        tracing::warn!(code, "code de juridiction au tiret");
+        tracing::warn!(code, "juridiction code with a hyphen");
     }
     Ok(fautifs.len() as u64)
 }
@@ -117,7 +246,7 @@ async fn jurisdiction_code_tire() -> Result<u64> {
 /// tant que la redirection existe l'alias résout quand même : la faute est
 /// entièrement invisible depuis le produit.
 async fn alias_sur_slug_mort() -> Result<u64> {
-    let vises: Vec<String> = lj_core::aliases::canonical_slugs()
+    let vises: Vec<String> = lj_norm::aliases::canonical_slugs()
         .map(str::to_string)
         .collect();
     let conn = repo_conn().await?;
@@ -126,7 +255,7 @@ async fn alias_sur_slug_mort() -> Result<u64> {
         .await
         .map_err(|e| anyhow!("slugs_sans_texte_vivant: {e}"))?;
     for slug in &fautifs {
-        tracing::warn!(slug, "alias pointant un slug mort");
+        tracing::warn!(slug, "alias pointing at a dead slug");
     }
     Ok(fautifs.len() as u64)
 }
@@ -136,7 +265,7 @@ async fn alias_sur_slug_mort() -> Result<u64> {
 /// C'est le pendant de [`alias_sur_slug_mort`] sur l'autre ancre, mais sans
 /// filet — un uid ne redirige pas, il désigne ou ne désigne rien.
 async fn alias_sur_uid_mort() -> Result<u64> {
-    let vises: Vec<String> = lj_core::aliases::canonical_uids()
+    let vises: Vec<String> = lj_norm::aliases::canonical_uids()
         .map(str::to_string)
         .collect();
     let conn = repo_conn().await?;
@@ -145,7 +274,7 @@ async fn alias_sur_uid_mort() -> Result<u64> {
         .await
         .map_err(|e| anyhow!("uids_sans_texte: {e}"))?;
     for uid in &fautifs {
-        tracing::warn!(uid, "alias pointant un uid mort");
+        tracing::warn!(uid, "alias pointing at a dead uid");
     }
     Ok(fautifs.len() as u64)
 }
@@ -157,9 +286,9 @@ async fn alias_sans_ancre_resoluble() -> Result<u64> {
     let conn = repo_conn().await?;
     let repo = DecisionRepository::new(&conn);
     let mut fautifs = 0u64;
-    for (alias, expansion) in lj_core::aliases::unanchored() {
+    for (alias, expansion) in lj_norm::aliases::unanchored() {
         let vise = repo
-            .resolve_instrument(expansion)
+            .resolve_instrument(expansion, None)
             .await
             .map_err(|e| anyhow!("resolve_instrument: {e}"))?;
         let slug = match vise {
@@ -167,7 +296,11 @@ async fn alias_sans_ancre_resoluble() -> Result<u64> {
             | InstrumentResolution::Rattrape { slug, .. } => slug,
             InstrumentResolution::Inconnu { .. } => continue,
         };
-        tracing::warn!(alias, slug, "alias sans ancre, texte au catalogue");
+        tracing::warn!(
+            alias,
+            slug,
+            "alias without an anchor, text in the catalogue"
+        );
         fautifs += 1;
     }
     Ok(fautifs)
@@ -193,7 +326,7 @@ async fn uid_ue_permute() -> Result<u64> {
         } else {
             &pair.0.text_uid
         };
-        tracing::warn!(canonique, doublon, "acte européen sous deux uid permutés");
+        tracing::warn!(canonique, doublon, "european act under two swapped uids");
         fautifs += 1;
     }
     Ok(fautifs)
@@ -214,7 +347,7 @@ async fn dataset_ue_uid_ferme() -> Result<u64> {
         .collect();
     let fautifs = crate::pipeline::datasets_a_retirer(&settings.legal_corpus_dir(), &en_base)?;
     for (path, uid, nomme) in &fautifs {
-        tracing::warn!(dataset = %path.display(), uid, nomme, "dataset ressemant un uid fermé");
+        tracing::warn!(dataset = %path.display(), uid, nomme, "dataset reseeding a closed uid");
     }
     Ok(fautifs.len() as u64)
 }
@@ -234,7 +367,7 @@ async fn version_article_mal_situee() -> Result<u64> {
         .await
         .map_err(|e| anyhow!("versions_mal_situees: {e}"))?;
     if sentinelles + non_fermees > 0 {
-        tracing::warn!(sentinelles, non_fermees, "versions d'article mal situées");
+        tracing::warn!(sentinelles, non_fermees, "article versions misplaced");
     }
     Ok(sentinelles + non_fermees)
 }
@@ -249,7 +382,7 @@ async fn version_intervalle_inverse() -> Result<u64> {
         .await
         .map_err(|e| anyhow!("versions_intervalle_inverse: {e}"))?;
     if fautifs > 0 {
-        tracing::warn!(fautifs, "versions d'article à intervalle inversé");
+        tracing::warn!(fautifs, "article versions with an inverted interval");
     }
     Ok(fautifs)
 }

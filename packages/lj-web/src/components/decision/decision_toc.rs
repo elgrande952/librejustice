@@ -148,9 +148,13 @@ fn chronology_block(chronology: Vec<ChronologyEntry>) -> Option<impl IntoView> {
                 } else {
                     "absolute left-[3px] top-[5px] h-[10px] w-[10px] rounded-full border-2 border-[var(--color-rule)] bg-[var(--color-parchment)]"
                 };
-                let body = match entry.id.filter(|_| !entry.current) {
-                    Some(id) => {
-                        let href = format!("/decision/{id}");
+                let body = match entry
+                    .id
+                    .zip(entry.jurisdiction_type)
+                    .filter(|_| !entry.current)
+                {
+                    Some((id, jurisdiction_type)) => {
+                        let href = lj_dtos::decision_path(jurisdiction_type, &id);
                         view! {
                             <HoverPreview kind=PreviewKind::Decision { id }>
                                 <a href=href class="group block no-underline">

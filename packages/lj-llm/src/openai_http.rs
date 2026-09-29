@@ -8,6 +8,9 @@ use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde_json::Value;
 
 const DEFAULT_TIMEOUT_S: f64 = 600.0;
+/// A query embed answers in ~50 ms at p50; past this, the local backend counts
+/// as down and `AnyEmbedder::Auto` serves the search from Cloudflare.
+const QUERY_TIMEOUT_S: f64 = 5.0;
 /// Cap on the TCP establishment phase. Without it, an unreachable backend (SYN
 /// with no reply, no RST) hangs the connect on the OS TCP timeout before
 /// `AnyEmbedder::Auto` falls back to Cloudflare. A legitimate local connect is
@@ -66,11 +69,11 @@ impl OpenAIHttpEmbedder {
     }
 
     /// POST des textes, parse + L2-normalise par lignes.
-    async fn post(&self, texts: &[String]) -> Result<Array2<f32>> {
+    async fn post(&self, texts: &[String], timeout_s: f64) -> Result<Array2<f32>> {
         let mut req = self
             .client
             .post(&self.url)
-            .timeout(std::time::Duration::from_secs_f64(self.timeout_s))
+            .timeout(std::time::Duration::from_secs_f64(timeout_s))
             .json(&serde_json::json!({ "model": self.model, "input": texts }));
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -136,7 +139,7 @@ fn normalize_batch(arr: &mut Array2<f32>) {
 
 impl Embedder for OpenAIHttpEmbedder {
     async fn embed_passages(&self, texts: &[String]) -> Result<Array2<f32>> {
-        self.post(texts).await
+        self.post(texts, self.timeout_s).await
     }
 
     async fn embed_query(&self, texts: &[String]) -> Result<Array2<f32>> {
@@ -144,7 +147,7 @@ impl Embedder for OpenAIHttpEmbedder {
             .iter()
             .map(|t| format_query(t, LEGAL_QUERY_INSTRUCTION))
             .collect();
-        self.post(&prefixed).await
+        self.post(&prefixed, QUERY_TIMEOUT_S).await
     }
 }
 

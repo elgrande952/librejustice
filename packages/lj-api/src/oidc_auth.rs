@@ -91,9 +91,6 @@ impl Fournisseur {
     }
 }
 
-/// Un départ sans retour est la seule trace qu'une panne chez le fournisseur
-/// laisse. Le trafic interne en est exclu : le smoke abandonne le tour dès que
-/// le clic quitte le site, donc son départ ne revient jamais.
 fn compter_tour(fournisseur: Fournisseur, phase: &'static str) {
     lj_telemetry::meter()
         .u64_counter("auth.provider.flow")
@@ -269,7 +266,7 @@ async fn callback(
     locale::retenir(
         &state,
         &sub,
-        locale::du_navigateur(&entetes).as_deref(),
+        &locale::du_navigateur(&entetes),
         identite.locale.as_deref(),
     )
     .await?;
@@ -362,7 +359,7 @@ async fn echanger_code(
     if !res.status().is_success() {
         let statut = res.status();
         let corps = res.text().await.unwrap_or_default();
-        tracing::warn!(fournisseur = cle, %statut, corps = %corps, "échange du code refusé");
+        tracing::warn!(fournisseur = cle, %statut, corps = %corps, "code exchange refused");
         return Err(refus_echange(cle, &corps));
     }
     Ok(res.json::<Jetons>().await.map_err(amont)?.id_token)
@@ -388,7 +385,7 @@ async fn verifier_id_token(
 ) -> Result<Identite> {
     let cle_fournisseur = fournisseur.cle();
     let refus = |detail: String| {
-        tracing::warn!(fournisseur = cle_fournisseur, detail, "id_token refusé");
+        tracing::warn!(fournisseur = cle_fournisseur, detail, "id_token refused");
         ApiError::BadRequest("id_token_invalide".into())
     };
     let entete = decode_header(id_token).map_err(|e| refus(e.to_string()))?;

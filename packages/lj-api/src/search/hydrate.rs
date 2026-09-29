@@ -5,7 +5,7 @@
 //! ([`crate::referential::Referential`]) : les compteurs se groupent par colonnes
 //! `_uid`/`jurisdiction_code`, les libellés viennent du cache.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use deadpool_postgres::Client;
 use lj_core::truecase;
@@ -27,6 +27,11 @@ const SNIPPET_MAX_CHARS: usize = 280;
 const TITLE_SNIPPET_CHARS: usize = 500;
 const LEGAL_INSTRUMENT_FACET_LIMIT: usize = 30;
 const LEGAL_ARTICLE_FACET_LIMIT: usize = 20;
+const LEGAL_ARTICLE_TOP_LIMIT: usize = 10;
+/// Cited articles served per hit. A decision cites 6.5 of them once the
+/// procedural bank is dropped (median 4, p90 15, measured 06/09/2026): beyond
+/// the rarest few it is a list, not a signal.
+const HIT_CITED_ARTICLES_LIMIT: usize = 5;
 
 // ── Facettes ─────────────────────────────────────────────────────────────
 
@@ -74,7 +79,7 @@ pub(crate) fn facets_from_counters(c: &FacetCounters, refs: &Referential) -> Sea
                         most_common(a, LEGAL_ARTICLE_FACET_LIMIT)
                             .into_iter()
                             .map(|(value, count)| FacetChoice {
-                                label: value.clone(),
+                                label: lj_norm::article_key::display(&value),
                                 value,
                                 count,
                                 parent: None,
@@ -98,6 +103,24 @@ pub(crate) fn facets_from_counters(c: &FacetCounters, refs: &Referential) -> Sea
             })
             .collect();
 
+    let mut article_top: Vec<FacetChoice> = Vec::new();
+    for f in &li_facets {
+        let slug = f.slug.as_deref().unwrap_or_default();
+        for a in &f.articles {
+            if !lj_norm::procedural::is_procedural(slug, &a.value) {
+                article_top.push(FacetChoice {
+                    value: format!("{}|{}", f.value, a.value),
+                    label: format!("{} · {}", a.label, f.label),
+                    count: a.count,
+                    parent: None,
+                    hint: None,
+                });
+            }
+        }
+    }
+    article_top.sort_by_key(|c| std::cmp::Reverse(c.count));
+    article_top.truncate(LEGAL_ARTICLE_TOP_LIMIT);
+
     SearchFacets {
         seat: seat_choices(&c.seats, refs),
         office: uid_choices(&c.office, refs),
@@ -116,6 +139,7 @@ pub(crate) fn facets_from_counters(c: &FacetCounters, refs: &Referential) -> Sea
             })
             .collect(),
         legal_instrument: li_facets,
+        legal_article_top: article_top,
     }
 }
 
@@ -123,7 +147,7 @@ pub(crate) fn facets_from_counters(c: &FacetCounters, refs: &Referential) -> Sea
 /// chambre » avant « 10e chambre », et les formations numérotées avant les
 /// nommées, leur première suite de texte étant vide.
 fn label_sort_key(label: &str) -> Vec<(String, u64)> {
-    let folded = lj_core::normalizer::strip_accents(label).to_lowercase();
+    let folded = lj_fold::fold_chars(label);
     let mut out: Vec<(String, u64)> = Vec::new();
     let mut rest = folded.as_str();
     while !rest.is_empty() {
@@ -216,10 +240,13 @@ pub(crate) struct DecisionMeta {
     pub(crate) formation_uid: Option<String>,
     pub(crate) official_url: Option<String>,
     pub(crate) case_name: Option<String>,
+    /// `text_uid|num_key`, as the composite array stores them: the slug and the
+    /// rank are resolved per page.
+    pub(crate) cited_terms: Vec<String>,
 }
 
-/// Identifiants publics de la page.
-pub(crate) async fn fetch_pub_ids(
+/// The page path of every decision of the list.
+pub(crate) async fn fetch_decision_paths(
     conn: &Client,
     decision_ids: &[i64],
 ) -> std::result::Result<HashMap<i64, String>, StoreError> {
@@ -228,15 +255,17 @@ pub(crate) async fn fetch_pub_ids(
     }
     let rows = conn
         .query(
-            "SELECT d.id, d.public_id FROM decisions d WHERE d.id = ANY($1)",
+            "SELECT d.id, d.public_id, d.jurisdiction_type FROM decisions d WHERE d.id = ANY($1)",
             &[&decision_ids],
         )
         .await?;
-    let mut pub_ids: HashMap<i64, String> = HashMap::new();
+    let mut paths: HashMap<i64, String> = HashMap::new();
     for row in &rows {
-        pub_ids.insert(row.get(0), row.get(1));
+        let jt = JurisdictionType::from_code(row.get(2))
+            .expect("a stored jurisdiction_type is a known variant");
+        paths.insert(row.get(0), lj_dtos::decision_path(jt, row.get(1)));
     }
-    Ok(pub_ids)
+    Ok(paths)
 }
 
 /// Seat facet: one choice per path, `parent` being the path minus its last
@@ -343,26 +372,29 @@ pub(crate) async fn hydrate_decisions(
     if decision_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    // Extractions inside the lateral: read from the outer select, its ORDER BY/LIMIT
+    // sort carries whole `source_fields` rows, 9 ms per 100 hits against 1.5 ms here.
     let rows = conn
         .query(
             "SELECT d.id, d.public_id, d.jurisdiction_type, d.jurisdiction_code, \
              d.date_lecture, d.solution_uid, d.procedure_uid, d.office_uid, \
              d.legal_domain_uid, d.publication_codes, \
-             d.docket_numbers, d.summary, c.chars, \
+             d.docket_numbers, (SELECT dt.summary FROM decision_text dt WHERE dt.decision_id = d.id AND dt.lead), c.chars, \
              d.seat, d.seat_paths, d.formation_uid, \
-             src.source, src.source_uid, \
-             src.source_fields->'Dossier'->>'Code_Juridiction', \
-             COALESCE(src.source_fields->'META_JURI_CONSTIT'->>'URL_CC', \
-                      src.source_fields->>'fiche_url'), \
-             src.source_fields->>'decision_date', \
-             src.source_fields->'numbers'->>0, \
-             d.case_name \
+             src.source, src.source_uid, src.court_code, src.published_url, \
+             src.decision_date, src.first_number, \
+             d.case_name, d.legal_article_composite \
              FROM decisions d \
              LEFT JOIN LATERAL (SELECT max(char_end) AS chars FROM decision_chunks \
                WHERE decision_id = d.id) c ON true \
-             LEFT JOIN LATERAL (SELECT source, source_uid, source_fields \
+             LEFT JOIN LATERAL (SELECT source, source_uid, \
+                 source_fields->'Dossier'->>'Code_Juridiction' AS court_code, \
+                 COALESCE(source_fields->'META_JURI_CONSTIT'->>'URL_CC', \
+                          source_fields->>'fiche_url') AS published_url, \
+                 source_fields->>'decision_date' AS decision_date, \
+                 source_fields->'numbers'->>0 AS first_number \
                FROM decision_sources WHERE decision_id = d.id AND deleted_at IS NULL \
-               ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, source_uid ASC \
+               ORDER BY source_rank DESC, (lang = 'fra') IS TRUE DESC, (lang = 'eng') IS TRUE DESC, source_uid ASC \
                LIMIT 1) src ON true \
              WHERE d.id = ANY($1)",
             &[&decision_ids],
@@ -408,6 +440,7 @@ pub(crate) async fn hydrate_decisions(
                         })
                     }),
                 case_name: r.get(22),
+                cited_terms: r.get::<_, Option<Vec<String>>>(23).unwrap_or_default(),
             },
         );
     }
@@ -427,14 +460,40 @@ async fn load_full_texts(
     }
     let rows = conn
         .query(
-            "SELECT id, full_text FROM decisions \
-             WHERE id = ANY($1) AND full_text IS NOT NULL",
+            "SELECT decision_id, full_text FROM decision_text \
+             WHERE decision_id = ANY($1) AND lead",
             &[&decision_ids],
         )
         .await?;
     Ok(rows
         .iter()
         .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1)))
+        .collect())
+}
+
+/// Text slug and corpus-wide citing decision count, for the `text_uid|num_key`
+/// terms of **one page**. The count is rebuilt weekly: a brand new article has
+/// no row and passes for the rarest, which it is.
+async fn load_article_ranks(
+    conn: &Client,
+    terms: &[String],
+) -> std::result::Result<HashMap<String, (String, i64)>, StoreError> {
+    if terms.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = conn
+        .query(
+            "SELECT u.term, t.slug, coalesce(c.decision_count, 0) \
+             FROM unnest($1::text[]) AS u(term) \
+             JOIN legal_text t ON t.text_uid = split_part(u.term, '|', 1) \
+             LEFT JOIN citing_decision_counts c ON c.cited_term = u.term \
+             WHERE t.slug IS NOT NULL",
+            &[&terms],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<_, String>(0), (r.get::<_, String>(1), r.get(2))))
         .collect())
 }
 
@@ -493,7 +552,7 @@ fn jt_from_str(code: &str) -> Option<JurisdictionType> {
 }
 
 /// Tag référentiel d'un uid optionnel (`solution:REJET` → `{REJET, Rejet}`).
-fn opt_tag(uid: &Option<String>, refs: &Referential) -> Option<FacetTag> {
+pub(crate) fn opt_tag(uid: &Option<String>, refs: &Referential) -> Option<FacetTag> {
     uid.as_deref().map(|u| refs.tag(u))
 }
 
@@ -524,8 +583,8 @@ pub(crate) fn display_title(m: &DecisionMeta, refs: &Referential) -> String {
         m.case_name.as_deref(),
         m.docket_numbers
             .as_deref()
-            .and_then(|d| d.first())
-            .map(String::as_str),
+            .and_then(lj_core::titles::docket_display)
+            .as_deref(),
     )
 }
 
@@ -544,6 +603,49 @@ pub(crate) fn display_seat(m: &DecisionMeta, refs: &Referential) -> Option<Strin
     )
 }
 
+/// The rarest articles the decision cites, grouped under their text: the slug
+/// runs to 63 characters and a hit cites the same code four times. The
+/// procedural bank is dropped; a term the catalogue does not name goes with it,
+/// being neither linkable nor filterable. Sorting by count then by key keeps
+/// the answer stable between two weekly rebuilds.
+fn cited_articles(
+    terms: &[String],
+    ranks: &HashMap<String, (String, i64)>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut kept: Vec<(i64, &str, &str)> = terms
+        .iter()
+        .filter_map(|term| {
+            let (slug, count) = ranks.get(term)?;
+            let num = term.split_once('|')?.1;
+            (!lj_norm::procedural::is_procedural(slug, num)).then_some((*count, slug.as_str(), num))
+        })
+        .collect();
+    kept.sort_unstable();
+    kept.truncate(HIT_CITED_ARTICLES_LIMIT);
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (_, slug, num) in kept {
+        out.entry(slug.to_string())
+            .or_default()
+            .push(num.to_string());
+    }
+    out
+}
+
+/// The docket the query bit on, said only when the title does not name it:
+/// `docket_display` titles a decision by its head number alone, a Cour de
+/// cassation judgment of 24/04/2013 carrying 1 244 pourvois. `query_keys` are
+/// canonical, like the `docket_keys` field the leg admits on.
+fn matched_docket(query_keys: &[String], numbers: &[String]) -> Option<String> {
+    let head = lj_core::titles::docket_display(numbers)?;
+    numbers
+        .iter()
+        .map(|n| n.trim())
+        .filter(|n| !n.is_empty() && *n != head)
+        .find(|n| query_keys.contains(&lj_core::docket_key::docket_key(n)))
+        .map(str::to_string)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn make_hit(
     m: &DecisionMeta,
     score: f64,
@@ -551,6 +653,8 @@ fn make_hit(
     title_html: String,
     summary: Option<String>,
     refs: &Referential,
+    ranks: &HashMap<String, (String, i64)>,
+    query_keys: &[String],
 ) -> SearchHit {
     SearchHit {
         id: m.public_id.clone(),
@@ -579,6 +683,11 @@ fn make_hit(
         chars: m.chars,
         summary,
         official_url: m.official_url.clone(),
+        cited_articles: cited_articles(&m.cited_terms, ranks),
+        matched_docket: m
+            .docket_numbers
+            .as_deref()
+            .and_then(|numbers| matched_docket(query_keys, numbers)),
     }
 }
 
@@ -612,6 +721,10 @@ pub(crate) async fn assemble_page(
     let full_texts = load_full_texts(conn, &decision_ids)
         .await
         .map_err(ApiError::Store)?;
+    let query_keys: Vec<String> = lj_core::docket_key::query_numbers(query_text)
+        .into_iter()
+        .map(|n| n.key)
+        .collect();
     // Vieilles décisions opendata intégralement en MAJUSCULES (surtout Cassation) :
     // recasse déterministe pour l'affichage du snippet, en miroir de la vue détail
     // (`decisions.rs`), gardée par `is_caps_lock`. Le highlight re-tokenise insensible
@@ -637,6 +750,16 @@ pub(crate) async fn assemble_page(
     let chunk_spans = load_chunk_spans(conn, &ann_chunk_ids)
         .await
         .map_err(ApiError::Store)?;
+    let page_terms: Vec<String> = display
+        .iter()
+        .filter_map(|(d, _, _)| meta.get(d))
+        .flat_map(|m| m.cited_terms.iter().cloned())
+        .collect::<std::collections::HashSet<String>>()
+        .into_iter()
+        .collect();
+    let ranks = load_article_ranks(conn, &page_terms)
+        .await
+        .map_err(ApiError::Store)?;
 
     let body_docs: Vec<(i64, String)> = display
         .iter()
@@ -652,22 +775,22 @@ pub(crate) async fn assemble_page(
 
     // Titres composés depuis les référentiels (jamais la colonne `search_title`,
     // qui porte la formation source brute) : highlight puis fallback verbatim.
-    let titles: HashMap<i64, String> = display
+    let mut titles: HashMap<i64, String> = display
         .iter()
         .filter_map(|(d, _, _)| meta.get(d).map(|m| (*d, display_title(m, refs))))
         .collect();
-    let title_docs: Vec<(i64, String)> = titles.iter().map(|(d, t)| (*d, t.clone())).collect();
-    let query_title = query_text.to_string();
-    let title_task = tokio::task::spawn_blocking(move || {
-        highlight(&title_docs, &query_title, TITLE_SNIPPET_CHARS)
-    });
+    // A query carrying a number does not highlight the title: its digit runs land
+    // inside another number, `C-782/19` marking the `19` of `C-776/19`, and a court
+    // with its day marks the title whole. Which number was bitten is said beside
+    // the card. What is left is prose, short enough to tokenise on the spot.
+    if query_keys.is_empty() {
+        let docs: Vec<(i64, String)> = titles.iter().map(|(d, t)| (*d, t.clone())).collect();
+        titles.extend(highlight(&docs, query_text, TITLE_SNIPPET_CHARS));
+    }
 
     let body_snippets = body_task
         .await
         .map_err(|e| ApiError::Internal(format!("body snippet task: {e}")))?;
-    let title_snippets = title_task
-        .await
-        .map_err(|e| ApiError::Internal(format!("title snippet task: {e}")))?;
 
     let mut hits = Vec::with_capacity(display.len());
     for (decision_id, score, mut display_chunk) in display {
@@ -690,11 +813,7 @@ pub(crate) async fn assemble_page(
             };
             Some(make_snippet(&raw))
         });
-        let title_html = title_snippets
-            .get(&decision_id)
-            .cloned()
-            .or_else(|| titles.get(&decision_id).cloned())
-            .unwrap_or_default();
+        let title_html = titles.get(&decision_id).cloned().unwrap_or_default();
         // Résumé garanti en base et déjà joint au hot path : embarqué
         // dans chaque hit quel que soit le mode → vue « Résumé » instantanée côté
         // front, sans aller-retour `/summary`.
@@ -706,6 +825,8 @@ pub(crate) async fn assemble_page(
             title_html,
             summary,
             refs,
+            &ranks,
+            &query_keys,
         ));
     }
     Ok(hits)
@@ -742,6 +863,86 @@ mod tests {
                 "Pôle 6, 8e chambre",
             ]
         );
+    }
+
+    #[test]
+    fn matched_docket_names_the_joined_number_and_never_the_head() {
+        let key = |n: &str| lj_core::docket_key::docket_key(n);
+        let joined: Vec<String> = ["C-776/19", "C-782/19"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            matched_docket(&[key("c 782/19")], &joined).as_deref(),
+            Some("C-782/19")
+        );
+        assert_eq!(matched_docket(&[key("C-776/19")], &joined), None);
+        assert_eq!(matched_docket(&[key("C-999/19")], &joined), None);
+        assert_eq!(matched_docket(&[key("C-776/19")], &joined[..1]), None);
+    }
+
+    #[test]
+    fn cited_articles_drop_the_bank_and_serve_the_rarest() {
+        let ranks: HashMap<String, (String, i64)> = [
+            ("CPC|700", ("code-de-procedure-civile", 1_100_839)),
+            ("CPC|1240", ("code-de-procedure-civile", 87_470)),
+            ("CIV|1240", ("code-civil", 87_470)),
+            ("CIV|1101", ("code-civil", 40_000)),
+            ("CIV|815-13", ("code-civil", 900)),
+            ("CIV|2224", ("code-civil", 12_000)),
+            ("CIV|1109", ("code-civil", 3_000)),
+            ("CIV|544", ("code-civil", 24_000)),
+            ("CIV|9", ("code-civil", 50)),
+            ("CJA|l600-1-1", ("code-de-justice-administrative", 200)),
+            ("CJA|l761-1", ("code-de-justice-administrative", 1_028_296)),
+        ]
+        .into_iter()
+        .map(|(term, (slug, n))| (term.to_string(), (slug.to_string(), n)))
+        .collect();
+        let terms: Vec<String> = [
+            "CPC|700",
+            "CIV|1240",
+            "CIV|1101",
+            "CIV|815-13",
+            "CIV|2224",
+            "CIV|1109",
+            "CIV|544",
+            "CIV|9",
+            "CJA|l600-1-1",
+            "CJA|l761-1",
+            "ABSENT|1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            cited_articles(&terms, &ranks),
+            BTreeMap::from([
+                (
+                    "code-civil".to_string(),
+                    vec![
+                        "9".to_string(),
+                        "815-13".to_string(),
+                        "1109".to_string(),
+                        "2224".to_string()
+                    ]
+                ),
+                (
+                    "code-de-justice-administrative".to_string(),
+                    vec!["l600-1-1".to_string()]
+                ),
+            ])
+        );
+        // The bank keys on the slug: 1240 of the CPC does not exist, and the
+        // number alone would have dropped article 1240 of the code civil.
+        assert_eq!(
+            cited_articles(&["CPC|1240".to_string()], &ranks),
+            BTreeMap::from([(
+                "code-de-procedure-civile".to_string(),
+                vec!["1240".to_string()]
+            )])
+        );
+        assert!(cited_articles(&["CPC|700".to_string()], &ranks).is_empty());
     }
 
     #[test]

@@ -23,8 +23,7 @@ pub fn corpus_stats() -> Signal<Option<CorpusStatsResponse>> {
     data.into()
 }
 
-/// Pont « Dans les textes » de `/decisions` sans requête : le volume du fond
-/// normatif et l'entrée de son arborescence.
+/// « Dans les textes » bridge of `/decision-search` without a query.
 #[component]
 pub fn TextesCorpusTeaser(
     #[prop(into)] stats: Signal<Option<CorpusStatsResponse>>,
@@ -43,14 +42,14 @@ pub fn TextesCorpusTeaser(
                     </p>
                 }
                 .into_any(),
-                "/normes".to_string(),
-                "Parcourir les textes".to_string(),
+                "/norm-search".to_string(),
+                "Rechercher dans les textes".to_string(),
             )
         })
     }
 }
 
-/// Pont « Dans les décisions » de `/textes` sans requête.
+/// Pont « Dans les décisions » de `/norm-search` sans requête.
 #[component]
 pub fn DecisionsCorpusTeaser(
     #[prop(into)] stats: Signal<Option<CorpusStatsResponse>>,
@@ -68,8 +67,8 @@ pub fn DecisionsCorpusTeaser(
                     </p>
                 }
                 .into_any(),
-                "/juridictions".to_string(),
-                "Parcourir les juridictions".to_string(),
+                "/decision-search".to_string(),
+                "Rechercher dans les décisions".to_string(),
             )
         })
     }

@@ -1,4 +1,4 @@
-//! SEO de la page /decisions.
+//! SEO of the /decision-search page.
 //!
-//! La route `/decisions` n'a PAS de meta propre : elle hérite du
-//! title/description racine (`site_default()`), comme les pages statiques.
+//! The `/decision-search` route has NO meta of its own: it inherits the root
+//! title/description (`site_default()`), like the static pages.

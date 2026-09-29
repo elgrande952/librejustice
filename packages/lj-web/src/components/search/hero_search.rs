@@ -2,7 +2,7 @@
 //! eyebrow + titre + accroche + formulaire + exemples groupés par univers.
 //!
 //! La barre porte un sélecteur de portée (Décisions | Textes | Annonces |
-//! Annuaire) : la soumission route vers `/decisions`, `/textes`, `/annonces` ou
+//! Annuaire) : la soumission route vers `/decision-search`, `/norm-search`, `/annonces` ou
 //! `/annuaire`, et le suggest comme le pied de barre (aide à la recherche, lien
 //! pleine page) suivent la portée. Les chips d'exemples sont groupées par
 //! univers — le groupe enseigne ce que le site couvre, la chip pose le mode et
@@ -146,12 +146,12 @@ pub fn HeroSearch() -> impl IntoView {
                     &trimmed,
                     None,
                 );
-                format!("/decisions?{qs}")
+                format!("/decision-search?{qs}")
             }
-            Scope::Textes => format!("/textes?q={}", encode_query(&trimmed)),
-            Scope::Annonces if trimmed.is_empty() => "/annonces".to_string(),
-            Scope::Annonces => format!("/annonces?q={}", encode_query(&trimmed)),
-            Scope::Annuaire => format!("/annuaire?q={}", encode_query(&trimmed)),
+            Scope::Textes => format!("/norm-search?q={}", encode_query(&trimmed)),
+            Scope::Annonces if trimmed.is_empty() => "/notice-search".to_string(),
+            Scope::Annonces => format!("/notice-search?q={}", encode_query(&trimmed)),
+            Scope::Annuaire => format!("/entity-search?q={}", encode_query(&trimmed)),
         };
         navigate(&href, Default::default());
     };
@@ -320,36 +320,18 @@ fn ScopeDropdown(scope: RwSignal<Scope>) -> impl IntoView {
     let open = RwSignal::new(false);
     let container_ref = NodeRef::<leptos::html::Span>::new();
 
-    // Fermeture au clic extérieur + Échap (même doctrine que `DropdownSelect` ;
-    // `window_event_listener` est inerte côté SSR — îlot client).
     #[cfg(feature = "hydrate")]
     {
-        use wasm_bindgen::JsCast;
-        let handle = window_event_listener(leptos::ev::mousedown, move |ev| {
-            if !open.get_untracked() {
-                return;
-            }
-            let inside = container_ref
-                .get_untracked()
-                .zip(ev.target())
-                .and_then(|(el, target)| {
-                    target
-                        .dyn_ref::<web_sys::Node>()
-                        .map(|node| el.contains(Some(node)))
-                })
-                .unwrap_or(false);
-            if !inside {
-                open.set(false);
-            }
-        });
-        on_cleanup(move || handle.remove());
-
-        let key_handle = window_event_listener(leptos::ev::keydown, move |ev| {
-            if open.get_untracked() && ev.key() == "Escape" {
-                open.set(false);
-            }
-        });
-        on_cleanup(move || key_handle.remove());
+        use crate::components::ui::panel::{dismiss, Dismiss};
+        dismiss(
+            container_ref,
+            move || open.get_untracked(),
+            move || open.set(false),
+            Dismiss {
+                escape: true,
+                scroll: false,
+            },
+        );
     }
 
     view! {

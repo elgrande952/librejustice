@@ -9,17 +9,13 @@ use lj_dtos::TopCitedArticle;
 use crate::helpers::{format_article_num, group_thousands};
 
 /// Bloc du palmarès. Aucun article cité ⇒ pas de bloc.
-pub(crate) fn top_cited_block(code: &str, top: Vec<TopCitedArticle>) -> AnyView {
+pub(crate) fn top_cited_block(top: Vec<TopCitedArticle>) -> AnyView {
     if top.is_empty() {
         return ().into_any();
     }
-    let code = code.to_string();
     let items = top
         .into_iter()
-        .map(|article| {
-            let code = code.clone();
-            view! { <TopCitedRow article=article code=code /> }
-        })
+        .map(|article| view! { <TopCitedRow article=article /> })
         .collect_view();
     view! {
         <div class="flex flex-col gap-2">
@@ -33,28 +29,25 @@ pub(crate) fn top_cited_block(code: &str, top: Vec<TopCitedArticle>) -> AnyView 
 /// Une entrée du palmarès : numéro formaté comme la vue-lecture (le `label` du
 /// DTO est brut), hover card d'article sur le lien.
 #[component]
-fn TopCitedRow(article: TopCitedArticle, code: String) -> impl IntoView {
-    use crate::components::hover_preview::{HoverPreview, PreviewKind};
+fn TopCitedRow(article: TopCitedArticle) -> impl IntoView {
+    use crate::components::hover_preview::{preview_kind, HoverPreview};
     let label = format!("Article {}", format_article_num(&article.label));
     let count = format!("{} déc.", group_thousands(article.count));
     let link = match article.href {
         Some(href) => {
-            let kind = PreviewKind::Article {
-                code,
-                num: article.num_key,
-                date: None,
+            let kind = preview_kind(&href, None);
+            let lien = view! {
+                <A
+                    href=href
+                    attr:class="text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
+                >
+                    {label}
+                </A>
             };
-            view! {
-                <HoverPreview kind=kind>
-                    <A
-                        href=href
-                        attr:class="text-sm text-[var(--color-ink)] underline-offset-4 hover:text-[var(--color-accent)] hover:underline"
-                    >
-                        {label}
-                    </A>
-                </HoverPreview>
+            match kind {
+                Some(kind) => view! { <HoverPreview kind=kind>{lien}</HoverPreview> }.into_any(),
+                None => lien.into_any(),
             }
-            .into_any()
         }
         None => view! { <span class="text-sm text-[var(--color-ink)]">{label}</span> }.into_any(),
     };

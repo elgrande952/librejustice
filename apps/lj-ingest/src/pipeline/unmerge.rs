@@ -20,11 +20,11 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
+use lj_sources::downloader::read_jsonl_gz_lines;
 use lj_store::repository::DecisionRepository;
 
 use super::batch::drain_batch_in_txn;
 use super::embed::build_local_strict;
-use super::files::read_jsonl_gz_lines;
 use super::prepare::classify_judilibre;
 use super::resplit::{provenance_canonical_ref, provenance_jurisdiction_type};
 use super::{generate_public_id, IngestCounts, IngestMode};
@@ -97,7 +97,7 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
     conn.batch_execute("SET statement_timeout = 0")
         .await
         .map_err(|e| anyhow!("set statement_timeout: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -117,7 +117,7 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
     tracing::info!(
         losers = losers.len(),
         execute,
-        "unmerge-same-source : perdantes judilibre à re-créer"
+        "unmerge-same-source: judilibre losers to re-create"
     );
 
     // Regroupe par fichier cache (jur, yyyymm) → lecture une seule fois par fichier.
@@ -168,7 +168,7 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
         for p in plans {
             let Some(line) = payloads.get(&p.object_id) else {
                 stats.cache_miss += 1;
-                tracing::warn!(object_id = %p.object_id, path = ?path, "unmerge: payload absent du cache, laissé fusionné");
+                tracing::warn!(object_id = %p.object_id, path = ?path, "unmerge: payload missing from the cache, left merged");
                 continue;
             };
             stats.ready += 1;
@@ -201,7 +201,7 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
                     &mut counts,
                 )
                 .await?;
-                tracing::debug!(new_id, object_id = %p.object_id, "unmerge: décision scindée matérialisée");
+                tracing::debug!(new_id, object_id = %p.object_id, "unmerge: split decision materialised");
                 Ok(())
             }
             .await;
@@ -214,7 +214,7 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
                 Err(e) => {
                     let _ = conn.batch_execute("ROLLBACK").await;
                     stats.failed += 1;
-                    tracing::warn!(object_id = %p.object_id, error = %e, "unmerge: split échoué, laissé fusionné");
+                    tracing::warn!(object_id = %p.object_id, error = %e, "unmerge: split failed, left merged");
                 }
             }
 
@@ -229,7 +229,7 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
                 );
             }
             if limit.is_some_and(|n| processed >= n) {
-                tracing::info!(limit = ?limit, "unmerge: borne --limit atteinte, arrêt");
+                tracing::info!(limit = ?limit, "unmerge: --limit reached, stopping");
                 break 'outer;
             }
         }
@@ -246,21 +246,21 @@ pub async fn unmerge_same_source(execute: bool, limit: Option<usize>) -> Result<
         stats.losers_total
     );
     println!(
-        "  sans jur/date (skip)                : {}",
+        "  without jur/date (skip)             : {}",
         stats.skipped_no_jur_date
     );
     println!(
-        "  sans canonical_ref (skip)           : {}",
+        "  without canonical_ref (skip)        : {}",
         stats.skipped_no_canonical
     );
     println!(
-        "  absentes du cache (laissées)        : {}",
+        "  missing from the cache (left)       : {}",
         stats.cache_miss
     );
-    println!("  re-matérialisables (cache-hit)      : {}", stats.ready);
+    println!("  rematerialisable (cache-hit)        : {}", stats.ready);
     if execute {
-        println!("  décisions scindées créées           : {}", stats.split);
-        println!("  échecs (laissées fusionnées)        : {}", stats.failed);
+        println!("  split decisions created             : {}", stats.split);
+        println!("  failures (left merged)              : {}", stats.failed);
     }
     Ok(())
 }

@@ -8,11 +8,12 @@ use lj_store::error::StoreError;
 use pgvector::Vector;
 use tokio_postgres::types::ToSql;
 
+use lj_core::docket_key::QueryNumber;
 use lj_dtos::SearchRequest;
 
 use super::filters::{
-    as_refs, build_array_filter_queries, build_facet_filter, compose_tantivy_query, ArrayFilters,
-    FilterTable, Params,
+    as_refs, build_array_filter_queries, build_facet_filter, compose_tantivy_query, term_any,
+    ArrayFilters, FilterTable, Params,
 };
 use super::query::{is_boolean_query, phrase_combo_parse, translate_boolean};
 
@@ -54,6 +55,17 @@ impl LegHit {
 
 // ── Jambes (BM25 body, title, ANN) ───────────────────────────────────────────
 
+/// A decision scores by its best text, never by the sum of its languages.
+fn best_per_decision(hits: impl Iterator<Item = (i64, f64)>) -> HashMap<i64, f64> {
+    let mut best: HashMap<i64, f64> = HashMap::new();
+    for (id, score) in hits {
+        best.entry(id)
+            .and_modify(|s| *s = s.max(score))
+            .or_insert(score);
+    }
+    best
+}
+
 #[tracing::instrument(skip(conn, req), fields(leg_limit))]
 pub(crate) async fn bm25_leg(
     conn: &Client,
@@ -68,9 +80,9 @@ pub(crate) async fn bm25_leg(
     bm25_parse_leg(conn, req, &body_query, leg_limit).await
 }
 
-/// BM25 body au grain décision sur `decisions_bm25` (`full_text`) : la `LIMIT`
-/// SQL est directement en décisions. Renvoie `{decision_id: score}`, symétrique
-/// de [`title_leg`].
+/// BM25 body leg on `decision_text_bm25` (`full_text`): the SQL `LIMIT` counts
+/// texts, a decision keeping its best one. Returns `{decision_id: score}`, like
+/// [`title_leg`].
 #[tracing::instrument(skip(conn, req, translated_query), fields(leg_limit))]
 pub(crate) async fn bm25_parse_leg(
     conn: &Client,
@@ -81,7 +93,7 @@ pub(crate) async fn bm25_parse_leg(
     let mut params: Params = Vec::new();
     params.push(Box::new(translated_query.to_string()));
     let mut idx = 2usize;
-    // `parse_with_field` : `decisions_bm25` porte DEUX champs texte (`full_text`
+    // `parse_with_field` : `decision_text_bm25` porte DEUX champs texte (`full_text`
     // + `search_title`) et un parse non qualifié chercherait dans les deux.
     // Cette jambe ne score que le texte intégral.
     let array_filters = build_array_filter_queries(req, &mut idx, &mut params);
@@ -95,21 +107,21 @@ pub(crate) async fn bm25_parse_leg(
         FilterTable::Decisions,
     );
     let sql = format!(
-        "SELECT d.id, paradedb.score(d.id) AS score \
-         FROM decisions d \
+        "SELECT d.decision_id, paradedb.score(d.id) AS score \
+         FROM decision_text d \
          WHERE d.id @@@ {query_expr}{ff} \
          ORDER BY score DESC LIMIT {limit}",
         ff = facet_filter,
         limit = leg_limit,
     );
     let rows = conn.query(sql.as_str(), &as_refs(&params)).await?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<_, i64>(0), r.get::<_, f32>(1) as f64))
-        .collect())
+    Ok(best_per_decision(
+        rows.iter()
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, f32>(1) as f64)),
+    ))
 }
 
-/// BM25 sur le champ `search_title` de `decisions_bm25`, au grain décision.
+/// BM25 sur le champ `search_title` de `decision_text_bm25`, au grain décision.
 /// Renvoie `{decision_id: score}`. Le titre porte le nom d'usage, absent du
 /// texte de sa propre décision et sans autre jambe pour le servir.
 ///
@@ -141,78 +153,180 @@ pub(crate) async fn title_leg(
         FilterTable::Decisions,
     );
     let sql = format!(
-        "SELECT d.id, paradedb.score(d.id) AS score \
-         FROM decisions d \
+        "SELECT d.decision_id, paradedb.score(d.id) AS score \
+         FROM decision_text d \
          WHERE d.id @@@ {query_expr}{ff} \
          ORDER BY score DESC LIMIT {limit}",
         ff = facet_filter,
         limit = leg_limit,
     );
     let rows = conn.query(sql.as_str(), &as_refs(&params)).await?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<_, i64>(0), r.get::<_, f32>(1) as f64))
-        .collect())
+    Ok(best_per_decision(
+        rows.iter()
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, f32>(1) as f64)),
+    ))
 }
 
-/// Exact key leg: the decisions whose canonical docket key equals one of the
-/// query's, most cited first (resolved spans of `case_citation`, 39 ms for 21
-/// bearers) then most recent; the score is the inverted rank, [`fuse_ranks`]
-/// only needs an order. `within` restricts the bearers to the decisions a case
-/// name resolved to: 66145 alone is Cadot (1889) and a decision of 1988.
+/// What the query writes beside its number, read against the referential.
+#[derive(Debug, Default)]
+pub(crate) struct Written {
+    pub(crate) kind: Option<&'static str>,
+    pub(crate) code: Option<String>,
+    pub(crate) day: Option<String>,
+}
+
+fn written_clauses(written: &Written, idx: &mut usize, params: &mut Params) -> Vec<String> {
+    let mut clauses = Vec::new();
+    let mut push = |field: &str, cast: &str, value: String, idx: &mut usize| {
+        params.push(Box::new(value) as Box<dyn ToSql + Sync + Send>);
+        clauses.push(format!("paradedb.term('{field}', ${idx}::text{cast})"));
+        *idx += 1;
+    };
+    if let Some(kind) = written.kind {
+        push("jurisdiction_type", "", kind.to_string(), idx);
+    }
+    if let Some(code) = &written.code {
+        push("jurisdiction_code", "", code.clone(), idx);
+    }
+    if let Some(day) = &written.day {
+        push("date_lecture", "::date", day.clone(), idx);
+    }
+    clauses
+}
+
+/// The one query of the reference retrieval. `docket_keys` and `ecli` carry the
+/// canonical form, insensitive to the graphy, so they are what ADMITS, with
+/// `docket_search`, the same keys plus the digits of a lettered number: an
+/// exact bearer matches both key fields and ranks above one reached by its
+/// digits alone;
+/// `search_title` carries the graphy as written, so it only RANKS, hence its
+/// place in `should`, beside the court and the day the query writes. Left a
+/// peer clause it admits on one token: `ECLI:FR:CCASS:2007:C200527` matches
+/// thousands of titles by `2007` alone.
 ///
-/// `lj_docket_keys(d.docket_numbers)` is spelled as in the expression index of
-/// migration 0212, or the planner ignores it. The `MATERIALIZED` CTE is an
-/// optimisation fence: `&&` has no selectivity estimator, so under `ORDER BY
-/// date_lecture LIMIT` the planner walked the date index calling the function
-/// on all 3.7 M rows. Measured in prod: 11 300 ms against 9 ms.
-#[tracing::instrument(skip(conn, req, keys, within), fields(leg_limit))]
-pub(crate) async fn docket_leg(
+/// No boost on the keys. Every hit bears one, so weighting them only flattens
+/// the gap the title opens between bearers, and `truncate_fused` cuts on that
+/// gap: probed 2026-09-07 on `Douai 22/01772`, 27.4 against 23.4 for a bearer
+/// of another court, which a boost of 8.0 crushes to 107.6 against 103.6.
+/// What the reference retrieval looks for: numbers, ECLIs, and whether they are
+/// the numbers of the decisions a case name resolved to.
+#[derive(Debug, Default)]
+pub(crate) struct ReferenceKeys {
+    pub(crate) numbers: Vec<QueryNumber>,
+    pub(crate) eclis: Vec<String>,
+    pub(crate) named: bool,
+}
+
+/// A number or an ECLI the query writes admits its bearers; the numbers of a
+/// named decision only rank, beside the title that carries the name: `66145`
+/// is Cadot (1889) and a decision of 1988, and « Annecy » names the Commune
+/// d'Annecy as much as it sits in « ERDF Annecy Léman ».
+fn reference_query(
+    req: &SearchRequest,
+    reference: &ReferenceKeys,
+    written: &Written,
+    idx: &mut usize,
+    params: &mut Params,
+) -> String {
+    let title = if is_boolean_query(&req.query) {
+        params.push(Box::new(translate_boolean(&req.query)) as Box<dyn ToSql + Sync + Send>);
+        format!("paradedb.parse_with_field('search_title', ${idx})")
+    } else {
+        params.push(Box::new(req.query.clone()) as Box<dyn ToSql + Sync + Send>);
+        format!("paradedb.match('search_title', ${idx})")
+    };
+    *idx += 1;
+    let mut keys: Vec<String> = Vec::new();
+    for n in &reference.numbers {
+        params.push(Box::new(n.key.clone()) as Box<dyn ToSql + Sync + Send>);
+        let key = format!(
+            "paradedb.boolean(should => ARRAY[paradedb.term('docket_keys', ${idx}::text), \
+             paradedb.term('docket_search', ${idx}::text)])"
+        );
+        *idx += 1;
+        keys.push(match n.courts.is_empty() {
+            true => key,
+            false => {
+                let courts: Vec<String> = n.courts.iter().map(|c| (*c).to_string()).collect();
+                let route = term_any("jurisdiction_type", &courts, idx, params);
+                format!("paradedb.boolean(must => ARRAY[{key}, {route}])")
+            }
+        });
+    }
+    for e in &reference.eclis {
+        params.push(Box::new(e.to_lowercase()) as Box<dyn ToSql + Sync + Send>);
+        keys.push(format!("paradedb.term('ecli', ${idx}::text)"));
+        *idx += 1;
+    }
+    if reference.named {
+        keys.insert(0, title);
+        return format!("paradedb.boolean(should => ARRAY[{}])", keys.join(", "));
+    }
+    let admits = match keys.len() {
+        0 => return title,
+        1 => keys.remove(0),
+        _ => format!("paradedb.boolean(should => ARRAY[{}])", keys.join(", ")),
+    };
+    let ranks = std::iter::once(title)
+        .chain(written_clauses(written, idx, params))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("paradedb.boolean(must => ARRAY[{admits}], should => ARRAY[{ranks}])")
+}
+
+/// Single leg of the reference retrieval: the title, the canonical docket keys
+/// and the ECLIs are clauses of one BM25 query, so a bearer that satisfies two
+/// of them ranks above one that satisfies a single one, and that one is still
+/// served.
+///
+/// Rows come back in final order, the citation count breaking a score tie
+/// (spans of `case_citation` and renvois of the Conseil d'Etat). The
+/// `MATERIALIZED` CTE keeps those two correlated subqueries on the rows the
+/// score already selected instead of the whole table.
+#[tracing::instrument(skip(conn, req, reference, written), fields(leg_limit))]
+pub(crate) async fn reference_leg(
     conn: &Client,
     req: &SearchRequest,
-    keys: &[String],
-    within: Option<&[i64]>,
+    reference: &ReferenceKeys,
+    written: &Written,
     leg_limit: i64,
-) -> std::result::Result<HashMap<i64, f64>, StoreError> {
+) -> std::result::Result<Vec<(i64, f64)>, StoreError> {
     let mut params: Params = Vec::new();
-    params.push(Box::new(keys.to_vec()));
-    let mut idx = 2usize;
-    let within_filter = match within {
-        Some(ids) => {
-            params.push(Box::new(ids.to_vec()));
-            idx += 1;
-            format!(" AND d.id = ANY(${})", idx - 1)
-        }
-        None => String::new(),
-    };
+    let mut idx = 1usize;
+    let primary = reference_query(req, reference, written, &mut idx, &mut params);
+    let array_filters = build_array_filter_queries(req, &mut idx, &mut params);
+    let query_expr = compose_tantivy_query(&primary, array_filters);
     let facet_filter = build_facet_filter(
         req,
         &mut idx,
         &mut params,
-        ArrayFilters::AsSql,
+        ArrayFilters::Tantivy,
         FilterTable::Decisions,
     );
+    let _ = idx;
     let sql = format!(
-        "WITH cles AS MATERIALIZED ( \
-           SELECT d.id, d.date_lecture \
-           FROM decisions d \
-           WHERE lj_docket_keys(d.docket_numbers) && $1::text[] \
-             AND d.deleted_at IS NULL{af}{ff} \
+        "WITH hits AS MATERIALIZED ( \
+           SELECT d.decision_id AS id, d.date_lecture, paradedb.score(d.id) AS score \
+           FROM decision_text d \
+           WHERE d.id @@@ {query_expr} AND d.deleted_at IS NULL{ff} \
+           ORDER BY score DESC LIMIT {limit} \
          ) \
-         SELECT c.id FROM cles c \
-         ORDER BY (SELECT count(*) FROM case_citation cc \
-                   WHERE cc.target_decision_id = c.id) DESC, \
-                  c.date_lecture DESC NULLS LAST, c.id DESC LIMIT {limit}",
-        af = within_filter,
+         SELECT h.id, h.score FROM hits h \
+         ORDER BY h.score DESC, \
+                  (SELECT count(*) FROM case_citation cc \
+                   WHERE cc.target_decision_id = h.id) \
+                + (SELECT count(*) FROM decision_renvoi r \
+                   WHERE r.target_decision_id = h.id) DESC, \
+                  h.date_lecture DESC NULLS LAST, h.id DESC",
         ff = facet_filter,
         limit = leg_limit,
     );
     let rows = conn.query(sql.as_str(), &as_refs(&params)).await?;
-    let n = rows.len() as f64;
+    let mut seen = std::collections::HashSet::new();
     Ok(rows
         .iter()
-        .enumerate()
-        .map(|(i, r)| (r.get::<_, i64>(0), n - i as f64))
+        .map(|r| (r.get::<_, i64>(0), r.get::<_, f32>(1) as f64))
+        .filter(|(id, _)| seen.insert(*id))
         .collect())
 }
 
@@ -312,14 +426,13 @@ fn ranks_by_score<F: Fn(i64) -> f64>(ids: &[i64], score: F) -> HashMap<i64, usiz
         .collect()
 }
 
-/// Les quatre classements entrant en fusion. `bm25`, `title` et `docket` sont des
-/// scores par décision (jambes `decisions_bm25` et clé exacte) ; `ann` porte le
-/// `LegHit` du chunk gagnant, seule jambe au grain chunk.
+/// The three rankings entering the fusion. `bm25` and `title` are scores per
+/// decision; `ann` carries the `LegHit` of the winning chunk, the only leg at
+/// chunk grain.
 pub(crate) struct Legs<'a> {
     pub(crate) bm25: &'a HashMap<i64, f64>,
     pub(crate) ann: &'a HashMap<i64, LegHit>,
     pub(crate) title: &'a HashMap<i64, f64>,
-    pub(crate) docket: &'a HashMap<i64, f64>,
 }
 
 /// Fusion RRF au grain décision, aux poids de [`crate::signals::Weights`]. Le
@@ -327,26 +440,18 @@ pub(crate) struct Legs<'a> {
 /// du snippet sémantique ([`super::hydrate::assemble_page`]) — sinon un chunk
 /// synthétique (snippet depuis `full_text`).
 pub(crate) fn fuse_ranks(legs: Legs<'_>, w: crate::signals::Weights) -> Vec<(i64, f64, LegHit)> {
-    let Legs {
-        bm25,
-        ann,
-        title,
-        docket,
-    } = legs;
+    let Legs { bm25, ann, title } = legs;
     let bm25_ids: Vec<i64> = bm25.keys().copied().collect();
     let ann_ids: Vec<i64> = ann.keys().copied().collect();
     let title_ids: Vec<i64> = title.keys().copied().collect();
-    let docket_ids: Vec<i64> = docket.keys().copied().collect();
     let bm25_rank = ranks_by_score(&bm25_ids, |d| bm25[&d]);
     let ann_rank = ranks_by_score(&ann_ids, |d| ann[&d].raw_score);
     let title_rank = ranks_by_score(&title_ids, |d| title[&d]);
-    let docket_rank = ranks_by_score(&docket_ids, |d| docket[&d]);
 
     let mut all: HashSet<i64> = HashSet::new();
     all.extend(bm25.keys());
     all.extend(ann.keys());
     all.extend(title.keys());
-    all.extend(docket.keys());
 
     let mut fused: Vec<(i64, f64, LegHit)> = all
         .into_iter()
@@ -360,9 +465,6 @@ pub(crate) fn fuse_ranks(legs: Legs<'_>, w: crate::signals::Weights) -> Vec<(i64
             }
             if let Some(r) = title_rank.get(&d) {
                 score += w.title / (*r as f64 + RRF_RANK_CONSTANT);
-            }
-            if let Some(r) = docket_rank.get(&d) {
-                score += w.docket / (*r as f64 + RRF_RANK_CONSTANT);
             }
             let chunk = ann
                 .get(&d)
@@ -396,7 +498,6 @@ pub(crate) fn truncate_fused(fused: Vec<(i64, f64, LegHit)>) -> Vec<(i64, f64, L
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signals;
 
     #[test]
     fn rrf_fusion_tiebreak_parity_oracle() {
@@ -410,13 +511,11 @@ mod tests {
         let bm25: HashMap<i64, f64> = HashMap::from([(1, 5.0), (2, 5.0), (3, 1.0)]);
         let ann = HashMap::from([(2, mk(2, 9.0)), (4, mk(4, 2.0))]);
         let title = HashMap::from([(1, 3.0), (4, 3.0)]);
-        let no_docket: HashMap<i64, f64> = HashMap::new();
         let fused = fuse_ranks(
             Legs {
                 bm25: &bm25,
                 ann: &ann,
                 title: &title,
-                docket: &no_docket,
             },
             crate::signals::BASE_WEIGHTS,
         );
@@ -450,13 +549,11 @@ mod tests {
         let bm25: HashMap<i64, f64> = HashMap::from([(1, 4.0)]);
         let ann = HashMap::from([(1, mk(1, 2.0)), (2, mk(2, 7.0))]);
         let title = HashMap::from([(5, 9.0)]);
-        let no_docket: HashMap<i64, f64> = HashMap::new();
         let fused = fuse_ranks(
             Legs {
                 bm25: &bm25,
                 ann: &ann,
                 title: &title,
-                docket: &no_docket,
             },
             crate::signals::BASE_WEIGHTS,
         );
@@ -533,39 +630,179 @@ mod tests {
         let mut title = HashMap::new();
         title.insert(1i64, 3.0);
         title.insert(2i64, 1.0);
-        let no_docket: HashMap<i64, f64> = HashMap::new();
         let fused = fuse_ranks(
             Legs {
                 bm25: &bm25,
                 ann: &ann,
                 title: &title,
-                docket: &no_docket,
             },
             crate::signals::BASE_WEIGHTS,
         );
         assert_eq!(fused[0].0, 1);
     }
 
-    #[test]
-    fn la_jambe_cle_remonte_la_decision_exacte_en_mode_reference() {
-        let bm25: HashMap<i64, f64> = HashMap::new();
-        let ann: HashMap<i64, LegHit> = HashMap::new();
-        let title: HashMap<i64, f64> = HashMap::from([(2, 9.0), (3, 8.0), (7, 1.0)]);
-        let docket: HashMap<i64, f64> = HashMap::from([(7, 1.0)]);
-        let w = signals::Weights {
-            docket: signals::PURE_REFERENCE_DOCKET_WEIGHT,
-            ..signals::BASE_WEIGHTS
+    fn reference_expr(query: &str, numbers: &[QueryNumber], eclis: &[String]) -> String {
+        let req: SearchRequest =
+            serde_json::from_value(serde_json::json!({ "query": query })).unwrap();
+        let reference = ReferenceKeys {
+            numbers: numbers.to_vec(),
+            eclis: eclis.to_vec(),
+            named: false,
         };
-        let fused = fuse_ranks(
-            Legs {
-                bm25: &bm25,
-                ann: &ann,
-                title: &title,
-                docket: &docket,
-            },
-            w,
+        let mut idx = 1usize;
+        let mut params: Params = Vec::new();
+        reference_query(&req, &reference, &Written::default(), &mut idx, &mut params)
+    }
+
+    fn nombre(key: &str, courts: &'static [&'static str]) -> QueryNumber {
+        QueryNumber {
+            key: key.to_string(),
+            courts,
+            weak: false,
+        }
+    }
+
+    /// A query with no number is the title clause alone, unwrapped: the `should`
+    /// of one is the one.
+    #[test]
+    fn sans_numero_la_reference_est_la_seule_clause_titre() {
+        assert_eq!(
+            reference_expr("Epoux Lemonnier", &[], &[]),
+            "paradedb.match('search_title', $1)"
         );
-        assert_eq!(fused[0].0, 7, "la décision exacte passe devant le voisin");
+    }
+
+    /// The key admits and the title ranks: a title matching one token of the
+    /// query brings nothing in on its own.
+    #[test]
+    fn la_cle_admet_et_le_titre_ne_fait_que_classer() {
+        assert_eq!(
+            reference_expr("25-12.849", &[nombre("2512849", &[])], &[]),
+            "paradedb.boolean(must => ARRAY[paradedb.boolean(should => ARRAY[paradedb.term('docket_keys', $2::text), \
+             paradedb.term('docket_search', $2::text)])], \
+             should => ARRAY[paradedb.match('search_title', $1)])"
+        );
+    }
+
+    /// Two keys admit by their union, so a query naming two numbers serves the
+    /// bearers of either.
+    #[test]
+    fn deux_cles_admettent_par_leur_union() {
+        let expr = reference_expr(
+            "25-12.848 25-12.849",
+            &[nombre("2512848", &[]), nombre("2512849", &[])],
+            &[],
+        );
+        assert!(
+            expr.starts_with(
+                "paradedb.boolean(must => ARRAY[paradedb.boolean(should => ARRAY[\
+                 paradedb.boolean(should => ARRAY[paradedb.term('docket_keys', $2::text), \
+             paradedb.term('docket_search', $2::text)]), \
+                 paradedb.boolean(should => ARRAY[paradedb.term('docket_keys', $3::text), \
+             paradedb.term('docket_search', $3::text)])])]"
+            ),
+            "{expr}"
+        );
+    }
+
+    /// A graphy that names its courts routes inside the key clause, never on the
+    /// whole query: the title of another court is still ranked.
+    #[test]
+    fn le_routage_des_cours_reste_dans_la_clause_de_la_cle() {
+        let expr = reference_expr("25-12.849", &[nombre("2512849", &["CC"])], &[]);
+        assert!(
+            expr.contains(
+                "paradedb.boolean(must => ARRAY[\
+                 paradedb.boolean(should => ARRAY[paradedb.term('docket_keys', $2::text), \
+             paradedb.term('docket_search', $2::text)]), \
+                 paradedb.term('jurisdiction_type', $3::text)])"
+            ),
+            "{expr}"
+        );
+    }
+
+    /// The court and the day the query writes rank beside the title, weighed by
+    /// BM25 like it: they admit nothing, so a bearer of another court is still
+    /// served.
+    #[test]
+    fn la_cour_et_le_jour_ecrits_classent_sans_admettre() {
+        let req: SearchRequest =
+            serde_json::from_value(serde_json::json!({ "query": "CA Versailles 22/03080" }))
+                .unwrap();
+        let written = Written {
+            kind: Some("CA"),
+            code: Some("ca_versailles".to_string()),
+            day: Some("2024-05-23".to_string()),
+        };
+        let mut idx = 1usize;
+        let mut params: Params = Vec::new();
+        let reference = ReferenceKeys {
+            numbers: vec![nombre("2203080", &[])],
+            ..Default::default()
+        };
+        let expr = reference_query(&req, &reference, &written, &mut idx, &mut params);
+        assert_eq!(
+            expr,
+            "paradedb.boolean(must => ARRAY[paradedb.boolean(should => ARRAY[paradedb.term('docket_keys', $2::text), \
+             paradedb.term('docket_search', $2::text)])], \
+             should => ARRAY[paradedb.match('search_title', $1), \
+             paradedb.term('jurisdiction_type', $3::text), \
+             paradedb.term('jurisdiction_code', $4::text), \
+             paradedb.term('date_lecture', $5::text::date)])"
+        );
+    }
+
+    /// The numbers of a named decision rank beside the title and admit as it
+    /// does: a title that answers the query is not dropped for lacking them.
+    #[test]
+    fn les_numeros_d_un_nom_classent_sans_restreindre() {
+        let req: SearchRequest =
+            serde_json::from_value(serde_json::json!({ "query": "Bergoend Annecy" })).unwrap();
+        let reference = ReferenceKeys {
+            numbers: vec![nombre("399094", &[])],
+            named: true,
+            ..Default::default()
+        };
+        let mut idx = 1usize;
+        let mut params: Params = Vec::new();
+        assert_eq!(
+            reference_query(&req, &reference, &Written::default(), &mut idx, &mut params),
+            "paradedb.boolean(should => ARRAY[paradedb.match('search_title', $1), \
+             paradedb.boolean(should => ARRAY[paradedb.term('docket_keys', $2::text), \
+             paradedb.term('docket_search', $2::text)])])"
+        );
+    }
+
+    /// A key asks both key fields, `docket_search` holding the exact keys with
+    /// the digits of a lettered number: `106/77` reaches `C-106/77` by its
+    /// digits, and a bearer of the exact key, which matches both, ranks above.
+    #[test]
+    fn une_cle_interroge_la_cle_exacte_et_ses_chiffres() {
+        let expr = reference_expr("106/77", &[nombre("10677", &[])], &[]);
+        assert!(
+            expr.contains("paradedb.term('docket_keys', $2::text)")
+                && expr.contains("paradedb.term('docket_search', $2::text)"),
+            "{expr}"
+        );
+    }
+
+    /// The operator governs the title clause, the keys sitting beside it: the two
+    /// no longer disagree on `ET`, which the array overlap could not express.
+    #[test]
+    fn un_operateur_booleen_passe_par_le_parse_du_titre() {
+        let expr = reference_expr(
+            "\"25-12.848\" OU \"25-12.849\"",
+            &[nombre("2512848", &[]), nombre("2512849", &[])],
+            &[],
+        );
+        assert!(
+            expr.contains("paradedb.parse_with_field('search_title', $1)"),
+            "{expr}"
+        );
+        assert!(
+            expr.contains("$2::text") && expr.contains("$3::text"),
+            "{expr}"
+        );
     }
 
     #[test]

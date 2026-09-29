@@ -39,7 +39,7 @@ HTTP 200
 [Asserts]
 header "Cache-Control" == "public, max-age=0, must-revalidate, s-maxage=300"
 
-GET {{base}}/decisions
+GET {{base}}/decision-search
 HTTP 200
 [Asserts]
 header "Cache-Control" == "public, max-age=0, must-revalidate, s-maxage=300"
@@ -52,6 +52,8 @@ HTTP 200
 decision_id: jsonpath "$.hits[0].id"
 
 GET {{base}}/decision/{{decision_id}}
+[Options]
+location: true
 HTTP 200
 [Asserts]
 header "Cache-Control" startsWith "public, max-age=0, s-maxage="

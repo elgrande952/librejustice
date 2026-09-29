@@ -59,15 +59,10 @@ pub fn ProfilePage() -> impl IntoView {
 async fn charger() -> Option<lj_dtos::AccountSummary> {
     #[cfg(feature = "ssr")]
     {
-        let state = use_context::<lj_api::state::AppState>()?;
         let parts = use_context::<axum::http::request::Parts>()?;
-        let (token, _) = lj_api::session::from_parts(&parts)?;
-        match lj_api::session::resolve(&state, &token).await {
-            lj_api::session::Verdict::Porteur { sub, .. } => {
-                lj_api::account::resume(&state, &sub).await.ok()
-            }
-            _ => None,
-        }
+        crate::api::ApiClient::from_context()
+            .account_summary(&parts)
+            .await
     }
     #[cfg(not(feature = "ssr"))]
     {
@@ -85,18 +80,18 @@ fn message_done(code: &str) -> &'static str {
         "google" => "Compte Google lié.",
         "microsoft" => "Compte Microsoft lié.",
         "deliaison" => "Connexion retirée.",
-        "email" => "Adresse email mise à jour.",
+        "email" => "Adresse e-mail mise à jour.",
         _ => "C'est fait.",
     }
 }
 
 fn message_sent(code: &str) -> &'static str {
     match code {
-        "password" => "Email envoyé : ouvrez le lien qu'il contient pour choisir le mot de passe.",
+        "password" => "E-mail envoyé : ouvrez le lien qu'il contient pour choisir le mot de passe.",
         "email_change" => {
-            "Email envoyé à votre adresse actuelle : confirmez-y la demande de changement."
+            "E-mail envoyé à votre adresse actuelle : confirmez-y la demande de changement."
         }
-        _ => "Email envoyé.",
+        _ => "E-mail envoyé.",
     }
 }
 
@@ -142,7 +137,7 @@ fn ProfileView(compte: AccountSummary) -> impl IntoView {
             <section class="flex flex-col gap-4">
                 <h2 class=TITRE_SECTION>"Identité"</h2>
                 <div class="rounded-md border border-[var(--color-rule)] px-4 py-3">
-                    <p class=ETIQUETTE>"Adresse email"</p>
+                    <p class=ETIQUETTE>"Adresse e-mail"</p>
                     <p class="mt-0.5 text-sm text-[var(--color-ink)]">{email}</p>
                 </div>
 
@@ -166,7 +161,7 @@ fn ProfileView(compte: AccountSummary) -> impl IntoView {
 
                 <form method="post" action="/internal/account/email-change" class="flex flex-col gap-3">
                     <label for="newEmail" class=ETIQUETTE>
-                        "Changer d'adresse email — un lien de confirmation part vers l'adresse actuelle, puis vers la nouvelle"
+                        "Changer d'adresse e-mail : un lien de confirmation part vers l'adresse actuelle, puis vers la nouvelle"
                     </label>
                     <input
                         id="newEmail"
@@ -227,7 +222,7 @@ fn ProfileView(compte: AccountSummary) -> impl IntoView {
                 </h2>
                 <p class="text-sm text-[var(--color-ink-muted)]">
                     "Cette action supprime " <strong>"définitivement"</strong>
-                    " votre compte, vos signets et votre historique de recherche. Aucune restauration n'est possible."
+                    " votre compte et vos signets. Aucune restauration n'est possible."
                 </p>
                 <form method="post" action="/internal/account/delete" class="flex flex-col gap-3">
                     <label for="deleteConfirm" class=ETIQUETTE>

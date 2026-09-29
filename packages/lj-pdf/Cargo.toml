@@ -1,0 +1,47 @@
+[package]
+name = "lj-pdf"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["embed-cmaps"]
+embed-cmaps = ["hayro-cmap/embed-cmaps"]
+
+[dependencies]
+serde = { workspace = true }
+flate2 = { workspace = true }
+sha2 = { workspace = true }
+sha1 = "0.10"
+md-5 = "0.10"
+aes = "0.8"
+cms = { version = "0.2", features = ["builder"] }
+const-oid = "0.9"
+der = "0.7"
+pkcs8 = "0.10"
+rsa = { version = "0.9", features = ["sha2", "pem"] }
+spki = "0.7"
+x509-cert = { version = "0.2", features = ["builder"] }
+jpeg-decoder = "0.3"
+# The version lj-office reads fonts with, so the browser module carries one copy.
+read-fonts = "0.41"
+# Without `embed-cmaps`, the predefined CMaps come from `provide_cmap`.
+hayro-cmap = { version = "0.1", default-features = false }
+hayro-jbig2 = { version = "0.3", default-features = false, features = ["simd"] }
+hayro-jpeg2000 = { version = "0.3.5", default-features = false, features = ["simd"] }
+brotli-decompressor = "5"
+lj-draw = { workspace = true }
+lj-image = { workspace = true }
+
+# `pdf_svg`, which rasterises each page as the Word bench does.
+[dev-dependencies]
+jpeg-encoder = "0.6"
+png = "0.18"
+resvg = "0.48"
+rand_chacha = "0.3"
+rand_core = "0.6"
+serde_json = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+lj-workspace-hack = { version = "0.1", path = "../lj-workspace-hack" }

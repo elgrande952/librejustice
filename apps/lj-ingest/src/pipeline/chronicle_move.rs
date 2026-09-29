@@ -50,7 +50,7 @@ pub async fn move_chronicle(vehicle: &str, exclude: &[String]) -> Result<()> {
     let (moved, dupes, toc) = repo
         .move_chronicle_articles(vehicle, &instrument, &exclusions)
         .await?;
-    let denorm = repo.refresh_article_denorm().await?;
+    let denorm = repo.refresh_article_denorm(None).await?;
     let (ranked_texts, _) = repo.refresh_reading_ranks().await?;
     tracing::info!(
         vehicle,

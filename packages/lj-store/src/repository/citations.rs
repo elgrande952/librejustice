@@ -98,7 +98,7 @@ impl DecisionRepository<'_> {
             .conn
             .query(
                 "SELECT id FROM decisions WHERE id = ANY($1) AND extract_version > $2",
-                &[&ids, &lj_core::EXTRACT_VERSION],
+                &[&ids, &lj_versions::EXTRACT_VERSION],
             )
             .await?
             .into_iter()
@@ -114,7 +114,7 @@ impl DecisionRepository<'_> {
             .iter()
             .map(|(id, occ)| (*id, occ.as_deref().unwrap_or(&[])))
             .collect();
-        self.write_citation_occurrences(&v9_items, lj_core::EXTRACT_VERSION)
+        self.write_citation_occurrences(&v9_items, lj_versions::EXTRACT_VERSION)
             .await?;
         Ok(changed)
     }
@@ -138,7 +138,7 @@ impl DecisionRepository<'_> {
                 FROM legal_citation
                 WHERE decision_id = ANY($1) AND extract_version <= $2
                 ",
-                &[&decision_ids, &lj_core::EXTRACT_VERSION],
+                &[&decision_ids, &lj_versions::EXTRACT_VERSION],
             )
             .await?;
         let mut current: HashMap<i64, HashSet<OccurrenceFingerprint>> = HashMap::new();
@@ -433,7 +433,7 @@ impl DecisionRepository<'_> {
                         (regexp_match(raw,
                             '(?i)^\s*(?:le |la |les |l['''']? ?|du |de la |de l['''']? ?)?\s*(?:directive|r[eè]glement)[^0-9]{0,40}(\d{1,4}/\d{1,4})'))[1] AS slashnum
                     FROM (
-                        SELECT substring(d.full_text FROM (el->>0)::int + 1
+                        SELECT substring((SELECT dt.full_text FROM decision_text dt WHERE dt.decision_id = d.id AND dt.lead) FROM (el->>0)::int + 1
                                          FOR (el->>1)::int - (el->>0)::int) AS raw
                         FROM legal_citation lc
                         JOIN decisions d ON d.id = lc.decision_id
@@ -647,7 +647,7 @@ impl DecisionRepository<'_> {
     }
 
     /// Palmarès « articles les plus cités » d'un **texte entier** (colonne droite
-    /// de `/texte/{code}`) : `(num_key, numéro affichable, décompte)`, du plus cité
+    /// de `/norm/{juris}/{code}`) : `(num_key, numéro affichable, décompte)`, du plus cité
     /// au moins cité.
     ///
     /// Le classement se lit dans `citing_decision_counts` seul — un scan de la
@@ -798,7 +798,7 @@ impl DecisionRepository<'_> {
                     "
                     SELECT d.id, d.public_id, d.jurisdiction_type,
                            j.label, d.date_lecture::text, d.docket_numbers,
-                           d.publication_codes, d.summary,
+                           d.publication_codes, (SELECT dt.summary FROM decision_text dt WHERE dt.decision_id = d.id AND dt.lead),
                            ARRAY(SELECT DISTINCT el->>3
                                  FROM jsonb_array_elements(lc.spans) AS el
                                  WHERE (el->>2) || '|' || (el->>3) = ANY($1))
@@ -825,7 +825,7 @@ impl DecisionRepository<'_> {
                         "
                         SELECT d.id, d.public_id, d.jurisdiction_type,
                                j.label, d.date_lecture::text, d.docket_numbers,
-                               d.publication_codes, d.summary,
+                               d.publication_codes, (SELECT dt.summary FROM decision_text dt WHERE dt.decision_id = d.id AND dt.lead),
                                ARRAY(SELECT DISTINCT split_part(t, '|', 2)
                                      FROM unnest(public.lj_cit_terms(lc.spans)) t
                                      WHERE t = ANY($1)),
@@ -943,7 +943,7 @@ impl DecisionRepository<'_> {
                     &r.char_end,
                     &r.ref_text_uid,
                     &r.ref_num_key,
-                    &lj_core::EXTRACT_VERSION,
+                    &lj_versions::EXTRACT_VERSION,
                 ])
                 .await?;
         }
@@ -1079,6 +1079,7 @@ impl DecisionRepository<'_> {
             .conn
             .query(
                 "SELECT c.char_start, c.char_end, lt.slug, c.ref_num_key, lt.title, \
+                        lt.jurisdiction, \
                         (EXISTS (SELECT 1 FROM legal_article a \
                                  WHERE a.text_uid = lt.text_uid) \
                          OR coalesce(length(lt.body), 0) > 0) AS readable \
@@ -1099,7 +1100,8 @@ impl DecisionRepository<'_> {
                 ref_slug: r.get(2),
                 ref_num_key: r.get(3),
                 ref_title: r.get(4),
-                ref_readable: r.get(5),
+                ref_jurisdiction: r.get(5),
+                ref_readable: r.get(6),
             })
             .collect())
     }

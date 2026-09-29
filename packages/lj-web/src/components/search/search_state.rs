@@ -40,6 +40,8 @@ pub struct SearchKey {
     pub date_from: Option<String>,
     pub date_to: Option<String>,
     pub sort: String,
+    /// Mode demandé : `auto` (défaut) laisse le résolveur lire la requête.
+    pub mode: String,
     pub ai_mode: bool,
 }
 
@@ -105,7 +107,18 @@ pub fn key_from_map(map: &ParamsMap) -> SearchKey {
         date_from: date("dateFrom"),
         date_to: date("dateTo"),
         sort: parse_sort(map.get("sort").as_deref()),
+        mode: parse_mode(map.get("mode").as_deref()),
         ai_mode: super::ai_mode::ai_mode_from_param(map.get("aiMode").as_deref()),
+    }
+}
+
+/// `auto` | `lexical` | `semantic` | `reference` (défaut `auto`).
+pub fn parse_mode(raw: Option<&str>) -> String {
+    match raw {
+        Some("lexical") => "lexical".to_string(),
+        Some("semantic") => "semantic".to_string(),
+        Some("reference") => "reference".to_string(),
+        _ => "auto".to_string(),
     }
 }
 
@@ -159,7 +172,12 @@ pub fn request_from_key(key: &SearchKey) -> SearchRequest {
         publication: non_empty(&key.publication),
         date_from: key.date_from.clone(),
         date_to: key.date_to.clone(),
-        mode: SearchMode::Auto,
+        mode: match key.mode.as_str() {
+            "lexical" => SearchMode::Lexical,
+            "semantic" => SearchMode::Semantic,
+            "reference" => SearchMode::Reference,
+            _ => SearchMode::Auto,
+        },
         sort,
         limit: SEARCH_PAGE_SIZE,
         offset,

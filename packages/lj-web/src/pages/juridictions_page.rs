@@ -1,6 +1,8 @@
 //! Hubs juridiction — l'arborescence navigable vers les décisions :
-//! `/juridictions` (catalogue par famille) → `/juridiction/{code}` (années)
-//! → `/juridiction/{code}/{annee}?page=N` (liste paginée de liens décision).
+//! `/decision-index/{juris}` (catalogue par famille) →
+//! `/decision-index/{juris}/{code}` (années) →
+//! `/decision-index/{juris}/{code}/{year}?page=N` (liste paginée de liens
+//! décision).
 //! Pages SSR crawlables : chaque décision est à quelques clics de la home.
 
 use leptos::either::Either;
@@ -9,13 +11,29 @@ use leptos_meta::{Link, Meta, Title};
 use leptos_router::components::A;
 use leptos_router::hooks::{use_params_map, use_query_map};
 use lj_dtos::{
-    JurisdictionCatalogueResponse, JurisdictionHubResponse, JurisdictionTypeGroup,
-    JurisdictionYearResponse,
+    JurisdictionCatalogueResponse, JurisdictionHubResponse, JurisdictionType,
+    JurisdictionTypeGroup, JurisdictionYearResponse,
 };
 
 use crate::api::ApiClient;
 use crate::components::own_page_description;
+use crate::helpers::decisions_href;
 use crate::pages::law_page::data::{sendable, PageError};
+
+fn not_found() -> PageError {
+    PageError {
+        status: 404,
+        message: "Juridiction inconnue".to_string(),
+    }
+}
+
+/// Keeps a response only when its court belongs to the jurisdiction the URL names.
+fn in_jurisdiction(jurisdiction_type: &str, juris: &str) -> bool {
+    JurisdictionType::from_code(jurisdiction_type).is_some_and(|t| t.url_segment() == juris)
+}
+
+const DEEP_LINK: &str =
+    "w-fit text-sm text-[var(--color-accent)] underline-offset-4 hover:underline";
 
 /// Nombre avec séparateur de milliers FR (espace fine insécable).
 pub(crate) fn fmt_count(n: i64) -> String {
@@ -143,7 +161,7 @@ pub(crate) fn HubBreadcrumb(items: Vec<(String, Option<String>)>) -> impl IntoVi
 }
 
 // ---------------------------------------------------------------------------
-// /juridictions — catalogue par famille
+// /decision-index/{juris}, catalogue par famille
 // ---------------------------------------------------------------------------
 
 #[component]
@@ -152,14 +170,22 @@ pub fn JuridictionsPage() -> impl IntoView {
     // on la declare ici, synchroniquement, sinon la generique du shell sort aussi.
     own_page_description();
 
+    let params = use_params_map();
     let catalogue = Resource::new_blocking(
-        || (),
-        |_| {
-            sendable(async {
-                ApiClient::from_context()
+        move || params.get().get("juris").unwrap_or_default(),
+        |juris| {
+            sendable(async move {
+                let mut catalogue = ApiClient::from_context()
                     .fetch_juridictions()
                     .await
-                    .map_err(PageError::from)
+                    .map_err(PageError::from)?;
+                catalogue
+                    .groups
+                    .retain(|g| in_jurisdiction(&g.jurisdiction_type, &juris));
+                if catalogue.groups.is_empty() {
+                    return Err(not_found());
+                }
+                Ok((juris, catalogue))
             })
         },
     );
@@ -168,9 +194,9 @@ pub fn JuridictionsPage() -> impl IntoView {
         <Suspense fallback=HubSkeleton>
             {move || Suspend::new(async move {
                 match catalogue.await {
-                    Ok(r) => {
+                    Ok((juris, r)) => {
                         set_cache_control(200);
-                        Either::Left(view! { <JuridictionsLoaded response=r /> })
+                        Either::Left(view! { <JuridictionsLoaded juris=juris response=r /> })
                     }
                     Err(err) => {
                         set_cache_control(err.status);
@@ -183,12 +209,12 @@ pub fn JuridictionsPage() -> impl IntoView {
 }
 
 #[component]
-fn JuridictionsLoaded(response: JurisdictionCatalogueResponse) -> impl IntoView {
+fn JuridictionsLoaded(juris: String, response: JurisdictionCatalogueResponse) -> impl IntoView {
     let title = "Juridictions - LibreJustice";
     let description = "Toutes les juridictions du corpus — Conseil d'État, Cour de cassation, \
          cours d'appel, tribunaux administratifs et judiciaires, cours européennes — avec \
          leurs décisions par année.";
-    let url = "https://librejustice.fr/juridictions".to_string();
+    let url = format!("https://librejustice.fr/decision-index/{juris}");
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", "https://librejustice.fr/".to_string()),
         ("Juridictions", url.clone()),
@@ -215,14 +241,14 @@ fn JuridictionsLoaded(response: JurisdictionCatalogueResponse) -> impl IntoView 
             {response
                 .groups
                 .into_iter()
-                .map(|group| view! { <JuridictionGroup group=group /> })
+                .map(|group| view! { <JuridictionGroup juris=juris.clone() group=group /> })
                 .collect_view()}
         </div>
     }
 }
 
 #[component]
-fn JuridictionGroup(group: JurisdictionTypeGroup) -> impl IntoView {
+fn JuridictionGroup(juris: String, group: JurisdictionTypeGroup) -> impl IntoView {
     view! {
         <section class="flex flex-col gap-3">
             <h2 class="text-xs uppercase tracking-[0.18em] text-[var(--color-ink-subtle)]">
@@ -233,7 +259,7 @@ fn JuridictionGroup(group: JurisdictionTypeGroup) -> impl IntoView {
                     .jurisdictions
                     .into_iter()
                     .map(|j| {
-                        let href = format!("/juridiction/{}", j.code);
+                        let href = format!("/decision-index/{juris}/{}", j.code);
                         let count = format!(
                             "{} décision{}",
                             fmt_count(j.decision_count),
@@ -262,7 +288,7 @@ fn JuridictionGroup(group: JurisdictionTypeGroup) -> impl IntoView {
 }
 
 // ---------------------------------------------------------------------------
-// /juridiction/{code} — hub d'une juridiction (années)
+// /decision-index/{juris}/{code}, hub d'une juridiction (années)
 // ---------------------------------------------------------------------------
 
 #[component]
@@ -310,15 +336,20 @@ fn JuridictionHubLoaded(hub: JurisdictionHubResponse) -> impl IntoView {
         fmt_count(hub.decision_count),
         hub.label,
     );
-    let url = format!("https://librejustice.fr/juridiction/{}", hub.code);
+    let index = format!(
+        "/decision-index/{}",
+        JurisdictionType::from_code(&hub.jurisdiction_type)
+            .expect("a stored jurisdiction_type is a known variant")
+            .url_segment()
+    );
+    let hub_href = format!("{index}/{}", hub.code);
+    let url = format!("https://librejustice.fr{hub_href}");
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", "https://librejustice.fr/".to_string()),
-        (
-            "Juridictions",
-            "https://librejustice.fr/juridictions".to_string(),
-        ),
+        ("Juridictions", format!("https://librejustice.fr{index}")),
         (&hub.label, url.clone()),
     ]);
+    let search_href = decisions_href([("seat", hub.seat_path.clone())]);
 
     view! {
         <Title text=title />
@@ -330,7 +361,7 @@ fn JuridictionHubLoaded(hub: JurisdictionHubResponse) -> impl IntoView {
             <header class="flex flex-col gap-3">
                 <HubBreadcrumb items=vec![
                     ("Accueil".to_string(), Some("/".to_string())),
-                    ("Juridictions".to_string(), Some("/juridictions".to_string())),
+                    ("Juridictions".to_string(), Some(index.clone())),
                     (hub.label.clone(), None),
                 ] />
                 <p class="text-xs uppercase tracking-[0.2em] text-[var(--color-ink-subtle)]">
@@ -345,6 +376,7 @@ fn JuridictionHubLoaded(hub: JurisdictionHubResponse) -> impl IntoView {
                         hub.years.first().map(|y| y.year).unwrap_or_default(),
                     )}
                 </p>
+                <A href=search_href attr:class=DEEP_LINK>"Rechercher dans ces décisions"</A>
             </header>
 
             <section class="flex flex-col gap-3">
@@ -356,7 +388,7 @@ fn JuridictionHubLoaded(hub: JurisdictionHubResponse) -> impl IntoView {
                         .years
                         .into_iter()
                         .map(|y| {
-                            let href = format!("/juridiction/{}/{}", hub.code, y.year);
+                            let href = format!("{hub_href}/{}", y.year);
                             let count = format!(
                                 "{} décision{}",
                                 fmt_count(y.count),
@@ -386,7 +418,7 @@ fn JuridictionHubLoaded(hub: JurisdictionHubResponse) -> impl IntoView {
 }
 
 // ---------------------------------------------------------------------------
-// /juridiction/{code}/{annee} — liste paginée des décisions d'une année
+// /decision-index/{juris}/{code}/{year}, liste paginée des décisions d'une année
 // ---------------------------------------------------------------------------
 
 #[component]
@@ -443,6 +475,7 @@ pub fn JuridictionYearPage() -> impl IntoView {
 
 #[component]
 fn JuridictionYearLoaded(page: JurisdictionYearResponse) -> impl IntoView {
+    let jurisdiction_type = page.jurisdiction_type;
     let page_size = i64::from(page.page_size);
     let page_count = ((page.total + page_size - 1) / page_size).max(1) as u32;
     let title = if page.page > 1 {
@@ -459,10 +492,10 @@ fn JuridictionYearLoaded(page: JurisdictionYearResponse) -> impl IntoView {
         page.year,
         page.label,
     );
-    let base_url = format!(
-        "https://librejustice.fr/juridiction/{}/{}",
-        page.code, page.year,
-    );
+    let index = format!("/decision-index/{}", jurisdiction_type.url_segment());
+    let hub_href = format!("{index}/{}", page.code);
+    let year_href = format!("{hub_href}/{}", page.year);
+    let base_url = format!("https://librejustice.fr{year_href}");
     // Canonical par page (?page=N au-delà de la première) : chaque page de la
     // pagination est un document distinct, pas un doublon de la première.
     let canonical = if page.page > 1 {
@@ -470,18 +503,16 @@ fn JuridictionYearLoaded(page: JurisdictionYearResponse) -> impl IntoView {
     } else {
         base_url.clone()
     };
-    let hub_href = format!("/juridiction/{}", page.code);
     let jsonld = breadcrumb_jsonld(&[
         ("Accueil", "https://librejustice.fr/".to_string()),
-        (
-            "Juridictions",
-            "https://librejustice.fr/juridictions".to_string(),
-        ),
-        (
-            &page.label,
-            format!("https://librejustice.fr/juridiction/{}", page.code),
-        ),
+        ("Juridictions", format!("https://librejustice.fr{index}")),
+        (&page.label, format!("https://librejustice.fr{hub_href}")),
         (&page.year.to_string(), base_url.clone()),
+    ]);
+    let search_href = decisions_href([
+        ("seat", page.seat_path.clone()),
+        ("dateFrom", format!("{}-01-01", page.year)),
+        ("dateTo", format!("{}-12-31", page.year)),
     ]);
 
     view! {
@@ -494,7 +525,7 @@ fn JuridictionYearLoaded(page: JurisdictionYearResponse) -> impl IntoView {
             <header class="flex flex-col gap-3">
                 <HubBreadcrumb items=vec![
                     ("Accueil".to_string(), Some("/".to_string())),
-                    ("Juridictions".to_string(), Some("/juridictions".to_string())),
+                    ("Juridictions".to_string(), Some(index.clone())),
                     (page.label.clone(), Some(hub_href.clone())),
                     (page.year.to_string(), None),
                 ] />
@@ -508,6 +539,9 @@ fn JuridictionYearLoaded(page: JurisdictionYearResponse) -> impl IntoView {
                         page.year,
                     )}
                 </p>
+                <A href=search_href attr:class=DEEP_LINK>
+                    {format!("Rechercher dans les décisions de {}", page.year)}
+                </A>
             </header>
 
             <ul class="flex flex-col divide-y divide-[var(--color-rule)]">
@@ -515,7 +549,7 @@ fn JuridictionYearLoaded(page: JurisdictionYearResponse) -> impl IntoView {
                     .decisions
                     .into_iter()
                     .map(|d| {
-                        let href = format!("/decision/{}", d.public_id);
+                        let href = lj_dtos::decision_path(jurisdiction_type, &d.public_id);
                         view! {
                             <li class="py-2.5">
                                 <A
@@ -531,7 +565,7 @@ fn JuridictionYearLoaded(page: JurisdictionYearResponse) -> impl IntoView {
             </ul>
 
             <YearPagination
-                base=format!("/juridiction/{}/{}", page.code, page.year)
+                base=year_href
                 page=page.page
                 page_count=page_count
             />

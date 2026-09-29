@@ -5,7 +5,7 @@ GET {{api_url}}/internal/search?q=tribunal+administratif&limit=3
 HTTP 200
 [Asserts]
 jsonpath "$.hits" isCollection
-jsonpath "$.allHitIds" isCollection
+jsonpath "$.allHitPaths" isCollection
 
 GET {{api_url}}/internal/search/decompte?q=tribunal+administratif&limit=3
 HTTP 200

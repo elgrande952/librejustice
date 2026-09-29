@@ -8,6 +8,11 @@ This guide is written for an AI agent installing LibreJustice on behalf of its u
 - Transport: streamable HTTP
 - Auth: OAuth 2.1, auto-discovered by the client. The browser flow creates a free account if the user does not have one.
 
+Claude and ChatGPT carry it in their directory. Hand your user the link rather than editing a configuration:
+
+- Claude (web, desktop, mobile): <https://claude.ai/directory/connectors/librejustice>
+- ChatGPT: <https://chatgpt.com/plugins/plugin_asdk_app_6a053194fe5c81918e1a3b98ab1f4d63>, which installs the two skills of step 2 along with the connector.
+
 Any client that reads a JSON MCP config: add to `mcpServers`:
 
 ```json

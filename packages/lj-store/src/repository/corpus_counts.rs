@@ -15,8 +15,8 @@ use crate::error::Result;
 /// only rewrites the counts that changed.
 const REBUILD_TAIL: &str = r#"
     , cit AS (
-        SELECT paradedb.aggregate('decisions_bm25',
-                 paradedb.boolean(must => ARRAY[paradedb.all()],
+        SELECT paradedb.aggregate('decision_text_bm25',
+                 paradedb.boolean(must => ARRAY[paradedb.term('lead', true)],
                                   must_not => ARRAY[paradedb.exists('deleted_at')]),
                  '{"inst": {"terms": {"field": "legal_instruments", "size": 30}},
                    "art": {"terms": {"field": "legal_article_composite", "size": 300}}}'::json,

@@ -16,10 +16,10 @@ use serde_json::json;
 
 use crate::ratelimit::{now_unix, Ledger, Quota};
 
-const MISTRAL_URL: &str = "https://api.mistral.ai/v1/chat/completions";
+// Since 2026-09-03 chat/completions serves mistral-small and mistral-medium at zero
+// requests per minute on the free tier; conversations serves them at the announced rate.
+const MISTRAL_URL: &str = "https://api.mistral.ai/v1/conversations";
 const OCR_URL: &str = "https://api.mistral.ai/v1/ocr";
-/// L'OCR fixe son modèle ; celui du client reste le modèle chat.
-const OCR_MODEL: &str = "mistral-ocr-latest";
 const MAX_RETRIES: u32 = 5;
 /// Back-off des pannes de service (5xx, transport) : ~2 s doublées à chaque cran.
 const RETRY_BASE_S: f64 = 2.0;
@@ -32,28 +32,40 @@ pub struct MistralClient {
     /// Même index que `keys`.
     fingerprints: Vec<String>,
     model: String,
+    /// `reasoning_effort`, left out when `None`.
+    effort: Option<String>,
     idx: std::sync::atomic::AtomicUsize,
-    /// Indices des clés refusées (401), sautées par le round-robin.
+    /// Indices des clés refusées (401, 402), sautées par le round-robin.
     dead: std::sync::Mutex<std::collections::HashSet<usize>>,
     /// Refus pas encore remontés, drainés par
     /// [`drain_spent_fingerprints`](Self::drain_spent_fingerprints).
-    unreported: std::sync::Mutex<Vec<usize>>,
+    unreported: std::sync::Mutex<Vec<(usize, u16)>>,
     ledger: Ledger,
 }
 
 impl MistralClient {
     /// `keys` non vide.
     pub fn new(keys: Vec<String>, model: String) -> Result<Self> {
-        Self::build(keys, model)
+        Self::build(keys, model, None)
     }
 
-    fn build(keys: Vec<String>, model: String) -> Result<Self> {
+    /// `mistral-medium` at `high` reasons for up to 16 000 tokens, measured 23/09/2026,
+    /// hence the longer timeout.
+    pub fn with_effort(keys: Vec<String>, model: String, effort: Option<String>) -> Result<Self> {
+        Self::build(keys, model, effort)
+    }
+
+    fn build(keys: Vec<String>, model: String, effort: Option<String>) -> Result<Self> {
         if keys.is_empty() {
             anyhow::bail!("MistralClient: keys must be non-empty");
         }
         let http = ClientBuilder::new(
             reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
+                .timeout(std::time::Duration::from_secs(if effort.is_some() {
+                    600
+                } else {
+                    60
+                }))
                 .build()
                 .context("mistral: client HTTP")?,
         )
@@ -71,6 +83,7 @@ impl MistralClient {
             fingerprints: keys.iter().map(|k| key_fingerprint(k)).collect(),
             keys,
             model,
+            effort,
             dead: std::sync::Mutex::new(std::collections::HashSet::new()),
             unreported: std::sync::Mutex::new(Vec::new()),
             ledger,
@@ -94,7 +107,7 @@ impl MistralClient {
         }
     }
 
-    fn mark_dead(&self, key_idx: usize) {
+    fn mark_dead(&self, key_idx: usize, status: u16) {
         if !self
             .dead
             .lock()
@@ -106,28 +119,12 @@ impl MistralClient {
         self.unreported
             .lock()
             .expect("mutex unreported non empoisonné")
-            .push(key_idx);
+            .push((key_idx, status));
         tracing::warn!(
             fingerprint = %self.fingerprints[key_idx],
-            "mistral_key_dead_401"
+            status,
+            "mistral_key_dead"
         );
-    }
-
-    /// Aligne les clés écartées sur la liste de l'appelant, qui fait autorité.
-    ///
-    /// Remplace, n'ajoute pas : un 401 constaté en cours de route est reversé au
-    /// magasin durable avant la fin de la requête
-    /// ([`Self::drain_spent_fingerprints`]). Unir ferait de ce jeu un cliquet
-    /// qu'aucune remise en service ne desserre tant que le processus vit.
-    pub fn set_dead_fingerprints(&self, fingerprints: &[String]) {
-        let mut dead = self.dead.lock().expect("mutex dead non empoisonné");
-        *dead = self
-            .fingerprints
-            .iter()
-            .enumerate()
-            .filter(|(_, fp)| fingerprints.contains(fp))
-            .map(|(i, _)| i)
-            .collect();
     }
 
     pub fn live_key_count(&self) -> usize {
@@ -136,15 +133,25 @@ impl MistralClient {
 
     /// Refus constatés depuis le dernier appel. Draine : un client de longue vie
     /// ne doit pas faire réécrire la même ligne à chaque requête.
-    pub fn drain_spent_fingerprints(&self) -> Vec<String> {
+    pub fn drain_spent_fingerprints(&self) -> Vec<(String, u16)> {
         let mut unreported = self
             .unreported
             .lock()
             .expect("mutex unreported non empoisonné");
         unreported
             .drain(..)
-            .map(|i| self.fingerprints[i].clone())
+            .map(|(i, status)| (self.fingerprints[i].clone(), status))
             .collect()
+    }
+
+    /// Calls a minute the pool admits as it stands, summed over its keys.
+    pub fn rate_per_min(&self) -> f64 {
+        self.ledger.rate_per_min()
+    }
+
+    /// Calls in flight the pool justifies holding, and the keys still mute.
+    pub fn demand(&self) -> (f64, usize) {
+        self.ledger.demand()
     }
 
     /// Borne de rotation : une passe complète du pool.
@@ -153,42 +160,51 @@ impl MistralClient {
     }
 
     /// Contenu brut du message ; le parsing incombe à l'appelant.
-    /// `prompt_cache_key` amortit le prompt système sur des appels répétés.
     pub async fn chat(
         &self,
         system: &str,
         user: &str,
         max_tokens: Option<u32>,
-        prompt_cache_key: Option<&str>,
     ) -> Result<String, MistralError> {
         self.complete(
-            self.chat_payload(system, user, max_tokens, prompt_cache_key),
+            self.chat_payload(system, user, max_tokens),
             system.len() + user.len(),
+            true,
         )
         .await
     }
 
-    fn chat_payload(
+    /// Same, without the wait: a caller holding one queue over several pools needs
+    /// its job back rather than parked behind this bucket.
+    pub async fn chat_now(
         &self,
         system: &str,
         user: &str,
         max_tokens: Option<u32>,
-        prompt_cache_key: Option<&str>,
-    ) -> serde_json::Value {
+    ) -> Result<String, MistralError> {
+        self.complete(
+            self.chat_payload(system, user, max_tokens),
+            system.len() + user.len(),
+            false,
+        )
+        .await
+    }
+
+    fn chat_payload(&self, system: &str, user: &str, max_tokens: Option<u32>) -> serde_json::Value {
         let mut payload = json!({
             "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0,
-            "stream": false,
+            "instructions": system,
+            "inputs": user,
+            "store": false,
+            "completion_args": {"temperature": 0},
         });
         if let Some(max_tokens) = max_tokens {
-            payload["max_tokens"] = json!(max_tokens);
+            payload["completion_args"]["max_tokens"] = json!(max_tokens);
         }
-        if let Some(key) = prompt_cache_key {
-            payload["prompt_cache_key"] = json!(key);
+        if let Some(effort) = &self.effort {
+            payload["completion_args"]["reasoning_effort"] = json!(effort);
+            // Greedy decoding under reasoning answers 400 unless top_p is 1.
+            payload["completion_args"]["top_p"] = json!(1);
         }
         payload
     }
@@ -197,13 +213,12 @@ impl MistralClient {
         &self,
         payload: serde_json::Value,
         prompt_chars: usize,
+        wait: bool,
     ) -> Result<String, MistralError> {
-        let body = self.post_raw(MISTRAL_URL, payload, prompt_chars).await?;
-        Ok(body["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string())
+        let body = self
+            .post_raw(MISTRAL_URL, payload, prompt_chars, wait)
+            .await?;
+        Ok(message_text(&body))
     }
 
     /// PDF → markdown, pages concaténées. Non-déterministe : à cacher en amont
@@ -211,7 +226,7 @@ impl MistralClient {
     pub async fn ocr(&self, pdf_bytes: &[u8]) -> Result<String, MistralError> {
         let b64 = base64::engine::general_purpose::STANDARD.encode(pdf_bytes);
         let payload = json!({
-            "model": OCR_MODEL,
+            "model": self.model,
             "document": {
                 "type": "document_url",
                 "document_url": format!("data:application/pdf;base64,{b64}"),
@@ -223,7 +238,7 @@ impl MistralClient {
         });
         // Coût nul : l'OCR se facture à la page, la taille du base64 ne prédit
         // rien. Seul le compteur de requêtes gate ; l'en-tête corrige ensuite.
-        let body = self.post_raw(OCR_URL, payload, 0).await?;
+        let body = self.post_raw(OCR_URL, payload, 0, true).await?;
         let markdown = body["pages"]
             .as_array()
             .map(|pages| {
@@ -243,16 +258,18 @@ impl MistralClient {
         url: &str,
         payload: serde_json::Value,
         prompt_chars: usize,
+        wait: bool,
     ) -> Result<serde_json::Value, MistralError> {
-        // Un appelant à échéance coupe ce sommeil par son `timeout_at` ; la
-        // réservation est alors rendue par `Drop`.
+        // A caller on a deadline cuts this sleep with its `timeout_at`, and `Drop`
+        // gives the reservation back.
         let reservation = loop {
             match self
                 .ledger
                 .reserve(&self.key_order(), prompt_chars, now_unix())
             {
                 Ok(reservation) => break reservation,
-                Err(wait) => tokio::time::sleep(wait).await,
+                Err(delay) if !wait => return Err(MistralError::Busy(delay.as_secs_f64())),
+                Err(delay) => tokio::time::sleep(delay).await,
             }
         };
         let key_idx = reservation.key_idx();
@@ -267,12 +284,18 @@ impl MistralClient {
         // Un refus n'annonce que le compteur épuisé : c'est justement celui qui
         // doit arrêter d'émettre.
         let quota = Quota::from_headers(response.headers());
-        reservation.settle(quota, now_unix());
         let status = response.status().as_u16();
         if !response.status().is_success() {
+            if status == 429 {
+                reservation.refused(quota, now_unix());
+            } else {
+                reservation.settle(quota, None, now_unix());
+            }
             // 401 : clé refusée, sautée ensuite.
-            if status == 401 {
-                self.mark_dead(key_idx);
+            // A 402 organisation never spends its budget, so the ledger picks it
+            // first once the live keys saturate: one absorbed 85 % of the batches.
+            if status == 401 || status == 402 {
+                self.mark_dead(key_idx, status);
             } else if status == 429 {
                 // Quelle ressource a manqué ne se déduit pas du volume émis :
                 // seule la réponse le dit.
@@ -285,8 +308,35 @@ impl MistralClient {
             }
             return Err(MistralError::Status(status));
         }
-        response.json().await.map_err(MistralError::Http)
+        let body = response.json::<serde_json::Value>().await;
+        reservation.settle(quota, billed_tokens(body.as_ref().ok()), now_unix());
+        body.map_err(MistralError::Http)
     }
+}
+
+/// Tokens actually billed for a served call. `/v1/conversations` sends no
+/// `x-ratelimit-tokens-query-cost`, and the counter drops by exactly this instead.
+fn billed_tokens(body: Option<&serde_json::Value>) -> Option<u32> {
+    let total = body?["usage"]["total_tokens"].as_u64()?;
+    u32::try_from(total).ok()
+}
+
+fn message_text(body: &serde_json::Value) -> String {
+    let mut text = String::new();
+    for entry in body["outputs"].as_array().into_iter().flatten() {
+        match &entry["content"] {
+            serde_json::Value::String(s) => text.push_str(s),
+            serde_json::Value::Array(chunks) => {
+                for chunk in chunks {
+                    if let Some(t) = chunk["text"].as_str() {
+                        text.push_str(t);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    text.trim().to_string()
 }
 
 /// Empreinte xxh3-64 hex d'une clé API.
@@ -298,6 +348,8 @@ pub fn key_fingerprint(key: &str) -> String {
 pub enum MistralError {
     /// Réponse HTTP non-2xx (code de statut).
     Status(u16),
+    /// No key can pay yet, and one will in this many seconds. Nothing was sent.
+    Busy(f64),
     /// Erreur de transport (réseau, timeout, parse JSON).
     Http(reqwest::Error),
     /// Erreur de la chaine middleware reqwest (envoi de la requete).
@@ -308,6 +360,7 @@ impl std::fmt::Display for MistralError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MistralError::Status(code) => write!(f, "mistral status {code}"),
+            MistralError::Busy(wait) => write!(f, "mistral: pool busy for {wait:.1}s"),
             MistralError::Http(e) => write!(f, "mistral transport: {e}"),
             MistralError::Middleware(e) => write!(f, "mistral transport: {e}"),
         }
@@ -425,37 +478,15 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         let c = MistralClient::new(keys(), "m".into()).unwrap();
         c.idx.store(0, Relaxed);
-        c.mark_dead(1); // « b » morte (401)
+        c.mark_dead(1, 401); // « b » morte (401)
         assert_eq!(c.key_order(), vec![0, 2]);
         assert_eq!(c.key_order(), vec![2, 0]);
-        assert_eq!(c.drain_spent_fingerprints(), vec![key_fingerprint("b")]);
-        c.mark_dead(1);
+        assert_eq!(
+            c.drain_spent_fingerprints(),
+            vec![(key_fingerprint("b"), 401)]
+        );
+        c.mark_dead(1, 401);
         assert!(c.drain_spent_fingerprints().is_empty());
-    }
-
-    #[test]
-    fn les_cles_desactivees_en_base_sont_sautees_sans_etre_re_rapportees() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let c = MistralClient::new(keys(), "m".into()).unwrap();
-        c.idx.store(0, Relaxed);
-        c.set_dead_fingerprints(&[key_fingerprint("a")]);
-        assert_eq!(c.key_order(), vec![1, 2]);
-        // La base la connaît déjà : rien à persister.
-        assert!(c.drain_spent_fingerprints().is_empty());
-    }
-
-    #[test]
-    fn une_cle_reactivee_en_base_revient_dans_la_rotation() {
-        use std::sync::atomic::Ordering::Relaxed;
-        let c = MistralClient::new(keys(), "m".into()).unwrap();
-        c.idx.store(0, Relaxed);
-        c.set_dead_fingerprints(&[key_fingerprint("a")]);
-        assert_eq!(c.live_key_count(), 2);
-
-        c.idx.store(0, Relaxed);
-        c.set_dead_fingerprints(&[]);
-        assert_eq!(c.live_key_count(), 3);
-        assert_eq!(c.key_order(), vec![0, 1, 2]);
     }
 
     #[test]
@@ -464,7 +495,7 @@ mod tests {
         let c = MistralClient::new(keys(), "m".into()).unwrap();
         c.idx.store(0, Relaxed);
         for i in 0..3 {
-            c.mark_dead(i);
+            c.mark_dead(i, 401);
         }
         // Tout le pool refusé : ordre complet, l'appelant borne ses retries.
         assert_eq!(c.key_order(), vec![0, 1, 2]);
@@ -481,19 +512,29 @@ mod tests {
     #[test]
     fn chat_payload_optional_fields() {
         let c = MistralClient::new(vec!["k".into()], "mistral-small-2506".into()).unwrap();
-        // Sans options : ni max_tokens ni prompt_cache_key ; température 0, stream off.
-        let p = c.chat_payload("sys", "usr", None, None);
+        let p = c.chat_payload("sys", "usr", None);
         assert_eq!(p["model"], "mistral-small-2506");
-        assert_eq!(p["temperature"], 0);
-        assert_eq!(p["stream"], false);
-        assert!(p.get("max_tokens").is_none());
-        assert!(p.get("prompt_cache_key").is_none());
-        assert_eq!(p["messages"][0]["role"], "system");
-        assert_eq!(p["messages"][0]["content"], "sys");
-        assert_eq!(p["messages"][1]["content"], "usr");
-        // Avec options (ex. ingest résumé + rerank listwise).
-        let p = c.chat_payload("sys", "usr", Some(400), Some("rr-lws-v1"));
-        assert_eq!(p["max_tokens"], 400);
-        assert_eq!(p["prompt_cache_key"], "rr-lws-v1");
+        assert_eq!(p["instructions"], "sys");
+        assert_eq!(p["inputs"], "usr");
+        assert_eq!(p["store"], false);
+        assert_eq!(p["completion_args"]["temperature"], 0);
+        assert!(p["completion_args"].get("max_tokens").is_none());
+        let p = c.chat_payload("sys", "usr", Some(400));
+        assert_eq!(p["completion_args"]["max_tokens"], 400);
+    }
+
+    #[test]
+    fn message_text_reads_string_and_chunked_content() {
+        let plain = serde_json::json!({"outputs": [{"content": " 1: 90\n2: 10 "}]});
+        assert_eq!(message_text(&plain), "1: 90\n2: 10");
+        let chunked = serde_json::json!({"outputs": [
+            {"content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "raisonnement"}]},
+                {"type": "text", "text": "1: 90\n"},
+                {"type": "text", "text": "2: 10"},
+            ]},
+        ]});
+        assert_eq!(message_text(&chunked), "1: 90\n2: 10");
+        assert_eq!(message_text(&serde_json::json!({})), "");
     }
 }

@@ -9,10 +9,10 @@ POST {{base}}/internal/auth/login
 [FormParams]
 email: probe@example.invalid
 password: MotDePasse1
-next: /decisions
+next: /decision-search
 HTTP 303
 [Asserts]
-header "Location" == "/login?error=auth_required&next=%2Fdecisions"
+header "Location" == "/login?error=auth_required&next=%2Fdecision-search"
 
 # ── Inscription : mot de passe trop faible, refusé avant toute écriture ──────
 POST {{base}}/internal/auth/signup

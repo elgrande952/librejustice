@@ -12,7 +12,6 @@ pub const REEXTRACTABLE_FIELDS: &[&str] = &[
     "date_lecture",
     "date_audience",
     "docket_numbers",
-    "chamber_key",
     "seat",
     "seat_paths",
     "formation_uid",
@@ -79,7 +78,7 @@ pub(super) fn extracted_column_type(field: &str) -> &'static str {
         "date_lecture" => "date",
         "date_audience" => "date",
         "docket_numbers" | "publication_codes" | "seat_paths" => "text[]",
-        "chamber_key" | "search_title" => "text",
+        "search_title" => "text",
         "seat" => "jsonb",
         "solution_uid" | "procedure_uid" | "office_uid" | "legal_domain_uid"
         | "jurisdiction_code" | "formation_uid" => "text",
@@ -105,7 +104,6 @@ pub(super) fn extracted_field_value(
         "date_lecture" => Box::new(extracted.date_lecture),
         "date_audience" => Box::new(extracted.date_audience),
         "docket_numbers" => Box::new(extracted.docket_numbers.clone()),
-        "chamber_key" => Box::new(extracted.chamber_key.clone()),
         "seat" => Box::new(extracted.seat.clone().map(tokio_postgres::types::Json)),
         "seat_paths" => Box::new(extracted.seat_paths.clone()),
         "formation_uid" => Box::new(extracted.formation_uid.clone()),
@@ -174,6 +172,8 @@ pub fn source_from_source_uid(source_uid: &str) -> &'static str {
         "adde"
     } else if source_uid.starts_with("juricaf/") {
         "juricaf"
+    } else if source_uid.starts_with("hal/") {
+        "hal"
     } else {
         "opendata"
     }
@@ -222,6 +222,21 @@ pub(super) fn as_param_refs(params: &[Box<dyn ToSql + Sync>]) -> Vec<&(dyn ToSql
         .iter()
         .map(|b| b.as_ref() as &(dyn ToSql + Sync))
         .collect()
+}
+
+/// The three columns an address binds to. The date crosses the pure boundary as
+/// an ISO string and becomes a `date` here; a string that does not parse binds
+/// NULL, which widens the designation instead of failing the write.
+pub fn address_columns(
+    a: &lj_core::address::CaseAddress,
+) -> (Option<&str>, Option<&str>, Option<chrono::NaiveDate>) {
+    (
+        a.court.as_deref(),
+        a.docket.as_deref(),
+        a.date
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()),
+    )
 }
 
 #[cfg(test)]

@@ -1,9 +1,1 @@
--- Migration 0104 — suppression définitive de `gold_annotation` (choix
--- ré-amendé) : la 0103 est annulée. Les révisions gold vivent dans les MÊMES
--- colonnes de `decisions` que l'extraction déterministe, à une
--- `extract_version` spécifique (1000, constante du banc) — aucune table
--- dédiée, aucune mécanique gold hors du banc. Le JSONL d'annotation
--- (versionné en git LFS) est la couche vivante ; la
--- base ne reçoit que la projection conforme au schéma.
-
 DROP TABLE IF EXISTS gold_annotation;

@@ -6,13 +6,13 @@
 /// Code d'erreur -> message FR.
 fn code_map(code: &str) -> Option<&'static str> {
     Some(match code {
-        "auth_required" => "Email ou mot de passe incorrect.",
+        "auth_required" => "E-mail ou mot de passe incorrect.",
         "mot_de_passe_trop_faible" => {
             "Mot de passe trop faible : au moins 8 caractères, dont une minuscule, une majuscule et un chiffre."
         }
         "mot_de_passe_trop_long" => "Mot de passe trop long (72 octets au plus).",
         "mots_de_passe_differents" => "Les mots de passe ne correspondent pas.",
-        "email_invalide" => "Adresse email invalide.",
+        "email_invalide" => "Adresse e-mail invalide.",
         "lien_invalide_ou_expire" => {
             "Ce lien a expiré ou a déjà servi. Demandez-en un nouveau."
         }
@@ -30,7 +30,7 @@ fn code_map(code: &str) -> Option<&'static str> {
         "google_deja_lie" => "Ce compte Google est déjà lié à un autre compte.",
         "microsoft_deja_lie" => "Ce compte Microsoft est déjà lié à un autre compte.",
         "google_sans_email" | "microsoft_sans_email" => {
-            "Ce compte n'expose pas d'adresse email : impossible de créer un compte LibreJustice avec."
+            "Ce compte n'expose pas d'adresse e-mail : impossible de créer un compte LibreJustice avec."
         }
         "id_token_invalide" | "etat_invalide" => {
             "La connexion n'a pas abouti. Réessayez."
@@ -39,11 +39,11 @@ fn code_map(code: &str) -> Option<&'static str> {
         "google_non_configure" | "microsoft_non_configure" => {
             "Cette connexion n'est pas disponible pour le moment."
         }
-        "sans_email" => "Votre compte n'a pas d'adresse email.",
+        "sans_email" => "Votre compte n'a pas d'adresse e-mail.",
         "nom_trop_long" => "Nom affiché trop long (80 caractères au plus).",
         "confirmation_suppression" => "Tapez « SUPPRIMER » pour confirmer la suppression.",
         "email_not_confirmed" => {
-            "Email non confirmé. Cliquez sur « Renvoyer l'email » pour recevoir un nouveau lien."
+            "E-mail non confirmé. Cliquez sur « Renvoyer l'e-mail » pour recevoir un nouveau lien."
         }
         "access_denied" => "Accès refusé.",
         _ => return None,
@@ -66,7 +66,7 @@ mod tests {
     fn code_connu_est_traduit() {
         assert_eq!(
             translate_auth_error(Some("auth_required")),
-            "Email ou mot de passe incorrect."
+            "E-mail ou mot de passe incorrect."
         );
     }
 

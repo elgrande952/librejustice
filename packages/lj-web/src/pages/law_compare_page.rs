@@ -1,4 +1,4 @@
-//! Page `/texte/{code}/{num}/comparer/{de}/{a}` : vis-à-vis de deux rédactions
+//! Page `/norm/{juris}/{code}/{num}/compare/{de}/{a}` : vis-à-vis de deux rédactions
 //! d'un article, une colonne par version, alignées au bloc d'alinéas.
 //! `noindex` (combinatoire de paires) + canonique sur la page article.
 
@@ -187,6 +187,7 @@ fn compare_row(row: LawCompareRow, change_no: Option<usize>) -> impl IntoView {
 fn CompareLoaded(cmp: LawCompareResponse) -> impl IntoView {
     let LawCompareResponse {
         code,
+        jurisdiction,
         code_title,
         num,
         num_key,
@@ -198,8 +199,9 @@ fn CompareLoaded(cmp: LawCompareResponse) -> impl IntoView {
     let code_label = code_title.unwrap_or_else(|| code.clone());
     let num_label = format_article_num(&num);
     let page_title = format!("Versions de l'article {num_label} du {code_label} - LibreJustice");
-    let article_href = format!("/texte/{code}/{num_key}");
-    let canonical = format!("https://librejustice.fr/texte/{code}/{num_key}");
+    let text = lj_vocab::norm_path(&jurisdiction, &code);
+    let article_href = format!("{text}/{num_key}");
+    let canonical = format!("https://librejustice.fr{text}/{num_key}");
 
     let from_label = version_label(&from);
     let to_label = version_label(&to);
@@ -212,7 +214,7 @@ fn CompareLoaded(cmp: LawCompareResponse) -> impl IntoView {
     // garde l'autre borne de l'URL courante.
     let from_key = version_url_key(&from);
     let to_key = version_url_key(&to);
-    let base = format!("/texte/{code}/{num_key}/comparer");
+    let base = format!("{text}/{num_key}/compare");
 
     let selector = |label: &'static str, selected: String, other: String, other_is_to: bool| {
         let navigate = use_navigate();

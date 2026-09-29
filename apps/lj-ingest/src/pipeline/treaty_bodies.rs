@@ -41,7 +41,7 @@ pub async fn backfill_treaty_bodies() -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -146,7 +146,7 @@ async fn backfill_jorf(
                             .insert(s.jorftext, s.articles.into_iter().map(|a| a.id).collect());
                     }
                     Err(e) => {
-                        tracing::error!(member = %name, error = %e, "jorf struct: parse échec");
+                        tracing::error!(member = %name, error = %e, "jorf struct: parse failed");
                     }
                 }
             } else if name.contains("/article/") && stem.starts_with("JORFARTI") {
@@ -165,7 +165,7 @@ async fn backfill_jorf(
                         }
                     }
                     Err(e) => {
-                        tracing::error!(member = %name, error = %e, "jorf article: parse échec");
+                        tracing::error!(member = %name, error = %e, "jorf article: parse failed");
                     }
                 }
             }
@@ -260,7 +260,7 @@ async fn backfill_kali(
                     }
                 }
                 Err(e) => {
-                    tracing::error!(member = %name, error = %e, "kali conteneur: parse échec");
+                    tracing::error!(member = %name, error = %e, "kali container: parse failed");
                 }
             }
             Ok(())
@@ -294,7 +294,7 @@ async fn backfill_kali(
                     }
                 }
                 Err(e) => {
-                    tracing::error!(member = %name, error = %e, "kali article: parse échec");
+                    tracing::error!(member = %name, error = %e, "kali article: parse failed");
                 }
             }
             Ok(())

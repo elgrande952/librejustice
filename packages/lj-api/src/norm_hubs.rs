@@ -1,28 +1,29 @@
 //! Hubs du catalogue des normes : catalogue `/api/normes`, hub
-//! `/api/normes/{fond}`, page année `/api/normes/{fond}/{annee}` (`annee` =
-//! année ou `sans-date`). Chemins de crawl SSR vers les textes — réponses
+//! `/api/normes/{juris}/{fond}`, page année `/api/normes/{juris}/{fond}/{annee}`
+//! (`juris` = segment d'URL, `annee` = année ou `sans-date`). Chemins de crawl SSR vers les textes, réponses
 //! stables (le corpus bouge à l'ingest quotidien), cache CDN long côté routes.
 
 use crate::error::{ApiError, Result};
 use crate::state::AppState;
-use lj_core::referential_labels::{norm_fond_label, NORM_FONDS};
 use lj_dtos::{
-    NormCatalogueResponse, NormFondEntry, NormFondResponse, NormHubText, NormYearCount,
-    NormYearResponse, HUB_PAGE_SIZE,
+    NormCatalogueResponse, NormFondEntry, NormFondResponse, NormHubText, NormJurisdictionEntry,
+    NormYearCount, NormYearResponse,
 };
+use lj_norm::referential_labels::{norm_fond_label, NORM_FONDS};
 use lj_store::repository::DecisionRepository;
+use lj_vocab::HUB_PAGE_SIZE;
 use std::sync::Arc;
 
 /// Token d'URL du bucket des textes sans date de parcours.
 pub const UNDATED_TOKEN: &str = "sans-date";
 
-/// Catalogue des fonds, dans l'ordre éditorial de `NORM_FONDS`. Une seule
-/// entrée de cache (clé `()`), TTL 12 h — l'agrégat sur 1 M de lignes ne se
-/// recalcule jamais par requête.
+/// Catalogue of each jurisdiction's fonds, in the editorial order of `NORM_FONDS`.
+/// A single cache entry (key `()`), TTL 12 h: the aggregate over 1 M rows is never
+/// recomputed per request.
 pub async fn catalogue(state: &AppState) -> Result<Arc<NormCatalogueResponse>> {
     state
         .norm_catalogue_cache
-        .try_get_with((), load_catalogue(state))
+        .try_get_with(String::new(), load_catalogue(state))
         .await
         .map_err(|e: Arc<ApiError>| ApiError::Internal(format!("catalogue normes: {e}")))
 }
@@ -30,43 +31,65 @@ pub async fn catalogue(state: &AppState) -> Result<Arc<NormCatalogueResponse>> {
 async fn load_catalogue(state: &AppState) -> Result<Arc<NormCatalogueResponse>> {
     let conn = state.pool.get().await?;
     let counts = DecisionRepository::new(&conn).norm_catalogue().await?;
-    // Le fond `codes` affiche le compte de son catalogue `/normes/codes` (codes +
-    // constitutions avec ≥ 1 article en vigueur), pas le compte brut de la
-    // taxonomie : la carte et la page disent le même nombre.
-    let codes_count = crate::legi::code_catalogue(state, true)
-        .await?
-        .entries
-        .len() as i64;
+    // Le fond `codes` affiche le compte de son catalogue (codes + constitutions
+    // avec ≥ 1 article en vigueur), pas le compte brut de la taxonomie : la
+    // carte et la page disent le même nombre.
+    let codes = crate::legi::code_catalogue(state, true).await?;
 
-    let fonds = NORM_FONDS
-        .iter()
-        .filter_map(|fond| {
-            let count = if *fond == "codes" {
-                codes_count
-            } else {
-                counts.iter().find(|(f, _)| f == fond).map(|(_, c)| *c)?
-            };
-            Some(NormFondEntry {
-                fond: (*fond).to_string(),
-                label: norm_fond_label(fond).unwrap_or(fond).to_string(),
-                text_count: count,
-            })
+    let mut stored: Vec<&str> = counts.iter().map(|(j, _, _)| j.as_str()).collect();
+    stored.sort_unstable();
+    stored.dedup();
+    let mut jurisdictions: Vec<NormJurisdictionEntry> = stored
+        .into_iter()
+        .map(|jurisdiction| {
+            let fonds: Vec<NormFondEntry> = NORM_FONDS
+                .iter()
+                .filter_map(|fond| {
+                    let count = if *fond == "codes" {
+                        let n = codes
+                            .entries
+                            .iter()
+                            .filter(|e| e.jurisdiction == jurisdiction)
+                            .count() as i64;
+                        (n > 0).then_some(n)?
+                    } else {
+                        counts
+                            .iter()
+                            .find(|(j, f, _)| j == jurisdiction && f == fond)
+                            .map(|(_, _, c)| *c)?
+                    };
+                    Some(NormFondEntry {
+                        fond: (*fond).to_string(),
+                        label: norm_fond_label(fond).unwrap_or(fond).to_string(),
+                        text_count: count,
+                    })
+                })
+                .collect();
+            NormJurisdictionEntry {
+                jurisdiction: lj_vocab::url_segment(jurisdiction),
+                text_count: fonds.iter().map(|f| f.text_count).sum(),
+                fonds,
+            }
         })
         .collect();
-    Ok(Arc::new(NormCatalogueResponse { fonds }))
+    jurisdictions.sort_by_key(|j| std::cmp::Reverse(j.text_count));
+    Ok(Arc::new(NormCatalogueResponse { jurisdictions }))
 }
 
-/// Hub d'un fond : années couvertes + volume. 404 si le fond est inconnu de
-/// la taxonomie, vide, ou `codes` (son catalogue est `/normes/codes`, servi
-/// par `/api/codes`).
-pub async fn hub(state: &AppState, fond: &str) -> Result<NormFondResponse> {
+/// A fond's hub: covered years + volume. 404 if the fond is unknown to the
+/// taxonomy, empty, or `codes` (its catalogue is served by `/api/codes`).
+pub async fn hub(state: &AppState, segment: &str, fond: &str) -> Result<NormFondResponse> {
     let label = browsable_fond_label(fond)?;
+    let jurisdiction = lj_vocab::jurisdiction_of_segment(segment);
     let conn = state.pool.get().await?;
-    let years = DecisionRepository::new(&conn).norm_fond_years(fond).await?;
+    let years = DecisionRepository::new(&conn)
+        .norm_fond_years(&jurisdiction, fond)
+        .await?;
     if years.is_empty() {
         return Err(ApiError::NotFound);
     }
     Ok(NormFondResponse {
+        jurisdiction: segment.to_string(),
         fond: fond.to_string(),
         label,
         text_count: years.iter().map(|(_, c)| c).sum(),
@@ -82,15 +105,17 @@ pub async fn hub(state: &AppState, fond: &str) -> Result<NormFondResponse> {
 /// une liste vide (total exact fourni).
 pub async fn year_page(
     state: &AppState,
+    segment: &str,
     fond: &str,
     year: Option<i32>,
     page: u32,
 ) -> Result<NormYearResponse> {
     let label = browsable_fond_label(fond)?;
+    let jurisdiction = lj_vocab::jurisdiction_of_segment(segment);
     let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
     let total = repo
-        .norm_fond_years(fond)
+        .norm_fond_years(&jurisdiction, fond)
         .await?
         .into_iter()
         .find(|(y, _)| *y == year)
@@ -100,9 +125,10 @@ pub async fn year_page(
     let page = page.max(1);
     let offset = i64::from(page - 1) * i64::from(HUB_PAGE_SIZE);
     let rows = repo
-        .norm_fond_year_texts(fond, year, i64::from(HUB_PAGE_SIZE), offset)
+        .norm_fond_year_texts(&jurisdiction, fond, year, i64::from(HUB_PAGE_SIZE), offset)
         .await?;
     Ok(NormYearResponse {
+        jurisdiction: segment.to_string(),
         fond: fond.to_string(),
         label,
         year,
@@ -114,14 +140,15 @@ pub async fn year_page(
             .map(|r| NormHubText {
                 slug: r.slug,
                 title: r.title,
+                jurisdiction: r.jurisdiction,
                 date: r.date,
             })
             .collect(),
     })
 }
 
-/// Libellé d'un fond navigable par hub année — 404 sur un fond hors
-/// taxonomie et sur `codes` (couvert par le catalogue `/normes/codes`).
+/// Label of a fond browsable by year hub: 404 on a fond outside the taxonomy and
+/// on `codes` (covered by its catalogue).
 fn browsable_fond_label(fond: &str) -> Result<String> {
     if fond == "codes" || !NORM_FONDS.contains(&fond) {
         return Err(ApiError::NotFound);

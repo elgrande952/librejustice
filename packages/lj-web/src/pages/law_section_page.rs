@@ -1,4 +1,4 @@
-//! Page `/texte/{code}/section/{cid}` (LawSectionPage) : vue-lecture d'une
+//! Page `/norm/{juris}/{code}/{path}` (LawSectionPage) : vue-lecture d'une
 //! division d'un texte au gabarit Légifrance `section_lc` — articles rendus à
 //! la suite avec intertitres, fil d'Ariane des divisions englobantes, plan
 //! « Dans cette division », décisions citant la division, divisions voisines.
@@ -18,10 +18,8 @@ use lj_dtos::{LawSectionItem, LawSectionRef, LawSectionResponse, TopCitedArticle
 use crate::components::decision::DecisionLayout;
 use crate::components::layout::SHELL;
 use crate::components::own_page_description;
-use crate::helpers::{format_article_num, group_thousands};
-use crate::pages::law_page::cited_by::{
-    decisions_href, section as cited_by_section, CitedBySubject, CitedText,
-};
+use crate::helpers::{decisions_href, format_article_num, group_thousands};
+use crate::pages::law_page::cited_by::{section as cited_by_section, CitedBySubject, CitedText};
 use crate::pages::law_page::data::{
     chrono_date, fetch_section, fetch_section_citing, section_key, sendable, CitingResult,
     PageError,
@@ -47,13 +45,13 @@ pub fn LawSectionPage() -> impl IntoView {
     let date = chrono_date();
     let section = Resource::new_blocking(
         move || (key.get(), date.get()),
-        |((code, cid), date)| sendable(fetch_section(code, cid, date)),
+        |((juris, code, path), date)| sendable(fetch_section(juris, code, path, date)),
     );
     // Décisions citant la division : non bloquantes, streamées sous la lecture —
     // la date choisit la composition du sous-arbre agrégé.
     let citing = Resource::new(
         move || (key.get(), date.get()),
-        |((code, cid), date)| sendable(fetch_section_citing(code, cid, date)),
+        |((juris, code, path), date)| sendable(fetch_section_citing(juris, code, path, date)),
     );
 
     view! {
@@ -134,14 +132,17 @@ fn SectionSkeleton() -> impl IntoView {
 }
 
 #[component]
-fn LawSectionLoaded(
+pub(crate) fn LawSectionLoaded(
     section: LawSectionResponse,
     citing: Resource<CitingResult>,
     /// Date de consultation Chronolégi (`?date=`), propagée aux liens.
     #[prop(optional_no_strip)]
     date: Option<String>,
 ) -> impl IntoView {
+    #[cfg(feature = "hydrate")]
+    Effect::new(|_| crate::reads::report(lj_dtos::ReadKind::Section));
     let code = section.code.clone();
+    let text = lj_vocab::norm_path(&section.jurisdiction, &section.code);
     let code_title = section
         .code_title
         .clone()
@@ -151,10 +152,7 @@ fn LawSectionLoaded(
         "{} — {}. Lecture à la suite des articles de la division, texte consolidé en vigueur.",
         section.title, code_title
     );
-    let url = format!(
-        "https://librejustice.fr/texte/{}/section/{}",
-        section.code, section.cid
-    );
+    let url = format!("https://librejustice.fr{text}/{}", section.path);
 
     let en_vigueur = section
         .items
@@ -173,24 +171,24 @@ fn LawSectionLoaded(
     };
 
     let breadcrumb = breadcrumb(
-        &code,
+        &text,
         code_title.clone(),
         &section.ancestors,
         date.as_deref(),
     );
     let footer = nav_footer(
-        &code,
+        &text,
         section.prev.clone(),
         section.next.clone(),
         date.as_deref(),
     );
-    let neighbors = neighbor_rail(&code, section.prev, section.next, date.as_deref());
+    let neighbors = neighbor_rail(&text, section.prev, section.next, date.as_deref());
 
     let hide_abroges = RwSignal::new(false);
     // Contenu de la gouttière gauche, rendu deux fois (voir plus bas) : la
     // closure le rebâtit, une vue ne se rend pas à deux endroits.
     let rail_content = {
-        let base = format!("/texte/{}/section/{}", section.code, section.cid);
+        let base = format!("{text}/{}", section.path);
         let date = date.clone();
         let items = section.items.clone();
         move || {
@@ -235,10 +233,11 @@ fn LawSectionLoaded(
     let subject = CitedBySubject {
         name: "cette division",
         all_href: decisions_href(
-            "legalArticle",
-            facet_values(&code, &section.items, &section.top_cited),
+            facet_values(&code, &section.items, &section.top_cited)
+                .into_iter()
+                .map(|value| ("legalArticle", value)),
         ),
-        search_href: decisions_href("q", [section.title.clone()]),
+        search_href: decisions_href([("q", section.title.clone())]),
     };
     let citing_texts: Vec<CitedText> = section
         .citing_texts
@@ -264,7 +263,7 @@ fn LawSectionLoaded(
             }}
         </Suspense>
     };
-    let top_cited = top_cited_block(&code, section.top_cited);
+    let top_cited = top_cited_block(section.top_cited);
 
     let trop_longue = section.omitted.map(|n| {
         view! {
@@ -373,7 +372,7 @@ fn facet_values(code: &str, items: &[LawSectionItem], top: &[TopCitedArticle]) -
 /// Fil d'Ariane : code → divisions englobantes (chacune vers sa vue-lecture).
 /// La division courante n'y figure pas — c'est le `<h1>`.
 fn breadcrumb(
-    code: &str,
+    text: &str,
     code_title: String,
     ancestors: &[LawSectionRef],
     date: Option<&str>,
@@ -384,7 +383,7 @@ fn breadcrumb(
     let ancestors = ancestors
         .iter()
         .map(|a| {
-            let href = format!("/texte/{code}/section/{}{q}", a.cid);
+            let href = format!("{text}/{}{q}", a.path);
             let label = a.label.clone();
             view! {
                 <li class="flex items-center gap-1.5">
@@ -400,7 +399,7 @@ fn breadcrumb(
         <nav aria-label="Fil d'Ariane" class="text-xs uppercase tracking-[0.14em] text-[var(--color-ink-subtle)]">
             <ol class="flex flex-wrap items-center gap-x-1.5 gap-y-1">
                 <li>
-                    <A href=format!("/texte/{code}{q}") attr:class=crumb_cls>
+                    <A href=format!("{text}{q}") attr:class=crumb_cls>
                         {code_title}
                     </A>
                 </li>
@@ -412,7 +411,7 @@ fn breadcrumb(
 }
 
 /// Rail « Dans cette division » : le plan local — les **enfants directs** de la
-/// division, sous-divisions (ancre `#{cid}`) et articles (ancre
+/// division, sous-divisions (ancre `#{path}`) et articles (ancre
 /// `#art-{num_key}`, portée par les `<article>` de la vue-lecture). Une division
 /// qui ne porte que des articles a donc un plan, elle aussi. Rien à lister ⇒ pas
 /// de rail.
@@ -426,8 +425,11 @@ fn division_rail(items: &[LawSectionItem]) -> Option<AnyView> {
             continue;
         }
         let (href, label, cls) = if item.kind == "section" {
+            let Some(path) = item.path.as_deref() else {
+                continue;
+            };
             (
-                format!("#{}", item.cid.clone().unwrap_or_default()),
+                format!("#{path}"),
                 item.label.clone(),
                 "block text-sm leading-snug text-[var(--color-accent)] no-underline hover:underline",
             )
@@ -461,7 +463,7 @@ fn division_rail(items: &[LawSectionItem]) -> Option<AnyView> {
 /// de la division courante — la piste droite ne porte que des rebonds. Aucune
 /// voisine ⇒ pas de bloc.
 fn neighbor_rail(
-    code: &str,
+    text: &str,
     prev: Option<LawSectionRef>,
     next: Option<LawSectionRef>,
     date: Option<&str>,
@@ -471,8 +473,8 @@ fn neighbor_rail(
     }
     let q = date.map(|d| format!("?date={d}")).unwrap_or_default();
     let cards: Vec<AnyView> = [
-        prev.map(|t| neighbor_card(code, t, "← Bloc précédent", &q, STACKED)),
-        next.map(|t| neighbor_card(code, t, "Bloc suivant →", &q, STACKED)),
+        prev.map(|t| neighbor_card(text, t, "← Bloc précédent", &q, STACKED)),
+        next.map(|t| neighbor_card(text, t, "Bloc suivant →", &q, STACKED)),
     ]
     .into_iter()
     .flatten()
@@ -491,7 +493,7 @@ fn neighbor_rail(
 /// sous `lg` les gouttières disparaissent (même patron que les articles voisins
 /// de la page article).
 fn nav_footer(
-    code: &str,
+    text: &str,
     prev: Option<LawSectionRef>,
     next: Option<LawSectionRef>,
     date: Option<&str>,
@@ -502,7 +504,7 @@ fn nav_footer(
     let q = date.map(|d| format!("?date={d}")).unwrap_or_default();
     let card =
         |target: Option<LawSectionRef>, eyebrow: &'static str, layout: &'static str| match target {
-            Some(t) => neighbor_card(code, t, eyebrow, &q, layout),
+            Some(t) => neighbor_card(text, t, eyebrow, &q, layout),
             None => view! { <span class="flex-1" /> }.into_any(),
         };
     view! {
@@ -527,13 +529,13 @@ const PAIRED_RIGHT: &str = "flex-1 items-end text-right";
 /// Carte de rebond vers une division voisine : œillard puis libellé, la
 /// grammaire bordée des rebonds. `layout` place la carte dans son conteneur.
 fn neighbor_card(
-    code: &str,
+    text: &str,
     target: LawSectionRef,
     eyebrow: &'static str,
     q: &str,
     layout: &'static str,
 ) -> AnyView {
-    let href = format!("/texte/{code}/section/{}{q}", target.cid);
+    let href = format!("{text}/{}{q}", target.path);
     view! {
         <A
             href=href
@@ -553,14 +555,14 @@ fn neighbor_card(
 }
 
 /// Rend un item de la vue-lecture : intertitre de sous-division (taille selon
-/// la profondeur, ancré `id = cid`) ou article complet (numéro lié à sa page,
+/// la profondeur, ancré `id = path`) ou article complet (numéro lié à sa page,
 /// corps, Nota). Les items abrogés portent `item-abroge` (masquables d'un
 /// clic, règle CSS `abroges-masques`). Partagé avec la vue-lecture intégrale
 /// des textes courts (`law_code_page`).
-pub(crate) fn section_item_view(item: LawSectionItem, code: &str, date: Option<&str>) -> AnyView {
+pub(crate) fn section_item_view(item: LawSectionItem, text: &str, date: Option<&str>) -> AnyView {
     let abroge = item.etat != "VIGUEUR";
     if item.kind == "section" {
-        let cid = item.cid.unwrap_or_default();
+        let id = item.path;
         let cls = match item.depth {
             1 => "mt-10 border-t border-[var(--color-rule)] pt-6 font-sans text-xl text-[var(--color-ink)]",
             2 => "mt-8 font-sans text-lg text-[var(--color-ink)]",
@@ -579,7 +581,7 @@ pub(crate) fn section_item_view(item: LawSectionItem, code: &str, date: Option<&
             }
         });
         return view! {
-            <h2 id=cid class=cls>
+            <h2 id=id class=cls>
                 {item.label}
                 {badge}
             </h2>
@@ -589,8 +591,8 @@ pub(crate) fn section_item_view(item: LawSectionItem, code: &str, date: Option<&
     let num_key = item.num_key.unwrap_or_default();
     // Chronolégi : le lien de l'article porte la date de consultation.
     let href = match date {
-        Some(d) => format!("/texte/{code}/{num_key}/{d}"),
-        None => format!("/texte/{code}/{num_key}"),
+        Some(d) => format!("{text}/{num_key}/{d}"),
+        None => format!("{text}/{num_key}"),
     };
     let id = format!("art-{num_key}");
     let label = format!("Article {}", format_article_num(&item.label));

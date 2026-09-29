@@ -39,7 +39,7 @@ pub async fn resolve_seats(dry_run: bool) -> Result<()> {
     }
     tracing::info!(
         secondes = started.elapsed().as_secs(),
-        "resolve-seats : vocabulaire des salles construit"
+        "resolve-seats: room vocabulary built"
     );
 
     let mut after = 0i64;
@@ -77,7 +77,7 @@ pub async fn resolve_seats(dry_run: bool) -> Result<()> {
             ecrites += flush(&repo, &mut pending, dry_run).await?;
         }
         if lues % 500_000 == 0 {
-            tracing::info!(lues, changees, ecrites, "resolve-seats : en cours");
+            tracing::info!(lues, changees, ecrites, "resolve-seats: running");
         }
     }
     ecrites += flush(&repo, &mut pending, dry_run).await?;
@@ -87,7 +87,7 @@ pub async fn resolve_seats(dry_run: bool) -> Result<()> {
         ecrites,
         dry_run,
         secondes = started.elapsed().as_secs(),
-        "resolve-seats : terminé"
+        "resolve-seats: done"
     );
     if dry_run {
         print_delta(&nodes);
@@ -106,7 +106,7 @@ fn print_delta(nodes: &HashMap<String, (i64, i64)>) {
         .collect();
     moved.sort_by_key(|(k, b, a)| (-(b - a).abs(), (*k).clone()));
     println!(
-        "feuilles : {before} avant, {after} après ; {} feuilles changent de compte",
+        "leaves: {before} before, {after} after; {} leaves change count",
         moved.len()
     );
     for (leaf, b, a) in moved.iter().take(DELTA_LINES) {
@@ -118,7 +118,7 @@ fn print_delta(nodes: &HashMap<String, (i64, i64)>) {
         println!("{leaf}\t{b} → {a}\t{mark}");
     }
     if moved.len() > DELTA_LINES {
-        println!("… et {} autres", moved.len() - DELTA_LINES);
+        println!("… and {} more", moved.len() - DELTA_LINES);
     }
 }
 

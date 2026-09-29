@@ -9,9 +9,9 @@ use std::sync::Arc;
 use fst::automaton::{Automaton, Str};
 use fst::{IntoStreamer, Map, Streamer};
 
-use lj_core::body_tok::tokenize;
-use lj_core::suggest::{DISPLAY_SEP, MAX_KEY_TOKENS};
 use lj_store::repository::DecisionRepository;
+use lj_textsearch::body_tok::tokenize;
+use lj_textsearch::suggest::{DISPLAY_SEP, MAX_KEY_TOKENS};
 
 use crate::entities;
 use crate::error::{validation, ApiError, Result};
@@ -29,7 +29,9 @@ pub async fn suggest(state: &AppState, q: &str, mode: &str) -> Result<lj_dtos::S
         "jurisprudence" => SuggestDomain::Jurisprudence,
         "textes" => SuggestDomain::Textes,
         "annuaire" => {
-            let found = entities::entity_search(state, q, None, SUGGEST_LIMIT as i64).await?;
+            // Anonymous scope even for a session: the response is CDN-cached.
+            let found =
+                entities::entity_search(state, q, None, false, SUGGEST_LIMIT as i64).await?;
             return Ok(lj_dtos::SuggestResponse {
                 matched_tokens: q.split_whitespace().count() as u32,
                 suggestions: found.items.into_iter().map(|i| i.denomination).collect(),
@@ -40,7 +42,7 @@ pub async fn suggest(state: &AppState, q: &str, mode: &str) -> Result<lj_dtos::S
                 &["query", "mode"],
                 other,
                 SUGGEST_MODES,
-            )))
+            )));
         }
     };
     let index = suggest_index(state).await?;
@@ -57,7 +59,7 @@ pub async fn suggest(state: &AppState, q: &str, mode: &str) -> Result<lj_dtos::S
 async fn suggest_index(state: &AppState) -> Result<Arc<SuggestIndex>> {
     state
         .suggest_cache
-        .try_get_with((), async {
+        .try_get_with(String::new(), async {
             let conn = state.pool.get().await?;
             let repo = DecisionRepository::new(&conn);
             match repo
@@ -69,7 +71,7 @@ async fn suggest_index(state: &AppState) -> Result<Arc<SuggestIndex>> {
                     .map(Arc::new)
                     .map_err(|e| ApiError::Internal(format!("blob suggest_index corrompu: {e}"))),
                 None => {
-                    tracing::warn!("suggest_index vide — lancer `lj-ingest build-suggest`");
+                    tracing::warn!("suggest_index empty, run `lj-ingest build-suggest`");
                     Ok(Arc::new(SuggestIndex::empty()))
                 }
             }

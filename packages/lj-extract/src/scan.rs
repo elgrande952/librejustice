@@ -20,8 +20,9 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use crate::compiled::{fold_stable, Norm};
+use crate::compiled::Norm;
 use crate::registry::Mention;
+use lj_fold::fold_chars;
 
 // ── catalogue de marqueurs (surfaces PLIÉES : minuscules, sans accents) ─────
 
@@ -340,7 +341,7 @@ fn un_seul_cote(apps: &mut Vec<Mention>, defs: &mut Vec<Mention>) {
 /// Mots d'identité d'une personne pseudonymisée : les marques de
 /// pseudonymisation ne la portent pas (« [FE] [XL] » = « FE XL »).
 fn mots_personne(v: &str) -> Vec<String> {
-    fold_stable(v)
+    fold_chars(v)
         .split(|c: char| {
             c.is_whitespace() || matches!(c, '.' | '\u{2026}' | '[' | ']' | ',' | '-' | '\'')
         })
@@ -1201,32 +1202,36 @@ pub fn scan_norm(norm: Norm) -> DocScan {
 }
 
 impl DocScan {
-    /// Texte plié du document (`fold_stable`, 1:1 char-stable).
+    /// The folded text (`lj_fold`), its offsets going back through `byte2char`.
     pub fn folded(&self) -> &str {
         &self.norm.folded
     }
 
-    pub(crate) fn chars(&self) -> &[char] {
+    pub fn chars(&self) -> &[char] {
         &self.norm.chars
     }
 
-    pub(crate) fn byte2char(&self) -> &[usize] {
+    pub fn byte2char(&self) -> &[usize] {
         &self.norm.byte2char
     }
 
-    pub(crate) fn verbatim(&self, s: usize, e: usize) -> String {
+    /// The line breaks of the input text, which `chars` mapped to a space.
+    pub fn breaks(&self) -> &[bool] {
+        &self.norm.breaks
+    }
+
+    pub fn verbatim(&self, s: usize, e: usize) -> String {
         self.text_slice(s, e)
     }
 
     /// Bornes (chars) du dispositif : son ouvreur, puis les moyens annexés ou la fin.
-    pub(crate) fn dispositif_span(&self) -> (usize, usize) {
+    pub fn dispositif_span(&self) -> (usize, usize) {
         let s = self.dispositif_start();
         (s, self.dispositif_end(s))
     }
 
-    /// Positions of the outcome verbs of the dispositif, each opening a clause.
-    pub(crate) fn dispositif_clause_starts(&self) -> Vec<usize> {
-        let (s, e) = self.dispositif_span();
+    /// The outcome verbs between `s` and `e`, each opening a clause.
+    pub fn clause_starts_in(&self, s: usize, e: usize) -> Vec<usize> {
         self.toks
             .iter()
             .filter(|t| t.s >= s && t.s < e)
@@ -1369,7 +1374,7 @@ fn is_law_structure(name: &str) -> bool {
 /// « Y... L..., J... F... »).
 fn same_words(a: &str, b: &str) -> bool {
     let words = |s: &str| {
-        let f = crate::compiled::fold_stable(s);
+        let f = lj_fold::fold_chars(s);
         let mut w: Vec<String> = f
             .split(|c: char| !c.is_alphanumeric())
             .filter(|x| !x.is_empty())
@@ -1424,12 +1429,11 @@ impl DocScan {
     /// (cf. [`crate::extract::common::better_cased`]). La sortie reste une tranche
     /// verbatim du texte, jamais une réécriture.
     pub(crate) fn best_cased_twin(&self, value: &str) -> Option<String> {
-        let needle = crate::compiled::fold_stable(value);
+        let needle = lj_fold::fold_chars(value);
         if needle.is_empty() {
             return None;
         }
         let bytes = self.norm.folded.as_bytes();
-        let len = needle.chars().count();
         for (bs, _) in self.norm.folded.match_indices(&needle) {
             let be = bs + needle.len();
             let boundary = (bs == 0 || !bytes[bs - 1].is_ascii_alphanumeric())
@@ -1438,12 +1442,19 @@ impl DocScan {
                 continue;
             }
             let cs = self.norm.byte2char[bs];
-            let cand: String = self.norm.chars[cs..cs + len].iter().collect();
+            let ce = self.norm.byte2char[be];
+            let cand: String = self.norm.chars[cs..ce].iter().collect();
             if crate::extract::common::better_cased(value, &cand) {
                 return Some(cand);
             }
         }
         None
+    }
+
+    /// The source char under folded byte `off` of a folded slice opened at
+    /// source char `from`.
+    fn source_after(&self, from: usize, off: usize) -> usize {
+        self.norm.byte2char[self.norm.char2byte[from] + off]
     }
 
     /// Tranche du texte plié aux bornes CHARS (les `PTok` sont en chars, la
@@ -1706,7 +1717,7 @@ impl DocScan {
     fn followed_by_counsel(&self, e: usize) -> bool {
         let re = RE_AFTER_COUNSEL.get_or_init(|| Regex::new(r"^\s*,?\s*avocats?\b").unwrap());
         let end = (e + 30).min(self.len());
-        re.is_match(&fold_stable(&self.text_slice(e, end)))
+        re.is_match(&fold_chars(&self.text_slice(e, end)))
     }
 
     /// Fin de la chaîne d'associés « X, Y, Z » après `ne` — les cabinets
@@ -1738,7 +1749,7 @@ impl DocScan {
     fn counsel_intro_just_before(&self, pos: usize) -> bool {
         self.toks.iter().any(|c| {
             c.kind == Mk::CounselIntro && c.e <= pos && c.e + 12 > pos && {
-                let f = fold_stable(&self.text_slice(c.s, c.e));
+                let f = fold_chars(&self.text_slice(c.s, c.e));
                 let ok_dir = Self::intro_precedes_counsel(&f)
                     || (f.starts_with("representant")
                         && (f.contains(':') || self.norm.chars[c.e..pos].contains(&':')))
@@ -2073,7 +2084,7 @@ impl DocScan {
                         // Qualifiée ou nom dont la tête fait partie (« Société Générale ») : tranche
                         // entière.
                         let bare = ns == head_end && !lower_start;
-                        if bare && fold_stable(&name) != "generale" {
+                        if bare && fold_chars(&name) != "generale" {
                             push(Mention::new(ns, ne, name), &mut out);
                         } else {
                             let head = self.text_slice(t.s, ns);
@@ -2098,7 +2109,7 @@ impl DocScan {
                         if (!name.contains(' ') && !name.contains('[') && t.kind == Mk::InstHead)
                             || (ne <= t.e + 1
                                 && matches!(
-                                    fold_stable(&name).as_str(),
+                                    fold_chars(&name).as_str(),
                                     "etablissement public" | "etablissement francais"
                                 ))
                         {
@@ -2113,7 +2124,7 @@ impl DocScan {
                     // (« représenté par Me X de la SCP Y ») : mandataires, liquidateurs, notaires
                     // assignés. « cabinet » n'ouvre jamais une partie.
                     if self.counsel_ctx_before(t.s)
-                        || fold_stable(&self.text_slice(t.s, t.e)) == "cabinet"
+                        || fold_chars(&self.text_slice(t.s, t.e)) == "cabinet"
                     {
                         continue;
                     }
@@ -2134,7 +2145,7 @@ impl DocScan {
                     // « prise en la personne de Me Y, ès qualités de liquidateur de… ») : le
                     // mandataire de justice n'est jamais une partie, seul le débiteur représenté
                     // l'est
-                    let win = fold_stable(&self.text_slice(ne, (ne + 120).min(to)));
+                    let win = fold_chars(&self.text_slice(ne, (ne + 120).min(to)));
                     if [
                         "mandataire",
                         "liquidateur",
@@ -2169,7 +2180,7 @@ impl DocScan {
             .find(|t| {
                 t.s >= from && t.s < to && t.kind == Mk::TrimLower && {
                     let s: String = self.norm.chars[t.s..t.e].iter().collect();
-                    let f = fold_stable(&s);
+                    let f = fold_chars(&s);
                     f == "demande" || f == "demandent"
                 }
             })
@@ -2196,7 +2207,7 @@ impl DocScan {
         // « en conséquence » ne sert que de repli.
         let strong = |t: &&PTok| {
             t.kind == Mk::Dispositif && {
-                let surf = fold_stable(&self.text_slice(t.s, t.e));
+                let surf = fold_chars(&self.text_slice(t.s, t.e));
                 let upper = is_upper_span(&self.norm.chars, t.s, t.e);
                 surf.starts_with("par ces motifs")
                     || (upper
@@ -2217,7 +2228,7 @@ impl DocScan {
 
     /// Fin de la zone dispositif : les MOYENS ANNEXÉS d'un arrêt CC le suivent et
     /// regorgent de « en ce qu'il » — ils n'en font pas partie.
-    fn dispositif_end(&self, from: usize) -> usize {
+    pub fn dispositif_end(&self, from: usize) -> usize {
         self.toks
             .iter()
             .find(|t| t.kind == Mk::MoyenPar && t.s > from)
@@ -2278,7 +2289,7 @@ impl DocScan {
     pub fn audience_windows(&self) -> Vec<String> {
         self.windows(110, 190, |t| {
             t.kind == Mk::Audience
-                || (t.kind == Mk::Stop && fold_stable(&self.text_slice(t.s, t.e)).contains("debat"))
+                || (t.kind == Mk::Stop && fold_chars(&self.text_slice(t.s, t.e)).contains("debat"))
         })
     }
 
@@ -2347,7 +2358,7 @@ impl DocScan {
                 // « saisie immobilière » partage le token JEX : la surface
                 // départage la matière.
                 Mk::ProcJex => {
-                    if fold_stable(&self.text_slice(t.s, t.e)).starts_with("saisie") {
+                    if fold_chars(&self.text_slice(t.s, t.e)).starts_with("saisie") {
                         "CIVIL_DROIT_SAISIE_IMMOBILIERE"
                     } else {
                         "CIVIL_PROCEDURES_CIVILES_EXECUTION"
@@ -2407,19 +2418,19 @@ impl DocScan {
         self.windows(170, 200, |t| {
             t.kind == Mk::AdminReq
                 && t.s < zone_end
-                && fold_stable(&self.text_slice(t.s, t.e)).starts_with("sous")
+                && fold_chars(&self.text_slice(t.s, t.e)).starts_with("sous")
         })
     }
 
     /// Le petit span (chars) qui SUIT un token, plié — pour les exceptions
     /// positionnées (« lieu de statuer *sur les dépens* »).
     fn span_after(&self, t: &PTok, n: usize) -> String {
-        fold_stable(&self.text_slice(t.e, (t.e + n).min(self.len())))
+        fold_chars(&self.text_slice(t.e, (t.e + n).min(self.len())))
     }
 
     /// Le petit span qui PRÉCÈDE un token, plié (gardes « non/pas prescrit »).
     fn span_before(&self, t: &PTok, n: usize) -> String {
-        fold_stable(&self.text_slice(t.s.saturating_sub(n), t.s))
+        fold_chars(&self.text_slice(t.s.saturating_sub(n), t.s))
     }
 
     /// Y a-t-il un token `kind` légitime dans la zone dispositif ?
@@ -2454,7 +2465,7 @@ impl DocScan {
                     Mk::OutRejette => {
                         // le NOM « rejet » en énumération (« propositions
                         // d'admission ou de rejet ») n'est pas un prononcé
-                        !(fold_stable(&self.text_slice(t.s, t.e)) == "rejet"
+                        !(fold_chars(&self.text_slice(t.s, t.e)) == "rejet"
                             && self.span_before(t, 6).ends_with("ou de "))
                     }
                     Mk::OutNeutral => {
@@ -2530,7 +2541,7 @@ impl DocScan {
                 && !self.text_slice(c.e, s.s).contains('.')
                 && !(s.kind == Mk::OutSauf && self.span_after(s, 3).trim_start().starts_with("a "))
                 && !(apres_confirme && {
-                    let surf = fold_stable(&self.text_slice(s.s, s.e));
+                    let surf = fold_chars(&self.text_slice(s.s, s.e));
                     matches!(
                         surf.as_str(),
                         "en ce qu'il"
@@ -2574,7 +2585,7 @@ impl DocScan {
         // juridictionnelle » exclu)
         let non_admis = self.toks.iter().any(|t| {
             t.kind == Mk::OutNonAdmis && {
-                let surf = fold_stable(&self.text_slice(t.s, t.e));
+                let surf = fold_chars(&self.text_slice(t.s, t.e));
                 if surf.contains("admission")
                     || self
                         .span_after(t, 16)
@@ -2750,7 +2761,7 @@ impl DocScan {
                     ));
                 }
                 if let Some(t) = self.disp_find(from, Mk::OutInfirme) {
-                    let surf = fold_stable(&self.text_slice(t.s, t.e));
+                    let surf = fold_chars(&self.text_slice(t.s, t.e));
                     let key = if surf.starts_with("reform") {
                         "REFORMATION"
                     } else {
@@ -2830,7 +2841,7 @@ impl DocScan {
                     continue;
                 }
                 let rest: String = chars[i + 1..].iter().collect();
-                let rest = fold_stable(rest.trim_start());
+                let rest = fold_chars(rest.trim_start());
                 const CHAINE: &[&str] = &[
                     "par suite",
                     "des lors",
@@ -2855,7 +2866,7 @@ impl DocScan {
                     // surface prescrit* ne prononce pas d'irrecevabilité
                     !(b.ends_with("non ")
                         || b.ends_with("pas ")
-                        || fold_stable(&self.text_slice(t.s, t.e)).starts_with("prescrit"))
+                        || fold_chars(&self.text_slice(t.s, t.e)).starts_with("prescrit"))
                 }
             })
             .collect();
@@ -2910,7 +2921,7 @@ impl DocScan {
             if sb <= win {
                 continue;
             }
-            let sent = fold_stable(&self.text_slice(sa, sb));
+            let sent = fold_chars(&self.text_slice(sa, sb));
             let vocab = ["irrecevab", "pas recevable", "non recevable", "tardiv"]
                 .iter()
                 .filter_map(|v| sent.find(v))
@@ -2950,11 +2961,11 @@ impl DocScan {
             if BLOCK.iter().any(|b| sent.contains(b)) {
                 continue;
             }
-            let to_disp = fold_stable(&self.text_slice(sb, from));
+            let to_disp = fold_chars(&self.text_slice(sb, from));
             if to_disp.contains("sur les conclusions") {
                 continue;
             }
-            let span = fold_stable(&self.text_slice(sa, from));
+            let span = fold_chars(&self.text_slice(sa, from));
             if span.contains("depourvue de fondement")
                 || span.contains("depourvues de fondement")
                 || span.contains("mal fonde")
@@ -2975,7 +2986,7 @@ impl DocScan {
         let end = self.dispositif_end(from);
         let toutes = self.toks.iter().any(|t| {
             t.s >= from && t.s < end && t.kind == Mk::OutCasse && {
-                let a = fold_stable(self.span_after(t, 40).trim_start());
+                let a = fold_chars(self.span_after(t, 40).trim_start());
                 a.starts_with(", dans toutes ses dispositions")
                     || a.starts_with(", en toutes ses dispositions")
                     || a.starts_with("dans toutes ses dispositions")
@@ -3013,7 +3024,7 @@ impl DocScan {
     /// (annuler = casser).
     pub fn header_has_pourvoi(&self) -> bool {
         let end = self.motifs_start();
-        fold_stable(&self.text_slice(0, end)).contains("pourvoi")
+        fold_chars(&self.text_slice(0, end)).contains("pourvoi")
     }
 
     /// Signaux procéduraux lus dans le texte — combinés aux métadonnées par
@@ -3083,7 +3094,7 @@ impl DocScan {
             // visa. Gate juridiction (CC/CE) dans `extract_procedure`.
             papc: self.toks.iter().any(|t| {
                 t.kind == Mk::ProcPapc && {
-                    let s = fold_stable(&self.text_slice(t.s, t.e));
+                    let s = fold_chars(&self.text_slice(t.s, t.e));
                     s.starts_with("l'admission") || s.starts_with("non specialement")
                 }
             }) || has_b(Mk::OutNonAdmis),
@@ -3100,7 +3111,7 @@ impl DocScan {
             // décision déférée) ou précédée de appel d'une / confirme l' / réforme l'
             refere_civil: self.toks.iter().any(|t| {
                 (t.kind == Mk::ProcRefCivil && {
-                    let surf = fold_stable(&self.text_slice(t.s, t.e));
+                    let surf = fold_chars(&self.text_slice(t.s, t.e));
                     if surf == "assignation en refere" {
                         t.s < header && self.span_before(t, 6).ends_with("vu l'")
                     } else {
@@ -3130,7 +3141,7 @@ impl DocScan {
             // formule d'ordonnance « NOUS, X, Premier Président de la cour »
             premier_president: self.toks.iter().any(|t| {
                 t.s < header && t.kind == Mk::ProcPremPres && {
-                    let surf = fold_stable(&self.text_slice(t.s, t.e));
+                    let surf = fold_chars(&self.text_slice(t.s, t.e));
                     surf != "premier president de la cour"
                         || self.span_before(t, 60).contains("nous")
                 }
@@ -3139,7 +3150,7 @@ impl DocScan {
             // clos par ponctuation (signature)
             magdes: self.toks.iter().any(|t| {
                 t.kind == Mk::ProcMagdes && {
-                    let surf = fold_stable(&self.text_slice(t.s, t.e));
+                    let surf = fold_chars(&self.text_slice(t.s, t.e));
                     !surf.starts_with("president")
                         || self
                             .span_after(t, 3)
@@ -3198,7 +3209,7 @@ impl DocScan {
             }) && !has_any(Mk::ProcJexFalse),
             jex_saisie_immo: self.toks.iter().any(|t| {
                 t.kind == Mk::ProcJex && {
-                    let s = fold_stable(&self.text_slice(t.s, t.e));
+                    let s = fold_chars(&self.text_slice(t.s, t.e));
                     s.starts_with("saisie")
                 }
             }),
@@ -3269,7 +3280,7 @@ impl DocScan {
         let apps_f: Vec<String> = self
             .admin_companies()
             .iter()
-            .map(|a| fold_stable(&a.value))
+            .map(|a| fold_chars(&a.value))
             .collect();
         let mut out: Vec<Mention> = Vec::new();
         // « le ministre de l'action et des comptes publics conclut au rejet » :
@@ -3277,7 +3288,7 @@ impl DocScan {
         for t in self.toks.iter().filter(|t| t.kind == Mk::DefConclu) {
             let from = self.sentence_start(t.s, 0);
             for m in self.autorites_in(from, t.s) {
-                let f = fold_stable(&m.value);
+                let f = fold_chars(&m.value);
                 if side_match(&f, &apps_f, &[]) {
                     continue;
                 }
@@ -3290,7 +3301,7 @@ impl DocScan {
                 let mut cellule = self.harvest(from, upto, upto);
                 cellule.extend(self.autorites_in(from, upto));
                 for m in cellule {
-                    let f = fold_stable(&m.value);
+                    let f = fold_chars(&m.value);
                     // une valeur contenue dans une autre est la meme partie vue
                     // deux fois (« commune de Conca » et « Conca ») : la plus
                     // longue porte le titre entier
@@ -3307,9 +3318,9 @@ impl DocScan {
     /// Une valeur contenue dans une autre est la meme partie vue deux fois
     /// (« commune de Conca » et « Conca ») : la plus longue porte le titre.
     fn pousse_la_plus_longue(out: &mut Vec<Mention>, m: Mention) {
-        let f = fold_stable(&m.value);
+        let f = fold_chars(&m.value);
         match out.iter_mut().find(|o| {
-            let g = fold_stable(&o.value);
+            let g = fold_chars(&o.value);
             g == f || g.contains(&f) || f.contains(&g)
         }) {
             Some(o) if o.value.len() < m.value.len() => *o = m,
@@ -3404,7 +3415,7 @@ impl DocScan {
                 Some(c) => {
                     // le connecteur n'appartient a aucune des deux cellules
                     cells.push((debut, i));
-                    debut = i + c.len();
+                    debut = self.source_after(i, c.len());
                     i = debut;
                 }
                 None => i += 1,
@@ -3649,7 +3660,7 @@ impl DocScan {
     /// les pourvois n° T au n° W » nu ne nomme personne).
     fn joint_pivot(&self, end: usize) -> Option<&PTok> {
         let j = self.find_tok(&[Mk::JointPourvois], 0, end)?;
-        let w = fold_stable(&self.text_slice(j.e, (j.e + 60).min(end)));
+        let w = fold_chars(&self.text_slice(j.e, (j.e + 60).min(end)));
         (w.contains("forme par") || w.contains("formes par")).then_some(j)
     }
 
@@ -3784,14 +3795,14 @@ impl DocScan {
         if defendants.is_empty() {
             // filet : « avocat de <partie> » des observations, moins les demandeurs déjà
             // connus (comparaison pliée et variantes de graphie)
-            let apps_f: Vec<String> = applicants.iter().map(|a| fold_stable(&a.value)).collect();
+            let apps_f: Vec<String> = applicants.iter().map(|a| fold_chars(&a.value)).collect();
             for t in self.toks.iter().filter(|t| t.kind == Mk::AvocatDe) {
                 if t.s >= end {
                     break;
                 }
                 let w_end = (t.e + 140).min(end);
                 for c in self.harvest(t.e, w_end, w_end) {
-                    let cf = fold_stable(&c.value);
+                    let cf = fold_chars(&c.value);
                     if apps_f.iter().any(|a| a.contains(cf.as_str()))
                         || side_match(&cf, &apps_f, &[])
                     {
@@ -4206,24 +4217,24 @@ impl DocScan {
     fn partie_representee(&self, apres: usize, to: usize) -> Option<String> {
         let c = self.toks.iter().find(|c| {
             c.kind == Mk::CounselIntro && c.s >= apres && c.s < to && c.s <= apres + 3 && {
-                fold_stable(&self.text_slice(c.s, c.e)).starts_with("representant")
+                fold_chars(&self.text_slice(c.s, c.e)).starts_with("representant")
             }
         })?;
-        Some(fold_stable(&self.text_slice(c.e, to.min(c.e + 120))))
+        Some(fold_chars(&self.text_slice(c.e, to.min(c.e + 120))))
     }
 
     /// Une mention de `v` dans `[from..to)` porte-t-elle une intro de
     /// conseil forte (« Rep/assistant : », « représenté par »… à ≤ 12 chars
     /// de son ancre « Me »/structure) ?
     fn strong_counsel_mention(&self, v: &str, from: usize, to: usize) -> bool {
-        let needle = fold_stable(v);
+        let needle = fold_chars(v);
         if needle.is_empty() {
             return false;
         }
         let hay = self.folded_slice(from, to.min(self.len()));
         let mut off = 0;
         while let Some(p) = hay[off..].find(&needle) {
-            let abs = from + hay[..off + p].chars().count();
+            let abs = self.source_after(from, off + p);
             let anchor = self
                 .toks
                 .iter()
@@ -4236,7 +4247,7 @@ impl DocScan {
                 .unwrap_or(abs);
             let strong = self.toks.iter().any(|c| {
                 c.kind == Mk::CounselIntro && c.e <= anchor && c.e + 12 > anchor && {
-                    let f = fold_stable(&self.text_slice(c.s, c.e));
+                    let f = fold_chars(&self.text_slice(c.s, c.e));
                     Self::intro_precedes_counsel(&f)
                 }
             });
@@ -4294,12 +4305,12 @@ impl DocScan {
         let apps_f: Vec<String> = self
             .admin_companies()
             .iter()
-            .map(|a| fold_stable(&a.value))
+            .map(|a| fold_chars(&a.value))
             .collect();
         let defs_f: Vec<String> = self
             .admin_defendants()
             .iter()
-            .map(|d| fold_stable(&d.value))
+            .map(|d| fold_chars(&d.value))
             .collect();
         let ctoks: Vec<PTok> = self
             .toks
@@ -4325,7 +4336,7 @@ impl DocScan {
             let is_def = match avde {
                 Some(a) => {
                     // petit span positionné par le token
-                    let party = fold_stable(&self.text_slice(a.e, win_end.min(a.e + 120)));
+                    let party = fold_chars(&self.text_slice(a.e, win_end.min(a.e + 120)));
                     let d = if side_match(&party, &apps_f, &[]) {
                         false
                     } else if apps_f.is_empty() {
@@ -4382,8 +4393,8 @@ impl DocScan {
             .max()
             .unwrap_or(0);
         let (apps, defs) = self.cc_companies();
-        let apps_f: Vec<String> = apps.iter().map(|a| fold_stable(&a.value)).collect();
-        let defs_f: Vec<String> = defs.iter().map(|d| fold_stable(&d.value)).collect();
+        let apps_f: Vec<String> = apps.iter().map(|a| fold_chars(&a.value)).collect();
+        let defs_f: Vec<String> = defs.iter().map(|d| fold_chars(&d.value)).collect();
         let mut starts: Vec<usize> = Vec::new();
         let mut entries: Vec<(bool, Mention)> = Vec::new();
         for t in &self.toks {
@@ -4411,7 +4422,7 @@ impl DocScan {
                 .and_then(|a| {
                     // petit span positionné par le token : la partie se nomme juste après
                     // « avocat de »
-                    let party = fold_stable(&self.text_slice(a.e, win_end.min(a.e + 120)));
+                    let party = fold_chars(&self.text_slice(a.e, win_end.min(a.e + 120)));
                     if side_match(&party, &apps_f, &defs_f) {
                         Some(false)
                     } else if side_match(&party, &defs_f, &apps_f) {
@@ -4461,7 +4472,7 @@ impl DocScan {
                 continue;
             };
             let ne = v.e;
-            let tail = fold_stable(&self.text_slice(ne, clause_end.min(ne + 120)));
+            let tail = fold_chars(&self.text_slice(ne, clause_end.min(ne + 120)));
             if tail.contains("incident") || tail.contains("provoqu") {
                 continue;
             }
@@ -4501,7 +4512,7 @@ impl DocScan {
             .iter()
             .filter_map(|n| win.find(n))
             .min()
-            .map(|p| from + win[..p].chars().count())
+            .map(|p| self.source_after(from, p))
             .unwrap_or(to)
     }
 
@@ -4675,7 +4686,7 @@ impl DocScan {
                 i += 1;
             }
             let w: String = self.norm.chars[ws..i].iter().collect();
-            let fw = fold_stable(&w);
+            let fw = fold_chars(&w);
             let particle = matches!(
                 fw.as_str(),
                 "de" | "du" | "des" | "la" | "le" | "les" | "von" | "van" | "el" | "ben" | "al"
@@ -4745,7 +4756,7 @@ impl DocScan {
     /// blancs élastiques : la valeur sort de [`Self::text_slice`] (runs de
     /// blancs collapsés), le texte plié garde ses runs. Bornes en CHARS.
     fn folded_mentions(&self, value: &str) -> Vec<(usize, usize)> {
-        let needle = fold_stable(value);
+        let needle = fold_chars(value);
         let words: Vec<&str> = needle.split_whitespace().collect();
         let Some((first, rest)) = words.split_first() else {
             return Vec::new();
@@ -4812,7 +4823,7 @@ impl DocScan {
                 return false;
             }
             if t.kind == Mk::CounselIntro {
-                let f = fold_stable(&self.text_slice(t.s, t.e));
+                let f = fold_chars(&self.text_slice(t.s, t.e));
                 // « Représentant : la SCP X » (label de greffe, colonisé) introduit le
                 // conseil ; « représentant X » de prose introduit la partie
                 let ok_dir = Self::intro_precedes_counsel(&f)
@@ -4836,7 +4847,7 @@ impl DocScan {
         self.apposition_after(e).is_some_and(|g| {
             self.toks.iter().any(|t| {
                 t.s == g && t.kind == Mk::CounselIntro && {
-                    let f = fold_stable(&self.text_slice(t.s, t.e));
+                    let f = fold_chars(&self.text_slice(t.s, t.e));
                     (f == "representant" || f == "representants") && !self.colon_after(t.e)
                 }
             })
@@ -4860,10 +4871,9 @@ impl DocScan {
         while g < to {
             match self.norm.chars[g] {
                 ' ' | ',' | '*' => g += 1,
-                '[' => match self.norm.chars[g..to].iter().position(|&c| c == ']') {
-                    Some(off) => g += off + 1,
-                    None => return None,
-                },
+                '[' => {
+                    g += self.norm.chars[g..to].iter().position(|&c| c == ']')? + 1;
+                }
                 _ => break,
             }
         }
@@ -4898,7 +4908,7 @@ impl DocScan {
             }
             matches!(t.kind, Mk::Opposant | Mk::AvocatDe | Mk::PivotOld)
                 || (t.kind == Mk::CounselIntro && {
-                    let f = fold_stable(&self.text_slice(t.s, t.e));
+                    let f = fold_chars(&self.text_slice(t.s, t.e));
                     // « représentant <partie> » de prose, jamais colonisé
                     f.starts_with("representant")
                         && !f.contains(':')
@@ -4923,7 +4933,7 @@ impl DocScan {
             return false;
         };
         self.toks.iter().filter(|t| t.s == g).any(|t| {
-            let f = fold_stable(&self.text_slice(t.s, t.e));
+            let f = fold_chars(&self.text_slice(t.s, t.e));
             match t.kind {
                 Mk::TrimAlways => {
                     f.starts_with("defaillant")
@@ -5265,9 +5275,9 @@ mod tests {
             let r = s.party_registry();
             assert!(!r.entities.is_empty(), "aucune entité : {texte}");
             for e in &r.entities {
-                let tranche = fold_stable(&s.text_slice(e.s, e.e));
+                let tranche = fold_chars(&s.text_slice(e.s, e.e));
                 let mut reste = tranche.as_str();
-                for mot in fold_stable(&e.value).split_whitespace() {
+                for mot in fold_chars(&e.value).split_whitespace() {
                     let Some(i) = reste.find(mot) else {
                         panic!(
                             "« {mot} » de « {} » hors de sa tranche « {tranche} »",

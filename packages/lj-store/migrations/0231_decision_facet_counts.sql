@@ -1,18 +1,3 @@
--- Migration 0231 : compteurs de facettes du fonds entier.
---
--- Le mode parcours (`/decisions` sans requête) affiche total et facettes du
--- fonds sans filtre : 6,95 s d'agrégats à la demande pour un état qui ne change
--- qu'une fois par nuit, contre 644 lignes à lire ici. Le recompte, lui, coûte
--- 11,6 s.
---
--- `value` porte la valeur BRUTE de la colonne, jamais une clé de référentiel :
--- la publication a changé de regroupement deux fois en un jour (0229, 0230), et
--- un fait brut ne se périme pas quand la correspondance bouge. D'où la dimension
--- `publication_codes`, dont le lecteur dérive les clés comme sur le chemin
--- filtré.
---
--- Écrivain unique : l'étape `resync-decision-facet-counts`, quotidienne.
-
 CREATE TABLE decision_facet_counts (
     dimension text   NOT NULL,
     value     text   NOT NULL,

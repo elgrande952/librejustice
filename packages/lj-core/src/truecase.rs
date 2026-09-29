@@ -65,7 +65,7 @@ static ACCENTS: LazyLock<HashMap<String, &'static str>> = LazyLock::new(|| {
         .lines()
         .chain(ACCENTS_SUPP_TXT.lines())
         .filter(|l| !l.is_empty())
-        .map(|w| (fold(w), w))
+        .map(|w| (lj_fold::fold_chars(w), w))
         .collect()
 });
 
@@ -73,7 +73,7 @@ static PROPER: LazyLock<HashMap<String, &'static str>> = LazyLock::new(|| {
     PROPER_TXT
         .lines()
         .filter(|l| !l.is_empty())
-        .map(|w| (fold(w), w))
+        .map(|w| (lj_fold::fold_chars(w), w))
         .collect()
 });
 
@@ -205,30 +205,6 @@ const DES_DET: &[&str] = &[
     "mes", "notre", "votre", "nos", "vos", "ton", "ta", "tes",
 ];
 
-/// Replie une chaîne en clé de recherche : minuscule + suppression des
-/// diacritiques français + ligatures (`œ→oe`, `æ→ae`). Utilisé identiquement pour
-/// bâtir les tables et pour interroger un token — la cohérence est interne.
-fn fold(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        for lc in c.to_lowercase() {
-            match lc {
-                'à' | 'â' | 'ä' | 'á' | 'ã' | 'å' => out.push('a'),
-                'é' | 'è' | 'ê' | 'ë' => out.push('e'),
-                'î' | 'ï' | 'í' | 'ì' => out.push('i'),
-                'ô' | 'ö' | 'ó' | 'ò' | 'õ' => out.push('o'),
-                'û' | 'ü' | 'ù' | 'ú' => out.push('u'),
-                'ÿ' | 'ý' => out.push('y'),
-                'ç' => out.push('c'),
-                'œ' => out.push_str("oe"),
-                'æ' => out.push_str("ae"),
-                other => out.push(other),
-            }
-        }
-    }
-    out
-}
-
 /// Vrai si le texte est majoritairement en capitales (≥ 85 % des lettres) sur un
 /// volume significatif — signature des vieilles décisions caps-lock. C'est le
 /// portillon : on ne recasse QUE ces documents, jamais un texte déjà en casse
@@ -319,7 +295,9 @@ fn folded_word_seq(chars: &[char]) -> Vec<String> {
             while i < chars.len() && is_word_char(chars[i]) {
                 i += 1;
             }
-            words.push(fold(&chars[start..i].iter().collect::<String>()));
+            words.push(lj_fold::fold_chars(
+                &chars[start..i].iter().collect::<String>(),
+            ));
         } else {
             i += 1;
         }
@@ -377,7 +355,7 @@ fn case_word(
         "mm" if next_dot => return "MM".to_string(),
         _ => {}
     }
-    let key = fold(&lower);
+    let key = lj_fold::fold_chars(&lower);
     // Nom propre (lieu/juridiction) : déjà capitalisé + accentué dans la table.
     // Homographe « a »/« à » : tranché par voisins (le filtre de dominance le
     // laisse hors lexique). Sinon, restauration d'accent par lexique.

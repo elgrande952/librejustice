@@ -106,7 +106,7 @@ fn Identifiants(signup: bool, next: String, error: Option<String>) -> impl IntoV
             >
                 <input type="hidden" name="next" value=next.clone() />
                 <div class="flex flex-col gap-1.5">
-                    <label for="email" class="text-sm text-[var(--color-ink-muted)]">"Email"</label>
+                    <label for="email" class="text-sm text-[var(--color-ink-muted)]">"E-mail"</label>
                     <input
                         id="email"
                         name="email"
@@ -160,7 +160,7 @@ fn Identifiants(signup: bool, next: String, error: Option<String>) -> impl IntoV
 
             <div class="text-center text-sm text-[var(--color-ink-muted)]">
                 <a href=lien_magique class="hover:text-[var(--color-ink)]">
-                    "Recevoir un lien de connexion par email"
+                    "Recevoir un lien de connexion par e-mail"
                 </a>
             </div>
 
@@ -173,7 +173,7 @@ fn Identifiants(signup: bool, next: String, error: Option<String>) -> impl IntoV
                                 for="resend-email"
                                 class="text-sm text-[var(--color-ink-muted)]"
                             >
-                                "Renvoyer l'email de confirmation"
+                                "Renvoyer l'e-mail de confirmation"
                             </label>
                             <input
                                 id="resend-email"
@@ -187,7 +187,7 @@ fn Identifiants(signup: bool, next: String, error: Option<String>) -> impl IntoV
                                 type="submit"
                                 class="self-start text-sm text-[var(--color-accent)] underline hover:opacity-80"
                             >
-                                "Renvoyer l'email"
+                                "Renvoyer l'e-mail"
                             </button>
                         </form>
                     }
@@ -239,13 +239,13 @@ fn DemandeReset(next: String, error: Option<String>) -> impl IntoView {
             <div class="flex flex-col gap-2">
                 <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Mot de passe oublié"</h1>
                 <p class="text-sm text-[var(--color-ink-muted)]">
-                    "Recevez par email un lien de réinitialisation."
+                    "Recevez par e-mail un lien de réinitialisation."
                 </p>
             </div>
             <form method="post" action="/internal/auth/reset-request" class="flex flex-col gap-4">
                 <input type="hidden" name="next" value=next.clone() />
                 <div class="flex flex-col gap-1.5">
-                    <label for="email" class="text-sm text-[var(--color-ink-muted)]">"Email"</label>
+                    <label for="email" class="text-sm text-[var(--color-ink-muted)]">"E-mail"</label>
                     <input
                         id="email"
                         name="email"
@@ -284,7 +284,7 @@ fn DemandeLien(next: String, error: Option<String>) -> impl IntoView {
     view! {
         <div class="mx-auto flex max-w-sm flex-col gap-8 px-4 py-16">
             <div class="flex flex-col gap-2">
-                <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Connexion par email"</h1>
+                <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Connexion par e-mail"</h1>
                 <p class="text-sm text-[var(--color-ink-muted)]">
                     "Recevez un lien qui ouvre votre session. Sans mot de passe à retenir."
                 </p>
@@ -292,7 +292,7 @@ fn DemandeLien(next: String, error: Option<String>) -> impl IntoView {
             <form method="post" action="/internal/auth/link-request" class="flex flex-col gap-4">
                 <input type="hidden" name="next" value=next.clone() />
                 <div class="flex flex-col gap-1.5">
-                    <label for="email" class="text-sm text-[var(--color-ink-muted)]">"Email"</label>
+                    <label for="email" class="text-sm text-[var(--color-ink-muted)]">"E-mail"</label>
                     <input
                         id="email"
                         name="email"
@@ -320,7 +320,7 @@ fn DemandeLien(next: String, error: Option<String>) -> impl IntoView {
 fn MailEnvoye(genre: String) -> impl IntoView {
     view! {
         <div class="mx-auto flex max-w-sm flex-col gap-4 px-4 py-16">
-            <h1 class="font-sans text-2xl text-[var(--color-ink)]">"Email envoyé"</h1>
+            <h1 class="font-sans text-2xl text-[var(--color-ink)]">"E-mail envoyé"</h1>
             <p class="text-[var(--color-ink-muted)]">
                 {match genre.as_str() {
                     "recovery" => {

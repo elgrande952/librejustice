@@ -9,13 +9,13 @@ use super::view_prefs::CardView;
 #[component]
 pub fn ResultList(
     hits: Vec<SearchHit>,
-    all_hit_ids: Vec<String>,
+    all_hit_paths: Vec<String>,
     page: u32,
     page_size: u32,
     #[prop(into)] default_view: Signal<CardView>,
     animate: bool,
 ) -> impl IntoView {
-    let all_hit_ids = std::sync::Arc::new(all_hit_ids);
+    let all_hit_paths = std::sync::Arc::new(all_hit_paths);
     // Liste keyée par `hit.id` : quand les hits diffèrent (nouvelle requête, filtre,
     // page), les clés changent, `<For>` recrée les `<article>` et l'animation « rise »
     // rejoue. Mode IA (mêmes hits, mêmes clés) → nœuds réutilisés, pas de rejeu ; le
@@ -30,7 +30,7 @@ pub fn ResultList(
                         index=index
                         page=page
                         page_size=page_size
-                        hit_ids=all_hit_ids.clone()
+                        hit_paths=all_hit_paths.clone()
                         default_view=default_view
                         animate=animate
                     />

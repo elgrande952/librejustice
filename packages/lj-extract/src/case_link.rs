@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use lj_core::address::CaseAddress;
 use lj_core::case_names::case_name_key as key;
 
 /// Les noms qu'un corps peut citer, et la clé pendante que chacun désigne. Une
@@ -10,17 +11,10 @@ use lj_core::case_names::case_name_key as key;
 /// quatre arrêts et le corps ne dit pas lequel.
 #[derive(Debug, Default, Clone)]
 pub struct CaseNameSnapshot {
-    par_cle: HashMap<String, Nommee>,
+    par_cle: HashMap<String, CaseAddress>,
     /// Premier mot replié vers la longueur de la plus longue clé qui commence par
     /// lui : une clé de 222 mots ne dicte plus la borne des 20 197 autres.
     par_tete: HashMap<String, usize>,
-}
-
-/// La décision qu'un nom désigne : sa clé pendante et sa date de lecture, ISO.
-#[derive(Debug, Clone)]
-struct Nommee {
-    target_ref: String,
-    date: Option<String>,
 }
 
 /// What the deciding court brings to the sorting of candidate targets.
@@ -35,12 +29,11 @@ pub struct Citing<'a> {
 }
 
 impl CaseNameSnapshot {
-    /// `rows` = `(clé repliée du nom, clé pendante de la décision nommée, sa
-    /// date de lecture ISO)`.
-    pub fn new(rows: impl IntoIterator<Item = (String, String, Option<String>)>) -> Self {
+    /// `rows` = `(clé repliée du nom, adresse de la décision nommée)`.
+    pub fn new(rows: impl IntoIterator<Item = (String, CaseAddress)>) -> Self {
         let mut par_cle = HashMap::new();
         let mut par_tete: HashMap<String, usize> = HashMap::new();
-        for (cle, target_ref, date) in rows {
+        for (cle, address) in rows {
             if cle.is_empty() {
                 continue;
             }
@@ -49,7 +42,7 @@ impl CaseNameSnapshot {
             let n = mots.count() + 1;
             let borne = par_tete.entry(tete.to_string()).or_default();
             *borne = (*borne).max(n);
-            par_cle.insert(cle, Nommee { target_ref, date });
+            par_cle.insert(cle, address);
         }
         CaseNameSnapshot { par_cle, par_tete }
     }
@@ -59,8 +52,8 @@ impl CaseNameSnapshot {
     }
 }
 
-/// Familles de clé pendante de l'ordre juridictionnel français.
-const FAMILLES_FR: [&str; 6] = ["ce", "cc", "tc", "constit", "rg", "af"];
+/// The two courts of the address that are not French.
+const COURS_EUROPEENNES: [&str; 2] = ["cjue", "cedh"];
 
 /// Codepoints of the identity block a European decision opens with (`AFFAIRE
 /// LA ROSA ET 3 AUTRES c. ITALIE (No 5)`, `En l'affaire Granata c. France`).
@@ -73,9 +66,11 @@ const EUROPEAN_HEADER: usize = 400;
 /// (31/08/2026): 2 555 attach the European judgment a European judge names
 /// (`arrêt Kadi`) to a homonymous French decision, 929 point at a decision
 /// handed down after the citing one.
-fn impossible(cle: &str, cible: &Nommee, citing: &Citing<'_>, banniere: Option<&str>) -> bool {
-    let famille = cible.target_ref.split('|').next().unwrap_or_default();
-    if citing.european && FAMILLES_FR.contains(&famille) && !nomme_le_droit_francais(cle, banniere)
+fn impossible(cle: &str, cible: &CaseAddress, citing: &Citing<'_>, banniere: Option<&str>) -> bool {
+    let cour = cible.court.as_deref().unwrap_or_default();
+    if citing.european
+        && !COURS_EUROPEENNES.contains(&cour)
+        && !nomme_le_droit_francais(cle, banniere)
     {
         return true;
     }
@@ -127,9 +122,9 @@ fn common_noun(mots: &[Mot<'_>], rang: usize) -> bool {
 pub fn cited_case_name_spans(
     text: &str,
     snap: &CaseNameSnapshot,
-    soi: &[String],
+    soi: &[CaseAddress],
     citing: Citing<'_>,
-) -> Vec<(usize, usize, String)> {
+) -> Vec<(usize, usize, CaseAddress)> {
     if snap.is_empty() {
         return Vec::new();
     }
@@ -139,7 +134,7 @@ pub fn cited_case_name_spans(
     let banniere = citing
         .european
         .then(|| key(&text.chars().take(EUROPEAN_HEADER).collect::<String>()));
-    let mut spans: Vec<(usize, usize, String)> = Vec::new();
+    let mut spans: Vec<(usize, usize, CaseAddress)> = Vec::new();
     let mut cle = String::new();
     let mut coupes: Vec<usize> = Vec::new();
     for (rang, mot) in mots.iter().enumerate() {
@@ -184,7 +179,7 @@ pub fn cited_case_name_spans(
             };
             let (debut, fin) = (mots[tete].debut, mots[tete + taille - 1].fin);
             let refuse = (citing.european && debut < EUROPEAN_HEADER)
-                || soi.contains(&nommee.target_ref)
+                || soi.contains(nommee)
                 || impossible(
                     &cle[..coupes[taille - 1]],
                     nommee,
@@ -194,7 +189,7 @@ pub fn cited_case_name_spans(
                 || nom_tronque(&mots, tete + taille)
                 || spans.last().is_some_and(|(_, f, _)| *f > debut);
             if !refuse {
-                spans.push((debut, fin, nommee.target_ref.clone()));
+                spans.push((debut, fin, nommee.clone()));
             }
             break;
         }
@@ -272,7 +267,7 @@ fn mots(text: &str) -> Vec<Mot<'_>> {
 /// Égalité accents et casse repliés, sans allocation. `pluriel` accepte le `s`
 /// final du mot lu : « arrêts Danthony » cite comme « arrêt Danthony ».
 fn egal_plie(mot: &str, cible: &str, pluriel: bool) -> bool {
-    let mut lu = mot.chars().map(plier);
+    let mut lu = mot.chars().flat_map(lj_fold::fold_char);
     let mut attendu = cible.chars();
     loop {
         match (lu.next(), attendu.next()) {
@@ -284,18 +279,6 @@ fn egal_plie(mot: &str, cible: &str, pluriel: bool) -> bool {
     }
 }
 
-fn plier(c: char) -> char {
-    match c.to_lowercase().next().unwrap_or(c) {
-        'à' | 'â' | 'ä' => 'a',
-        'é' | 'è' | 'ê' | 'ë' => 'e',
-        'î' | 'ï' => 'i',
-        'ô' | 'ö' => 'o',
-        'ù' | 'û' | 'ü' => 'u',
-        'ç' => 'c',
-        autre => autre,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,38 +287,31 @@ mod tests {
         CaseNameSnapshot::new([
             (
                 "danthony".to_string(),
-                "ce|335033".to_string(),
-                Some("2011-12-23".to_string()),
+                CaseAddress::new("ce", "335033", "2011-12-23"),
             ),
             (
                 "soulier".to_string(),
-                "ce|223041".to_string(),
-                Some("2002-10-30".to_string()),
+                CaseAddress::new("ce", "223041", "2002-10-30"),
             ),
             (
                 "societe tropic travaux signalisation".to_string(),
-                "ce|291545".to_string(),
-                Some("2007-07-16".to_string()),
+                CaseAddress::new("ce", "291545", "2007-07-16"),
             ),
             (
                 "tropic".to_string(),
-                "ce|291545".to_string(),
-                Some("2007-07-16".to_string()),
+                CaseAddress::new("ce", "291545", "2007-07-16"),
             ),
             (
                 "granata c france".to_string(),
-                "cedh|39626/98".to_string(),
-                Some("2003-03-27".to_string()),
+                CaseAddress::new("cedh", "39626/98", "2003-03-27"),
             ),
             (
                 "czabaj".to_string(),
-                "ce|389011".to_string(),
-                Some("2016-07-13".to_string()),
+                CaseAddress::new("ce", "389011", "2016-07-13"),
             ),
             (
                 "sanchez".to_string(),
-                "ce|401800".to_string(),
-                Some("2017-05-10".to_string()),
+                CaseAddress::new("ce", "401800", "2017-05-10"),
             ),
         ])
     }
@@ -348,11 +324,16 @@ mod tests {
         }
     }
 
-    fn cles(text: &str, soi: &[&str]) -> Vec<String> {
-        let soi: Vec<String> = soi.iter().map(|k| k.to_string()).collect();
-        cited_case_name_spans(text, &snap(), &soi, citante())
+    /// `court|docket` of each span, an address in its readable test form.
+    fn rendu(a: &CaseAddress) -> String {
+        let c = |o: &Option<String>| o.clone().unwrap_or_default();
+        format!("{}|{}", c(&a.court), c(&a.docket))
+    }
+
+    fn cles(text: &str, soi: &[CaseAddress]) -> Vec<String> {
+        cited_case_name_spans(text, &snap(), soi, citante())
             .into_iter()
-            .map(|(_, _, r)| r)
+            .map(|(_, _, r)| rendu(&r))
             .collect()
     }
 
@@ -395,7 +376,11 @@ mod tests {
 
     #[test]
     fn la_decision_ne_se_cite_pas_elle_meme() {
-        assert!(cles("la jurisprudence Danthony", &["ce|335033"]).is_empty());
+        assert!(cles(
+            "la jurisprudence Danthony",
+            &[CaseAddress::new("ce", "335033", "2011-12-23")]
+        )
+        .is_empty());
     }
 
     /// La bannière du greffe, la partie apposée et la phrase déjà close.
@@ -479,7 +464,7 @@ mod tests {
         assert_eq!(
             cited_case_name_spans(&corps, &snap(), &[], europeenne)
                 .into_iter()
-                .map(|(_, _, r)| r)
+                .map(|(_, _, r)| rendu(&r))
                 .collect::<Vec<_>>(),
             vec!["ce|389011"]
         );
@@ -514,7 +499,7 @@ mod tests {
         assert_eq!(
             cited_case_name_spans(&corps, &snap(), &[], europeenne)
                 .into_iter()
-                .map(|(_, _, r)| r)
+                .map(|(_, _, r)| rendu(&r))
                 .collect::<Vec<_>>(),
             vec!["cedh|39626/98"]
         );

@@ -1,9 +1,23 @@
 //! Types publics du repository : structs/enums de contrat (lignes de résultat,
 //! bundles d'écriture, statuts d'upsert). Réexportés tels quels par [`super`].
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use chrono::NaiveDate;
+use lj_core::address::CaseAddress;
 use lj_core::decision::Decision;
 use serde_json::Value;
+
+/// Whether the payload being written is at least as fresh as the row it lands
+/// on. A repair replays an old bulk stock, where differing bytes mean "mine are
+/// older", never "mine are better": DILA re-delivers a version's own file with
+/// its `ETAT` and `DATE_FIN` updated, so a stale payload relabels a superseded
+/// version as in force. Measured on 40 texts: 500 versions wrongly relabelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fraicheur {
+    Autoritaire,
+    Rejeu,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpsertStatus {
@@ -37,6 +51,13 @@ pub struct MissingSummaryRow {
     pub jurisdiction_name: Option<String>,
     pub date_lecture: Option<String>,
     pub docket_numbers: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollageRow {
+    pub decision_id: i64,
+    pub full_text: String,
+    pub commentary: String,
 }
 
 /// Corps + métadonnées grain décision d'une décision poolée pour le GT.
@@ -100,6 +121,7 @@ pub struct SlugSourceRow {
     pub title: String,
     pub jurisdiction: String,
     pub date_texte: Option<String>,
+    pub date_publi: Option<String>,
     pub nor: Option<String>,
 }
 
@@ -188,7 +210,7 @@ pub struct LegalLinkRow {
 /// `target_text_slug`/`target_text_title` = le texte porteur de la cible s'il est
 /// en base ; `resolved_slug`/`resolved_num_key` = la version d'article cible
 /// résolue (par `source_uid`, sinon par `(texte, num_key)`) — `Some` ⇒ le lien
-/// `/texte/{resolved_slug}/{resolved_num_key}` est garanti.
+/// `/norm/{resolved_slug}/{resolved_num_key}` est garanti.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLegalLink {
     pub typelien: String,
@@ -204,10 +226,12 @@ pub struct ResolvedLegalLink {
     pub target_text_uid: Option<String>,
     pub target_text_slug: Option<String>,
     pub target_text_title: Option<String>,
+    pub target_text_jurisdiction: Option<String>,
     pub resolved_slug: Option<String>,
+    pub resolved_jurisdiction: Option<String>,
     pub resolved_num_key: Option<String>,
     /// Cible section : cid stable résolu via `legal_toc_edge` — `Some` ⇒ l'ancre
-    /// `/texte/{target_text_slug}#{cid}` existe au sommaire.
+    /// `/norm/{target_text_slug}#{cid}` existe au sommaire.
     pub resolved_section_cid: Option<String>,
 }
 
@@ -250,13 +274,27 @@ pub struct TocTreeRow {
     pub etat: String,
 }
 
-/// Un item de vue-lecture d'une section : les nœuds du sous-arbre en ordre de
-/// lecture, corps (`texte`/`nota`) joint pour les articles.
+impl TocTreeRow {
+    /// The row as the path computation reads it.
+    pub fn toc_row(&self) -> lj_norm::toc_path::TocRow<'_> {
+        lj_norm::toc_path::TocRow {
+            kind: if self.child_kind == "article" {
+                lj_norm::toc_path::TocKind::Article
+            } else {
+                lj_norm::toc_path::TocKind::Section
+            },
+            depth: self.depth,
+            label: &self.label,
+            num_key: self.child_num_key.as_deref(),
+        }
+    }
+}
+
+/// Un article de la lecture à plat d'un texte sans structure, corps joint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TocReadingRow {
     pub depth: i32,
     pub child_kind: String,
-    pub child_cid: Option<String>,
     pub child_num_key: Option<String>,
     pub label: String,
     pub etat: String,
@@ -295,13 +333,14 @@ pub struct CoCitedArticleRow {
 }
 
 /// Un hit de recherche plein-texte d'article (`/recherche-textes`).
-/// `slug` = slug du `legal_text` parent (lien `/texte/{slug}/{num}`) ; `texte` =
+/// `slug` = slug du `legal_text` parent (lien `/norm/{juris}/{slug}/{num}`) ; `texte` =
 /// corps brut pour le snippet. `score` = `paradedb.score`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArticleSearchRow {
     pub text_uid: String,
     pub slug: Option<String>,
     pub code_title: String,
+    pub jurisdiction: String,
     pub num: String,
     pub num_key: String,
     pub title_path: Option<String>,
@@ -314,16 +353,108 @@ pub struct ArticleSearchRow {
     pub score: f32,
 }
 
-/// Filtres du parcours d'articles, aux axes de la barre `/textes`.
-#[derive(Debug, Clone, Copy, Default)]
+/// Filtres du parcours d'articles, aux axes de la barre `/norm-search`.
+#[derive(Debug, Clone, Copy)]
 pub struct ArticleBrowseFilters<'a> {
+    /// Where the reader is read from, as `legal_text.jurisdiction` codes. A
+    /// query naming no country searches that, and nothing else. Never empty:
+    /// an empty scope filters every row out.
+    pub home: &'a [&'a str],
     pub text_uid: Option<&'a str>,
-    pub jurisdiction: Option<&'a str>,
+    /// The corpora stated, searched in place of those the query designates.
+    pub jurisdictions: &'a [&'a str],
     pub nature: Option<&'a str>,
     pub source: Option<&'a str>,
     /// `(liste, true)` = nature dans la liste, `(liste, false)` = hors liste.
     pub nature_set: Option<(&'a [String], bool)>,
     pub at: Option<NaiveDate>,
+}
+
+impl Default for ArticleBrowseFilters<'_> {
+    /// A caller that names no reader browses from France, which is what every
+    /// caller did before the place became a setting.
+    fn default() -> Self {
+        Self {
+            home: &lj_norm::jurisdictions::DOMESTIC_REGIONS,
+            text_uid: None,
+            jurisdictions: &[],
+            nature: None,
+            source: None,
+            nature_set: None,
+            at: None,
+        }
+    }
+}
+
+/// A place read on a day, as the coverage is asked about it.
+pub struct PlaceReading<'a> {
+    /// The place, then each place it belongs to.
+    pub path: &'a [String],
+    pub day: chrono::NaiveDate,
+    /// The keys under which a text stays: those reaching the place, and those
+    /// reaching it on mention only, a doubt.
+    pub keeping: &'a [String],
+    /// Every other key: excluded or frozen there, or not reaching it at all.
+    pub dropping: &'a [String],
+}
+
+/// A text the coverage places somewhere on the day a place is read, never there
+/// nor under a key the place keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedElsewhere {
+    pub text_uid: String,
+    pub jurisdiction: String,
+    pub title: String,
+    /// Placed under a key the place drops, not only by name elsewhere.
+    pub keyed: bool,
+    pub articles: bool,
+    pub body: bool,
+}
+
+/// The texts a search read from some places drops, by the index each is found
+/// through: its articles, or its body. A text with neither is never found. A
+/// text of a jurisdiction none of the places belongs to is kept: a treaty, or
+/// the country a query or a facet names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaceFilter {
+    pub articles: Vec<String>,
+    pub bodies: Vec<String>,
+}
+
+impl PlaceFilter {
+    /// The union of what several places receive, each given as what it rules
+    /// out per jurisdiction it belongs to: a text is dropped when every place
+    /// of its jurisdiction rules it out.
+    pub fn union(places: &[&BTreeMap<String, PlaceFilter>]) -> Self {
+        PlaceFilter {
+            articles: dropped_everywhere(places, |f| f.articles.as_slice()),
+            bodies: dropped_everywhere(places, |f| f.bodies.as_slice()),
+        }
+    }
+}
+
+fn dropped_everywhere(
+    places: &[&BTreeMap<String, PlaceFilter>],
+    side: fn(&PlaceFilter) -> &[String],
+) -> Vec<String> {
+    let mut by_jurisdiction: BTreeMap<&str, Vec<BTreeSet<&str>>> = BTreeMap::new();
+    for place in places {
+        for (jurisdiction, filter) in place.iter() {
+            by_jurisdiction
+                .entry(jurisdiction)
+                .or_default()
+                .push(side(filter).iter().map(String::as_str).collect());
+        }
+    }
+    by_jurisdiction
+        .into_values()
+        .flat_map(|sets| {
+            let mut sets = sets.into_iter();
+            let first = sets.next().expect("a jurisdiction comes from a place");
+            sets.fold(first, |acc, set| acc.intersection(&set).copied().collect())
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Un hit du banc de ranking articles :
@@ -357,16 +488,16 @@ pub enum ArticleTitleMode {
 /// scores RRF sommés par doc) au lieu des 2 jambes à prédicat mixte
 /// titre+corps. `container` ajoute une jambe « conteneurs » : `legal_text`
 /// sans corps mais à articles (les codes), titre en match conjonctif SEUL — un
-/// hit `slug` sans `num` (lien `/texte/{slug}`), prioritaire à rang RRF égal.
+/// hit `slug` sans `num` (lien `/norm/{juris}/{slug}`), prioritaire à rang RRF égal.
 /// `foreign_weight` scinde la jambe articles en domestique (jurisdiction
 /// FR/UE/INTL + pays nommés dans la requête,
-/// [`lj_core::jurisdictions::query_jurisdictions`]) et étrangère, pondérée
+/// [`lj_norm::jurisdictions::query_jurisdictions`]) et étrangère, pondérée
 /// par ce poids. `container_alias` admet dans la jambe conteneurs les
 /// expansions d'alias **pleine requête**
-/// ([`lj_core::aliases::whole_query_expansions`] : « code civil du sénégal »
+/// ([`lj_norm::aliases::whole_query_expansions`] : « code civil du sénégal »
 /// → « code de la famille sénégalais »). `country_leg` ajoute une jambe
 /// « pays nommé » : articles des juridictions nommées, requête débarrassée
-/// des tokens pays ([`lj_core::jurisdictions::strip_query_jurisdictions`]).
+/// des tokens pays ([`lj_norm::jurisdictions::strip_query_jurisdictions`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ArticleRrf {
     pub k: f64,
@@ -391,12 +522,41 @@ pub struct ArticleRrf {
     pub usage_table: Option<&'static str>,
 }
 
+/// The text a query names, and what is left of the query once that name is cut.
+/// Resolved once and handed to every leg: the two lookups behind it cost 720 ms
+/// and 320 ms, and each leg used to run them for itself.
+#[derive(Debug, Clone)]
+pub struct NamedText {
+    pub text_uid: String,
+    pub stripped: String,
+}
+
+/// The articles a free query designates, in the search row shape so a
+/// designation and a ranked hit take the same presentation path. Empty when the
+/// cited keys land nowhere: the refusal is then the designation.
+#[derive(Debug, Clone)]
+pub struct ArticleDesignation {
+    pub articles: Vec<ArticleSearchRow>,
+    /// The query is nothing but this designation, so the list is the reference
+    /// itself rather than a card above a content list.
+    pub consumes: bool,
+}
+
 /// Un comptage de facette de recherche d'articles : valeur de la facette
 /// (jurisdiction/nature/source) et nombre de hits sous le même prédicat BM25 + filtres.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FacetCount {
     pub value: String,
     pub count: i64,
+}
+
+/// One member of a facet count, already checked against aggregate truncation.
+/// Members are summed by axis value, never concatenated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArticleFacetMember {
+    pub total: i64,
+    /// `code` (slug), `jurisdiction`, `nature`, `source`, in that order.
+    pub axes: [std::collections::BTreeMap<String, i64>; 4],
 }
 
 /// Total + facettes d'une recherche d'articles, calculés en UNE requête
@@ -407,7 +567,7 @@ pub struct FacetCount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArticleSearchStats {
     pub total: i64,
-    /// Slugs des textes porteurs de hits — token du filtre `code` (`/texte/{slug}`).
+    /// Slugs des textes porteurs de hits, token du filtre `code` (`/norm/{juris}/{slug}`).
     pub code: Vec<FacetCount>,
     pub jurisdiction: Vec<FacetCount>,
     pub nature: Vec<FacetCount>,
@@ -443,7 +603,7 @@ pub struct TextRefsOracleStats {
 
 /// Une entrée du catalogue des codes (`/api/codes`) : un `legal_text` à slug +
 /// nombre d'articles en vigueur. `text_uid` = identité globale, `slug` = code court de
-/// l'URL `/texte/{slug}`.
+/// l'URL `/norm/{juris}/{slug}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegalTextCatalogRow {
     pub text_uid: String,
@@ -454,6 +614,14 @@ pub struct LegalTextCatalogRow {
     pub article_count: i64,
 }
 
+/// What resolving a slug returns: `(uid, today's slug, title, jurisdiction)`.
+/// The slug returned may differ from the one received, the caller reading the
+/// gap to raise a 301.
+pub type ReferentialRef = (String, String, Option<String>, String);
+
+/// One sitemap article row: `(slug, num_key, jurisdiction, lastmod)`.
+pub type SitemapArticle = (String, String, String, Option<NaiveDate>);
+
 /// Un candidat de catalogue proposé pour une valeur d'instrument inconnue
 /// (`suggest_instruments`). Le titre sert le message « did you mean », le slug
 /// et l'uid servent le rattrapage quand le candidat EST le texte demandé.
@@ -462,6 +630,19 @@ pub struct InstrumentCandidate {
     pub slug: String,
     pub title: String,
     pub text_uid: String,
+    pub jurisdiction: String,
+}
+
+/// One text of the catalogue carrying a given article number
+/// (`suggest_articles`). `num` is that text's spelling, `num_key` the key the
+/// composite filter holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArticleCandidate {
+    pub text_uid: String,
+    pub num_key: String,
+    pub num: String,
+    pub title: String,
+    pub slug: Option<String>,
 }
 
 /// Issue d'une résolution de nom de texte (`resolve_instrument`). `Rattrape`
@@ -469,12 +650,17 @@ pub struct InstrumentCandidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstrumentResolution {
     /// Le slug demandé est au catalogue, tel quel ou par alias d'usage.
-    Direct { slug: String, text_uid: String },
+    Direct {
+        slug: String,
+        text_uid: String,
+        jurisdiction: String,
+    },
     /// Un candidat unique porte le texte demandé, sous une autre graphie.
     Rattrape {
         slug: String,
         text_uid: String,
-        regle: lj_core::instrument_match::Rule,
+        jurisdiction: String,
+        regle: lj_norm::instrument_match::Rule,
     },
     /// Aucune cible unique : les candidats partent dans l'erreur corrective.
     Inconnu {
@@ -483,7 +669,7 @@ pub enum InstrumentResolution {
 }
 
 /// Une entrée de la table des matières d'un code : version en vigueur par
-/// `num_key`, sans corps (clic = navigation `/texte/{slug}/{num}`).
+/// `num_key`, sans corps (clic = navigation `/norm/{juris}/{slug}/{num}`).
 /// `position` = ordre de lecture réel (≠ tri lexical).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TocArticleRow {
@@ -497,7 +683,7 @@ pub struct TocArticleRow {
 }
 
 /// Un article voisin pour le contexte de lecture : numéro + état, sans corps
-/// (clic = navigation `/texte/{slug}/{num}`). `current` marque l'article de la
+/// (clic = navigation `/norm/{juris}/{slug}/{num}`). `current` marque l'article de la
 /// page courante.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArticleNeighborRow {
@@ -524,6 +710,7 @@ pub struct LawCodeSummaryRow {
     pub text_uid: String,
     pub slug: Option<String>,
     pub title: String,
+    pub jurisdiction: String,
     pub nature: String,
     pub last_modified: Option<String>,
     pub article_count: i64,
@@ -571,23 +758,20 @@ pub struct CitationOccurrenceRow {
 /// 2000-1093 …` → `2000-1093`, `None` si non numéroté).
 pub type LegalTextMeta = (String, Option<String>, Option<String>);
 
-/// Hubs de crawl pour les sitemaps : par clé de hub (code juridiction, fond),
-/// les buckets `(année, nombre de pages de listing)`.
-pub type JurisdictionHubPages = Vec<(String, Vec<(i32, i64)>)>;
+/// Crawl hubs for the sitemaps: per (jurisdiction type, code) or
+/// (jurisdiction, fond), the buckets `(year, listing page count)`.
+pub type JurisdictionHubPages = Vec<(String, String, Vec<(i32, i64)>)>;
 /// Le pendant côté normes, dont le bucket est un token (`2026`, `sans-date`).
-pub type NormHubPages = Vec<(String, Vec<(String, i64)>)>;
+pub type NormHubPages = Vec<(String, String, Vec<(String, i64)>)>;
 
 /// Champs structurés extraits d'une décision, prêts à persister. Construits à
-/// l'ingest (`lj_ingest::extract`).
+/// l'ingest (`lj_extract_rows`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtractedFields {
     pub date_lecture: Option<NaiveDate>,
     pub date_audience: Option<NaiveDate>,
     pub docket_numbers: Vec<String>,
-    /// Formation structurée : clé canonique du siège
-    /// ([`lj_core::chamber::Seat`]) + uid référentiel `formation:*`
-    /// (FK `facet_value`).
-    pub chamber_key: Option<String>,
+    /// Referential uid `formation:*` (FK `facet_value`).
     pub formation_uid: Option<String>,
     /// Column `decisions.seat` (jsonb): what the source wrote, never resolved,
     /// the resolution reaching only the paths derived from it.
@@ -668,16 +852,15 @@ pub struct DecisionPartyRow {
     pub char_ends: Vec<i32>,
 }
 
-/// Ligne `case_citation` prête à écrire : span (offsets codepoints, token
-/// identifiant) + clé pendante par famille (`cc|1823954`, `cjue|c-561/19`,
-/// `rg|{jurisdiction_code}|21/04532`, `af|{jurisdiction_code}|1906041` fond
-/// administratif TA/CAA…). Livrées par décision TRIÉES par `char_start`, sans
-/// chevauchement — la PK `(decision_id, char_start)` en dépend.
+/// A `case_citation` row ready to write: span (codepoint offsets, identifying
+/// token) + address of the cited decision. Delivered per decision SORTED by
+/// `char_start` and without overlap, which the PK `(decision_id, char_start)`
+/// depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaseCitationRow {
     pub char_start: i32,
     pub char_end: i32,
-    pub target_ref: String,
+    pub address: CaseAddress,
 }
 
 /// Ligne `text_case_citation` : un texte/article du référentiel cite une
@@ -689,8 +872,7 @@ pub struct TextCaseCitationRow {
     pub owner_date_debut: Option<NaiveDate>,
     pub char_start: i32,
     pub char_end: i32,
-    /// Clé pendante par famille, même format que `case_citation`.
-    pub target_ref: String,
+    pub address: CaseAddress,
 }
 
 /// Ligne `text_legal_citation` : un texte/article du référentiel renvoie à un
@@ -717,23 +899,23 @@ pub struct ArticleCitationSpanRow {
     pub ref_slug: Option<String>,
     pub ref_num_key: Option<String>,
     pub ref_title: String,
+    pub ref_jurisdiction: String,
     /// La fiche cible est lisible — ≥ 1 article, ou un corps monolithique
     /// (circulaires, traités/TI, BOFiP) : gate du lien « mention nue » vers
-    /// `/texte/{slug}`.
+    /// `/norm/{juris}/{slug}`.
     pub ref_readable: bool,
 }
 
-/// Ligne `decision_links` prête à écrire : type de lien + clé pendante
-/// `canonical_ref` de la décision attaquée. Miroir store de
-/// `lj_extract::chrono::PriorRef`.
+/// Ligne `decision_links` prête à écrire : type de lien + adresse de la
+/// décision attaquée. Miroir store de `lj_extract::chrono::PriorRef`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecisionLinkRow {
     /// `APPEL_DE` | `POURVOI_CONTRE` | `RENVOI_APRES_CASSATION`.
     pub link_type: String,
-    pub target_ref: String,
+    pub address: CaseAddress,
 }
 
-/// Une juridiction du catalogue hub `/juridictions` : ligne du référentiel +
+/// Une juridiction du catalogue hub `/decision-index/{juris}` : ligne du référentiel +
 /// volume de décisions actives.
 #[derive(Debug, Clone)]
 pub struct JurisdictionHubRow {
@@ -758,6 +940,7 @@ pub struct HubDecisionRow {
 pub struct NormTextRow {
     pub slug: String,
     pub title: String,
+    pub jurisdiction: String,
     /// Date de parcours (`date_texte` valide, sinon `date_publi` valide) —
     /// absente sur les pages « sans date ».
     pub date: Option<String>,
@@ -774,14 +957,6 @@ pub struct JurisdictionRow {
     pub jurisdiction_type: String,
     pub city: Option<String>,
     pub label: String,
-}
-
-/// Ligne du référentiel `chamber` : une chambre sous sa cour. Le libellé n'y
-/// est pas stocké, c'est une fonction pure des deux autres colonnes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChamberRow {
-    pub jurisdiction_code: String,
-    pub chamber_key: String,
 }
 
 /// Ligne du référentiel `facet_value` : uid namespacé (`solution:REJET`…),
@@ -846,15 +1021,6 @@ pub struct EntityJurisdictionCountRow {
     pub count: i64,
 }
 
-/// Un conseil (avocat/cabinet) co-occurrent d'une entité : verbatim extrait +
-/// uid registre résolu si le conseil l'est lui-même.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntityCounselRow {
-    pub value: String,
-    pub entity_uid: Option<String>,
-    pub count: i64,
-}
-
 /// Une décision citant l'entité (liste paginée) : id interne pour
 /// l'hydratation `SearchHit` côté `lj-api` + côté et qualité représentatifs de
 /// l'entité dans cette décision (pick stable par priorité `party` > `law_firm` >
@@ -901,7 +1067,7 @@ pub struct BulkDecisionWrite {
     pub public_id: String,
     pub decision: Decision,
     pub content_checksum: String,
-    /// `canonical_ref` calculé à l'ingest (`lj_ingest::extract`), passé à l'upsert.
+    /// `canonical_ref` calculé à l'ingest (`lj_extract_rows`), passé à l'upsert.
     pub canonical_ref: Option<String>,
     pub write_mode: String,
     pub chunks: Vec<ChunkWrite>,
@@ -913,4 +1079,53 @@ pub struct BulkDecisionWrite {
     pub source_fields: Value,
     /// Version chunk+embed des chunks écrits (`None` = écrits sans embeddings).
     pub embed_version: Option<i16>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Codes are found through their articles, laws through their body too.
+    fn place(entries: &[(&str, &[&str])]) -> BTreeMap<String, PlaceFilter> {
+        entries
+            .iter()
+            .map(|(j, texts)| {
+                let filter = PlaceFilter {
+                    articles: uids(texts),
+                    bodies: uids(texts)
+                        .into_iter()
+                        .filter(|t| t.starts_with("loi-"))
+                        .collect(),
+                };
+                (j.to_string(), filter)
+            })
+            .collect()
+    }
+
+    fn uids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_text_is_dropped_when_every_place_of_its_jurisdiction_rules_it_out() {
+        // The metropole rules out a Mayotte code and a Caledonian one, Mayotte
+        // the Caledonian code and an Alsatian law; Polynesia rules out the
+        // labour code, New Caledonia the tax code too. A statute is ruled out
+        // by neither: it reaches them on mention, and names them nowhere.
+        let metropole = place(&[("FR", &["code-yt", "code-nc"]), ("UE", &[])]);
+        let mayotte = place(&[("FR", &["code-nc", "loi-als"]), ("UE", &[])]);
+        let polynesie = place(&[("FR", &["code-travail"]), ("PF", &[])]);
+        let caledonie = place(&[("FR", &["code-travail", "cgi"]), ("NC", &[])]);
+
+        let articles =
+            |places: &[&BTreeMap<String, PlaceFilter>]| PlaceFilter::union(places).articles;
+        assert_eq!(articles(&[&metropole]), uids(&["code-nc", "code-yt"]));
+        assert_eq!(articles(&[&metropole, &mayotte]), uids(&["code-nc"]));
+        assert!(articles(&[&metropole, &polynesie]).is_empty());
+        assert_eq!(articles(&[&polynesie, &caledonie]), uids(&["code-travail"]));
+        assert_eq!(PlaceFilter::union(&[&mayotte]).bodies, uids(&["loi-als"]));
+        assert!(PlaceFilter::union(&[&metropole, &mayotte])
+            .bodies
+            .is_empty());
+    }
 }

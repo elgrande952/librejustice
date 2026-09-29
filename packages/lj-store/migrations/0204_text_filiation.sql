@@ -1,20 +1,7 @@
--- Migration 0204 — Filiation entre textes : copie datée, jamais pointeur.
---
--- Un code reçu naît d'un code parent à une date, par un acte de réception,
--- puis diverge sans fusionner. Aucun événement du parent postérieur au fork
--- n'atteint l'enfant (la renumérotation française de 2016 n'a pas déplacé
--- l'article 1382 belge). La restitution se calcule en LECTURE : les versions
--- du parent antérieures à `fork_date` complètent la timeline de l'enfant,
--- labellisées « héritées » — uniquement si `num_compatible` (Haïti renumérote,
--- FR 1382 = HT 1168 : la fusion y attend une concordance par empreinte).
---
--- FKs vers legal_text bienvenues ici : `text_uid` n'est jamais réécrit en
--- masse, contrairement à `num_key`.
-
 CREATE TABLE text_filiation (
     child_text_uid  text NOT NULL REFERENCES legal_text(text_uid) ON DELETE CASCADE,
     parent_text_uid text NOT NULL REFERENCES legal_text(text_uid) ON DELETE CASCADE,
-    fork_date       date,          -- NULL = filiation établie, date non vérifiée
+    fork_date       date,
     num_compatible  boolean NOT NULL,
     reception_act   text,
     note            text,
@@ -24,11 +11,6 @@ CREATE TABLE text_filiation (
 
 CREATE INDEX text_filiation_parent_idx ON text_filiation (parent_text_uid);
 
--- Arêtes vérifiées par source primaire (rapport des forks). Les
--- réceptions non vérifiées (CI, ML, BJ, BF, CF, GA, SN colonial) et le
--- Burundi (petit-fils via le décret belgo-congolais de 1888, absent de la
--- base) attendent leur source — une date fausse restituerait à une branche
--- un passé qui n'est pas le sien.
 INSERT INTO text_filiation (child_text_uid, parent_text_uid, fork_date, num_compatible, reception_act, note) VALUES
     ('BE/CODE-CIVIL', 'LEGITEXT000006070721', '1815-06-09', true,
      'Loi du 9 vendémiaire an IV (annexion) ; code du 21 mars 1804',

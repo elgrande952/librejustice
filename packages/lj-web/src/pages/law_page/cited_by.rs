@@ -10,10 +10,10 @@
 
 use leptos::prelude::*;
 use leptos_router::components::A;
-use leptos_router::params::ParamsMap;
 use lj_dtos::{CitingDecisionHit, LinkedTextRef, SectionCitingText};
 
 use super::data::CitingResult;
+use crate::helpers::decisions_href;
 
 /// Intertitre de sous-bloc : petites capitales trackées du registre discret.
 const SUBTITLE: &str = "text-xs uppercase tracking-[0.16em] text-[var(--color-ink-subtle)]";
@@ -87,8 +87,8 @@ pub(crate) fn CitedBySection(
 ) -> impl IntoView {
     let subject = CitedBySubject {
         name: "cet article",
-        all_href: decisions_href("legalArticle", [format!("{code}|{num_key}")]),
-        search_href: decisions_href("q", [search_query]),
+        all_href: decisions_href([("legalArticle", format!("{code}|{num_key}"))]),
+        search_href: decisions_href([("q", search_query)]),
     };
     let texts: Vec<CitedText> = texts.into_iter().map(CitedText::from).collect();
     view! {
@@ -227,19 +227,6 @@ fn cited_articles_line(cited: &[String], articles: &[(String, String)]) -> Optio
     }
 }
 
-/// `/decisions?{key}={valeur}…`, les valeurs encodées par `ParamsMap` — une
-/// facette à plusieurs valeurs répète sa clé.
-pub(crate) fn decisions_href(
-    key: &'static str,
-    values: impl IntoIterator<Item = String>,
-) -> String {
-    let mut qs = ParamsMap::new();
-    for value in values {
-        qs.insert(key, value);
-    }
-    format!("/decisions{}", qs.to_query_string())
-}
-
 /// Une décision citante : titre lié (hover card), première phrase du résumé,
 /// articles de la division qu'elle cite, badge de portée.
 ///
@@ -252,7 +239,7 @@ pub(crate) fn decisions_href(
 pub(crate) fn CitedDecisionRow(hit: CitingDecisionHit, cited: Option<String>) -> impl IntoView {
     use crate::components::hover_preview::{HoverPreview, PreviewKind};
     let kind = PreviewKind::Decision { id: hit.id.clone() };
-    let href = format!("/decision/{}", hit.id);
+    let href = lj_dtos::decision_path(hit.jurisdiction_type, &hit.id);
     let badge = crate::pages::decision_page::labels::publication_badge(&hit.publication_codes)
         .map(|label| {
             view! {

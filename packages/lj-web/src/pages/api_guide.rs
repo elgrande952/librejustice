@@ -26,20 +26,20 @@ const ROUTES: [(&str, &str); 7] = [
         "Une décision entière, avec son texte et ses métadonnées.",
     ),
     (
-        "GET /api/texte/{code}",
-        "Un texte sans articles rend son corps ; un texte qui en porte rend son sommaire. Le code se nomme par son slug, son nom ou son sigle.",
+        "GET /api/norm/{juridiction}/{code}",
+        "Un texte sans articles rend son corps ; un texte qui en porte rend son sommaire. La juridiction est son code ISO en minuscules (`fr`, `be`, `eu`) ; le code se nomme par son slug, son nom ou son sigle.",
     ),
     (
-        "GET /api/texte/{code}/section/{cid}",
-        "Une division du texte et ses articles, telle que le sommaire l'adresse.",
-    ),
-    (
-        "GET /api/texte/{code}/{article}",
+        "GET /api/norm/{juridiction}/{code}/{article}",
         "Un article dans sa version en vigueur, ou telle qu'elle était au jour passé en `date`.",
     ),
     (
+        "GET /api/norm/{juridiction}/{code}/{chemin}",
+        "Une division du texte et ses articles, nommée par le chemin que porte le sommaire (`livre-i/titre-v`).",
+    ),
+    (
         "GET /api/article/{LEGIARTI…}",
-        "Le même article, adressé par son identifiant Légifrance.",
+        "Le même article, adressé par son identifiant Légifrance, qui peut aussi désigner un texte ou une section.",
     ),
 ];
 
@@ -119,7 +119,7 @@ pub fn ApiGuide() -> impl IntoView {
                 </div>
                 <p class="text-sm leading-relaxed text-[var(--color-ink-muted)]">
                     "Le contrat complet, paramètres et réponses, se lit en OpenAPI : "
-                    <a href="/openapi.json" class=LIEN>
+                    <a href="/openapi.json" rel="external" class=LIEN>
                         "openapi.json"
                     </a>
                     ". Si votre usage demande autre chose, "

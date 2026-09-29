@@ -10,6 +10,11 @@ pub enum StoreError {
         "migration {version:04}: la base contient des versions absentes sur disque: {missing:?}"
     )]
     UnknownMigrations { version: i32, missing: Vec<i32> },
+    #[error(
+        "schéma en retard de {} migration(s) ({pending:?}) : lancez `lj-ingest migrate`, seule commande qui applique",
+        pending.len()
+    )]
+    PendingMigrations { pending: Vec<i32> },
     #[error("invalid: {0}")]
     Invalid(String),
 }

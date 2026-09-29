@@ -9,5 +9,6 @@ license.workspace = true
 # Noyau léger serde-pur partagé backend ↔ front wasm : aucune dépendance
 # lourde, compile en `wasm32-unknown-unknown`.
 [dependencies]
+lj-vocab = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

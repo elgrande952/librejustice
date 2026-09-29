@@ -9,9 +9,9 @@
 
 use lj_dtos::{
     AnnuaireCategorieStatsDto, AnnuaireStatsResponse, DecisionPartiesResponse, DecisionPartyDto,
-    EntityCounselDto, EntityDecisionHitDto, EntityDecisionsResponse, EntityDenominationDto,
-    EntityDirectoryItemDto, EntityDirectoryResponse, EntityHeaderDto, EntityKeyCountDto,
-    EntityPageResponse, EntitySearchResponse, EntityStatsDto, EntityYearCountDto,
+    EntityDecisionHitDto, EntityDecisionsResponse, EntityDenominationDto, EntityDirectoryItemDto,
+    EntityDirectoryResponse, EntityHeaderDto, EntityKeyCountDto, EntityPageResponse,
+    EntitySearchResponse, EntityStatsDto, EntityYearCountDto,
 };
 use lj_store::repository::{DecisionRepository, EntityDirectoryRow, EntityJurisdictionCountRow};
 use std::collections::HashMap;
@@ -23,7 +23,11 @@ use crate::state::AppState;
 
 /// Uid namespacé depuis les segments d'URL (`{ns}` / `{id}` → `ns:id`).
 fn build_uid(ns: &str, id: &str) -> String {
-    format!("{ns}:{id}")
+    match ns {
+        // A name-derived uid answers to its accented spelling too.
+        "cnb" | "oacc" => format!("{ns}:{}", lj_fold::fold_chars(id)),
+        _ => format!("{ns}:{id}"),
+    }
 }
 
 /// Libellé d'affichage de la `forme` d'une entité : code catégorie juridique
@@ -64,9 +68,6 @@ fn jurisdiction_label(row: &EntityJurisdictionCountRow, refs: &Referential) -> (
     }
 }
 
-/// Nombre max de conseils co-occurrents affichés sur la fiche.
-const TOP_COUNSEL_LIMIT: i64 = 10;
-
 /// Fiche entité (`GET /entity/{ns}/{id}`) : en-tête registre + agrégats
 /// contentieux. `None` amont (uid inconnu) → 404.
 #[instrument(skip(state), fields(db.system = "postgresql", uid = %build_uid(ns, id)))]
@@ -81,7 +82,6 @@ pub async fn entity_page(state: &AppState, ns: &str, id: &str) -> Result<EntityP
     let counts = repo.entity_contentieux_counts(&uid).await?;
     let by_year = repo.entity_by_year(&uid).await?;
     let by_jurisdiction = repo.entity_by_jurisdiction(&uid).await?;
-    let top_counsel = repo.entity_top_counsel(&uid, TOP_COUNSEL_LIMIT).await?;
 
     let namespace = uid
         .split_once(':')
@@ -127,14 +127,6 @@ pub async fn entity_page(state: &AppState, ns: &str, id: &str) -> Result<EntityP
                     label,
                     count: row.count,
                 }
-            })
-            .collect(),
-        top_counsel: top_counsel
-            .into_iter()
-            .map(|c| EntityCounselDto {
-                uid: c.entity_uid,
-                name: c.value,
-                count: c.count,
             })
             .collect(),
     };
@@ -241,15 +233,35 @@ pub fn kind_to_category(kind: &str) -> Option<&'static str> {
     }
 }
 
-/// Plie une requête de recherche du MÊME fold que
-/// `entity_contentieux.denomination_folded` (fold_stable + blancs réduits),
-/// neutralise les wildcards LIKE et suffixe `%` : préfixe prêt pour
-/// `LIKE $1 ESCAPE '\'`.
+/// Natural persons: an account is required to reach them, and they are never listed.
+const NATURAL_PERSON_CATEGORIES: &[&str] = &["avocats"];
+
+/// Exact complement of [`NATURAL_PERSON_CATEGORIES`] over the `kind_to_category` image.
+const PUBLIC_CATEGORIES: &[&str] = &[
+    "entreprises",
+    "personnes_publiques",
+    "associations",
+    "cabinets",
+];
+
+pub fn names_natural_persons(category: &str) -> bool {
+    NATURAL_PERSON_CATEGORIES.contains(&category)
+}
+
+/// Categories a search is allowed to read. `None` = no restriction.
+fn search_scope(category: Option<&str>, authenticated: bool) -> Option<Vec<&str>> {
+    match (category, authenticated) {
+        (Some(c), _) => Some(vec![c]),
+        (None, true) => None,
+        (None, false) => Some(PUBLIC_CATEGORIES.to_vec()),
+    }
+}
+
+/// Folds a search query like the `lj_fold(denomination)` expression of the
+/// `entity` indexes, escapes the LIKE wildcards and appends `%`: a prefix ready
+/// for `LIKE $1 ESCAPE '\'`.
 fn fold_search_prefix(q: &str) -> String {
-    let folded = lj_core::text::fold_stable(q)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let folded = lj_fold::fold(q);
     let mut escaped = String::with_capacity(folded.len() + 1);
     for c in folded.chars() {
         if matches!(c, '\\' | '%' | '_') {
@@ -274,35 +286,41 @@ fn directory_item(row: EntityDirectoryRow) -> EntityDirectoryItemDto {
     }
 }
 
-/// Recherche d'entités (`GET /entities/search`) : préfixe de dénomination sur
-/// le registre complet, filtre `kind` optionnel (déjà mappé en catégorie), tri
-/// contentieux décroissant. `q` est déjà validé (≥ 2 codepoints), `limit` borné
-/// par la route.
+/// Entity search (`GET /entities/search`): denomination prefix over the whole
+/// registry, optional `category` narrowing, contentious volume first. `q` and
+/// `limit` are validated by the route.
+///
+/// `authenticated` decides the scope when no category is asked for: an anonymous
+/// caller searches [`PUBLIC_CATEGORIES`] only, so no unnamed search ever surfaces
+/// a natural person. An explicit natural-person `category` is refused upstream.
 #[instrument(skip(state), fields(db.system = "postgresql"))]
 pub async fn entity_search(
     state: &AppState,
     q: &str,
     category: Option<&str>,
+    authenticated: bool,
     limit: i64,
 ) -> Result<EntitySearchResponse> {
     let conn = state.pool.get().await?;
     let repo = DecisionRepository::new(&conn);
 
+    let scope = search_scope(category, authenticated);
     let folded_like = fold_search_prefix(q);
-    let rows = repo.entity_search(&folded_like, category, limit).await?;
+    let rows = repo
+        .entity_search(&folded_like, scope.as_deref(), limit)
+        .await?;
     Ok(EntitySearchResponse {
         items: rows.into_iter().map(directory_item).collect(),
     })
 }
 
-/// Listing paginé d'une catégorie de l'annuaire (`GET /entities/directory`),
-/// filtre barreau optionnel. `category`/`page`/`page_size` déjà validés par la
-/// route ; `page` 1-basé.
+/// Paginated listing of one directory category (`GET /entities/directory`).
+/// `category`, `page` and `page_size` are validated by the route, which also
+/// refuses a natural-person category; `page` is 1-based.
 #[instrument(skip(state), fields(db.system = "postgresql"))]
 pub async fn entity_directory(
     state: &AppState,
     category: &str,
-    barreau: Option<&str>,
     page: i64,
     page_size: i64,
 ) -> Result<EntityDirectoryResponse> {
@@ -310,9 +328,7 @@ pub async fn entity_directory(
     let repo = DecisionRepository::new(&conn);
 
     let offset = (page - 1) * page_size;
-    let (total, contentieux, rows) = repo
-        .entity_directory(category, barreau, page_size, offset)
-        .await?;
+    let (total, contentieux, rows) = repo.entity_directory(category, page_size, offset).await?;
     Ok(EntityDirectoryResponse {
         total,
         contentieux,
@@ -345,4 +361,47 @@ pub async fn annuaire_stats(state: &AppState) -> Result<AnnuaireStatsResponse> {
         };
     }
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every slug `kind_to_category` answers on, so the tests below range over the
+    /// whole image and not over a list that could drift from it.
+    const KIND_SLUGS: [&str; 5] = [
+        "entreprises",
+        "personnes-publiques",
+        "associations",
+        "avocats",
+        "cabinets",
+    ];
+
+    #[test]
+    fn an_anonymous_search_reaches_no_natural_person() {
+        let scope = search_scope(None, false).expect("anonymous search is bounded");
+        assert!(!scope.iter().any(|c| names_natural_persons(c)));
+    }
+
+    #[test]
+    fn public_categories_are_the_exact_complement() {
+        for slug in KIND_SLUGS {
+            let category = kind_to_category(slug).expect("known slug");
+            assert_eq!(
+                PUBLIC_CATEGORIES.contains(&category),
+                !names_natural_persons(category),
+                "{category} sits in neither list or in both"
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_lifts_the_category_bound() {
+        assert!(search_scope(None, true).is_none());
+    }
+
+    #[test]
+    fn an_asked_category_is_honoured_as_asked() {
+        assert_eq!(search_scope(Some("avocats"), true), Some(vec!["avocats"]));
+    }
 }

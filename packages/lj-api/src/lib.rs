@@ -1,6 +1,6 @@
 //! `lj-api` — serveur API mono-serveur.
 //!
-//! Axum + tokio-postgres/deadpool + pgvector. Endpoint MCP (rmcp). Auth OAuth +
+//! Axum + tokio-postgres/deadpool + pgvector. Endpoint MCP. Auth OAuth +
 //! JWT. Télémétrie tracing + OTel. Les DTOs viennent de `lj-dtos` (source de
 //! vérité partagée avec le front).
 
@@ -16,13 +16,11 @@ pub mod cache;
 pub mod cache_metrics;
 pub mod chronology;
 pub mod config;
-pub mod decision_views;
 pub mod decisions;
 pub mod embedder;
 pub mod entities;
 pub mod error;
 pub mod host_metrics;
-pub mod identity;
 pub mod jurisdiction_hubs;
 pub mod legi;
 pub mod locale;
@@ -33,18 +31,18 @@ pub mod me;
 pub mod norm_hubs;
 pub mod oauth;
 pub mod oidc_auth;
+pub mod oidc_keys;
 pub mod page_gates;
 pub mod pdf_export;
 pub mod pg_metrics;
 pub mod ratelimit;
-pub mod redirect;
+pub mod reads;
 pub mod referential;
 pub mod registre;
 pub mod rerank;
 pub mod robots;
 pub mod routes;
 pub mod search;
-pub mod search_history;
 pub mod session;
 pub mod signals;
 pub mod sitemap;
@@ -54,6 +52,7 @@ pub mod stats;
 pub mod support;
 pub mod telemetry;
 pub mod titles;
+pub mod typed_cache;
 pub mod usage;
 
 #[cfg(test)]

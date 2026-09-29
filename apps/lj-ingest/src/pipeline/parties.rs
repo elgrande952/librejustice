@@ -19,10 +19,9 @@ use lj_store::repository::{DecisionPartyRow, DecisionRepository};
 /// Décisions lues par lot (keyset id).
 const READ_BATCH: i64 = 1_000;
 
-/// (colonne, qualité, côté) : l'ordre définit `ord` intra-décision, avec les
-/// deux cellules de personne physique intercalées comme au fil de l'eau
-/// (`lj_ingest::extract`). La colonne `intervenors` est gatée : pas d'émission
-/// relation en prod.
+/// (column, capacity, side): the order sets `ord` within a decision, with the two
+/// natural-person cells interleaved as in the daily flow (`lj_extract_rows`).
+/// The `intervenors` column is gated: no relation emitted in prod.
 const COLUMNS: &[(&str, &str, Option<&str>)] = &[
     ("applicant_companies", "party", Some("applicant")),
     ("defendant_companies", "party", Some("defendant")),
@@ -57,7 +56,7 @@ pub async fn reconcile_parties(workers: Option<usize>) -> Result<()> {
     let pool = lj_store::db::build_pool(&settings.db_url, workers + 1)
         .map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     conn.batch_execute("SET statement_timeout = 0").await?;
@@ -67,9 +66,9 @@ pub async fn reconcile_parties(workers: Option<usize>) -> Result<()> {
     // matérialise en DELETE.
     let ids: Vec<i64> = conn
         .query(
-            "SELECT id FROM decisions WHERE full_text IS NOT NULL AND deleted_at IS NULL \
+            "SELECT decision_id FROM decision_text WHERE lead AND deleted_at IS NULL \
              UNION SELECT DISTINCT decision_id FROM decision_party \
-             ORDER BY id",
+             ORDER BY 1",
             &[],
         )
         .await?
@@ -78,7 +77,7 @@ pub async fn reconcile_parties(workers: Option<usize>) -> Result<()> {
         .collect();
     drop(conn);
     let total = ids.len();
-    tracing::info!(total, workers, "parties-reconcile : worklist construite");
+    tracing::info!(total, workers, "parties-reconcile: worklist built");
     if ids.is_empty() {
         return Ok(());
     }
@@ -98,7 +97,7 @@ pub async fn reconcile_parties(workers: Option<usize>) -> Result<()> {
         total,
         rewritten,
         elapsed_s = started.elapsed().as_secs(),
-        "parties-reconcile : dérive résorbée"
+        "parties-reconcile: drift absorbed"
     );
     println!(
         "parties-reconcile : {total} décisions examinées, {rewritten} réécrites \
@@ -127,8 +126,11 @@ async fn reconcile_worker(
         .map(|(c, _, _)| *c)
         .collect::<Vec<_>>()
         .join(", ");
-    let query =
-        format!("SELECT id, full_text, {cols} FROM decisions WHERE id = ANY($1) ORDER BY id");
+    let query = format!(
+        "SELECT d.id, dt.full_text, {cols} FROM decisions d \
+         LEFT JOIN decision_text dt ON dt.decision_id = d.id AND dt.lead \
+         WHERE d.id = ANY($1) ORDER BY d.id"
+    );
 
     for batch in slice.chunks(READ_BATCH as usize) {
         let batch = batch.to_vec();
@@ -160,16 +162,16 @@ async fn reconcile_worker(
             tracing::info!(
                 decisions = done,
                 rewritten = rewritten.load(Ordering::Relaxed),
-                "parties-reconcile : progression"
+                "parties-reconcile: progress"
             );
         }
     }
     Ok(())
 }
 
-/// Lignes acteur d'une décision, du texte à la relation : mêmes cellules et
-/// même ordre que le fil de l'eau (`lj_ingest::extract`), un seul endroit qui
-/// porte la dérivation. `intervenors` est gatée : pas d'émission relation.
+/// Actor rows of a decision, from text to relation: same cells and same order as
+/// the daily flow (`lj_extract_rows`), one place carrying the derivation.
+/// `intervenors` is gated: no relation emitted.
 fn actor_rows(full_text: &str, plates: &[Vec<String>]) -> Vec<DecisionPartyRow> {
     use lj_extract::parties::Cell;
     if full_text.is_empty() {
@@ -186,7 +188,7 @@ fn actor_rows(full_text: &str, plates: &[Vec<String>]) -> Vec<DecisionPartyRow> 
             cells.push(Cell::physique("party", Some("defendant"), &di));
         }
     }
-    lj_extract::parties::actor_rows_folded(scan.folded(), &cells)
+    lj_extract::parties::actor_rows_scanned(&scan, &cells)
         .into_iter()
         .map(|r| DecisionPartyRow {
             quality: r.quality.to_string(),
@@ -214,7 +216,7 @@ pub async fn relink_parties(full: bool) -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 2).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     relink_with(&DecisionRepository::new(&conn), full).await
@@ -235,7 +237,7 @@ pub(crate) async fn relink_with(repo: &DecisionRepository<'_>, full: bool) -> Re
         rna,
         cnb,
         oacc,
-        "parties : résolution"
+        "parties: resolution"
     );
     println!(
         "decision_party : {total} lignes, {resolved} résolues \
@@ -245,7 +247,7 @@ pub(crate) async fn relink_with(repo: &DecisionRepository<'_>, full: bool) -> Re
     // fraîchement résolue : `decision_count` et `annuaire_registre` reflètent
     // l'état des liens de cette passe.
     let annuaire = repo.refresh_annuaire().await?;
-    tracing::info!(annuaire, "annuaire : compteurs rafraîchis");
-    println!("annuaire : {annuaire} entités avec contentieux.");
+    tracing::info!(annuaire, "annuaire: counters refreshed");
+    println!("annuaire: {annuaire} entities with litigation.");
     Ok(())
 }

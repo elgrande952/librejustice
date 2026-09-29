@@ -15,7 +15,7 @@ use crate::config::Settings;
 
 use super::batch::{drain_batch, drain_batch_in_txn, run_stream};
 use super::embed::{build_embedder, build_local_strict};
-use super::files::{collect_jsonl_gz, collect_zip_paths, read_jsonl_gz_lines};
+use super::files::{collect_jsonl_gz, collect_zip_paths};
 use super::prepare::{classify_judilibre, classify_xml};
 use super::{Candidate, IngestCounts, IngestMode};
 
@@ -33,7 +33,7 @@ pub async fn ingest_opendata(
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     // Connexion dédiée aux écritures : la phase amont du lot suivant (lecture
@@ -48,7 +48,7 @@ pub async fn ingest_opendata(
 
     let zip_paths = collect_zip_paths(data_dir)?;
     if zip_paths.is_empty() {
-        tracing::info!(dir = %data_dir.display(), "aucun ZIP opendata trouvé");
+        tracing::info!(dir = %data_dir.display(), "no opendata ZIP found");
         return Ok(());
     }
 
@@ -199,7 +199,7 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let write_conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
@@ -210,7 +210,7 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
         .into_iter()
         .collect();
     if targets.is_empty() {
-        tracing::info!("reingest_stale_opendata : aucune cible (rien à flipper)");
+        tracing::info!("reingest_stale_opendata: no target (nothing to flip)");
         return Ok(());
     }
 
@@ -232,7 +232,7 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
     tracing::info!(
         targets = targets.len(),
         zips = zip_paths.len(),
-        "reingest_stale_opendata : début"
+        "reingest_stale_opendata: start"
     );
     let mut total = IngestCounts::default();
     for zip_path in &zip_paths {
@@ -262,7 +262,7 @@ pub async fn reingest_stale_opendata(data_dir: &Path) -> Result<()> {
         updated = total.updated,
         errors = total.errors,
         chunks = total.chunks_created,
-        "reingest_stale_opendata : terminé"
+        "reingest_stale_opendata: done"
     );
     Ok(())
 }
@@ -280,7 +280,7 @@ pub async fn ingest_judilibre(
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
 
@@ -299,7 +299,7 @@ pub async fn ingest_judilibre(
 
     let files = collect_jsonl_gz(data_dir)?;
     if files.is_empty() {
-        tracing::info!(dir = %data_dir.display(), "aucun fichier Judilibre trouvé");
+        tracing::info!(dir = %data_dir.display(), "no Judilibre file found");
         return Ok(());
     }
 
@@ -354,7 +354,7 @@ pub async fn ingest_judilibre(
             _ => 0,
         };
 
-        let lines = read_jsonl_gz_lines(path)?;
+        let lines = lj_sources::downloader::read_jsonl_gz_lines(path)?;
         let lines_total = lines.len();
         if skip_first_lines > 0 {
             tracing::info!(
@@ -385,7 +385,7 @@ pub async fn ingest_judilibre(
                         }
                         Ok(None) => counts.errors += 1,
                         Err(e) => {
-                            tracing::error!(source = %source, error = %e, "parse Judilibre échec");
+                            tracing::error!(source = %source, error = %e, "Judilibre parse failed");
                             counts.errors += 1;
                         }
                     }
@@ -455,7 +455,7 @@ pub async fn refetch_judilibre(
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
 
@@ -477,7 +477,7 @@ pub async fn refetch_judilibre(
                 tracing::info!(id = %id, uid = %candidate.decision.source_uid, "refetch_judilibre_fetched");
                 candidates.push(candidate);
             }
-            None => tracing::warn!(id = %id, "refetch: décision non reconnue, skip"),
+            None => tracing::warn!(id = %id, "refetch: decision not recognised, skip"),
         }
     }
 
@@ -523,7 +523,7 @@ pub(super) async fn refetch_into<E: Embedder>(
         let line = serde_json::to_vec(&payload).context("refetch: sérialisation payload")?;
         match classify_judilibre(line)? {
             Some(candidate) => candidates.push(candidate),
-            None => tracing::warn!(id = %id, "refetch: décision non reconnue, skip"),
+            None => tracing::warn!(id = %id, "refetch: decision not recognised, skip"),
         }
     }
     if candidates.is_empty() {

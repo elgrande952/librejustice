@@ -42,7 +42,7 @@ pub async fn run(revue: Option<i64>) -> Result<()> {
 /// colonne `second` porte la décision plus que le support.
 async fn relire(repo: &DecisionRepository<'_>, genre: &str, limite: i64) -> Result<()> {
     let lignes = repo.alias_candidates_revue(genre, limite).await?;
-    println!("cle\tsurnom\tcible\tdate\tsupport\tsecond\tau_fonds");
+    println!("key\tnickname\ttarget\tdate\tsupport\tsecond\tin_corpus");
     for l in &lignes {
         let date = l.target_date.map(|d| d.to_string()).unwrap_or_default();
         let fonds = match l.decision_id {

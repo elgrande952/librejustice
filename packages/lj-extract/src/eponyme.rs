@@ -8,9 +8,10 @@
 
 use std::sync::LazyLock;
 
-use lj_core::annonces::parse_date_fr;
 use lj_core::case_names::case_name_key;
-use lj_core::text::{fold, normalize_spaces};
+use lj_core::dates::parse_date_fr;
+use lj_core::text::normalize_spaces;
+use lj_fold::fold;
 use regex::Regex;
 
 /// Citation portée par un renvoi. `dockets` est vide quand le renvoi ne donne que

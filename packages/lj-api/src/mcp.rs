@@ -10,25 +10,21 @@ use axum::{
     routing::post,
     Extension, Json, Router,
 };
-use lj_dtos::mcp_tools::{
-    enum_values, nullable, read_only_annotations, ACTIVITY_KINDS, SERVER_INSTRUCTIONS,
+use lj_mcp_tools::{
+    enum_values, negotiate_protocol_version, nullable, read_only_annotations, SERVER_INSTRUCTIONS,
 };
-use lj_dtos::Domain;
+use lj_vocab::ZONE_SANS;
 use opentelemetry::KeyValue;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tracing::Instrument;
 
 use crate::annonces::FONDS;
-use crate::bookmarks::fetch_bookmarks;
-use crate::decision_views::{fetch_views, record_decision_view};
 use crate::error::ApiError;
 use crate::mcp_presenters::{
-    present_annonce_search, present_bookmarks, present_decision_detail, present_law_article,
-    present_law_search, present_law_text, present_reading_history, present_saved_searches,
-    present_search_response, McpActivityResponse,
+    present_annonce_search, present_decision_detail, present_law_article, present_law_search,
+    present_law_text, present_search_response,
 };
-use crate::search_history::{fetch_history, record_search};
 use crate::state::AppState;
 
 #[derive(Clone, Copy)]
@@ -40,10 +36,8 @@ struct Provenance<'a> {
 fn mcp_caller(
     user: Option<&str>,
     prov: Provenance<'_>,
-    pseudo: Option<&crate::identity::Pseudonymiser>,
+    pseudo: Option<&lj_identity::Pseudonymiser>,
 ) -> crate::usage::Caller {
-    // MCP is always authenticated, so `caller` names the caller and `visit` stays
-    // empty.
     crate::usage::Caller {
         source: lj_dtos::ActivitySource::Mcp,
         authenticated: user.is_some(),
@@ -57,14 +51,13 @@ fn mcp_caller(
 
 fn mcp_pseudonym(
     user: Option<&str>,
-    pseudo: Option<&crate::identity::Pseudonymiser>,
+    pseudo: Option<&lj_identity::Pseudonymiser>,
 ) -> Option<String> {
     pseudo
         .zip(user)
-        .and_then(|(p, sub)| p.caller(&crate::identity::Identity::Account(sub.to_string())))
+        .and_then(|(p, sub)| p.caller(&lj_identity::Identity::Account(sub.to_string())))
 }
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "librejustice";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -182,7 +175,7 @@ async fn mcp_auth(State(state): State<AppState>, mut req: Request, next: Next) -
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let Some(token) = auth.strip_prefix("Bearer ") else {
-            tracing::debug!("mcp: challenge servi (aucun Bearer)");
+            tracing::debug!("mcp: challenge served (no Bearer)");
             return mcp_unauthorized(&challenge, "auth_required");
         };
         match lookup_mcp_user(&state, token, &mut phases).await {
@@ -190,12 +183,10 @@ async fn mcp_auth(State(state): State<AppState>, mut req: Request, next: Next) -
                 bump_last_seen(&state, &uid, &mut phases).await;
                 user = Some(uid);
             }
-            // The reason is repeated in the message body: a Loki line filter (`|=`)
-            // only sees that, never the structured metadata.
             Ok(None) => {
                 tracing::warn!(
                     mcp_token_rejete = "invalid_token",
-                    "jeton MCP refusé : invalid_token (absent de la table ou expiré)"
+                    "MCP token refused: invalid_token (missing from the table or expired)"
                 );
                 return mcp_unauthorized(&challenge, "invalid_token");
             }
@@ -203,7 +194,7 @@ async fn mcp_auth(State(state): State<AppState>, mut req: Request, next: Next) -
                 tracing::warn!(
                     mcp_token_rejete = "lookup_echec",
                     error = %e,
-                    "jeton MCP non vérifiable : lookup_echec"
+                    "MCP token unverifiable: lookup_failed"
                 );
                 return e.into_response();
             }
@@ -241,7 +232,6 @@ enum ErrorCategory {
     Validation,
     /// Absent from the corpus, which never proves the resource does not exist.
     NotFound,
-    Auth,
     /// The account's allowance for the minute is spent: wait, then retry.
     RateLimited,
     /// Internal or transient failure: an identical retry may succeed.
@@ -253,7 +243,6 @@ impl ErrorCategory {
         match self {
             Self::Validation => "validation",
             Self::NotFound => "not_found",
-            Self::Auth => "auth",
             Self::RateLimited => "rate_limited",
             Self::Internal => "internal",
         }
@@ -306,15 +295,6 @@ impl RpcError {
             code: -32603,
             message: msg.into(),
             category: ErrorCategory::NotFound,
-            retryable: false,
-            hint: None,
-        }
-    }
-    fn auth(msg: impl Into<String>) -> Self {
-        Self {
-            code: -32603,
-            message: msg.into(),
-            category: ErrorCategory::Auth,
             retryable: false,
             hint: None,
         }
@@ -415,7 +395,7 @@ async fn dispatch(
     outil: &mut Option<&'static str>,
 ) -> Result<Value, RpcError> {
     match method {
-        "initialize" => Ok(initialize_result()),
+        "initialize" => Ok(initialize_result(&params)),
         "notifications/initialized" => Ok(Value::Null),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
@@ -424,9 +404,9 @@ async fn dispatch(
     }
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(params: &Value) -> Value {
     json!({
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": negotiate_protocol_version(params["protocolVersion"].as_str()),
         "capabilities": {
             "experimental": {},
             "tools": {"listChanged": false},
@@ -455,12 +435,6 @@ async fn call_tool(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // Usage pseudonym, never the identity, the `sub` or the address.
-    //
-    // The span carries the detail, the counter the volumes, the log line of the
-    // `internal` case the alert: the counter is born at the first failure of the
-    // process, so `increase()` over a short window counted 2.7 out of 6 on
-    // 22/08/2026.
     let span = tracing::info_span!(
         "mcp_tool_call",
         librejustice.mcp.tool = name,
@@ -471,7 +445,6 @@ async fn call_tool(
         librejustice.mcp.outcome = tracing::field::Empty,
         librejustice.mcp.error_category = tracing::field::Empty,
         librejustice.mcp.error = tracing::field::Empty,
-        // Same name as on the `search` span: one query sieves both.
         librejustice.search.caller = mcp_pseudonym(user, state.pseudonymiser.as_ref()).as_deref(),
         user_agent.original = prov.user_agent,
     );
@@ -481,6 +454,7 @@ async fn call_tool(
     let arg: String = arguments.to_string().chars().take(256).collect();
     span.record("librejustice.mcp.arg", arg.as_str());
 
+    let lecture = read_kind(lj_mcp_tools::canonical_tool_name(name), &arguments);
     async move {
         // MCP semantics: a tool execution failure is not a JSON-RPC error but a
         // result with `isError: true` and the message in `content`. Only protocol
@@ -488,7 +462,7 @@ async fn call_tool(
         //
         // The counter label is a literal, never `name`: a client calling made-up
         // names would create one series per name.
-        let (label, result) = match name {
+        let (label, result) = match lj_mcp_tools::canonical_tool_name(name) {
             "search_decisions" => (
                 "search_decisions",
                 tool_search_decisions(state, arguments, user, prov).await,
@@ -497,32 +471,18 @@ async fn call_tool(
                 "get_decision",
                 tool_get_decision(state, arguments, user).await,
             ),
-            "list_my_activity" => (
-                "list_my_activity",
-                tool_list_my_activity(state, arguments, user).await,
-            ),
-            "get_legal_text" => (
-                "get_legal_text",
-                tool_get_legal_text(state, arguments, user).await,
-            ),
-            "search_legal_texts" => (
-                "search_legal_texts",
-                tool_search_legal_texts(state, arguments, user, prov).await,
+            "get_norm" => ("get_norm", tool_get_norm(state, arguments, user).await),
+            "search_norms" => (
+                "search_norms",
+                tool_search_norms(state, arguments, user, prov).await,
             ),
             "search_annonces" if PUBLISH_SEARCH_ANNONCES => (
                 "search_annonces",
                 tool_search_annonces(state, arguments, user).await,
             ),
-            // An MCP client freezes the tool list when the connector is installed
-            // and the model can only emit a name from that list: a rename is
-            // recoverable by an alias and nothing else.
-            "get_law_article" | "get_legal_article" => (
-                "get_legal_text",
-                tool_get_legal_text(state, arguments, user).await,
-            ),
-            "search_law_articles" | "search_legal_articles" => (
-                "search_legal_texts",
-                tool_search_legal_texts(state, arguments, user, prov).await,
+            removed if lj_mcp_tools::REMOVED_NAMES.contains(&removed) => (
+                "removed",
+                Err(RpcError::invalid_params(format!("{removed} was removed."))),
             ),
             other => (
                 "unknown",
@@ -537,6 +497,10 @@ async fn call_tool(
             Ok((text, structured)) => {
                 span.record("librejustice.mcp.outcome", "ok");
                 count_call(label, "ok");
+                if let Some(kind) = lecture {
+                    let caller = mcp_caller(user, prov, state.pseudonymiser.as_ref());
+                    crate::reads::served(kind, crate::reads::Surface::Mcp, &caller, &arg);
+                }
                 Ok(json!({
                     "content": [{"type": "text", "text": text}],
                     "structuredContent": structured,
@@ -552,7 +516,7 @@ async fn call_tool(
                     tracing::error!(
                         librejustice.mcp.tool = label,
                         librejustice.mcp.error = e.message.as_str(),
-                        "mcp: échec interne d'outil"
+                        "mcp: internal tool failure"
                     );
                 }
                 Ok(tool_error_content(&e))
@@ -606,10 +570,12 @@ async fn tool_search_decisions(
     user: Option<&str>,
     prov: Provenance<'_>,
 ) -> Result<(String, Value), RpcError> {
-    let mut req = build_search_request(&args)?;
     let refs = crate::referential::referential(state)
         .await
         .map_err(|e| RpcError::tool_error(e.to_string()))?;
+    let mut args = args;
+    fold_retired_chamber(&mut args, &refs);
+    let mut req = build_search_request(&args)?;
     // A code outside the referential would silently match zero decisions.
     if let Some(codes) = req.jurisdiction_code.as_deref_mut() {
         relax_jurisdiction_codes(codes, &refs);
@@ -621,6 +587,20 @@ async fn tool_search_decisions(
         .find(|c| refs.jurisdiction(c).is_none())
     {
         return Err(unknown_jurisdiction_code(bad, &refs));
+    }
+    if let Some(seats) = req.seat.as_mut() {
+        crate::referential::canonicalize_seats(seats);
+        for path in seats.iter_mut().filter(|p| !refs.has_seat(p)) {
+            if let Some(complet) = crate::referential::seat_completion(path, refs.seat_nodes()) {
+                tracing::warn!(
+                    librejustice.mcp.relaxed_field = "seat",
+                    librejustice.mcp.relaxed_value = path.as_str(),
+                    librejustice.mcp.relaxed_slug = complet,
+                    "mcp: seat path recovered from its abbreviated segment"
+                );
+                *path = complet.to_string();
+            }
+        }
     }
     if let Some(bad) = req.seat.iter().flatten().find(|p| !refs.has_seat(p)) {
         return Err(
@@ -645,7 +625,6 @@ async fn tool_search_decisions(
         ))
         .with_hint(list_hint("publication", &tokens)));
     }
-    let filter_rewritten = rewrite_legacy_matiere(&args, &mut req)?;
     // The columns carry catalogue uids, not names.
     resolve_instrument_filters(state, &mut req).await?;
     // Budget per MCP account: the OAuth token is the key, and it is revocable.
@@ -661,19 +640,11 @@ async fn tool_search_decisions(
     )
     .await
     .map_err(RpcError::from_api)?;
-    if let Some(user_id) = user {
-        record_search(
-            &state.pool,
-            user_id,
-            &req.query,
-            crate::search_history::filters_from_request(&req),
-            lj_dtos::ActivitySource::Mcp,
-            lj_dtos::SearchEngine::Decisions,
-        )
-        .await;
-    }
-    let mut out = present_search_response(&response, &state.settings.web_base_url);
-    out.filter_rewritten = filter_rewritten;
+    let out = present_search_response(
+        &response,
+        &state.settings.web_base_url,
+        req.seat.as_deref().unwrap_or_default(),
+    );
     tool_ok(&out)
 }
 
@@ -684,7 +655,7 @@ async fn tool_get_decision(
 ) -> Result<(String, Value), RpcError> {
     lecture(state, user).await?;
     let url = required_str(&args, "url")?;
-    // The key is the last segment of the public url `/decision/{key}`.
+    // The key is the last segment of the public url `/decision/{juris}/{key}`.
     let id = url
         .trim_end_matches('/')
         .rsplit('/')
@@ -702,9 +673,6 @@ async fn tool_get_decision(
                 ),
             other => RpcError::tool_error(other.to_string()),
         })?;
-    if let Some(user_id) = user {
-        record_decision_view(&state.pool, user_id, id, lj_dtos::ActivitySource::Mcp).await;
-    }
     let refs = crate::referential::referential(state)
         .await
         .map_err(|e| RpcError::tool_error(e.to_string()))?;
@@ -715,91 +683,110 @@ async fn tool_get_decision(
     ))
 }
 
-async fn tool_list_my_activity(
-    state: &AppState,
-    args: Value,
-    user: Option<&str>,
-) -> Result<(String, Value), RpcError> {
-    let user_id = user.ok_or_else(|| {
-        RpcError::auth(
-            "authentication required: connect your LibreJustice account to this MCP \
-             connector to access your activity.",
-        )
-    })?;
-    lecture(state, user).await?;
-    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("all");
-    if !ACTIVITY_KINDS.contains(&kind) {
-        return Err(RpcError::invalid_params(format!(
-            "unknown kind '{kind}'; valid values: {}",
-            ACTIVITY_KINDS.join(", ")
-        )));
-    }
-    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(50);
-    let web = &state.settings.web_base_url;
-    let refs = crate::referential::referential(state)
-        .await
-        .map_err(|e| RpcError::tool_error(e.to_string()))?;
-
-    let mut out = McpActivityResponse::default();
-    if matches!(kind, "searches" | "all") {
-        let (entries, _) = fetch_history(&state.pool, user_id, Some(limit), 0)
-            .await
-            .map_err(|e| RpcError::tool_error(e.to_string()))?;
-        out.searches = Some(present_saved_searches(&entries));
-    }
-    if matches!(kind, "bookmarks" | "all") {
-        let (items, _) = fetch_bookmarks(&state.pool, &refs, user_id, Some(limit), 0)
-            .await
-            .map_err(|e| RpcError::tool_error(e.to_string()))?;
-        out.bookmarks = Some(present_bookmarks(&items, web, &refs));
-    }
-    if matches!(kind, "readingHistory" | "all") {
-        let (views, _) = fetch_views(&state.pool, &refs, user_id, Some(limit), 0)
-            .await
-            .map_err(|e| RpcError::tool_error(e.to_string()))?;
-        out.reading_history = Some(present_reading_history(&views, web, &refs));
-    }
-    tool_ok(&out)
-}
-
 // ── Law-at-date tool ─────────────────────────────────────────────────────────
 
-async fn tool_get_legal_text(
+async fn tool_get_norm(
     state: &AppState,
     args: Value,
     user: Option<&str>,
 ) -> Result<(String, Value), RpcError> {
     lecture(state, user).await?;
+    read_legal_text(state, args).await
+}
+
+async fn read_legal_text(state: &AppState, args: Value) -> Result<(String, Value), RpcError> {
     let date: Option<String> = deser_field(&args, "date")?;
 
-    let (code, num) = match law_target(&args)? {
-        LawTarget::Article { code, num } => (code, num),
-        LawTarget::Root { code } => return tool_get_legal_root(state, &code).await,
-        LawTarget::Section { code, cid } => {
-            return tool_get_legal_section(state, &code, &cid, date.as_deref()).await
+    let (juris, code, num) = match law_target(&args)? {
+        LawTarget::Article { juris, code, num } => (juris, code, num),
+        LawTarget::Root { juris, code } => {
+            return tool_get_legal_root(state, &code, juris.as_deref()).await
         }
-        LawTarget::SourceUid(uid) => resolve_source_uid(state, &uid).await?,
+        LawTarget::Section { juris, code, path } => {
+            return tool_get_legal_section(state, &code, juris.as_deref(), &path, date.as_deref())
+                .await
+        }
+        LawTarget::SectionOf { juris, code, cid } => {
+            return tool_get_section_cid(state, args, &code, juris.as_deref(), &cid).await
+        }
+        LawTarget::SourceUid(uid) => {
+            let (code, num) = resolve_source_uid(state, &uid).await?;
+            (None, code, num)
+        }
+        LawTarget::TextUid(uid) => {
+            let (code, juris) = resolve_text_uid(state, &uid).await?;
+            return tool_get_legal_root(state, &code, Some(&juris)).await;
+        }
+        LawTarget::SectionCid(cid) => {
+            let (code, juris) = resolve_section_cid(state, &cid).await?;
+            return tool_get_section_cid(state, args, &code, Some(&juris), &cid).await;
+        }
     };
-    let num = lj_core::article_key::article_key(&num);
+    let juris = juris.as_deref();
+    let segment = num.clone();
+    let num = lj_norm::article_key::article_key(&num);
 
-    let code = resolve_law_code(state, &code).await?;
+    let code = resolve_law_code(state, &code, juris).await?;
 
-    let detail = match date {
-        Some(d) => {
-            let parsed = parse_mcp_date("date", &d)?;
-            crate::legi::article_at_date(state, &code, &num, parsed).await
-        }
-        None => crate::legi::article_in_force(state, &code, &num).await,
+    let at = date
+        .as_deref()
+        .map(|d| parse_mcp_date("date", d))
+        .transpose()?;
+    let detail = match at {
+        Some(parsed) => crate::legi::article_at_date(state, &code, juris, &num, parsed, None).await,
+        None => crate::legi::article_in_force(state, &code, juris, &num, None).await,
     };
     let detail = match detail {
         Ok(detail) => detail,
-        Err(ApiError::NotFound) => return Err(article_not_found(state, &code).await),
+        Err(ApiError::NotFound) => {
+            // One segment names a first-level section when no article answers it.
+            return match crate::legi::law_section(state, &code, juris, &segment, at).await {
+                Ok(section) => tool_ok(&crate::mcp_presenters::present_law_section(
+                    &section,
+                    &state.settings.web_base_url,
+                )),
+                Err(_) => Err(article_not_found(state, &code, juris, &num).await),
+            };
+        }
         Err(other) => return Err(map_legi_error(other)),
     };
     tool_ok(&present_law_article(&detail, &state.settings.web_base_url))
 }
 
-async fn tool_search_legal_texts(
+/// A section named by its Légifrance id is read at the address of its node,
+/// which may be an article or the text itself.
+async fn tool_get_section_cid(
+    state: &AppState,
+    mut args: Value,
+    code: &str,
+    juris: Option<&str>,
+    cid: &str,
+) -> Result<(String, Value), RpcError> {
+    let slug = resolve_law_code(state, code, juris).await?;
+    let address = crate::legi::section_address(state, &slug, juris, cid)
+        .await
+        .map_err(map_legi_error)?
+        .ok_or_else(|| {
+            RpcError::not_found(format!("unknown Légifrance id '{cid}'")).with_hint(
+                "This section is not in the text's table of contents today: read the text \
+                 by its url and follow its `section` entries.",
+            )
+        })?;
+    let Some(obj) = args.as_object_mut() else {
+        return Err(RpcError::invalid_params("arguments must be an object"));
+    };
+    for key in ID_KEYS
+        .iter()
+        .chain(CODE_KEYS.iter())
+        .chain(ARTICLE_KEYS.iter())
+    {
+        obj.remove(*key);
+    }
+    obj.insert("url".to_string(), Value::String(address));
+    Box::pin(read_legal_text(state, args)).await
+}
+
+async fn tool_search_norms(
     state: &AppState,
     args: Value,
     user: Option<&str>,
@@ -817,7 +804,7 @@ async fn tool_search_legal_texts(
     let limit = clamp_search_limit(&args)?;
 
     let code = match opt("code") {
-        Some(c) => Some(resolve_law_code(state, c).await?),
+        Some(c) => Some(resolve_law_code(state, c, None).await?),
         None => None,
     };
 
@@ -830,40 +817,27 @@ async fn tool_search_legal_texts(
         state,
         &query,
         code.as_deref(),
-        opt("jurisdiction"),
+        // The connector names no place, so it reads from the default one, as
+        // `get_norm` does.
+        &[],
+        &opt("jurisdiction")
+            .map(str::to_string)
+            .into_iter()
+            .collect::<Vec<_>>(),
         None,
         None,
         None,
         at,
         limit,
         0,
+        // A citation with no code named has no other door: `get_norm` wants
+        // the code alongside the article.
+        lj_dtos::SearchMode::Auto,
         mcp_caller(user, prov, state.pseudonymiser.as_ref()),
         crate::ratelimit::caller_key(user, &axum::http::HeaderMap::new()).as_ref(),
     )
     .await
     .map_err(map_legi_error)?;
-
-    if let Some(user_id) = user {
-        let mut filters = serde_json::Map::new();
-        if let Some(c) = code.as_deref() {
-            filters.insert("code".to_string(), Value::String(c.to_string()));
-        }
-        if let Some(j) = opt("jurisdiction") {
-            filters.insert("jurisdiction".to_string(), Value::String(j.to_string()));
-        }
-        if let Some(d) = opt("date") {
-            filters.insert("date".to_string(), Value::String(d.to_string()));
-        }
-        record_search(
-            &state.pool,
-            user_id,
-            &query,
-            Value::Object(filters),
-            lj_dtos::ActivitySource::Mcp,
-            lj_dtos::SearchEngine::Textes,
-        )
-        .await;
-    }
 
     tool_ok(&present_law_search(
         &query,
@@ -893,17 +867,24 @@ async fn tool_search_annonces(
     };
     let limit = clamp_search_limit(&args)?;
     lecture(state, user).await?;
-    let departement = strings("departement");
+    let zone = strings("zone");
     // A code outside the nomenclature filters nothing: a plain error rather than
     // an empty page a model would read as "no tender at all".
-    if let Some(bad) = departement
-        .iter()
-        .find(|c| lj_core::referential_labels::departement_label(c).is_none())
-    {
+    if let Some(bad) = zone.iter().find(|c| {
+        c.as_str() != ZONE_SANS.to_uppercase()
+            && lj_annonces::zones::Zone::parse(&c.to_lowercase()).is_none()
+    }) {
         return Err(RpcError::invalid_params(format!(
-            "departement: {bad:?} is not a French département code (\"75\", \"2A\", \"973\")"
+            "zone: {bad:?} is not a département code (\"75\", \"2A\", \"973\"), \"fr\" or \"ue\""
         )));
     }
+    let zone: Vec<String> = zone
+        .into_iter()
+        .map(|c| match c.as_str() {
+            "FR" | "UE" | "SANS" => c.to_lowercase(),
+            _ => c,
+        })
+        .collect();
     let famille = strings("nature");
     if let Some(bad) = famille
         .iter()
@@ -935,7 +916,7 @@ async fn tool_search_annonces(
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string),
         fond,
-        departement,
+        zone,
         famille,
         cpv: strings("cpv"),
         echeance_jours: args
@@ -950,35 +931,102 @@ async fn tool_search_annonces(
         .await
         .map_err(|e| RpcError::tool_error(e.to_string()))?;
 
-    if let Some(user_id) = user {
-        record_search(
-            &state.pool,
-            user_id,
-            req.q.as_deref().unwrap_or(""),
-            serde_json::to_value(&req).unwrap_or_else(|_| json!({})),
-            lj_dtos::ActivitySource::Mcp,
-            lj_dtos::SearchEngine::Annonces,
-        )
-        .await;
-    }
     tool_ok(&present_annonce_search(
         &response,
         &state.settings.web_base_url,
     ))
 }
 
-/// `ta_clermont-ferrand` for `ta_clermont_ferrand`: none of the 376 codes of the
-/// referential carries a hyphen, and swapping the hyphen for an underscore puts
-/// none of them in collision, so the recovery cannot land on another court.
+/// Folds the retired `chamber` into `seat`, the court coming from the call.
+///
+/// A published ChatGPT app is served the metadata snapshot frozen at review, not
+/// the live `tools/list`, so its users still send the field the seat axis
+/// replaced on 03/09/2026: 14 of the 15 refusals of the 13 days to 08/09/2026
+/// compose. One value that does not resolve in the fonds leaves the whole call
+/// to the unknown-field error, `CC` plus `CIVILE` being the case that must keep
+/// failing, the civil chambers being `CC.C1_CIVILE` to `CC.C3_CIVILE`.
+fn fold_retired_chamber(args: &mut Value, refs: &crate::referential::Referential) {
+    let Some(chambers) = args.get("chamber").and_then(as_str_list) else {
+        return;
+    };
+    let trunks = seat_trunks(args, refs);
+    if chambers.is_empty() || trunks.is_empty() {
+        return;
+    }
+    let mut folded = Vec::new();
+    for trunk in &trunks {
+        for chamber in &chambers {
+            let segment = if chamber.chars().all(|c| c.is_ascii_digit()) {
+                format!("C{chamber}")
+            } else {
+                chamber.to_uppercase()
+            };
+            let path = format!("{trunk}.{segment}");
+            if !refs.has_seat(&path) {
+                return;
+            }
+            folded.push(path);
+        }
+    }
+    tracing::warn!(
+        librejustice.mcp.relaxed_field = "chamber",
+        librejustice.mcp.relaxed_value = chambers.join(","),
+        librejustice.mcp.relaxed_slug = folded.join(","),
+        "mcp: removed chamber folded onto the seat path"
+    );
+    if let Some(obj) = args.as_object_mut() {
+        obj.remove("chamber");
+        let mut seats = obj.get("seat").and_then(as_str_list).unwrap_or_default();
+        seats.extend(folded);
+        obj.insert("seat".to_string(), json!(seats));
+    }
+}
+
+/// Trunks the call already names, the code preferred over the type since it
+/// carries the court.
+fn seat_trunks(args: &Value, refs: &crate::referential::Referential) -> Vec<String> {
+    if let Some(codes) = args.get("jurisdiction_code").and_then(as_str_list) {
+        return codes
+            .iter()
+            .filter_map(|code| {
+                let kind = &refs.jurisdiction(code)?.jurisdiction_type;
+                Some(lj_core::chamber::jurisdiction_trunk(kind, Some(code)).join("."))
+            })
+            .collect();
+    }
+    args.get("jurisdiction_type")
+        .and_then(as_str_list)
+        .unwrap_or_default()
+        .iter()
+        .map(|kind| lj_core::chamber::jurisdiction_trunk(kind, None).join("."))
+        .filter(|trunk| !trunk.is_empty())
+        .collect()
+}
+
+fn as_str_list(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::String(s) => Some(vec![s.clone()]),
+        Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => None,
+    }
+}
+
+/// `ta_clermont-ferrand` for `ta_clermont_ferrand`, `CC` for `cc`, `CA.PARIS` for
+/// `ca_paris`: the 376 codes of the referential are all lowercase and carry
+/// neither hyphen nor dot (measured 15/09/2026), so the normalisation can only
+/// turn an invalid value into a valid one, never one court into another.
 fn relax_jurisdiction_codes(codes: &mut [String], refs: &crate::referential::Referential) {
     for code in codes.iter_mut().filter(|c| refs.jurisdiction(c).is_none()) {
-        let underscored = code.replace('-', "_");
+        let underscored = code.to_lowercase().replace(['-', '.'], "_");
         if refs.jurisdiction(&underscored).is_some() {
             tracing::warn!(
                 librejustice.mcp.relaxed_field = "jurisdiction_code",
                 librejustice.mcp.relaxed_value = code.as_str(),
                 librejustice.mcp.relaxed_slug = underscored.as_str(),
-                "mcp: code de juridiction rattrapé sur le souligné"
+                "mcp: juridiction code recovered from the underscore"
             );
             *code = underscored;
         }
@@ -995,149 +1043,33 @@ fn unknown_jurisdiction_code(code: &str, refs: &crate::referential::Referential)
     .with_hint(list_hint("jurisdiction_code", &examples))
 }
 
-/// The 24 values of the retired `matiere` argument, mapped to the subject a
-/// caller meant by them. `None`: the value named a court formation, no subject
-/// matches it.
-const MATIERE_VERS_DOMAINE: [(&str, Option<Domain>); 24] = [
-    ("BAUX", Some(Domain::CivilDroitLocatif)),
-    ("CIVI", Some(Domain::CivilDroitResponsabilite)),
-    ("CIVILE", Some(Domain::Civil)),
-    ("COMMERCIALE", Some(Domain::Commercial)),
-    ("CONSEIL", None),
-    (
-        "CONSTRUCTION",
-        Some(Domain::CivilDroitImmobilierConstruction),
-    ),
-    (
-        "COPROPRIETE",
-        Some(Domain::CivilDroitCoproprieteProprieteImmobiliere),
-    ),
-    ("CORRECTIONNELLE", Some(Domain::Criminel)),
-    ("CRIMINELLE", Some(Domain::Criminel)),
-    ("DALO", Some(Domain::PublicDroitAideActionSociale)),
-    ("ETRANGERS", Some(Domain::PublicDroitEtrangersNationalite)),
-    (
-        "EXPROPRIATION",
-        Some(Domain::CivilDroitExpropriationPreemption),
-    ),
-    ("FAMILLE", Some(Domain::CivilDroitPersonnesFamille)),
-    ("INSTRUCTION", Some(Domain::Criminel)),
-    ("MINEURS", Some(Domain::CivilDroitMineurs)),
-    ("NATIONALITE", Some(Domain::PublicDroitEtrangersNationalite)),
-    (
-        "PROCEDURES_COLLECTIVES",
-        Some(Domain::CommercialDroitEntreprisesDifficulte),
-    ),
-    (
-        "PROTECTION_SOCIALE",
-        Some(Domain::SocialDroitAideActionSociale),
-    ),
-    ("PROXIMITE", None),
-    ("PRUD_HOMALE", Some(Domain::SocialDroitTravail)),
-    ("SOCIALE", Some(Domain::Social)),
-    ("SURENDETTEMENT", Some(Domain::CommercialDroitConsommation)),
-    ("TERRES", Some(Domain::CivilDroitRural)),
-    ("URGENCES", None),
-];
-
-/// The `matiere` values named the chamber, not the subject, and `ETRANGERS`
-/// missed 82.8 % of the litigation it aimed at (131,575 decisions against
-/// 751,570).
-fn rewrite_legacy_matiere(
-    args: &Value,
-    req: &mut lj_dtos::SearchRequest,
-) -> Result<Option<String>, RpcError> {
-    let legacy: Vec<String> = match deser_list(args, "matiere")? {
-        Some(vs) if !vs.is_empty() => vs,
-        _ => return Ok(None),
-    };
-    let mut domains: Vec<Domain> = Vec::new();
-    for value in &legacy {
-        match MATIERE_VERS_DOMAINE.iter().find(|(m, _)| m == value) {
-            Some((_, Some(domain))) if !domains.contains(domain) => domains.push(*domain),
-            Some((_, Some(_))) => {}
-            Some((_, None)) => {
-                return Err(retired_matiere(&format!(
-                    "matiere '{value}' is retired and named a court formation, not a subject: \
-                     filter by seat for a court's own formation, or by procedure"
-                )))
-            }
-            None => {
-                return Err(retired_matiere(&format!(
-                    "matiere '{value}' is retired: filter by legal_domain instead"
-                )))
-            }
-        }
-    }
-    let asked = legacy.join(", ");
-    tracing::warn!(
-        librejustice.mcp.relaxed_field = "matiere",
-        librejustice.mcp.relaxed_value = asked.as_str(),
-        "mcp: filtre matiere retiré, réécrit en legal_domain"
-    );
-    // A `legal_domain` already set says the subject better than the retired axis:
-    // widening it would return more than the call asks for.
-    if req.legal_domain.iter().flatten().next().is_some() {
-        return Ok(Some(format!(
-            "The `matiere` filter is retired: `matiere: [{asked}]` was dropped, \
-             `legal_domain` was set and carries the subject. Use `legal_domain` alone."
-        )));
-    }
-    let rewritten = domains
-        .iter()
-        .map(domain_token)
-        .collect::<Vec<String>>()
-        .join(", ");
-    req.legal_domain = Some(domains);
-    Ok(Some(format!(
-        "The `matiere` filter is retired: `matiere: [{asked}]` was read as \
-         `legal_domain: [{rewritten}]`. It named the chamber that heard the case, \
-         so it missed every court that names its chambers otherwise, while \
-         `legal_domain` names the subject. Filter by `legal_domain` from now on."
-    )))
-}
-
-fn retired_matiere(message: &str) -> RpcError {
-    let tokens: Vec<String> = MATIERE_VERS_DOMAINE
-        .iter()
-        .filter_map(|(_, d)| d.as_ref().map(domain_token))
-        .collect();
-    RpcError::invalid_params(message).with_hint(list_hint("legal_domain", &tokens))
-}
-
-/// Filter token of a domain (`CIVIL_DROIT_LOCATIF`), its serialised form.
-fn domain_token(d: &Domain) -> String {
-    match serde_json::to_value(d) {
-        Ok(Value::String(s)) => s,
-        _ => String::new(),
-    }
-}
-
 /// Resolves an instrument value (slug, free name or acronym) to its catalogue
 /// `(slug, text_uid)`.
 async fn resolve_instrument(
     repo: &lj_store::repository::DecisionRepository<'_>,
     field: &str,
     value: &str,
+    juris: Option<&str>,
 ) -> Result<(String, String), RpcError> {
     use lj_store::repository::InstrumentResolution as R;
     match repo
-        .resolve_instrument(value)
+        .resolve_instrument(value, juris)
         .await
         .map_err(|e| RpcError::tool_error(e.to_string()))?
     {
-        R::Direct { slug, text_uid } => Ok((slug, text_uid)),
+        R::Direct { slug, text_uid, .. } => Ok((slug, text_uid)),
         R::Rattrape {
             slug,
             text_uid,
             regle: rule,
+            ..
         } => {
             tracing::warn!(
                 librejustice.mcp.relaxed_field = field,
                 librejustice.mcp.relaxed_value = value,
                 librejustice.mcp.relaxed_slug = slug.as_str(),
                 librejustice.mcp.relaxed_rule = ?rule,
-                "mcp: nom de texte rattrapé sur son slug de catalogue"
+                "mcp: text name recovered from its catalogue slug"
             );
             Ok((slug, text_uid))
         }
@@ -1162,7 +1094,9 @@ async fn resolve_instrument_filters(
     let repo = lj_store::repository::DecisionRepository::new(&conn);
     if let Some(values) = req.legal_instrument.as_mut() {
         for v in values.iter_mut() {
-            *v = resolve_instrument(&repo, "legal_instrument", v).await?.1;
+            *v = resolve_instrument(&repo, "legal_instrument", v, None)
+                .await?
+                .1;
         }
     }
     if let Some(values) = req.legal_article.as_mut() {
@@ -1173,11 +1107,47 @@ async fn resolve_instrument_filters(
                      (e.g. \"code-civil|1240\", \"code-de-justice-administrative|L761-1\")"
                 )));
             };
-            let (_, uid) = resolve_instrument(&repo, "legal_article", instrument.trim()).await?;
-            *v = format!("{uid}|{}", lj_core::article_key::article_key(num));
+            let (slug, uid) =
+                resolve_instrument(&repo, "legal_article", instrument.trim(), None).await?;
+            *v = format!(
+                "{uid}|{}",
+                served_article_key(&repo, &uid, &slug, num).await?
+            );
         }
     }
     Ok(())
+}
+
+/// The key the referential holds, `legi::served_version` recovering the same
+/// spellings. An unresolved number filters on nothing, which reads as case law
+/// being silent on the article rather than as a number naming none.
+async fn served_article_key(
+    repo: &lj_store::repository::DecisionRepository<'_>,
+    uid: &str,
+    slug: &str,
+    num: &str,
+) -> Result<String, RpcError> {
+    let key = lj_norm::article_key::article_key(num);
+    let mut tries = vec![key.clone()];
+    tries.extend(lj_norm::article_key::letter_suffix_separated(&key));
+    tries.extend(lj_norm::article_key::without_spoken_word(&key).map(str::to_string));
+    tries.extend(lj_norm::article_key::sole_article_alias(&key).map(str::to_string));
+    for essai in tries {
+        let known = !repo
+            .law_article_versions(uid, &essai)
+            .await
+            .map_err(|e| RpcError::tool_error(e.to_string()))?
+            .is_empty();
+        if known {
+            return Ok(essai);
+        }
+    }
+    Err(
+        RpcError::not_found(format!("no article {num} in {slug}")).with_hint(format!(
+            "Article numbers are not composable: read the index with get_norm \
+             on {slug}, or take the number from a citation link of a decision."
+        )),
+    )
 }
 
 fn unknown_instrument_msg(
@@ -1215,14 +1185,18 @@ fn unknown_instrument(
 }
 
 /// Scalar `code` field: no list shape to give, only the alphabet of its values.
-async fn resolve_law_code(state: &AppState, raw: &str) -> Result<String, RpcError> {
+async fn resolve_law_code(
+    state: &AppState,
+    raw: &str,
+    juris: Option<&str>,
+) -> Result<String, RpcError> {
     let conn = state
         .pool
         .get()
         .await
         .map_err(|e| RpcError::tool_error(format!("checkout connexion: {e}")))?;
     let repo = lj_store::repository::DecisionRepository::new(&conn);
-    resolve_instrument(&repo, "code", raw)
+    resolve_instrument(&repo, "code", raw, juris)
         .await
         .map(|(slug, _)| slug)
         .map_err(|e| {
@@ -1233,12 +1207,16 @@ async fn resolve_law_code(state: &AppState, raw: &str) -> Result<String, RpcErro
         })
 }
 
-/// `/texte/{code}` with no article segment: the table of contents of a text with
+/// A text named with no article segment: the table of contents of a text with
 /// articles, bodies attached below `INLINE_READING_MAX`.
-async fn tool_get_legal_root(state: &AppState, code: &str) -> Result<(String, Value), RpcError> {
-    let slug = resolve_law_code(state, code).await?;
+async fn tool_get_legal_root(
+    state: &AppState,
+    code: &str,
+    juris: Option<&str>,
+) -> Result<(String, Value), RpcError> {
+    let slug = resolve_law_code(state, code, juris).await?;
     let web = &state.settings.web_base_url;
-    match crate::legi::law_root(state, &slug)
+    match crate::legi::law_root(state, &slug, juris)
         .await
         .map_err(map_legi_error)?
     {
@@ -1249,17 +1227,18 @@ async fn tool_get_legal_root(state: &AppState, code: &str) -> Result<(String, Va
     }
 }
 
-/// `/texte/{code}/section/{cid}`: the division the table of contents addresses.
-/// Without it, reading a chapter costs one call per article.
+/// A section path (`…/livre-i/titre-v`): the division the table of contents
+/// addresses. Without it, reading a chapter costs one call per article.
 async fn tool_get_legal_section(
     state: &AppState,
     code: &str,
-    cid: &str,
+    juris: Option<&str>,
+    path: &str,
     date: Option<&str>,
 ) -> Result<(String, Value), RpcError> {
-    let slug = resolve_law_code(state, code).await?;
+    let slug = resolve_law_code(state, code, juris).await?;
     let at = date.map(|d| parse_mcp_date("date", d)).transpose()?;
-    let section = crate::legi::law_section(state, &slug, cid, at)
+    let section = crate::legi::law_section(state, &slug, juris, path, at)
         .await
         .map_err(map_legi_error)?;
     tool_ok(&crate::mcp_presenters::present_law_section(
@@ -1277,53 +1256,119 @@ async fn resolve_source_uid(state: &AppState, uid: &str) -> Result<(String, Stri
         0 => Err(
             RpcError::not_found(format!("unknown Légifrance id '{uid}'")).with_hint(
                 "Ids from another source than our LEGI import are unknown here — \
-             search the article with search_legal_texts, its hits carry the url.",
+             search the article with search_norms, its hits carry the url.",
             ),
         ),
         n => Err(RpcError::invalid_params(format!(
             "Légifrance id '{uid}' designates {n} distinct articles"
         ))
-        .with_hint("Pass the url of the one you mean (/texte/{code}/{article}).")),
+        .with_hint("Pass the url of the one you mean (/norm/{jurisdiction}/{code}/{article}).")),
+    }
+}
+
+async fn resolve_text_uid(state: &AppState, uid: &str) -> Result<(String, String), RpcError> {
+    crate::legi::text_ref_by_uid(state, uid)
+        .await
+        .map_err(map_legi_error)?
+        .ok_or_else(|| {
+            RpcError::not_found(format!("unknown Légifrance id '{uid}'"))
+                .with_hint("This text is not in our referential: search it with search_norms.")
+        })
+}
+
+async fn resolve_section_cid(state: &AppState, cid: &str) -> Result<(String, String), RpcError> {
+    let mut texts = crate::legi::section_texts_by_cid(state, cid)
+        .await
+        .map_err(map_legi_error)?;
+    match texts.len() {
+        1 => Ok(texts.remove(0)),
+        0 => Err(
+            RpcError::not_found(format!("unknown Légifrance id '{cid}'")).with_hint(
+                "This section is not in our tables of contents: read the text by its url \
+                 and follow its `section` entries.",
+            ),
+        ),
+        n => Err(RpcError::invalid_params(format!(
+            "Légifrance id '{cid}' is a section of {n} distinct texts"
+        ))
+        .with_hint("Pass the section url, /norm/{jurisdiction}/{code}/{section path}.")),
     }
 }
 
 /// Three accepted forms: the public url, absolute or relative
-/// (`/texte/{code}/{article}`), the legacy `/loi/` prefix, and the bare path
-/// (`code-civil/1240`).
+/// (`/norm/{juris}/{code}/{article}`), the legacy `/texte/` and `/loi/` prefixes, and the
+/// bare path (`code-civil/1240`). The jurisdiction segment is optional: the
+/// shape it replaces still resolves, and no text slug is two letters nor `intl`.
 ///
 /// The bare path stays reserved to inputs with no scheme: on an absolute url the
 /// prefix is required, otherwise the split would bite on the `//` of `https://`.
 ///
-/// Second member `None`: the code is there, the article is missing.
-fn split_article_url(url: &str) -> Option<(&str, Option<&str>)> {
+/// Third member `None`: the code is there, the article is missing.
+fn split_article_url(url: &str) -> Option<(Option<&'static str>, &str, Option<&str>)> {
     let path = url
-        .split("/texte/")
+        .split("/norm/")
         .nth(1)
+        .or_else(|| url.split("/texte/").nth(1))
         .or_else(|| url.split("/loi/").nth(1))
         .or_else(|| (!url.contains("://")).then(|| url.trim_start_matches('/')))?
         .trim_end_matches('/');
     let mut segs = path.splitn(2, '/');
+    let premier = segs.next().filter(|s| !s.is_empty())?;
+    let reste = segs.next().filter(|s| !s.is_empty());
+    let Some(juris) = lj_norm::jurisdictions::from_url_segment(premier) else {
+        return Some((None, premier, reste));
+    };
+    let mut segs = reste?.splitn(2, '/');
     let code = segs.next().filter(|s| !s.is_empty())?;
-    Some((code, segs.next().filter(|s| !s.is_empty())))
+    Some((Some(juris), code, segs.next().filter(|s| !s.is_empty())))
 }
 
-/// Target designated by the `get_legal_text` arguments, whichever door was used.
+fn is_iso_date(s: &str) -> bool {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+}
+
+fn read_kind(tool: &str, args: &Value) -> Option<lj_dtos::ReadKind> {
+    match tool {
+        "get_decision" => Some(lj_dtos::ReadKind::Decision),
+        "get_norm" => match law_target(args).ok()? {
+            LawTarget::Article { .. } | LawTarget::SourceUid(_) => Some(lj_dtos::ReadKind::Article),
+            LawTarget::Section { .. } | LawTarget::SectionOf { .. } | LawTarget::SectionCid(_) => {
+                Some(lj_dtos::ReadKind::Section)
+            }
+            LawTarget::Root { .. } | LawTarget::TextUid(_) => Some(lj_dtos::ReadKind::Text),
+        },
+        _ => None,
+    }
+}
+
+/// Target designated by the `get_norm` arguments, whichever door was used.
 #[derive(Debug, PartialEq, Eq)]
 enum LawTarget {
     Article {
+        juris: Option<String>,
         code: String,
         num: String,
     },
     /// Text named without an article, served whole when it carries none.
     Root {
+        juris: Option<String>,
         code: String,
     },
     Section {
+        juris: Option<String>,
+        code: String,
+        path: String,
+    },
+    /// The `…/section/{cid}` form of our own urls.
+    SectionOf {
+        juris: Option<String>,
         code: String,
         cid: String,
     },
-    /// Légifrance article id, resolved against the database.
+    /// Légifrance ids, resolved against the database.
     SourceUid(String),
+    TextUid(String),
+    SectionCid(String),
 }
 
 /// The schema announces only the first of each line; the others are what callers
@@ -1341,51 +1386,69 @@ fn arg_str<'a>(args: &'a Value, keys: &[&'static str]) -> Option<(&'static str, 
     })
 }
 
-/// A Légifrance article id is recognised by its shape, not by the key carrying
-/// it: callers put it in `textId` as readily as in `url`.
-fn is_legiarti(value: &str) -> bool {
-    value
-        .strip_prefix("LEGIARTI")
-        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-}
-
 fn law_target(args: &Value) -> Result<LawTarget, RpcError> {
     let url = arg_str(args, &["url"]);
     let id = arg_str(args, &ID_KEYS);
-    if let Some((key, value)) = [url, id]
-        .into_iter()
-        .flatten()
-        .find(|(_, v)| is_legiarti(v))
-    {
+    // Our own section urls carry their LEGISCTA: the url parser reads them.
+    let ours = |v: &str| v.contains("/norm/") || v.contains("/texte/") || v.contains("/loi/");
+    if let Some((key, kind, id)) = [url, id].into_iter().flatten().find_map(|(k, v)| {
+        crate::legi::legifrance_id(v)
+            .filter(|(kind, _)| *kind == crate::legi::IdKind::Article || k != "url" || !ours(v))
+            .map(|(kind, id)| (k, kind, id))
+    }) {
         relaxed_key(key, "textId");
-        return Ok(LawTarget::SourceUid(value.to_string()));
+        let id = id.to_string();
+        return Ok(match kind {
+            crate::legi::IdKind::Article => LawTarget::SourceUid(id),
+            crate::legi::IdKind::Section => LawTarget::SectionCid(id),
+            crate::legi::IdKind::Text => LawTarget::TextUid(id),
+        });
     }
     if let Some((_, url)) = url {
         return match split_article_url(url) {
-            Some((code, Some(reste))) => Ok(match reste.strip_prefix("section/") {
-                Some(cid) => LawTarget::Section {
-                    code: code.to_string(),
-                    cid: cid.to_string(),
-                },
-                None => LawTarget::Article {
-                    code: code.to_string(),
-                    num: reste.split('/').next().unwrap_or(reste).to_string(),
-                },
-            }),
-            Some((code, None)) => Ok(LawTarget::Root {
+            Some((juris, code, Some(reste))) => {
+                let juris = juris.map(str::to_string);
+                let code = code.to_string();
+                let reste = reste.split(['?', '#']).next().unwrap_or(reste);
+                let segs: Vec<&str> = reste.split('/').filter(|s| !s.is_empty()).collect();
+                Ok(match segs.as_slice() {
+                    ["section", cid] => LawTarget::SectionOf {
+                        juris,
+                        code,
+                        cid: (*cid).to_string(),
+                    },
+                    [num] | [num, "compare", ..] => LawTarget::Article {
+                        juris,
+                        code,
+                        num: (*num).to_string(),
+                    },
+                    [num, date] if is_iso_date(date) => LawTarget::Article {
+                        juris,
+                        code,
+                        num: (*num).to_string(),
+                    },
+                    _ => LawTarget::Section {
+                        juris,
+                        code,
+                        path: segs.join("/"),
+                    },
+                })
+            }
+            Some((juris, code, None)) => Ok(LawTarget::Root {
+                juris: juris.map(str::to_string),
                 code: code.to_string(),
             }),
             None => Err(RpcError::invalid_params(format!(
-                "not an article url (expected …/texte/{{code}}/{{article}}): {url}"
+                "not an article url (expected …/norm/{{jurisdiction}}/{{code}}/{{article}}): {url}"
             ))),
         };
     }
     let Some((code_key, code)) = arg_str(args, &CODE_KEYS) else {
         return Err(
             RpcError::invalid_params("missing tool argument: url").with_hint(
-                "Address the article by url — /texte/{code-slug}/{article-key}, e.g. \
-             {\"url\": \"/texte/code-civil/1240\"} — or by the pair {code, article}. \
-             A LEGIARTI id works too; LEGITEXT and CID do not.",
+                "Address the article by url, /texte/{jurisdiction}/{code-slug}/{article-key}, \
+             e.g. {\"url\": \"/norm/fr/code-civil/1240\"}, or by the pair {code, article}. \
+             A Légifrance id works too (LEGIARTI, LEGITEXT, LEGISCTA…).",
             ),
         );
     };
@@ -1394,11 +1457,13 @@ fn law_target(args: &Value) -> Result<LawTarget, RpcError> {
         Some((article_key, num)) => {
             relaxed_key(article_key, "article");
             Ok(LawTarget::Article {
+                juris: None,
                 code: code.to_string(),
                 num: num.to_string(),
             })
         }
         None => Ok(LawTarget::Root {
+            juris: None,
             code: code.to_string(),
         }),
     }
@@ -1409,7 +1474,7 @@ fn relaxed_key(used: &'static str, canonical: &'static str) {
         tracing::warn!(
             librejustice.mcp.relaxed_field = canonical,
             librejustice.mcp.relaxed_value = used,
-            "mcp: argument de get_legal_text rattrapé sur son orthographe de schéma"
+            "mcp: get_norm argument recovered from its schema spelling"
         );
     }
 }
@@ -1437,25 +1502,79 @@ fn required_str(args: &Value, key: &str) -> Result<String, RpcError> {
 /// bare `not_found`, which sends the caller correcting a key that is right.
 /// 944,382 fiches of the 1,335,851 of the catalogue carry neither body nor
 /// article, so the second case is the common one.
-async fn article_not_found(state: &AppState, code: &str) -> RpcError {
-    match crate::legi::code_summary(state, code).await {
-        Ok(s) if s.article_count == 0 && s.body.is_none() => RpcError::not_found(format!(
+/// Keys handed back with an absent one. Twenty fit a hint and a caller walking a
+/// numbering it invented, and the whole numbering of a code does not: 6,663
+/// articles in force at the CGCT on 10/09/2026.
+const NEAR_KEYS_MAX: i64 = 20;
+
+/// Which of the two halves failed, named where it is known: 19 of the 85
+/// `get_norm` errors of the week of 08/09/2026 were a bare « law article or
+/// code not found », which names neither and sends the caller correcting the half
+/// that was right.
+async fn unknown_code(state: &AppState, code: &str) -> RpcError {
+    let Ok(conn) = state.pool.get().await else {
+        return map_legi_error(ApiError::NotFound);
+    };
+    let repo = lj_store::repository::DecisionRepository::new(&conn);
+    let candidates = repo.suggest_instruments(code, 5).await.unwrap_or_default();
+    RpcError::not_found(unknown_instrument_msg("code", code, &candidates)).with_hint(
+        "The code half of the call is what failed, not the article. Take a slug from \
+         search_norms, or compose the url as /texte/{code-slug}/{article-key}.",
+    )
+}
+
+fn no_such_article(titre: &str, num: &str) -> RpcError {
+    RpcError::not_found(format!("\"{titre}\" holds no article \"{num}\"")).with_hint(
+        "The code resolved, the article key did not. Read the index with get_norm \
+         on the code alone, or take the key from a citation link of a decision.",
+    )
+}
+
+async fn article_not_found(
+    state: &AppState,
+    code: &str,
+    juris: Option<&str>,
+    num: &str,
+) -> RpcError {
+    let Ok(s) = crate::legi::code_summary(state, code, juris).await else {
+        return unknown_code(state, code).await;
+    };
+    if s.article_count == 0 && s.body.is_none() {
+        return RpcError::not_found(format!(
             "\"{}\" is in the catalogue with no text: we hold its identity, not its articles",
             s.titre
         ))
         .with_hint(
             "Nothing to fix in the call, the article is nowhere to be read here. \
              Its official publisher carries the text.",
-        ),
-        _ => map_legi_error(ApiError::NotFound),
+        );
     }
+    let Ok((near, total)) =
+        crate::legi::article_keys_near(state, &s.legitext, num, NEAR_KEYS_MAX).await
+    else {
+        return no_such_article(&s.titre, num);
+    };
+    if near.is_empty() {
+        return no_such_article(&s.titre, num);
+    }
+    let keys: Vec<&str> = near.iter().map(|(k, _)| k.as_str()).collect();
+    let texte = lj_vocab::norm_path(&s.jurisdiction, &s.code);
+    RpcError::not_found(format!(
+        "no article \"{num}\" in \"{}\", which holds {total} in force",
+        s.titre
+    ))
+    .with_hint(format!(
+        "Closest keys held: {}. Address one of them as {texte}/{{key}}, or \
+         call get_norm on {texte} for the table of contents.",
+        keys.join(", ")
+    ))
 }
 
 fn map_legi_error(e: ApiError) -> RpcError {
     match e {
         ApiError::TooManyRequests => RpcError::rate_limited(),
         ApiError::NotFound => RpcError::not_found("law article or code not found").with_hint(
-            "Find the article with search_legal_texts, or compose the url as \
+            "Find the article with search_norms, or compose the url as \
              /texte/{code-slug}/{article-key} (lowercase key: \"l761-1\" for L. 761-1).",
         ),
         ApiError::NoVersionAtDate(msg) => RpcError::not_found(msg).with_hint(
@@ -1481,7 +1600,7 @@ fn build_search_request(args: &Value) -> Result<lj_dtos::SearchRequest, RpcError
     // Server-side parity with the `additionalProperties: false` the schema
     // announces: an unknown filter silently ignored would skew the search with no
     // signal.
-    const FIELDS: [&str; 18] = [
+    const FIELDS: [&str; 17] = [
         "query",
         "jurisdiction_type",
         "solution",
@@ -1489,9 +1608,6 @@ fn build_search_request(args: &Value) -> Result<lj_dtos::SearchRequest, RpcError
         "office",
         "legal_domain",
         "jurisdiction_code",
-        // Outside the published schema, still accepted: rewritten into
-        // `legal_domain` by [`rewrite_legacy_matiere`].
-        "matiere",
         "seat",
         "legal_instrument",
         "legal_article",
@@ -1505,10 +1621,14 @@ fn build_search_request(args: &Value) -> Result<lj_dtos::SearchRequest, RpcError
     ];
     if let Some(obj) = args.as_object() {
         if let Some(unknown) = obj.keys().find(|k| !FIELDS.contains(&k.as_str())) {
-            return Err(RpcError::invalid_params(format!(
+            let refus = RpcError::invalid_params(format!(
                 "unknown field '{unknown}'; valid fields: {}",
                 FIELDS.join(", ")
-            )));
+            ));
+            return Err(match moved_field_hint(unknown) {
+                Some(hint) => refus.with_hint(hint),
+                None => refus,
+            });
         }
     }
     let query = args
@@ -1575,6 +1695,30 @@ fn parse_mcp_date(field: &str, s: &str) -> Result<chrono::NaiveDate, RpcError> {
     })
 }
 
+/// Where the intention of a field callers keep writing lives now. Without it the
+/// refusal only lists the 17 valid names, and two recoveries out of three over 02
+/// to 07/09/2026 widened the search rather than moved the filter.
+fn moved_field_hint(field: &str) -> Option<&'static str> {
+    match field {
+        "chamber" | "jurisdiction_name" => Some(
+            "A court or a room is a path in `seat`, e.g. \
+             {\"seat\": [\"CA.PARIS\", \"CC.COMMERCIALE\", \"CA.DOUAI.C7\"]}, \
+             taken from facets.seat.",
+        ),
+        "docketNumber" => Some(
+            "A docket number is searched as text: put it in `query`, quoted, \
+             e.g. {\"query\": \"\\\"17/00302\\\"\"}.",
+        ),
+        "significance" => Some(
+            "Publication standing is `publication`, \
+             e.g. {\"publication\": [\"PUBLIE_BULLETIN\", \"PUBLIE_LEBON\"]}.",
+        ),
+        "max_results" => Some("The size of the shortlist is `limit`."),
+        "dateEnd" => Some("The date window is `date_from` and `date_to`, in ISO form."),
+        _ => None,
+    }
+}
+
 /// One hint for every list field, whatever the cause of the rejection. It says
 /// two things no value message says: that several values combine at once, where
 /// "expected one of" reads as "only one", and the shape of the call. `examples`
@@ -1618,14 +1762,24 @@ fn deser_list<T: serde::de::DeserializeOwned>(
     let Some(value) = args.get(key).filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-    let coerced = (!value.is_array()).then(|| json!([value]));
+    let coerced = match value {
+        Value::Array(_) => None,
+        // A client that serialises its list before handing it over sends
+        // `"[\"CE\",\"CAA\"]"`: 5 refusals in 22 s on 07/09/2026, then the same
+        // searches with no filter at all.
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .filter(Value::is_array)
+            .or_else(|| Some(json!([value]))),
+        _ => Some(json!([value])),
+    };
     match serde_json::from_value(coerced.clone().unwrap_or_else(|| value.clone())) {
         Ok(parsed) => {
             if coerced.is_some() {
                 tracing::warn!(
                     librejustice.mcp.coerced_arg = key,
                     librejustice.mcp.coerced_value = %value,
-                    "mcp: scalaire accepté comme tableau singleton"
+                    "mcp: scalar accepted as an array"
                 );
             }
             Ok(Some(parsed))
@@ -1655,9 +1809,9 @@ fn deser_field<T: serde::de::DeserializeOwned>(
 
 // ── Tools: the annonces fund, not published ──────────────────────────────────
 
-/// The five published tools carry one definition, in `lj_dtos::mcp_tools`.
+/// The five published tools carry one definition, in `lj_mcp_tools`.
 fn tool_definitions() -> Vec<Value> {
-    let mut tools = lj_dtos::mcp_tools::tool_definitions();
+    let mut tools = lj_mcp_tools::tool_definitions();
     if PUBLISH_SEARCH_ANNONCES {
         tools.push(json!({
             "name": "search_annonces",
@@ -1698,10 +1852,10 @@ fn search_annonces_schema() -> Value {
                 "items": enum_values(&FONDS),
                 "description": "Which body of public notices to search. \"marche\": open public tenders, aggregated from the BOAMP and 8 buyer platforms, with a bid deadline. \"bodacc\": BODACC company notices (insolvency proceedings, incorporations, sales, filings) served live from the official API — no deadline. \"joafe\": Journal officiel des associations notices (creations, modifications, dissolutions), live too — no deadline. Omit to search all three, returned in separate groups.",
             },
-            "departement": {
+            "zone": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "French département codes: \"75\", \"2A\", \"973\". Several codes are OR'd. Reuse the keys of facets.departement.",
+                "description": "Where the market applies: a département code (\"75\", \"2A\", \"973\"), \"fr\" nationwide, \"ue\" Europe-wide. Several are OR'd.",
             },
             "nature": {
                 "type": "array",
@@ -1711,7 +1865,7 @@ fn search_annonces_schema() -> Value {
             "cpv": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "CPV divisions, two digits (\"45\" construction works, \"72\" IT services, \"85\" health). Reuse the keys of facets.cpv.",
+                "description": "CPV divisions, two digits (\"45\" construction works, \"72\" IT services, \"85\" health).",
             },
             "closing_within_days": nullable(
                 json!({"type": "integer", "minimum": 1, "maximum": 365}),
@@ -1743,12 +1897,13 @@ fn search_annonces_output_schema() -> Value {
                     "required": ["title", "fund", "actor", "actorRole", "url", "platformUrl", "published", "channels"],
                     "properties": {
                         "title": {"type": "string"},
+                        "description": nullable(json!({"type": "string"}), json!({})),
                         "fund": {"type": "string", "description": "Body this notice comes from: \"marche\" or \"bodacc\"."},
                         "actor": {"type": "string", "description": "Who the notice is about: the buyer of a tender, the company of a BODACC notice."},
                         "actorRole": {"type": "string", "description": "What that body calls this actor (\"Acheteur\", \"Entreprise\")."},
-                        "url": {"type": "string", "description": "Page to hand to the user: the LibreJustice tender page (/marche/…), or the official notice page for bodies served live."},
+                        "url": {"type": "string", "description": "Page to hand to the user: the LibreJustice tender page (/notice/fr/…), or the official notice page for bodies served live."},
                         "platformUrl": {"type": "string", "description": "Buyer's platform page: where the dossier is downloaded and the bid is filed. Not openable by an MCP tool."},
-                        "departement": nullable(json!({"type": "string"}), json!({})),
+                        "zones": {"type": "array", "items": {"type": "string"}},
                         "nature": nullable(json!({"type": "string"}), json!({})),
                         "cpv": nullable(json!({"type": "string"}), json!({})),
                         "deadline": nullable(json!({"type": "string"}), json!({"description": "Bid deadline, RFC 3339. Absent = no source publishes one."})),
@@ -1790,60 +1945,6 @@ open », not « who won ».";
 mod tests {
     use super::*;
 
-    /// `matiere` is out of the schema and still served: translated to a subject,
-    /// announced, and refused with a fix when the value names no subject.
-    #[test]
-    fn le_filtre_matiere_retire_se_traduit_en_domaine() {
-        let mut req = build_search_request(&json!({"query": "OQTF"})).unwrap();
-        let notice = rewrite_legacy_matiere(&json!({"matiere": ["ETRANGERS"]}), &mut req)
-            .unwrap()
-            .expect("la réécriture s'annonce");
-        assert_eq!(
-            req.legal_domain,
-            Some(vec![Domain::PublicDroitEtrangersNationalite])
-        );
-        assert!(notice.contains("matiere"));
-        assert!(notice.contains("PUBLIC_DROIT_ETRANGERS_NATIONALITE"));
-
-        let mut req = build_search_request(&json!({"query": "x"})).unwrap();
-        rewrite_legacy_matiere(&json!({"matiere": ["ETRANGERS", "NATIONALITE"]}), &mut req)
-            .unwrap();
-        assert_eq!(
-            req.legal_domain,
-            Some(vec![Domain::PublicDroitEtrangersNationalite])
-        );
-    }
-
-    #[test]
-    fn un_legal_domain_pose_garde_la_main_sur_la_matiere() {
-        let args = json!({"query": "x", "legal_domain": ["CIVIL_DROIT_LOCATIF"], "matiere": ["ETRANGERS"]});
-        let mut req = build_search_request(&args).unwrap();
-        let notice = rewrite_legacy_matiere(&args, &mut req).unwrap().unwrap();
-        assert_eq!(req.legal_domain, Some(vec![Domain::CivilDroitLocatif]));
-        assert!(notice.contains("dropped"));
-    }
-
-    #[test]
-    fn une_matiere_qui_ne_nommait_pas_un_sujet_rend_un_correctif() {
-        let mut req = build_search_request(&json!({"query": "x"})).unwrap();
-        for value in ["URGENCES", "CONSEIL", "PROXIMITE", "PAS_UNE_VALEUR"] {
-            let err = rewrite_legacy_matiere(&json!({"matiere": [value]}), &mut req).unwrap_err();
-            assert_eq!(err.code, -32602);
-            assert!(err.hint.as_deref().unwrap().contains("legal_domain"));
-        }
-        assert_eq!(req.legal_domain, None);
-    }
-
-    #[test]
-    fn la_table_de_traduction_couvre_le_vocabulaire_retire() {
-        assert_eq!(MATIERE_VERS_DOMAINE.len(), 24);
-        for (_, cible) in MATIERE_VERS_DOMAINE {
-            if let Some(d) = cible {
-                assert!(Domain::ALL.contains(&d));
-            }
-        }
-    }
-
     #[test]
     fn tool_list_exposes_all_tools() {
         let tools = tool_definitions();
@@ -1853,9 +1954,8 @@ mod tests {
             vec![
                 "search_decisions",
                 "get_decision",
-                "list_my_activity",
-                "get_legal_text",
-                "search_legal_texts",
+                "get_norm",
+                "search_norms",
             ]
         );
     }
@@ -1920,6 +2020,25 @@ mod tests {
         assert_eq!(
             req.jurisdiction_type,
             Some(vec![lj_dtos::JurisdictionType::Ca])
+        );
+    }
+
+    /// A list the client serialised before handing it over: the whole filter was
+    /// refused, and the retry dropped it.
+    #[test]
+    fn build_request_reads_a_list_serialised_into_a_string() {
+        let req = build_search_request(&json!({
+            "query": "impôt",
+            "jurisdiction_type": "[\"CE\",\"CAA\",\"TA\"]",
+        }))
+        .unwrap();
+        assert_eq!(
+            req.jurisdiction_type,
+            Some(vec![
+                lj_dtos::JurisdictionType::Ce,
+                lj_dtos::JurisdictionType::Caa,
+                lj_dtos::JurisdictionType::Ta,
+            ])
         );
     }
 
@@ -2011,35 +2130,45 @@ mod tests {
             "ca_aix-en-provence".to_string(),
             "ca_aix_en_provence".to_string(),
             "ca-nulle-part".to_string(),
+            "CA_AIX_EN_PROVENCE".to_string(),
+            "CA.AIX_EN_PROVENCE".to_string(),
         ];
         relax_jurisdiction_codes(&mut codes, &refs);
         assert_eq!(codes[0], "ca_aix_en_provence");
         assert_eq!(codes[1], "ca_aix_en_provence");
         assert_eq!(codes[2], "ca-nulle-part");
+        assert_eq!(codes[3], "ca_aix_en_provence");
+        assert_eq!(codes[4], "ca_aix_en_provence");
     }
 
     /// The four shapes collected from the `missing tool argument: url` errors,
     /// plus the text root and the Légifrance id.
     #[test]
     fn law_target_lit_les_portes_observees() {
-        let article = |code: &str, num: &str| LawTarget::Article {
+        let article = |juris: Option<&str>, code: &str, num: &str| LawTarget::Article {
+            juris: juris.map(str::to_string),
             code: code.into(),
             num: num.into(),
         };
         assert_eq!(
+            law_target(&json!({"url": "/norm/fr/code-civil/1240"})).unwrap(),
+            article(Some("FR"), "code-civil", "1240")
+        );
+        // L'ancienne forme, sans segment, résout encore.
+        assert_eq!(
             law_target(&json!({"url": "/texte/code-civil/1240"})).unwrap(),
-            article("code-civil", "1240")
+            article(None, "code-civil", "1240")
         );
         assert_eq!(
             law_target(
                 &json!({"code_name": "code-de-procedure-penale", "article_number": "706-88"})
             )
             .unwrap(),
-            article("code-de-procedure-penale", "706-88")
+            article(None, "code-de-procedure-penale", "706-88")
         );
         assert_eq!(
             law_target(&json!({"code": "code-civil", "article": "1240"})).unwrap(),
-            article("code-civil", "1240")
+            article(None, "code-civil", "1240")
         );
         assert_eq!(
             law_target(&json!({"textId": "LEGIARTI000048784916"})).unwrap(),
@@ -2049,38 +2178,96 @@ mod tests {
             law_target(&json!({"url": "LEGIARTI000048784916"})).unwrap(),
             LawTarget::SourceUid("LEGIARTI000048784916".into())
         );
+        // The permalink a caller pastes, which used to be refused whole.
+        assert_eq!(
+            law_target(&json!({
+                "url": "https://www.legifrance.gouv.fr/codes/article_lc/LEGIARTI000052014018"
+            }))
+            .unwrap(),
+            LawTarget::SourceUid("LEGIARTI000052014018".into())
+        );
+        // The digit run bounds the id: neither a dated suffix nor a query enters it.
+        assert_eq!(
+            law_target(&json!({
+                "url": "https://www.legifrance.gouv.fr/codes/article_lc/LEGIARTI000006419282/2024-01-01?x=1"
+            }))
+            .unwrap(),
+            LawTarget::SourceUid("LEGIARTI000006419282".into())
+        );
+        assert_eq!(
+            law_target(&json!({"textId": "LEGITEXT000006070721"})).unwrap(),
+            LawTarget::TextUid("LEGITEXT000006070721".into())
+        );
+        assert_eq!(
+            law_target(&json!({"textId": "KALIARTI000044253023"})).unwrap(),
+            LawTarget::SourceUid("KALIARTI000044253023".into())
+        );
+        // A permalink names the text first: the article it carries wins.
+        assert_eq!(
+            law_target(&json!({
+                "url": "https://www.legifrance.gouv.fr/codes/id/LEGITEXT000033555730/LEGIARTI000033555747/"
+            }))
+            .unwrap(),
+            LawTarget::SourceUid("LEGIARTI000033555747".into())
+        );
+        assert_eq!(
+            law_target(&json!({
+                "url": "https://www.legifrance.gouv.fr/codes/section_lc/LEGITEXT000006070721/LEGISCTA000006136059/"
+            }))
+            .unwrap(),
+            LawTarget::SectionCid("LEGISCTA000006136059".into())
+        );
         assert_eq!(
             law_target(&json!({"code": "circulaire-x", "query": "séjour"})).unwrap(),
             LawTarget::Root {
+                juris: None,
                 code: "circulaire-x".into()
             }
         );
         assert_eq!(
-            law_target(&json!({"url": "https://librejustice.fr/texte/code-du-travail"})).unwrap(),
+            law_target(&json!({"url": "https://librejustice.fr/norm/fr/code-du-travail"})).unwrap(),
             LawTarget::Root {
+                juris: Some("FR".into()),
                 code: "code-du-travail".into()
             }
         );
         assert_eq!(
             law_target(&json!({
-                "url": "https://librejustice.fr/texte/code-du-travail/section/LEGISCTA000006195791"
+                "url": "https://librejustice.fr/norm/fr/code-du-travail/section/LEGISCTA000006195791"
             }))
             .unwrap(),
-            LawTarget::Section {
+            LawTarget::SectionOf {
+                juris: Some("FR".into()),
                 code: "code-du-travail".into(),
                 cid: "LEGISCTA000006195791".into()
             }
         );
         assert_eq!(
-            law_target(&json!({"url": "/texte/code-civil/1240/2016-09-05"})).unwrap(),
-            article("code-civil", "1240")
+            law_target(&json!({"url": "https://librejustice.fr/norm/fr/code-civil/livre-i/titre-v?date=2020-01-01"}))
+                .unwrap(),
+            LawTarget::Section {
+                juris: Some("FR".into()),
+                code: "code-civil".into(),
+                path: "livre-i/titre-v".into()
+            }
+        );
+        assert_eq!(
+            law_target(&json!({"url": "/norm/fr/code-civil/1240/compare/2016-10-01/initiale"}))
+                .unwrap(),
+            article(Some("FR"), "code-civil", "1240")
+        );
+        assert_eq!(
+            law_target(&json!({"url": "/norm/fr/code-civil/1240/2016-09-05"})).unwrap(),
+            article(Some("FR"), "code-civil", "1240")
         );
         let err = law_target(&json!({"date": "2026-08-08"})).unwrap_err();
         assert!(err.message.contains("missing tool argument: url"));
         assert!(err.hint.is_some_and(|h| h.contains("{code, article}")));
-        assert!(!is_legiarti("LEGITEXT000006070721"));
-        assert!(!is_legiarti("LEGIARTI"));
-        assert!(is_legiarti("LEGIARTI000006419282"));
+        assert_eq!(crate::legi::legifrance_id("LEGIARTI"), None);
+        assert_eq!(
+            crate::legi::legifrance_id("LEGIARTI000006419282"),
+            Some((crate::legi::IdKind::Article, "LEGIARTI000006419282"))
+        );
     }
 
     #[test]
@@ -2091,6 +2278,82 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.message.contains("jurisdiction_name"));
+
+        let sans_remplacant = build_search_request(&json!({"query": "bail", "couleur": "x"}))
+            .unwrap_err()
+            .hint;
+        assert!(sans_remplacant.is_none(), "{sans_remplacant:?}");
+
+        for (field, replacement) in [
+            ("chamber", "seat"),
+            ("jurisdiction_name", "seat"),
+            ("docketNumber", "query"),
+            ("significance", "publication"),
+            ("max_results", "limit"),
+            ("dateEnd", "date_to"),
+        ] {
+            let err = build_search_request(&json!({"query": "bail", field: "x"})).unwrap_err();
+            let hint = err.hint.unwrap_or_else(|| panic!("hint sur {field}"));
+            assert!(hint.contains(replacement), "{field} : {hint}");
+        }
+    }
+
+    /// The shapes the frozen ChatGPT app actually sends, and the one that has to
+    /// keep failing: the fonds carries no `CC.CIVILE` node.
+    #[test]
+    fn retired_chamber_folds_into_seat_or_does_not_fold() {
+        use lj_store::repository::JurisdictionRow;
+        let refs = crate::referential::Referential::new(
+            vec![],
+            vec![
+                JurisdictionRow {
+                    code: "cc".to_string(),
+                    source_code: "CASS".to_string(),
+                    jurisdiction_type: "CC".to_string(),
+                    city: None,
+                    label: "Cour de cassation".to_string(),
+                },
+                JurisdictionRow {
+                    code: "ca_douai".to_string(),
+                    source_code: "DOUAI".to_string(),
+                    jurisdiction_type: "CA".to_string(),
+                    city: Some("Douai".to_string()),
+                    label: "Cour d'appel de Douai".to_string(),
+                },
+            ],
+            vec![
+                "CC.SOCIALE".to_string(),
+                "CC.COMMERCIALE".to_string(),
+                "CA.DOUAI.C7".to_string(),
+            ],
+        );
+        let folded = |mut args: Value| {
+            fold_retired_chamber(&mut args, &refs);
+            args
+        };
+
+        assert_eq!(
+            folded(json!({"query": "q", "jurisdiction_type": ["CC"], "chamber": ["SOCIALE"]})),
+            json!({"query": "q", "jurisdiction_type": ["CC"], "seat": ["CC.SOCIALE"]})
+        );
+        assert_eq!(
+            folded(json!({"query": "q", "jurisdiction_code": ["cc"], "chamber": ["COMMERCIALE"]})),
+            json!({"query": "q", "jurisdiction_code": ["cc"], "seat": ["CC.COMMERCIALE"]})
+        );
+        assert_eq!(
+            folded(json!({"query": "q", "jurisdiction_code": ["ca_douai"], "chamber": ["7"]})),
+            json!({"query": "q", "jurisdiction_code": ["ca_douai"], "seat": ["CA.DOUAI.C7"]})
+        );
+
+        let kept = json!({"query": "q", "jurisdiction_type": ["CC"], "chamber": ["COMMERCIALE", "CIVILE"]});
+        assert_eq!(folded(kept.clone()), kept);
+        assert!(build_search_request(&kept)
+            .unwrap_err()
+            .message
+            .contains("chamber"));
+
+        let no_court = json!({"query": "q", "chamber": ["SOCIALE"]});
+        assert_eq!(folded(no_court.clone()), no_court);
     }
 
     #[test]
@@ -2112,11 +2375,6 @@ mod tests {
         assert_eq!(body["category"], json!("internal"));
         assert_eq!(body["retryable"], json!(true));
         assert!(body.get("hint").is_none());
-
-        let auth = tool_error_content(&RpcError::auth("authentication required"));
-        let body: Value =
-            serde_json::from_str(auth["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(body["category"], json!("auth"));
     }
 
     /// A root combinator in an `inputSchema` makes the client drop the tool, with
@@ -2178,28 +2436,52 @@ mod tests {
     #[test]
     fn article_url_accepts_absolute_relative_legacy_and_bare_path() {
         use super::split_article_url as split;
-        let civ = Some(("code-civil", Some("1240")));
+        let civ = Some((None, "code-civil", Some("1240")));
         assert_eq!(split("https://librejustice.fr/texte/code-civil/1240"), civ);
         assert_eq!(split("/texte/code-civil/1240"), civ);
         assert_eq!(split("/loi/code-civil/1240"), civ);
         assert_eq!(split("code-civil/1240"), civ);
         assert_eq!(split("code-civil/1240/"), civ);
 
+        // The jurisdiction segment, on the same doors.
+        let fr = Some((Some("FR"), "code-civil", Some("1240")));
+        assert_eq!(split("https://librejustice.fr/norm/fr/code-civil/1240"), fr);
+        assert_eq!(split("/norm/fr/code-civil/1240"), fr);
+        assert_eq!(split("/texte/fr/code-civil/1240"), fr);
+        assert_eq!(
+            split("/norm/be/nouveau-code-civil"),
+            Some((Some("BE"), "nouveau-code-civil", None))
+        );
+
         assert_eq!(
             split("/texte/code-du-travail"),
-            Some(("code-du-travail", None))
+            Some((None, "code-du-travail", None))
         );
-        assert_eq!(split("code-du-travail"), Some(("code-du-travail", None)));
+        assert_eq!(
+            split("code-du-travail"),
+            Some((None, "code-du-travail", None))
+        );
 
-        assert_eq!(split("https://librejustice.fr/decision/abc"), None);
-        assert_eq!(split("/texte/"), None);
+        assert_eq!(split("https://librejustice.fr/decision/fr/abc"), None);
+        assert_eq!(split("/norm/"), None);
         assert_eq!(split(""), None);
+        // A jurisdiction segment on its own names no text.
+        assert_eq!(split("/norm/fr"), None);
     }
 
     #[test]
     fn initialize_carries_protocol_and_instructions() {
-        let res = initialize_result();
-        assert_eq!(res["protocolVersion"], json!(PROTOCOL_VERSION));
+        let res = initialize_result(&json!({"protocolVersion": "2025-06-18"}));
+        assert_eq!(res["protocolVersion"], json!("2025-06-18"));
+        let newest = initialize_result(&json!({"protocolVersion": "1.0.0"}));
+        assert_eq!(
+            newest["protocolVersion"],
+            json!(lj_mcp_tools::PROTOCOL_VERSIONS[0])
+        );
+        assert_eq!(
+            initialize_result(&json!(null))["protocolVersion"],
+            newest["protocolVersion"]
+        );
         assert_eq!(res["serverInfo"]["name"], json!(SERVER_NAME));
         assert!(res["instructions"]
             .as_str()

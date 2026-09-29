@@ -1,7 +1,5 @@
 //! Seat of a formation in the organigram of its jurisdiction: the stored datum
-//! (`decisions.seat`), starting at level 0, the jurisdiction itself. The legacy
-//! key (`decisions.chamber_key`) names it WITHIN ITS COURT only: its structural
-//! slots (`C2`, `P1.C11`), its bare speciality otherwise (`SOCIALE`).
+//! (`decisions.seat`), starting at level 0, the jurisdiction itself.
 
 use serde::de::{value::StrDeserializer, IntoDeserializer};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -431,65 +429,6 @@ impl Seat {
             && self.joined.is_none()
     }
 
-    /// Canonical stored key, `None` when nothing was located nor named. The
-    /// speciality holds a slot of its own: without it two rooms the registry
-    /// tells apart share one key.
-    pub fn key(&self) -> Option<String> {
-        let mut segs: Vec<String> = Vec::new();
-        match self.container {
-            Some(Container::Pole(n)) => segs.push(format!("P{n}")),
-            Some(Container::Section(n)) => segs.push(format!("SC{n}")),
-            None => {}
-        }
-        match self.chamber {
-            Some(ChamberId::Number(n)) => segs.push(format!("C{n}")),
-            Some(ChamberId::Letter(l)) => segs.push(format!("C{l}")),
-            Some(ChamberId::Composed(a, b)) => segs.push(format!("C{a}-{b}")),
-            None => {}
-        }
-        if let Some(&uid) = self.specialty.first() {
-            segs.push(suffix(uid).to_string());
-        }
-        if let Some(n) = self.section {
-            segs.push(format!("S{n}"));
-        }
-        if let Some(l) = self.letter {
-            segs.push(format!("L{l}"));
-        }
-        match &self.joined {
-            Some(Joined::SubSections(v)) => segs.push(format!("Q{}", join(&sorted(v), '-'))),
-            Some(Joined::Chambers(v)) => segs.push(format!("R{}", join(&sorted(v), '-'))),
-            None => {}
-        }
-        (!segs.is_empty()).then(|| segs.join("."))
-    }
-
-    /// Relecture d'une clé, `None` hors grammaire. La clé relue se réémet à
-    /// l'identique : une graphie non canonique est refusée, jamais absorbée.
-    pub fn parse(key: &str) -> Option<Seat> {
-        let mut s = Seat::default();
-        for seg in key.split('.') {
-            // Untagged segment, read before the tags: `CIVILE` would otherwise
-            // be cut as the `C` slot.
-            if let Some(uid) = static_specialty(seg) {
-                s.specialty.is_empty().then(|| s.specialty.push(uid))?;
-                continue;
-            }
-            let (tag, payload) = split_tag(seg)?;
-            match tag {
-                "P" => place(&mut s.container, Container::Pole(number(payload)?))?,
-                "SC" => place(&mut s.container, Container::Section(number(payload)?))?,
-                "C" => place(&mut s.chamber, chamber_payload(payload)?)?,
-                "S" => place(&mut s.section, number(payload)?)?,
-                "L" => place(&mut s.letter, letter(payload)?)?,
-                "Q" => place(&mut s.joined, Joined::SubSections(number_list(payload)?))?,
-                "R" => place(&mut s.joined, Joined::Chambers(number_list(payload)?))?,
-                _ => return None,
-            }
-        }
-        (s.key().as_deref() == Some(key)).then_some(s)
-    }
-
     /// Libellé affichable, fonction totale des emplacements.
     pub fn label(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
@@ -674,32 +613,11 @@ fn lowercase_first(s: &str) -> String {
     }
 }
 
-fn place<T>(slot: &mut Option<T>, value: T) -> Option<()> {
-    slot.is_none().then(|| *slot = Some(value))
-}
-
-/// Tag d'emplacement et sa charge utile. Les tags se testent du plus long au
-/// plus court, `SC` primant sur `S`.
-fn split_tag(seg: &str) -> Option<(&str, &str)> {
-    ["SC", "P", "C", "S", "L", "Q", "R"]
-        .into_iter()
-        .find_map(|tag| {
-            seg.strip_prefix(tag)
-                .filter(|r| !r.is_empty())
-                .map(|r| (tag, r))
-        })
-}
-
 fn number(s: &str) -> Option<u32> {
     (s.len() <= 2 && s.bytes().all(|b| b.is_ascii_digit()))
         .then(|| s.parse().ok())
         .flatten()
         .filter(|n| *n > 0)
-}
-
-fn number_list(s: &str) -> Option<Vec<u32>> {
-    let v: Option<Vec<u32>> = s.split('-').map(number).collect();
-    v.filter(|v| !v.is_empty())
 }
 
 fn chamber_payload(s: &str) -> Option<ChamberId> {
@@ -779,16 +697,6 @@ pub fn read_matters(mut rest: &str) -> Option<Vec<&'static str>> {
     (!uids.is_empty()).then_some(uids)
 }
 
-/// Rendered label of a stored key: the entry point for the API and the ingest,
-/// which handle the key and never the structure.
-pub fn seat_label(key: Option<&str>) -> Option<String> {
-    match key {
-        Some(k) => Seat::parse(k)?,
-        None => Seat::default(),
-    }
-    .label()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +718,14 @@ mod tests {
     fn seat(chamber: ChamberId) -> Seat {
         Seat {
             chamber: Some(chamber),
+            ..Default::default()
+        }
+    }
+
+    fn room(chamber: Option<ChamberId>, specialty: &[&'static str]) -> Seat {
+        Seat {
+            chamber,
+            specialty: specialty.to_vec(),
             ..Default::default()
         }
     }
@@ -1104,7 +1020,6 @@ mod tests {
             numbered.label().as_deref(),
             Some("1re chambre civile et commerciale")
         );
-        assert_eq!(numbered.key().as_deref(), Some("C1.CIVILE"));
         let unnumbered = Seat {
             specialty: vec!["matiere:CIVILE", "matiere:COMMERCIALE"],
             ..at("CA")
@@ -1127,146 +1042,38 @@ mod tests {
     }
 
     #[test]
-    fn la_chambre_nommee_prend_la_cle_de_sa_specialisation() {
+    fn an_unnumbered_room_is_named_by_its_matter() {
         let nommee = Seat {
             specialty: vec!["matiere:SOCIALE"],
             ..Default::default()
         };
-        assert_eq!(nommee.key().as_deref(), Some("SOCIALE"));
-        assert_eq!(
-            seat_label(Some("SOCIALE")).as_deref(),
-            Some("Chambre sociale")
-        );
-        assert_eq!(Seat::default().key(), None);
+        assert_eq!(nommee.label().as_deref(), Some("Chambre sociale"));
+        assert_eq!(Seat::default().label(), None);
     }
 
     #[test]
-    fn la_specialisation_tient_dans_la_cle_a_cote_de_la_position() {
+    fn the_matter_qualifies_the_numbered_room() {
         let deuxieme = Seat {
             chamber: Some(ChamberId::Number(2)),
             specialty: vec!["matiere:CIVILE"],
             ..Default::default()
         };
-        assert_eq!(deuxieme.key().as_deref(), Some("C2.CIVILE"));
-        assert_eq!(
-            seat_label(Some("C2.CIVILE")).as_deref(),
-            Some("2e chambre civile")
-        );
+        assert_eq!(deuxieme.label().as_deref(), Some("2e chambre civile"));
         let sociale = Seat {
             chamber: Some(ChamberId::Number(2)),
             specialty: vec!["matiere:SOCIALE"],
             ..Default::default()
         };
-        assert_ne!(deuxieme.key(), sociale.key());
-        assert_eq!(seat_label(Some("C2")).as_deref(), Some("2e chambre"));
+        assert_ne!(deuxieme, sociale);
+        assert_eq!(sociale.label().as_deref(), Some("2e chambre sociale"));
+        let nue = Seat {
+            chamber: Some(ChamberId::Number(2)),
+            ..Default::default()
+        };
+        assert_eq!(nue.label().as_deref(), Some("2e chambre"));
     }
 
-    #[test]
-    fn la_cle_fait_aller_retour() {
-        let cas = [
-            (seat(ChamberId::Number(2)), "C2"),
-            (seat(ChamberId::Letter('D')), "CD"),
-            (seat(ChamberId::Composed(4, 7)), "C4-7"),
-            (
-                Seat {
-                    chamber: Some(ChamberId::Number(2)),
-                    section: Some(1),
-                    ..Default::default()
-                },
-                "C2.S1",
-            ),
-            (
-                Seat {
-                    container: Some(Container::Section(4)),
-                    chamber: Some(ChamberId::Number(1)),
-                    ..Default::default()
-                },
-                "SC4.C1",
-            ),
-            (
-                Seat {
-                    container: Some(Container::Pole(1)),
-                    chamber: Some(ChamberId::Number(11)),
-                    ..Default::default()
-                },
-                "P1.C11",
-            ),
-            (
-                Seat {
-                    container: Some(Container::Pole(2)),
-                    ..Default::default()
-                },
-                "P2",
-            ),
-            (
-                Seat {
-                    section: Some(8),
-                    ..Default::default()
-                },
-                "S8",
-            ),
-            (
-                Seat {
-                    joined: Some(Joined::SubSections(vec![3])),
-                    ..Default::default()
-                },
-                "Q3",
-            ),
-            (
-                Seat {
-                    joined: Some(Joined::SubSections(vec![1, 4])),
-                    ..Default::default()
-                },
-                "Q1-4",
-            ),
-            (
-                Seat {
-                    joined: Some(Joined::Chambers(vec![3, 8])),
-                    ..Default::default()
-                },
-                "R3-8",
-            ),
-            (
-                Seat {
-                    specialty: vec!["matiere:SOCIALE"],
-                    letter: Some('A'),
-                    ..Default::default()
-                },
-                "SOCIALE.LA",
-            ),
-            (
-                Seat {
-                    container: Some(Container::Pole(6)),
-                    chamber: Some(ChamberId::Number(3)),
-                    specialty: vec!["matiere:PROTECTION_SOCIALE"],
-                    letter: Some('B'),
-                    ..Default::default()
-                },
-                "P6.C3.PROTECTION_SOCIALE.LB",
-            ),
-            (
-                Seat {
-                    chamber: Some(ChamberId::Number(5)),
-                    letter: Some('A'),
-                    ..Default::default()
-                },
-                "C5.LA",
-            ),
-            (
-                Seat {
-                    letter: Some('B'),
-                    ..Default::default()
-                },
-                "LB",
-            ),
-        ];
-        for (seat, key) in cas {
-            assert_eq!(seat.key().as_deref(), Some(key), "{seat:?}");
-            assert_eq!(Seat::parse(key).as_ref(), Some(&seat), "{key}");
-        }
-    }
-
-    /// Deux permutations sont la même formation, clé comme libellé.
+    /// Two permutations are one formation, under one label.
     #[test]
     fn les_formations_reunies_sont_un_ensemble() {
         let a = Seat {
@@ -1277,66 +1084,109 @@ mod tests {
             joined: Some(Joined::SubSections(vec![1, 4])),
             ..Default::default()
         };
-        assert_eq!(a.key(), b.key());
         assert_eq!(a.label().as_deref(), Some("Sous-sections 1/4 réunies"));
         assert_eq!(b.label(), a.label());
         let ce = Seat {
             joined: Some(Joined::Chambers(vec![10, 9])),
             ..Default::default()
         };
-        assert_eq!(ce.key().as_deref(), Some("R9-10"));
         assert_eq!(ce.label().as_deref(), Some("Chambres 9/10 réunies"));
     }
 
     #[test]
     fn la_specialisation_accorde_le_libelle_de_la_position() {
         let cas = [
-            ("C2.CIVILE", "2e chambre civile"),
-            ("C2.PROTECTION_SOCIALE", "2e chambre, protection sociale"),
-            ("C1.FAMILLE", "1re chambre de la famille"),
-            ("URGENCES.S4", "Chambre des urgences, 4e section"),
-            ("C4-7.CIVILE", "Chambre 4-7"),
-            ("CD.CIVILE", "Chambre D civile"),
-            ("P1.C11.SOCIALE", "Pôle 1, 11e chambre sociale"),
-            ("SOCIALE", "Chambre sociale"),
+            (
+                room(Some(ChamberId::Number(2)), &["matiere:CIVILE"]),
+                "2e chambre civile",
+            ),
+            (
+                room(Some(ChamberId::Number(2)), &["matiere:PROTECTION_SOCIALE"]),
+                "2e chambre, protection sociale",
+            ),
+            (
+                room(Some(ChamberId::Number(1)), &["matiere:FAMILLE"]),
+                "1re chambre de la famille",
+            ),
+            (
+                Seat {
+                    section: Some(4),
+                    ..room(None, &["matiere:URGENCES"])
+                },
+                "Chambre des urgences, 4e section",
+            ),
+            (
+                room(Some(ChamberId::Composed(4, 7)), &["matiere:CIVILE"]),
+                "Chambre 4-7",
+            ),
+            (
+                room(Some(ChamberId::Letter('D')), &["matiere:CIVILE"]),
+                "Chambre D civile",
+            ),
+            (
+                Seat {
+                    container: Some(Container::Pole(1)),
+                    ..room(Some(ChamberId::Number(11)), &["matiere:SOCIALE"])
+                },
+                "Pôle 1, 11e chambre sociale",
+            ),
+            (room(None, &["matiere:SOCIALE"]), "Chambre sociale"),
         ];
-        for (key, attendu) in cas {
-            assert_eq!(seat_label(Some(key)).as_deref(), Some(attendu), "{key}");
+        for (seat, attendu) in cas {
+            assert_eq!(seat.label().as_deref(), Some(attendu), "{seat:?}");
         }
-        assert_eq!(seat_label(None), None);
     }
 
     #[test]
     fn les_emplacements_se_remplissent_librement() {
         let cas = [
-            ("P5.C6", "Pôle 5, 6e chambre"),
-            ("SC4.C1", "4e section, 1re chambre"),
-            ("C2.S1", "2e chambre, 1re section"),
-            ("S9.LD", "9e section D"),
-            ("LB", "Section B"),
-            ("CD", "Chambre D"),
-            ("Q3", "3e sous-section"),
+            (
+                Seat {
+                    container: Some(Container::Pole(5)),
+                    ..seat(ChamberId::Number(6))
+                },
+                "Pôle 5, 6e chambre",
+            ),
+            (
+                Seat {
+                    container: Some(Container::Section(4)),
+                    ..seat(ChamberId::Number(1))
+                },
+                "4e section, 1re chambre",
+            ),
+            (
+                Seat {
+                    section: Some(1),
+                    ..seat(ChamberId::Number(2))
+                },
+                "2e chambre, 1re section",
+            ),
+            (
+                Seat {
+                    section: Some(9),
+                    letter: Some('D'),
+                    ..Default::default()
+                },
+                "9e section D",
+            ),
+            (
+                Seat {
+                    letter: Some('B'),
+                    ..Default::default()
+                },
+                "Section B",
+            ),
+            (seat(ChamberId::Letter('D')), "Chambre D"),
+            (
+                Seat {
+                    joined: Some(Joined::SubSections(vec![3])),
+                    ..Default::default()
+                },
+                "3e sous-section",
+            ),
         ];
-        for (key, attendu) in cas {
-            assert_eq!(seat_label(Some(key)).as_deref(), Some(attendu), "{key}");
-        }
-    }
-
-    #[test]
-    fn une_cle_hors_grammaire_ne_se_relit_pas() {
-        for key in [
-            "C",
-            "Cx1",
-            "ZZ1",
-            "Q",
-            "C1.AB",
-            "1",
-            "C0",
-            "S1.C2",
-            "C1.C2",
-            "MAT:SOCIALE",
-        ] {
-            assert!(Seat::parse(key).is_none(), "{key}");
+        for (seat, attendu) in cas {
+            assert_eq!(seat.label().as_deref(), Some(attendu), "{seat:?}");
         }
     }
 

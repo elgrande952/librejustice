@@ -116,3 +116,186 @@ HTTP *
 [Asserts]
 status >= 400
 status < 500
+
+
+# ── 11. Reference mode ───────────────────────────────────────────────────────
+GET {{base}}/internal/search-textes?q=code%20civil%201240
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.total" == 1
+jsonpath "$.hits[0].num" == "1240"
+
+GET {{base}}/internal/search-textes?q=code%20civil%201240&mode=lexical
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "lexical"
+jsonpath "$.total" > 1
+
+# A bare key lists every text carrying it, within the searched corpora.
+GET {{base}}/internal/search-textes?q=L752-2
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.total" > 5
+jsonpath "$.facets.code" count > 5
+jsonpath "$.jurisdictions" count == 3
+jsonpath "$.pinned" not exists
+
+GET {{base}}/internal/search-textes?q=article%201240
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.hits[*].code" contains "code-civil"
+jsonpath "$.hits[*].code" contains "code-de-procedure-civile"
+
+# Several keys after a named text: one article each.
+GET {{base}}/internal/search-textes?q=articles%201240%20et%201241%20du%20code%20civil
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.total" == 2
+
+# A key the named text does not carry: the reference refuses instead of ranking.
+GET {{base}}/internal/search-textes?q=code%20civil%20l112
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "reference"
+jsonpath "$.total" == 0
+jsonpath "$.hits" count == 0
+
+# A key followed by words asks the content; the card pins the carriers, three at
+# most, and points at the full list.
+GET {{base}}/internal/search-textes?q=L752-2%20licenciement&limit=5
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "lexical"
+jsonpath "$.pinned" count == 3
+jsonpath "$.pinnedMore" == true
+
+
+# ── 12. Legal orders on the axis ─────────────────────────────────────────────
+# The axis names the orders the reader's places search: states first, then the
+# Union, then treaties.
+GET {{base}}/internal/search-textes?q=responsabilite&limit=1
+HTTP 200
+[Asserts]
+jsonpath "$.facets.jurisdiction" count == 3
+jsonpath "$.facets.jurisdiction[0].value" == "FR"
+jsonpath "$.facets.jurisdiction[1].value" == "UE"
+jsonpath "$.facets.jurisdiction[2].value" == "INTL"
+
+# Read from Belgium and Luxembourg, each country is a position of its own.
+GET {{base}}/internal/search-textes?q=responsabilite&place=BE&place=LU&limit=1
+HTTP 200
+[Asserts]
+jsonpath "$.facets.jurisdiction" count == 4
+jsonpath "$.facets.jurisdiction[0].value" == "BE"
+jsonpath "$.facets.jurisdiction[1].value" == "LU"
+jsonpath "$.facets.jurisdiction[2].value" == "UE"
+
+# An order filtered outside the reader's places comes after theirs, which count
+# zero. ParadeDB counts the total and SQL serves the hits: a zero total over
+# served hits is the symptom of the two filters parting.
+GET {{base}}/internal/search-textes?q=responsabilite&jurisdiction=BE&limit=3
+HTTP 200
+[Asserts]
+jsonpath "$.total" > 0
+jsonpath "$.hits[0].jurisdiction" == "BE"
+jsonpath "$.jurisdictions[0]" == "BE"
+jsonpath "$.facets.jurisdiction[0].count" == 0
+jsonpath "$.facets.jurisdiction[3].value" == "BE"
+
+# Orders stated together are searched together, each counted in the facet.
+GET {{base}}/internal/search-textes?q=responsabilite&jurisdiction=CH&jurisdiction=LU&limit=20
+HTTP 200
+[Asserts]
+jsonpath "$.jurisdictions" count == 2
+jsonpath "$.jurisdictions[0]" == "CH"
+jsonpath "$.jurisdictions[1]" == "LU"
+jsonpath "$.hits[*].jurisdiction" not contains "FR"
+jsonpath "$.facets.jurisdiction[3].value" == "CH"
+jsonpath "$.facets.jurisdiction[3].count" > 0
+jsonpath "$.facets.jurisdiction[4].value" == "LU"
+jsonpath "$.facets.jurisdiction[4].count" > 0
+
+
+# ── 14. Jurisdiction scope ───────────────────────────────────────────────────
+# Naming no country searches the law applicable in France, and the response
+# says so.
+GET {{base}}/internal/search-textes?q=responsabilite%20du%20fait%20des%20choses&limit=1
+HTTP 200
+[Asserts]
+jsonpath "$.jurisdictions" count == 3
+jsonpath "$.jurisdictions[0]" == "FR"
+
+# Naming one searches that country alone, under its own name.
+GET {{base}}/internal/search-textes?q=divorce%20au%20senegal&limit=3
+HTTP 200
+[Asserts]
+jsonpath "$.jurisdictions" count == 1
+jsonpath "$.jurisdictions[0]" == "SN"
+jsonpath "$.facets.jurisdiction[*].value" contains "SN"
+jsonpath "$.hits[0].jurisdiction" == "SN"
+
+# An instrument word joins INTL: a bilateral treaty lives in neither signatory's
+# own corpus.
+GET {{base}}/internal/search-textes?q=convention%20fiscale%20France%20Senegal&limit=1
+HTTP 200
+[Asserts]
+jsonpath "$.jurisdictions" contains "INTL"
+jsonpath "$.jurisdictions" contains "SN"
+
+
+# ── 13. A division is not a name ─────────────────────────────────────────────
+# The formed title carries the leaf division after the code and the number, and
+# article 1240 of the Code civil sits under « la responsabilité
+# extracontractuelle »: reaching it that way is not a citation.
+GET {{base}}/internal/search-textes?q=responsabilite%201240
+HTTP 200
+[Asserts]
+jsonpath "$.queryMode" == "lexical"
+jsonpath "$.total" > 1
+
+
+# ── 15. Places read from ─────────────────────────────────────────────────────
+# Naming no place reads from the default one, whose answer the others narrow.
+GET {{base}}/internal/search-textes?q=bail%20commercial%20renouvellement&limit=1
+HTTP 200
+[Captures]
+metropole: jsonpath "$.total"
+
+# A place drops what the coverage knows does not apply there: from Polynesia,
+# the national tax law.
+GET {{base}}/internal/search-textes?q=bail%20commercial%20renouvellement&place=PF&limit=1
+HTTP 200
+[Asserts]
+jsonpath "$.total" > 0
+jsonpath "$.total" < {{metropole}}
+jsonpath "$.readerPlace.uid" == "PF"
+
+# `place` repeats, and what applies in any of the places is served, from the
+# corpora they belong to; several places name no one to open an article at.
+GET {{base}}/internal/search-textes?q=responsabilite&place=BE&place=LU&limit=5
+HTTP 200
+[Asserts]
+jsonpath "$.jurisdictions" contains "BE"
+jsonpath "$.jurisdictions" contains "LU"
+jsonpath "$.jurisdictions" contains "UE"
+jsonpath "$.jurisdictions" not contains "FR"
+jsonpath "$.hits[*].jurisdiction" not contains "FR"
+jsonpath "$.readerPlace" not exists
+
+# Each place the day has not read yet costs a pass over the coverage: 20 at most.
+GET {{base}}/internal/search-textes?q=responsabilite&place=AM&place=AO&place=AT&place=BE&place=BF&place=BG&place=BI&place=BJ&place=CD&place=CF&place=CG&place=CH&place=CI&place=CM&place=DE&place=DJ&place=DO&place=DZ&place=EG&place=ES&place=GA
+HTTP 422
+[Asserts]
+jsonpath "$.detail[0].loc[1]" == "place"
+jsonpath "$.detail[0].msg" contains "at most 20"
+
+# The browse keeps to the same corpora.
+GET {{base}}/internal/search-textes?q=&place=BE&limit=3
+HTTP 200
+[Asserts]
+jsonpath "$.total" > 0
+jsonpath "$.hits[*].jurisdiction" not contains "FR"

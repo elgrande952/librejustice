@@ -1,9 +1,3 @@
-//! Exécuteur `any_spawner` qui rattache chaque tâche Leptos au span courant.
-//!
-//! Une tâche tokio n'hérite d'aucun contexte de son parent : sans cela, chaque
-//! `Resource` / `Suspense` ouvre une trace neuve au lieu de se rattacher à la
-//! requête.
-
 use any_spawner::{CustomExecutor, Executor, PinnedFuture, PinnedLocalFuture};
 use anyhow::{anyhow, Result};
 use tracing::Instrument;
@@ -42,7 +36,6 @@ mod tests {
         use tracing_subscriber::util::SubscriberInitExt as _;
 
         super::install().unwrap();
-        // Sans abonné, un span n'a pas d'identifiant et la comparaison est vide.
         let _abonne = tracing_subscriber::registry().set_default();
 
         tokio::runtime::Builder::new_current_thread()

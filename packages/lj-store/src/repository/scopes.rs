@@ -34,7 +34,7 @@ pub struct ArticleScopeRow {
 impl DecisionRepository<'_> {
     /// Compteurs candidats : articles EN VIGUEUR dont le texte porte à la
     /// fois le pivot (« applicable(s) ») et le nom de la collectivité. Le
-    /// parser pur (`lj_core::compteurs`) fait le tri fin en aval.
+    /// parser pur (`lj_norm::compteurs`) fait le tri fin en aval.
     pub async fn compteur_candidates(&self, collectivite: &str) -> Result<Vec<CompteurArticleRow>> {
         let rows = self
             .conn
@@ -79,6 +79,26 @@ impl DecisionRepository<'_> {
         Ok(rows
             .iter()
             .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .collect())
+    }
+
+    /// Held version identities of a text: `(num_key, source_uid, status, start)`,
+    /// the start date in ISO. Read by the chronicle audit.
+    pub async fn article_version_uids_of(
+        &self,
+        text_uid: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let rows = self
+            .conn
+            .query(
+                "SELECT num_key, source_uid, status, to_char(date_debut, 'YYYY-MM-DD')
+                 FROM legal_article WHERE text_uid = $1 ORDER BY num_key, date_debut",
+                &[&text_uid],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
             .collect())
     }
 

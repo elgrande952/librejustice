@@ -36,48 +36,48 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 3,
-            name: "0003_store_source_xml.sql",
-            sql: include_str!("../migrations/0003_store_source_xml.sql"),
+            name: "0003_add_source_xml_gzip.sql",
+            sql: include_str!("../migrations/0003_add_source_xml_gzip.sql"),
         },
         Migration {
             version: 4,
-            name: "0004_add_public_id.sql",
-            sql: include_str!("../migrations/0004_add_public_id.sql"),
+            name: "0004_decisions_public_id.sql",
+            sql: include_str!("../migrations/0004_decisions_public_id.sql"),
         },
         Migration {
             version: 5,
-            name: "0005_drop_unused_source_xml_size_columns.sql",
-            sql: include_str!("../migrations/0005_drop_unused_source_xml_size_columns.sql"),
+            name: "0005_drop_source_xml_size_columns.sql",
+            sql: include_str!("../migrations/0005_drop_source_xml_size_columns.sql"),
         },
         Migration {
             version: 6,
-            name: "0006_nullable_gzip_blob.sql",
-            sql: include_str!("../migrations/0006_nullable_gzip_blob.sql"),
+            name: "0006_gzip_blob_nullable.sql",
+            sql: include_str!("../migrations/0006_gzip_blob_nullable.sql"),
         },
         Migration {
             version: 7,
-            name: "0007_drop_gzip_blob.sql",
-            sql: include_str!("../migrations/0007_drop_gzip_blob.sql"),
+            name: "0007_drop_gzip_blob_columns.sql",
+            sql: include_str!("../migrations/0007_drop_gzip_blob_columns.sql"),
         },
         Migration {
             version: 8,
-            name: "0008_rename_xml_gzip.sql",
-            sql: include_str!("../migrations/0008_rename_xml_gzip.sql"),
+            name: "0008_rename_source_xml_gzip.sql",
+            sql: include_str!("../migrations/0008_rename_source_xml_gzip.sql"),
         },
         Migration {
             version: 9,
-            name: "0009_add_extracted_fields.sql",
-            sql: include_str!("../migrations/0009_add_extracted_fields.sql"),
+            name: "0009_decisions_extracted_fields.sql",
+            sql: include_str!("../migrations/0009_decisions_extracted_fields.sql"),
         },
         Migration {
             version: 10,
-            name: "0010_mcp_oauth.sql",
-            sql: include_str!("../migrations/0010_mcp_oauth.sql"),
+            name: "0010_mcp_oauth_tables.sql",
+            sql: include_str!("../migrations/0010_mcp_oauth_tables.sql"),
         },
         Migration {
             version: 11,
-            name: "0011_semantic_keywords.sql",
-            sql: include_str!("../migrations/0011_semantic_keywords.sql"),
+            name: "0011_semantic_keywords_tables.sql",
+            sql: include_str!("../migrations/0011_semantic_keywords_tables.sql"),
         },
         Migration {
             version: 12,
@@ -86,23 +86,23 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 13,
-            name: "0013_add_jurisdiction_name.sql",
-            sql: include_str!("../migrations/0013_add_jurisdiction_name.sql"),
+            name: "0013_decisions_jurisdiction_name.sql",
+            sql: include_str!("../migrations/0013_decisions_jurisdiction_name.sql"),
         },
         Migration {
             version: 14,
-            name: "0014_corpus_token_df.sql",
-            sql: include_str!("../migrations/0014_corpus_token_df.sql"),
+            name: "0014_corpus_token_df_tables.sql",
+            sql: include_str!("../migrations/0014_corpus_token_df_tables.sql"),
         },
         Migration {
             version: 15,
-            name: "0015_search_title.sql",
-            sql: include_str!("../migrations/0015_search_title.sql"),
+            name: "0015_decisions_search_title.sql",
+            sql: include_str!("../migrations/0015_decisions_search_title.sql"),
         },
         Migration {
             version: 16,
-            name: "0016_search_title_stopwords.sql",
-            sql: include_str!("../migrations/0016_search_title_stopwords.sql"),
+            name: "0016_search_title_bm25_stopwords.sql",
+            sql: include_str!("../migrations/0016_search_title_bm25_stopwords.sql"),
         },
         Migration {
             version: 17,
@@ -111,33 +111,33 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 18,
-            name: "0018_add_content_checksum.sql",
-            sql: include_str!("../migrations/0018_add_content_checksum.sql"),
+            name: "0018_decisions_content_checksum.sql",
+            sql: include_str!("../migrations/0018_decisions_content_checksum.sql"),
         },
         Migration {
             version: 19,
-            name: "0019_rename_payload_and_format.sql",
-            sql: include_str!("../migrations/0019_rename_payload_and_format.sql"),
+            name: "0019_full_text_payload_and_format.sql",
+            sql: include_str!("../migrations/0019_full_text_payload_and_format.sql"),
         },
         Migration {
             version: 20,
-            name: "0020_revert_search_title.sql",
-            sql: include_str!("../migrations/0020_revert_search_title.sql"),
+            name: "0020_drop_chunks_search_title.sql",
+            sql: include_str!("../migrations/0020_drop_chunks_search_title.sql"),
         },
         Migration {
             version: 21,
-            name: "0021_search_title_regex_stopwords.sql",
-            sql: include_str!("../migrations/0021_search_title_regex_stopwords.sql"),
+            name: "0021_search_title_bm25_regex_stopwords.sql",
+            sql: include_str!("../migrations/0021_search_title_bm25_regex_stopwords.sql"),
         },
         Migration {
             version: 22,
-            name: "0022_search_title_stopwords_in_tokenizer.sql",
-            sql: include_str!("../migrations/0022_search_title_stopwords_in_tokenizer.sql"),
+            name: "0022_search_title_bm25_tokenizer_fix.sql",
+            sql: include_str!("../migrations/0022_search_title_bm25_tokenizer_fix.sql"),
         },
         Migration {
             version: 23,
-            name: "0023_rabitq8_embedding.sql",
-            sql: include_str!("../migrations/0023_rabitq8_embedding.sql"),
+            name: "0023_chunks_embedding_rabitq8.sql",
+            sql: include_str!("../migrations/0023_chunks_embedding_rabitq8.sql"),
         },
         Migration {
             version: 24,
@@ -146,8 +146,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 25,
-            name: "0025_search_title_stopword_a.sql",
-            sql: include_str!("../migrations/0025_search_title_stopword_a.sql"),
+            name: "0025_search_title_bm25_stopword_a.sql",
+            sql: include_str!("../migrations/0025_search_title_bm25_stopword_a.sql"),
         },
         Migration {
             version: 26,
@@ -171,43 +171,43 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 30,
-            name: "0030_drop_unused_docket_gin.sql",
-            sql: include_str!("../migrations/0030_drop_unused_docket_gin.sql"),
+            name: "0030_drop_docket_numbers_gin.sql",
+            sql: include_str!("../migrations/0030_drop_docket_numbers_gin.sql"),
         },
         Migration {
             version: 31,
-            name: "0031_full_text_payload_storage_external.sql",
-            sql: include_str!("../migrations/0031_full_text_payload_storage_external.sql"),
+            name: "0031_payload_gzip_storage_external.sql",
+            sql: include_str!("../migrations/0031_payload_gzip_storage_external.sql"),
         },
         Migration {
             version: 32,
-            name: "0032_drop_content_hash.sql",
-            sql: include_str!("../migrations/0032_drop_content_hash.sql"),
+            name: "0032_drop_decisions_content_hash.sql",
+            sql: include_str!("../migrations/0032_drop_decisions_content_hash.sql"),
         },
         Migration {
             version: 33,
-            name: "0033_chunks_vec_hierarchical.sql",
-            sql: include_str!("../migrations/0033_chunks_vec_hierarchical.sql"),
+            name: "0033_chunks_vec_ivf_lists.sql",
+            sql: include_str!("../migrations/0033_chunks_vec_ivf_lists.sql"),
         },
         Migration {
             version: 34,
-            name: "0034_users.sql",
-            sql: include_str!("../migrations/0034_users.sql"),
+            name: "0034_users_table.sql",
+            sql: include_str!("../migrations/0034_users_table.sql"),
         },
         Migration {
             version: 35,
-            name: "0035_user_bookmarks.sql",
-            sql: include_str!("../migrations/0035_user_bookmarks.sql"),
+            name: "0035_user_bookmarks_table.sql",
+            sql: include_str!("../migrations/0035_user_bookmarks_table.sql"),
         },
         Migration {
             version: 36,
-            name: "0036_user_search_history.sql",
-            sql: include_str!("../migrations/0036_user_search_history.sql"),
+            name: "0036_user_search_history_table.sql",
+            sql: include_str!("../migrations/0036_user_search_history_table.sql"),
         },
         Migration {
             version: 37,
-            name: "0037_mcp_oauth_register.sql",
-            sql: include_str!("../migrations/0037_mcp_oauth_register.sql"),
+            name: "0037_mcp_clients_redirect_uris.sql",
+            sql: include_str!("../migrations/0037_mcp_clients_redirect_uris.sql"),
         },
         Migration {
             version: 38,
@@ -221,8 +221,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 40,
-            name: "0040_search_source_and_decision_views.sql",
-            sql: include_str!("../migrations/0040_search_source_and_decision_views.sql"),
+            name: "0040_search_source_decision_views.sql",
+            sql: include_str!("../migrations/0040_search_source_decision_views.sql"),
         },
         Migration {
             version: 41,
@@ -246,8 +246,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 45,
-            name: "0045_sitemaps.sql",
-            sql: include_str!("../migrations/0045_sitemaps.sql"),
+            name: "0045_sitemaps_table.sql",
+            sql: include_str!("../migrations/0045_sitemaps_table.sql"),
         },
         Migration {
             version: 46,
@@ -276,10 +276,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 51,
-            name: "0051_decisions_full_text_source_fields_embed_version.sql",
-            sql: include_str!(
-                "../migrations/0051_decisions_full_text_source_fields_embed_version.sql"
-            ),
+            name: "0051_full_text_source_fields_embed_ver.sql",
+            sql: include_str!("../migrations/0051_full_text_source_fields_embed_ver.sql"),
         },
         Migration {
             version: 52,
@@ -293,8 +291,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 54,
-            name: "0054_drop_chunks_bm25_body_source_payload.sql",
-            sql: include_str!("../migrations/0054_drop_chunks_bm25_body_source_payload.sql"),
+            name: "0054_drop_chunks_bm25_body_payload.sql",
+            sql: include_str!("../migrations/0054_drop_chunks_bm25_body_payload.sql"),
         },
         Migration {
             version: 55,
@@ -308,23 +306,23 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 57,
-            name: "0057_legi_referentiel.sql",
-            sql: include_str!("../migrations/0057_legi_referentiel.sql"),
+            name: "0057_legi_codes_and_articles.sql",
+            sql: include_str!("../migrations/0057_legi_codes_and_articles.sql"),
         },
         Migration {
             version: 58,
-            name: "0058_payload_format_dila_html.sql",
-            sql: include_str!("../migrations/0058_payload_format_dila_html.sql"),
+            name: "0058_full_text_payload_format_html.sql",
+            sql: include_str!("../migrations/0058_full_text_payload_format_html.sql"),
         },
         Migration {
             version: 59,
-            name: "0059_payload_format_pdf.sql",
-            sql: include_str!("../migrations/0059_payload_format_pdf.sql"),
+            name: "0059_full_text_payload_format_pdf.sql",
+            sql: include_str!("../migrations/0059_full_text_payload_format_pdf.sql"),
         },
         Migration {
             version: 60,
-            name: "0060_referentiel_multi_source.sql",
-            sql: include_str!("../migrations/0060_referentiel_multi_source.sql"),
+            name: "0060_referential_multi_source.sql",
+            sql: include_str!("../migrations/0060_referential_multi_source.sql"),
         },
         Migration {
             version: 61,
@@ -468,8 +466,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 89,
-            name: "0089_citation_overrides.sql",
-            sql: include_str!("../migrations/0089_citation_overrides.sql"),
+            name: "0089_citation_override_certified_version.sql",
+            sql: include_str!("../migrations/0089_citation_override_certified_version.sql"),
         },
         Migration {
             version: 90,
@@ -513,23 +511,23 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 98,
-            name: "0098_facettes_ref_uid.sql",
-            sql: include_str!("../migrations/0098_facettes_ref_uid.sql"),
+            name: "0098_facet_arrays_from_legal_citation.sql",
+            sql: include_str!("../migrations/0098_facet_arrays_from_legal_citation.sql"),
         },
         Migration {
             version: 99,
-            name: "0099_drop_ancien_monde_citations.sql",
-            sql: include_str!("../migrations/0099_drop_ancien_monde_citations.sql"),
+            name: "0099_drop_legacy_citation_tables.sql",
+            sql: include_str!("../migrations/0099_drop_legacy_citation_tables.sql"),
         },
         Migration {
             version: 100,
-            name: "0100_facet_referentiels.sql",
-            sql: include_str!("../migrations/0100_facet_referentiels.sql"),
+            name: "0100_facet_value_jurisdiction_tables.sql",
+            sql: include_str!("../migrations/0100_facet_value_jurisdiction_tables.sql"),
         },
         Migration {
             version: 101,
-            name: "0101_sync_arrays_rapportent_derive.sql",
-            sql: include_str!("../migrations/0101_sync_arrays_rapportent_derive.sql"),
+            name: "0101_facet_sync_functions_report_drift.sql",
+            sql: include_str!("../migrations/0101_facet_sync_functions_report_drift.sql"),
         },
         Migration {
             version: 102,
@@ -548,18 +546,18 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 105,
-            name: "0105_served_lang_normalise.sql",
-            sql: include_str!("../migrations/0105_served_lang_normalise.sql"),
+            name: "0105_add_served_lang_drop_lang_rank.sql",
+            sql: include_str!("../migrations/0105_add_served_lang_drop_lang_rank.sql"),
         },
         Migration {
             version: 106,
-            name: "0106_lang_materialise.sql",
-            sql: include_str!("../migrations/0106_lang_materialise.sql"),
+            name: "0106_drop_served_lang_add_lang_column.sql",
+            sql: include_str!("../migrations/0106_drop_served_lang_add_lang_column.sql"),
         },
         Migration {
             version: 107,
-            name: "0107_drop_ancien_monde_facettes.sql",
-            sql: include_str!("../migrations/0107_drop_ancien_monde_facettes.sql"),
+            name: "0107_drop_legacy_facet_columns.sql",
+            sql: include_str!("../migrations/0107_drop_legacy_facet_columns.sql"),
         },
         Migration {
             version: 108,
@@ -578,8 +576,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 111,
-            name: "0111_slug_universel.sql",
-            sql: include_str!("../migrations/0111_slug_universel.sql"),
+            name: "0111_legal_text_slug_unique.sql",
+            sql: include_str!("../migrations/0111_legal_text_slug_unique.sql"),
         },
         Migration {
             version: 112,
@@ -593,8 +591,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 114,
-            name: "0114_portee_facette.sql",
-            sql: include_str!("../migrations/0114_portee_facette.sql"),
+            name: "0114_facet_portee_seed_publication_relabel.sql",
+            sql: include_str!("../migrations/0114_facet_portee_seed_publication_relabel.sql"),
         },
         Migration {
             version: 115,
@@ -603,43 +601,43 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 116,
-            name: "0116_drop_vocab_arianeweb.sql",
-            sql: include_str!("../migrations/0116_drop_vocab_arianeweb.sql"),
+            name: "0116_drop_unused_juridiction_facet_values.sql",
+            sql: include_str!("../migrations/0116_drop_unused_juridiction_facet_values.sql"),
         },
         Migration {
             version: 117,
-            name: "0117_formation_structuree.sql",
-            sql: include_str!("../migrations/0117_formation_structuree.sql"),
+            name: "0117_decisions_chambre_formation_columns.sql",
+            sql: include_str!("../migrations/0117_decisions_chambre_formation_columns.sql"),
         },
         Migration {
             version: 118,
-            name: "0118_chambres_terres_civi.sql",
-            sql: include_str!("../migrations/0118_chambres_terres_civi.sql"),
+            name: "0118_facet_chambre_terres_civi.sql",
+            sql: include_str!("../migrations/0118_facet_chambre_terres_civi.sql"),
         },
         Migration {
             version: 119,
-            name: "0119_search_title_ecrit_par_ingest.sql",
-            sql: include_str!("../migrations/0119_search_title_ecrit_par_ingest.sql"),
+            name: "0119_search_title_drop_expression.sql",
+            sql: include_str!("../migrations/0119_search_title_drop_expression.sql"),
         },
         Migration {
             version: 120,
-            name: "0120_purge_ancien_monde_titres.sql",
-            sql: include_str!("../migrations/0120_purge_ancien_monde_titres.sql"),
+            name: "0120_drop_legacy_title_columns.sql",
+            sql: include_str!("../migrations/0120_drop_legacy_title_columns.sql"),
         },
         Migration {
             version: 121,
-            name: "0121_juridiction_cassation_maille_cour.sql",
-            sql: include_str!("../migrations/0121_juridiction_cassation_maille_cour.sql"),
+            name: "0121_jurisdiction_cassation_court_grain.sql",
+            sql: include_str!("../migrations/0121_jurisdiction_cassation_court_grain.sql"),
         },
         Migration {
             version: 122,
-            name: "0122_legal_link_graphe_liens.sql",
-            sql: include_str!("../migrations/0122_legal_link_graphe_liens.sql"),
+            name: "0122_legal_link_graph.sql",
+            sql: include_str!("../migrations/0122_legal_link_graph.sql"),
         },
         Migration {
             version: 123,
-            name: "0123_legal_toc_edge_arbre_structurel.sql",
-            sql: include_str!("../migrations/0123_legal_toc_edge_arbre_structurel.sql"),
+            name: "0123_legal_toc_edge.sql",
+            sql: include_str!("../migrations/0123_legal_toc_edge.sql"),
         },
         Migration {
             version: 124,
@@ -648,8 +646,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 125,
-            name: "0125_entity_referentiel.sql",
-            sql: include_str!("../migrations/0125_entity_referentiel.sql"),
+            name: "0125_entity_denomination_tables.sql",
+            sql: include_str!("../migrations/0125_entity_denomination_tables.sql"),
         },
         Migration {
             version: 126,
@@ -668,13 +666,13 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 129,
-            name: "0129_juridiction_cnil.sql",
-            sql: include_str!("../migrations/0129_juridiction_cnil.sql"),
+            name: "0129_juridiction_cnil_source_rank.sql",
+            sql: include_str!("../migrations/0129_juridiction_cnil_source_rank.sql"),
         },
         Migration {
             version: 130,
-            name: "0130_decision_party_grain_acteur.sql",
-            sql: include_str!("../migrations/0130_decision_party_grain_acteur.sql"),
+            name: "0130_decision_party_evidence_columns.sql",
+            sql: include_str!("../migrations/0130_decision_party_evidence_columns.sql"),
         },
         Migration {
             version: 131,
@@ -698,38 +696,38 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 135,
-            name: "0135_registre_annonce.sql",
-            sql: include_str!("../migrations/0135_registre_annonce.sql"),
+            name: "0135_registry_announcements.sql",
+            sql: include_str!("../migrations/0135_registry_announcements.sql"),
         },
         Migration {
             version: 136,
-            name: "0136_document_bodies_text_case_citation.sql",
-            sql: include_str!("../migrations/0136_document_bodies_text_case_citation.sql"),
+            name: "0136_legal_text_body_case_citation.sql",
+            sql: include_str!("../migrations/0136_legal_text_body_case_citation.sql"),
         },
         Migration {
             version: 137,
-            name: "0137_codes_juridiction_ville.sql",
-            sql: include_str!("../migrations/0137_codes_juridiction_ville.sql"),
+            name: "0137_jurisdiction_code_by_city.sql",
+            sql: include_str!("../migrations/0137_jurisdiction_code_by_city.sql"),
         },
         Migration {
             version: 138,
-            name: "0138_referentiel_juridiction_reparations.sql",
-            sql: include_str!("../migrations/0138_referentiel_juridiction_reparations.sql"),
+            name: "0138_jurisdiction_referential_repair.sql",
+            sql: include_str!("../migrations/0138_jurisdiction_referential_repair.sql"),
         },
         Migration {
             version: 139,
-            name: "0139_drop_registre_annonce.sql",
-            sql: include_str!("../migrations/0139_drop_registre_annonce.sql"),
+            name: "0139_drop_registry_announcements.sql",
+            sql: include_str!("../migrations/0139_drop_registry_announcements.sql"),
         },
         Migration {
             version: 140,
-            name: "0140_pg_trgm.sql",
-            sql: include_str!("../migrations/0140_pg_trgm.sql"),
+            name: "0140_pg_trgm_extension.sql",
+            sql: include_str!("../migrations/0140_pg_trgm_extension.sql"),
         },
         Migration {
             version: 141,
-            name: "0141_slugs_sans_uid.sql",
-            sql: include_str!("../migrations/0141_slugs_sans_uid.sql"),
+            name: "0141_legal_text_slug_cleanup.sql",
+            sql: include_str!("../migrations/0141_legal_text_slug_cleanup.sql"),
         },
         Migration {
             version: 142,
@@ -738,18 +736,18 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 143,
-            name: "0143_search_history_filters_jurisdiction.sql",
-            sql: include_str!("../migrations/0143_search_history_filters_jurisdiction.sql"),
+            name: "0143_search_history_jurisdiction_type_key.sql",
+            sql: include_str!("../migrations/0143_search_history_jurisdiction_type_key.sql"),
         },
         Migration {
             version: 144,
-            name: "0144_article_commentaire.sql",
-            sql: include_str!("../migrations/0144_article_commentaire.sql"),
+            name: "0144_article_commentary.sql",
+            sql: include_str!("../migrations/0144_article_commentary.sql"),
         },
         Migration {
             version: 145,
-            name: "0145_facettes_un_nom_par_axe.sql",
-            sql: include_str!("../migrations/0145_facettes_un_nom_par_axe.sql"),
+            name: "0145_facet_value_axis_rename.sql",
+            sql: include_str!("../migrations/0145_facet_value_axis_rename.sql"),
         },
         Migration {
             version: 146,
@@ -763,23 +761,23 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 148,
-            name: "0148_purge_fiches_versions_tnc.sql",
-            sql: include_str!("../migrations/0148_purge_fiches_versions_tnc.sql"),
+            name: "0148_purge_legal_text_version_shells.sql",
+            sql: include_str!("../migrations/0148_purge_legal_text_version_shells.sql"),
         },
         Migration {
             version: 149,
-            name: "0149_et_suivants_famille.sql",
-            sql: include_str!("../migrations/0149_et_suivants_famille.sql"),
+            name: "0149_legal_citation_family_expansion.sql",
+            sql: include_str!("../migrations/0149_legal_citation_family_expansion.sql"),
         },
         Migration {
             version: 150,
-            name: "0150_annuaire_registre.sql",
-            sql: include_str!("../migrations/0150_annuaire_registre.sql"),
+            name: "0150_directory_registry_totals.sql",
+            sql: include_str!("../migrations/0150_directory_registry_totals.sql"),
         },
         Migration {
             version: 151,
-            name: "0151_alphabet_public_suivants.sql",
-            sql: include_str!("../migrations/0151_alphabet_public_suivants.sql"),
+            name: "0151_legal_citation_family_public_keys.sql",
+            sql: include_str!("../migrations/0151_legal_citation_family_public_keys.sql"),
         },
         Migration {
             version: 152,
@@ -788,18 +786,18 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 153,
-            name: "0153_annuaire_registre_complet.sql",
-            sql: include_str!("../migrations/0153_annuaire_registre_complet.sql"),
+            name: "0153_entity_directory_complete.sql",
+            sql: include_str!("../migrations/0153_entity_directory_complete.sql"),
         },
         Migration {
             version: 154,
-            name: "0154_entity_recherche_contentieux_partiel.sql",
-            sql: include_str!("../migrations/0154_entity_recherche_contentieux_partiel.sql"),
+            name: "0154_entity_search_litigation_index.sql",
+            sql: include_str!("../migrations/0154_entity_search_litigation_index.sql"),
         },
         Migration {
             version: 155,
-            name: "0155_entites_mono_table_folded_en_index.sql",
-            sql: include_str!("../migrations/0155_entites_mono_table_folded_en_index.sql"),
+            name: "0155_entity_single_table_fold_index.sql",
+            sql: include_str!("../migrations/0155_entity_single_table_fold_index.sql"),
         },
         Migration {
             version: 156,
@@ -813,8 +811,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 158,
-            name: "0158_legal_citation_spans_jsonb_par_decision.sql",
-            sql: include_str!("../migrations/0158_legal_citation_spans_jsonb_par_decision.sql"),
+            name: "0158_legal_citation_jsonb_per_decision.sql",
+            sql: include_str!("../migrations/0158_legal_citation_jsonb_per_decision.sql"),
         },
         Migration {
             version: 159,
@@ -843,8 +841,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 164,
-            name: "0164_decisions_jurisdiction_code_date_index.sql",
-            sql: include_str!("../migrations/0164_decisions_jurisdiction_code_date_index.sql"),
+            name: "0164_decisions_jurisdiction_code_date_idx.sql",
+            sql: include_str!("../migrations/0164_decisions_jurisdiction_code_date_idx.sql"),
         },
         Migration {
             version: 165,
@@ -853,23 +851,23 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 166,
-            name: "0166_legal_text_norm_fond_browse_index.sql",
-            sql: include_str!("../migrations/0166_legal_text_norm_fond_browse_index.sql"),
+            name: "0166_legal_text_norm_browse_index.sql",
+            sql: include_str!("../migrations/0166_legal_text_norm_browse_index.sql"),
         },
         Migration {
             version: 167,
-            name: "0167_decisions_jur_code_date_partial_covering.sql",
-            sql: include_str!("../migrations/0167_decisions_jur_code_date_partial_covering.sql"),
+            name: "0167_decisions_jur_code_date_partial_idx.sql",
+            sql: include_str!("../migrations/0167_decisions_jur_code_date_partial_idx.sql"),
         },
         Migration {
             version: 168,
-            name: "0168_legal_text_curated.sql",
-            sql: include_str!("../migrations/0168_legal_text_curated.sql"),
+            name: "0168_legal_text_curated_flag.sql",
+            sql: include_str!("../migrations/0168_legal_text_curated_flag.sql"),
         },
         Migration {
             version: 169,
-            name: "0169_legal_article_usage_text_uid_indexed.sql",
-            sql: include_str!("../migrations/0169_legal_article_usage_text_uid_indexed.sql"),
+            name: "0169_legal_article_usage_text_uid_idx.sql",
+            sql: include_str!("../migrations/0169_legal_article_usage_text_uid_idx.sql"),
         },
         Migration {
             version: 170,
@@ -883,23 +881,23 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 172,
-            name: "0172_chunks_legal_gin_fastupdate_off.sql",
-            sql: include_str!("../migrations/0172_chunks_legal_gin_fastupdate_off.sql"),
+            name: "0172_decision_chunks_gin_fastupdate_off.sql",
+            sql: include_str!("../migrations/0172_decision_chunks_gin_fastupdate_off.sql"),
         },
         Migration {
             version: 173,
-            name: "0173_legal_citation_autovacuum.sql",
-            sql: include_str!("../migrations/0173_legal_citation_autovacuum.sql"),
+            name: "0173_legal_citation_autovacuum_tuning.sql",
+            sql: include_str!("../migrations/0173_legal_citation_autovacuum_tuning.sql"),
         },
         Migration {
             version: 174,
-            name: "0174_article_commentaire_ancre_slug.sql",
-            sql: include_str!("../migrations/0174_article_commentaire_ancre_slug.sql"),
+            name: "0174_article_commentary_slug_anchor.sql",
+            sql: include_str!("../migrations/0174_article_commentary_slug_anchor.sql"),
         },
         Migration {
             version: 175,
-            name: "0175_article_commentaire_drop_text_uid.sql",
-            sql: include_str!("../migrations/0175_article_commentaire_drop_text_uid.sql"),
+            name: "0175_article_commentary_drop_text_uid.sql",
+            sql: include_str!("../migrations/0175_article_commentary_drop_text_uid.sql"),
         },
         Migration {
             version: 176,
@@ -918,18 +916,18 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 179,
-            name: "0179_annonces.sql",
-            sql: include_str!("../migrations/0179_annonces.sql"),
+            name: "0179_public_procurement_notices.sql",
+            sql: include_str!("../migrations/0179_public_procurement_notices.sql"),
         },
         Migration {
             version: 180,
-            name: "0180_suivants_family_datee.sql",
-            sql: include_str!("../migrations/0180_suivants_family_datee.sql"),
+            name: "0180_legal_citation_family_by_date.sql",
+            sql: include_str!("../migrations/0180_legal_citation_family_by_date.sql"),
         },
         Migration {
             version: 181,
-            name: "0181_decisions_updated_at_contenu.sql",
-            sql: include_str!("../migrations/0181_decisions_updated_at_contenu.sql"),
+            name: "0181_decisions_updated_at_content_date.sql",
+            sql: include_str!("../migrations/0181_decisions_updated_at_content_date.sql"),
         },
         Migration {
             version: 182,
@@ -943,13 +941,13 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 184,
-            name: "0184_annonce_flux_pur.sql",
-            sql: include_str!("../migrations/0184_annonce_flux_pur.sql"),
+            name: "0184_procurement_notice_stream_idx.sql",
+            sql: include_str!("../migrations/0184_procurement_notice_stream_idx.sql"),
         },
         Migration {
             version: 185,
-            name: "0185_legal_text_bm25_facet_fields.sql",
-            sql: include_str!("../migrations/0185_legal_text_bm25_facet_fields.sql"),
+            name: "0185_legal_text_bm25_v2_facet_fields.sql",
+            sql: include_str!("../migrations/0185_legal_text_bm25_v2_facet_fields.sql"),
         },
         Migration {
             version: 186,
@@ -958,18 +956,18 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 187,
-            name: "0187_legal_article_bm25_v2_fenetre_validite.sql",
-            sql: include_str!("../migrations/0187_legal_article_bm25_v2_fenetre_validite.sql"),
+            name: "0187_legal_article_bm25_v2_validity_window.sql",
+            sql: include_str!("../migrations/0187_legal_article_bm25_v2_validity_window.sql"),
         },
         Migration {
             version: 188,
-            name: "0188_legal_text_bm25_bascule.sql",
-            sql: include_str!("../migrations/0188_legal_text_bm25_bascule.sql"),
+            name: "0188_legal_text_bm25_index_swap.sql",
+            sql: include_str!("../migrations/0188_legal_text_bm25_index_swap.sql"),
         },
         Migration {
             version: 189,
-            name: "0189_legal_article_bm25_bascule.sql",
-            sql: include_str!("../migrations/0189_legal_article_bm25_bascule.sql"),
+            name: "0189_legal_article_bm25_index_swap.sql",
+            sql: include_str!("../migrations/0189_legal_article_bm25_index_swap.sql"),
         },
         Migration {
             version: 190,
@@ -978,8 +976,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 191,
-            name: "0191_annonce_acteur_libelle_et_contract.sql",
-            sql: include_str!("../migrations/0191_annonce_acteur_libelle_et_contract.sql"),
+            name: "0191_notice_rename_actor_drop_stale.sql",
+            sql: include_str!("../migrations/0191_notice_rename_actor_drop_stale.sql"),
         },
         Migration {
             version: 192,
@@ -988,18 +986,18 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 193,
-            name: "0193_legal_text_bm25_bascule_text_uid.sql",
-            sql: include_str!("../migrations/0193_legal_text_bm25_bascule_text_uid.sql"),
+            name: "0193_legal_text_bm25_text_uid_swap.sql",
+            sql: include_str!("../migrations/0193_legal_text_bm25_text_uid_swap.sql"),
         },
         Migration {
             version: 194,
-            name: "0194_annonce_source_drop_content_checksum.sql",
-            sql: include_str!("../migrations/0194_annonce_source_drop_content_checksum.sql"),
+            name: "0194_notice_source_drop_checksum.sql",
+            sql: include_str!("../migrations/0194_notice_source_drop_checksum.sql"),
         },
         Migration {
             version: 195,
-            name: "0195_mcp_tokens_empreinte.sql",
-            sql: include_str!("../migrations/0195_mcp_tokens_empreinte.sql"),
+            name: "0195_mcp_tokens_sha256_hashing.sql",
+            sql: include_str!("../migrations/0195_mcp_tokens_sha256_hashing.sql"),
         },
         Migration {
             version: 196,
@@ -1008,8 +1006,8 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 197,
-            name: "0197_annonce_trgm_chemin_archive.sql",
-            sql: include_str!("../migrations/0197_annonce_trgm_chemin_archive.sql"),
+            name: "0197_notice_title_actor_trgm_idx.sql",
+            sql: include_str!("../migrations/0197_notice_title_actor_trgm_idx.sql"),
         },
         Migration {
             version: 198,
@@ -1023,23 +1021,23 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 200,
-            name: "0200_drop_idx_decision_sources_active.sql",
-            sql: include_str!("../migrations/0200_drop_idx_decision_sources_active.sql"),
+            name: "0200_drop_decision_sources_active_idx.sql",
+            sql: include_str!("../migrations/0200_drop_decision_sources_active_idx.sql"),
         },
         Migration {
             version: 201,
-            name: "0201_annonce_redirect.sql",
-            sql: include_str!("../migrations/0201_annonce_redirect.sql"),
+            name: "0201_notice_redirect.sql",
+            sql: include_str!("../migrations/0201_notice_redirect.sql"),
         },
         Migration {
             version: 202,
-            name: "0202_mcp_tokens_drop_clair.sql",
-            sql: include_str!("../migrations/0202_mcp_tokens_drop_clair.sql"),
+            name: "0202_mcp_tokens_drop_plaintext.sql",
+            sql: include_str!("../migrations/0202_mcp_tokens_drop_plaintext.sql"),
         },
         Migration {
             version: 203,
-            name: "0203_article_scope_portee_datee.sql",
-            sql: include_str!("../migrations/0203_article_scope_portee_datee.sql"),
+            name: "0203_article_scope_and_geo_facets.sql",
+            sql: include_str!("../migrations/0203_article_scope_and_geo_facets.sql"),
         },
         Migration {
             version: 204,
@@ -1058,43 +1056,43 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 207,
-            name: "0207_legal_article_usage_bm25_bascule_num_key.sql",
-            sql: include_str!("../migrations/0207_legal_article_usage_bm25_bascule_num_key.sql"),
+            name: "0207_legal_article_usage_bm25_swap.sql",
+            sql: include_str!("../migrations/0207_legal_article_usage_bm25_swap.sql"),
         },
         Migration {
             version: 208,
-            name: "0208_decisions_public_id_not_null.sql",
-            sql: include_str!("../migrations/0208_decisions_public_id_not_null.sql"),
+            name: "0208_decisions_public_id_check_not_valid.sql",
+            sql: include_str!("../migrations/0208_decisions_public_id_check_not_valid.sql"),
         },
         Migration {
             version: 209,
-            name: "0209_decisions_public_id_not_null_valide.sql",
-            sql: include_str!("../migrations/0209_decisions_public_id_not_null_valide.sql"),
+            name: "0209_decisions_public_id_not_null.sql",
+            sql: include_str!("../migrations/0209_decisions_public_id_not_null.sql"),
         },
         Migration {
             version: 210,
-            name: "0210_auth_maison_sessions_et_jetons.sql",
-            sql: include_str!("../migrations/0210_auth_maison_sessions_et_jetons.sql"),
+            name: "0210_auth_password_sessions_email_tokens.sql",
+            sql: include_str!("../migrations/0210_auth_password_sessions_email_tokens.sql"),
         },
         Migration {
             version: 211,
-            name: "0211_docket_keys_fonction_canonique.sql",
-            sql: include_str!("../migrations/0211_docket_keys_fonction_canonique.sql"),
+            name: "0211_lj_docket_keys_function.sql",
+            sql: include_str!("../migrations/0211_lj_docket_keys_function.sql"),
         },
         Migration {
             version: 212,
-            name: "0212_docket_keys_index_gin.sql",
-            sql: include_str!("../migrations/0212_docket_keys_index_gin.sql"),
+            name: "0212_idx_decisions_docket_keys_gin.sql",
+            sql: include_str!("../migrations/0212_idx_decisions_docket_keys_gin.sql"),
         },
         Migration {
             version: 213,
-            name: "0213_decisions_bm25_v2_numero_entier.sql",
-            sql: include_str!("../migrations/0213_decisions_bm25_v2_numero_entier.sql"),
+            name: "0213_decisions_bm25_number_tokenizer.sql",
+            sql: include_str!("../migrations/0213_decisions_bm25_number_tokenizer.sql"),
         },
         Migration {
             version: 214,
-            name: "0214_decisions_bm25_bascule_numero_entier.sql",
-            sql: include_str!("../migrations/0214_decisions_bm25_bascule_numero_entier.sql"),
+            name: "0214_decisions_bm25_swap_v2.sql",
+            sql: include_str!("../migrations/0214_decisions_bm25_swap_v2.sql"),
         },
         Migration {
             version: 215,
@@ -1103,33 +1101,33 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 216,
-            name: "0216_slugs_de_codes_sans_artefact.sql",
-            sql: include_str!("../migrations/0216_slugs_de_codes_sans_artefact.sql"),
+            name: "0216_code_slugs_drop_artefacts.sql",
+            sql: include_str!("../migrations/0216_code_slugs_drop_artefacts.sql"),
         },
         Migration {
             version: 217,
-            name: "0217_identites_liees_et_jeton_avec_adresse.sql",
-            sql: include_str!("../migrations/0217_identites_liees_et_jeton_avec_adresse.sql"),
+            name: "0217_user_identities_and_email_change.sql",
+            sql: include_str!("../migrations/0217_user_identities_and_email_change.sql"),
         },
         Migration {
             version: 218,
-            name: "0218_legal_article_bm25_v2_numero_entier.sql",
-            sql: include_str!("../migrations/0218_legal_article_bm25_v2_numero_entier.sql"),
+            name: "0218_legal_article_bm25_int_tokenizer.sql",
+            sql: include_str!("../migrations/0218_legal_article_bm25_int_tokenizer.sql"),
         },
         Migration {
             version: 219,
-            name: "0219_legal_text_body_bm25_v2_numero_entier.sql",
-            sql: include_str!("../migrations/0219_legal_text_body_bm25_v2_numero_entier.sql"),
+            name: "0219_legal_text_body_bm25_int_tokenizer.sql",
+            sql: include_str!("../migrations/0219_legal_text_body_bm25_int_tokenizer.sql"),
         },
         Migration {
             version: 220,
-            name: "0220_legal_article_usage_bm25_v2_numero_entier.sql",
-            sql: include_str!("../migrations/0220_legal_article_usage_bm25_v2_numero_entier.sql"),
+            name: "0220_legal_article_usage_bm25_int_tokenizer.sql",
+            sql: include_str!("../migrations/0220_legal_article_usage_bm25_int_tokenizer.sql"),
         },
         Migration {
             version: 221,
-            name: "0221_moteur_textes_bascule_numero_entier.sql",
-            sql: include_str!("../migrations/0221_moteur_textes_bascule_numero_entier.sql"),
+            name: "0221_legal_text_engine_bm25_swap.sql",
+            sql: include_str!("../migrations/0221_legal_text_engine_bm25_swap.sql"),
         },
         Migration {
             version: 222,
@@ -1138,13 +1136,13 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 223,
-            name: "0223_legal_text_norm_browse_actes_individuels.sql",
-            sql: include_str!("../migrations/0223_legal_text_norm_browse_actes_individuels.sql"),
+            name: "0223_legal_text_norm_browse_idx.sql",
+            sql: include_str!("../migrations/0223_legal_text_norm_browse_idx.sql"),
         },
         Migration {
             version: 224,
-            name: "0224_libelles_juridictions_ultramarines.sql",
-            sql: include_str!("../migrations/0224_libelles_juridictions_ultramarines.sql"),
+            name: "0224_jurisdiction_label_overseas_fix.sql",
+            sql: include_str!("../migrations/0224_jurisdiction_label_overseas_fix.sql"),
         },
         Migration {
             version: 225,
@@ -1158,25 +1156,23 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 227,
-            name: "0227_idx_decisions_jur_code_date_bascule.sql",
-            sql: include_str!("../migrations/0227_idx_decisions_jur_code_date_bascule.sql"),
+            name: "0227_idx_decisions_jur_code_date_swap.sql",
+            sql: include_str!("../migrations/0227_idx_decisions_jur_code_date_swap.sql"),
         },
         Migration {
             version: 228,
-            name: "0228_search_title_porte_la_cle_collee_des_articles_etoiles.sql",
-            sql: include_str!(
-                "../migrations/0228_search_title_porte_la_cle_collee_des_articles_etoiles.sql"
-            ),
+            name: "0228_legal_article_search_title_star.sql",
+            sql: include_str!("../migrations/0228_legal_article_search_title_star.sql"),
         },
         Migration {
             version: 229,
-            name: "0229_publication_au_grain_de_la_cour.sql",
-            sql: include_str!("../migrations/0229_publication_au_grain_de_la_cour.sql"),
+            name: "0229_facet_value_hint_and_publication.sql",
+            sql: include_str!("../migrations/0229_facet_value_hint_and_publication.sql"),
         },
         Migration {
             version: 230,
-            name: "0230_le_rapport_annuel_ouvre_le_menu_publication.sql",
-            sql: include_str!("../migrations/0230_le_rapport_annuel_ouvre_le_menu_publication.sql"),
+            name: "0230_facet_value_publication_sort.sql",
+            sql: include_str!("../migrations/0230_facet_value_publication_sort.sql"),
         },
         Migration {
             version: 231,
@@ -1185,339 +1181,538 @@ pub fn embedded_migrations() -> Vec<Migration> {
         },
         Migration {
             version: 232,
-            name: "0232_idx_decisions_date_lecture.sql",
-            sql: include_str!("../migrations/0232_idx_decisions_date_lecture.sql"),
+            name: "0232_idx_decisions_date_lecture_actives.sql",
+            sql: include_str!("../migrations/0232_idx_decisions_date_lecture_actives.sql"),
         },
         Migration {
             version: 233,
-            name: "0233_publication_uid_et_portee_sortent.sql",
-            sql: include_str!("../migrations/0233_publication_uid_et_portee_sortent.sql"),
+            name: "0233_drop_decisions_publication_uid.sql",
+            sql: include_str!("../migrations/0233_drop_decisions_publication_uid.sql"),
         },
         Migration {
             version: 234,
-            name: "0234_chambre_clef_canonique.sql",
-            sql: include_str!("../migrations/0234_chambre_clef_canonique.sql"),
+            name: "0234_decisions_add_chamber_key.sql",
+            sql: include_str!("../migrations/0234_decisions_add_chamber_key.sql"),
         },
         Migration {
             version: 235,
-            name: "0235_le_quantum_du_prejudice_corporel_entre_en_base.sql",
-            sql: include_str!(
-                "../migrations/0235_le_quantum_du_prejudice_corporel_entre_en_base.sql"
-            ),
+            name: "0235_decision_quantum_tables.sql",
+            sql: include_str!("../migrations/0235_decision_quantum_tables.sql"),
         },
         Migration {
             version: 236,
-            name: "0236_la_matiere_libere_le_nom_de_chambre.sql",
-            sql: include_str!("../migrations/0236_la_matiere_libere_le_nom_de_chambre.sql"),
+            name: "0236_decisions_add_matiere_uid.sql",
+            sql: include_str!("../migrations/0236_decisions_add_matiere_uid.sql"),
         },
         Migration {
             version: 237,
-            name: "0237_le_quantum_tient_en_une_ligne_et_ses_observations.sql",
-            sql: include_str!(
-                "../migrations/0237_le_quantum_tient_en_une_ligne_et_ses_observations.sql"
-            ),
+            name: "0237_quantum_observation_table.sql",
+            sql: include_str!("../migrations/0237_quantum_observation_table.sql"),
         },
         Migration {
             version: 238,
-            name: "0238_les_surnoms_candidats_avant_activation.sql",
-            sql: include_str!("../migrations/0238_les_surnoms_candidats_avant_activation.sql"),
+            name: "0238_alias_candidate_table.sql",
+            sql: include_str!("../migrations/0238_alias_candidate_table.sql"),
         },
         Migration {
             version: 239,
-            name: "0239_la_chambre_de_rendu_et_son_ancien_nom_sortent.sql",
-            sql: include_str!(
-                "../migrations/0239_la_chambre_de_rendu_et_son_ancien_nom_sortent.sql"
-            ),
+            name: "0239_drop_decisions_chamber_position_uid.sql",
+            sql: include_str!("../migrations/0239_drop_decisions_chamber_position_uid.sql"),
         },
         Migration {
             version: 240,
-            name: "0240_lissue_de_la_victime_directe_entre_dans_lobservation.sql",
-            sql: include_str!(
-                "../migrations/0240_lissue_de_la_victime_directe_entre_dans_lobservation.sql"
-            ),
+            name: "0240_quantum_observation_add_deces.sql",
+            sql: include_str!("../migrations/0240_quantum_observation_add_deces.sql"),
         },
         Migration {
             version: 241,
-            name: "0241_ce_qui_reclasse_une_observation_sans_relire_larret.sql",
-            sql: include_str!(
-                "../migrations/0241_ce_qui_reclasse_une_observation_sans_relire_larret.sql"
-            ),
+            name: "0241_quantum_observation_add_comparabilite.sql",
+            sql: include_str!("../migrations/0241_quantum_observation_add_comparabilite.sql"),
         },
         Migration {
             version: 242,
-            name: "0242_le_grain_manquant_dune_categorie_descend_aussi.sql",
-            sql: include_str!(
-                "../migrations/0242_le_grain_manquant_dune_categorie_descend_aussi.sql"
-            ),
+            name: "0242_quantum_observation_categorie_manque.sql",
+            sql: include_str!("../migrations/0242_quantum_observation_categorie_manque.sql"),
         },
         Migration {
             version: 243,
-            name: "0243_la_chambre_porte_son_nom_complet.sql",
-            sql: include_str!("../migrations/0243_la_chambre_porte_son_nom_complet.sql"),
+            name: "0243_chamber_table.sql",
+            sql: include_str!("../migrations/0243_chamber_table.sql"),
         },
         Migration {
             version: 244,
-            name: "0244_les_renvois_officiels_sont_une_relation_de_citation.sql",
-            sql: include_str!(
-                "../migrations/0244_les_renvois_officiels_sont_une_relation_de_citation.sql"
-            ),
+            name: "0244_decision_renvoi_table.sql",
+            sql: include_str!("../migrations/0244_decision_renvoi_table.sql"),
         },
         Migration {
             version: 245,
-            name: "0245_decisions_bm25_v3_axes_de_facettes.sql",
-            sql: include_str!("../migrations/0245_decisions_bm25_v3_axes_de_facettes.sql"),
+            name: "0245_decisions_bm25_v3_facet_axes.sql",
+            sql: include_str!("../migrations/0245_decisions_bm25_v3_facet_axes.sql"),
         },
         Migration {
             version: 246,
-            name: "0246_decisions_bm25_bascule_axes_de_facettes.sql",
-            sql: include_str!("../migrations/0246_decisions_bm25_bascule_axes_de_facettes.sql"),
+            name: "0246_decisions_bm25_v3_swap.sql",
+            sql: include_str!("../migrations/0246_decisions_bm25_v3_swap.sql"),
         },
         Migration {
             version: 247,
-            name: "0247_la_fiche_dce_porte_une_decision_le_commentaire_non.sql",
-            sql: include_str!(
-                "../migrations/0247_la_fiche_dce_porte_une_decision_le_commentaire_non.sql"
-            ),
+            name: "0247_decision_sources_rank_rebuild.sql",
+            sql: include_str!("../migrations/0247_decision_sources_rank_rebuild.sql"),
         },
         Migration {
             version: 248,
-            name: "0248_la_donnee_de_compte_passe_dans_son_schema.sql",
-            sql: include_str!("../migrations/0248_la_donnee_de_compte_passe_dans_son_schema.sql"),
+            name: "0248_move_account_tables_to_comptes_schema.sql",
+            sql: include_str!("../migrations/0248_move_account_tables_to_comptes_schema.sql"),
         },
         Migration {
             version: 249,
-            name: "0249_decisions_bm25_v4_procedure.sql",
-            sql: include_str!("../migrations/0249_decisions_bm25_v4_procedure.sql"),
+            name: "0249_decisions_bm25_v4_procedure_uid.sql",
+            sql: include_str!("../migrations/0249_decisions_bm25_v4_procedure_uid.sql"),
         },
         Migration {
             version: 250,
-            name: "0250_decisions_bm25_bascule_procedure.sql",
-            sql: include_str!("../migrations/0250_decisions_bm25_bascule_procedure.sql"),
+            name: "0250_decisions_bm25_v4_swap.sql",
+            sql: include_str!("../migrations/0250_decisions_bm25_v4_swap.sql"),
         },
         Migration {
             version: 251,
-            name: "0251_la_decision_porte_le_nom_sous_lequel_on_la_cite.sql",
-            sql: include_str!(
-                "../migrations/0251_la_decision_porte_le_nom_sous_lequel_on_la_cite.sql"
-            ),
+            name: "0251_decisions_add_case_name.sql",
+            sql: include_str!("../migrations/0251_decisions_add_case_name.sql"),
         },
         Migration {
             version: 252,
-            name: "0252_les_cles_de_docket_nattendent_pas_dans_la_liste.sql",
-            sql: include_str!(
-                "../migrations/0252_les_cles_de_docket_nattendent_pas_dans_la_liste.sql"
-            ),
+            name: "0252_docket_keys_index_fastupdate_off.sql",
+            sql: include_str!("../migrations/0252_docket_keys_index_fastupdate_off.sql"),
         },
         Migration {
             version: 253,
-            name: "0253_le_bareme_dautorite_rendu_a_la_cnil.sql",
-            sql: include_str!("../migrations/0253_le_bareme_dautorite_rendu_a_la_cnil.sql"),
+            name: "0253_decision_sources_rank_cnil_fix.sql",
+            sql: include_str!("../migrations/0253_decision_sources_rank_cnil_fix.sql"),
         },
         Migration {
             version: 254,
-            name: "0254_la_matiere_generale_regroupe_ses_specialites.sql",
-            sql: include_str!(
-                "../migrations/0254_la_matiere_generale_regroupe_ses_specialites.sql"
-            ),
+            name: "0254_facet_value_matiere_parent_uid.sql",
+            sql: include_str!("../migrations/0254_facet_value_matiere_parent_uid.sql"),
         },
         Migration {
             version: 255,
-            name: "0255_les_decisions_notables_ont_leur_index.sql",
-            sql: include_str!("../migrations/0255_les_decisions_notables_ont_leur_index.sql"),
+            name: "0255_idx_decisions_notable.sql",
+            sql: include_str!("../migrations/0255_idx_decisions_notable.sql"),
         },
         Migration {
             version: 256,
-            name: "0256_le_nom_dusage_dit_qui_lui_a_donne_ce_nom.sql",
-            sql: include_str!("../migrations/0256_le_nom_dusage_dit_qui_lui_a_donne_ce_nom.sql"),
+            name: "0256_decisions_case_name_source.sql",
+            sql: include_str!("../migrations/0256_decisions_case_name_source.sql"),
         },
         Migration {
             version: 257,
-            name: "0257_le_nom_dusage_se_retrouve_sans_balayer_le_fonds.sql",
-            sql: include_str!(
-                "../migrations/0257_le_nom_dusage_se_retrouve_sans_balayer_le_fonds.sql"
-            ),
+            name: "0257_idx_decisions_case_name_source.sql",
+            sql: include_str!("../migrations/0257_idx_decisions_case_name_source.sql"),
         },
         Migration {
             version: 258,
-            name: "0258_la_specialisation_est_un_fait_de_chambre.sql",
-            sql: include_str!("../migrations/0258_la_specialisation_est_un_fait_de_chambre.sql"),
+            name: "0258_chamber_add_speciality_uid.sql",
+            sql: include_str!("../migrations/0258_chamber_add_speciality_uid.sql"),
         },
         Migration {
             version: 259,
-            name: "0259_la_partie_repliee_departage_deux_arrets_du_meme_jour.sql",
-            sql: include_str!(
-                "../migrations/0259_la_partie_repliee_departage_deux_arrets_du_meme_jour.sql"
-            ),
+            name: "0259_lj_party_fold_function.sql",
+            sql: include_str!("../migrations/0259_lj_party_fold_function.sql"),
         },
         Migration {
             version: 260,
-            name: "0260_la_relation_porte_l_arete_de_representation.sql",
-            sql: include_str!("../migrations/0260_la_relation_porte_l_arete_de_representation.sql"),
+            name: "0260_decision_party_representation_edge.sql",
+            sql: include_str!("../migrations/0260_decision_party_representation_edge.sql"),
         },
         Migration {
             version: 261,
-            name: "0261_decisions_bm25_v5_sans_matiere.sql",
-            sql: include_str!("../migrations/0261_decisions_bm25_v5_sans_matiere.sql"),
+            name: "0261_decisions_bm25_v5_drop_matiere.sql",
+            sql: include_str!("../migrations/0261_decisions_bm25_v5_drop_matiere.sql"),
         },
         Migration {
             version: 262,
-            name: "0262_decisions_bm25_bascule_sans_matiere.sql",
-            sql: include_str!("../migrations/0262_decisions_bm25_bascule_sans_matiere.sql"),
+            name: "0262_decisions_bm25_v5_swap.sql",
+            sql: include_str!("../migrations/0262_decisions_bm25_v5_swap.sql"),
         },
         Migration {
             version: 263,
-            name: "0263_la_matiere_quitte_la_decision.sql",
-            sql: include_str!("../migrations/0263_la_matiere_quitte_la_decision.sql"),
+            name: "0263_drop_decisions_matiere_uid.sql",
+            sql: include_str!("../migrations/0263_drop_decisions_matiere_uid.sql"),
         },
         Migration {
             version: 264,
-            name: "0264_le_desabonnement_a_sa_table_du_cote_du_produit.sql",
-            sql: include_str!(
-                "../migrations/0264_le_desabonnement_a_sa_table_du_cote_du_produit.sql"
-            ),
+            name: "0264_comptes_desabonnements_table.sql",
+            sql: include_str!("../migrations/0264_comptes_desabonnements_table.sql"),
         },
         Migration {
             version: 265,
-            name: "0265_la_langue_de_l_utilisateur_est_retenue_a_la_connexion.sql",
-            sql: include_str!(
-                "../migrations/0265_la_langue_de_l_utilisateur_est_retenue_a_la_connexion.sql"
-            ),
+            name: "0265_users_add_locale_columns.sql",
+            sql: include_str!("../migrations/0265_users_add_locale_columns.sql"),
         },
         Migration {
             version: 266,
-            name: "0266_le_lien_de_connexion_est_un_quatrieme_usage_de_jeton.sql",
-            sql: include_str!(
-                "../migrations/0266_le_lien_de_connexion_est_un_quatrieme_usage_de_jeton.sql"
-            ),
+            name: "0266_auth_email_tokens_purpose_login.sql",
+            sql: include_str!("../migrations/0266_auth_email_tokens_purpose_login.sql"),
         },
         Migration {
             version: 267,
-            name: "0267_la_table_du_desabonnement_prend_son_nom_anglais.sql",
-            sql: include_str!(
-                "../migrations/0267_la_table_du_desabonnement_prend_son_nom_anglais.sql"
-            ),
+            name: "0267_rename_desabonnements_to_unsubscribes.sql",
+            sql: include_str!("../migrations/0267_rename_desabonnements_to_unsubscribes.sql"),
         },
         Migration {
             version: 268,
-            name: "0268_l_ordre_des_juridictions_suit_l_autorite.sql",
-            sql: include_str!("../migrations/0268_l_ordre_des_juridictions_suit_l_autorite.sql"),
+            name: "0268_facet_value_jurisdiction_type_sort.sql",
+            sql: include_str!("../migrations/0268_facet_value_jurisdiction_type_sort.sql"),
         },
         Migration {
             version: 269,
-            name: "0269_chaque_palier_de_publication_dit_ce_qu_il_est.sql",
-            sql: include_str!(
-                "../migrations/0269_chaque_palier_de_publication_dit_ce_qu_il_est.sql"
-            ),
+            name: "0269_facet_value_publication_hints.sql",
+            sql: include_str!("../migrations/0269_facet_value_publication_hints.sql"),
         },
         Migration {
             version: 270,
-            name: "0270_la_matiere_nomme_une_chambre_pas_un_sujet.sql",
-            sql: include_str!("../migrations/0270_la_matiere_nomme_une_chambre_pas_un_sujet.sql"),
+            name: "0270_facet_value_matiere_labels.sql",
+            sql: include_str!("../migrations/0270_facet_value_matiere_labels.sql"),
         },
         Migration {
             version: 271,
-            name: "0271_le_recueil_nomme_sa_piece_de_tete.sql",
-            sql: include_str!("../migrations/0271_le_recueil_nomme_sa_piece_de_tete.sql"),
+            name: "0271_legal_text_base_piece_uid.sql",
+            sql: include_str!("../migrations/0271_legal_text_base_piece_uid.sql"),
         },
         Migration {
             version: 272,
-            name: "0272_le_recensement_compte_les_nuits_sans_reponse.sql",
-            sql: include_str!(
-                "../migrations/0272_le_recensement_compte_les_nuits_sans_reponse.sql"
-            ),
+            name: "0272_profil_acheteur_echecs_consecutifs.sql",
+            sql: include_str!("../migrations/0272_profil_acheteur_echecs_consecutifs.sql"),
         },
         Migration {
             version: 273,
-            name: "0273_le_libelle_de_chambre_se_recompose.sql",
-            sql: include_str!("../migrations/0273_le_libelle_de_chambre_se_recompose.sql"),
+            name: "0273_chamber_label_nullable_truncate.sql",
+            sql: include_str!("../migrations/0273_chamber_label_nullable_truncate.sql"),
         },
         Migration {
             version: 274,
-            name: "0274_le_libelle_de_chambre_a_un_defaut_vide.sql",
-            sql: include_str!("../migrations/0274_le_libelle_de_chambre_a_un_defaut_vide.sql"),
+            name: "0274_chamber_label_default_empty.sql",
+            sql: include_str!("../migrations/0274_chamber_label_default_empty.sql"),
         },
         Migration {
             version: 275,
-            name: "0275_les_compteurs_du_fonds_tiennent_dans_une_table.sql",
-            sql: include_str!(
-                "../migrations/0275_les_compteurs_du_fonds_tiennent_dans_une_table.sql"
-            ),
+            name: "0275_corpus_counts_rename_and_seed.sql",
+            sql: include_str!("../migrations/0275_corpus_counts_rename_and_seed.sql"),
         },
         Migration {
             version: 276,
-            name: "0276_le_libelle_de_chambre_n_est_plus_une_colonne.sql",
-            sql: include_str!(
-                "../migrations/0276_le_libelle_de_chambre_n_est_plus_une_colonne.sql"
-            ),
+            name: "0276_chamber_drop_label.sql",
+            sql: include_str!("../migrations/0276_chamber_drop_label.sql"),
         },
         Migration {
             version: 277,
-            name: "0277_les_cles_d_api_vivent_a_cote_des_sessions.sql",
-            sql: include_str!("../migrations/0277_les_cles_d_api_vivent_a_cote_des_sessions.sql"),
+            name: "0277_api_keys.sql",
+            sql: include_str!("../migrations/0277_api_keys.sql"),
         },
         Migration {
             version: 278,
-            name: "0278_le_nom_ancien_des_compteurs_du_fonds_tombe.sql",
-            sql: include_str!("../migrations/0278_le_nom_ancien_des_compteurs_du_fonds_tombe.sql"),
+            name: "0278_drop_decision_facet_counts_view.sql",
+            sql: include_str!("../migrations/0278_drop_decision_facet_counts_view.sql"),
         },
         Migration {
             version: 279,
-            name: "0279_la_table_du_desabonnement_tombe.sql",
-            sql: include_str!("../migrations/0279_la_table_du_desabonnement_tombe.sql"),
+            name: "0279_drop_unsubscribes.sql",
+            sql: include_str!("../migrations/0279_drop_unsubscribes.sql"),
         },
         Migration {
             version: 280,
-            name: "0280_la_matiere_quitte_la_ligne_de_chambre.sql",
-            sql: include_str!("../migrations/0280_la_matiere_quitte_la_ligne_de_chambre.sql"),
+            name: "0280_chamber_drop_speciality_uid.sql",
+            sql: include_str!("../migrations/0280_chamber_drop_speciality_uid.sql"),
         },
         Migration {
             version: 281,
-            name: "0281_la_chambre_du_conseil_est_une_procedure.sql",
-            sql: include_str!("../migrations/0281_la_chambre_du_conseil_est_une_procedure.sql"),
+            name: "0281_facet_value_chambre_du_conseil.sql",
+            sql: include_str!("../migrations/0281_facet_value_chambre_du_conseil.sql"),
         },
         Migration {
             version: 282,
-            name: "0282_le_siege_entre_en_base_avec_ses_chemins.sql",
-            sql: include_str!("../migrations/0282_le_siege_entre_en_base_avec_ses_chemins.sql"),
+            name: "0282_decisions_seat_and_seat_paths.sql",
+            sql: include_str!("../migrations/0282_decisions_seat_and_seat_paths.sql"),
         },
         Migration {
             version: 283,
-            name: "0283_le_verdict_du_tableur_descend_a_la_cellule.sql",
-            sql: include_str!("../migrations/0283_le_verdict_du_tableur_descend_a_la_cellule.sql"),
+            name: "0283_quantum_preuve_equations_verdict.sql",
+            sql: include_str!("../migrations/0283_quantum_preuve_equations_verdict.sql"),
         },
         Migration {
             version: 284,
-            name: "0284_le_quantum_tient_une_lecture_par_decision.sql",
-            sql: include_str!("../migrations/0284_le_quantum_tient_une_lecture_par_decision.sql"),
+            name: "0284_quantum_observation_one_row_per_decision.sql",
+            sql: include_str!("../migrations/0284_quantum_observation_one_row_per_decision.sql"),
         },
         Migration {
             version: 285,
-            name: "0285_l_observation_porte_son_origine_et_les_indemnites_acquises.sql",
-            sql: include_str!(
-                "../migrations/0285_l_observation_porte_son_origine_et_les_indemnites_acquises.sql"
-            ),
+            name: "0285_quantum_observation_origine_indemnites.sql",
+            sql: include_str!("../migrations/0285_quantum_observation_origine_indemnites.sql"),
         },
         Migration {
             version: 286,
-            name: "0286_decisions_bm25_v6_sur_les_chemins_de_siege.sql",
-            sql: include_str!("../migrations/0286_decisions_bm25_v6_sur_les_chemins_de_siege.sql"),
+            name: "0286_decisions_bm25_v6_seat_paths.sql",
+            sql: include_str!("../migrations/0286_decisions_bm25_v6_seat_paths.sql"),
         },
         Migration {
             version: 287,
-            name: "0287_les_chemins_de_siege_ont_leur_index.sql",
-            sql: include_str!("../migrations/0287_les_chemins_de_siege_ont_leur_index.sql"),
+            name: "0287_decisions_seat_paths_gin_index.sql",
+            sql: include_str!("../migrations/0287_decisions_seat_paths_gin_index.sql"),
         },
         Migration {
             version: 288,
-            name: "0288_l_historique_de_recherche_suit_l_axe_du_siege.sql",
-            sql: include_str!(
-                "../migrations/0288_l_historique_de_recherche_suit_l_axe_du_siege.sql"
-            ),
+            name: "0288_user_search_history_chamber_to_seat.sql",
+            sql: include_str!("../migrations/0288_user_search_history_chamber_to_seat.sql"),
         },
         Migration {
             version: 289,
-            name: "0289_bascule_sur_l_index_des_chemins_de_siege.sql",
-            sql: include_str!("../migrations/0289_bascule_sur_l_index_des_chemins_de_siege.sql"),
+            name: "0289_decisions_bm25_swap_seat_paths.sql",
+            sql: include_str!("../migrations/0289_decisions_bm25_swap_seat_paths.sql"),
+        },
+        Migration {
+            version: 290,
+            name: "0290_drop_chamber_key_and_chamber_table.sql",
+            sql: include_str!("../migrations/0290_drop_chamber_key_and_chamber_table.sql"),
+        },
+        Migration {
+            version: 291,
+            name: "0291_decisions_bm25_v7_docket_keys.sql",
+            sql: include_str!("../migrations/0291_decisions_bm25_v7_docket_keys.sql"),
+        },
+        Migration {
+            version: 292,
+            name: "0292_decisions_bm25_swap_docket_keys.sql",
+            sql: include_str!("../migrations/0292_decisions_bm25_swap_docket_keys.sql"),
+        },
+        Migration {
+            version: 293,
+            name: "0293_decisions_summary_engine.sql",
+            sql: include_str!("../migrations/0293_decisions_summary_engine.sql"),
+        },
+        Migration {
+            version: 294,
+            name: "0294_gemini_key_day_quota.sql",
+            sql: include_str!("../migrations/0294_gemini_key_day_quota.sql"),
+        },
+        Migration {
+            version: 295,
+            name: "0295_annonce_lien_sonde.sql",
+            sql: include_str!("../migrations/0295_annonce_lien_sonde.sql"),
+        },
+        Migration {
+            version: 296,
+            name: "0296_legal_article_kind_generated.sql",
+            sql: include_str!("../migrations/0296_legal_article_kind_generated.sql"),
+        },
+        Migration {
+            version: 297,
+            name: "0297_annonce_zones_array.sql",
+            sql: include_str!("../migrations/0297_annonce_zones_array.sql"),
+        },
+        Migration {
+            version: 298,
+            name: "0298_disable_aggregate_custom_scan.sql",
+            sql: include_str!("../migrations/0298_disable_aggregate_custom_scan.sql"),
+        },
+        Migration {
+            version: 299,
+            name: "0299_annonce_bm25_index.sql",
+            sql: include_str!("../migrations/0299_annonce_bm25_index.sql"),
+        },
+        Migration {
+            version: 300,
+            name: "0300_annonce_description_column.sql",
+            sql: include_str!("../migrations/0300_annonce_description_column.sql"),
+        },
+        Migration {
+            version: 301,
+            name: "0301_journal_wording_assertion_tables.sql",
+            sql: include_str!("../migrations/0301_journal_wording_assertion_tables.sql"),
+        },
+        Migration {
+            version: 302,
+            name: "0302_users_mcp_connected_at.sql",
+            sql: include_str!("../migrations/0302_users_mcp_connected_at.sql"),
+        },
+        Migration {
+            version: 303,
+            name: "0303_assertion_text_uid_foreign_keys.sql",
+            sql: include_str!("../migrations/0303_assertion_text_uid_foreign_keys.sql"),
+        },
+        Migration {
+            version: 304,
+            name: "0304_quantum_observation_composante_tranche.sql",
+            sql: include_str!("../migrations/0304_quantum_observation_composante_tranche.sql"),
+        },
+        Migration {
+            version: 305,
+            name: "0305_text_place_coverage_table.sql",
+            sql: include_str!("../migrations/0305_text_place_coverage_table.sql"),
+        },
+        Migration {
+            version: 306,
+            name: "0306_text_place_coverage_journal_nature.sql",
+            sql: include_str!("../migrations/0306_text_place_coverage_journal_nature.sql"),
+        },
+        Migration {
+            version: 307,
+            name: "0307_llm_credential_table.sql",
+            sql: include_str!("../migrations/0307_llm_credential_table.sql"),
+        },
+        Migration {
+            version: 308,
+            name: "0308_llm_credential_label_to_tenant.sql",
+            sql: include_str!("../migrations/0308_llm_credential_label_to_tenant.sql"),
+        },
+        Migration {
+            version: 309,
+            name: "0309_llm_credential_account_column.sql",
+            sql: include_str!("../migrations/0309_llm_credential_account_column.sql"),
+        },
+        Migration {
+            version: 310,
+            name: "0310_llm_credential_schema_comptes.sql",
+            sql: include_str!("../migrations/0310_llm_credential_schema_comptes.sql"),
+        },
+        Migration {
+            version: 311,
+            name: "0311_drop_mistral_key_status.sql",
+            sql: include_str!("../migrations/0311_drop_mistral_key_status.sql"),
+        },
+        Migration {
+            version: 312,
+            name: "0312_legal_text_slug_jurisdiction_unique.sql",
+            sql: include_str!("../migrations/0312_legal_text_slug_jurisdiction_unique.sql"),
+        },
+        Migration {
+            version: 313,
+            name: "0313_annonce_metiers_array.sql",
+            sql: include_str!("../migrations/0313_annonce_metiers_array.sql"),
+        },
+        Migration {
+            version: 314,
+            name: "0314_drop_legal_text_slug_index.sql",
+            sql: include_str!("../migrations/0314_drop_legal_text_slug_index.sql"),
+        },
+        Migration {
+            version: 315,
+            name: "0315_jurisdiction_place_column.sql",
+            sql: include_str!("../migrations/0315_jurisdiction_place_column.sql"),
+        },
+        Migration {
+            version: 316,
+            name: "0316_llm_credential_priority_column.sql",
+            sql: include_str!("../migrations/0316_llm_credential_priority_column.sql"),
+        },
+        Migration {
+            version: 317,
+            name: "0317_pending_target_court_docket_date.sql",
+            sql: include_str!("../migrations/0317_pending_target_court_docket_date.sql"),
+        },
+        Migration {
+            version: 318,
+            name: "0318_llm_credential_purpose_nullable.sql",
+            sql: include_str!("../migrations/0318_llm_credential_purpose_nullable.sql"),
+        },
+        Migration {
+            version: 319,
+            name: "0319_drop_llm_credential_purpose.sql",
+            sql: include_str!("../migrations/0319_drop_llm_credential_purpose.sql"),
+        },
+        Migration {
+            version: 320,
+            name: "0320_users_browser_languages_country.sql",
+            sql: include_str!("../migrations/0320_users_browser_languages_country.sql"),
+        },
+        Migration {
+            version: 321,
+            name: "0321_lj_docket_search_keys_function.sql",
+            sql: include_str!("../migrations/0321_lj_docket_search_keys_function.sql"),
+        },
+        Migration {
+            version: 322,
+            name: "0322_lj_docket_search_keys_schema_qualify.sql",
+            sql: include_str!("../migrations/0322_lj_docket_search_keys_schema_qualify.sql"),
+        },
+        Migration {
+            version: 323,
+            name: "0323_decisions_bm25_v8_docket_search.sql",
+            sql: include_str!("../migrations/0323_decisions_bm25_v8_docket_search.sql"),
+        },
+        Migration {
+            version: 324,
+            name: "0324_decisions_bm25_swap_docket_search.sql",
+            sql: include_str!("../migrations/0324_decisions_bm25_swap_docket_search.sql"),
+        },
+        Migration {
+            version: 325,
+            name: "0325_lj_fold_function.sql",
+            sql: include_str!("../migrations/0325_lj_fold_function.sql"),
+        },
+        Migration {
+            version: 326,
+            name: "0326_reindex_entity_annuaire_idx.sql",
+            sql: include_str!("../migrations/0326_reindex_entity_annuaire_idx.sql"),
+        },
+        Migration {
+            version: 327,
+            name: "0327_reindex_entity_prefix_idx.sql",
+            sql: include_str!("../migrations/0327_reindex_entity_prefix_idx.sql"),
+        },
+        Migration {
+            version: 328,
+            name: "0328_reindex_entity_prefix_contentieux_idx.sql",
+            sql: include_str!("../migrations/0328_reindex_entity_prefix_contentieux_idx.sql"),
+        },
+        Migration {
+            version: 329,
+            name: "0329_reindex_entity_folded_all_idx.sql",
+            sql: include_str!("../migrations/0329_reindex_entity_folded_all_idx.sql"),
+        },
+        Migration {
+            version: 330,
+            name: "0330_assertion_rule_and_coverage_rule.sql",
+            sql: include_str!("../migrations/0330_assertion_rule_and_coverage_rule.sql"),
+        },
+        Migration {
+            version: 331,
+            name: "0331_drop_users_browser_locale.sql",
+            sql: include_str!("../migrations/0331_drop_users_browser_locale.sql"),
+        },
+        Migration {
+            version: 332,
+            name: "0332_pending_docket_idx_fastupdate_off.sql",
+            sql: include_str!("../migrations/0332_pending_docket_idx_fastupdate_off.sql"),
+        },
+        Migration {
+            version: 333,
+            name: "0333_decision_text.sql",
+            sql: include_str!("../migrations/0333_decision_text.sql"),
+        },
+        Migration {
+            version: 334,
+            name: "0334_decision_text_bm25.sql",
+            sql: include_str!("../migrations/0334_decision_text_bm25.sql"),
+        },
+        Migration {
+            version: 335,
+            name: "0335_decision_text_writers.sql",
+            sql: include_str!("../migrations/0335_decision_text_writers.sql"),
+        },
+        Migration {
+            version: 336,
+            name: "0336_drop_decisions_bm25.sql",
+            sql: include_str!("../migrations/0336_drop_decisions_bm25.sql"),
+        },
+        Migration {
+            version: 337,
+            name: "0337_drop_decisions_text_columns.sql",
+            sql: include_str!("../migrations/0337_drop_decisions_text_columns.sql"),
+        },
+        Migration {
+            version: 338,
+            name: "0338_decision_text_per_provenance.sql",
+            sql: include_str!("../migrations/0338_decision_text_per_provenance.sql"),
         },
     ]
 }
@@ -1536,7 +1731,7 @@ const MIGRATION_LOCK_OBJ: i32 = 0x6D6967;
 /// survit au COMMIT et reste tenu jusqu'à `pg_advisory_unlock` ou la fin de
 /// session.
 async fn acquire_migration_lock(conn: &Connection) -> Result<()> {
-    tracing::info!("migrations : prise du verrou consultatif");
+    tracing::info!("migrations: acquiring the advisory lock");
     let waited = std::time::Instant::now();
     conn.batch_execute("BEGIN").await?;
     let acquired = async {
@@ -1555,7 +1750,7 @@ async fn acquire_migration_lock(conn: &Connection) -> Result<()> {
             conn.batch_execute("COMMIT").await?;
             tracing::info!(
                 waited_ms = waited.elapsed().as_millis() as u64,
-                "migrations : verrou consultatif obtenu"
+                "migrations: advisory lock acquired"
             );
             Ok(())
         }
@@ -1613,8 +1808,63 @@ async fn applied_versions(conn: &Connection, table: &str) -> Result<Vec<i32>> {
 /// Sérialise les runners concurrents via un verrou consultatif de session
 /// (cf. doc de module), puis délègue à [`apply_migrations_locked`]. Le verrou est
 /// **toujours relâché** au retour, succès comme erreur.
-pub async fn apply_migrations(conn: &Connection) -> Result<Vec<i32>> {
-    apply_migrations_with(conn, embedded_migrations(), SCHEMA_MIGRATIONS).await
+pub async fn apply_migrations(conn: &Connection, intent: MigrationIntent) -> Result<Vec<i32>> {
+    match intent {
+        MigrationIntent::Apply => {
+            apply_migrations_with(conn, embedded_migrations(), SCHEMA_MIGRATIONS).await
+        }
+        MigrationIntent::Verify => {
+            verify_schema_current(conn).await?;
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// What a caller allows itself on the schema. Every command states it, because
+/// the implicit default was `Apply`: on 2026-09-10 migration 0296 rode in on a
+/// `quantum-extract` and took 547 s of ACCESS EXCLUSIVE on `legal_article`,
+/// which its operator had not asked for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MigrationIntent {
+    /// Refuses a schema that lags, and writes nothing.
+    Verify,
+    /// Applies what is pending. Reserved for `lj-ingest migrate`.
+    Apply,
+}
+
+/// The check of [`apply_migrations`] without its writing: raises when the base
+/// holds a version the binary lacks, then when the binary holds one the base
+/// lacks. It does not create `schema_migrations`, a check writing nothing.
+async fn verify_schema_current(conn: &Connection) -> Result<()> {
+    let table: Option<String> = conn
+        .query_one(
+            &format!("SELECT to_regclass('{SCHEMA_MIGRATIONS}')::text"),
+            &[],
+        )
+        .await?
+        .get(0);
+    let available: Vec<i32> = embedded_migrations().iter().map(|m| m.version).collect();
+    let applied = match table {
+        Some(_) => applied_versions(conn, SCHEMA_MIGRATIONS).await?,
+        None => Vec::new(),
+    };
+    let missing: Vec<i32> = applied
+        .iter()
+        .copied()
+        .filter(|v| !available.contains(v))
+        .collect();
+    if let Some(&version) = missing.first() {
+        return Err(StoreError::UnknownMigrations { version, missing });
+    }
+    let pending: Vec<i32> = available
+        .into_iter()
+        .filter(|v| !applied.contains(v))
+        .collect();
+    if pending.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::PendingMigrations { pending })
+    }
 }
 
 /// Applique une **autre** série, suivie dans sa propre table : deux séries qui
@@ -1688,7 +1938,7 @@ async fn apply_migrations_locked(
         tracing::info!(
             version = migration.version,
             name = migration.name,
-            "application migration"
+            "applying migration"
         );
         let started = std::time::Instant::now();
         if let Err(err) = apply_one(conn, migration, table).await {
@@ -1700,7 +1950,7 @@ async fn apply_migrations_locked(
             version = migration.version,
             name = migration.name,
             elapsed_ms = started.elapsed().as_millis() as u64,
-            "migration appliquée"
+            "migration applied"
         );
         newly_applied.push(migration.version);
     }

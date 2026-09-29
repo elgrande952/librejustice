@@ -42,7 +42,7 @@ HTTP 200
 jsonpath "$.jsonrpc" == "2.0"
 jsonpath "$.id" == 1
 jsonpath "$.result" exists
-jsonpath "$.result.protocolVersion" isString
+jsonpath "$.result.protocolVersion" == "2024-11-05"
 jsonpath "$.result.capabilities" exists
 jsonpath "$.result.capabilities.tools" exists
 jsonpath "$.result.serverInfo" exists
@@ -51,8 +51,8 @@ jsonpath "$.result.serverInfo.version" isString
 jsonpath "$.result.instructions" isString
 jsonpath "$.result.instructions" contains "French case law"
 jsonpath "$.error" not exists
-# DIVERGENCE: Python protocolVersion is SDK-negotiated (e.g. "2025-06-18"),
-# Rust hardcodes "2024-11-05". serverInfo.version: SDK version vs CARGO_PKG_VERSION.
+# The revision asserted above is the one this request asked for: the server
+# echoes a revision it speaks, and answers its newest for anything else.
 
 # -----------------------------------------------------------------------------
 # initialize sur /mcp SANS slash final — même handler. Les clients MCP (ChatGPT,
@@ -109,7 +109,7 @@ jsonpath "$.result" exists
 jsonpath "$.error" not exists
 
 # -----------------------------------------------------------------------------
-# tools/list — five tools, exact names, ordering, strict inputSchema
+# tools/list: four tools, exact names, ordering, strict inputSchema
 # -----------------------------------------------------------------------------
 POST {{base}}/mcp/
 Accept: application/json, text/event-stream
@@ -125,12 +125,11 @@ HTTP 200
 jsonpath "$.jsonrpc" == "2.0"
 jsonpath "$.id" == 3
 jsonpath "$.result.tools" isCollection
-jsonpath "$.result.tools" count == 5
+jsonpath "$.result.tools" count == 4
 jsonpath "$.result.tools[0].name" == "search_decisions"
 jsonpath "$.result.tools[1].name" == "get_decision"
-jsonpath "$.result.tools[2].name" == "list_my_activity"
-jsonpath "$.result.tools[3].name" == "get_legal_text"
-jsonpath "$.result.tools[4].name" == "search_legal_texts"
+jsonpath "$.result.tools[2].name" == "get_norm"
+jsonpath "$.result.tools[3].name" == "search_norms"
 # Every tool: description + inputSchema, no title-bearing $ref/$defs leakage.
 jsonpath "$.result.tools[0].description" isString
 jsonpath "$.result.tools[0].inputSchema" exists
@@ -152,8 +151,7 @@ jsonpath "$.result.tools[0].inputSchema.properties.ai_rerank.type" == "boolean"
 jsonpath "$.result.tools[0].inputSchema.properties.jurisdiction_type.anyOf[0].items.enum" includes "TA"
 jsonpath "$.result.tools[0].inputSchema.properties.jurisdiction_type.anyOf[0].items.enum" includes "CC"
 jsonpath "$.result.tools[0].inputSchema.properties.jurisdiction_type.anyOf[0].items.enum" includes "TCOM"
-# Tous les outils sont read-only (le log d'activité est une journalisation
-# privée du compte, cf. read_only_annotations dans mcp.rs).
+# No tool writes anything.
 jsonpath "$.result.tools[0].annotations.readOnlyHint" == true
 jsonpath "$.result.tools[0].annotations.destructiveHint" == false
 jsonpath "$.result.tools[0].annotations.idempotentHint" == true
@@ -162,12 +160,6 @@ jsonpath "$.result.tools[1].inputSchema.additionalProperties" == false
 jsonpath "$.result.tools[1].inputSchema.required" includes "url"
 jsonpath "$.result.tools[1].inputSchema.properties.url.type" == "string"
 jsonpath "$.result.tools[1].inputSchema.properties.url.minLength" == 1
-jsonpath "$.result.tools[2].inputSchema.additionalProperties" == false
-jsonpath "$.result.tools[2].inputSchema.properties.kind.enum" includes "searches"
-jsonpath "$.result.tools[2].inputSchema.properties.kind.enum" includes "bookmarks"
-jsonpath "$.result.tools[2].inputSchema.properties.kind.enum" includes "readingHistory"
-jsonpath "$.result.tools[2].inputSchema.properties.kind.enum" includes "all"
-jsonpath "$.result.tools[2].inputSchema.properties.limit.maximum" == 100
 # DIVERGENCE: Python registers tools with title="Search Decisions" etc.;
 # _postprocess only strips `title` INSIDE inputSchema, leaving the tool-level
 # `title` field present. Rust omits tool-level `title` entirely. The differ
@@ -200,10 +192,10 @@ jsonpath "$.result.structuredContent.query" isString
 jsonpath "$.result.structuredContent.hits" isCollection
 jsonpath "$.result.isError" == false
 # Per-hit shape (only assert when at least one hit; data-dependent):
-# hits[].title/url/chars/jurisdictionType always present (camelCase), plus
-# exactly one of aiSummary (semantic) / snippet (lexical) per hit,
-# optional metadata = filter tokens: jurisdictionCode, seat, solution,
-# procedure, office, legalDomain, publication, dateLecture, docketNumbers
+# hits[].title/url/chars always present (camelCase), plus exactly one of
+# aiSummary (semantic) / snippet (lexical) per hit, optional metadata =
+# filter tokens: seat, solution, procedure, office, legalDomain,
+# publication, dateLecture, docketNumbers
 # (omitted when null — skip_serializing_if).
 
 # -----------------------------------------------------------------------------
@@ -219,7 +211,7 @@ Content-Type: application/json
   "jsonrpc": "2.0",
   "id": 5,
   "method": "tools/call",
-  "params": {"name": "get_decision", "arguments": {"url": "https://librejustice.fr/decision/does-not-exist-zzz"}}
+  "params": {"name": "get_decision", "arguments": {"url": "https://librejustice.fr/decision/fr/does-not-exist-zzz"}}
 }
 HTTP 200
 [Asserts]
@@ -273,6 +265,23 @@ jsonpath "$.result.content[0].text" contains "\"category\":\"validation\""
 jsonpath "$.result.content[0].text" contains "\"hint\""
 
 # -----------------------------------------------------------------------------
+# tools/call on a removed tool: a client that froze its tool list still calls it.
+# -----------------------------------------------------------------------------
+POST {{base}}/mcp/
+Accept: application/json, text/event-stream
+Content-Type: application/json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {"name": "list_my_activity", "arguments": {}}
+}
+HTTP 200
+[Asserts]
+jsonpath "$.result.isError" == true
+jsonpath "$.result.content[0].text" contains "list_my_activity was removed."
+
+# -----------------------------------------------------------------------------
 # resources/list: the capability is not announced, so the method does not exist.
 # Serving an empty list made the directories advertise `capability:resources`.
 # -----------------------------------------------------------------------------
@@ -293,8 +302,9 @@ jsonpath "$.error.code" == -32601
 jsonpath "$.result" not exists
 
 # -----------------------------------------------------------------------------
-# tools/call search_decisions : le filtre `matiere`, retiré du schéma, est
-# toujours accepté, réécrit en `legal_domain` et annoncé dans `filterRewritten`.
+# tools/call search_decisions: `jurisdiction_code`, out of the schema, is still
+# accepted and announces nothing. While callers move over to `seat`, a call
+# still carrying it answers as before.
 # -----------------------------------------------------------------------------
 POST {{base}}/mcp/
 Accept: application/json, text/event-stream
@@ -305,19 +315,18 @@ Content-Type: application/json
   "method": "tools/call",
   "params": {
     "name": "search_decisions",
-    "arguments": {"query": "obligation de quitter le territoire", "matiere": ["ETRANGERS"], "limit": 3, "ai_rerank": false}
+    "arguments": {"query": "obligation de quitter le territoire", "jurisdiction_code": ["cc"], "limit": 3, "ai_rerank": false}
   }
 }
 HTTP 200
 [Asserts]
 jsonpath "$.result.isError" == false
-jsonpath "$.result.structuredContent.filterRewritten" contains "legal_domain"
-jsonpath "$.result.structuredContent.filterRewritten" contains "PUBLIC_DROIT_ETRANGERS_NATIONALITE"
 jsonpath "$.result.structuredContent.hits" isCollection
+jsonpath "$.result.structuredContent.filterRewritten" not exists
 
 # -----------------------------------------------------------------------------
-# tools/call search_decisions : une valeur `matiere` qui ne nommait pas un sujet
-# rend une erreur corrective, pas un filtre muet.
+# tools/call search_decisions: `matiere` is retired for good, so refused as an
+# unknown field instead of silently rewritten.
 # -----------------------------------------------------------------------------
 POST {{base}}/mcp/
 Accept: application/json, text/event-stream
@@ -334,7 +343,7 @@ Content-Type: application/json
 HTTP 200
 [Asserts]
 jsonpath "$.result.isError" == true
-jsonpath "$.result.content[0].text" contains "legal_domain"
+jsonpath "$.result.content[0].text" contains "unknown field"
 
 # -----------------------------------------------------------------------------
 # unknown top-level method → method not found

@@ -7,8 +7,9 @@
 //!   les `JORFARTI` d'un véhicule cible d'une arête `publie`, routés vers la
 //!   fiche instrument, et seulement les annexes (`num` non numérique). Le reste
 //!   du JO n'entre pas au référentiel versionné : LEGI consolide les décrets.
-//! - **Articles sans numéro ignorés** : `NUM` vide n'est pas citable. Les
-//!   `referential_texts`, eux, restent complets.
+//! - **Unnumbered articles stay out of the versioned referential**: an empty
+//!   `NUM` is not citable. Their text becomes the body of a JORFTEXT with
+//!   neither body nor article, often all an individual act carries.
 //! - **Deux séries d'articles dans un même JORFTEXT**, quand une annexe
 //!   renumérote à partir de 1 : la passe textes lit les `texte/struct` pour
 //!   connaître le dispositif propre de chaque texte, et la passe articles
@@ -17,7 +18,7 @@
 //! Le corps des accords antérieurs à la numérisation est absent du bulk : leurs
 //! `referential_articles` viennent d'un track OCR distinct.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -58,6 +59,46 @@ fn classify_jorf_member(name: &str) -> JorfMember {
         return JorfMember::Texte;
     }
     JorfMember::Ignore
+}
+
+/// Unnumbered article text of each JORFTEXT, keyed by `JORFARTI`: a later
+/// archive's version replaces the earlier one, and id order is reading order.
+#[derive(Default)]
+pub(crate) struct UnnumberedBodies(HashMap<String, BTreeMap<String, String>>);
+
+impl UnnumberedBodies {
+    fn push(&mut self, jorftext: String, jorfarti: String, texte: String) {
+        self.0.entry(jorftext).or_default().insert(jorfarti, texte);
+    }
+
+    /// Writes the joined bodies on the empty texts, returns the rows written.
+    async fn write(self, repo: &DecisionRepository<'_>) -> Result<u64> {
+        let bodies: Vec<(String, String)> = self
+            .0
+            .into_iter()
+            .map(|(uid, arts)| (uid, arts.into_values().collect::<Vec<_>>().join("\n\n")))
+            .collect();
+        let mut written = 0;
+        for chunk in bodies.chunks(JORF_BATCH_SIZE) {
+            written += repo
+                .fill_empty_legal_text_bodies(chunk)
+                .await
+                .map_err(|e| anyhow!("fill_empty_legal_text_bodies: {e}"))?;
+        }
+        Ok(written)
+    }
+}
+
+/// The text of an unnumbered article, `None` for a numbered or empty one.
+fn unnumbered_text(art: &lj_extract::jorf::JorfArticle) -> Option<String> {
+    if art.num.is_some() {
+        return None;
+    }
+    art.texte
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 /// Convertit une date ISO (`YYYY-MM-DD`) émise par le parser pur en
@@ -153,7 +194,7 @@ fn jorf_link_rows(
                 .num
                 .as_deref()
                 .map(|n| {
-                    lj_core::article_key::article_key(&lj_extract::extract::normalize_article(n))
+                    lj_norm::article_key::article_key(&lj_extract::extract::normalize_article(n))
                 })
                 .filter(|k| !k.is_empty());
             Ok(lj_store::repository::LegalLinkRow {
@@ -247,7 +288,7 @@ fn article_num_key(
 ) -> String {
     match title_path.filter(|p| !p.is_empty()) {
         Some(path) if dispositif.contains(&dispositif_slot(text_uid, num_key)) => {
-            format!("{}-{num_key}", lj_core::article_key::article_key(path))
+            format!("{}-{num_key}", lj_norm::article_key::article_key(path))
         }
         _ => num_key.to_string(),
     }
@@ -269,7 +310,7 @@ pub async fn ingest_jorf(paths: &[std::path::PathBuf]) -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     // Finisseurs pleine-table : au-delà du `statement_timeout` du pool.
@@ -316,7 +357,7 @@ async fn ingest_jorf_archive(
 
     // Passe 2 : articles (routés par arête publie) + suppressions `.dat`.
     let routes = publie_routes.len();
-    let (upserted, skipped, no_num, errors, deleted) =
+    let (upserted, skipped, no_num, errors, deleted, bodies) =
         ingest_jorf_articles(repo, path, publie_routes, dispositif).await?;
 
     tracing::info!(
@@ -330,6 +371,7 @@ async fn ingest_jorf_archive(
         articles_skipped = skipped,
         articles_no_num = no_num,
         articles_deleted = deleted,
+        bodies,
         errors,
         "ingest_jorf_archive"
     );
@@ -363,7 +405,7 @@ async fn finish_jorf(
 
     // Titre du code dénormalisé → titre formé `search_title`.
     let retitled = repo
-        .refresh_article_denorm()
+        .refresh_article_denorm(None)
         .await
         .map_err(|e| anyhow!("refresh_article_denorm: {e}"))?;
     // Ordre de lecture des textes touchés : l'écriture n'a fait qu'invalider les
@@ -400,17 +442,17 @@ pub async fn sync_jorf() -> Result<()> {
     .map_err(|e| anyhow!("sync_dila join (jorf): {e}"))?
     .map_err(|e| anyhow!("sync_dila (jorf): {e}"))?;
     if batch.archives.is_empty() {
-        tracing::info!("sync_jorf : rien de neuf (≤ watermark)");
+        tracing::info!("sync_jorf: nothing new (<= watermark)");
         return Ok(());
     }
     tracing::info!(
         downloaded = batch.archives.len(),
-        "sync_jorf : ingestion des archives fraîches"
+        "sync_jorf: ingesting the fresh archives"
     );
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     // Finisseurs pleine-table : au-delà du `statement_timeout` du pool.
@@ -426,6 +468,46 @@ pub async fn sync_jorf() -> Result<()> {
             .map_err(|e| anyhow!("filigrane jorf {}: {e}", archive.watermark))?;
     }
     finish_jorf(&repo, Some(&touched)).await
+}
+
+/// Rereads the unnumbered articles of every cached JORF archive, stock then
+/// increments, and writes the body of the texts with neither body nor article.
+pub async fn backfill_jorf_bodies() -> Result<()> {
+    let settings = Settings::from_env()?;
+    let paths = lj_sources::dila::cached_dila_tarballs(
+        &settings.cache_dir(),
+        lj_sources::dila::DilaFond::Jorf,
+    )?;
+    let unnumbered = tokio::task::spawn_blocking(move || -> Result<UnnumberedBodies> {
+        let mut unnumbered = UnnumberedBodies::default();
+        for path in &paths {
+            lj_sources::tar_reader::for_each_member(path, |name, raw| {
+                if !matches!(classify_jorf_member(&name), JorfMember::Article) {
+                    return Ok(());
+                }
+                match lj_extract::jorf::parse_jorf_article(&raw) {
+                    Ok(art) => {
+                        if let Some(texte) = unnumbered_text(&art) {
+                            unnumbered.push(art.jorftext, art.jorfarti, texte);
+                        }
+                    }
+                    Err(e) => tracing::error!(member = %name, error = %e, "jorf article: parse failed"),
+                }
+                Ok(())
+            })?;
+            tracing::info!(archive = %path.display(), texts = unnumbered.0.len(), "jorf bodies: archive read");
+        }
+        Ok(unnumbered)
+    })
+    .await
+    .map_err(|e| anyhow!("jorf bodies join: {e}"))??;
+    let pool =
+        lj_store::db::build_pool(&settings.db_url, 1).map_err(|e| anyhow!("build_pool: {e}"))?;
+    let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
+    let candidates = unnumbered.0.len();
+    let written = unnumbered.write(&DecisionRepository::new(&conn)).await?;
+    tracing::warn!(candidates, written, "jorf bodies: empty texts filled");
+    Ok(())
 }
 
 /// Compteurs de la passe textes : traités upsertés, fiches JO créées, fiches JO
@@ -477,7 +559,7 @@ async fn ingest_jorf_texts(repo: &DecisionRepository<'_>, path: &Path) -> Result
                         Ok(())
                     }
                     Err(e) => {
-                        tracing::error!(member = %name, error = %e, "jorf struct: parse échec");
+                        tracing::error!(member = %name, error = %e, "jorf struct: parse failed");
                         Ok(())
                     }
                 },
@@ -486,7 +568,7 @@ async fn ingest_jorf_texts(repo: &DecisionRepository<'_>, path: &Path) -> Result
                         .blocking_send(jorf_texte_msg(t, &vehicles))
                         .map_err(|_| anyhow!("canal JORF textes fermé")),
                     Err(e) => {
-                        tracing::error!(member = %name, error = %e, "jorf texte: parse échec");
+                        tracing::error!(member = %name, error = %e, "jorf texte: parse failed");
                         Ok(())
                     }
                 },
@@ -513,17 +595,17 @@ async fn ingest_jorf_texts(repo: &DecisionRepository<'_>, path: &Path) -> Result
     Ok(counts)
 }
 
-/// Passe 2 — articles JORF → `referential_articles`. Renvoie
-/// `(upserted, skipped, no_num, errors)`.
+/// Pass 2: JORF articles into `referential_articles`, and the bodies of the
+/// empty texts. Returns `(upserted, skipped, no_num, errors, deleted, bodies)`.
 async fn ingest_jorf_articles(
     repo: &DecisionRepository<'_>,
     path: &Path,
     publie_routes: HashMap<String, String>,
     dispositif: HashSet<String>,
-) -> Result<(usize, usize, usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize, usize, u64)> {
     enum ArtMsg {
         Row(Box<lj_store::repository::LegalArticleRow>),
-        NoNum,
+        NoNum(Option<(String, String, String)>),
         Err,
         Dat(Vec<String>),
     }
@@ -551,6 +633,9 @@ async fn ingest_jorf_articles(
                 return Ok(());
             }
             let msg = match lj_extract::jorf::parse_jorf_article(&raw) {
+                Ok(art) if art.num.is_none() => {
+                    ArtMsg::NoNum(unnumbered_text(&art).map(|t| (art.jorftext, art.jorfarti, t)))
+                }
                 Ok(art) => {
                     let route = publie_routes.get(&art.jorftext).cloned();
                     let checksum = xxhash_rust::xxh3::xxh3_64(&raw);
@@ -574,7 +659,7 @@ async fn ingest_jorf_articles(
                             }
                             ArtMsg::Row(Box::new(row))
                         }
-                        Ok(None) => ArtMsg::NoNum,
+                        Ok(None) => ArtMsg::NoNum(None),
                         Err(e) => {
                             tracing::error!(member = %name, error = %e, "jorf article: row invalide");
                             ArtMsg::Err
@@ -582,7 +667,7 @@ async fn ingest_jorf_articles(
                     }
                 }
                 Err(e) => {
-                    tracing::error!(member = %name, error = %e, "jorf article: parse échec");
+                    tracing::error!(member = %name, error = %e, "jorf article: parse failed");
                     ArtMsg::Err
                 }
             };
@@ -594,6 +679,7 @@ async fn ingest_jorf_articles(
     let mut batch: Vec<lj_store::repository::LegalArticleRow> = Vec::new();
     let mut suppress: Vec<String> = Vec::new();
     let (mut upserted, mut skipped, mut no_num, mut errors) = (0usize, 0usize, 0usize, 0usize);
+    let mut unnumbered = UnnumberedBodies::default();
     while let Some(msg) = rx.recv().await {
         match msg {
             ArtMsg::Row(row) => {
@@ -608,7 +694,12 @@ async fn ingest_jorf_articles(
                     .await?;
                 }
             }
-            ArtMsg::NoNum => no_num += 1,
+            ArtMsg::NoNum(art) => {
+                no_num += 1;
+                if let Some((jorftext, jorfarti, texte)) = art {
+                    unnumbered.push(jorftext, jorfarti, texte);
+                }
+            }
             ArtMsg::Err => errors += 1,
             ArtMsg::Dat(paths) => suppress.extend(paths),
         }
@@ -626,7 +717,8 @@ async fn ingest_jorf_articles(
             .await
             .map_err(|e| anyhow!("delete_legal_articles_by_paths: {e}"))? as usize
     };
-    Ok((upserted, skipped, no_num, errors, deleted))
+    let bodies = unnumbered.write(repo).await?;
+    Ok((upserted, skipped, no_num, errors, deleted, bodies))
 }
 
 /// Écrit un batch de textes JORF : traité ou véhicule de publication → upsert
@@ -697,7 +789,7 @@ async fn flush_jorf_articles(
 ) -> Result<()> {
     for art in articles {
         if repo
-            .upsert_legal_article(&art)
+            .upsert_legal_article(&art, lj_store::repository::Fraicheur::Autoritaire)
             .await
             .map_err(|e| anyhow!("upsert_legal_article {}: {e}", art.source_uid))?
         {

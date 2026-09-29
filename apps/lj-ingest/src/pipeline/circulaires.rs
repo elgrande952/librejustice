@@ -44,7 +44,7 @@ pub async fn sync_circulaires() -> Result<()> {
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
-    lj_store::migrator::apply_migrations(&conn)
+    lj_store::migrator::apply_migrations(&conn, lj_store::migrator::MigrationIntent::Verify)
         .await
         .map_err(|e| anyhow!("migrations: {e}"))?;
     let repo = DecisionRepository::new(&conn);
@@ -106,21 +106,22 @@ pub async fn sync_circulaires_bodies() -> Result<()> {
         .map_err(|e| anyhow!("plan_circulaires_pdf_sync: {e}"))?
     };
 
-    // Repli OCR marginal, pool standard. Client dédié, donc registre de quota
-    // dédié : le seau de `mistral-ocr` n'est pas celui du chat.
-    let ocr_client = if settings.mistral_api_keys.is_empty() {
-        None
-    } else {
-        Some(MistralClient::new(
-            settings.mistral_api_keys.clone(),
-            "mistral-ocr-latest".to_string(),
-        )?)
-    };
-
     let pool =
         lj_store::db::build_pool(&settings.db_url, 4).map_err(|e| anyhow!("build_pool: {e}"))?;
     let conn = pool.get().await.map_err(|e| anyhow!("pool.get: {e}"))?;
     let repo = DecisionRepository::new(&conn);
+
+    // Repli OCR marginal, pool standard. Client dédié, donc registre de quota
+    // dédié : le seau de `mistral-ocr` n'est pas celui du chat.
+    let ocr_keys = repo.pool_api_keys("mistral").await?;
+    let ocr_client = if ocr_keys.is_empty() {
+        None
+    } else {
+        Some(MistralClient::new(
+            ocr_keys,
+            "mistral-ocr-latest".to_string(),
+        )?)
+    };
 
     let mut total = PdfCounts::default();
     drain_pending_ocr(&repo, ocr_client.as_ref(), &dir, &mut total).await?;
@@ -179,7 +180,7 @@ async fn drain_pending_ocr(
             continue;
         };
         total.ocr += 1;
-        let body = lj_core::parsing::clean_ocr_markdown(&md);
+        let body = lj_parse::clean_ocr_markdown(&md);
         if repo
             .set_legal_text_body(&id, &body)
             .await
@@ -187,7 +188,7 @@ async fn drain_pending_ocr(
         {
             total.updated += 1;
         } else {
-            tracing::debug!(id = %id, "circulaire: pdf orphelin (pas de ligne legal_text)");
+            tracing::debug!(id = %id, "circulaire: orphan pdf (no legal_text row)");
             total.missing_row += 1;
         }
         if let Err(e) = lj_sources::circulaires::remove_pending_circulaire_pdf(circ_dir, &id) {
@@ -274,7 +275,7 @@ async fn ingest_circulaire_pdfs(
                     None => PdfMsg::Scanned(id, raw),
                 },
                 Err(e) => {
-                    tracing::warn!(member = %name, error = %e, "circulaire: pdf illisible");
+                    tracing::warn!(member = %name, error = %e, "circulaire: unreadable pdf");
                     PdfMsg::Unreadable
                 }
             };
@@ -297,7 +298,7 @@ async fn ingest_circulaire_pdfs(
             PdfMsg::Scanned(id, bytes) => {
                 match scanned_ocr_fallback(ocr_client, circ_dir, &id, &bytes).await {
                     Some(md) => PdfOutcome::Body {
-                        body: lj_core::parsing::clean_ocr_markdown(&md),
+                        body: lj_parse::clean_ocr_markdown(&md),
                         id,
                         ocr: true,
                     },
@@ -305,7 +306,7 @@ async fn ingest_circulaire_pdfs(
                         if let Err(e) = lj_sources::circulaires::save_pending_circulaire_pdf(
                             circ_dir, &id, &bytes,
                         ) {
-                            tracing::warn!(id = %id, error = %e, "circulaire: dépôt ocr-pending");
+                            tracing::warn!(id = %id, error = %e, "circulaire: ocr-pending drop");
                         }
                         PdfOutcome::OcrMissed
                     }
@@ -340,7 +341,7 @@ async fn ingest_circulaire_pdfs(
         {
             counts.updated += 1;
         } else {
-            tracing::debug!(id = %id, "circulaire: pdf orphelin (pas de ligne legal_text)");
+            tracing::debug!(id = %id, "circulaire: orphan pdf (no legal_text row)");
             counts.missing_row += 1;
         }
     }
@@ -398,7 +399,7 @@ async fn scanned_ocr_fallback(
             Some(markdown)
         }
         Err(e) => {
-            tracing::warn!(id = %id, error = %e, "circulaire: repli OCR scanné échoué");
+            tracing::warn!(id = %id, error = %e, "circulaire: scanned OCR fallback failed");
             None
         }
     }
@@ -420,7 +421,7 @@ async fn ingest_circulaires_tarball(
             let msg = match lj_sources::circulaires::parse_circulaire_xml(&raw) {
                 Ok(c) => Ok(Box::new(c)),
                 Err(e) => {
-                    tracing::error!(member = %name, error = %e, "circulaire: parse échec");
+                    tracing::error!(member = %name, error = %e, "circulaire: parse failed");
                     Err(())
                 }
             };
@@ -493,7 +494,7 @@ fn circulaire_row(c: Circulaire) -> lj_store::repository::LegalTextRow {
         match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
             Ok(d) => Some(d),
             Err(e) => {
-                tracing::warn!(id = %c.id, value = s, error = %e, "circulaire: date illisible");
+                tracing::warn!(id = %c.id, value = s, error = %e, "circulaire: unreadable date");
                 None
             }
         }
@@ -505,7 +506,7 @@ fn circulaire_row(c: Circulaire) -> lj_store::repository::LegalTextRow {
         "V" => "VIGUEUR",
         "A" => "ABROGE",
         other => {
-            tracing::warn!(id = %c.id, etat = other, "circulaire: état inconnu, gardé brut");
+            tracing::warn!(id = %c.id, etat = other, "circulaire: unknown state, kept raw");
             other
         }
     }

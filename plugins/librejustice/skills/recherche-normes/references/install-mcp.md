@@ -1,6 +1,6 @@
 # Connect the LibreJustice MCP server
 
-Every tool this skill uses (`search_legal_texts`, `get_legal_text`, `search_decisions`, `get_decision`) is served by the LibreJustice remote MCP server: the skill does nothing without it.
+Every tool this skill uses (`search_norms`, `get_norm`, `search_decisions`, `get_decision`) is served by the LibreJustice remote MCP server: the skill does nothing without it.
 
 - Endpoint: `https://librejustice.fr/mcp`
 - Transport: streamable HTTP
