@@ -24,18 +24,20 @@ The manual GitHub workflow requires the exact 40-character commit SHA of this re
 
 - Upstream standalone MCP client: 26 upstream tests passed locally on 2026-10-24.
 - Shell syntax and Python compilation checked locally.
-- API/database integration result on 2026-10-24: **database startup and Rust compilation succeeded; the official database migration failed before the HTTP server started**. See [the bounded CI run](https://github.com/elgrande952/librejustice/actions/runs/40130233557).
+- API/database integration on 2026-10-24: **passed in an independent, disposable instance**. See [the successful bounded CI run](https://github.com/elgrande952/librejustice/actions/runs/40130965975).
 - Assertions check health, retrieval of the synthetic marker and public API rejection without credentials. Full-text decision rendering, production OAuth, high-load behavior, semantic ranking, OCR, browser UI and complete corpus are not validated.
 - `lj-ingest` is intentionally not built: its build script downloads a Qwen tokenizer. `mise run build-app` is not run because it fetches OCR/HTR model assets.
 - Before compilation, the guard checks the resolved API dependency graph, excludes `lj-ingest` and rejects known model-download terms in reachable build-script entrypoints. This is not a full supply-chain security audit.
 
-The run used upstream revision `ca1d06062ec4bb2cb332b0e9d41a45309fa3ad75` and test-kit revision `221ec3f684718f96afd72e243b5efbee39cd7309`. PostgreSQL 18.6 accepted TCP connections; 95 reachable build-script entrypoints passed the targeted guard; the real API example compiled in 2 minutes 40 seconds. Migration `0204_text_filiation.sql` then failed with SQLSTATE `23503`: it unconditionally references `BE/CODE-CIVIL`, absent from the fresh `legal_text` table. The database was running, with `OOMKilled=false`, before successful cleanup.
+The successful run used upstream revision `ca1d06062ec4bb2cb332b0e9d41a45309fa3ad75`, the SQL deviation documented below, and test-kit revision `6b1a7624fef10515c96913edd607fd37b71edba9`. Its 95 build-script entrypoints passed the targeted guard; the API example compiled in 2 minutes 41 seconds. All 338 migrations completed. The backfill executed twice while `legal_text` and `text_filiation` remained empty; then exactly one synthetic decision was inserted.
 
-No synthetic fixture or HTTP check was reached in that run. These results do not establish a working independent search server. The revised kit below addresses the observed migration failure; its SQL/runtime result remains pending a new actual CI run.
+All three HTTP checks passed: health returned `ok` with the expected upstream revision, lexical retrieval found the unique synthetic marker, and public search without credentials returned HTTP 401. Runtime extension versions were `pg_search=0.25.6`, `vchord=1.1.1` and `vector=0.8.4`. The database snapshot was 244.6 MiB out of its 2 GiB limit; this tiny test is not production sizing. Cleanup completed successfully. No permanent instance or public endpoint remains.
+
+The patch was prompted by [an earlier fresh-database failure](https://github.com/elgrande952/librejustice/actions/runs/40130233557): unmodified migration 0204 inserted a relationship for absent canonical text `BE/CODE-CIVIL`, causing SQLSTATE `23503` before HTTP startup.
 
 ## Explicit upstream migration deviation
 
-`apply_migration_patch.py` checks migration `0204_text_filiation.sql` against upstream SHA-256 `4e633ba41b4c96794f7625b7948c0a0ab197f6ee9d4680fd6a470ac9e68264f0`, then replaces only that file in the disposable checkout. The reviewed replacement SHA-256 is `1a58353857de0b145f2cd4a96405dd84b163899710b01243678e099a5a3cc13d`. Cleanup restores the original bytes. Neither the upstream repository nor a live database is changed.
+`apply_migration_patch.py` checks migration `0204_text_filiation.sql` against upstream SHA-256 `4e633ba41b4c96794f7625b7948c0a0ab197f6ee9d4680fd6a470ac9e68264f0`, then replaces only that file in the disposable checkout. The reviewed replacement SHA-256 is `1a58353857de0b145f2cd4a96405dd84b163899710b01243678e099a5a3cc13d`. Cleanup restores the original bytes. Neither the upstream repository nor any existing production database is changed.
 
 The replacement preserves the seven original filiation tuples byte for byte and keeps all foreign keys. The insert casts `fork_date` explicitly to `date` and selects a relationship only when both canonical `legal_text` identifiers already exist. It inserts **no legal text rows**. `backfill_text_filiation.sql` preserves the same tuples and uses `ON CONFLICT DO NOTHING`, so the operator can rerun it explicitly after ingestion without losing relations skipped on an empty corpus:
 
