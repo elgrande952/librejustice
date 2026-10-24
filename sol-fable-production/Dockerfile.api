@@ -1,0 +1,21 @@
+# Original integration recipe; upstream source and dependencies are pinned.
+FROM rust:1.98.1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends git python3 cmake clang libclang-dev pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git init . && git remote add origin https://github.com/librejustice/librejustice.git && git fetch --depth=1 origin ca1d06062ec4bb2cb332b0e9d41a45309fa3ad75 && git checkout --detach FETCH_HEAD
+COPY runtime/ /kit/
+RUN python3 /kit/apply_patches.py /src && mkdir -p packages/lj-api/examples && cp /kit/sol_fable_lexical.rs packages/lj-api/examples/sol_fable_lexical.rs
+# Same bounded profile as integration CI: no debug symbols, no incremental cache.
+ENV CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0
+RUN cargo fetch --locked && python3 /kit/audit_build_scripts.py && cargo build --locked -p lj-api --example sol_fable_lexical
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libstdc++6 && rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --create-home app
+WORKDIR /app
+COPY --from=build /src/target/debug/examples/sol_fable_lexical /app/librejustice-lexical
+COPY corpus/ /app/corpus/
+USER app
+ENV LIBREJUSTICE_API_BIND_HOST=0.0.0.0 LIBREJUSTICE_API_BIND_PORT=8080 LIBREJUSTICE_API_POOL_MIN=1 LIBREJUSTICE_API_POOL_MAX=8 LIBREJUSTICE_EMBED_BACKEND=disabled LJ_BOOTSTRAP_CORPUS=/app/corpus/initial-judilibre.jsonl
+EXPOSE 8080
+ENTRYPOINT ["/app/librejustice-lexical"]
+CMD ["boot"]

@@ -1,0 +1,84 @@
+{
+  "source": "API officielle Judilibre",
+  "source_class": "official_legal_data",
+  "licence": "Licence Ouverte 2.0",
+  "scope": "Échantillon initial de décisions de la chambre sociale; pas corpus complet ni analyse juridique",
+  "selection_queries": [
+    "obligation de sécurité",
+    "harcèlement moral employeur",
+    "heures supplémentaires salarié"
+  ],
+  "count": 10,
+  "documents": [
+    {
+      "id": "5fca845e7a2d0874d482edb3",
+      "date": "2018-10-10",
+      "ecli": "ECLI:FR:CCASS:2018:SO01421",
+      "retrieved_at": "2026-10-24T21:07:31Z",
+      "canonical_json_sha256": "e03d9bdadb40d9315773e8cf697b59729097b6ed2839167084de88d13b2162f5"
+    },
+    {
+      "id": "6079c60f9ba5988459c574da",
+      "date": "2014-11-19",
+      "ecli": "ECLI:FR:CCASS:2014:SO02049",
+      "retrieved_at": "2026-10-24T21:07:31Z",
+      "canonical_json_sha256": "2e7b1b9130b8fc7e56e376770c94fe6190f18640ecf43896ff35f4db10a11219"
+    },
+    {
+      "id": "6079c2f89ba5988459c5737e",
+      "date": "2013-10-09",
+      "ecli": "ECLI:FR:CCASS:2013:SO01625",
+      "retrieved_at": "2026-10-24T21:07:31Z",
+      "canonical_json_sha256": "8a2d348ee8bd2e9ba958925ee3ca50c6a8157e703c15eac5ee6c5884fd1177eb"
+    },
+    {
+      "id": "67cfdd6ed22131b78dde9aa0",
+      "date": "2025-03-11",
+      "ecli": "ECLI:FR:CCASS:2025:SO00300",
+      "retrieved_at": "2026-10-24T21:07:32Z",
+      "canonical_json_sha256": "912cb92d5e61da21f909cdfeff068e8b2350f293c5396f1ab246b69bbae33a41"
+    },
+    {
+      "id": "6079c1019ba5988459c572a3",
+      "date": "2011-11-15",
+      "ecli": "ECLI:FR:CCASS:2011:SO02392",
+      "retrieved_at": "2026-10-24T21:07:32Z",
+      "canonical_json_sha256": "200b8722ef1fd1c1a6c188eeb6704e2cceb8983a039b9833fc0fb527f9259294"
+    },
+    {
+      "id": "5fd9311a41c028111a1b2cc3",
+      "date": "2016-06-01",
+      "ecli": "ECLI:FR:CCASS:2016:SO01068",
+      "retrieved_at": "2026-10-24T21:07:33Z",
+      "canonical_json_sha256": "33ad7c57d41d52565c1a8a3c757b9dc4d57e60cbdc5d6cf81deb2308a60f003f"
+    },
+    {
+      "id": "5fca80a7d739fc7044e50d8f",
+      "date": "2018-11-14",
+      "ecli": "ECLI:FR:CCASS:2018:SO01652",
+      "retrieved_at": "2026-10-24T21:07:34Z",
+      "canonical_json_sha256": "486f8d5fc043e4390e1d696658bd3b3742182de1545af8d8252914c861652962"
+    },
+    {
+      "id": "5fca80a7d739fc7044e50d8c",
+      "date": "2018-11-14",
+      "ecli": "ECLI:FR:CCASS:2018:SO01648",
+      "retrieved_at": "2026-10-24T21:07:34Z",
+      "canonical_json_sha256": "71d9d61c13c180c1e08cd9f7e6031b6164c322a841cde9feef705b104beb42c9"
+    },
+    {
+      "id": "6079c35f9ba5988459c573aa",
+      "date": "2013-11-14",
+      "ecli": "ECLI:FR:CCASS:2013:SO01895",
+      "retrieved_at": "2026-10-24T21:07:34Z",
+      "canonical_json_sha256": "bf235536e09e340edeca88ec842ce060148c6cdfa33d42be8e062baeb5097cac"
+    },
+    {
+      "id": "6079c6849ba5988459c5750b",
+      "date": "2014-12-17",
+      "ecli": "ECLI:FR:CCASS:2014:SO02409",
+      "retrieved_at": "2026-10-24T21:07:36Z",
+      "canonical_json_sha256": "bbd84abda9c559d34690b3db5bc84d6ef829a13a7d6cec5f377bed1d82666db1"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "upstream": "ca1d06062ec4bb2cb332b0e9d41a45309fa3ad75",
+  "files": [
+    {
+      "path": "packages/lj-llm/src/backend.rs",
+      "original_sha256": "ab2f953036c65a19ba39cce4f870d7ad72b38ed967db486e669d9d4170962b2e",
+      "patched_sha256": "4c750fefc4a26a72c357fc4f840c6f003f57f4b10def9f650a61ccbf843d152f"
+    },
+    {
+      "path": "packages/lj-api/src/embedder.rs",
+      "original_sha256": "686e2602ec77e1b60f50b18d1eb8cba7456a9632fc6accc6355fb073ce0f8316",
+      "patched_sha256": "dd6b0f93a8c486a8bf69dbce72b4959f2f531ba3e025de6aae8eb3237504ea02"
+    },
+    {
+      "path": "packages/lj-store/migrations/0204_text_filiation.sql",
+      "original_sha256": "4e633ba41b4c96794f7625b7948c0a0ab197f6ee9d4680fd6a470ac9e68264f0",
+      "patched_sha256": "1a58353857de0b145f2cd4a96405dd84b163899710b01243678e099a5a3cc13d"
+    }
+  ]
+}

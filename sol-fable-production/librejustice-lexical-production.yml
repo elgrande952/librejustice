@@ -1,0 +1,50 @@
+name: LibreJustice authenticated lexical runtime
+on:
+  workflow_dispatch:
+    inputs:
+      kit_sha:
+        description: Exact reviewed production-kit commit
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: librejustice-lexical-runtime
+  cancel-in-progress: false
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Validate immutable kit reference
+        env:
+          KIT_SHA: ${{ inputs.kit_sha }}
+        run: '[[ "$KIT_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Checkout exact kit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ inputs.kit_sha }}
+          path: kit
+          persist-credentials: false
+      - name: Checkout exact official source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: librejustice/librejustice
+          ref: ca1d06062ec4bb2cb332b0e9d41a45309fa3ad75
+          path: upstream
+          persist-credentials: false
+      - name: Native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake clang libclang-dev
+          rustup toolchain install 1.98.1 --profile minimal
+      - name: Real runtime and official corpus integration
+        env:
+          LJ_SOURCE_DIR: ${{ github.workspace }}/upstream
+        run: timeout --signal=TERM 35m bash kit/sol-fable-production/runtime/run-integration.sh
+      - name: Final cleanup
+        if: always()
+        run: |
+          for item in $(docker ps -aq --filter 'name=lj-smoke-lexical-'); do
+            docker rm -fv "$item"
+          done
