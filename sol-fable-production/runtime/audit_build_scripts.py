@@ -29,7 +29,9 @@ for item in sorted(seen):
             text = path.read_text()
             assert not pattern.search(text), f'Model-related build hook needs review: {package["name"]}'
             audited.append(package['name'])
-Path('smoke-evidence/build-hook-audit.json').write_text(json.dumps({
+evidence = Path('smoke-evidence/build-hook-audit.json')
+evidence.parent.mkdir(parents=True, exist_ok=True)
+evidence.write_text(json.dumps({
     'api_dependency_packages': len(seen), 'build_script_packages': sorted(audited),
     'scope': 'known model download terms in reachable custom-build entrypoints; not full supply-chain audit',
 }, indent=2) + '\n')

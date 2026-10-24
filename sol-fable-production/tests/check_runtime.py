@@ -26,8 +26,10 @@ status,search=call("/search?"+urllib.parse.urlencode({"q":"obligation de sécuri
 assert status==200 and search["hits"] and search["queryMode"]=="lexical" and search["reranked"] is False,(status,search)
 first=search["hits"][0]
 assert first.get("officialUrl","").startswith("https://www.courdecassation.fr/")
+assert all(hit.get("dateLecture") and hit.get("docketNumbers") and hit.get("titleHtml") for hit in search["hits"])
 status,decision=call("/decision/"+first["id"])
 assert status==200 and decision["id"]==first["id"]
+assert decision["dateLecture"]==first["dateLecture"] and decision["docketNumbers"]==first["docketNumbers"]
 assert "SYNTHETIQUE" not in json.dumps(decision,ensure_ascii=False)
 for suffix in ["&mode=semantic","&mode=auto","&mode=reference","&aiMode=true"]:
     assert call("/search?q=test"+suffix)[0]==422

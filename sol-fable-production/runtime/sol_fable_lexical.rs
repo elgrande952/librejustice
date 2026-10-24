@@ -7,7 +7,7 @@ use aws_lc_rs::{digest, hmac};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use lj_api::{config::Settings, state::AppState};
 use lj_dtos::{SearchMode, SearchRequest};
-use lj_store::{db, migrator::{apply_migrations, MigrationIntent}, repository::{DecisionRepository, UpsertStatus}};
+use lj_store::{db, migrator::{apply_migrations, MigrationIntent}, repository::{DecisionRepository, ExtractedFields, UpsertStatus}};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -44,7 +44,7 @@ async fn authorize(State(rt): State<Runtime>, req: Request, next: Next) -> Respo
 
 async fn health(State(rt): State<Runtime>) -> Response {
     let ok = match rt.api.pool.get().await { Ok(c) => c.simple_query("SELECT 1").await.is_ok(), Err(_) => false };
-    (if ok {StatusCode::OK} else {StatusCode::SERVICE_UNAVAILABLE}, Json(json!({"status":if ok {"ok"} else {"database_unavailable"},"service":"LibreJustice Sol-Fable lexical","upstream":UPSTREAM,"mode":"lexical_only","embeddings":"disabled","reranking":"disabled"}))).into_response()
+    (if ok {StatusCode::OK} else {StatusCode::SERVICE_UNAVAILABLE}, Json(json!({"status":if ok {"ok"} else {"database_unavailable"},"service":"LibreJustice Sol-Fable lexical","upstream":UPSTREAM,"runtime_revision":std::env::var("RAILWAY_GIT_COMMIT_SHA").unwrap_or_else(|_|"local-unpublished".into()),"mode":"lexical_only","embeddings":"disabled","reranking":"disabled"}))).into_response()
 }
 
 async fn search(State(rt): State<Runtime>, Query(q): Query<SearchQuery>) -> Response {
@@ -96,15 +96,22 @@ async fn import(pool: &db::Pool, file: &Path) -> anyhow::Result<()> {
     for row in rows {
         let parsed=lj_parse::parse_judilibre(&row.payload,None);
         ensure!(parsed.jurisdiction_type.is_some(),"unrecognized official jurisdiction");
-        let bytes=serde_json::to_vec(&row.payload)?;
+        let mut bytes=b"sol-fable-minimal-metadata-v1\0".to_vec();
+        bytes.extend(serde_json::to_vec(&row.payload)?);
         let checksum=digest::digest(&digest::SHA256,&bytes).as_ref().iter().map(|b|format!("{b:02x}")).collect::<String>();
         let id_hash=digest::digest(&digest::SHA256,parsed.source_uid.as_bytes());
         let public_id=URL_SAFE_NO_PAD.encode(&id_hash.as_ref()[..9]);
         let mut fields=lj_parse::build_source_fields(&row.payload,&parsed.sections);
         fields.as_object_mut().context("object fields")?.insert("_sol_fable_provenance".into(),json!({"source_url":row.source_url,"retrieved_at":row.retrieved_at,"licence":row.licence,"checksum":checksum}));
+        // The store requires explicit extracted metadata; passing None loses dates,
+        // dockets and search titles even though the parser retains them.
+        let dockets=parsed.numero_dossiers.clone().unwrap_or_else(||parsed.numero_dossier.clone().into_iter().collect());
+        let date=chrono::NaiveDate::parse_from_str(parsed.date_lecture.as_deref().context("official decision date")?,"%Y-%m-%d")?;
+        let title=lj_api::titles::decision_title(parsed.jurisdiction_type.as_deref().unwrap_or(""),parsed.jurisdiction_name.as_deref(),None,parsed.date_lecture.as_deref(),None,Some(&dockets));
+        let extracted=ExtractedFields{date_lecture:Some(date),docket_numbers:dockets,search_title:Some(title),publication_codes:parsed.publication_codes.clone(),themes:parsed.themes.clone(),..Default::default()};
         let conn=pool.get().await?;
         conn.batch_execute("BEGIN").await?;
-        let result=DecisionRepository::new(&conn).upsert(&parsed,&checksum,&public_id,None,None,&fields,None,"json").await;
+        let result=DecisionRepository::new(&conn).upsert(&parsed,&checksum,&public_id,Some(&extracted),None,&fields,None,"json").await;
         match result {
             Ok(result)=> {conn.batch_execute("COMMIT").await?;let i=match result.status {UpsertStatus::Created=>0,UpsertStatus::Updated=>1,UpsertStatus::Skipped=>2};counts[i]+=1;},
             Err(e)=>{let _=conn.batch_execute("ROLLBACK").await;return Err(e.into());}

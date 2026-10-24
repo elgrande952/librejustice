@@ -1,0 +1,18 @@
+{
+  "checked_at": "2026-10-24T21:12:52.022295+00:00",
+  "checks": {
+    "official_judilibre_payload_sha256": 10,
+    "snapshot_documents": 10,
+    "patch_source_and_destination_sha": "passed",
+    "patch_application": "passed",
+    "patch_idempotence": "passed",
+    "unexpected_source_rejected": "passed",
+    "shell_syntax": "passed",
+    "python_compilation": "passed"
+  },
+  "rust_compilation": "pending_real_ci",
+  "new_api_http_tests": "pending_real_ci",
+  "permanent_deployment": "pending_parent_owned_action",
+  "new_models_downloaded": false,
+  "remote_mutations_by_this_branch": false
+}
