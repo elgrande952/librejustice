@@ -13,17 +13,24 @@ cp "$LJ_KIT_DIR/smoke_api.rs" packages/lj-api/examples/sol_fable_smoke.rs
 LJ_CONTAINER="lj-smoke-${GITHUB_RUN_ID:-local}-$$"
 LJ_API_PID=''
 cleanup() {
+  LJ_EXIT_STATUS=$?
   if [[ -n "$LJ_API_PID" ]]; then kill "$LJ_API_PID" 2>/dev/null || true; fi
   docker logs "$LJ_CONTAINER" > smoke-evidence/database.log 2>&1 || true
+  if (( LJ_EXIT_STATUS != 0 )); then
+    echo 'Database state (no environment or credentials):'
+    docker inspect --format '{{json .State}}' "$LJ_CONTAINER" || true
+    echo 'Database startup log (last 120 lines):'
+    tail -n 120 smoke-evidence/database.log || true
+    if [[ -f smoke-evidence/api.log ]]; then
+      echo 'API log (last 80 lines):'
+      tail -n 80 smoke-evidence/api.log || true
+    fi
+  fi
   docker rm -fv "$LJ_CONTAINER" >/dev/null 2>&1 || true
   rm -f packages/lj-api/examples/sol_fable_smoke.rs
+  return "$LJ_EXIT_STATUS"
 }
 trap cleanup EXIT
-# Only this crate is built: lj-ingest/build.rs downloads a model tokenizer and is excluded.
-export CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0
-cargo fetch --locked
-python3 "$LJ_KIT_DIR/audit_build_scripts.py"
-cargo build --locked -p lj-api --example sol_fable_smoke 2>&1 | tee smoke-evidence/build.log
 # Database image uses fixed upstream versions; it is never pushed to a registry.
 docker build -f infra/Dockerfile.pg -t "lj-autonomy-smoke:${GITHUB_RUN_ID:-local}" . 2>&1 | tee smoke-evidence/database-build.log
 LJ_TEST_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
@@ -33,14 +40,24 @@ docker run -d --name "$LJ_CONTAINER" --memory=2g --cpus=2 --shm-size=1g \
   -e POSTGRES_PASSWORD="$LJ_TEST_PASSWORD" \
   "lj-autonomy-smoke:${GITHUB_RUN_ID:-local}" \
   postgres -c 'shared_preload_libraries=pg_search,vchord,pg_cron,pg_stat_statements,pg_prewarm' \
-  -c cron.database_name=lj_smoke -c shared_buffers=256MB \
+  -c cron.database_name=postgres -c shared_buffers=256MB \
   -c max_connections=30 -c default_toast_compression=lz4 \
   -c paradedb.planner_warnings=off >/dev/null
 for ((attempt=0; attempt<60; attempt++)); do
-  if docker exec "$LJ_CONTAINER" pg_isready -U librejustice -d lj_smoke >/dev/null 2>&1; then break; fi
+  if [[ "$(docker inspect --format '{{.State.Running}}' "$LJ_CONTAINER")" != true ]]; then
+    echo 'Database stopped before readiness; see cleanup diagnostics.'
+    exit 1
+  fi
+  if docker exec "$LJ_CONTAINER" pg_isready -h 127.0.0.1 -U librejustice -d lj_smoke >/dev/null 2>&1; then break; fi
   sleep 1
 done
-docker exec "$LJ_CONTAINER" pg_isready -U librejustice -d lj_smoke
+docker exec "$LJ_CONTAINER" pg_isready -h 127.0.0.1 -U librejustice -d lj_smoke
+# Build only after proving that the disposable database can start.
+# lj-ingest/build.rs downloads a model tokenizer and is intentionally excluded.
+export CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0
+cargo fetch --locked
+python3 "$LJ_KIT_DIR/audit_build_scripts.py"
+cargo build --locked -p lj-api --example sol_fable_smoke 2>&1 | tee smoke-evidence/build.log
 # env -i prevents inherited provider credentials; no network model/backend or SMTP configured.
 env -i PATH="$PATH" LANG=C.UTF-8 \
   LIBREJUSTICE_DB_URL=postgresql://librejustice@127.0.0.1:55432/lj_smoke \

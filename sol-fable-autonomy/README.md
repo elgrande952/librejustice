@@ -33,6 +33,14 @@ The manual GitHub workflow requires the exact 40-character commit SHA of this re
 
 A persistent independent deployment still requires a dedicated database volume, backed-up and monitored storage, TLS/authentication, deliberate corpus selection and licensed source access. The upstream database configuration gives development sizing references (512 MiB shared buffers, 2 GiB effective cache, 3 GiB container shared-memory setting); these are not measured minimum hardware requirements. The tiny integration test cannot estimate full-corpus storage.
 
+The minimal independent architecture has three explicit parts:
+
+1. A stateless LibreJustice API service behind an authenticated TLS endpoint. The test binds only loopback; no new public API or ChatGPT connection is exposed by this kit.
+2. A dedicated persistent PostgreSQL 18 database with the pinned search extensions and a separately backed-up volume. No suitable unassigned database/volume has been identified in the existing deployment inventory. Existing services and private session storage are not reassigned.
+3. An intentionally selected legal corpus plus an optional, compatible embedding service. Lexical indexing/search needs no inference model, but upstream API startup still constructs an embedder. Its `dummy` option is a test aid, not production semantic search. A production lexical-only route must explicitly force lexical mode, reject semantic/automatic modes and disable AI reranking; this adapter has not been deployed. Full hybrid search needs a verified existing embedding endpoint producing the expected 1,024-dimensional vectors. A generation model being installed does not prove this compatibility.
+
+The standard CI runner is an actual alternative to local Docker, but its database is destroyed at the end and is not permanent hosting. Successful synthetic tests therefore establish bounded execution only. No new hosting purchase, model download, API credit, production service, volume, or credential change is part of this kit. Storage and capacity for a real corpus remain to be measured before production allocation.
+
 The existing direct legal API connections need not be replaced by an independent index. Official Légifrance production uses `https://api.piste.gouv.fr/dila/legifrance/lf-engine-app`, Judilibre `https://api.piste.gouv.fr/cassation/judilibre/v1.0`, with PISTE OAuth at `https://oauth.piste.gouv.fr/api/oauth/token`. The upstream ingestion code expects `LIBREJUSTICE_PISTE_CLIENT_ID` and `LIBREJUSTICE_PISTE_CLIENT_SECRET`; PISTE application subscriptions must authorize the requested APIs. No identifiers or tokens are included in this kit.
 
 ## Provenance
