@@ -1,0 +1,31 @@
+{
+  "run_id": 40133440234,
+  "job_id": 120989859531,
+  "kit_commit": "97a1e8172d2a5bc37b0055a3aa41fce1efdf9c65",
+  "conclusion": "failure",
+  "actual_results": {
+    "rust_compilation": "passed",
+    "rust_unit_tests": 4,
+    "migrations": 338,
+    "official_decisions_imported": 10,
+    "http_auth_health_lexical_decision_and_rejection_checks": "passed",
+    "idempotent_reimport_skipped": 10
+  },
+  "harness_failure": "rg command absent on GitHub runner after successful HTTP and reimport operations",
+  "not_yet_checked": [
+    "zero vector chunks",
+    "ldd dependencies",
+    "binary size"
+  ],
+  "corrective_change": "Use Python standard library for existing log assertion",
+  "log_excerpt": [
+    "2026-10-24T21:17:19.7467363Z Build hook guard: 95 reachable entrypoints checked; lj-ingest excluded.",
+    "2026-10-24T21:20:34.2172256Z test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "2026-10-24T21:20:40.4829733Z {\"health\": \"passed\", \"authentication\": \"passed\", \"corpus_count\": 10, \"corpus_complete\": false, \"lexical_search_hits\": 7, \"decision_read\": \"passed\", \"semantic_auto_reference_ai\": \"rejected_422\", \"upstream_admin_internal\": \"not_exposed\", \"embeddings\": \"disabled\", \"model_downloads\": false}",
+    "2026-10-24T21:20:40.7429303Z IMPORT_CREATED=0; IMPORT_UPDATED=0; IMPORT_SKIPPED=10; EMBEDDINGS=disabled",
+    "2026-10-24T21:20:40.7448053Z /home/runner/work/librejustice/librejustice/kit/sol-fable-production/runtime/run-integration.sh: line 63: rg: command not found",
+    "2026-10-24T21:20:40.7703052Z MIGRATIONS_APPLIED=338",
+    "2026-10-24T21:20:40.7703447Z IMPORT_CREATED=10; IMPORT_UPDATED=0; IMPORT_SKIPPED=0; EMBEDDINGS=disabled",
+    "2026-10-24T21:20:41.1795806Z ##[error]Process completed with exit code 127."
+  ]
+}

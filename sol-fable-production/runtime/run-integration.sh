@@ -60,7 +60,7 @@ done
 python3 "$LJ_KIT_DIR/tests/check_runtime.py"
 # Re-import the same snapshots; all ten must be skipped, no duplicate rows.
 ./target/debug/examples/sol_fable_lexical import "$LJ_KIT_DIR/corpus/initial-judilibre.jsonl" | tee lexical-evidence/reimport.log
-rg -q 'IMPORT_CREATED=0; IMPORT_UPDATED=0; IMPORT_SKIPPED=10;' lexical-evidence/reimport.log
+python3 -c 'from pathlib import Path; assert "IMPORT_CREATED=0; IMPORT_UPDATED=0; IMPORT_SKIPPED=10;" in Path("lexical-evidence/reimport.log").read_text()'
 docker exec "$LJ_CONTAINER" psql -U librejustice -d lj_lexical -Atc "SELECT count(*) FROM decision_chunks" | tee lexical-evidence/chunks.txt
 [[ "$(cat lexical-evidence/chunks.txt)" == 0 ]]
 docker exec "$LJ_CONTAINER" psql -U librejustice -d lj_lexical -Atc "SELECT extname || '=' || extversion FROM pg_extension ORDER BY extname"
