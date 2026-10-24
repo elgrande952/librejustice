@@ -12,7 +12,7 @@ def read(path):
     with urllib.request.urlopen(BASE + path, timeout=45) as response:
         return response.status, json.load(response)
 
-status, health = read('/api/health')
+status, health = read('/internal/health')
 assert status == 200 and health.get('status') == 'ok', health
 status, result = read('/internal/search?q=solfablefixtureverifiable&mode=lexical&aiMode=0&limit=1')
 serialized = json.dumps(result, ensure_ascii=False)

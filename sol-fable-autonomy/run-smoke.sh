@@ -56,7 +56,7 @@ env -i PATH="$PATH" LANG=C.UTF-8 \
   ./target/debug/examples/sol_fable_smoke >smoke-evidence/api.log 2>&1 &
 LJ_API_PID=$!
 for ((attempt=0; attempt<180; attempt++)); do
-  if curl -fsS --max-time 2 http://127.0.0.1:18300/api/health >/dev/null 2>&1; then break; fi
+  if curl -fsS --max-time 2 http://127.0.0.1:18300/internal/health >/dev/null 2>&1; then break; fi
   if ! kill -0 "$LJ_API_PID" 2>/dev/null; then cat smoke-evidence/api.log; exit 1; fi
   sleep 1
 done
