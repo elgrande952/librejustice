@@ -15,6 +15,15 @@ async fn main() -> anyhow::Result<()> {
     let applied = apply_migrations(&conn, MigrationIntent::Apply).await?;
     println!("MIGRATIONS_APPLIED={}", applied.len());
     apply_migrations(&conn, MigrationIntent::Verify).await?;
+    let legal_count: i64 = conn.query_one("SELECT count(*) FROM legal_text", &[]).await?.get(0);
+    anyhow::ensure!(legal_count == 0, "no artificial canonical legal text may be seeded");
+    let backfill = std::fs::read_to_string(std::env::var("LJ_SMOKE_BACKFILL_SQL")?)?;
+    for _ in 0..2 {
+        conn.batch_execute(&backfill).await?;
+    }
+    let filiations: i64 = conn.query_one("SELECT count(*) FROM text_filiation", &[]).await?.get(0);
+    anyhow::ensure!(filiations == 0, "backfill must skip missing canonical parents");
+    println!("EMPTY_CORPUS_BACKFILL_PASSES=2; LEGAL_TEXT_ROWS=0; FILIATION_ROWS=0");
     let existing: i64 = conn.query_one("SELECT count(*) FROM decisions", &[]).await?.get(0);
     anyhow::ensure!(existing == 0, "requires empty disposable corpus");
     // Synthetic fixture: never represents a court ruling or a legal authority.

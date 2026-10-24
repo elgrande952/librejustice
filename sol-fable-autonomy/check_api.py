@@ -27,6 +27,8 @@ except urllib.error.HTTPError as exc:
 receipt = {
     'scope': 'ephemeral independent API, synthetic fixture, lexical only',
     'upstream_commit': 'ca1d06062ec4bb2cb332b0e9d41a45309fa3ad75',
+    'upstream_deviation': '0204 migration guarded against absent canonical legal texts',
+    'migration_patch_sha256': '1a58353857de0b145f2cd4a96405dd84b163899710b01243678e099a5a3cc13d',
     'health': health,
     'lexical_fixture_found': True,
     'public_api_without_key_http_status': auth_status,

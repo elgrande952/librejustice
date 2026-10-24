@@ -4,7 +4,7 @@ This kit verifies a real, independent **API core** from the Apache-2.0 LibreJust
 
 ## What runs
 
-The test adds an example entrypoint to a disposable checkout, calls the official database migrator and mounts the official `lj-api` router. It builds PostgreSQL 18 with the upstream pinned ParadeDB 0.25.6 and VectorChord 1.1.1 image recipe. The database is ephemeral and exposed only at `127.0.0.1:55432`; the API only at `127.0.0.1:18300`.
+The test adds an example entrypoint to a disposable checkout, calls the official database migrator and mounts the official `lj-api` router. **One upstream SQL migration is patched in that disposable checkout**, as documented below; the API library code is unchanged. It builds PostgreSQL 18 with the upstream pinned ParadeDB 0.25.6 and VectorChord 1.1.1 image recipe. The database is ephemeral and exposed only at `127.0.0.1:55432`; the API only at `127.0.0.1:18300`.
 
 One **synthetic** document, explicitly marked as such, tests lexical retrieval. The official dummy embedder is used solely to avoid a model/API dependency in this test. It provides no validated semantic capability. Public search must refuse requests lacking an API key. The internal test API is reachable only on the runner loopback.
 
@@ -24,10 +24,26 @@ The manual GitHub workflow requires the exact 40-character commit SHA of this re
 
 - Upstream standalone MCP client: 26 upstream tests passed locally on 2026-10-24.
 - Shell syntax and Python compilation checked locally.
-- API/database integration: **pending the actual workflow result**, never inferred from a green health endpoint alone.
+- API/database integration result on 2026-10-24: **database startup and Rust compilation succeeded; the official database migration failed before the HTTP server started**. See [the bounded CI run](https://github.com/elgrande952/librejustice/actions/runs/40130233557).
 - Assertions check health, retrieval of the synthetic marker and public API rejection without credentials. Full-text decision rendering, production OAuth, high-load behavior, semantic ranking, OCR, browser UI and complete corpus are not validated.
 - `lj-ingest` is intentionally not built: its build script downloads a Qwen tokenizer. `mise run build-app` is not run because it fetches OCR/HTR model assets.
 - Before compilation, the guard checks the resolved API dependency graph, excludes `lj-ingest` and rejects known model-download terms in reachable build-script entrypoints. This is not a full supply-chain security audit.
+
+The run used upstream revision `ca1d06062ec4bb2cb332b0e9d41a45309fa3ad75` and test-kit revision `221ec3f684718f96afd72e243b5efbee39cd7309`. PostgreSQL 18.6 accepted TCP connections; 95 reachable build-script entrypoints passed the targeted guard; the real API example compiled in 2 minutes 40 seconds. Migration `0204_text_filiation.sql` then failed with SQLSTATE `23503`: it unconditionally references `BE/CODE-CIVIL`, absent from the fresh `legal_text` table. The database was running, with `OOMKilled=false`, before successful cleanup.
+
+No synthetic fixture or HTTP check was reached in that run. These results do not establish a working independent search server. The revised kit below addresses the observed migration failure; its SQL/runtime result remains pending a new actual CI run.
+
+## Explicit upstream migration deviation
+
+`apply_migration_patch.py` checks migration `0204_text_filiation.sql` against upstream SHA-256 `4e633ba41b4c96794f7625b7948c0a0ab197f6ee9d4680fd6a470ac9e68264f0`, then replaces only that file in the disposable checkout. The reviewed replacement SHA-256 is `1a58353857de0b145f2cd4a96405dd84b163899710b01243678e099a5a3cc13d`. Cleanup restores the original bytes. Neither the upstream repository nor a live database is changed.
+
+The replacement preserves the seven original filiation tuples byte for byte and keeps all foreign keys. The insert casts `fork_date` explicitly to `date` and selects a relationship only when both canonical `legal_text` identifiers already exist. It inserts **no legal text rows**. `backfill_text_filiation.sql` preserves the same tuples and uses `ON CONFLICT DO NOTHING`, so the operator can rerun it explicitly after ingestion without losing relations skipped on an empty corpus:
+
+```sh
+psql "$LIBREJUSTICE_DB_URL" -v ON_ERROR_STOP=1 -f sol-fable-autonomy/backfill_text_filiation.sql
+```
+
+The integration harness checks that `legal_text` stays empty and executes the backfill twice before inserting its synthetic decision. Static tests proved exact seed preservation, retained foreign keys, no legal-text insert, date conversion, conflict handling, guarded application, exact restoration and rejection of an unexpectedly changed original. A read-only review of migrations 0205–0338 found no further certain dependence on a preloaded corpus; this does not replace runtime validation.
 
 ## Production path
 
